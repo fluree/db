@@ -103,9 +103,9 @@ async fn main() {
     let classes = env_usize("PROBE_CLASSES", 50);
     let rel_types = env_usize("PROBE_RELTYPES", 50);
     let uris = env_usize("PROBE_URIS", 1_000);
-    // import:  bulk-import a .jsonl (import-pipeline root, annotation_index
-    //          absent — the customer's `fluree create --from` ledger shape)
-    // reindex: insert + reindex (indexer-built root WITH the annotation arena)
+    // import:  bulk-import a .jsonl (the customer's `fluree create --from`
+    //          ledger shape)
+    // reindex: insert + reindex (indexer-built root)
     let mode = std::env::var("PROBE_MODE").unwrap_or_else(|_| "import".to_string());
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -167,11 +167,7 @@ async fn main() {
     );
 
     let db = fluree.db("probe:kbpage").await.expect("db");
-    eprintln!(
-        "annotation_index={} content_store={}",
-        db.snapshot.annotation_index.is_some(),
-        db.snapshot.content_store.is_some()
-    );
+    eprintln!("has_annotations={}", db.snapshot.has_annotations);
 
     // ---- getObjectsByUris: UNWIND + untyped rel + p.p property read ----
     let uri_list: Vec<serde_json::Value> = (0..uris)

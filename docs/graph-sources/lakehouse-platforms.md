@@ -17,6 +17,7 @@ The option reference is in [Delta Lake tables](delta.md) and
 | Databricks **external** tables, by path, without Unity Catalog | [Delta source](#databricks-external-tables), by path | Your own credentials for that S3 bucket or ADLS container |
 | Databricks tables with Iceberg reads (UniForm) or managed Iceberg tables | [Iceberg REST source](#databricks-through-the-iceberg-rest-endpoint) | A Databricks service principal (or a personal access token); storage credentials are vended per request |
 | Delta tables on S3 | Delta source, by path — see [Delta Lake tables](delta.md#credentials) | AWS credentials in the environment, or the instance / container role |
+| Iceberg tables in the AWS Glue Data Catalog, or in an AWS S3 Tables table bucket | [Iceberg source](iceberg.md#catalog-modes) with `--mode glue` or `--mode s3tables` | The ambient AWS credential chain, for both the catalog call and the S3 reads (see [AWS Credentials](iceberg.md#aws-credentials)); no vended credentials, so Lake Formation–vended access is not supported yet |
 
 Everything Fabric stores in OneLake is a Delta table, whichever Fabric engine
 wrote it, so OneLake is always the Delta route. Iceberg tables on Azure storage
@@ -311,7 +312,7 @@ HTTP API), the server's operator lists the variable in
 | `403` from ADLS right after setup | The role assignment has not applied yet (1–2 minutes), or the role is *Reader* / *Contributor* rather than a *Storage Blob Data* role |
 | `403 … not authorized … for workspace` from OneLake | The principal is a workspace *Viewer*; it needs *Contributor* or a OneLake data access role |
 | `(not readable yet)` when mapping | The mapping process could not open the table — often only because it lacks the credentials the server has. The source is registered; the first query reports the real error |
-| S3 reads fail although `aws` works in the same shell | `AWS_PROFILE` and SSO sessions are not read. Export the profile's keys (`aws configure export-credentials --format env`) |
+| Delta S3 reads fail although `aws` works in the same shell | The Delta reader does not read `AWS_PROFILE` or SSO sessions (Iceberg sources, including Glue and S3 Tables, do). Export the profile's keys (`aws configure export-credentials --format env`) |
 | `User does not have EXTERNAL USE SCHEMA on Schema …` (or `USE CATALOG`, `USE SCHEMA`, `SELECT`) | A grant from [step 3](#databricks-tables-through-unity-catalog) is missing; none is implied by ownership or admin rights |
 | `Unity Catalog issued no credentials. The table has a row filter …` (or `column mask`) | Whether such a table can be read is Unity Catalog's decision, and today it refuses: it enforces those rules only in its own compute and issues no credentials to read such a table's files, even to its owner. Expose the permitted rows and columns as a separate table, and govern access in Fluree with a model ledger's [access policy](iceberg.md#access-policy) |
 | `… is a VIEW, not a Delta table` / `… in PARQUET format` | Unity Catalog places only Delta tables with files of their own; map the underlying table |

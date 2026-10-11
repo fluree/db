@@ -66,6 +66,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         self.vars.get_or_insert(&format!("?{}", v.name))
     }
 
+    /// Register a fresh anonymous blank-node variable in the shared `_:[]`
+    /// namespace, which cannot collide with a user-written blank-node label.
+    pub(super) fn fresh_blank_node_var(&mut self) -> VarId {
+        self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()))
+    }
+
     pub(super) fn lower_subject(&mut self, term: &SubjectTerm) -> Result<Ref> {
         match term {
             SubjectTerm::Var(v) => Ok(self.lower_var_ref(v)),
@@ -82,10 +88,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Ref::Var(var_id))
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Ref::Var(var_id))
-                }
+                BlankNodeValue::Anon => Ok(Ref::Var(self.fresh_blank_node_var())),
             },
             SubjectTerm::QuotedTriple(_qt) => {
                 // This path is reached when a quoted triple appears in a
@@ -141,10 +144,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Term::Var(var_id))
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Term::Var(var_id))
-                }
+                BlankNodeValue::Anon => Ok(Term::Var(self.fresh_blank_node_var())),
             },
             SparqlTerm::QuotedTriple(qt) => {
                 // Reified-triple objects are desugared by
@@ -229,7 +229,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Like [`Self::lower_literal`] but also returns the
     /// datatype/language constraint that pins the lexical value to a
     /// specific RDF datatype or language tag.
-    fn lower_literal_with_constraint(
+    pub(super) fn lower_literal_with_constraint(
         &mut self,
         lit: &Literal,
     ) -> Result<(Term, Option<DatatypeConstraint>)> {
@@ -418,6 +418,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 })?;
                 Ok(FlakeValue::Vector(arr.into()))
             }
+            // A WKT POINT is stored as a GeoPoint; a constant that stayed a
+            // string would match no stored point. Coerced as a write coerces.
+            fluree_vocab::geo::WKT_LITERAL => {
+                Ok(fluree_db_core::coerce::coerce_string_value(value, &dt_iri)
+                    .unwrap_or_else(|_| FlakeValue::String(value.to_string())))
+            }
             _ => {
                 // Default to string for unknown datatypes
                 Ok(FlakeValue::String(value.to_string()))
@@ -523,12 +529,54 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 "RDF 1.2 reified triples (`<< s p o >>`) as VALUES data",
                 qt.span,
             )),
-            // SPARQL 1.2 triple-term value as VALUES data: parse-accepted,
-            // lower-deferred (burn-down D-1).
-            SparqlTerm::TripleTerm(tt) => Err(LowerError::not_implemented(
-                "SPARQL 1.2 triple-term values (`<<( s p o )>>`) as VALUES data",
-                tt.span,
-            )),
+            SparqlTerm::TripleTerm(tt) => {
+                let node = |binding: Binding| match binding {
+                    Binding::Sid { sid, .. } => Ok(sid),
+                    _ => Err(LowerError::not_implemented(
+                        "a triple term in VALUES data whose subject is not an IRI",
+                        tt.span,
+                    )),
+                };
+                let s = match &tt.subject {
+                    SubjectTerm::Iri(iri) => {
+                        node(self.term_to_binding(&SparqlTerm::Iri(iri.clone()))?)?
+                    }
+                    _ => node(Binding::Unbound)?,
+                };
+                let p = match &tt.predicate {
+                    PredicateTerm::Iri(iri) => {
+                        node(self.term_to_binding(&SparqlTerm::Iri(iri.clone()))?)?
+                    }
+                    PredicateTerm::Var(_) => node(Binding::Unbound)?,
+                };
+                let (o, dt, lang) = match self.term_to_binding(&tt.object)? {
+                    Binding::Sid { sid, .. } => (
+                        FlakeValue::Ref(sid),
+                        fluree_db_core::edge::id_datatype_sid(),
+                        None,
+                    ),
+                    Binding::Lit { val, dtc, .. } => {
+                        let lang = dtc.lang_tag().map(str::to_string);
+                        (val, dtc.datatype().clone(), lang)
+                    }
+                    _ => {
+                        return Err(LowerError::not_implemented(
+                            "a triple term in VALUES data whose object is not a constant",
+                            tt.span,
+                        ))
+                    }
+                };
+                Ok(Binding::lit(
+                    FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                        s,
+                        p,
+                        o,
+                        dt,
+                        lang,
+                    })),
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                ))
+            }
         }
     }
 }

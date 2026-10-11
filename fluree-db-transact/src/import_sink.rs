@@ -24,6 +24,8 @@
 
 mod inner {
     use crate::commit_v2::StreamingCommitWriter;
+    use crate::datatype_limit::MAX_NON_RESERVED_DATATYPES;
+    use crate::error::TransactError;
     use crate::generate::{infer_datatype, DT_ID, DT_JSON};
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
     use crate::value_convert::{convert_native_literal, convert_string_literal};
@@ -33,12 +35,12 @@ mod inner {
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
     use fluree_db_core::DatatypeConstraint;
-    use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+    use fluree_db_core::{DatatypeDictId, Flake, FlakeMeta, FlakeValue, GraphId, Sid};
     use fluree_db_indexer::run_index::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
-    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -93,6 +95,10 @@ mod inner {
         pub vector_pool: Arc<SharedVectorArenaPool>,
         /// Shared namespace allocator (for prefix lookup).
         pub ns_alloc: Arc<SharedNamespaceAllocator>,
+        /// Decimal-encoding policy for the index this import builds. Must match
+        /// the version of the root written for the import (same source) so inline
+        /// decimals and the root format agree.
+        pub decimal_encoding: fluree_db_core::DecimalEncoding,
         /// Sticky: some record written through this config carried an RDF-list
         /// position. Set once per chunk at [`SpoolContext::finish`] /
         /// [`SpoolContext::finish_buffered`] from a plain per-chunk bool, so
@@ -115,6 +121,9 @@ mod inner {
         pub subjects: ChunkSubjectDict,
         /// Chunk-local string dictionary (chunk-local ID → string bytes).
         pub strings: ChunkStringDict,
+        /// Triple-term table: one pseudo-record per reified base edge, in
+        /// ordinal order (see [`SpoolContext::write_link_record`]).
+        pub terms: Vec<RunRecord>,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish_buffered`] —
@@ -131,6 +140,9 @@ mod inner {
         pub languages: rustc_hash::FxHashMap<String, u16>,
         /// Chunk index (for deterministic ordering in merge phase).
         pub chunk_idx: usize,
+        /// Triple-term table: one pseudo-record per reified base edge, in
+        /// ordinal order (see [`SpoolContext::write_link_record`]).
+        pub terms: Vec<RunRecord>,
     }
 
     /// Per-chunk context for writing spool records during parse (Phase B).
@@ -147,6 +159,13 @@ mod inner {
     pub struct SpoolContext {
         /// Buffered records (insertion-order, chunk-local IDs).
         records: Vec<RunRecord>,
+        /// Reified base edges as pseudo-records, indexed by the ordinal a
+        /// link record's `o_key` carries until the build interns them.
+        terms: Vec<RunRecord>,
+        /// Global predicate id of `rdf:reifies`, assigned on first link.
+        rdf_reifies_pid: Option<u32>,
+        /// Global datatype id of `f:tripleTerm`, assigned on first link.
+        triple_term_dt: Option<u16>,
         /// Path for writing spool file (used by `finish()` backward-compat path).
         spool_path: std::path::PathBuf,
         chunk_idx: usize,
@@ -170,6 +189,9 @@ mod inner {
         next_lang_id: u16,
         /// Graph ID for all records in this chunk (0 = default).
         g_id: GraphId,
+        /// Decimal-encoding policy (from `SpoolConfig`): under `InlineWhenFits`,
+        /// small exact decimals encode inline instead of via the numbig pool.
+        decimal_encoding: fluree_db_core::DecimalEncoding,
         /// Per-chunk mirror of `SpoolConfig::saw_list_meta` — a plain bool so
         /// `write_record` never touches the shared atomic. Folded in at
         /// finish.
@@ -191,6 +213,9 @@ mod inner {
         ) -> std::io::Result<Self> {
             Ok(Self {
                 records: Vec::new(),
+                terms: Vec::new(),
+                rdf_reifies_pid: None,
+                triple_term_dt: None,
                 spool_path: spool_path.into(),
                 chunk_idx,
                 subjects: ChunkSubjectDict::new(),
@@ -203,6 +228,7 @@ mod inner {
                 ns_alloc: Arc::clone(&config.ns_alloc),
                 ns_prefix_cache: FxHashMap::default(),
                 languages: FxHashMap::default(),
+                decimal_encoding: config.decimal_encoding,
                 next_lang_id: 1, // 0 = no language tag
                 g_id,
                 saw_list_meta: false,
@@ -231,6 +257,7 @@ mod inner {
                 spool_info,
                 subjects: self.subjects,
                 strings: self.strings,
+                terms: self.terms,
             })
         }
 
@@ -247,6 +274,7 @@ mod inner {
                 strings: self.strings,
                 languages: self.languages,
                 chunk_idx: self.chunk_idx,
+                terms: self.terms,
             }
         }
 
@@ -339,7 +367,10 @@ mod inner {
         }
 
         /// Assign a global datatype ID via `DictWorkerCache`.
-        fn assign_datatype_id(&mut self, sid: &Sid) -> u16 {
+        ///
+        /// Fails once the import holds more non-reserved datatypes than a
+        /// ledger can, so no record carries an ID the index cannot store.
+        fn assign_datatype_id(&mut self, sid: &Sid) -> Result<u16, CommitCodecError> {
             let code = sid.namespace_code;
             self.cache_prefix(code);
             let prefix = self
@@ -347,7 +378,18 @@ mod inner {
                 .get(&code)
                 .map(std::string::String::as_str)
                 .unwrap_or("");
-            self.datatypes.get_or_insert_parts(prefix, &sid.name) as u16
+            let id = self.datatypes.get_or_insert_parts(prefix, &sid.name);
+            DatatypeDictId::try_from_dict_id(id)
+                .map(DatatypeDictId::as_u16)
+                .ok_or_else(|| {
+                    let max = MAX_NON_RESERVED_DATATYPES;
+                    let limit = TransactError::DatatypeLimitExceeded {
+                        used: max,
+                        adding: 1,
+                        max,
+                    };
+                    CommitCodecError::InvalidOp(limit.to_string())
+                })
         }
 
         /// Assign a chunk-local string ID via `ChunkStringDict`.
@@ -445,6 +487,9 @@ mod inner {
                     (ObjKind::JSON_ID.as_u8(), ObjKey::encode_u32_id(id).as_u64())
                 }
                 FlakeValue::GeoPoint(bits) => (ObjKind::GEO_POINT.as_u8(), bits.0),
+                // Only the link path produces term objects, through the
+                // chunk's term table; a materialized term here has no encoding.
+                FlakeValue::TripleTerm(_) => return None,
                 FlakeValue::BigInt(bi) => {
                     use num_bigint::BigInt;
                     use std::convert::TryFrom;
@@ -462,14 +507,29 @@ mod inner {
                     }
                 }
                 FlakeValue::Decimal(dec) => {
-                    // Use shared numbig pool for global handle.
-                    let handle =
-                        self.numbig_pool
-                            .get_or_insert_bigdec(self.g_id, p_id, dec.as_ref());
-                    (
-                        ObjKind::NUM_BIG.as_u8(),
-                        ObjKey::encode_u32_id(handle).as_u64(),
-                    )
+                    // Under InlineWhenFits, a small exact decimal encodes inline —
+                    // no numbig-pool handle, avoiding the shared-pool insert on the
+                    // import hot path. Large/high-precision decimals (and every
+                    // decimal under ArenaOnly) fall back to the pool.
+                    let inline = self
+                        .decimal_encoding
+                        .inlines()
+                        .then(|| ObjKey::encode_decimal(dec.as_ref()))
+                        .flatten();
+                    match inline {
+                        Some(key) => (ObjKind::NUM_DEC.as_u8(), key.as_u64()),
+                        None => {
+                            let handle = self.numbig_pool.get_or_insert_bigdec(
+                                self.g_id,
+                                p_id,
+                                dec.as_ref(),
+                            );
+                            (
+                                ObjKind::NUM_BIG.as_u8(),
+                                ObjKey::encode_u32_id(handle).as_u64(),
+                            )
+                        }
+                    }
                 }
                 FlakeValue::Vector(v) => {
                     // Use shared vector pool for global handle.
@@ -488,7 +548,9 @@ mod inner {
         }
 
         /// Write a spool record for one flake.
-        fn write_record(&mut self, rec: FlakeRecord) {
+        ///
+        /// Fails if the flake's datatype would pass the datatype limit.
+        fn write_record(&mut self, rec: FlakeRecord) -> Result<(), CommitCodecError> {
             let FlakeRecord {
                 s,
                 p,
@@ -500,9 +562,9 @@ mod inner {
             } = rec;
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
-            let dt_id = self.assign_datatype_id(dt);
+            let dt_id = self.assign_datatype_id(dt)?;
             let Some((o_kind, o_key)) = self.resolve_object_value(o, p_id) else {
-                return; // skip spool record on unresolvable value (e.g. bad vector)
+                return Ok(()); // skip spool record on unresolvable value (e.g. bad vector)
             };
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
             let i = list_index
@@ -531,6 +593,123 @@ mod inner {
             };
 
             self.records.push(record);
+            Ok(())
+        }
+
+        /// Spool the RDF 1.2 link `ann rdf:reifies <<( s p o )>>`.
+        ///
+        /// The term becomes a pseudo-record in the chunk's term table,
+        /// resolved as the base triple's own record would be, except that a
+        /// decimal, big-integer or vector object holds the string id of its
+        /// canonical form. The link record's `o_key` is that entry's ordinal;
+        /// the build remaps the entry to global ids and interns it, replacing
+        /// the ordinal with the term handle.
+        fn write_link_record(
+            &mut self,
+            ann: &Sid,
+            term: &fluree_db_core::TripleTermValue,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
+            self.write_term_record(ann, None, term, t)
+        }
+
+        /// A term's term-table entry, written after its inner term's when it
+        /// nests one (whose ordinal is then its object): the entry's ordinal,
+        /// or `None` when its object has no spool encoding.
+        fn spool_term(
+            &mut self,
+            term: &fluree_db_core::TripleTermValue,
+            t: i64,
+        ) -> Result<Option<u64>, CommitCodecError> {
+            let s_id = self.assign_subject_id(&term.s);
+            let p_id = self.assign_predicate_id(&term.p);
+            let dt_id = self.assign_datatype_id(&term.dt)?;
+            // An arena handle names a value only within one graph and
+            // predicate; a term keys the object by its canonical form.
+            let resolved = if let FlakeValue::TripleTerm(inner) = &term.o {
+                self.spool_term(inner, t)?
+                    .map(|ordinal| (ObjKind::TRIPLE_TERM.as_u8(), ordinal))
+            } else if let Some((o_type, form)) =
+                fluree_db_core::triple_term::lexical_term_object(&term.o)
+            {
+                let o_kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
+                    ObjKind::VECTOR_ID
+                } else {
+                    ObjKind::NUM_BIG
+                };
+                let id = self.assign_string_id(&form);
+                Some((o_kind.as_u8(), ObjKey::encode_u32_id(id).as_u64()))
+            } else {
+                self.resolve_object_value(&term.o, p_id)
+            };
+            let Some((o_kind, o_key)) = resolved else {
+                return Ok(None);
+            };
+            let lang_id = term
+                .lang
+                .as_deref()
+                .map(|l| self.assign_lang_id(l))
+                .unwrap_or(0);
+            let ordinal = self.terms.len() as u64;
+            self.terms.push(RunRecord {
+                g_id: self.g_id,
+                s_id: SubjectId::from_u64(s_id),
+                p_id,
+                dt: dt_id,
+                o_kind,
+                op: 1,
+                o_key,
+                t: t as u32,
+                lang_id,
+                i: LIST_INDEX_NONE,
+            });
+            Ok(Some(ordinal))
+        }
+
+        /// Spool `s p <<( … )>>`: the term's components as a term-table
+        /// pseudo-record, and the statement with the term's ordinal as its
+        /// object. `p` is `rdf:reifies` when `None`.
+        fn write_term_record(
+            &mut self,
+            s: &Sid,
+            p: Option<&Sid>,
+            term: &fluree_db_core::TripleTermValue,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
+            let Some(ordinal) = self.spool_term(term, t)? else {
+                return Ok(());
+            };
+            let link_p = match (p, self.rdf_reifies_pid) {
+                (Some(p), _) => self.assign_predicate_id(p),
+                (None, Some(p)) => p,
+                (None, None) => {
+                    let p = self.assign_predicate_id(fluree_db_core::rdf_reifies_sid());
+                    self.rdf_reifies_pid = Some(p);
+                    p
+                }
+            };
+            let link_dt = match self.triple_term_dt {
+                Some(d) => d,
+                None => {
+                    let d = self.assign_datatype_id(fluree_db_core::triple_term_datatype_sid())?;
+                    self.triple_term_dt = Some(d);
+                    d
+                }
+            };
+            let stmt_s_id = self.assign_subject_id(s);
+            self.records.push(RunRecord {
+                g_id: self.g_id,
+                s_id: SubjectId::from_u64(stmt_s_id),
+                p_id: link_p,
+                dt: link_dt,
+                o_kind: ObjKind::TRIPLE_TERM.as_u8(),
+                op: 1,
+                o_key: ordinal,
+                t: t as u32,
+                lang_id: 0,
+                i: LIST_INDEX_NONE,
+            });
+            Ok(())
         }
 
         /// Allocate (or look up) the `g_id` for a named-graph IRI via the shared
@@ -553,11 +732,33 @@ mod inner {
         /// they enter the Tier-2 index (and the `named_graphs` routing) exactly
         /// like default-graph triples. Only invoked when an import contains named
         /// graphs — the single-graph hot path never touches this.
-        pub fn push_named_graph_record(&mut self, g_id: GraphId, rec: FlakeRecord) {
+        pub fn push_named_graph_record(
+            &mut self,
+            g_id: GraphId,
+            rec: FlakeRecord,
+        ) -> Result<(), CommitCodecError> {
             let saved = self.g_id;
             self.g_id = g_id;
-            self.write_record(rec);
+            let result = self.write_record(rec);
             self.g_id = saved;
+            result
+        }
+
+        /// Spool `s p <<( … )>>` in an explicit named graph (`g_id`); see
+        /// [`Self::write_term_record`].
+        pub fn push_named_graph_term(
+            &mut self,
+            g_id: GraphId,
+            s: &Sid,
+            p: Option<&Sid>,
+            term: &fluree_db_core::TripleTermValue,
+            t: i64,
+        ) -> Result<(), CommitCodecError> {
+            let saved = self.g_id;
+            self.g_id = g_id;
+            let result = self.write_term_record(s, p, term, t);
+            self.g_id = saved;
+            result
         }
     }
 
@@ -605,6 +806,17 @@ mod inner {
         prefix_map: HashMap<String, String>,
         /// Optional spool context for Tier 2 parallel pipeline.
         spool_ctx: Option<SpoolContext>,
+        /// Each reifier's `f:reifies*` slots seen so far, when its triple
+        /// arrives as slots (see [`Self::absorb_slot`]).
+        pending_links: HashMap<Sid, PendingLink>,
+    }
+
+    /// A reifier's slots, collected until all three are in.
+    #[derive(Default)]
+    struct PendingLink {
+        s: Option<Sid>,
+        p: Option<Sid>,
+        o: Option<(FlakeValue, DatatypeConstraint)>,
     }
 
     impl<'a> ImportSink<'a> {
@@ -635,6 +847,7 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                pending_links: HashMap::new(),
             })
         }
 
@@ -658,6 +871,7 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                pending_links: HashMap::new(),
             })
         }
 
@@ -749,6 +963,26 @@ mod inner {
             let Some((o, dtc)) = self.resolve_object(object) else {
                 return;
             };
+            if fluree_db_core::is_reserved_reifies_predicate(&p) {
+                self.absorb_slot(s, &p, o, dtc);
+                return;
+            }
+
+            // `rdf:reifies` names a triple term; the reified-triple forms
+            // arrive through `emit_reified_triple`, so an ordinary object
+            // here is a data error the link lowering would read as a
+            // reifier of nothing. Same rule as the transactional sink.
+            if fluree_db_core::is_rdf_reifies(&p) && !matches!(o, FlakeValue::TripleTerm(_)) {
+                if self.encode_error.is_none() {
+                    let msg = "'rdf:reifies' takes a triple term as its object; write the \
+                               reified-triple form (`<< s p o >>` or `~ <reifier>`) rather \
+                               than an ordinary object"
+                        .to_string();
+                    tracing::error!("ImportSink: {msg}");
+                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                }
+                return;
+            }
 
             let dt = dtc.datatype().clone();
             let lang = dtc.lang_tag().map(std::string::ToString::to_string);
@@ -787,7 +1021,13 @@ mod inner {
 
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
-                ctx.write_record(FlakeRecord {
+                if let FlakeValue::TripleTerm(term) = &o {
+                    if let Err(e) = ctx.write_term_record(&s, Some(&p), term, self.t) {
+                        self.encode_error.get_or_insert(e);
+                    }
+                    return;
+                }
+                let written = ctx.write_record(FlakeRecord {
                     s: &s,
                     p: &p,
                     o: &o,
@@ -796,6 +1036,73 @@ mod inner {
                     list_index,
                     t: self.t,
                 });
+                if let Err(e) = written {
+                    self.encode_error.get_or_insert(e);
+                }
+            }
+        }
+
+        /// The JSON-LD annotation lowering, and exports written before
+        /// links, describe a reified triple by its `f:reifies*` slots; a
+        /// reifier's slots become its `rdf:reifies` link once its subject,
+        /// predicate and object are in. The object slot carries the
+        /// triple's datatype and tag, so the other slots add nothing.
+        fn absorb_slot(&mut self, ann: Sid, slot: &Sid, o: FlakeValue, dtc: DatatypeConstraint) {
+            use fluree_vocab::db;
+            let entry = self.pending_links.entry(ann.clone()).or_default();
+            match (slot.name.as_ref(), o) {
+                (db::REIFIES_SUBJECT, FlakeValue::Ref(s)) => entry.s = Some(s),
+                (db::REIFIES_PREDICATE, FlakeValue::Ref(p)) => entry.p = Some(p),
+                (db::REIFIES_OBJECT, o) => entry.o = Some((o, dtc)),
+                _ => return,
+            }
+            if entry.s.is_none() || entry.p.is_none() || entry.o.is_none() {
+                return;
+            }
+            let Some(PendingLink {
+                s: Some(s),
+                p: Some(p),
+                o: Some((o, dtc)),
+            }) = self.pending_links.remove(&ann)
+            else {
+                unreachable!("all three slots checked above");
+            };
+            self.push_link(s, p, o, &dtc, &ann);
+        }
+
+        /// Write `ann rdf:reifies <<( s p o )>>` to the commit and the spool.
+        fn push_link(
+            &mut self,
+            s: Sid,
+            p: Sid,
+            o: FlakeValue,
+            dtc: &DatatypeConstraint,
+            ann: &Sid,
+        ) {
+            let link =
+                match crate::generate::flakes::reified_triple_link(None, s, p, o, dtc, ann, self.t)
+                {
+                    Ok(link) => link,
+                    Err(e) => {
+                        if self.encode_error.is_none() {
+                            let msg = format!("invariant violation in reified triple: {e}");
+                            tracing::error!("ImportSink: {msg}");
+                            self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                        }
+                        return;
+                    }
+                };
+            if let Err(e) = self.writer.push_flake(&link) {
+                if self.encode_error.is_none() {
+                    tracing::error!("ImportSink: link flake encode failed: {}", e);
+                    self.encode_error = Some(e);
+                }
+                return;
+            }
+            if let (Some(ctx), FlakeValue::TripleTerm(term)) = (&mut self.spool_ctx, &link.o) {
+                if let Err(e) = ctx.write_link_record(ann, term, self.t) {
+                    self.encode_error.get_or_insert(e);
+                }
             }
         }
     }
@@ -919,13 +1226,32 @@ mod inner {
             true
         }
 
-        /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
-        /// built by the shared
-        /// [`crate::generate::flakes::reified_triple_bundle`] (bit-identical
-        /// with the JSON-LD `@annotation` lowering and with `FlakeSink`'s
-        /// transactional path) and streamed through the commit writer (and
-        /// spool, when attached) exactly like ordinary triples. The base
-        /// triple has already been emitted by the parser via `emit_triple`.
+        fn supports_triple_terms(&self) -> bool {
+            true
+        }
+
+        fn term_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> Result<TermId, SinkError> {
+            let term = crate::flake_sink::triple_term_value(
+                self.resolve_sid(subject),
+                self.resolve_sid(predicate),
+                self.resolve_object(object),
+            )?;
+            Ok(self.add_term(ResolvedTerm::Literal {
+                value: term,
+                dtc: DatatypeConstraint::Explicit(
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                ),
+            }))
+        }
+
+        /// The reified triple's link, written to the commit and the spool
+        /// like any triple; the parser has already emitted the base triple
+        /// through `emit_triple`.
         fn emit_reified_triple(
             &mut self,
             subject: TermId,
@@ -946,39 +1272,7 @@ mod inner {
                 return Ok(());
             };
 
-            let bundle = match crate::generate::flakes::reified_triple_bundle(
-                None, s, p, o, &dtc, &ann, self.t,
-            ) {
-                Ok(bundle) => bundle,
-                Err(e) => {
-                    if self.encode_error.is_none() {
-                        let msg = format!("invariant violation in reifier bundle: {e}");
-                        tracing::error!("ImportSink: {msg}");
-                        self.encode_error = Some(CommitCodecError::InvalidOp(msg));
-                    }
-                    return Ok(());
-                }
-            };
-            for flake in bundle {
-                if let Err(e) = self.writer.push_flake(&flake) {
-                    if self.encode_error.is_none() {
-                        tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
-                        self.encode_error = Some(e);
-                    }
-                    return Ok(()); // Don't spool a flake that failed to encode
-                }
-                if let Some(ctx) = &mut self.spool_ctx {
-                    ctx.write_record(FlakeRecord {
-                        s: &flake.s,
-                        p: &flake.p,
-                        o: &flake.o,
-                        dt: &flake.dt,
-                        lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
-                        list_index: None,
-                        t: self.t,
-                    });
-                }
-            }
+            self.push_link(s, p, o, &dtc, &ann);
             Ok(())
         }
     }
@@ -1029,6 +1323,7 @@ mod inner {
                 numbig_pool: Arc::new(SharedNumBigPool::new()),
                 vector_pool: Arc::new(SharedVectorArenaPool::new()),
                 ns_alloc: Arc::new(SharedNamespaceAllocator::from_registry(ns)),
+                decimal_encoding: fluree_db_core::DecimalEncoding::InlineWhenFits,
                 saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
@@ -1052,6 +1347,52 @@ mod inner {
             // A user-range code allocated outside the shared allocator.
             let rogue = Sid::new(fluree_vocab::namespaces::USER_START, "name");
             let _ = ctx.assign_predicate_id(&rogue);
+        }
+
+        /// A record whose datatype would take an ID past `DatatypeDictId::MAX`
+        /// is refused, so no spooled record carries an ID the index cannot
+        /// store.
+        #[test]
+        fn spool_record_past_datatype_limit_is_refused() {
+            let ns = NamespaceRegistry::new();
+            let mut config = make_spool_config(&ns);
+            let mut full = PredicateDict::new();
+            for i in 0..DatatypeDictId::MAX {
+                full.get_or_insert(&format!("urn:dt:{i}"));
+            }
+            full.get_or_insert(fluree_vocab::xsd::STRING);
+            config.datatype_alloc = Arc::new(SharedDictAllocator::from_predicate_dict(&full));
+
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-datatype-limit-{}.spool",
+                std::process::id()
+            ));
+            let mut ctx = SpoolContext::new(&path, 0, 0, &config).unwrap();
+            let s = Sid::new(fluree_vocab::namespaces::RDF, "subject");
+            let p = Sid::new(fluree_vocab::namespaces::RDF, "pred");
+            let o = FlakeValue::String("v".to_string());
+            let rec = |dt| FlakeRecord {
+                s: &s,
+                p: &p,
+                o: &o,
+                dt,
+                lang: None,
+                list_index: None,
+                t: 1,
+            };
+
+            let known = Sid::new(fluree_vocab::namespaces::XSD, "string");
+            ctx.write_record(rec(&known))
+                .expect("a datatype the dictionary holds is accepted");
+            assert_eq!(ctx.records[0].dt, DatatypeDictId::MAX);
+
+            let new = Sid::new(fluree_vocab::namespaces::XSD, "int");
+            let err = ctx.write_record(rec(&new)).unwrap_err();
+            assert!(
+                err.to_string().contains("datatype limit exceeded"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(ctx.record_count(), 1, "the refused record is not spooled");
         }
 
         /// The sticky list-position bit is per-import, not per-chunk: a chunk
@@ -1084,7 +1425,7 @@ mod inner {
 
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-a.spool"), 0, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(None));
+            ctx.write_record(rec(None)).unwrap();
             let _ = ctx.finish_buffered();
             assert!(
                 !config.saw_list_meta.load(Ordering::Relaxed),
@@ -1093,7 +1434,7 @@ mod inner {
 
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-b.spool"), 1, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(Some(0)));
+            ctx.write_record(rec(Some(0))).unwrap();
             let _ = ctx.finish_buffered();
             assert!(
                 config.saw_list_meta.load(Ordering::Relaxed),
@@ -1103,7 +1444,7 @@ mod inner {
             // Sticky: a later list-free chunk must not clear it.
             let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-c.spool"), 2, 0, &config)
                 .expect("spool ctx");
-            ctx.write_record(rec(None));
+            ctx.write_record(rec(None)).unwrap();
             let _ = ctx.finish_buffered();
             assert!(config.saw_list_meta.load(Ordering::Relaxed));
         }
@@ -1195,13 +1536,10 @@ mod inner {
         }
 
         #[test]
-        fn test_reified_triple_streams_jsonld_compatible_bundle() {
-            // The import path must write the SAME bundle shape as the
-            // transactional FlakeSink / JSON-LD lowering: base triple +
-            // S/P/O bundle, no f:reifiesDatatype, decodable to the base
-            // edge's EdgeKey.
-            use fluree_db_core::edge::EdgeKey;
-            use fluree_db_core::namespaces::is_reifies_datatype;
+        fn test_reified_triple_streams_its_link() {
+            // Import writes the same record as the transactional FlakeSink:
+            // the base triple plus `r rdf:reifies <<( s p o )>>`.
+            use fluree_db_core::FlakeValue;
 
             let mut ns = NamespaceRegistry::new();
             let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
@@ -1214,19 +1552,22 @@ mod inner {
             sink.emit_reified_triple(s, p, o, r).unwrap();
 
             let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
-            assert_eq!(writer.op_count(), 4, "base + 3 bundle flakes");
+            assert_eq!(writer.op_count(), 2, "base + link");
 
             let result = writer.finish(&make_envelope(1)).unwrap();
             let decoded = read_commit(&result.bytes).unwrap();
-            assert_eq!(decoded.flakes.len(), 4);
-            let base = &decoded.flakes[0];
-            let bundle = &decoded.flakes[1..];
-            assert!(
-                !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
-                "import bundle must omit f:reifiesDatatype: {bundle:?}"
+            let [base, link] = decoded.flakes.as_slice() else {
+                panic!("expected base + link: {:?}", decoded.flakes);
+            };
+            assert!(fluree_db_core::is_rdf_reifies(&link.p));
+            let FlakeValue::TripleTerm(term) = &link.o else {
+                panic!("link object is not a triple term: {link:?}");
+            };
+            assert_eq!(
+                (&term.s, &term.p, &term.o),
+                (&base.s, &base.p, &base.o),
+                "the link names the base edge"
             );
-            let key = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
-            assert_eq!(key, EdgeKey::from_flake(base));
         }
 
         #[test]

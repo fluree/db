@@ -29,7 +29,8 @@ fluree branch drop experiment
 
 - **Branches are isolated** — Transactions on one branch are invisible to others
 - **Branches are cheap** — Creating a branch doesn't copy data; it creates a new commit pointer
-- **Merge takes two shapes** — If the target hasn't advanced since the fork, the merge fast-forwards and the source's commits become the target's line. If it has, the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
+- **Merge takes two shapes** — If the target's head is on the source's line of commits, the merge fast-forwards and the source's commits become the target's line. Otherwise the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
+- **Merge runs in any direction.** A branch merges into the one it came from, into one created from it, or into a branch that shares an earlier commit. Use `--target` to name where the changes go
 - **Source branch survives merge** — After merging, the branch can continue receiving transactions
 
 ## Patterns
@@ -217,7 +218,7 @@ Each branch numbers its transactions on its own clock, starting from the point w
 
 ### Branch at a historical point
 
-By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier commit on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
+By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier point on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
 
 ```bash
 # Start a branch at transaction 5 on main
@@ -225,11 +226,16 @@ fluree branch create rewind --at t:5
 
 # Or use a hex-digest prefix of the commit
 fluree branch create rewind --at 3dd028a7
+
+# Or start from the data as of a point in time
+fluree branch create q2-close --at time:2026-06-30T23:59:59Z
 ```
+
+`--at` takes the same spellings as `fluree query --at`, and the branch starts at the commit a query at that point would read: `time:` (alias `iso:`) resolves against commit event time, `recorded:` against the wall-clock time commits were recorded, and `latest` is the HEAD. A time before the source's first commit is rejected.
 
 The commit must be reachable from the source branch's HEAD (branching from an unrelated branch's commit is rejected). The new branch starts with no index and replays from genesis on first query — acceptable for small/medium histories; if replay cost matters, transact a small no-op to force an index rebuild.
 
-Full CIDs are also accepted (`--at fluree:commit:sha256:...`) and resolve without requiring the source to be indexed; `t:N` and hex prefixes require an indexed source.
+Full CIDs are also accepted (`--at fluree:commit:sha256:...`).
 
 ## Branch lifecycle
 
@@ -256,6 +262,11 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
 curl -X POST http://localhost:8090/v1/fluree/branch \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
+
+# Branch from the data as of a point in time
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "q2-close", "at": "time:2026-06-30T23:59:59Z"}'
 
 # Query a specific branch
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \

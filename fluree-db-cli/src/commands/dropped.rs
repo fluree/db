@@ -83,7 +83,7 @@ impl Target {
                 });
             }
         }
-        Ok(Target::Local(Box::new(context::build_fluree(dirs)?)))
+        Ok(Target::Local(Box::new(context::build_fluree(dirs).await?)))
     }
 
     async fn finish(&self, dirs: &FlureeDir) {

@@ -266,7 +266,6 @@ fn rewrite_single_pattern(
         | Pattern::Graph { .. }
         | Pattern::Service(_)
         | Pattern::EdgeAnnotation { .. }
-        | Pattern::AnnotationTarget { .. }
         | Pattern::DefaultGraphSource { .. } => {
             rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
                 rewrite_patterns_internal(&xs, hierarchy, ctx, diag, total_expansions)
@@ -279,6 +278,7 @@ fn rewrite_single_pattern(
         | Pattern::Unwind { .. }
         | Pattern::Values { .. }
         | Pattern::PropertyPath(_)
+        | Pattern::TermComponents(_)
         | Pattern::ShortestPath(_)
         | Pattern::Subquery(_)
         | Pattern::IndexSearch(_)

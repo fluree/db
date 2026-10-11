@@ -24,12 +24,12 @@ fluree insert [LEDGER] [DATA] [OPTIONS]
 | `-e, --expr <EXPR>` | Inline data expression (alternative to positional) |
 | `-f, --file <FILE>` | Read data from a file |
 | `-m, --message <MSG>` | Commit message |
-| `--format <FORMAT>` | Data format: `turtle` or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples), `trig` or `jsonld` (auto-detected if omitted) |
 | `--remote <NAME>` | Execute against a remote server (by remote name, e.g., `origin`) |
 
 ## Description
 
-Inserts RDF data into a ledger. Supports both Turtle and JSON-LD formats. Data can come from:
+Inserts RDF data into a ledger. Supports Turtle, TriG and JSON-LD. TriG `GRAPH <iri> { ... }` blocks (and the compact `<iri> { ... }` form) land in their named graphs, and a `GRAPH <#txn-meta> { ... }` block becomes commit metadata. Data can come from:
 - A positional argument (inline data)
 - `-e` flag (inline expression)
 - `-f` flag (file)
@@ -47,6 +47,9 @@ fluree insert '{"@id": "ex:bob", "ex:name": "Bob"}'
 
 # Insert from file
 fluree insert -f data.ttl
+
+# Insert a TriG file: its graph blocks land in their named graphs
+fluree insert -f dataset.trig
 
 # Insert with commit message
 fluree insert -f data.ttl -m "Added initial users"
@@ -72,13 +75,15 @@ Commit ID: bafybeig...
 
 ## Data Format Detection
 
-The format is auto-detected:
-- `@prefix` or `@base` at line start → Turtle
-- Starts with `{` or `[` → JSON-LD
-- `.ttl` or `.nt` file extension → Turtle (N-Triples is parsed as Turtle)
-- `.json` or `.jsonld` extension → JSON-LD
+The format comes from `--format` when given, then from the file extension, then from the content:
+- `.ttl` or `.nt` → Turtle (N-Triples is a subset of Turtle and uses the same parser)
+- `.trig` → TriG
+- `.json` or `.jsonld` → JSON-LD
+- No extension, or inline or piped data: content that parses as JSON is JSON-LD, and anything else is Turtle
 
-Override with `--format turtle` or `--format jsonld`.
+Turtle input that turns out to contain graph blocks is read as TriG, so a TriG body needs no flag. Override detection with `--format turtle` (or `ttl`, or `nt`), `--format trig` or `--format jsonld`.
+
+N-Quads (`.nq`) is not read by `insert`; import it into a new ledger with `fluree create <ledger> --from <file>.nq`.
 
 ## See Also
 

@@ -83,6 +83,20 @@ fluree query '{
 }'
 ```
 
+The same search in SPARQL:
+
+```bash
+fluree query '
+PREFIX ex: <http://example.org/>
+SELECT ?title ?score WHERE {
+  ?doc a ex:Article ; ex:body ?body ; ex:title ?title .
+  BIND(fulltext(?body, "graph database relationships") AS ?score)
+  FILTER(?score > 0)
+}
+ORDER BY DESC(?score)
+LIMIT 10'
+```
+
 The `fulltext()` function returns a BM25 relevance score. Higher scores mean better matches. Documents with none of the search terms score 0.
 
 ### 3. Combine search with graph filters
@@ -156,14 +170,13 @@ Count matches by category:
 ```bash
 fluree query '{
   "@context": {"ex": "http://example.org/"},
-  "select": ["?category", "?count"],
+  "select": ["?category", "(as (count ?doc) ?count)"],
   "where": [
     {"@id": "?doc", "ex:body": "?body", "ex:category": "?category"},
     ["bind", "?score", "(fulltext ?body \"database\")"],
     ["filter", "(> ?score 0)"]
   ],
-  "groupBy": "?category",
-  "aggregate": {"?count": ["count", "?doc"]}
+  "groupBy": "?category"
 }'
 ```
 
@@ -203,20 +216,36 @@ Vectors are stored as f32. Values are quantized at ingest time.
 
 ### 2. Find similar items
 
-Use `cosineSimilarity` (or `dotProduct`, `euclideanDistance`) to rank by similarity:
+Use `cosineSimilarity` (or `dotProduct`, `euclideanDistance`) to rank by similarity. The query vector is bound with `values`:
 
 ```bash
 fluree query '{
-  "@context": {"ex": "http://example.org/"},
+  "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+  "values": [["?q"], [{"@value": [0.80, 0.14, 0.90, 0.25], "@type": "f:embeddingVector"}]],
   "select": ["?name", "?sim"],
   "where": [
     {"@id": "?product", "@type": "ex:Product", "ex:name": "?name", "ex:embedding": "?vec"},
-    ["bind", "?sim", "(cosineSimilarity ?vec [0.80, 0.14, 0.90, 0.25])"],
+    ["bind", "?sim", "(cosineSimilarity ?vec ?q)"],
     ["filter", "(> ?sim 0.9)"]
   ],
   "orderBy": [["desc", "?sim"]],
   "limit": 5
 }'
+```
+
+The same search in SPARQL:
+
+```bash
+fluree query '
+PREFIX ex: <http://example.org/>
+PREFIX f:  <https://ns.flur.ee/db#>
+SELECT ?name ?sim WHERE {
+  ?product a ex:Product ; ex:name ?name ; ex:embedding ?vec .
+  BIND(cosineSimilarity(?vec, "[0.80, 0.14, 0.90, 0.25]"^^f:embeddingVector) AS ?sim)
+  FILTER(?sim > 0.9)
+}
+ORDER BY DESC(?sim)
+LIMIT 5'
 ```
 
 ### 3. Combine vector search with graph patterns
@@ -225,7 +254,8 @@ Find products similar to a query vector, but only in a specific category:
 
 ```bash
 fluree query '{
-  "@context": {"ex": "http://example.org/"},
+  "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+  "values": [["?q"], [{"@value": [0.80, 0.14, 0.90, 0.25], "@type": "f:embeddingVector"}]],
   "select": ["?name", "?sim"],
   "where": [
     {
@@ -233,7 +263,7 @@ fluree query '{
       "ex:name": "?name", "ex:embedding": "?vec",
       "ex:category": "electronics"
     },
-    ["bind", "?sim", "(cosineSimilarity ?vec [0.80, 0.14, 0.90, 0.25])"]
+    ["bind", "?sim", "(cosineSimilarity ?vec ?q)"]
   ],
   "orderBy": [["desc", "?sim"]],
   "limit": 10
@@ -246,7 +276,8 @@ Combine BM25 keyword relevance with vector semantic similarity for the best of b
 
 ```bash
 fluree query '{
-  "@context": {"ex": "http://example.org/"},
+  "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+  "values": [["?q"], [{"@value": [0.80, 0.14, 0.90, 0.25], "@type": "f:embeddingVector"}]],
   "select": ["?name", "?hybrid"],
   "where": [
     {
@@ -254,7 +285,7 @@ fluree query '{
       "ex:description": "?desc", "ex:embedding": "?vec"
     },
     ["bind", "?textScore", "(fulltext ?desc \"wireless audio\")"],
-    ["bind", "?vecScore", "(cosineSimilarity ?vec [0.80, 0.14, 0.90, 0.25])"],
+    ["bind", "?vecScore", "(cosineSimilarity ?vec ?q)"],
     ["bind", "?hybrid", "(+ (* ?textScore 0.4) (* ?vecScore 0.6))"],
     ["filter", "(> ?hybrid 0)"]
   ],

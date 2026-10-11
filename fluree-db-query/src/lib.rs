@@ -15,7 +15,6 @@
 
 pub mod aggregate;
 pub(crate) mod aggregate_complement_fold;
-pub mod annotation_edge_probe;
 pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
@@ -105,6 +104,7 @@ pub(crate) mod stats_cache;
 pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
+pub mod term_components;
 pub mod union;
 pub mod unwind;
 pub mod values;
@@ -114,7 +114,7 @@ pub mod vector;
 // Re-exports
 pub use aggregate::AggregateOperator;
 pub use binary_history::BinaryHistoryScanOperator;
-pub use binary_range::BinaryRangeProvider;
+pub use binary_range::{BinaryRangeProvider, IndexAttachments};
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;
 pub use binding::{
@@ -126,8 +126,9 @@ pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
 pub use execute::{
-    build_operator_tree, execute, expand_edge_annotation_patterns, fast_paths_disabled,
-    run_operator, set_fast_paths_disabled, ContextConfig, ExecutableQuery,
+    build_operator_tree, execute, expand_edge_annotation_patterns,
+    expand_edge_annotation_patterns_for, fast_paths_disabled, run_operator,
+    set_fast_paths_disabled, ContextConfig, ExecutableQuery,
 };
 pub use exists::ExistsOperator;
 pub use explain::{
@@ -265,13 +266,20 @@ struct WhereCursorOperator<'a> {
 impl WhereCursor<'_> {
     /// Pull the next result batch. Returns `Ok(None)` when the operator is
     /// exhausted; further calls continue to return `Ok(None)`.
+    ///
+    /// A nested subquery is planned when it is first pulled, so its plan
+    /// errors surface here; like the open errors, they name their variables.
     pub async fn next_batch(&mut self) -> Result<Option<Batch>> {
         match &mut self.inner {
             CursorInner::Operator(state) => {
                 if state.closed {
                     return Ok(None);
                 }
-                let result = state.operator.next_batch(&state.ctx).await?;
+                let result = state
+                    .operator
+                    .next_batch(&state.ctx)
+                    .await
+                    .map_err(|e| e.name_variables(state.ctx.vars))?;
                 if result.is_none() {
                     state.operator.close();
                     state.closed = true;
@@ -381,8 +389,12 @@ pub async fn execute_where_streaming<'a>(
     let planning = temporal_mode::PlanningContext::current()
         .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2))
         .with_unmatched_optional(unmatched_optional);
-    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)?;
-    operator.open(&ctx).await?;
+    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)
+        .map_err(|e| e.name_variables(vars))?;
+    operator
+        .open(&ctx)
+        .await
+        .map_err(|e| e.name_variables(vars))?;
     Ok(WhereCursor {
         inner: CursorInner::Operator(Box::new(WhereCursorOperator {
             operator,

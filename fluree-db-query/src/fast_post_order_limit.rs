@@ -19,9 +19,9 @@
 //! (`index_t`). Querying *before* the index point needs the history sidecar and
 //! defers to the generic pipeline. They split on whether novelty is present:
 //!
-//! - **Base lane** (`epoch == 0`): the persisted index is exact, so a plain
+//! - **Base lane** (no live novelty): the persisted index is exact, so a plain
 //!   reverse leaf-walk suffices.
-//! - **Overlay lane** (`epoch != 0`): the same reverse leaf-walk is merged with
+//! - **Overlay lane** (live novelty): the same reverse leaf-walk is merged with
 //!   the predicate's resolved novelty ops. This is a *row-set* merge (skip base
 //!   rows retracted by overlay; add overlay asserts; dedup by fact identity), so
 //!   it sidesteps the "base + asserts − retracts" arithmetic pitfall that only
@@ -139,11 +139,7 @@ pub fn post_order_desc_limit_operator(
             if ctx.to_t < store.max_t() {
                 return Ok(None);
             }
-            let overlay_present = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let overlay_present = crate::fast_path_common::overlay_has_novelty(ctx);
 
             let g_id: GraphId = ctx.binary_g_id;
             let need = offset.saturating_add(limit);

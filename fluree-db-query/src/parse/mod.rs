@@ -253,12 +253,25 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
-        // LIMIT 1 for efficiency — only need to know if any solution exists
-        query.options.limit = Some(1);
+        // `groupBy` / `having` group the level, which changes the answer: `ask`
+        // is then true when some group passes `having` (a `having` that rejects
+        // every group is false), as in SPARQL ASK.
+        let (having, having_aggregates) =
+            options::parse_having_with_aggregates(obj, filter_data::parse_filter_expr)?;
+        query.options.group_by = options::parse_group_by(obj)?;
+        query.options.having = having;
+        query.options.aggregates = having_aggregates;
+        parse_top_level_values(obj, &ctx, &mut query)?;
+        where_clause::resolve_atoms_outside_where(&mut query, &ctx);
+        // `ask` is true when a solution remains after `offset` and `limit`
+        // (`limit: 0` is false); one is enough, so the limit is at most 1.
+        query.options.offset = options::parse_offset(obj)?;
+        query.options.limit = Some(options::parse_limit(obj)?.map_or(1, |limit| limit.min(1)));
         // ASK returns before `parse_options` runs, so opts that the
         // executor cares about have to be parsed inline. Currently
         // just `includeSystemFacts`; extend here as more land.
         query.options.include_system_facts = options::parse_include_system_facts(obj);
+        query.options.union_default_graph = options::parse_union_default_graph(obj)?;
         return Ok((query, SelectMode::Ask));
     }
 
@@ -304,14 +317,7 @@ fn parse_query_ast_internal(
         }
     }
 
-    // Parse top-level VALUES (optional) - mirrors the `:values` initial solution seed.
-    if let Some(values_val) = obj.get("values") {
-        if !values_val.is_null() {
-            let values_pat = values::parse_values_clause(values_val, &ctx)?;
-            // Place VALUES first so it seeds the pipeline before WHERE patterns.
-            query.patterns.insert(0, values_pat);
-        }
-    }
+    parse_top_level_values(obj, &ctx, &mut query)?;
 
     // Parse where clause.
     //
@@ -543,11 +549,19 @@ fn parse_construct_query(
     // Parse template into patterns
     let template_patterns = match construct_val {
         JsonValue::Bool(true) => {
-            // Shorthand: use WHERE patterns as template (filter to triples only)
+            // Shorthand: use the WHERE clause's triples (and their edge
+            // annotations) as the template
             query
                 .patterns
                 .iter()
-                .filter(|p| matches!(p, UnresolvedPattern::Triple(_)))
+                .filter(|p| {
+                    matches!(
+                        p,
+                        UnresolvedPattern::Triple(_)
+                            | UnresolvedPattern::EdgeAnnotation { .. }
+                            | UnresolvedPattern::TripleTermValue { .. }
+                    )
+                })
                 .cloned()
                 .collect()
         }
@@ -569,6 +583,8 @@ fn parse_construct_query(
 
     query.construct_template = Some(ast::UnresolvedConstructTemplate::new(template_patterns));
 
+    parse_top_level_values(obj, ctx, &mut query)?;
+
     // Parse query options (limit, offset, orderBy, etc.)
     // Note: groupBy with CONSTRUCT will error at format time (Binding::Grouped unsupported)
     query.options = options::parse_options(obj, filter_data::parse_filter_expr)?;
@@ -576,68 +592,103 @@ fn parse_construct_query(
     Ok((query, SelectMode::Construct))
 }
 
+/// Parse a query's top-level `values` (optional), the initial solution seed
+/// (mirrors `:values`), for every query form: `select`, `ask` and `construct`.
+fn parse_top_level_values(
+    obj: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+) -> Result<()> {
+    if let Some(values_val) = obj.get("values") {
+        if !values_val.is_null() {
+            let values_pat = values::parse_values_clause(values_val, ctx)?;
+            // Place VALUES first so it seeds the pipeline before WHERE patterns.
+            query.patterns.insert(0, values_pat);
+        }
+    }
+    Ok(())
+}
+
 /// Parse a CONSTRUCT template (explicit form)
 ///
-/// Parses the template node-map(s) into unresolved triple patterns.
-/// Only triple patterns are valid in templates (filters/optionals are ignored).
+/// Parses the template node-map(s) into unresolved triple patterns, edge
+/// annotations (`@annotation` on an object) and named-graph blocks
+/// (`["graph", "<iri or ?var>", node-map, ...]`, the `where` clause's form).
+/// Other patterns (filters, optionals) are ignored.
 fn parse_construct_template(
     template: &JsonValue,
     ctx: &JsonLdParseCtx,
 ) -> Result<Vec<UnresolvedPattern>> {
     let mut subject_counter = 0u32;
     let mut nested_counter = 0u32;
-
     match template {
-        JsonValue::Object(map) => {
-            // Single node-map template
-            let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
-            node_map::parse_node_map(
-                map,
-                ctx,
-                &mut temp_query,
-                &mut subject_counter,
-                &mut nested_counter,
-                true,
-            )?;
-            // Filter to triple patterns only (templates don't have filters/optionals)
-            Ok(temp_query
-                .patterns
-                .into_iter()
-                .filter(|p| matches!(p, UnresolvedPattern::Triple(_)))
-                .collect())
-        }
-        JsonValue::Array(arr) => {
-            // Array of node-map templates
-            let mut patterns = Vec::new();
-            for item in arr {
-                if let JsonValue::Object(map) = item {
-                    let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
-                    node_map::parse_node_map(
-                        map,
-                        ctx,
-                        &mut temp_query,
-                        &mut subject_counter,
-                        &mut nested_counter,
-                        true,
-                    )?;
-                    patterns.extend(
-                        temp_query
-                            .patterns
-                            .into_iter()
-                            .filter(|p| matches!(p, UnresolvedPattern::Triple(_))),
-                    );
-                } else {
-                    return Err(ParseError::InvalidConstruct(
-                        "construct array items must be objects".to_string(),
-                    ));
-                }
-            }
-            Ok(patterns)
+        JsonValue::Object(_) => parse_construct_items(
+            std::slice::from_ref(template),
+            ctx,
+            &mut subject_counter,
+            &mut nested_counter,
+        ),
+        JsonValue::Array(items) => {
+            parse_construct_items(items, ctx, &mut subject_counter, &mut nested_counter)
         }
         _ => Err(ParseError::InvalidConstruct(
             "construct template must be an object or array".to_string(),
         )),
     }
+}
+
+fn parse_construct_items(
+    items: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<Vec<UnresolvedPattern>> {
+    let mut patterns = Vec::new();
+    for item in items {
+        match item {
+            JsonValue::Object(map) => {
+                let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
+                node_map::parse_node_map(
+                    map,
+                    ctx,
+                    &mut temp_query,
+                    subject_counter,
+                    nested_counter,
+                    true,
+                )?;
+                patterns.extend(temp_query.patterns.into_iter().filter(|p| {
+                    matches!(
+                        p,
+                        UnresolvedPattern::Triple(_)
+                            | UnresolvedPattern::EdgeAnnotation { .. }
+                            | UnresolvedPattern::TripleTermValue { .. }
+                    )
+                }));
+            }
+            JsonValue::Array(arr) if arr.first().and_then(JsonValue::as_str) == Some("graph") => {
+                let name = arr.get(1).and_then(JsonValue::as_str).ok_or_else(|| {
+                    ParseError::InvalidConstruct(
+                        "a construct graph block is [\"graph\", <graph IRI or ?var>, node-map, ...]"
+                            .to_string(),
+                    )
+                })?;
+                let name = if name.starts_with('?') {
+                    name.to_string()
+                } else {
+                    ctx.expand_id(name)?.0
+                };
+                let inner = parse_construct_items(&arr[2..], ctx, subject_counter, nested_counter)?;
+                patterns.push(UnresolvedPattern::graph(name.as_str(), inner));
+            }
+            _ => {
+                return Err(ParseError::InvalidConstruct(
+                    "construct items must be node-map objects or [\"graph\", ...] blocks"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(patterns)
 }
 
 /// Parse the select clause
@@ -825,7 +876,7 @@ fn parse_select_string(
         // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
         // `aggregates` with a synthetic output var and the call is rewritten
         // to reference that var; the surrounding expression then lowers as a
-        // post-aggregation bind via `lower_select_expr_bind`.
+        // post-aggregation bind (`lower::lower_select_computations`).
         let mut inner_tok = list[1].clone();
         hoist_inline_aggregates(&mut inner_tok, aggregates)?;
         let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;
@@ -1441,7 +1492,14 @@ pub fn parse_query<E: IriEncoder>(
     strict_override: Option<bool>,
 ) -> Result<Query> {
     let (ast, select_mode) = parse_query_ast(json, strict_override)?;
-    lower_query(ast, encoder, vars, select_mode)
+    let mut query = lower_query(ast, encoder, vars, select_mode)?;
+    // The JSON-LD query surface projects a variable its grouping does not
+    // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
+    // Only the top-level output may: a subquery's projection cannot carry it.
+    query
+        .output
+        .set_ungrouped_projection(crate::ir::UngroupedProjection::PerGroupList);
+    Ok(query)
 }
 
 /// Parse a filter expression value and lower it to a Expression.
@@ -3660,16 +3718,14 @@ mod tests {
         let encoder = encode::MemoryEncoder::with_common_namespaces();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         // One aggregate, one post-aggregation BIND.
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 1);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
+        assert_eq!(binds[0].0, adjusted_var);
     }
 
     #[test]
@@ -3817,18 +3873,16 @@ mod tests {
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
         // One aggregate, two post-aggregation BINDs (in select order).
-        let agg = query
-            .grouping
-            .as_ref()
-            .and_then(|g| g.aggregation())
-            .expect("aggregation phase present");
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
         assert_eq!(agg.aggregates.len(), 1);
-        assert_eq!(agg.binds.len(), 2);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 2);
 
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         let again_var = vars.get("?again").expect("?again registered");
-        assert_eq!(agg.binds[0].0, adjusted_var);
-        assert_eq!(agg.binds[1].0, again_var);
+        assert_eq!(binds[0].0, adjusted_var);
+        assert_eq!(binds[1].0, again_var);
 
         // No leaked Pattern::Bind for these — they must NOT have been
         // pre-aggregation.
@@ -4274,7 +4328,13 @@ mod tests {
                 assert!(
                     matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor")
                 );
-                assert!(matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"));
+                assert!(matches!(
+                    &edge.o,
+                    crate::parse::ast::UnresolvedTermObject::Value {
+                        o: UnresolvedTerm::Var(v),
+                        ..
+                    } if v.as_ref() == "?org"
+                ));
                 // Body: 2 facts about the annotation (ex:role, ex:since).
                 assert_eq!(body.len(), 2, "body should have ex:role + ex:since");
             }

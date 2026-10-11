@@ -972,7 +972,8 @@ impl TryFrom<&FlakeValue> for ComparableValue {
             | FlakeValue::GMonthDay(_)
             | FlakeValue::YearMonthDuration(_)
             | FlakeValue::DayTimeDuration(_)
-            | FlakeValue::Duration(_) => Ok(ComparableValue::TypedLiteral {
+            | FlakeValue::Duration(_)
+            | FlakeValue::TripleTerm(_) => Ok(ComparableValue::TypedLiteral {
                 val: val.clone(),
                 dtc: None,
             }),
@@ -1006,7 +1007,8 @@ impl TryFrom<FlakeValue> for ComparableValue {
             | FlakeValue::GMonthDay(_)
             | FlakeValue::YearMonthDuration(_)
             | FlakeValue::DayTimeDuration(_)
-            | FlakeValue::Duration(_)) => Ok(ComparableValue::TypedLiteral { val, dtc: None }),
+            | FlakeValue::Duration(_)
+            | FlakeValue::TripleTerm(_)) => Ok(ComparableValue::TypedLiteral { val, dtc: None }),
         }
     }
 }

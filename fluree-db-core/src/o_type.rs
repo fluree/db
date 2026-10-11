@@ -128,7 +128,15 @@ impl OType {
     /// Blank node (`_:b{id}`) — `o_key` is the atomic bnode integer.
     pub const BLANK_NODE: Self = Self(0x001F);
 
-    // Tag `00` payload range 0x0020–0x3FFF reserved for future embedded types.
+    /// `xsd:decimal` stored **inline** as an exact, order-preserving base-10
+    /// float key (see [`ObjKey::encode_decimal`]) — canonical *and* value-ordered.
+    /// Distinct from the lossy f64 [`XSD_DECIMAL`](Self::XSD_DECIMAL) lane: this
+    /// carries the exact value with no arena handle. Only written by new-format
+    /// index roots; large/high-precision decimals still fall back to the NumBig
+    /// arena ([`NUM_BIG_OVERFLOW`](Self::NUM_BIG_OVERFLOW)).
+    pub const XSD_DECIMAL_INLINE: Self = Self(0x0020);
+
+    // Tag `00` payload range 0x0021–0x3FFF reserved for future embedded types.
 
     // ── Tag `10` — Fluree-reserved dictionary/arena-backed ─────────────
 
@@ -158,8 +166,11 @@ impl OType {
     pub const NUM_BIG_OVERFLOW: Self = Self(0x800B);
     /// Spatial (complex geometry) — `o_key` is a spatial arena handle.
     pub const SPATIAL_COMPLEX: Self = Self(0x800C);
+    /// RDF 1.2 triple term — `o_key` is a triple-term dictionary handle
+    /// (`(inner p_id << 32) | seq`, see `fluree_db_core::triple_term`).
+    pub const TRIPLE_TERM: Self = Self(0x800D);
 
-    // Tag `10` payload range 0x800D–0xBFFF reserved for future Fluree domains.
+    // Tag `10` payload range 0x800E–0xBFFF reserved for future Fluree domains.
 
     // ── Tag `11` — rdf:langString ──────────────────────────────────────
 
@@ -188,10 +199,13 @@ impl OType {
         (self.0 >> 14) as u8
     }
 
+    /// Largest value the 14-bit payload (bits 13:0) can hold.
+    pub const MAX_PAYLOAD: u16 = 0x3FFF;
+
     /// 14-bit payload (bits 13:0).
     #[inline]
     pub const fn payload(self) -> u16 {
-        self.0 & 0x3FFF
+        self.0 & Self::MAX_PAYLOAD
     }
 
     /// Whether `(o_type, o_key)` identifies an object term **graph-wide**.
@@ -255,9 +269,16 @@ impl OType {
     }
 
     /// Construct a customer-defined datatype OType from a payload.
+    ///
+    /// Panics if `payload` exceeds [`Self::MAX_PAYLOAD`]. A larger payload
+    /// would spill into the tag bits and silently become a different type.
+    /// Callers bound it through [`crate::ids::DatatypeDictId::MAX`].
     #[inline]
     pub const fn customer_datatype(payload: u16) -> Self {
-        debug_assert!(payload < 0x4000, "customer payload exceeds 14-bit range");
+        assert!(
+            payload <= Self::MAX_PAYLOAD,
+            "customer payload exceeds 14-bit range"
+        );
         Self(0x4000 | payload)
     }
 
@@ -326,10 +347,10 @@ impl OType {
         self.0 >= Self::XSD_DOUBLE.0 && self.0 <= Self::XSD_DECIMAL.0
     }
 
-    /// True if this is any numeric type (integer or float, inline only).
+    /// True if this is an inline numeric type (integer, float, or exact decimal).
     #[inline]
     pub const fn is_numeric(self) -> bool {
-        self.is_integer() || self.is_float()
+        self.is_integer() || self.is_float() || self.0 == Self::XSD_DECIMAL_INLINE.0
     }
 
     /// True if this is a temporal type (date/time/dateTime/gYear/etc./durations).
@@ -345,6 +366,17 @@ impl OType {
     pub const fn is_string_dict(self) -> bool {
         self.0 >= Self::XSD_STRING.0 && self.0 <= Self::XSD_HEX_BINARY.0
             || self.0 == Self::FULLTEXT.0
+    }
+
+    /// True if `o_key` is a string-dictionary id — the only o_types that can
+    /// carry a literal's lexical string. Every other o_type decodes `o_key` as
+    /// the value itself, so pairing it with a string id misreads the id.
+    #[inline]
+    pub const fn is_string_keyed(self) -> bool {
+        matches!(
+            self.decode_kind(),
+            DecodeKind::StringDict | DecodeKind::JsonArena | DecodeKind::Duration
+        )
     }
 
     // ── langString helpers ─────────────────────────────────────────────
@@ -395,6 +427,7 @@ impl OType {
             0x001D => DecodeKind::Duration,
             0x001E => DecodeKind::GeoPoint,
             0x001F => DecodeKind::BlankNode,
+            0x0020 => DecodeKind::Decimal,
             _ => DecodeKind::Sentinel, // future embedded types
         }
     }
@@ -409,6 +442,7 @@ impl OType {
             0x800A => DecodeKind::StringDict, // fulltext (string dict + BM25)
             0x800B => DecodeKind::NumBigArena,
             0x800C => DecodeKind::SpatialArena,
+            0x800D => DecodeKind::TripleTermDict,
             _ => DecodeKind::Sentinel, // future Fluree domains
         }
     }
@@ -468,6 +502,11 @@ pub enum DecodeKind {
     NumBigArena,
     /// Spatial arena handle (per-predicate).
     SpatialArena,
+    /// Triple-term dictionary handle (ledger-global, partitioned by inner predicate).
+    TripleTermDict,
+    /// Exact inline `xsd:decimal` — o_key is an order-preserving base-10 float
+    /// code (see [`super::value_id::ObjKey::decode_decimal`]). Not arena-backed.
+    Decimal,
 }
 
 impl DecodeKind {
@@ -498,6 +537,8 @@ impl DecodeKind {
             21 => Some(Self::VectorArena),
             22 => Some(Self::NumBigArena),
             23 => Some(Self::SpatialArena),
+            24 => Some(Self::TripleTermDict),
+            25 => Some(Self::Decimal),
             _ => None,
         }
     }
@@ -540,6 +581,7 @@ impl fmt::Debug for OType {
             0x001D => write!(f, "OType::XSD_DURATION"),
             0x001E => write!(f, "OType::GEO_POINT"),
             0x001F => write!(f, "OType::BLANK_NODE"),
+            0x0020 => write!(f, "OType::XSD_DECIMAL_INLINE"),
             0x8000 => write!(f, "OType::XSD_STRING"),
             0x8001 => write!(f, "OType::XSD_ANY_URI"),
             0x8002 => write!(f, "OType::XSD_NORMALIZED_STRING"),
@@ -553,6 +595,7 @@ impl fmt::Debug for OType {
             0x800A => write!(f, "OType::FULLTEXT"),
             0x800B => write!(f, "OType::NUM_BIG_OVERFLOW"),
             0x800C => write!(f, "OType::SPATIAL_COMPLEX"),
+            0x800D => write!(f, "OType::TRIPLE_TERM"),
             v if self.is_lang_string() => write!(f, "OType::LANG_STRING({})", v & 0x3FFF),
             v if self.is_customer_datatype() => {
                 write!(f, "OType::CUSTOMER({})", v & 0x3FFF)
@@ -631,6 +674,9 @@ mod tests {
 
         assert!(OType::XSD_INTEGER.is_numeric());
         assert!(OType::XSD_DOUBLE.is_numeric());
+        assert!(OType::XSD_DECIMAL_INLINE.is_numeric());
+        assert!(!OType::XSD_DECIMAL_INLINE.is_float());
+        assert!(!OType::NUM_BIG_OVERFLOW.is_numeric());
         assert!(!OType::XSD_DATE.is_numeric());
 
         assert!(OType::XSD_DATE.is_temporal());
@@ -653,6 +699,30 @@ mod tests {
         assert!(ot.is_customer_datatype());
         assert_eq!(ot.payload(), 999);
         assert_eq!(ot.as_u16(), 0x4000 + 999);
+    }
+
+    #[test]
+    fn customer_datatype_max_payload_stays_customer() {
+        let ot = OType::customer_datatype(OType::MAX_PAYLOAD);
+        assert!(ot.is_customer_datatype());
+        assert_eq!(ot.payload(), OType::MAX_PAYLOAD);
+    }
+
+    #[test]
+    #[should_panic(expected = "customer payload exceeds 14-bit range")]
+    fn customer_datatype_rejects_payload_past_max() {
+        let _ = OType::customer_datatype(OType::MAX_PAYLOAD + 1);
+    }
+
+    #[test]
+    fn datatype_dict_id_limit_matches_customer_payload() {
+        use crate::ids::DatatypeDictId;
+        let max = u32::from(DatatypeDictId::MAX);
+        let top = DatatypeDictId::try_from_dict_id(max).expect("max id fits");
+        assert!(OType::customer_datatype(top.as_u16()).is_customer_datatype());
+        assert_eq!(DatatypeDictId::try_from_dict_id(max + 1), None);
+        // The old u8 boundary is well inside the limit.
+        assert!(DatatypeDictId::try_from_dict_id(256).is_some());
     }
 
     #[test]
@@ -690,11 +760,52 @@ mod tests {
             OType::NUM_BIG_OVERFLOW.decode_kind(),
             DecodeKind::NumBigArena
         );
+        assert_eq!(OType::TRIPLE_TERM.decode_kind(), DecodeKind::TripleTermDict);
+        assert_eq!(DecodeKind::TripleTermDict as u8, 24);
+        assert_eq!(DecodeKind::Decimal as u8, 25);
+        assert_eq!(DecodeKind::from_u8(25), Some(DecodeKind::Decimal));
+        assert_eq!(OType::XSD_DECIMAL_INLINE.decode_kind(), DecodeKind::Decimal);
+        assert_eq!(
+            DecodeKind::from_u8(DecodeKind::TripleTermDict as u8),
+            Some(DecodeKind::TripleTermDict)
+        );
         assert_eq!(OType::lang_string(5).decode_kind(), DecodeKind::StringDict);
         assert_eq!(
             OType::customer_datatype(10).decode_kind(),
             DecodeKind::StringDict
         );
+    }
+
+    #[test]
+    fn string_keyed_o_types() {
+        for ot in [
+            OType::XSD_STRING,
+            OType::XSD_ANY_URI,
+            OType::FULLTEXT,
+            OType::RDF_JSON,
+            OType::XSD_DURATION,
+            OType::lang_string(3),
+            OType::customer_datatype(9),
+        ] {
+            assert!(ot.is_string_keyed(), "{ot:?}");
+        }
+        for ot in [
+            OType::XSD_BOOLEAN,
+            OType::XSD_INTEGER,
+            OType::XSD_LONG,
+            OType::XSD_DOUBLE,
+            OType::XSD_DATE,
+            OType::XSD_DATE_TIME,
+            OType::XSD_TIME,
+            OType::XSD_G_YEAR,
+            OType::XSD_DAY_TIME_DURATION,
+            OType::IRI_REF,
+            OType::VECTOR,
+            OType::NUM_BIG_OVERFLOW,
+            OType::TRIPLE_TERM,
+        ] {
+            assert!(!ot.is_string_keyed(), "{ot:?}");
+        }
     }
 
     #[test]

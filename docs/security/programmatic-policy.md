@@ -200,6 +200,20 @@ let result = fluree.query_from()
     .await?;
 ```
 
+### Body Options Through the Graph-Scoped Builder
+
+`fluree.graph(<ledger>).query()` honors the same body `opts` as `query_from()`,
+and a ledger's configured `f:policyDefaults` govern a bare read through either.
+Use it when the target may be a mapped graph source as well as a native ledger.
+
+A SPARQL request carries the same selection in its
+[`# PRAGMA` comments](../query/sparql.md#request-options--pragma) (`identity`,
+`policy-class`, `policy-values`, `default-allow`; the inline policy document has
+no pragma), and both builders honor them. One limit is worth knowing: a snapshot
+materialized with `graph(<ledger>).load()` carries configured defaults but not a
+query's own `opts` or pragmas, because it is loaded before any query is attached
+and then serves many of them.
+
 ## Policy Options Precedence
 
 When multiple policy options are provided, they follow this precedence:

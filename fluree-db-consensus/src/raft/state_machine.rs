@@ -141,7 +141,7 @@ impl RefKey {
 
     /// The same id, validated, for consumers keyed by [`LedgerId`].
     pub fn id(&self) -> Result<fluree_db_core::LedgerId, fluree_db_core::LedgerIdParseError> {
-        fluree_db_core::LedgerId::from_parts(&self.ledger_name, &self.branch)
+        fluree_db_core::LedgerId::from_persisted_parts(&self.ledger_name, &self.branch)
     }
 }
 

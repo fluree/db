@@ -327,6 +327,25 @@ impl UnmatchedOptional {
 }
 
 impl Binding {
+    /// A triple term's object as a binding: a node, or a literal with the
+    /// term's datatype or language tag, which `"chat"@fr` and `"5"^^xsd:int`
+    /// must keep (a nested term is such a literal).
+    pub fn term_object(term: &fluree_db_core::TripleTermValue) -> Binding {
+        match &term.o {
+            FlakeValue::Ref(sid) => Binding::sid(sid.clone()),
+            other => Binding::Lit {
+                val: other.clone(),
+                dtc: match &term.lang {
+                    Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang.as_str())),
+                    None => DatatypeConstraint::Explicit(term.dt.clone()),
+                },
+                t: None,
+                op: None,
+                p_id: None,
+            },
+        }
+    }
+
     /// Create a new literal binding
     ///
     /// # Panics

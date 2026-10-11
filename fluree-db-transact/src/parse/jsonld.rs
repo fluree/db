@@ -14,7 +14,8 @@
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
 use crate::ir::{
-    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    GraphSel, InlineValues, TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn,
+    TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::DatatypeConstraint;
@@ -159,11 +160,16 @@ pub fn parse_transaction(
         std::borrow::Cow::Borrowed(json)
     };
 
-    match txn_type {
+    let mut txn = match txn_type {
         TxnType::Insert => parse_insert(&lowered, opts, ns_registry),
         TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
         TxnType::Update => parse_update(&lowered, opts, ns_registry),
+    }?;
+    if matches!(lowered, std::borrow::Cow::Owned(_)) {
+        super::edge_annotations::fold_slots_into_links(&mut txn.insert_templates)?;
+        super::edge_annotations::fold_slots_into_links(&mut txn.delete_templates)?;
     }
+    Ok(txn)
 }
 
 /// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
@@ -224,33 +230,6 @@ pub fn parse_graph_insert(
     for t in &mut txn.insert_templates {
         t.graph = TemplateGraph::Iri(Arc::clone(&target));
     }
-    // Edge annotations were lowered against a payload with no graph identity,
-    // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
-    // bundle into the target graph without one produces a bundle whose
-    // flake-level graph disagrees with the edge graph it encodes
-    // (`EdgeKey::from_reifies_facts` → `GraphMismatch`, refused at stage).
-    // Anchor every reifier to the target graph, exactly as the named-`@graph`
-    // lowering does for an annotated edge written inside a graph block.
-    let reifies_subject = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_SUBJECT,
-    );
-    let reifies_graph = fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_GRAPH,
-    );
-    let anchors: Vec<TripleTemplate> = txn
-        .insert_templates
-        .iter()
-        .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == reifies_subject))
-        .map(|t| {
-            let mut anchor = t.clone();
-            anchor.predicate = TemplateTerm::Sid(reifies_graph.clone());
-            anchor.object = TemplateTerm::Sid(ns_registry.sid_for_iri(graph_iri));
-            anchor
-        })
-        .collect();
-    txn.insert_templates.extend(anchors);
     txn.write_graphs.insert(graph_iri.clone());
     Ok(txn)
 }
@@ -495,6 +474,8 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.default_graph_is_template_default = template_default_graph.is_some();
+        ctx.ill_typed_as_stored = true;
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -541,6 +522,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.default_graph_is_template_default = template_default_graph.is_some();
         let templates = parse_update_templates_with_ctx(insert_val, &mut ctx)?;
         if templates.is_empty() {
             return Err(TransactError::Parse(
@@ -561,6 +543,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_opts(opts)
         .with_txn_meta(txn_meta);
     txn.write_graphs = write_graphs.iris();
+    txn.template_default_graph = template_default_graph.map(|(_, iri)| iri);
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
 
@@ -856,8 +839,15 @@ struct TemplateParseCtx<'a> {
     strict_compact_iri: bool,
     write_graphs: &'a mut WriteGraphs,
     default_graph: Option<Arc<str>>,
+    /// Whether `default_graph` is the update's top-level `graph` (the
+    /// template default, [`Txn::template_default_graph`]) rather than the
+    /// graph of an enclosing `["graph", <iri>, …]` wrapper.
+    default_graph_is_template_default: bool,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
+    /// Delete templates keep an ill-typed literal's lexical form as stored
+    /// (see [`coerce_value_with_datatype`]) instead of refusing it.
+    ill_typed_as_stored: bool,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -880,8 +870,10 @@ impl<'a> TemplateParseCtx<'a> {
             strict_compact_iri,
             write_graphs,
             default_graph,
+            default_graph_is_template_default: false,
             from_named_aliases,
             blank_counter: 0,
+            ill_typed_as_stored: false,
         }
     }
 
@@ -931,14 +923,17 @@ impl<'a> TemplateParseCtx<'a> {
 /// stored data). Stable `_:fdb-` ids never appear here — the term parsers
 /// resolve them to constant `TemplateTerm::Sid`s.
 fn first_blank_node_in_templates(templates: &[TripleTemplate]) -> Option<&str> {
-    templates.iter().find_map(|t| {
-        [&t.subject, &t.predicate, &t.object]
-            .into_iter()
-            .find_map(|term| match term {
-                TemplateTerm::BlankNode(label) => Some(label.as_str()),
-                _ => None,
-            })
-    })
+    let mut found = None;
+    for t in templates {
+        for term in [&t.subject, &t.predicate, &t.object] {
+            term.for_each_leaf(&mut |leaf| {
+                if let (None, TemplateTerm::BlankNode(label)) = (found, leaf) {
+                    found = Some(label.as_str());
+                }
+            });
+        }
+    }
+    found
 }
 
 fn parse_update_templates_with_ctx(
@@ -966,8 +961,12 @@ fn parse_update_templates_with_ctx(
                     })?;
                     let expanded = ctx.expand_document(&arr[2])?;
                     let prev_default = ctx.default_graph.replace(graph.0);
+                    // The wrapper names its graph: not the template default.
+                    let prev_is_template_default =
+                        std::mem::replace(&mut ctx.default_graph_is_template_default, false);
                     let templates = parse_expanded_triples_with_ctx(&expanded, ctx)?;
                     ctx.default_graph = prev_default;
+                    ctx.default_graph_is_template_default = prev_is_template_default;
                     out.extend(templates);
                     continue;
                 }
@@ -1286,7 +1285,8 @@ fn parse_values_cell(
                 }
 
                 let expanded_type = expand_datatype_iri(type_val, context, strict)?;
-                let parsed = coerce_value_with_datatype(value_val, &expanded_type, ns_registry)?;
+                let parsed =
+                    coerce_value_with_datatype(value_val, &expanded_type, ns_registry, false)?;
                 return Ok(parsed.term);
             }
 
@@ -1378,7 +1378,21 @@ fn parse_expanded_object_with_ctx(
             Ok(ctx.write_graphs.get_or_assign(&resolved))
         })
         .transpose()?;
+    // A node with no `@graph` of its own takes the default: the update's
+    // template default (top-level `graph`), an enclosing wrapper's graph, or
+    // the graph of the node it is nested in.
+    let graph_from_template_default = node_graph.is_none()
+        && ctx.default_graph.is_some()
+        && ctx.default_graph_is_template_default;
+    let own_graph = node_graph.clone();
     let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
+    let place = |t: TripleTemplate| match &node_graph {
+        Some(graph) if graph_from_template_default => {
+            t.in_template_default_graph(Arc::clone(graph))
+        }
+        Some(graph) => t.in_graph(Arc::clone(graph)),
+        None => t,
+    };
 
     // Get subject from @id (already expanded IRI or variable)
     let subject = if let Some(id) = obj.get("@id") {
@@ -1390,7 +1404,32 @@ fn parse_expanded_object_with_ctx(
         TemplateTerm::BlankNode(format!("_:b{n}"))
     };
 
-    // Parse each predicate-object pair
+    // Nodes nested in this one belong to its graph, as an embedded node object
+    // does in JSON-LD.
+    let outer = own_graph.map(|graph| {
+        (
+            ctx.default_graph.replace(graph),
+            std::mem::replace(&mut ctx.default_graph_is_template_default, false),
+        )
+    });
+    let parsed = parse_node_properties(obj, &subject, &place, ctx, &mut templates);
+    if let Some((default_graph, is_template_default)) = outer {
+        ctx.default_graph = default_graph;
+        ctx.default_graph_is_template_default = is_template_default;
+    }
+    parsed?;
+
+    Ok((subject, templates))
+}
+
+/// The triples for each predicate-object pair of a node object.
+fn parse_node_properties(
+    obj: &serde_json::Map<String, Value>,
+    subject: &TemplateTerm,
+    place: &dyn Fn(TripleTemplate) -> TripleTemplate,
+    ctx: &mut TemplateParseCtx<'_>,
+    templates: &mut Vec<TripleTemplate>,
+) -> Result<()> {
     for (key, value) in obj {
         // Skip JSON-LD keywords except @type which becomes rdf:type
         if key == "@id" || key == "@context" || key == "@graph" {
@@ -1415,10 +1454,11 @@ fn parse_expanded_object_with_ctx(
                     } else {
                         TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(type_iri))
                     };
-                    let mut t = TripleTemplate::new(subject.clone(), predicate.clone(), object);
-                    if let Some(graph) = &node_graph {
-                        t = t.in_graph(Arc::clone(graph));
-                    }
+                    let t = place(TripleTemplate::new(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                    ));
                     templates.push(t);
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -1443,14 +1483,14 @@ fn parse_expanded_object_with_ctx(
             TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
         };
 
-        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, &mut templates)?;
+        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, templates)?;
 
         for parsed_value in parsed_values {
-            let mut template =
-                TripleTemplate::new(subject.clone(), predicate.clone(), parsed_value.term);
-            if let Some(graph) = &node_graph {
-                template = template.in_graph(Arc::clone(graph));
-            }
+            let mut template = place(TripleTemplate::new(
+                subject.clone(),
+                predicate.clone(),
+                parsed_value.term,
+            ));
             if let Some(dtc) = parsed_value.dtc {
                 template = template.with_dtc(dtc);
             }
@@ -1460,8 +1500,7 @@ fn parse_expanded_object_with_ctx(
             templates.push(template);
         }
     }
-
-    Ok((subject, templates))
+    Ok(())
 }
 
 fn resolve_graph_selector_str_for_templates(
@@ -1606,6 +1645,15 @@ fn parse_expanded_value_with_ctx(
 ) -> Result<ParsedValue> {
     match value {
         Value::Object(obj) => {
+            if let Some(Value::Object(term)) = obj.get("@id") {
+                if obj.len() > 1 {
+                    return Err(TransactError::Parse(
+                        "a triple term ({\"@id\": {...}}) is a value and cannot carry properties"
+                            .to_string(),
+                    ));
+                }
+                return parse_expanded_triple_term_with_ctx(term, ctx);
+            }
             // Check for @id (reference)
             if let Some(id) = obj.get("@id") {
                 // If the object has additional keys, materialize it as a nested node.
@@ -1629,6 +1677,7 @@ fn parse_expanded_value_with_ctx(
                     ctx.ns_registry,
                     ctx.object_var_parsing,
                     ctx.strict_compact_iri,
+                    ctx.ill_typed_as_stored,
                 );
             }
 
@@ -1712,6 +1761,39 @@ fn parse_expanded_value_with_ctx(
     }
 }
 
+/// `{"@id": {"@id": s, p: o}}`: the triple term `<<( s p o )>>`.
+fn parse_expanded_triple_term_with_ctx(
+    term: &serde_json::Map<String, Value>,
+    ctx: &mut TemplateParseCtx<'_>,
+) -> Result<ParsedValue> {
+    let invalid = |msg: &str| TransactError::Parse(format!("triple term: {msg}"));
+    let parts = fluree_graph_json_ld::triple_term::triple_term_parts(term).map_err(invalid)?;
+    let s = parse_expanded_id_with_ctx(parts.subject, ctx)?;
+    let key = parts.predicate;
+    let values = parts.object;
+    let p = if key.starts_with('?') {
+        TemplateTerm::Var(ctx.vars.get_or_insert(key))
+    } else {
+        TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
+    };
+    // A node with properties would assert them; a list or another term is
+    // not one object.
+    let mut asserted = Vec::new();
+    let mut objects = parse_expanded_objects_with_ctx(values, ctx, &mut asserted)?;
+    let o = match objects.pop() {
+        Some(o) if objects.is_empty() && asserted.is_empty() && o.list_index.is_none() => o,
+        _ => return Err(invalid("it must describe exactly one triple")),
+    };
+    Ok(ParsedValue::new(TemplateTerm::TripleTerm(Box::new(
+        TemplateTripleTerm {
+            s,
+            p,
+            o: o.term,
+            dtc: o.dtc,
+        },
+    ))))
+}
+
 // Compatibility wrapper used by unit tests.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -1767,6 +1849,7 @@ fn parse_literal_value_with_meta(
     ns_registry: &mut NamespaceRegistry,
     object_var_parsing: bool,
     strict: bool,
+    ill_typed_as_stored: bool,
 ) -> Result<ParsedValue> {
     // Check for @type first - always route through typed coercion when present
     if let Some(type_val) = obj.get("@type") {
@@ -1804,7 +1887,12 @@ fn parse_literal_value_with_meta(
             };
 
             // Route all @value types through typed coercion
-            return coerce_value_with_datatype(val, resolved_type, ns_registry);
+            return coerce_value_with_datatype(
+                val,
+                resolved_type,
+                ns_registry,
+                ill_typed_as_stored,
+            );
         }
     }
 
@@ -1868,16 +1956,30 @@ fn parse_literal_value_with_meta(
 /// - Boolean @value + xsd:string → ERROR
 /// - Numeric @value + xsd:boolean → ERROR
 /// - Integer subtypes enforce range bounds (e.g., xsd:byte must be -128 to 127)
+///
+/// With `ill_typed_as_stored` (delete templates), a string `@value` the
+/// datatype does not accept is kept as a string with the declared datatype,
+/// the form a Turtle write stores an ill-typed literal in: a DELETE names
+/// what is stored, and a term that is not stored retracts nothing.
 fn coerce_value_with_datatype(
     val: &Value,
     type_iri: &str,
     ns_registry: &mut NamespaceRegistry,
+    ill_typed_as_stored: bool,
 ) -> Result<ParsedValue> {
     let datatype_sid = ns_registry.sid_for_iri(type_iri);
 
     // Delegate to core coercion module
-    let flake_value = fluree_db_core::coerce::coerce_json_value(val, type_iri)
-        .map_err(|e| TransactError::Parse(e.message))?;
+    let flake_value = match (
+        fluree_db_core::coerce::coerce_json_value(val, type_iri),
+        val,
+    ) {
+        (Ok(value), _) => value,
+        (Err(_), Value::String(lexical)) if ill_typed_as_stored => {
+            FlakeValue::String(lexical.clone())
+        }
+        (Err(e), _) => return Err(TransactError::Parse(e.message)),
+    };
 
     Ok(ParsedValue::new(TemplateTerm::Value(flake_value))
         .with_dtc(DatatypeConstraint::Explicit(datatype_sid)))

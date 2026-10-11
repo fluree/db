@@ -2,11 +2,13 @@
 //! parser.
 //!
 //! Walks the raw transaction document **before** JSON-LD expansion and
-//! rewrites every `@annotation` / `@edge` / `@reifies` block into the
-//! seven-fact `f:reifies*` system encoding. The output is a document
-//! that contains only ordinary IRIs (no `@`-keyword extensions), so
-//! the rest of the parsing pipeline (`expand_with_context_policy`,
-//! `parse_expanded_triples_with_ctx`) processes it unchanged.
+//! rewrites every `@annotation` / `@edge` / `@reifies` block into
+//! `f:reifies*` slot keys naming the annotated edge. JSON-LD has no
+//! triple-term syntax, so the slots are how the edge travels through
+//! `expand_with_context_policy` and `parse_expanded_triples_with_ctx`
+//! unchanged; [`fold_slots_into_links`] then turns each annotation's slots
+//! into its `rdf:reifies <<( s p o )>>` link, and bulk import's sink does
+//! the same. The slots are never stored.
 //!
 //! The accepted insert shape is the **inline form** (`@annotation` /
 //! `@edge` on the *object* node of a predicate):
@@ -88,10 +90,21 @@ pub(crate) enum ReifiedObjectShape {
         /// `value.get("@type")`.
         value: Value,
         /// `@language` payload if explicit. Drives `f:reifiesLang`
-        /// emission — required so `EdgeKey::from_reifies_facts` decodes
-        /// to the same `lang` the base flake carries via `flake.m.lang`.
+        /// emission — required so the link `fold_slots_into_links` builds
+        /// names the same `lang` the base flake carries via `flake.m.lang`.
         language: Option<String>,
     },
+    /// Object is a triple term: the node naming its triple,
+    /// `{"@id": s, p: o}`.
+    TripleTerm(Value),
+}
+
+/// The triple-term shape of an object written `{"@id": {"@id": s, p: o}}`.
+fn triple_term_shape(map: &Map<String, Value>, id_alias: &str) -> Option<ReifiedObjectShape> {
+    map.get("@id")
+        .or_else(|| map.get(id_alias))
+        .filter(|id| id.is_object())
+        .map(|node| ReifiedObjectShape::TripleTerm(node.clone()))
 }
 
 /// Reject the deferred JSON-LD wrapper shapes that can't carry an edge
@@ -332,8 +345,8 @@ pub(crate) fn classify_reified_object(map: &Map<String, Value>) -> Result<Reifie
 }
 
 /// Build the JSON payload for `f:reifiesObject` plus the optional
-/// `f:reifiesLang` companion. Mirrors [`EdgeKey::to_reifies_facts`]
-/// so writers and the binary decoder agree on bundle shape.
+/// `f:reifiesLang` companion, which [`fold_slots_into_links`] reads back
+/// into the link's triple term.
 ///
 /// Returns `(object_payload, lang)`:
 /// - `Iri` → `({"@id": "..."}, None)`
@@ -345,6 +358,7 @@ pub(crate) fn emit_reifies_object_payload(shape: &ReifiedObjectShape) -> (Value,
         ReifiedObjectShape::Literal {
             value, language, ..
         } => (value.clone(), language.clone()),
+        ReifiedObjectShape::TripleTerm(node) => (json!({ "@id": node }), None),
     }
 }
 
@@ -437,7 +451,9 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
                 } else {
                     expand_iri(k, effective)
                 };
-                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key)
+                    || expanded_key == fluree_vocab::rdf::REIFIES
+                {
                     return Err(TransactError::UnsupportedFeature(format!(
                         "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
                          use @annotation or @reifies instead"
@@ -1006,6 +1022,8 @@ fn lift_annotations_under_predicate(
                 // becomes a silent no-op.
                 reject_context_coercion_on_annotated_literal(map, predicate, ctx)?;
                 classify_reified_object(map)?
+            } else if let Some(shape) = triple_term_shape(map, ctx.id_key.as_str()) {
+                shape
             } else {
                 let id_alias = ctx.id_key.as_str();
                 let object_id = map
@@ -1136,39 +1154,17 @@ fn build_annotation_delete(
         // body — same deferral rule as inserts.
         scan_annotation_keywords_in_map(&ann_map, ctx)?;
 
-        // Build the WHERE pattern as a flat triple-pattern node. The
-        // body properties (remaining in `ann_map`) act as selector
-        // predicates; the `f:reifies*` triples pin the annotation to
-        // the (parent_subject, predicate, object_id) edge. We emit
-        // the system predicates directly rather than the higher-level
-        // `@reifies` shape because the standard lowering walker
-        // rejects `@reifies` outside its query-side context, while
-        // `f:reifies*` IRIs are accepted as ordinary IRIs (the
-        // user-authored-reifies firewall has already run against the
-        // original doc, so our synthesized ones aren't re-scanned).
-        // The JSON-LD-Q query parser still resolves `f:reifies*`
-        // triple patterns into the same indexed lookups as
-        // `@reifies` would.
+        // The WHERE node: the body properties (remaining in `ann_map`) act
+        // as selector predicates, and the query-side `@reifies` pins the
+        // annotation to the (parent_subject, predicate, object) edge through
+        // its `rdf:reifies` link.
         let mut where_node = ann_map.clone();
         where_node.insert("@id".to_string(), Value::String(var.clone()));
-        where_node.insert(
-            reifies_iris::SUBJECT.to_string(),
-            json!({"@id": parent_subject}),
-        );
-        where_node.insert(
-            reifies_iris::PREDICATE.to_string(),
-            json!({"@id": predicate}),
-        );
-        where_node.insert(reifies_iris::OBJECT.to_string(), object_payload.clone());
-        if let Some(lang) = &lang_payload {
-            // Emit `f:reifiesLang` as an additional WHERE constraint
-            // so the selector form binds only annotations whose
-            // language tag matches — same lexical string across
-            // different languages must not collide.
-            where_node.insert(reifies_iris::LANG.to_string(), json!(lang));
-        }
+        let mut edge = Map::new();
+        edge.insert("@id".to_string(), json!(parent_subject));
+        edge.insert(predicate.to_string(), object_payload.clone());
+        where_node.insert(REIFIES_KEY.to_string(), Value::Object(edge));
         if let Some(graph) = graph_iri {
-            where_node.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
             // Named-graph case: wrap the node in the JLDQ s-expression
             // graph form `["graph", "<iri>", { ...patterns... }]` so
             // the WHERE evaluation scopes its triple matches to the
@@ -1399,10 +1395,10 @@ fn build_annotation_sibling(
 
     // f:reifiesObject and (optional) f:reifiesLang. For a literal
     // object, the value payload is the canonical value-object built by
-    // the classifier; `EdgeKey::from_reifies_facts` derives `lang` from
-    // a separate `f:reifiesLang` flake, so language-tagged literals
-    // MUST emit it explicitly — otherwise the decoded EdgeKey would
-    // not match the writer's base-edge EdgeKey.
+    // the classifier; `fold_slots_into_links` takes the term's `lang`
+    // from a separate `f:reifiesLang` slot, so language-tagged literals
+    // MUST emit it explicitly — otherwise the link's term would not
+    // name the base edge.
     let (object_payload, lang_payload) = emit_reifies_object_payload(object);
     ann_map.insert(reifies_iris::OBJECT.to_string(), object_payload);
     if let Some(lang) = lang_payload {
@@ -1410,9 +1406,8 @@ fn build_annotation_sibling(
     }
 
     // f:reifiesGraph — emitted iff the reified edge lives in a named
-    // graph. Default-graph edges omit it (absence = default), which
-    // matches the encoding in `EdgeKey::to_reifies_facts` and the
-    // bundle validator's "at most one" rule for `f:reifiesGraph`.
+    // graph. Default-graph edges omit it (absence = default);
+    // `fold_slots_into_links` puts the link in its template's graph.
     //
     // The synthetic annotation node *also* lives in the same named
     // graph as the edge it reifies, so we set its own `@graph`
@@ -1426,104 +1421,121 @@ fn build_annotation_sibling(
 
     // f:reifiesDatatype is intentionally omitted at lowering time —
     // we don't know the object's datatype before JSON-LD expansion.
-    // The decoder treats it as optional and derives the canonical
-    // datatype from the flake-level `dt` of `f:reifiesObject`. The
-    // in-Rust `EdgeKey::to_reifies_facts` builder still emits both
-    // for diagnostic clarity.
+    // `fold_slots_into_links` takes it from the `f:reifiesObject` value.
 
     Ok(Some(Value::Object(ann_map)))
 }
 
-/// Lower a `@reifies` block on the enclosing node. The enclosing node
-/// IS the annotation; `@reifies` names the base edge.
+/// Lower a `@reifies` block on the enclosing node: the node is a reifier,
+/// and each triple the block describes becomes its `rdf:reifies` link
+/// without being asserted (RDF 1.2). An array reifies several triples; the
+/// first rides on the node, the rest on siblings with the same `@id`.
 fn lower_reifies_block(
     map: &mut Map<String, Value>,
+    reifier: &str,
     reifies_val: Value,
-    _ctx: &mut LowerCtx,
+    graph: Option<&str>,
+    ctx: &mut LowerCtx,
 ) -> Result<()> {
-    let Value::Object(reifies_map) = reifies_val else {
+    let blocks = match reifies_val {
+        Value::Array(blocks) if !blocks.is_empty() => blocks,
+        Value::Array(_) => {
+            return Err(TransactError::Parse(
+                "@reifies must describe at least one triple".to_string(),
+            ))
+        }
+        block => vec![block],
+    };
+    for (i, block) in blocks.into_iter().enumerate() {
+        let slots = reifies_slots(block)?;
+        if i == 0 {
+            map.extend(slots);
+        } else {
+            let mut sibling = slots;
+            sibling.insert("@id".to_string(), json!(reifier));
+            if let Some(graph) = graph {
+                sibling.insert("@graph".to_string(), json!(graph));
+            }
+            ctx.siblings.push(Value::Object(sibling));
+        }
+    }
+    Ok(())
+}
+
+/// The `f:reifies*` slots naming the one triple a `@reifies` block
+/// describes: `{"@id": s, p: o}`.
+fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
+    let Value::Object(block) = block else {
         return Err(TransactError::Parse(
-            "@reifies value must be a JSON object describing the base triple".to_string(),
+            "@reifies value must be a JSON object describing a triple".to_string(),
         ));
     };
-
-    // Reject nested annotations inside @reifies (v1 deferral).
-    for (k, _) in &reifies_map {
+    for k in block.keys() {
         if is_annotation_key(k) || k == REIFIES_KEY {
             return Err(TransactError::UnsupportedFeature(format!(
-                "{k} inside @reifies is the deferred nested-triple-term shape (v1)"
+                "{k} inside @reifies is the deferred nested-triple-term shape"
             )));
         }
     }
-
-    // Subject of the base edge: @id of the @reifies node-map.
-    let Some(Value::String(base_subject)) = reifies_map.get("@id") else {
+    let Some(Value::String(subject)) = block.get("@id") else {
         return Err(TransactError::Parse(
-            "@reifies must include an @id naming the base subject".to_string(),
+            "@reifies must include an @id naming the triple's subject".to_string(),
         ));
     };
-
-    // Find the single predicate-object pair (non-`@`-keyword key).
-    let pred_obj_pairs: Vec<(&String, &Value)> = reifies_map
-        .iter()
-        .filter(|(k, _)| !k.starts_with('@'))
-        .collect();
-    if pred_obj_pairs.len() != 1 {
+    let pairs: Vec<(&String, &Value)> = block.iter().filter(|(k, _)| !k.starts_with('@')).collect();
+    let [(predicate, object)] = pairs.as_slice() else {
+        return Err(TransactError::Parse(format!(
+            "@reifies must describe exactly one triple (got {} predicates); \
+             use an array to reify several",
+            pairs.len()
+        )));
+    };
+    if reifies_iris::ALL.contains(&predicate.as_str()) || *predicate == fluree_vocab::rdf::REIFIES {
         return Err(TransactError::UnsupportedFeature(format!(
-            "@reifies must describe exactly one base triple (got {} predicates); \
-             multi-triple reifiers are deferred to v2",
-            pred_obj_pairs.len()
+            "'{predicate}' is a system-controlled predicate"
         )));
     }
-    let (predicate, object_val) = pred_obj_pairs[0];
-
-    // Resolve the object: must be an IRI string, `{"@id": "..."}`, or a
-    // blank node; literal-valued reifiers are deferred.
-    let object_id = match object_val {
-        Value::String(s) => s.clone(),
-        Value::Object(ov) => match ov.get("@id") {
-            Some(Value::String(s)) => s.clone(),
+    let shape = match object {
+        Value::Object(object)
+            if object.contains_key("@value") || object.contains_key("@language") =>
+        {
+            classify_reified_object(object)?
+        }
+        Value::Object(object) => match object.get("@id") {
+            Some(Value::String(id)) if object.len() == 1 => ReifiedObjectShape::Iri(id.clone()),
+            Some(node @ Value::Object(_)) if object.len() == 1 => {
+                ReifiedObjectShape::TripleTerm(node.clone())
+            }
             _ => {
-                return Err(TransactError::UnsupportedFeature(
-                    "@reifies object position: literal-valued or multi-property objects are deferred (v1); \
-                     reify only IRI-typed (or @id-shaped) objects"
-                        .to_string(),
-                ));
+                return Err(TransactError::Parse(
+                    "@reifies object must be an @id reference or a value".to_string(),
+                ))
             }
         },
-        _ => {
+        Value::Array(_) => {
             return Err(TransactError::Parse(
-                "@reifies object must be an IRI string, @id reference, or variable".to_string(),
-            ));
+                "@reifies must describe exactly one triple; use an array of @reifies \
+                 blocks to reify several"
+                    .to_string(),
+            ))
+        }
+        scalar => {
+            classify_reified_object(&Map::from_iter([("@value".to_string(), (*scalar).clone())]))?
         }
     };
 
-    // Inject f:reifies* predicates onto the enclosing map.
-    map.insert(
-        reifies_iris::SUBJECT.to_string(),
-        json!({"@id": base_subject}),
-    );
-    map.insert(
+    let mut slots = Map::new();
+    slots.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
+    slots.insert(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
     );
-    map.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
-
-    // The base edge is asserted by the user including @reifies, so
-    // we don't synthesize a sibling for it: presence of f:reifiesSubject /
-    // f:reifiesPredicate / f:reifiesObject IS the assertion intent at
-    // the system level; the actual base flake is asserted via the
-    // `f:reifies*` mechanism plus the AttachmentNovelty observer in
-    // M1's runtime path. M2 layers an arena on top.
-    //
-    // Wait — actually no. `@reifies` is *only* a query-side construct
-    // in v1 per the design doc. On the insert path, `@reifies` is
-    // currently rejected as the deferred unasserted-reifier shape.
-    Err(TransactError::UnsupportedFeature(
-        "@reifies on inserts is deferred (v1); use @annotation on the inline form instead, \
-         or split the insert into the base edge plus a separate annotation node"
-            .to_string(),
-    ))
+    let (object, lang) = emit_reifies_object_payload(&shape);
+    slots.insert(reifies_iris::OBJECT.to_string(), object);
+    if let Some(lang) = lang {
+        slots.insert(reifies_iris::LANG.to_string(), json!(lang));
+    }
+    Ok(slots)
 }
 
 /// Append synthetic sibling nodes to the document so the standard
@@ -1863,16 +1875,14 @@ fn lower_object_with_subject(
         graph: effective_graph,
     };
 
-    // 1. Honor `@reifies` on this node (rejected in v1 — see above).
-    //    Subject minting must use the merged context so a node-local
-    //    `@id` alias is recognized.
+    // 1. Honor `@reifies` on this node. Subject minting must use the
+    //    merged context so a node-local `@id` alias is recognized.
     if map.contains_key(REIFIES_KEY) {
         let val = map.remove(REIFIES_KEY).unwrap();
-        // `@reifies` is one of the cases that requires a subject id; the
-        // lower function reads `map`'s `@id` directly, but the mint must
-        // run first so the value is present.
-        let _ = ensure_subject_id(map, &child_walk, ctx);
-        lower_reifies_block(map, val, ctx)?;
+        // The lower function reads `map`'s `@id` directly, so the mint
+        // must run first.
+        let reifier = ensure_subject_id(map, &child_walk, ctx);
+        lower_reifies_block(map, &reifier, val, child_walk.graph, ctx)?;
     }
 
     // 2. Walk predicate-value pairs. Skip JSON-LD keywords plus their
@@ -2049,12 +2059,14 @@ fn intercept_annotations_for_predicate(
                 // cannot silently diverge from the base flake's.
                 reject_context_coercion_on_annotated_literal(map, predicate, walk.json_ld)?;
                 classify_reified_object(map)?
+            } else if let Some(shape) = triple_term_shape(map, walk.json_ld.id_key.as_str()) {
+                shape
             } else {
                 let object_id = ensure_subject_id(map, walk, ctx);
                 ReifiedObjectShape::Iri(object_id)
             };
 
-            if reifies_iris::ALL.contains(&predicate) {
+            if reifies_iris::ALL.contains(&predicate) || predicate == fluree_vocab::rdf::REIFIES {
                 return Err(TransactError::UnsupportedFeature(format!(
                     "'{predicate}' is a system-controlled predicate; use @annotation instead"
                 )));
@@ -2077,6 +2089,112 @@ fn intercept_annotations_for_predicate(
         }
         _ => Ok(()),
     }
+}
+
+/// Replace each annotation's lowered `f:reifies*` slot templates with its
+/// `rdf:reifies` link. The slots are this module's intermediate form: they
+/// carry the edge through JSON-LD expansion, which has no triple-term syntax.
+/// Each annotation sets each slot once, in its own node, so a slot set again
+/// for the same reifier starts that reifier's next link.
+pub(crate) fn fold_slots_into_links(templates: &mut Vec<crate::ir::TripleTemplate>) -> Result<()> {
+    use crate::ir::{TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate};
+    use fluree_db_core::{DatatypeConstraint, FlakeValue};
+    use fluree_vocab::db;
+
+    #[derive(Default)]
+    struct Slots {
+        s: Option<TemplateTerm>,
+        p: Option<TemplateTerm>,
+        o: Option<(TemplateTerm, Option<DatatypeConstraint>)>,
+        lang: Option<String>,
+    }
+    impl Slots {
+        fn has(&self, slot: &str) -> bool {
+            match slot {
+                db::REIFIES_SUBJECT => self.s.is_some(),
+                db::REIFIES_PREDICATE => self.p.is_some(),
+                db::REIFIES_OBJECT => self.o.is_some(),
+                db::REIFIES_LANG => self.lang.is_some(),
+                _ => false,
+            }
+        }
+    }
+    let key = |t: &TripleTemplate| -> Option<(TemplateGraph, String)> {
+        let subject = match &t.subject {
+            TemplateTerm::Var(v) => format!("?{v:?}"),
+            TemplateTerm::Sid(sid) => format!("<{sid}>"),
+            TemplateTerm::BlankNode(label) => label.clone(),
+            _ => return None,
+        };
+        Some((t.graph.clone(), subject))
+    };
+
+    let mut reifiers: Vec<((TemplateGraph, String), TripleTemplate, Slots)> = Vec::new();
+    let mut kept = Vec::with_capacity(templates.len());
+    for t in templates.drain(..) {
+        let slot = match &t.predicate {
+            TemplateTerm::Sid(p) if fluree_db_core::is_reserved_reifies_predicate(p) => {
+                p.name.to_string()
+            }
+            _ => {
+                kept.push(t);
+                continue;
+            }
+        };
+        let k = key(&t).ok_or_else(|| {
+            TransactError::Parse("an annotation's reifier must be a node".to_string())
+        })?;
+        let open = reifiers
+            .iter()
+            .rposition(|(rk, _, slots)| *rk == k && !slots.has(&slot));
+        let at = match open {
+            Some(at) => at,
+            None => {
+                reifiers.push((k, t.clone(), Slots::default()));
+                reifiers.len() - 1
+            }
+        };
+        let slots = &mut reifiers[at].2;
+        match slot.as_str() {
+            db::REIFIES_SUBJECT => slots.s = Some(t.object),
+            db::REIFIES_PREDICATE => slots.p = Some(t.object),
+            db::REIFIES_OBJECT => slots.o = Some((t.object, t.dtc)),
+            db::REIFIES_LANG => {
+                if let TemplateTerm::Value(FlakeValue::String(lang)) = t.object {
+                    slots.lang = Some(lang);
+                }
+            }
+            // The link lives in its template's graph and names the object's
+            // datatype itself.
+            db::REIFIES_GRAPH | db::REIFIES_DATATYPE => {}
+            other => {
+                return Err(TransactError::UnsupportedFeature(format!(
+                    "f:{other} is not supported on an annotation"
+                )))
+            }
+        }
+    }
+
+    for (_, first, slots) in reifiers {
+        let (Some(s), Some(p), Some((o, dtc))) = (slots.s, slots.p, slots.o) else {
+            return Err(TransactError::Parse(
+                "an annotation must name its triple's subject, predicate and object".to_string(),
+            ));
+        };
+        let dtc = match slots.lang {
+            Some(lang) => Some(DatatypeConstraint::LangTag(std::sync::Arc::from(lang))),
+            None => dtc,
+        };
+        kept.push(TripleTemplate {
+            predicate: TemplateTerm::Sid(fluree_db_core::rdf_reifies_sid().clone()),
+            object: TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm { s, p, o, dtc })),
+            dtc: None,
+            list_index: None,
+            ..first
+        });
+    }
+    *templates = kept;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2859,8 +2977,8 @@ mod tests {
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({"@value": "chat", "@language": "fr"})
         );
-        // f:reifiesLang explicit — required for EdgeKey::from_reifies_facts
-        // to decode the same `lang` the base flake carries via flake.m.lang.
+        // f:reifiesLang explicit — required for the folded link to name
+        // the same `lang` the base flake carries via flake.m.lang.
         assert_eq!(sibling.get(reifies_iris::LANG).unwrap(), &json!("fr"));
     }
 
@@ -2999,8 +3117,8 @@ mod tests {
         let lowered = lower_delete(doc).unwrap();
         let wn = &wheres(&lowered)[0];
         assert_eq!(
-            wn.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "Alice"})
+            wn.get(REIFIES_KEY).unwrap(),
+            &json!({"@id": "ex:alice", "ex:name": {"@value": "Alice"}})
         );
         let t = &templates(&lowered)[0];
         assert_eq!(
@@ -3012,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_by_selector_on_lang_tagged_literal_emits_lang_in_where_and_template() {
+    fn delete_by_selector_on_lang_tagged_literal_keeps_lang_in_where_and_template() {
         let doc = json!({
             "delete": {
                 "@id": "ex:alice",
@@ -3025,14 +3143,12 @@ mod tests {
         });
         let lowered = lower_delete(doc).unwrap();
         let wn = &wheres(&lowered)[0];
+        // The WHERE selector's `@reifies` keeps the language tag, so the
+        // same lexical string in another language does not bind.
         assert_eq!(
-            wn.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "chat", "@language": "fr"})
+            wn.get(REIFIES_KEY).unwrap(),
+            &json!({"@id": "ex:alice", "ex:label": {"@value": "chat", "@language": "fr"}})
         );
-        // f:reifiesLang on the WHERE selector pins the join to the
-        // right language tag — same lexical string in another
-        // language must not bind.
-        assert_eq!(wn.get(reifies_iris::LANG).unwrap(), &json!("fr"));
         let t = &templates(&lowered)[0];
         assert_eq!(t.get(reifies_iris::LANG).unwrap(), &json!("fr"));
     }
@@ -3126,19 +3242,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reifies_on_insert() {
+    fn reifies_on_insert_names_its_triple_without_asserting_it() {
         let doc = json!({
             "@id": "ex:employment-1",
             "ex:role": "Engineer",
-            "@reifies": {
-                "@id": "ex:alice",
-                "ex:worksFor": { "@id": "ex:acme" }
-            }
+            "@reifies": [
+                { "@id": "ex:alice", "ex:worksFor": { "@id": "ex:acme" } },
+                { "@id": "ex:alice", "ex:age": 42 }
+            ]
         });
-        let err = lower(doc).unwrap_err();
+        let lowered = lower(doc).expect("lower");
+        let nodes = lowered["@graph"].as_array().expect("reifier + sibling");
+        assert_eq!(nodes.len(), 2, "{lowered:#}");
+        assert_eq!(nodes[0]["ex:role"], "Engineer");
+        assert_eq!(nodes[0][reifies_iris::SUBJECT], json!({"@id": "ex:alice"}));
+        assert_eq!(nodes[0][reifies_iris::OBJECT], json!({"@id": "ex:acme"}));
+        assert_eq!(nodes[1]["@id"], "ex:employment-1");
+        assert_eq!(nodes[1][reifies_iris::PREDICATE], json!({"@id": "ex:age"}));
+        assert_eq!(nodes[1][reifies_iris::OBJECT], json!({"@value": 42}));
         assert!(
-            err.to_string().contains("@reifies on inserts"),
-            "expected @reifies-on-insert deferral message, got: {err}"
+            nodes.iter().all(|n| n.get("ex:worksFor").is_none()),
+            "the triple is not asserted"
         );
     }
 
@@ -3298,9 +3422,7 @@ mod tests {
     #[test]
     fn annotation_in_default_graph_omits_reifies_graph() {
         // Default-graph edges encode "default" as the *absence* of
-        // `f:reifiesGraph` — matching the bundle validator's
-        // "at most one" rule and `EdgeKey::from_reifies_facts`'s
-        // None-means-default semantics.
+        // `f:reifiesGraph`.
         let doc = json!({
             "@id": "ex:alice",
             "ex:worksFor": {

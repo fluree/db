@@ -6,7 +6,8 @@
 //!
 //! ```json
 //! {
-//!   "ledger": { "alias", "t", "commit-t", "index-t", "flakes", "size", "named-graphs" },
+//!   "ledger": { "alias", "t", "commit-t", "index-t", "flakes", "size", "named-graphs",
+//!               "needs-link-reindex" (only when true) },
 //!   "graph": "urn:default",
 //!   "stats": { "flakes", "size", "properties": { ... }, "classes": { ... } },
 //!   "commit": { ... },
@@ -28,7 +29,7 @@ use fluree_db_core::value_id::ValueTypeTag;
 use fluree_db_core::{
     ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry, IndexSchema, IndexStats,
     LedgerSnapshot, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, SchemaPredicateInfo,
-    Sid, Storage,
+    Sid, Storage, DEFAULT_GRAPH_IRI,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
@@ -150,6 +151,14 @@ pub struct Ledger {
     /// Registered named graphs (always includes `urn:default`).
     #[serde(rename = "named-graphs")]
     pub named_graphs: Vec<NamedGraph>,
+    /// The index predates RDF 1.2 triple-term links: the ledger's
+    /// annotations read only after a full reindex. Omitted when false.
+    #[serde(
+        rename = "needs-link-reindex",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub needs_link_reindex: bool,
 }
 
 /// One entry in `ledger.named-graphs`.
@@ -712,7 +721,7 @@ pub(crate) fn resolve_graph_selector(
         GraphSelector::Default => Ok(0),
         GraphSelector::ById(g_id) => Ok(*g_id),
         GraphSelector::ByName(name) => match name.as_str() {
-            "default" | "urn:default" => Ok(0),
+            "default" | DEFAULT_GRAPH_IRI => Ok(0),
             "txn-meta" => Ok(1),
             "config" => Ok(2),
             other => {
@@ -729,7 +738,7 @@ pub(crate) fn resolve_graph_selector(
             }
         },
         GraphSelector::ByIri(iri) => {
-            if iri == "urn:default" {
+            if iri == DEFAULT_GRAPH_IRI {
                 return Ok(0);
             }
             // Recognize this ledger's reserved system graph IRIs so resolution
@@ -758,7 +767,7 @@ pub(crate) fn resolve_graph_selector(
 /// Determine the display name for a graph ID.
 fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String {
     if g_id == 0 {
-        return "urn:default".to_string();
+        return DEFAULT_GRAPH_IRI.to_string();
     }
     if let Some(store) = store {
         if let Some(iri) = store.graph_iri_for_id(g_id) {
@@ -774,18 +783,6 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
 
 /// Build the `ledger` block with ledger-wide metadata.
 fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
-    let index_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.index_t)
-        .unwrap_or(ledger.snapshot.t);
-
-    let commit_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.commit_t)
-        .unwrap_or(ledger.t());
-
     let graph_sizes = stats.graphs.as_deref().unwrap_or_default();
     let graph_totals = |g_id: GraphId| -> (u64, u64) {
         graph_sizes
@@ -809,7 +806,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     // store an IRI for it, so we synthesize `urn:default` here.
     let (default_flakes, default_size) = graph_totals(0);
     named_graphs.push(NamedGraph {
-        iri: "urn:default".to_string(),
+        iri: DEFAULT_GRAPH_IRI.to_string(),
         g_id: 0,
         flakes: Some(default_flakes as i64),
         size: default_size,
@@ -830,11 +827,14 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     Ledger {
         alias: ledger.snapshot.ledger_id.clone().to_string(),
         t: Some(ledger.t()),
-        commit_t: Some(commit_t),
-        index_t: Some(index_t),
+        // The record saved at load time can lag cached commits or index installs.
+        // Describe the state serving this request, not that saved record.
+        commit_t: Some(ledger.t()),
+        index_t: Some(ledger.index_t()),
         flakes: Some(stats.flakes as i64),
         size: stats.size,
         named_graphs,
+        needs_link_reindex: ledger.snapshot.needs_link_reindex,
     }
 }
 
@@ -1546,13 +1546,14 @@ pub fn build_virtual_ledger_info(
             flakes: total_rows,
             size: 0,
             named_graphs: vec![NamedGraph {
-                iri: "urn:default".to_string(),
+                iri: DEFAULT_GRAPH_IRI.to_string(),
                 g_id: 0,
                 flakes: total_rows,
                 size: 0,
             }],
+            needs_link_reindex: false,
         },
-        graph: "urn:default".to_string(),
+        graph: DEFAULT_GRAPH_IRI.to_string(),
         stats: Stats {
             flakes: total_rows,
             size: 0,
@@ -1660,8 +1661,8 @@ fn info_count_budget_ms() -> u64 {
 }
 
 /// Fetch best-effort per-table row counts (and the first table's snapshot id) for
-/// a virtual Iceberg dataset, sharing ONE REST catalog client across a bounded
-/// concurrent fan-out.
+/// a virtual Iceberg dataset, sharing ONE catalog client (REST, AWS Glue, or AWS S3
+/// Tables) across a bounded concurrent fan-out.
 ///
 /// The prior path built a fresh client AND OAuth provider (empty token cache) per
 /// table inside a SERIAL loop — a redundant token exchange + `loadTable` per
@@ -1671,11 +1672,13 @@ fn info_count_budget_ms() -> u64 {
 /// (keyed by the SAME config fingerprint), and the per-table `loadTable`s run with
 /// bounded concurrency.
 ///
-/// Metadata-only: `loadTable` returns the snapshot-summary row count; no
+/// Metadata-only: the count is the snapshot summary of the table metadata — inline
+/// in a REST `loadTable`, else from the query path's caches, else one read of the
+/// metadata file (AWS Glue / S3 Tables return only its location); no
 /// manifest-list, manifest, or Parquet/data file is read. Every step is
 /// best-effort — a parse / auth / load / metadata failure drops only that table's
 /// count (logged at debug), never the whole response. A Direct-catalog source (no
-/// REST client) returns no counts.
+/// catalog) returns no counts.
 /// One table's `loadTable` outcome for the virtual-info fan-out:
 /// `(table name, summary row count if present, snapshot id, MoR-approximate?)`.
 #[cfg(feature = "iceberg")]
@@ -1688,68 +1691,30 @@ async fn fetch_virtual_table_row_counts(
     cfg: &fluree_db_iceberg::IcebergGsConfig,
     tables: &[String],
 ) -> (HashMap<String, i64>, Option<i64>, Vec<String>) {
-    use fluree_db_iceberg::catalog::{
-        parse_table_identifier, RestCatalogClient, RestCatalogConfig, SendCatalogClient,
-    };
-    use fluree_db_iceberg::config::CatalogConfig;
+    use fluree_db_iceberg::catalog::{parse_table_identifier, SendCatalogClient};
     use futures::StreamExt;
     use std::sync::Arc;
 
-    // Only a REST catalog has a client (and token) worth sharing; a Direct
-    // (table-location) source has no catalog to query for counts.
-    let CatalogConfig::Rest {
-        uri,
-        warehouse,
-        auth,
-        ..
-    } = &cfg.catalog
-    else {
-        return (HashMap::new(), None, Vec::new());
-    };
-
-    // Reuse (or warm) the process-wide REST client under the SAME cache key the
-    // scan path uses, so `/info` and query execution share one OAuth token +
-    // connection pool (see graph_source::r2rml::rest_client_cache_key).
-    let cache = fluree.r2rml_cache();
-    let client_fp =
-        crate::graph_source::rest_client_cache_key(&record.graph_source_id, &record.config);
-    let catalog: Arc<RestCatalogClient> = match cache.rest_client(&client_fp) {
-        Some(c) => c,
-        None => {
-            // Hydrate any SecretRef auth INSIDE the miss arm — after `client_fp`
-            // was computed over the raw config (same ordering discipline as the
-            // scan path). Best-effort: a resolver failure just omits counts, like
-            // every other failure in this display-only path.
-            let hydrated_auth = match auth.hydrate(fluree.secret_resolver()).await {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: auth secret resolution failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            };
-            let auth_provider = match hydrated_auth.create_provider_arc() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            };
-            let catalog_config = RestCatalogConfig {
-                uri: uri.clone(),
-                warehouse: warehouse.clone(),
-                ..Default::default()
-            };
-            match RestCatalogClient::new(catalog_config, auth_provider) {
-                Ok(client) => {
-                    let client = Arc::new(client);
-                    cache.put_rest_client(client_fp, Arc::clone(&client));
-                    client
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            }
+    // Every catalog-backed source (REST, AWS Glue, AWS S3 Tables) is counted
+    // through the SAME process-wide client the scan path uses
+    // (graph_source::shared_catalog_client, keyed by catalog_client_cache_key), so
+    // `/info` and query execution share one OAuth token / SDK client + connection
+    // pool, warmed by whichever runs first. A Direct (table-location) source has no
+    // catalog to ask. Best-effort: a client that cannot be built just omits counts,
+    // like every other failure in this display-only path.
+    let catalog = match crate::graph_source::shared_catalog_client(
+        fluree,
+        &record.graph_source_id,
+        &record.config,
+        cfg,
+    )
+    .await
+    {
+        Ok(Some(catalog)) => catalog,
+        Ok(None) => return (HashMap::new(), None, Vec::new()),
+        Err(e) => {
+            tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
+            return (HashMap::new(), None, Vec::new());
         }
     };
 
@@ -1767,7 +1732,7 @@ async fn fetch_virtual_table_row_counts(
                     let id = parse_table_identifier(&table).ok()?;
                     let api_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
                     let catalog_table_id = api_id.to_catalog();
-                    let load = match SendCatalogClient::load_table(
+                    let mut load = match SendCatalogClient::load_table(
                         &*catalog,
                         &catalog_table_id,
                         vended,
@@ -1780,7 +1745,20 @@ async fn fetch_virtual_table_row_counts(
                             return None;
                         }
                     };
-                    let metadata = load.metadata.as_ref()?;
+                    // Inline (REST), else the caches a query filled, else one read of
+                    // the metadata file (Glue / S3 Tables return a location only).
+                    let metadata = match crate::graph_source::catalog_table_metadata(
+                        fluree, cfg, &mut load,
+                    )
+                    .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::debug!(table = %table, error = %e, "virtual ledger-info: table metadata unreadable; count omitted");
+                            return None;
+                        }
+                    };
+                    let metadata = metadata.as_ref();
                     // MoR rider (F-AUD-1): the snapshot-summary `total-records` this
                     // count derives from OVER-COUNTS a merge-on-read table (it does not
                     // subtract position/equality deletes, which Fluree recognizes but
@@ -1880,9 +1858,22 @@ async fn build_iceberg_virtual_info(
             CatalogConfig::Direct { table_location } => {
                 meta.table_location = Some(table_location.clone());
             }
+            CatalogConfig::Glue { .. } => {
+                meta.catalog_type = Some("glue".to_string());
+                meta.catalog_uri = Some(cfg.catalog.catalog_label().to_string());
+            }
+            CatalogConfig::S3Tables { .. } => {
+                meta.catalog_type = Some("s3tables".to_string());
+                meta.catalog_uri = Some(cfg.catalog.catalog_label().to_string());
+            }
         }
+        // A mapped source's own `table` may be the placeholder a mapping-defined
+        // source records; its tables are the mapping's, so never list (or ask the
+        // catalog about) the placeholder.
         let id = cfg.table.identifier();
-        if !id.is_empty() && !tables.contains(&id) {
+        let placeholder =
+            cfg.mapping.is_some() && id == fluree_db_iceberg::config::MAPPING_DEFINED_TABLE;
+        if !id.is_empty() && !placeholder && !tables.contains(&id) {
             tables.push(id);
         }
     }
@@ -2848,6 +2839,21 @@ mod tests {
         assert_eq!(datatype_display_string(14), "rdf:langString");
         assert_eq!(datatype_display_string(38), "@vector");
         assert_eq!(datatype_display_string(39), "@fulltext");
+    }
+
+    #[test]
+    fn ledger_block_uses_live_watermarks_instead_of_saved_nameservice_record() {
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("info-watermarks:main");
+        snapshot.t = 1;
+        let mut novelty = fluree_db_novelty::Novelty::new(1);
+        novelty.t = 2;
+        let mut ledger = LedgerState::new(snapshot, novelty);
+        ledger.ns_record = Some(NsRecord::new("info-watermarks:main"));
+
+        let block = build_ledger_block(&ledger, &IndexStats::default());
+        assert_eq!(block.t, Some(2));
+        assert_eq!(block.commit_t, Some(2));
+        assert_eq!(block.index_t, Some(1));
     }
 
     #[test]

@@ -18,6 +18,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
 use crate::format::FormatterConfig;
+use crate::query::connection::FormatTarget;
+#[cfg(feature = "iceberg")]
 use crate::query::helpers::parse_dataset_spec;
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -120,6 +122,10 @@ impl<'a> QueryCore<'a> {
 
     pub(crate) fn set_execution_options(&mut self, options: QueryExecutionOptions) {
         self.execution = options;
+    }
+
+    pub(crate) fn set_params(&mut self, params: fluree_db_sparql::ParamMap) {
+        self.execution = std::mem::take(&mut self.execution).with_params(params);
     }
 
     #[cfg(feature = "iceberg")]
@@ -232,6 +238,12 @@ impl<'a> ViewQueryBuilder<'a> {
         self
     }
 
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
@@ -330,14 +342,9 @@ impl<'a> ViewQueryBuilder<'a> {
                     .await?
             }
         };
-        match self.view.policy() {
-            Some(policy) => Ok(result
-                .format_async_with_policy(self.view.as_graph_db_ref(), &format_config, policy)
-                .await?),
-            None => Ok(result
-                .format_async(self.view.as_graph_db_ref(), &format_config)
-                .await?),
-        }
+        Ok(result
+            .format_async_for_view(self.view, &format_config)
+            .await?)
     }
 
     /// Execute and return formatted string output.
@@ -512,6 +519,12 @@ impl<'a> DatasetQueryBuilder<'a> {
         self
     }
 
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
@@ -610,14 +623,9 @@ impl<'a> DatasetQueryBuilder<'a> {
 
         // Use primary view's db for formatting
         if let Some(primary) = self.dataset.primary() {
-            match primary.policy() {
-                Some(policy) => Ok(result
-                    .format_async_with_policy(primary.as_graph_db_ref(), &format_config, policy)
-                    .await?),
-                None => Ok(result
-                    .format_async(primary.as_graph_db_ref(), &format_config)
-                    .await?),
-            }
+            Ok(result
+                .format_async_for_view(primary, &format_config)
+                .await?)
         } else {
             Err(ApiError::query("No primary view in dataset for formatting"))
         }
@@ -879,6 +887,12 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
@@ -917,12 +931,13 @@ impl<'a> FromQueryBuilder<'a> {
     /// / inline policy) that should be resolved into a `PolicyContext`
     /// *internally*, against the query's own resolved dataset.
     ///
-    /// This is the policy channel for **SPARQL** sub-queries, which have no
-    /// body `opts` block to carry identity/policy the way JSON-LD does. When
-    /// set and the input is SPARQL, execution routes through
+    /// This is the programmatic policy channel for **SPARQL**, which carries
+    /// only the pragma subset of JSON-LD's body `opts` (no inline `policy`
+    /// document). When set and the input is SPARQL, execution routes through
     /// `query_connection_sparql_with_opts` (mirroring JSON-LD's
-    /// `query_connection` opts→policy path). For JSON-LD input it is a no-op
-    /// — JSON-LD carries its opts in the body. Takes precedence over
+    /// `query_connection` opts→policy path), and the request's own
+    /// `# PRAGMA` policy selection is not consulted. For JSON-LD input it is a
+    /// no-op — JSON-LD carries its opts in the body. Takes precedence over
     /// [`Self::policy`] when both are set.
     pub fn connection_opts(mut self, opts: GovernanceOptions) -> Self {
         self.connection_opts = Some(opts);
@@ -944,6 +959,7 @@ impl<'a> FromQueryBuilder<'a> {
     }
 
     fn prepare_authorization(&mut self) -> Result<Option<JsonValue>> {
+        self.adopt_sparql_pragma_policy();
         let Some(authorization) = self.authorization else {
             return Ok(None);
         };
@@ -960,6 +976,22 @@ impl<'a> FromQueryBuilder<'a> {
             Ok(Some(json))
         } else {
             Ok(None)
+        }
+    }
+
+    /// A SPARQL request's policy pragmas stand in for the body `opts` it has
+    /// no room for, unless the caller chose policy programmatically. Under
+    /// [`Self::authorization`] they are constrained like any request selection.
+    fn adopt_sparql_pragma_policy(&mut self) {
+        if self.connection_opts.is_some() || self.policy.is_some() {
+            return;
+        }
+        if let Some(QueryInput::Sparql(sparql)) = self.core.input {
+            let mut opts = GovernanceOptions::from_sparql(sparql);
+            if opts.has_any_policy_inputs() {
+                opts.server_identity = self.core.execution.server_identity.clone();
+                self.connection_opts = Some(opts);
+            }
         }
     }
 
@@ -1137,7 +1169,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1159,42 +1191,39 @@ impl<'a> FromQueryBuilder<'a> {
             QueryInput::JsonLd(json) => {
                 let policy = self.policy.as_deref();
                 let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
-                let (result, dataset) = self
+                let (result, target) = self
                     .fluree
-                    .query_connection_jsonld_returning_dataset_with_options(
+                    .query_connection_jsonld_returning_target_with_options(
                         json,
                         policy,
                         r2rml_pair,
                         execution.clone(),
                     )
                     .await?;
-                match dataset {
+                match target {
                     // Multi-ledger: format hydration per home-ledger view so
                     // cross-graph IRIs/properties decode correctly (issue #1259).
-                    Some(dataset) => Ok(crate::format::format_results_async_dataset(
+                    FormatTarget::Dataset(dataset) => {
+                        Ok(crate::format::format_results_async_dataset(
+                            &result,
+                            &result.context,
+                            &dataset,
+                            &format_config,
+                            None,
+                        )
+                        .await?)
+                    }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => Ok(crate::format::format_results_async(
                         &result,
                         &result.context,
-                        &dataset,
+                        view.as_graph_db_ref(),
                         &format_config,
+                        view.policy(),
                         None,
                     )
                     .await?),
-                    // Single-ledger: format against the sole view (today's path).
-                    None => {
-                        let (spec, _) = parse_dataset_spec(json)?;
-                        let alias = spec
-                            .default_graphs
-                            .first()
-                            .or_else(|| spec.named_graphs.first())
-                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self
-                            .fluree
-                            .db_or_graph_source(alias.identifier.as_str())
-                            .await?;
-                        Ok(result
-                            .format_async(view.as_graph_db_ref(), &format_config)
-                            .await?)
-                    }
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1239,7 +1268,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
                 if let Some(alias) = spec
                     .default_graphs
@@ -1310,7 +1339,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1338,48 +1367,39 @@ impl<'a> FromQueryBuilder<'a> {
             QueryInput::JsonLd(json) => {
                 let policy = self.policy.as_deref();
                 let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
-                let (result, dataset) = self
+                let (result, target) = self
                     .fluree
-                    .query_connection_jsonld_returning_dataset_with_options(
+                    .query_connection_jsonld_returning_target_with_options(
                         json,
                         policy,
                         r2rml_pair,
                         execution.clone(),
                     )
                     .await?;
-                match dataset {
+                match target {
                     // Multi-ledger: dataset-aware string formatting (issue #1259).
-                    Some(dataset) => crate::format::format_results_string_async_dataset(
-                        &result,
-                        &result.context,
-                        &dataset,
-                        &format_config,
-                        None,
-                    )
-                    .await
-                    .map_err(ApiError::from),
-                    // Single-ledger: format against the sole view (today's path).
-                    None => {
-                        let (spec, _) = parse_dataset_spec(json)?;
-                        let alias = spec
-                            .default_graphs
-                            .first()
-                            .or_else(|| spec.named_graphs.first())
-                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self
-                            .fluree
-                            .db_or_graph_source(alias.identifier.as_str())
-                            .await?;
-                        crate::format::format_results_string_async(
+                    FormatTarget::Dataset(dataset) => {
+                        crate::format::format_results_string_async_dataset(
                             &result,
                             &result.context,
-                            view.as_graph_db_ref(),
+                            &dataset,
                             &format_config,
                             None,
                         )
                         .await
                         .map_err(ApiError::from)
                     }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => crate::format::format_results_string_async(
+                        &result,
+                        &result.context,
+                        view.as_graph_db_ref(),
+                        &format_config,
+                        view.policy(),
+                    )
+                    .await
+                    .map_err(ApiError::from),
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1424,7 +1444,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
                 if let Some(alias) = spec
                     .default_graphs

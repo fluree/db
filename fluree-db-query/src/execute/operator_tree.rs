@@ -46,7 +46,7 @@ use crate::having::HavingOperator;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, InputSemantics, PathModifier,
-    Pattern, Query, QueryOutput,
+    Pattern, Query, QueryOutput, UngroupedProjection,
 };
 use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
@@ -431,9 +431,15 @@ fn extract_simple_numeric_compare_threshold(
     if args.len() != 2 {
         return None;
     }
+    // Long/Double, plus exact integer (BigInt) and decimal constants — the
+    // numeric-compare fast paths now encode all of these into the matching
+    // order-preserving key space, so `FILTER(?v > 0.1)` and `FILTER(?n > big)`
+    // can take the pushdown rather than always deferring to the general scan.
     let const_to_flake = |c: &FlakeValue| match c {
         FlakeValue::Long(n) => Some(fluree_db_core::FlakeValue::Long(*n)),
         FlakeValue::Double(d) => Some(fluree_db_core::FlakeValue::Double(*d)),
+        FlakeValue::Decimal(d) => Some(fluree_db_core::FlakeValue::Decimal(d.clone())),
+        FlakeValue::BigInt(b) => Some(fluree_db_core::FlakeValue::BigInt(b.clone())),
         _ => None,
     };
     let direct_op = match *func {
@@ -595,8 +601,9 @@ fn extract_regex_const_pattern(
 /// inspect the spec's function/distinct/input_var fields.
 fn implicit_single_aggregate(query: &Query) -> Option<&AggregateSpec> {
     let Some(Grouping::Implicit {
-        aggregation: Aggregation { aggregates, binds },
+        aggregation: Aggregation { aggregates },
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -728,8 +735,9 @@ fn detect_predicate_group_by_object_count_topk(
     // GROUP BY ?object with exactly one aggregate, no HAVING.
     let Some(Grouping::Explicit {
         group_by,
-        aggregation: Some(Aggregation { aggregates, binds }),
+        aggregation: Some(Aggregation { aggregates }),
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -756,6 +764,15 @@ fn detect_predicate_group_by_object_count_topk(
     }
     let ob = &query.ordering[0];
     if ob.var != agg.output_var || ob.direction != crate::sort::SortDirection::Descending {
+        return None;
+    }
+    // The operator outputs the key and the count only: a projection of
+    // anything else (a JSON-LD per-group list of the subjects) declines.
+    let select_vars = query.output.projected_vars()?;
+    if select_vars
+        .iter()
+        .any(|v| *v != o_var && *v != agg.output_var)
+    {
         return None;
     }
     Some((pred, s_var, o_var, agg.output_var, limit))
@@ -789,8 +806,9 @@ fn detect_group_by_object_star_topk(
     let select_vars: Arc<[VarId]> = Arc::from(query.output.projected_vars()?.into_boxed_slice());
     let Some(Grouping::Explicit {
         group_by,
-        aggregation: Some(Aggregation { aggregates, binds }),
+        aggregation: Some(Aggregation { aggregates }),
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -993,12 +1011,11 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
     // shape that the outer SUM(STRLEN(?cat)) fast-path is keyed against.
     let Some(Grouping::Explicit {
         group_by: sq_group_by,
-        aggregation:
-            Some(Aggregation {
-                aggregates: sq_aggregates,
-                binds: sq_binds,
-            }),
+        aggregation: Some(Aggregation {
+            aggregates: sq_aggregates,
+        }),
         having: None,
+        binds: sq_binds,
     }) = &sq.grouping
     else {
         return None;
@@ -1744,8 +1761,9 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     // aggregate, no HAVING.
     let Some(Grouping::Explicit {
         group_by,
-        aggregation: Some(Aggregation { aggregates, binds }),
+        aggregation: Some(Aggregation { aggregates }),
         having: None,
+        binds,
     }) = &query.grouping
     else {
         return None;
@@ -1767,6 +1785,15 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
 
     // No post-aggregation binds (for simplicity)
     if !binds.is_empty() {
+        return None;
+    }
+    // The operator outputs the predicate and the count only: a projection of
+    // anything else (a JSON-LD per-group list) declines.
+    let select_vars = query.output.projected_vars()?;
+    if select_vars
+        .iter()
+        .any(|v| *v != *p_var && *v != agg.output_var)
+    {
         return None;
     }
 
@@ -2243,7 +2270,9 @@ fn detect_union_star_count_all(
 /// query with fast paths on and off and asserts identical results, and as
 /// an operational escape hatch when triaging a suspected fast-path bug.
 /// It is NOT a tuning knob: runtime operator-internal optimizations
-/// (cursor selection, batched joins) are unaffected.
+/// (cursor selection, fixed-predicate batched joins) are unaffected. The
+/// wildcard-predicate join, independent-scan replay and independent-join count
+/// lanes also honor this switch for differential tests.
 static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -2277,7 +2306,47 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
-    let planning = &planning.with_unmatched_optional(query.unmatched_optional);
+    // A small, unordered prefix benefits from streaming joins even when
+    // DISTINCT or FILTER prevents forwarding a source row budget. Restrict
+    // this startup hint to a simple join block; aggregates, sorting and
+    // compound patterns keep their existing throughput-oriented plans.
+    // Recompute at every query root so a subquery cannot inherit the hint.
+    let row_goal = if query.grouping.is_none()
+        && query.ordering.is_empty()
+        && query.order_binds.is_empty()
+        && query.post_values.is_none()
+        && query.patterns.iter().all(|p| {
+            matches!(
+                p,
+                Pattern::Triple(_)
+                    | Pattern::Filter(_)
+                    | Pattern::Bind { .. }
+                    | Pattern::Values { .. }
+            )
+        }) {
+        query
+            .limit
+            .map(|limit| limit.saturating_add(query.offset.unwrap_or(0)))
+    } else {
+        None
+    };
+    // DISTINCT may exhaust a large join before producing the requested prefix.
+    // When every projected variable has a known domain and its estimated product
+    // is smaller than the goal, retain throughput planning. Sketch estimates only
+    // change the plan: they never bound how many rows execution may produce.
+    let row_goal = row_goal.filter(|&goal| {
+        if !query.output.is_distinct() {
+            return true;
+        }
+        let (Some(stats), Some(vars)) = (stats.as_deref(), query.output.projected_vars()) else {
+            return true;
+        };
+        crate::planner::estimate_projected_distinct_rows(&query.patterns, &vars, stats)
+            .is_none_or(|rows| rows >= goal as f64)
+    });
+    let planning = &planning
+        .with_unmatched_optional(query.unmatched_optional)
+        .with_row_goal(row_goal);
     // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
     // same-group filter into required triples (well-formed left-join
     // simplification), so equality/range pushdown and selectivity estimation
@@ -2362,9 +2431,7 @@ fn build_operator_tree_folds(
 /// `fluree-db-sparql`, the `"ask"` branch of the JSON-LD parser). `OFFSET`
 /// does weaken it — it counts rows off the front, so `OFFSET 5` over six
 /// duplicates is non-empty while its deduped form is empty — and is excluded.
-/// Neither surface can currently attach an offset to an ASK (SPARQL lowering
-/// discards the modifier, the JSON-LD `"ask"` branch never parses options),
-/// so the guard exists for programmatically built IR.
+/// Both surfaces attach one (SPARQL `ASK … OFFSET n`, JSON-LD `"offset"`).
 fn result_is_multiplicity_blind(query: &Query) -> bool {
     match &query.output {
         QueryOutput::Construct(template) => {
@@ -2373,6 +2440,32 @@ fn result_is_multiplicity_blind(query: &Query) -> bool {
         QueryOutput::Ask => query.offset.is_none(),
         QueryOutput::Select { .. } => false,
     }
+}
+
+/// The query with the reified-edge components nothing reads removed (see
+/// `elide_unread_term_binds`), or `None` when it has none to drop.
+fn elide_unread_term_binds_in_query(query: &Query) -> Option<Query> {
+    let deps = compute_variable_deps(query);
+    let required = deps.as_ref().map(|d| d.required_where_vars.as_slice());
+    let needed: HashSet<VarId> = match required {
+        Some(req) => req.iter().copied().collect(),
+        None => {
+            let mut counts: HashMap<VarId, usize> = HashMap::new();
+            let mut vars: HashSet<VarId> = HashSet::new();
+            collect_var_stats(&query.patterns, &mut counts, &mut vars);
+            vars.extend(counts.keys().copied());
+            vars
+        }
+    };
+    let patterns = crate::execute::where_plan::elide_unread_term_binds(
+        &query.patterns,
+        &needed,
+        required,
+        &HashSet::new(),
+    )?;
+    let mut query = query.clone();
+    query.patterns = patterns;
+    Some(query)
 }
 
 fn build_operator_tree_inner(
@@ -2386,6 +2479,12 @@ fn build_operator_tree_inner(
     // below alike.
     let fast_paths_globally_disabled = fast_paths_disabled();
     let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // A trailing VALUES clause (`query.post_values`) joins after the WHERE
+    // tree, below grouping. Every fast path reads `query.patterns` alone, so
+    // one would answer as if the VALUES were absent (`COUNT(*) … VALUES ?a
+    // { "Net" }` counted every row). None of them applies.
+    let trailing_values = query.post_values.is_some();
+    let enable_fused_fast_paths = enable_fused_fast_paths && !trailing_values;
     // EXPLAIN seed (PR-1): record whether the kill switch suppressed the fused
     // fast-path chain at this gate. TODO(PR-3): per-detector verdicts, not one
     // aggregate chain stamp.
@@ -2412,6 +2511,18 @@ fn build_operator_tree_inner(
     // over-count a triple shared across members. Decline them and let the
     // general pipeline run over the deduplicating `DatasetOperator`.
     let enable_fused_fast_paths = enable_fused_fast_paths && !planning.multi_default_graph;
+
+    // Drop the reified-edge positions nothing reads before any fast path
+    // looks at the pattern list, so a `COUNT(*)` over `<< ?s ?p ?o >>` is the
+    // plain two-triple join the count planner handles.
+    let elided_query;
+    let query = match elide_unread_term_binds_in_query(query) {
+        Some(q) => {
+            elided_query = q;
+            &elided_query
+        }
+        None => query,
+    };
 
     // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
     // generic pipeline's dedicated post-grouping bind stage. No fast path runs
@@ -2678,7 +2789,11 @@ fn build_operator_tree_inner(
                 crate::r2rml::sql_lane::SqlAggregateOperator::new(plan, fallback),
             );
             if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
-                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+                op = Box::new(crate::having::HavingOperator::new(
+                    op,
+                    having.clone(),
+                    *planning,
+                ));
             }
             if !query.ordering.is_empty() {
                 op = Box::new(crate::sort::SortOperator::new(op, query.ordering.clone()));
@@ -2720,7 +2835,11 @@ fn build_operator_tree_inner(
             // HAVING expression sees only variables in the fused output — no
             // output trim is needed.
             if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
-                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+                op = Box::new(crate::having::HavingOperator::new(
+                    op,
+                    having.clone(),
+                    *planning,
+                ));
             }
             // The fused operator emits the final grouped result; apply ORDER BY /
             // OFFSET / LIMIT on top with the engine's own operators (exact
@@ -3003,7 +3122,7 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() && !fast_paths_globally_disabled {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
@@ -3034,7 +3153,7 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() && !fast_paths_globally_disabled {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
@@ -3088,7 +3207,11 @@ fn build_operator_tree_inner(
     // open()-time gate (`fast_path_store`) is the real guard, declining to the
     // generic fallback under overlay novelty, time-travel, a non-root policy, or
     // multi-ledger.
-    if !planning.is_history() && !fast_paths_globally_disabled && stats.is_some() {
+    if !planning.is_history()
+        && !fast_paths_globally_disabled
+        && !trailing_values
+        && stats.is_some()
+    {
         if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
             // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
             // stamps the runtime Proceed/Fallback(GateDeclined) at open().
@@ -3256,12 +3379,20 @@ fn build_operator_tree_inner(
     // Apply post-query VALUES clause after the WHERE tree is fully built.
     // This is kept separate from `patterns` so the WHERE-clause planner cannot
     // reorder it relative to OPTIONAL/UNION (which would change semantics).
-    if let Some(Pattern::Values { vars, rows }) = &query.post_values {
+    if let Some(post_values) = &query.post_values {
         operator = Box::new(crate::values::ValuesOperator::new(
             operator,
-            vars.clone(),
-            rows.clone(),
+            post_values.vars.clone(),
+            post_values.rows.clone(),
         ));
+        // The level's generated binds read the VALUES variables: they run
+        // after the join, in order, as trailing WHERE binds would.
+        for (var, expr) in &post_values.then {
+            operator = Box::new(
+                crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
+                    .with_planning(*planning),
+            );
+        }
     }
 
     // The solution-modifier tail (grouping → HAVING → post-binds → order-binds
@@ -3270,12 +3401,21 @@ fn build_operator_tree_inner(
     // `apply_solution_modifiers`, so both inherit identical modifier semantics.
     // Only the WHERE build and outermost-only concerns (post-VALUES) stay here.
     let projected = query.output.projected_vars();
+    let ordering = bindable_sort_keys(
+        &query.ordering,
+        projected.as_deref(),
+        query.grouping.as_ref(),
+        &query.order_binds,
+        &query.patterns,
+        query.post_values.as_ref(),
+    );
     apply_solution_modifiers(
         operator,
         query.grouping.as_ref(),
         &query.order_binds,
-        &query.ordering,
+        &ordering,
         projected.as_deref(),
+        query.output.ungrouped_projection(),
         query.output.is_distinct(),
         query.offset,
         query.limit,
@@ -3283,6 +3423,66 @@ fn build_operator_tree_inner(
         variable_deps.as_ref(),
         planning,
     )
+}
+
+/// The ORDER BY keys some stage of a query level can bind: its WHERE
+/// (`patterns`, a trailing VALUES), its grouping (keys, aggregate outputs,
+/// binds), its ORDER BY expressions, or a seed through its projection. A key
+/// none of them binds is unbound in every solution, so it orders nothing
+/// (an unbound key sorts the same in every row, SPARQL 1.1 §15.1): it is
+/// dropped, and `ORDER BY ?nosuch` returns the solutions unordered by it
+/// instead of failing the plan. A key some stage binds is kept, so a plan that
+/// loses one still fails the sort validation in [`apply_solution_modifiers`].
+///
+/// Borrows `ordering` unchanged in the usual case, where every key is
+/// projected, grouped or an ORDER BY expression: the WHERE is walked only for
+/// a key that is none of these.
+pub(crate) fn bindable_sort_keys<'a>(
+    ordering: &'a [SortSpec],
+    select: Option<&[VarId]>,
+    grouping: Option<&Grouping>,
+    order_binds: &[(VarId, Expression)],
+    patterns: &[Pattern],
+    post_values: Option<&crate::ir::PostValues>,
+) -> std::borrow::Cow<'a, [SortSpec]> {
+    use std::borrow::Cow;
+    let staged = |v: VarId| {
+        select.is_some_and(|s| s.contains(&v))
+            || order_binds.iter().any(|(out, _)| *out == v)
+            || grouping.is_some_and(|g| {
+                g.group_by_vars().any(|k| k == v)
+                    || g.aggregates().any(|spec| spec.output_var == v)
+                    || g.binds().any(|(out, _)| *out == v)
+            })
+    };
+    if ordering.iter().all(|spec| staged(spec.var)) {
+        return Cow::Borrowed(ordering);
+    }
+    let produced: HashSet<VarId> = crate::ir::pattern::produced_vars_of(patterns)
+        .into_iter()
+        .chain(
+            post_values
+                .into_iter()
+                .flat_map(crate::ir::PostValues::produced_vars),
+        )
+        .collect();
+    let bindable = |v: VarId| staged(v) || produced.contains(&v);
+    if ordering.iter().all(|spec| bindable(spec.var)) {
+        return Cow::Borrowed(ordering);
+    }
+    Cow::Owned(
+        ordering
+            .iter()
+            .filter(|spec| bindable(spec.var))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// A grouping-stage plan error about one variable, typed so callers holding
+/// the query's registry name the variable (`QueryError::name_variables`).
+fn grouping_var_error(var: VarId, stage: crate::ir::ReadStage) -> QueryError {
+    QueryError::UngroupedRead(crate::ir::UngroupedRead { var, stage })
 }
 
 /// Apply the SPARQL solution-modifier tail to an already-built WHERE operator.
@@ -3299,6 +3499,13 @@ fn build_operator_tree_inner(
 /// caller. `variable_deps` drives projection trimming; pass `None` to skip it.
 /// `partitioned` is the streaming-GroupAggregate partition hint (callers that
 /// don't benefit pass `false`).
+///
+/// `ungrouped` says whether the projection may read a variable the grouping
+/// does not produce (as a per-group list): only a JSON-LD top-level query may.
+/// Every other post-grouping read of such a variable — HAVING, the grouping's
+/// binds, ORDER BY, and the projection under
+/// [`UngroupedProjection::Reject`] — fails the plan here, in every build
+/// ([`Grouping::first_ungrouped_read`]). A sub-query passes `Reject`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_solution_modifiers(
     mut operator: BoxedOperator,
@@ -3306,6 +3513,7 @@ pub(crate) fn apply_solution_modifiers(
     order_binds: &[(VarId, Expression)],
     ordering: &[SortSpec],
     select_vars: Option<&[VarId]>,
+    ungrouped: UngroupedProjection,
     distinct: bool,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -3471,6 +3679,42 @@ pub(crate) fn apply_solution_modifiers(
     // Get the schema after WHERE (before grouping), including any unbound pads.
     let where_schema: Arc<[VarId]> = Arc::from(where_schema_vec.into_boxed_slice());
 
+    // After grouping, a variable the WHERE binds but the grouping neither keys,
+    // aggregates nor binds is a per-group list. Only a JSON-LD top-level
+    // projection may read one; any other read (HAVING, a SELECT expression, an
+    // ORDER BY key or expression, a projection under `Reject`) fails the plan,
+    // in every build — a sub-query can never return such a list. The error
+    // carries the variable's id; callers holding the query's registry name it
+    // (`QueryError::name_variables`).
+    if let Some(g) = grouping {
+        if let Some(read) =
+            g.first_ungrouped_read(&where_schema, order_binds, ordering, select_vars, ungrouped)
+        {
+            return Err(QueryError::UngroupedRead(read));
+        }
+    }
+    // With no per-group list allowed out, the grouping carries only what its own
+    // stages read: keys and aggregate inputs into the aggregation, keys and
+    // aggregate outputs out of it. Dependency trimming already does this when it
+    // applies; a sub-query (no dependency sets) used to carry every WHERE column
+    // through the traditional lane as a list.
+    let reject_trim = ungrouped == UngroupedProjection::Reject && variable_deps.is_none();
+    let groupby_trim: Option<Vec<VarId>> = reject_trim.then(|| {
+        let mut vars = group_by_vec.clone();
+        for spec in &aggregates_vec {
+            match &spec.function {
+                AggregateFn::CountDistinctAll(visible) => vars.extend(visible.iter().copied()),
+                other => vars.extend(other.input_var()),
+            }
+        }
+        vars
+    });
+    let aggregate_trim: Option<Vec<VarId>> = reject_trim.then(|| {
+        let mut vars = group_by_vec.clone();
+        vars.extend(aggregates_vec.iter().map(|spec| spec.output_var));
+        vars
+    });
+
     // GROUP BY + Aggregates
     // We use streaming GroupAggregateOperator when all aggregates are streamable
     // (COUNT, SUM, AVG, MIN, MAX). This is O(groups) memory instead of O(rows).
@@ -3493,27 +3737,28 @@ pub(crate) fn apply_solution_modifiers(
         for spec in &aggregates_vec {
             if let Some(input_var) = spec.function.input_var() {
                 if !current_schema.contains(&input_var) {
-                    return Err(QueryError::VariableNotFound(format!(
-                        "Aggregate input variable {input_var:?} not found in schema"
-                    )));
+                    return Err(grouping_var_error(
+                        input_var,
+                        crate::ir::ReadStage::UnboundAggregateInput,
+                    ));
                 }
                 if spec.output_var != input_var && current_schema.contains(&spec.output_var) {
-                    return Err(QueryError::InvalidQuery(format!(
-                        "Aggregate output variable {:?} already exists in schema",
-                        spec.output_var
-                    )));
+                    return Err(grouping_var_error(
+                        spec.output_var,
+                        crate::ir::ReadStage::BoundAggregateOutput,
+                    ));
                 }
             } else if current_schema.contains(&spec.output_var) {
-                return Err(QueryError::InvalidQuery(format!(
-                    "Aggregate output variable {:?} already exists in schema",
-                    spec.output_var
-                )));
+                return Err(grouping_var_error(
+                    spec.output_var,
+                    crate::ir::ReadStage::BoundAggregateOutput,
+                ));
             }
             if !seen_output_vars.insert(spec.output_var) {
-                return Err(QueryError::InvalidQuery(format!(
-                    "Duplicate aggregate output variable {:?}",
-                    spec.output_var
-                )));
+                return Err(grouping_var_error(
+                    spec.output_var,
+                    crate::ir::ReadStage::RepeatedAggregateOutput,
+                ));
             }
         }
 
@@ -3535,26 +3780,44 @@ pub(crate) fn apply_solution_modifiers(
             .collect();
 
         // The streaming GroupAggregateOperator only outputs GROUP BY keys + aggregate outputs.
-        // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
-        // we must use the traditional GroupByOperator path so those vars become
-        // `Binding::Grouped(Vec<Binding>)` and remain selectable. Post-aggregation
-        // bind outputs (e.g. `(count(a)+count(b)) AS total`) are NOT grouped
-        // passthroughs — they are computed by a downstream BindOperator — so they
-        // must not force the traditional path (which would drop the row when the
-        // bind's aggregate inputs aren't themselves projected).
-        let select_needs_grouped_vars = select_vars.is_some_and(|vars| {
-            vars.iter().any(|v| {
-                !group_by_vec.contains(v)
-                    && !aggregates_vec.iter().any(|a| a.output_var == *v)
-                    && !post_binds_vec.iter().any(|(out, _)| out == v)
-            })
-        });
+        // If a JSON-LD top-level SELECT projects a *grouped* variable (non-key,
+        // non-aggregate), the traditional GroupByOperator path must run so it
+        // becomes a `Binding::Grouped(Vec<Binding>)` list. Every other surface
+        // rejected that projection above. Post-aggregation bind outputs (e.g.
+        // `(count(a)+count(b)) AS total`) are NOT grouped passthroughs — they are
+        // computed by a downstream BindOperator — so they never force the
+        // traditional path.
+        let select_needs_grouped_vars = ungrouped == UngroupedProjection::PerGroupList
+            && select_vars.is_some_and(|vars| {
+                vars.iter().any(|v| {
+                    where_schema.contains(v)
+                        && !group_by_vec.contains(v)
+                        && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                        && !post_binds_vec.iter().any(|(out, _)| out == v)
+                })
+            });
 
         let use_streaming = !aggregates_vec.is_empty()
             && GroupAggregateOperator::all_streamable(&streaming_specs)
             && !select_needs_grouped_vars;
 
         if use_streaming {
+            // COUNT(DISTINCT) already deduplicates its input within each group.
+            // A DISTINCT directly below it repeats that work across the full
+            // group/input tuple. Remove only this terminal wrapper: earlier
+            // dedup between joins still limits fan-out. Mixed aggregates and
+            // grouped-list output retain their original multiplicities.
+            if aggregates_vec.iter().all(|spec| {
+                matches!(
+                    spec.function,
+                    AggregateFn::CountDistinct(_) | AggregateFn::CountDistinctAll(_)
+                )
+            }) {
+                if let Some(input) = operator.take_distinct_input() {
+                    operator = input;
+                    tracing::debug!("elided terminal DISTINCT before distinct counts");
+                }
+            }
             // Streaming path: O(groups) memory
             tracing::debug!(
                 group_by_count = group_by_vec.len(),
@@ -3584,7 +3847,8 @@ pub(crate) fn apply_solution_modifiers(
                 GroupByOperator::new(operator, group_by_vec.clone()).with_out_schema(
                     variable_deps
                         .as_ref()
-                        .map(|d| d.required_groupby_vars.as_slice()),
+                        .map(|d| d.required_groupby_vars.as_slice())
+                        .or(groupby_trim.as_deref()),
                 ),
             );
             if !aggregates_vec.is_empty() {
@@ -3592,27 +3856,25 @@ pub(crate) fn apply_solution_modifiers(
                     AggregateOperator::new(operator, aggregates_vec.clone()).with_out_schema(
                         variable_deps
                             .as_ref()
-                            .map(|d| d.required_aggregate_vars.as_slice()),
+                            .map(|d| d.required_aggregate_vars.as_slice())
+                            .or(aggregate_trim.as_deref()),
                     ),
                 );
             }
         }
     }
 
-    // HAVING (filter on aggregated results)
-    if let Some(expr) = having_expr {
-        operator = Box::new(
-            HavingOperator::new(operator, expr.clone()).with_out_schema(
-                variable_deps
-                    .as_ref()
-                    .map(|d| d.required_having_vars.as_slice()),
-            ),
-        );
-    }
-
-    // Post-aggregation BINDs (e.g., SELECT (CEIL(?avg) AS ?ceil))
-    if !post_binds_vec.is_empty() {
+    // Post-aggregation BINDs (e.g., SELECT (CEIL(?avg) AS ?ceil)): the ones
+    // HAVING reads run before it, the rest after it
+    // (`Grouping::binds_before_having`), each once per group.
+    let before_having: Vec<bool> = grouping
+        .map(Grouping::binds_before_having)
+        .unwrap_or_default();
+    let apply_binds = |mut operator: BoxedOperator, before: bool| -> BoxedOperator {
         for (i, (var, expr)) in post_binds_vec.iter().enumerate() {
+            if before_having.get(i).copied().unwrap_or(false) != before {
+                continue;
+            }
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
                     .with_planning(*planning)
@@ -3624,7 +3886,22 @@ pub(crate) fn apply_solution_modifiers(
                     ),
             );
         }
+        operator
+    };
+    operator = apply_binds(operator, true);
+
+    // HAVING (filter on aggregated results)
+    if let Some(expr) = having_expr {
+        operator = Box::new(
+            HavingOperator::new(operator, expr.clone(), *planning).with_out_schema(
+                variable_deps
+                    .as_ref()
+                    .map(|d| d.required_having_vars.as_slice()),
+            ),
+        );
     }
+
+    operator = apply_binds(operator, false);
 
     // Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)`).
     //
@@ -3634,32 +3911,10 @@ pub(crate) fn apply_solution_modifiers(
     // For ungrouped queries this is simply a post-WHERE stage. This placement is
     // what makes expression ORDER BY work uniformly across no-grouping,
     // dedup-only GROUP BY (no aggregation stage), and aggregating queries.
+    // Under grouping, an order-key expression reads only keys, aggregate
+    // outputs and bind outputs: `first_ungrouped_read` rejected the plan above
+    // otherwise.
     if !order_binds.is_empty() {
-        // Under grouping, an order-key expression may only read GROUP BY keys,
-        // aggregate outputs, and post-aggregation bind outputs. Referencing any
-        // other variable means it is `Binding::Grouped` here — reject cleanly
-        // rather than evaluating the bind over a grouped binding (which panics
-        // in `eval`), matching how bare `ORDER BY ?groupedVar` is rejected.
-        if needs_grouping {
-            let mut allowed: HashSet<VarId> = group_by_vec.iter().copied().collect();
-            for spec in &aggregates_vec {
-                allowed.insert(spec.output_var);
-            }
-            for (var, _) in &post_binds_vec {
-                allowed.insert(*var);
-            }
-            for (out_var, expr) in order_binds {
-                for v in expr.referenced_vars() {
-                    if !allowed.contains(&v) {
-                        return Err(QueryError::InvalidQuery(format!(
-                            "ORDER BY expression references variable {v:?}, which is not a GROUP BY key or aggregate result"
-                        )));
-                    }
-                }
-                // A later order bind may legitimately reference an earlier one.
-                allowed.insert(*out_var);
-            }
-        }
         for (var, expr) in order_binds {
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
@@ -3686,59 +3941,27 @@ pub(crate) fn apply_solution_modifiers(
         && select_vars
             .is_some_and(|vars| !vars.is_empty() && ordering.iter().all(|s| vars.contains(&s.var)));
 
-    // Validate SELECT vars (when present) exist in the post-group schema.
+    // Validate SELECT vars (when present) exist in the post-group schema. An
+    // ungrouped query padded its unbound SELECT vars above, so a miss here is
+    // a grouped projection of a variable nothing binds: a client error, typed
+    // so the API names the variable.
     if let Some(vars) = select_vars {
-        if !vars.is_empty() {
-            for var in vars {
-                if !post_group_schema.contains(var) {
-                    return Err(QueryError::VariableNotFound(format!(
-                        "Selected variable {var:?} not found in query schema"
-                    )));
-                }
-            }
+        if let Some(var) = vars.iter().find(|var| !post_group_schema.contains(var)) {
+            return Err(QueryError::UngroupedRead(crate::ir::UngroupedRead {
+                var: *var,
+                stage: crate::ir::ReadStage::UnboundProjection,
+            }));
         }
     }
 
-    // Validate ORDER BY vars exist in the post-group schema and are allowed under grouping.
-    if !ordering.is_empty() {
-        // Disallow sorting on Grouped variables (non-key, non-aggregated) because comparison is undefined.
-        let mut allowed_sort_vars: Option<HashSet<VarId>> = None;
-        if needs_grouping {
-            let mut allowed = HashSet::new();
-            for v in &group_by_vec {
-                allowed.insert(*v);
-            }
-            for spec in &aggregates_vec {
-                allowed.insert(spec.output_var);
-            }
-            // Post-aggregation binds (SELECT expressions like `(CEIL(?avg) AS
-            // ?c)`) are per-group scalars computed after aggregation — they are
-            // valid sort keys.
-            for (var, _) in &post_binds_vec {
-                allowed.insert(*var);
-            }
-            // Desugared expression-ORDER-BY keys run as a post-grouping stage
-            // and are validated above to read only allowed vars.
-            for (var, _) in order_binds {
-                allowed.insert(*var);
-            }
-            allowed_sort_vars = Some(allowed);
-        }
-        for spec in ordering {
-            if !post_group_schema.contains(&spec.var) {
-                return Err(QueryError::VariableNotFound(format!(
-                    "Sort variable {:?} not found in query schema",
-                    spec.var
-                )));
-            }
-            if let Some(ref allowed) = allowed_sort_vars {
-                if !allowed.contains(&spec.var) {
-                    return Err(QueryError::InvalidQuery(format!(
-                        "Cannot ORDER BY variable {:?} because it is grouped (non-key, non-aggregate)",
-                        spec.var
-                    )));
-                }
-            }
+    // Validate ORDER BY vars exist in the post-group schema. (A sort key
+    // reading a per-group list was rejected by `first_ungrouped_read` above.)
+    for spec in ordering {
+        if !post_group_schema.contains(&spec.var) {
+            return Err(QueryError::VariableNotFound(format!(
+                "Sort variable {:?} not found in query schema",
+                spec.var
+            )));
         }
     }
 
@@ -3865,6 +4088,282 @@ mod tests {
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
+    #[tokio::test]
+    async fn distinct_counts_remove_only_the_terminal_distinct() {
+        use crate::binding::{Batch, Binding};
+        use crate::context::ExecutionContext;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+
+        fn distincts(node: &crate::plan_node::PlanNode) -> usize {
+            usize::from(node.op == "DistinctOperator")
+                + node
+                    .children
+                    .iter()
+                    .map(|c| distincts(&c.node))
+                    .sum::<usize>()
+        }
+
+        let value = VarId(0);
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        for planning in [PlanningContext::current(), PlanningContext::history()] {
+            for (functions, removes) in [
+                (vec![AggregateFn::CountDistinct(value)], true),
+                (vec![AggregateFn::CountDistinctAll(vec![value])], true),
+                (vec![AggregateFn::CountAll], false),
+                (vec![AggregateFn::Count(value)], false),
+                (
+                    vec![AggregateFn::CountDistinct(value), AggregateFn::CountAll],
+                    false,
+                ),
+            ] {
+                // If removal leaks through LIMIT, [1,1,2] LIMIT 2 collapses
+                // to one value. The inner DISTINCT must first produce [1,2].
+                for limited in [false, true] {
+                    let batch = Batch::new(
+                        Arc::from(vec![value].into_boxed_slice()),
+                        vec![vec![1, 1, 2]
+                            .into_iter()
+                            .map(|n| Binding::lit(FlakeValue::Long(n), Sid::xsd_integer()))
+                            .collect()],
+                    )
+                    .unwrap();
+                    let mut input: BoxedOperator = Box::new(DistinctOperator::new(Box::new(
+                        BatchSeedOperator::from_batch(batch),
+                    )));
+                    if limited {
+                        input = Box::new(DistinctOperator::new(Box::new(LimitOperator::new(
+                            input, 2,
+                        ))));
+                    }
+                    let outputs: Vec<VarId> =
+                        (1..=functions.len()).map(|i| VarId(i as u16)).collect();
+                    let grouping = Grouping::assemble(
+                        vec![],
+                        functions
+                            .iter()
+                            .cloned()
+                            .zip(&outputs)
+                            .map(|(function, &output_var)| AggregateSpec {
+                                function,
+                                output_var,
+                            })
+                            .collect(),
+                        vec![],
+                        None,
+                    )
+                    .expect("valid grouping");
+                    let mut op = apply_solution_modifiers(
+                        input,
+                        grouping.as_ref(),
+                        &[],
+                        &[],
+                        Some(&outputs),
+                        UngroupedProjection::Reject,
+                        false,
+                        None,
+                        None,
+                        false,
+                        None,
+                        &planning,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        distincts(&op.describe()),
+                        usize::from(!removes) + usize::from(limited)
+                    );
+                    op.open(&ctx).await.unwrap();
+                    let batch = op.next_batch(&ctx).await.unwrap().unwrap();
+                    assert_eq!(batch.len(), 1);
+                    for col in 0..outputs.len() {
+                        assert_eq!(
+                            batch.get_by_col(0, col),
+                            &Binding::lit(FlakeValue::Long(2), Sid::xsd_integer()),
+                        );
+                    }
+                    assert!(op.next_batch(&ctx).await.unwrap().is_none());
+                    op.close();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_count_with_grouped_list_keeps_terminal_distinct() {
+        use crate::binding::{Batch, Binding};
+        use crate::context::ExecutionContext;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+
+        let value = VarId(0);
+        let count = VarId(1);
+        let one = Binding::lit(FlakeValue::Long(1), Sid::xsd_integer());
+        let two = Binding::lit(FlakeValue::Long(2), Sid::xsd_integer());
+        let batch = Batch::new(
+            Arc::from(vec![value].into_boxed_slice()),
+            vec![vec![one.clone(), one.clone(), two.clone()]],
+        )
+        .unwrap();
+        let input = Box::new(DistinctOperator::new(Box::new(
+            BatchSeedOperator::from_batch(batch),
+        )));
+        let grouping = Grouping::assemble(
+            vec![],
+            vec![AggregateSpec {
+                function: AggregateFn::CountDistinct(value),
+                output_var: count,
+            }],
+            vec![],
+            None,
+        )
+        .expect("valid grouping");
+        // The per-group list of `value` is a JSON-LD top-level projection.
+        let mut op = apply_solution_modifiers(
+            input,
+            grouping.as_ref(),
+            &[],
+            &[],
+            Some(&[value, count]),
+            UngroupedProjection::PerGroupList,
+            false,
+            None,
+            None,
+            false,
+            None,
+            &PlanningContext::current(),
+        )
+        .unwrap();
+        let plan = serde_json::to_string(&op.describe()).unwrap();
+        assert!(
+            plan.contains("GroupByOperator") && plan.contains("DistinctOperator"),
+            "{plan}"
+        );
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        op.open(&ctx).await.unwrap();
+        let batch = op.next_batch(&ctx).await.unwrap().unwrap();
+        assert_eq!(
+            batch.get_by_col(0, 0),
+            &Binding::Grouped(vec![one, two.clone()])
+        );
+        assert_eq!(batch.get_by_col(0, 1), &two);
+        op.close();
+    }
+
+    /// The plan-time check holds without dependency sets (the sub-query
+    /// pipeline passes none): HAVING, a grouping bind, ORDER BY and a `Reject`
+    /// projection may not read a WHERE variable the grouping does not produce.
+    /// A `PerGroupList` projection (JSON-LD top level) may.
+    #[test]
+    fn solution_modifiers_reject_ungrouped_reads_without_dependency_sets() {
+        use crate::binding::{Batch, Binding};
+        use crate::seed::BatchSeedOperator;
+        use fluree_db_core::FlakeValue;
+
+        let (key, other, n, bound) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let lit = |i| Binding::lit(FlakeValue::Long(i), Sid::xsd_integer());
+        let input = || -> BoxedOperator {
+            let batch = Batch::new(
+                Arc::from(vec![key, other].into_boxed_slice()),
+                vec![vec![lit(1), lit(1)], vec![lit(2), lit(3)]],
+            )
+            .unwrap();
+            Box::new(BatchSeedOperator::from_batch(batch))
+        };
+        let count = || AggregateSpec {
+            function: AggregateFn::Count(other),
+            output_var: n,
+        };
+        let plan = |grouping: &Grouping,
+                    ordering: &[SortSpec],
+                    select: &[VarId],
+                    ungrouped: UngroupedProjection| {
+            apply_solution_modifiers(
+                input(),
+                Some(grouping),
+                &[],
+                ordering,
+                Some(select),
+                ungrouped,
+                false,
+                None,
+                None,
+                false,
+                None,
+                &PlanningContext::current(),
+            )
+            .err()
+            .map(|e| e.to_string())
+        };
+        let group = |having: Option<Expression>, binds: Vec<(VarId, Expression)>| {
+            Grouping::assemble(vec![key], vec![count()], binds, having)
+                .expect("valid grouping")
+                .expect("a grouping")
+        };
+
+        let having = group(Some(Expression::Var(other)), vec![]);
+        let err = plan(&having, &[], &[key, n], UngroupedProjection::Reject);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("HAVING reads variable VarId(1)")),
+            "{err:?}"
+        );
+        let bind = group(None, vec![(bound, Expression::Var(other))]);
+        let err = plan(&bind, &[], &[key, bound], UngroupedProjection::Reject);
+        assert!(
+            err.as_deref().is_some_and(
+                |e| e.contains("the SELECT expression for VarId(3) reads variable VarId(1)")
+            ),
+            "{err:?}"
+        );
+        let plain = group(None, vec![]);
+        let err = plan(
+            &plain,
+            &[SortSpec::asc(other)],
+            &[key, n],
+            UngroupedProjection::Reject,
+        );
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("ORDER BY variable VarId(1)")),
+            "{err:?}"
+        );
+        let err = plan(&plain, &[], &[key, other], UngroupedProjection::Reject);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("projected variable VarId(1)")),
+            "{err:?}"
+        );
+        assert_eq!(
+            plan(
+                &plain,
+                &[],
+                &[key, other],
+                UngroupedProjection::PerGroupList
+            ),
+            None
+        );
+        // Keys, aggregate outputs and bind outputs are what grouping produces.
+        let fine = group(
+            Some(Expression::Var(n)),
+            vec![(bound, Expression::Var(key))],
+        );
+        assert_eq!(
+            plan(
+                &fine,
+                &[SortSpec::asc(bound)],
+                &[key, n, bound],
+                UngroupedProjection::Reject
+            ),
+            None
+        );
+    }
+
     /// PR-5: the scan-side top-k directive offered to the child must carry
     /// `k = LIMIT + OFFSET`, not `LIMIT` — the scan has to retain enough rows for
     /// the OFFSET the sort above then skips, or `ORDER BY DESC … LIMIT k OFFSET m`
@@ -3919,6 +4418,7 @@ mod tests {
             &[],
             &[SortSpec::desc(VarId(1))],
             None,
+            UngroupedProjection::Reject,
             false,
             Some(5),
             Some(10),
@@ -3984,6 +4484,7 @@ mod tests {
             &[],
             &[SortSpec::asc(VarId(1))],
             None,
+            UngroupedProjection::Reject,
             false,
             None,
             Some(10),
@@ -4026,6 +4527,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         }
@@ -4227,6 +4729,7 @@ mod tests {
             ))],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
             grouping: Grouping::assemble(
@@ -4237,7 +4740,8 @@ mod tests {
                 }],
                 vec![],
                 None,
-            ),
+            )
+            .expect("valid grouping"),
             ordering,
             order_binds,
             limit: None,
@@ -4304,6 +4808,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -4336,6 +4841,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -4351,8 +4857,10 @@ mod tests {
         );
     }
 
+    /// A sort key nothing binds orders nothing: it is dropped, not a plan
+    /// error. A key the WHERE binds is kept.
     #[test]
-    fn test_build_operator_tree_validates_sort_vars() {
+    fn test_build_operator_tree_drops_sort_keys_nothing_binds() {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -4360,24 +4868,65 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             reasoning: ReasoningConfig::default(),
             grouping: None,
-            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            ordering: vec![SortSpec::asc(VarId(99)), SortSpec::desc(VarId(1))],
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
 
+        let kept = bindable_sort_keys(
+            &query.ordering,
+            Some(&[VarId(0)]),
+            None,
+            &[],
+            &query.patterns,
+            None,
+        );
+        assert_eq!(
+            kept.iter().map(|spec| spec.var).collect::<Vec<_>>(),
+            vec![VarId(1)]
+        );
         let result = build_operator_tree(
             &query,
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// A sort key some stage binds, missing from the plan's schema, is a plan
+    /// that lost it: still an error, never a silently unsorted answer.
+    #[test]
+    fn test_apply_solution_modifiers_validates_sort_vars() {
+        use crate::binding::{Batch, Binding};
+        let batch = Batch::new(
+            Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice()),
+            vec![vec![Binding::Unbound], vec![Binding::Unbound]],
+        )
+        .unwrap();
+        let input: BoxedOperator = Box::new(crate::seed::BatchSeedOperator::from_batch(batch));
+        let result = apply_solution_modifiers(
+            input,
+            None,
+            &[],
+            &[SortSpec::asc(VarId(5))],
+            None,
+            UngroupedProjection::Reject,
+            false,
+            None,
+            None,
+            false,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         match result {
-            Err(e) => assert!(e.to_string().contains("Sort variable")),
-            Ok(_) => panic!("Expected error for invalid sort var"),
+            Err(e) => assert!(e.to_string().contains("Sort variable"), "{e}"),
+            Ok(_) => panic!("a sort key missing from the plan's schema must fail"),
         }
     }
 
@@ -4415,9 +4964,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             })
         };
         let counted_first = Query {
@@ -4444,6 +4993,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -4471,6 +5021,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -4509,6 +5060,7 @@ mod tests {
             ],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
             grouping: Some(Grouping::Implicit {
@@ -4520,9 +5072,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             }),
             ordering: Vec::new(),
             order_binds: Vec::new(),
@@ -4585,6 +5137,7 @@ mod tests {
             ],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
             grouping: Some(Grouping::Implicit {
@@ -4596,9 +5149,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             }),
             ordering: Vec::new(),
             order_binds: Vec::new(),
@@ -4644,6 +5197,7 @@ mod tests {
             ],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
             grouping: Some(Grouping::Implicit {
@@ -4655,9 +5209,9 @@ mod tests {
                         },
                     ])
                     .unwrap(),
-                    binds: Vec::new(),
                 },
                 having: None,
+                binds: Vec::new(),
             }),
             ordering: Vec::new(),
             order_binds: Vec::new(),
@@ -4695,6 +5249,7 @@ mod tests {
             patterns,
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
             grouping: None,

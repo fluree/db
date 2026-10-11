@@ -33,15 +33,17 @@ fluree token create --private-key <KEY> [OPTIONS]
 | `--identity <ID>` | Fluree identity claim (`fluree.identity`) - takes precedence over `sub` for policy |
 | `--policy-select` | Allow request policy selection (`"fluree.policy": "request"`); requires `--audience` and an issuer trusted as a policy authority by the server |
 | `--all` | Grant full access to all ledgers (events, storage, read, and write) |
-| `--events-ledger <ALIAS>` | Grant events access to specific ledger (repeatable) |
-| `--storage-ledger <ALIAS>` | Grant storage access to specific ledger (repeatable) |
+| `--events-ledger <ALIAS>` | Grant events access to one ledger branch (repeatable) |
+| `--storage-ledger <ALIAS>` | Grant storage access to one ledger branch (repeatable) |
 | `--read-all` | Grant data API read access to all ledgers (`fluree.ledger.read.all=true`) |
-| `--read-ledger <ALIAS>` | Grant data API read access to specific ledger (repeatable) |
+| `--read-ledger <ALIAS>` | Grant data API read access to one ledger branch (repeatable) |
 | `--write-all` | Grant data API write access to all ledgers (`fluree.ledger.write.all=true`) |
-| `--write-ledger <ALIAS>` | Grant data API write access to specific ledger (repeatable) |
+| `--write-ledger <ALIAS>` | Grant data API write access to one ledger branch (repeatable) |
 | `--graph-source <ALIAS>` | Grant access to specific graph source (repeatable) |
 | `--output <FMT>` | Output format: `token`, `json`, or `curl` (default: `token`) |
 | `--print-claims` | Print decoded claims to stderr |
+
+Ledger scopes name branches: `--read-ledger mydb` grants `mydb:main` only, and no scope covers every branch of a ledger, so list each one. A scope that is not a valid ledger ID is refused when the token is created.
 
 ### Private Key Formats
 

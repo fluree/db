@@ -36,7 +36,7 @@ pub async fn run(
             Err(CliError::NotFound(_)) => {
                 // Ledger not found — try graph source lookup
                 let alias = context::resolve_ledger(ledger, dirs)?;
-                let fluree = context::build_fluree(dirs)?;
+                let fluree = context::build_fluree(dirs).await?;
                 let gs_id = context::to_ledger_id(&alias)?;
                 if let Some(gs) = fluree.nameservice().lookup_graph_source(&gs_id).await? {
                     if graph.is_some() {
@@ -99,6 +99,13 @@ pub async fn run(
                 {
                     println!("Index ID:       {index}");
                 }
+                if info
+                    .pointer("/ledger/needs-link-reindex")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    print_link_reindex_warning(&remote_alias);
+                }
 
                 // Print full JSON if there are stats
                 if info.get("stats").is_some() {
@@ -138,7 +145,17 @@ pub async fn run(
                 }
                 println!("Index t:        {}", record.index_t);
                 match &record.index_head_id {
-                    Some(id) => println!("Index ID:       {id}"),
+                    Some(id) => {
+                        println!("Index ID:       {id}");
+                        let root = fluree
+                            .content_store(&record.storage_namespace())
+                            .get(id)
+                            .await?;
+                        let snapshot = fluree_db_core::LedgerSnapshot::from_root_bytes(&root)?;
+                        if snapshot.needs_link_reindex {
+                            print_link_reindex_warning(&record.ledger_id);
+                        }
+                    }
                     None => println!("Index ID:       (none)"),
                 }
             } else if let Some(gs) = fluree.nameservice().lookup_graph_source(&ledger_id).await? {
@@ -157,4 +174,13 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// The ledger's index predates triple-term links, so its annotations cannot be
+/// read until a full reindex.
+fn print_link_reindex_warning(ledger: &str) {
+    println!(
+        "Warning:        index predates RDF 1.2 triple-term links; annotations cannot be \
+         read until `fluree reindex {ledger}`"
+    );
 }

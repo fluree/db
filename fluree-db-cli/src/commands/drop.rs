@@ -54,7 +54,7 @@ async fn run_remote(name: &str, hard: bool, client: &RemoteLedgerClient) -> CliR
 }
 
 async fn run_local(name: &str, hard: bool, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let mode = if hard { DropMode::Hard } else { DropMode::Soft };
 
     let report = fluree.drop_ledger(name, mode).await?;

@@ -117,6 +117,8 @@ Snapshot ids arriving from peers are validated before any disk write: non-empty,
 
 Raft mode is built behind a `raft` Cargo feature. A build without the feature has no `--raft-*` flags at all, so single-node binaries don't pull in openraft.
 
+Unlike single-node deployments, which run the server through `fluree server run`, Raft nodes run the standalone `fluree-server` binary built with the feature (`cargo build --release -p fluree-db-server --features raft`). The Raft bootstrap lives in that binary's startup path; `fluree server run` does not start Raft.
+
 When the feature is enabled, four CLI/env switches govern Raft mode:
 
 | CLI flag                | Env var                        | Required when raft is on |
@@ -392,7 +394,8 @@ If no leader is currently elected (mid-election), follower nodes return `503 Ser
 
 - `409 Conflict` — branch head was reset while the request was queued.
 - `410 Gone` — branch was dropped, purged, or retracted while queued.
-- `422 Unprocessable Entity` — staging failed (policy denial, malformed body, conflict outcome).
+- `403 Forbidden` — a policy denied the staged write after refresh and retry.
+- `422 Unprocessable Entity` — another staging failure (malformed body or conflict outcome).
 
 **When it happens:** The queue can outlive the branch state it targets. Admin operations and concurrent writes can invalidate queued work.
 

@@ -388,7 +388,7 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
         .map_err(|e| CliError::Config(format!("invalid origins config: {e}")))?;
 
     let ledger_id = context::to_ledger_id(ledger)?;
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     // Serialize to canonical bytes and store in CAS.
     let canonical_bytes = config.to_bytes();

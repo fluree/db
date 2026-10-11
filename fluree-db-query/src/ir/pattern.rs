@@ -2,6 +2,7 @@
 //! `SubqueryPattern`, `ServicePattern`, plus the small `GraphName` /
 //! `ServiceEndpoint` types they depend on.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::adapters::{
@@ -152,6 +153,10 @@ impl SubqueryPattern {
         for p in &mut self.patterns {
             p.substitute_var(old, new);
         }
+        let rename_order_bind: fn(&mut Expression, VarId, VarId) = self
+            .grouping
+            .as_ref()
+            .map_or(Expression::substitute_var, |g| g.group_row_renamer(old));
         if let Some(g) = &mut self.grouping {
             g.substitute_var(old, new);
         }
@@ -164,7 +169,7 @@ impl SubqueryPattern {
             if *v == old {
                 *v = new;
             }
-            expr.substitute_var(old, new);
+            rename_order_bind(expr, old, new);
         }
     }
 
@@ -397,6 +402,10 @@ pub enum Pattern {
     /// Property path pattern (transitive traversal)
     PropertyPath(PropertyPathPattern),
 
+    /// The components of a triple term (internal: the reified-edge lowering
+    /// emits it beside the link `?r rdf:reifies ?t`).
+    TermComponents(super::TermComponentsPattern),
+
     /// Anchored shortest-path pattern (Cypher `shortestPath`/`allShortestPaths`).
     ///
     /// Both endpoints must be bound by a preceding pattern; binds a path value
@@ -499,8 +508,7 @@ pub enum Pattern {
     /// # Execution
     ///
     /// Planning expands this variant into the base edge plus the
-    /// corresponding `f:reifies*` lookup chain before operator-tree
-    /// assembly.
+    /// annotation's `rdf:reifies` link to it before operator-tree assembly.
     EdgeAnnotation {
         /// The annotated edge (base triple).
         edge: TriplePattern,
@@ -508,33 +516,40 @@ pub enum Pattern {
         annotation: Ref,
         /// Patterns about the annotation subject.
         body: Vec<Pattern>,
+        /// The variable the link binds to the edge's triple term, reserved
+        /// at lowering because planning cannot mint one.
+        term: VarId,
     },
+}
 
-    /// Annotation-rooted pattern — reverse direction of [`Pattern::EdgeAnnotation`].
-    ///
-    /// Lowered from JSON-LD `@reifies`. The enclosing node-map is the
-    /// annotation subject; `@reifies` names the base triple it reifies.
-    ///
-    /// # Semantics
-    ///
-    /// One row per `(annotation, base_edge)` pair. The base edge must be
-    /// **currently asserted and policy-visible** before a row is emitted
-    /// (M1 enforcement) — otherwise this operator would leak hidden
-    /// edges via annotation existence.
-    ///
-    /// # Execution
-    ///
-    /// Planning expands this variant into the base edge plus the
-    /// corresponding `f:reifies*` lookup chain before operator-tree
-    /// assembly.
-    AnnotationTarget {
-        /// The annotation subject — variable or constant ref.
-        annotation: Ref,
-        /// The base edge being reified.
-        edge: TriplePattern,
-        /// Patterns about the annotation subject.
-        body: Vec<Pattern>,
-    },
+/// Columns of a VALUES table that bind their variable on every row: those with
+/// no UNDEF cell. A table with no rows binds every column vacuously.
+pub fn values_bound_in_every_row<'a>(
+    vars: &'a [VarId],
+    rows: &'a [Vec<Binding>],
+) -> impl Iterator<Item = VarId> + 'a {
+    vars.iter()
+        .enumerate()
+        .filter(|(col, _)| {
+            rows.iter()
+                .all(|row| row.get(*col).is_some_and(Binding::is_bound))
+        })
+        .map(|(_, var)| *var)
+}
+
+/// Whether column `col` of a VALUES table is UNDEF on every row. A table with
+/// no rows has no such column: it emits no solution, not one of any value.
+pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+}
+
+/// Variables some pattern of `patterns` may bind (the planner's
+/// `must_bind_vars` gives the ones bound on every row).
+pub fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
+    patterns.iter().flat_map(Pattern::produced_vars).collect()
 }
 
 impl Pattern {
@@ -578,19 +593,12 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
+                term,
             } => Pattern::EdgeAnnotation {
                 edge,
                 annotation,
                 body: f(body),
-            },
-            Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
-            } => Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body: f(body),
+                term,
             },
             Pattern::DefaultGraphSource { patterns } => Pattern::DefaultGraphSource {
                 patterns: f(patterns),
@@ -659,6 +667,18 @@ impl Pattern {
             Pattern::PropertyPath(pp) => {
                 debug_assert!(!pp.referenced_vars().contains(&old), "{UNHANDLED}");
             }
+            Pattern::TermComponents(tc) => {
+                for v in std::iter::once(&mut tc.term).chain(
+                    [&mut tc.subject, &mut tc.predicate, &mut tc.object]
+                        .into_iter()
+                        .filter_map(|c| match c {
+                            super::Component::Var(v) => Some(v),
+                            _ => None,
+                        }),
+                ) {
+                    rename(v);
+                }
+            }
             Pattern::ShortestPath(sp) => {
                 debug_assert!(!sp.referenced_vars().contains(&old), "{UNHANDLED}");
                 debug_assert!(sp.path_var != old, "{UNHANDLED}");
@@ -682,16 +702,13 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
-            }
-            | Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
+                term,
             } => {
                 edge.substitute_var(old, new);
                 if let Ref::Var(v) = annotation {
                     rename(v);
                 }
+                rename(term);
                 for p in body {
                     p.substitute_var(old, new);
                 }
@@ -745,6 +762,7 @@ impl Pattern {
                 inner.iter().flat_map(Pattern::referenced_vars).collect()
             }
             Pattern::PropertyPath(pp) => pp.referenced_vars(),
+            Pattern::TermComponents(tc) => tc.referenced_vars(),
             Pattern::ShortestPath(sp) => sp.referenced_vars(),
             Pattern::Subquery(sq) => sq.referenced_vars(),
             Pattern::IndexSearch(isp) => isp.referenced_vars(),
@@ -765,16 +783,13 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
-            }
-            | Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
+                term,
             } => {
                 let mut vars = edge.referenced_vars();
                 if let Ref::Var(v) = annotation {
                     vars.push(*v);
                 }
+                vars.push(*term);
                 vars.extend(body.iter().flat_map(Pattern::referenced_vars));
                 vars
             }
@@ -805,6 +820,7 @@ impl Pattern {
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
             Pattern::PropertyPath(pp) => pp.produced_vars(),
+            Pattern::TermComponents(tc) => tc.produced_vars(),
             Pattern::ShortestPath(sp) => sp.produced_vars(),
             Pattern::Subquery(sq) => sq.produced_vars(),
             Pattern::IndexSearch(isp) => isp.produced_vars(),
@@ -825,16 +841,13 @@ impl Pattern {
                 edge,
                 annotation,
                 body,
-            }
-            | Pattern::AnnotationTarget {
-                annotation,
-                edge,
-                body,
+                term,
             } => {
                 let mut vars = edge.produced_vars();
                 if let Ref::Var(v) = annotation {
                     vars.push(*v);
                 }
+                vars.push(*term);
                 vars.extend(body.iter().flat_map(Pattern::produced_vars));
                 vars
             }
@@ -866,7 +879,7 @@ impl Pattern {
                 .any(|branch| branch.iter().any(|p| p.contains_function(target))),
             Pattern::Graph { patterns, .. } => patterns.iter().any(|p| p.contains_function(target)),
             Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
-            Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+            Pattern::EdgeAnnotation { body, .. } => {
                 body.iter().any(|p| p.contains_function(target))
             }
             Pattern::DefaultGraphSource { patterns, .. } => {

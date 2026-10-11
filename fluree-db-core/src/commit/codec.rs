@@ -50,7 +50,7 @@ mod writer;
 pub use envelope::CodecEnvelope;
 pub use error::CommitCodecError;
 pub use format::{CommitSignature, ALGO_ED25519, MAGIC, VERSION, VERSION_V3};
-pub use raw_reader::{CommitOps, RawObject, RawOp};
+pub use raw_reader::{CommitOps, RawObject, RawOp, RawTripleTerm};
 #[cfg(feature = "credential")]
 pub use writer::{write_commit, CommitWriteResult};
 

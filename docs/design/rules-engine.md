@@ -174,7 +174,7 @@ cannot carry provenance.
 |---|---|---|---|---|
 | A. No minting (status quo) | Provenance modelled as extra derived triples on the endpoints | n/a | none | Cannot attach provenance to the edge itself; a second rule per fact |
 | B. Deterministic anonymous reifier | Head `@annotation` block mints one reifier per derived triple with id = skolem hash of (rule id, instantiated s p o); body from constants and body vars | Stable: same inputs, same id | Head instantiation emits the `f:reifies*` bundle plus body facts into the overlay; the annotation lanes already read overlays | Bundle size (4–6 flakes per derived edge) multiplies derived-fact counts; budgets must count them |
-| C. Reuse a body-bound reifier | `@annotation: {"@id": "?claim"}` re-attaches the supporting claim to the derived edge | Stable | Cheapest | Violates the single-target invariant (one reifier, one live edge); rejected on that ground |
+| C. Reuse a body-bound reifier | `@annotation: {"@id": "?claim"}` re-attaches the supporting claim to the derived edge | Stable | Cheapest | Was rejected under the former single-target rule (one reifier, one live edge); RDF 1.2 allows it, so this row is open again |
 | D. System provenance metadata | Each derived flake carries the rule id in flake metadata; a query-side function exposes it | Stable | Smallest storage | New query surface, invisible to RDF tooling; cannot carry rule-supplied properties like confidence |
 
 Recommendation: B, as a follow-up once this engine has landed, with the head

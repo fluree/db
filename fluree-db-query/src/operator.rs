@@ -6,13 +6,22 @@
 pub(crate) mod flush;
 pub mod inline;
 
-use crate::binding::Batch;
+use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// One nonempty group returned by a grouped count drain.
+#[derive(Debug)]
+pub struct CountGroup {
+    /// Representative bindings in the requested group-variable order.
+    pub keys: Vec<Binding>,
+    /// Number of remaining output rows in this group.
+    pub count: u64,
+}
 
 /// Query execution operator
 ///
@@ -69,6 +78,23 @@ pub trait Operator: Send + Sync {
         false
     }
 
+    /// Schema variables bound in every row this operator emits, when it can see
+    /// its rows. A plan seeded by this operator holds a BIND or FILTER reading
+    /// any other schema variable until the triples that could still bind it
+    /// have run. `None` plans every schema variable as bound.
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        None
+    }
+
+    /// Extract the input of a DISTINCT wrapper during planning, before `open()`.
+    /// The caller must prove that its consumer cannot observe input duplicates.
+    /// A successful extraction leaves the wrapper closed; discard it immediately.
+    /// Only DISTINCT implements this: do not forward through other operators,
+    /// since a LIMIT, projection or subquery can make deduplication significant.
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        None
+    }
+
     /// Consume all remaining output rows to exhaustion and return the total count.
     ///
     /// # Contract
@@ -84,6 +110,19 @@ pub trait Operator: Send + Sync {
     /// Operators that implement this avoid materializing output batches, reducing
     /// allocation and cloning overhead when the downstream consumer only needs a count.
     async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Count remaining rows by `group_vars`, using ordinary GROUP BY equality.
+    /// A successful drain exhausts this operator and returns each nonempty group
+    /// exactly once. Empty input returns an empty vector. Returning `None` must
+    /// leave the input untouched so the consumer can aggregate ordinary rows.
+    /// Do not forward through row-changing operators such as DISTINCT or LIMIT.
+    async fn drain_grouped_count(
+        &mut self,
+        _ctx: &ExecutionContext<'_>,
+        _group_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
         Ok(None)
     }
 
@@ -247,4 +286,25 @@ pub fn trim_batch(out_schema: &Option<Arc<[VarId]>>, batch: Batch) -> Option<Bat
         Some(schema) => Some(batch.retain(Arc::clone(schema))),
         None => Some(batch),
     }
+}
+
+/// Count an operator to exhaustion, preferring its `drain_count`
+/// (count-only, no binding materialization) and falling back to a streaming
+/// `next_batch` row count when the operator declines count-only mode.
+pub(crate) async fn count_operator(
+    op: &mut dyn Operator,
+    ctx: &ExecutionContext<'_>,
+) -> Result<u64> {
+    if let Some(n) = op.drain_count(ctx).await? {
+        return Ok(n);
+    }
+    let mut n: u64 = 0;
+    while let Some(batch) = op.next_batch(ctx).await? {
+        ctx.check_cancelled()?;
+        n = n
+            .checked_add(batch.len() as u64)
+            .ok_or_else(|| QueryError::execution("COUNT(*) overflow while counting operator"))?;
+    }
+    ctx.check_cancelled()?;
+    Ok(n)
 }

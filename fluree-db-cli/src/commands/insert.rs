@@ -195,7 +195,9 @@ pub async fn run(
         } => {
             let client = client.with_policy(policy.clone());
             let result = match data_format {
-                detect::DataFormat::Turtle => client.insert_turtle(&remote_alias, &content).await?,
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
+                    client.insert_turtle(&remote_alias, &content).await?
+                }
                 detect::DataFormat::JsonLd => {
                     let json: serde_json::Value = serde_json::from_str(&content)?;
                     client.insert_jsonld(&remote_alias, &json).await?
@@ -214,7 +216,7 @@ pub async fn run(
             let graph = fluree.graph(&alias);
 
             let result = match data_format {
-                detect::DataFormat::Turtle => {
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
                     let mut b = graph
                         .transact()
                         .insert_turtle(&content)

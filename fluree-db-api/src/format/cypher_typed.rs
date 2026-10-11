@@ -429,12 +429,6 @@ struct NodeHydrator<'a> {
     enforcer: Option<Arc<fluree_db_query::policy::QueryPolicyEnforcer>>,
     rdf_type: Option<Sid>,
     node_marker: Option<Sid>,
-    /// The `f:reifies{Subject,Predicate,Object}` predicate Sids (when the
-    /// dictionary knows them): a subject carrying these is an edge
-    /// annotation and renders as a Relationship, never a Node.
-    reifies_subject: Option<Sid>,
-    reifies_predicate: Option<Sid>,
-    reifies_object: Option<Sid>,
     cache: HashMap<Sid, CypherNode>,
     /// Rendered top-level cells per subject (Node, or Relationship for
     /// reifier subjects); what [`Self::subject_cell`] serves.
@@ -462,6 +456,17 @@ struct NodeHydrator<'a> {
 #[cfg(not(target_arch = "wasm32"))]
 const PREFETCH_CONCURRENCY: usize = 16;
 
+/// The `(start, type, end)` of a link's triple when it relates two nodes.
+fn node_edge(link_object: &FlakeValue) -> Option<(Sid, Sid, Sid)> {
+    match link_object {
+        FlakeValue::TripleTerm(term) => match &term.o {
+            FlakeValue::Ref(end) => Some((term.s.clone(), term.p.clone(), end.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl<'a> NodeHydrator<'a> {
     fn new(
         view: &'a GraphDb,
@@ -481,13 +486,6 @@ impl<'a> NodeHydrator<'a> {
             enforcer,
             rdf_type: view.snapshot.encode_iri(fluree_vocab::rdf::TYPE),
             node_marker: view.snapshot.encode_iri(fluree_vocab::fluree::NODE),
-            reifies_subject: view
-                .snapshot
-                .encode_iri(fluree_vocab::reifies_iris::SUBJECT),
-            reifies_predicate: view
-                .snapshot
-                .encode_iri(fluree_vocab::reifies_iris::PREDICATE),
-            reifies_object: view.snapshot.encode_iri(fluree_vocab::reifies_iris::OBJECT),
             cell_cache: HashMap::new(),
             cache: HashMap::new(),
             flake_cache: HashMap::new(),
@@ -538,7 +536,7 @@ impl<'a> NodeHydrator<'a> {
             return Ok(hit.clone());
         }
         let p_iri = self.compactor.decode_sid(pred)?;
-        let name = if p_iri.starts_with(FLUREE_SYSTEM_NS) {
+        let name = if p_iri.starts_with(FLUREE_SYSTEM_NS) || p_iri == fluree_vocab::rdf::REIFIES {
             None
         } else {
             Some(Arc::from(self.name(&p_iri).as_str()))
@@ -649,25 +647,11 @@ impl<'a> NodeHydrator<'a> {
                 FormatError::InvalidBinding(format!("batched subject crawl failed: {e}"))
             })?;
 
-        let reifies_pids: Option<(u32, u32, u32)> = match (
-            self.reifies_subject.as_ref(),
-            self.reifies_predicate.as_ref(),
-            self.reifies_object.as_ref(),
-        ) {
-            (Some(rs), Some(rp), Some(ro)) => match (
-                store.sid_to_p_id(rs),
-                store.sid_to_p_id(rp),
-                store.sid_to_p_id(ro),
-            ) {
-                (Some(a), Some(b), Some(c)) => Some((a, b, c)),
-                _ => None,
-            },
-            _ => None,
-        };
+        let reifies_pid = store.sid_to_p_id(fluree_db_core::rdf_reifies_sid());
         for (s_id, sid) in subjects {
             let rows = rows_by_subject.remove(&s_id).unwrap_or_default();
             let cell = if let Some(rel) =
-                self.relationship_from_rows(&sid, &rows, store.as_ref(), g_id, reifies_pids)?
+                self.relationship_from_rows(&sid, &rows, store.as_ref(), g_id, reifies_pid)?
             {
                 CypherCell::Relationship(Box::new(rel))
             } else {
@@ -680,45 +664,34 @@ impl<'a> NodeHydrator<'a> {
         Ok(())
     }
 
-    /// Detect and render a reifier subject from batched-crawl rows: present
-    /// `f:reifies{Subject,Predicate,Object}` rows with node-ref objects make
-    /// it a Relationship. Returns `None` for ordinary nodes.
+    /// Detect and render a reifier subject from batched-crawl rows: an
+    /// `rdf:reifies` link to a node→node triple makes it a Relationship.
+    /// Returns `None` for ordinary nodes.
     fn relationship_from_rows(
         &mut self,
         sid: &Sid,
         rows: &[(u32, u16, u64)],
         store: &fluree_db_binary_index::BinaryIndexStore,
         g_id: u16,
-        reifies_pids: Option<(u32, u32, u32)>,
+        reifies_pid: Option<u32>,
     ) -> Result<Option<CypherRelationship>> {
-        let Some((rs_pid, rp_pid, ro_pid)) = reifies_pids else {
+        let Some(reifies_pid) = reifies_pid else {
             return Ok(None);
         };
-        let mut start = None;
-        let mut pred = None;
-        let mut end = None;
+        let mut edge = None;
         for &(p_id, o_type, o_key) in rows {
-            if p_id != rs_pid && p_id != rp_pid && p_id != ro_pid {
-                continue;
-            }
-            if !fluree_db_core::o_type::OType::from_u16(o_type).is_node_ref() {
+            if p_id != reifies_pid {
                 continue;
             }
             let decoded = store
                 .decode_value_v3(o_type, o_key, p_id, g_id)
-                .map_err(|e| FormatError::InvalidBinding(format!("decode reifies ref: {e}")))?;
-            let FlakeValue::Ref(target) = decoded else {
-                continue;
-            };
-            if p_id == rs_pid {
-                start = Some(target);
-            } else if p_id == rp_pid {
-                pred = Some(target);
-            } else {
-                end = Some(target);
+                .map_err(|e| FormatError::InvalidBinding(format!("decode link: {e}")))?;
+            edge = node_edge(&decoded);
+            if edge.is_some() {
+                break;
             }
         }
-        let (Some(start), Some(pred), Some(end)) = (start, pred, end) else {
+        let Some((start, pred, end)) = edge else {
             return Ok(None);
         };
         // Annotation (user) properties: the scalar rows minus bookkeeping.
@@ -804,7 +777,9 @@ impl<'a> NodeHydrator<'a> {
             return Ok(hit.clone());
         }
         let name = match store.resolve_predicate_iri(p_id) {
-            Some(iri) if iri.starts_with(FLUREE_SYSTEM_NS) => None,
+            Some(iri) if iri.starts_with(FLUREE_SYSTEM_NS) || iri == fluree_vocab::rdf::REIFIES => {
+                None
+            }
             Some(iri) => Some(Arc::from(self.name(iri).as_str())),
             None => None,
         };
@@ -952,28 +927,14 @@ impl<'a> NodeHydrator<'a> {
             return Ok(hit.clone());
         }
         let flakes = self.subject_flakes(sid).await?;
-        let mut start = None;
-        let mut pred = None;
-        let mut end = None;
-        for flake in flakes.iter().filter(|f| f.op) {
-            if Some(&flake.p) == self.reifies_subject.as_ref() {
-                if let FlakeValue::Ref(s) = &flake.o {
-                    start = Some(s.clone());
-                }
-            } else if Some(&flake.p) == self.reifies_predicate.as_ref() {
-                if let FlakeValue::Ref(p) = &flake.o {
-                    pred = Some(p.clone());
-                }
-            } else if Some(&flake.p) == self.reifies_object.as_ref() {
-                if let FlakeValue::Ref(o) = &flake.o {
-                    end = Some(o.clone());
-                }
-            }
-        }
-        let cell = match (start, pred, end) {
+        let edge = flakes
+            .iter()
+            .filter(|f| f.op && fluree_db_core::is_rdf_reifies(&f.p))
+            .find_map(|f| node_edge(&f.o));
+        let cell = match edge {
             // A reified node→node edge. (Literal-object annotations keep
             // the node rendering — Bolt relationships need node endpoints.)
-            (Some(start), Some(pred), Some(end)) => {
+            Some((start, pred, end)) => {
                 let start_iri = self.compactor.decode_sid_shared(&start)?;
                 let end_iri = self.compactor.decode_sid_shared(&end)?;
                 let type_iri = self.compactor.decode_sid(&pred)?;

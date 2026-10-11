@@ -58,11 +58,12 @@ let client = FlureeBuilder::from_json_ld(&config)?
 // and the id that encrypts new writes.
 let fluree = FlureeBuilder::file("/data/fluree")
     .with_encryption_keys(vec![(1, old_key), (2, new_key)], 2)?
-    .build()?;
+    .build_async()
+    .await?;
 ```
 
 A key set on the builder (`with_encryption_key*()`, `with_encryption_keys()`,
-or `AES256Key` / `AES256Keys` in JSON-LD) is applied by every terminal build method — `build()`, `build_memory()`, `build_s3()`,
+or `AES256Key` / `AES256Keys` in JSON-LD) is applied by every terminal build method: `build()`, `build_async()`, `build_memory()`, `build_s3()`,
 `build_client()` and friends — on every backend. The `build_*_encrypted()` methods
 remain for callers that want the key to be an explicit argument;
 `build_encrypted(key)` replaces any configured key set with that one key, as
@@ -84,7 +85,7 @@ Set the encryption key via environment variable:
 export FLUREE_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
 # Start the server with JSON-LD config
-./fluree-db-server --config config.jsonld
+fluree server run --connection-config config.jsonld
 ```
 
 ## Configuration
@@ -465,10 +466,15 @@ are outside it by design:
   flakes or commit data. Under Raft the same state is also in each node's Raft
   log and snapshots under `--raft-storage-path`; put that directory on an
   encrypted volume ([#1955](https://github.com/fluree/db/issues/1955)).
-- **Nothing else on local disk, once a build is done.** Readers keep a
-  read-through disk cache of index artifacts (`$TMPDIR/fluree_binary_cache` by
-  default, or `LedgerManagerConfig::cache_dir`), and the indexer seeds it with
-  artifacts it just built. With encryption enabled that cache is bypassed
+- **Nothing else on local disk, once a build is done.** Readers of remote
+  storage (S3, a peer's upstream) keep a read-through disk cache of index
+  artifacts (`$TMPDIR/fluree_binary_cache` by default, or
+  `LedgerManagerConfig::cache_dir`), and the indexer seeds it with artifacts it
+  just built; storage on local disk or in memory never uses it. Earlier
+  releases also copied artifacts from local and in-memory storage into it,
+  which nothing reads or evicts any more: on a host where no process reads
+  remote storage, the directory can be deleted after upgrading. With
+  encryption enabled that cache is bypassed
   entirely: no decrypted leaf, branch, dictionary or vector shard is written
   outside the encrypted storage, and nothing already in the cache directory is
   consulted. Fetched artifacts are served from memory instead.

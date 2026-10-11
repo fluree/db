@@ -523,23 +523,23 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
     }
 }
 
-/// Translate an apply-path `(Command, Response)` pair into the
 /// A state-machine ledger identity as an event id. The state machine only
 /// holds ids that passed validation on the way in; one that no longer parses
 /// is logged and its event dropped rather than broadcast under a key no
 /// consumer can match.
 fn event_ledger_id(name: &str, branch: &str) -> Option<fluree_db_core::LedgerId> {
-    fluree_db_core::LedgerId::from_parts(name, branch)
+    fluree_db_core::LedgerId::from_persisted_parts(name, branch)
         .inspect_err(|e| tracing::error!(error = %e, "raft state holds an invalid ledger id"))
         .ok()
 }
 
 fn parsed_event_ledger_id(ledger_id: &str) -> Option<fluree_db_core::LedgerId> {
-    fluree_db_core::LedgerId::parse(ledger_id)
+    fluree_db_core::LedgerId::parse_persisted(ledger_id)
         .inspect_err(|e| tracing::error!(error = %e, "raft state holds an invalid ledger id"))
         .ok()
 }
 
+/// Translate an apply-path `(Command, Response)` pair into the
 /// matching [`NameServiceEvent`]. Returns `None` for pairs that
 /// don't advance head state — desyncs, no-ops, idempotency hits.
 fn event_for(

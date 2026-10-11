@@ -14,8 +14,9 @@ use crate::manifest::Test;
 use crate::rdfxml;
 use crate::result_comparison::{are_results_isomorphic, format_results_diff};
 use crate::result_format::{
-    fluree_construct_to_sparql_results, fluree_json_to_sparql_results, parse_expected_graph,
-    parse_expected_results, project_to_csv_space, RdfTerm, SparqlResults, Triple,
+    fluree_construct_to_sparql_results, fluree_json_to_sparql_results, parse_expected_dataset,
+    parse_expected_graph, parse_expected_results, project_to_csv_space, RdfTerm, SparqlResults,
+    Triple,
 };
 use crate::subprocess::{run_in_subprocess, TestDescriptor};
 
@@ -144,11 +145,11 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
 /// named graphs. Returns the resulting ledger state.
 ///
 /// Named graphs are loaded as TriG `GRAPH <name> { ... }` blocks through the
-/// alias-based transact builder (`upsert_turtle`), which routes through
-/// `parse_trig_phase1`. Each file's `@prefix`/`@base` directives are hoisted
-/// above the GRAPH block (TriG directives are document-scoped), and each
-/// graph loads in its own transaction so prefix declarations can't collide
-/// across files.
+/// alias-based transact builder (`upsert_turtle`), which parses the document
+/// once with the Turtle parser. Each file's `@prefix`/`@base` directives are
+/// hoisted above the GRAPH block (a directive cannot sit inside a block),
+/// and each graph loads in its own transaction so prefix declarations can't
+/// collide across files.
 async fn setup_graph_store(
     fluree: &Fluree,
     data_url: Option<&str>,
@@ -191,8 +192,8 @@ async fn setup_graph_store(
             continue;
         }
         let trig = format!("{directives}GRAPH <{graph_name}> {{\n{body}}}\n");
-        // upsert_turtle (not insert_turtle): the builder's insert_turtle
-        // fast path bypasses TriG GRAPH-block extraction.
+        // Either verb reads a TriG body; upsert keeps a repeated load of the
+        // same graph from accumulating copies.
         match fluree
             .graph(TEST_LEDGER)
             .transact()
@@ -560,10 +561,10 @@ pub async fn run_update_eval_test(
 
     let ledger = fetch_state(&fluree).await?;
 
-    // 3. Compare default graph state
-    let expected_default = match result_data_url {
-        Some(url) => parse_expected_graph(url)?,
-        None => Vec::new(),
+    // 3. Compare default graph state. A TriG result file also names graphs.
+    let (expected_default, result_dataset_graphs) = match result_data_url {
+        Some(url) => parse_expected_dataset(url)?,
+        None => (Vec::new(), Vec::new()),
     };
     let actual_default = read_graph_triples(&fluree, &ledger, None).await?;
     compare_graph(
@@ -584,6 +585,16 @@ pub async fn run_update_eval_test(
             expected,
             actual,
             Some(expected_url),
+        )?;
+    }
+    for (graph_name, expected) in &result_dataset_graphs {
+        let actual = read_graph_triples(&fluree, &ledger, Some(graph_name)).await?;
+        compare_graph(
+            test_id,
+            &format!("named graph <{graph_name}>"),
+            expected.clone(),
+            actual,
+            result_data_url,
         )?;
     }
 
@@ -611,6 +622,7 @@ pub async fn run_update_eval_test(
     let expected_names: std::collections::HashSet<&str> = result_graph_data
         .iter()
         .map(|(name, _)| name.as_str())
+        .chain(result_dataset_graphs.iter().map(|(name, _)| name.as_str()))
         .collect();
     for name in &list_named_graphs(&fluree, &ledger).await? {
         if expected_names.contains(name.as_str()) {

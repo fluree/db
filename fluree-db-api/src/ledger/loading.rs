@@ -1,17 +1,26 @@
 use std::sync::Arc;
 
-use crate::ledger_view::CommitRef;
-use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
+use crate::ledger_view::{CommitRef, LedgerView};
+use crate::time_resolve;
+use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result, TimeSpec};
+use fluree_db_binary_index::IndexRoot;
 use fluree_db_core::ContentStore;
 use fluree_db_core::LedgerId;
-use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId};
+use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId, ContentId};
+use fluree_db_ledger::DecodedIndexRoot;
 use fluree_db_nameservice::lifecycle::PendingLedger;
 use fluree_db_nameservice::{NameServiceError, NsRecord};
+use fluree_db_query::QueryError;
 
 impl Fluree {
     /// Attach the binary index store and range provider to an already-loaded
     /// ledger state when its nameservice record points at a binary index root.
-    pub(crate) async fn attach_index(&self, state: &mut LedgerState) -> Result<()> {
+    /// `root` is the index root the state load already decoded, if any.
+    pub(crate) async fn attach_index(
+        &self,
+        state: &mut LedgerState,
+        root: Option<DecodedIndexRoot<IndexRoot>>,
+    ) -> Result<()> {
         crate::ledger_manager::load_and_attach_binary_store(
             self.backend(),
             self.nameservice(),
@@ -19,6 +28,7 @@ impl Fluree {
             &self.binary_store_cache_dir(),
             Some(Arc::clone(self.leaflet_cache())),
             None,
+            root,
         )
         .await?;
         Ok(())
@@ -53,8 +63,13 @@ impl Fluree {
     where
         C: ContentStore + Clone + 'static,
     {
-        let mut state = LedgerState::load_with_store(store, record).await?;
-        self.attach_index(&mut state).await?;
+        let (mut state, root) = LedgerState::load_with_store_decoding_root(
+            store,
+            record,
+            crate::ledger_manager::decode_index_root,
+        )
+        .await?;
+        self.attach_index(&mut state, root).await?;
         Ok(state)
     }
 
@@ -78,9 +93,14 @@ impl Fluree {
     /// same lock) would deadlock the transact path — and the failure mode is
     /// a hang, not a red test. Anything added here must stay manager-free.
     pub(crate) async fn load_ledger_uncached(&self, ledger_id: &str) -> Result<LedgerState> {
-        let mut state =
-            LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
-        self.attach_index(&mut state).await?;
+        let (mut state, root) = LedgerState::load_decoding_root(
+            &self.nameservice_mode,
+            ledger_id,
+            self.backend(),
+            crate::ledger_manager::decode_index_root,
+        )
+        .await?;
+        self.attach_index(&mut state, root).await?;
         // Default context is not loaded here. Opt-in callers route through
         // `Fluree::db_with_default_context` / `db_at_with_default_context`,
         // which fetch and attach the context onto the returned `GraphDb`.
@@ -179,15 +199,19 @@ impl Fluree {
     /// Looks up the source branch to capture its current commit state, then
     /// creates a new [`NsRecord`] for `ledger_name:new_branch`.
     ///
-    /// When `source_commit` is `None`, the new branch starts at the source's
-    /// current HEAD and inherits its index (copied into the new branch's
-    /// storage namespace so it's safe from GC on the source). This is the
-    /// default behavior.
+    /// When `at` is `None` or [`TimeSpec::Latest`], the new branch starts at
+    /// the source's current HEAD and inherits its index (copied into the new
+    /// branch's storage namespace so it's safe from GC on the source). This is
+    /// the default behavior.
     ///
-    /// When `source_commit` is `Some(ref)`, the ref is resolved to a canonical
-    /// [`CommitId`] against the source branch, verified to be reachable from
-    /// the source HEAD, and becomes the new branch's head. The index is not
-    /// copied — the index at the source HEAD is typically too fresh for a
+    /// Any other `at` names a point on the source branch, read exactly as a
+    /// query pinned at `@<at>` on the source reads it: the new branch's head is
+    /// the commit that query would see as its head. `AtTime` / `AtRecorded`
+    /// resolve through the same timestamp resolver queries use, `AtT` names
+    /// that transaction, and `AtCommit` names that commit (a hex digest prefix,
+    /// with or without `sha256:` / `fluree:commit:`, or a full CID). The
+    /// commit is verified to be on the source's line of commits. The index is
+    /// not copied — the index at the source HEAD is typically too fresh for a
     /// historical branch point, so the new branch replays from genesis.
     ///
     /// Commits themselves are **not** copied — the branch's content store
@@ -196,14 +220,19 @@ impl Fluree {
     /// # Errors
     ///
     /// - [`ApiError::LedgerExists`] if the branch already exists
-    /// - [`ApiError::NotFound`] if the source branch does not exist, or if
-    ///   `source_commit` resolves to a commit not reachable from source HEAD
+    /// - [`ApiError::InvalidBranch`] if the source branch has no commits, or
+    ///   `at` is a malformed timestamp, a time before the source's first
+    ///   commit, a transaction number below 1, or an `AtSnapshot` (a
+    ///   graph-source table snapshot, never a commit on a ledger)
+    /// - [`ApiError::NotFound`] if the source branch does not exist
+    /// - [`ApiError::CommitNotFound`] if `at` names no commit, or one not
+    ///   reachable from source HEAD
     pub async fn create_branch(
         &self,
         ledger_name: &str,
         new_branch: &str,
         source_branch: Option<&str>,
-        source_commit: Option<CommitRef>,
+        at: Option<TimeSpec>,
     ) -> Result<NsRecord> {
         use fluree_db_core::ledger_id::validate_branch_name;
         use tracing::info;
@@ -228,18 +257,21 @@ impl Fluree {
 
         // Verify the source branch has a commit head before creating.
         let source_head = source_record.commit_head_id.clone().ok_or_else(|| {
-            ApiError::internal(format!("Source branch {source_id} has no commit head"))
+            ApiError::InvalidBranch(format!(
+                "Cannot branch from '{source_id}': it has no commits yet. \
+                 Transact to it first."
+            ))
         })?;
 
-        // If the caller specified a historical commit, resolve it and verify
+        // If the caller specified a historical point, resolve it and verify
         // it's reachable from source HEAD before we touch the nameservice.
-        // A ref that resolves to the source head itself is collapsed to the
+        // A point that resolves to the source head itself is collapsed to the
         // default (None) path so the user still gets an index copy — otherwise
         // `--at <head-cid>` would silently produce a slower branch than
         // omitting `--at` entirely.
-        let at_commit = if let Some(commit_ref) = source_commit {
+        let at_commit = if let Some(at) = at {
             let view = self.ledger_cached(&source_id).await?.snapshot().await;
-            let resolved = view.resolve_commit(commit_ref).await?;
+            let resolved = branch_point_commit(view, &source_id, at).await?;
             if resolved == source_head {
                 None
             } else {
@@ -438,6 +470,37 @@ impl Fluree {
     }
 }
 
+/// The commit a query pinned at `@<at>` on the source reads as its head.
+///
+/// Everything but a commit spelling goes through
+/// [`time_resolve::resolve_time_spec`], the resolver queries and export use,
+/// so a branch at `time:X` and a query at `@time:X` cannot disagree.
+async fn branch_point_commit(view: LedgerView, source_id: &str, at: TimeSpec) -> Result<CommitId> {
+    if let TimeSpec::AtCommit(spelling) = at {
+        // Resolved directly rather than through its `t`: a CID stays exact, so
+        // an off-line commit reaches `verify_ancestor`'s explanation.
+        let commit_ref = match ContentId::parse_canonical(&spelling) {
+            Some(cid) => CommitRef::Exact(cid),
+            None => CommitRef::Prefix(spelling),
+        };
+        return view.resolve_commit(commit_ref).await;
+    }
+    let as_branch_error = |e| match e {
+        ApiError::Query(QueryError::InvalidQuery(msg)) => {
+            ApiError::InvalidBranch(format!("Cannot branch from '{source_id}': {msg}"))
+        }
+        other => other,
+    };
+    let state = view.to_ledger_state();
+    let t = time_resolve::resolve_time_spec(&state, &at)
+        .await
+        .map_err(as_branch_error)?;
+    LedgerView::from_state(&state)
+        .resolve_commit(CommitRef::T(t))
+        .await
+        .map_err(as_branch_error)
+}
+
 /// Verify `target` is on the source branch's line of commits, and return
 /// its `t` value.
 ///
@@ -463,7 +526,7 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     let target_envelope = load_commit_envelope_by_id(store, target)
         .await
         .map_err(|_| {
-            ApiError::NotFound(format!("commit {target} not found in source namespace"))
+            ApiError::CommitNotFound(format!("commit {target} not found in source namespace"))
         })?;
 
     if source_head == target {
@@ -476,7 +539,7 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
     if line.iter().any(|(_, cid)| cid == target) {
         Ok(target_envelope.t)
     } else {
-        Err(ApiError::NotFound(format!(
+        Err(ApiError::CommitNotFound(format!(
             "commit {target} is not on the line of commits behind {source_head}. \
              A commit that arrived through a merge cannot be branched at: branch \
              at the merge commit instead, or at a commit on the branch that made it"

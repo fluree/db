@@ -54,6 +54,8 @@ use crate::namespace::NamespaceRegistry;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES};
 use fluree_graph_turtle::{tokenize, Token, TokenKind};
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
+use std::sync::Arc;
 
 /// IRI reference for the transaction metadata named graph.
 ///
@@ -66,19 +68,6 @@ fn is_commit_this_iri(iri: &str) -> bool {
     iri == fluree_vocab::fluree::COMMIT_THIS_HTTP || iri == fluree_vocab::fluree::COMMIT_THIS_SCHEME
 }
 
-/// Result of extracting transaction metadata from a TriG document.
-#[derive(Debug)]
-pub struct TrigMetaResult {
-    /// Turtle content for the default graph (GRAPH blocks removed).
-    /// This should be passed to the normal Turtle parser.
-    pub turtle: String,
-    /// Extracted transaction metadata entries (from txn-meta graph).
-    pub txn_meta: Vec<TxnMetaEntry>,
-    /// Named graph blocks (non-txn-meta graphs).
-    /// Each entry is (graph_iri, triples).
-    pub named_graphs: Vec<NamedGraphBlock>,
-}
-
 /// A named graph block with its IRI and triples.
 #[derive(Debug, Clone)]
 pub struct NamedGraphBlock {
@@ -86,12 +75,13 @@ pub struct NamedGraphBlock {
     pub iri: String,
     /// Triples in this graph.
     pub triples: Vec<RawTriple>,
-    /// RDF 1.2 reifier attachments (TriG-star) in this graph. The reified
-    /// base triple is also present in `triples` (Fluree asserts it), so
-    /// consumers emit the `f:reifies*` bundle from here and nothing else.
+    /// RDF 1.2 reifier attachments (TriG-star) in this graph. Each becomes
+    /// the reifier's `rdf:reifies` link; the reified triple is in `triples`
+    /// only when the annotation syntax asserted it.
     pub reified: Vec<RawReifiedTriple>,
-    /// Prefix mappings from the TriG document (for IRI expansion).
-    pub prefixes: FxHashMap<String, String>,
+    /// The document's prefix mappings where the block appears (for IRI
+    /// expansion). Blocks with no directive between them share one map.
+    pub prefixes: Arc<FxHashMap<String, String>>,
 }
 
 /// One RDF 1.2 reifier attachment parsed inside a GRAPH block: `reifier`
@@ -121,9 +111,10 @@ pub struct RawReifiedTriple {
 
 /// Result of Phase 1 TriG parsing (before namespace resolution).
 #[derive(Debug, Clone)]
-pub struct TrigPhase1Result {
-    /// Cleaned Turtle content (GRAPH blocks removed).
-    pub turtle: String,
+pub struct TrigPhase1Result<'a> {
+    /// Cleaned Turtle content (GRAPH blocks removed). Borrows the input when
+    /// it cannot contain a graph block, so plain Turtle is not copied.
+    pub turtle: Cow<'a, str>,
     /// Raw metadata entries from txn-meta graph (if present).
     pub raw_meta: Option<RawTrigMeta>,
     /// Named graph blocks (non-txn-meta graphs).
@@ -136,8 +127,8 @@ pub struct TrigPhase1Result {
 /// Use `resolve_trig_meta()` to convert to `TxnMetaEntry` with namespace codes.
 #[derive(Debug, Clone)]
 pub struct RawTrigMeta {
-    /// Prefix mappings from the TriG document.
-    pub prefixes: FxHashMap<String, String>,
+    /// The document's prefix mappings where the txn-meta block appears.
+    pub prefixes: Arc<FxHashMap<String, String>>,
     /// Parsed triples from the txn-meta GRAPH block.
     pub triples: Vec<RawTriple>,
 }
@@ -183,6 +174,12 @@ pub enum RawObject {
     TypedLiteral { value: String, datatype: String },
     /// Language-tagged string.
     LangString { value: String, lang: String },
+    /// A triple term, `<<( subject predicate object )>>`.
+    TripleTerm {
+        subject: RawTerm,
+        predicate: RawTerm,
+        object: Box<RawObject>,
+    },
 }
 
 /// Phase 1: Parse TriG input and extract GRAPH blocks (no namespace resolution).
@@ -195,11 +192,11 @@ pub enum RawObject {
 ///
 /// The raw metadata can be converted to `TxnMetaEntry` using `resolve_trig_meta()`
 /// once a `NamespaceRegistry` is available.
-pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result> {
+pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result<'_>> {
     // Check if input might contain a graph block - if not, pass through as-is
     if !might_contain_graph_block(input) {
         return Ok(TrigPhase1Result {
-            turtle: input.to_string(),
+            turtle: Cow::Borrowed(input),
             raw_meta: None,
             named_graphs: Vec::new(),
         });
@@ -214,73 +211,6 @@ pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result> {
 
     // Extract phase 1 result (no namespace resolution)
     parser.extract_phase1()
-}
-
-/// A TriG document read as one graph's Turtle (see [`unwrap_trig_graph_blocks`]).
-#[derive(Debug, Clone)]
-pub struct UnwrappedTrig {
-    /// The document as Turtle: labeled graph block delimiters blanked out, so
-    /// block triples stay in place in document order, and the txn-meta block
-    /// blanked out entirely. Every edit is same-length, so a Turtle parse
-    /// error's line and column still point into the original document.
-    pub turtle: String,
-    /// Labels of the unwrapped blocks, in document order (repeats kept).
-    pub graph_iris: Vec<String>,
-    /// Whether the document has default-graph triples beside its blocks.
-    /// In TriG those belong to a different graph than any block's.
-    pub mixes_default_and_named: bool,
-    /// The txn-meta block, as [`parse_trig_phase1`] reports it.
-    pub raw_meta: Option<RawTrigMeta>,
-}
-
-/// Unwrap a TriG document's labeled graph blocks in place, leaving Turtle
-/// the full Turtle parser reads — anonymous `[ … ]` nodes, collections and
-/// every RDF 1.2 form included, none of which [`parse_trig_phase1`]'s block
-/// parser accepts. The labels are reported, not applied: this is for a caller
-/// that writes the document to one graph, and must check they name it.
-///
-/// Blank-node labels are document-scoped in TriG, so one label in two blocks
-/// is one node here too.
-pub fn unwrap_trig_graph_blocks(input: &str) -> Result<UnwrappedTrig> {
-    if !might_contain_graph_block(input) {
-        return Ok(UnwrappedTrig {
-            turtle: input.to_string(),
-            graph_iris: Vec::new(),
-            mixes_default_and_named: false,
-            raw_meta: None,
-        });
-    }
-    let tokens = tokenize(input).map_err(|e| TransactError::Parse(e.to_string()))?;
-    let mut parser = TrigMetaParser::new(input, &tokens);
-    parser.unwrap_blocks = true;
-    parser.parse()?;
-
-    let mut turtle = input.as_bytes().to_vec();
-    let blank = |bytes: &mut [u8]| {
-        for b in bytes.iter_mut().filter(|b| !matches!(b, b'\n' | b'\r')) {
-            *b = b' ';
-        }
-    };
-    for block in &parser.unwrapped {
-        blank(&mut turtle[block.header.0..block.header.1]);
-        // A block's last triple may omit its `.`; Turtle's may not.
-        turtle[block.close] = if block.needs_dot { b'.' } else { b' ' };
-    }
-    for &(start, end) in &parser.excised {
-        blank(&mut turtle[start..end]);
-    }
-    let turtle = String::from_utf8(turtle).expect("only ASCII bytes replaced ASCII bytes");
-
-    let mixes_default_and_named =
-        !parser.default_triples.is_empty() && !parser.unwrapped.is_empty();
-    let graph_iris = parser.unwrapped.iter().map(|b| b.iri.clone()).collect();
-    let raw_meta = parser.extract_phase1()?.raw_meta;
-    Ok(UnwrappedTrig {
-        turtle,
-        graph_iris,
-        mixes_default_and_named,
-        raw_meta,
-    })
 }
 
 /// Phase 2: Resolve raw TriG metadata to TxnMetaEntry using namespace registry.
@@ -377,54 +307,10 @@ fn raw_object_to_txn_meta_value(
                 dt_name: dt_sid.name.to_string(),
             })
         }
+        RawObject::TripleTerm { .. } => Err(TransactError::Parse(
+            "txn-meta does not support triple-term values".to_string(),
+        )),
     }
-}
-
-/// Extract transaction metadata and named graphs from a TriG document.
-///
-/// This function:
-/// 1. Parses @prefix/@base directives into a shared prefix map
-/// 2. Finds all `GRAPH <iri> { ... }` blocks
-/// 3. For txn-meta graph: extracts triples where subject is `fluree:commit:this`
-/// 4. For other graphs: returns the triples for later processing
-/// 5. Returns the default graph content as Turtle + extracted metadata + named graphs
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Subject in txn-meta GRAPH block is not `fluree:commit:this`
-/// - Blank nodes appear in txn-meta block
-/// - Entry count or size limits exceeded
-pub fn extract_trig_txn_meta(
-    input: &str,
-    ns_registry: &mut NamespaceRegistry,
-) -> Result<TrigMetaResult> {
-    // Check if input might contain a graph block - if not, pass through as-is
-    if !might_contain_graph_block(input) {
-        return Ok(TrigMetaResult {
-            turtle: input.to_string(),
-            txn_meta: Vec::new(),
-            named_graphs: Vec::new(),
-        });
-    }
-
-    // Tokenize the input
-    let tokens = tokenize(input).map_err(|e| TransactError::Parse(e.to_string()))?;
-
-    // Parse into structured form
-    let mut parser = TrigMetaParser::new(input, &tokens);
-    parser.parse()?;
-
-    // Extract txn-meta, named graphs, and rebuild Turtle
-    let (turtle, txn_meta, named_graphs) = parser.extract(ns_registry)?;
-
-    validate_limits(&txn_meta)?;
-
-    Ok(TrigMetaResult {
-        turtle,
-        txn_meta,
-        named_graphs,
-    })
 }
 
 /// Quick check if input might contain a graph block — either the SPARQL-style
@@ -438,13 +324,16 @@ pub fn extract_trig_txn_meta(
 /// The `GRAPH` keyword is still checked so a malformed `GRAPH <iri>` (missing
 /// braces) is routed to the parser for a proper error rather than passed
 /// through silently.
-fn might_contain_graph_block(input: &str) -> bool {
+///
+/// Scans without copying: a caller that only needs to rule TriG out, such as
+/// a failed Turtle insert, may be holding a very large document.
+pub fn might_contain_graph_block(input: &str) -> bool {
     // Cheap, common-case-first: a brace is present in every graph block.
-    if input.contains('{') {
-        return true;
-    }
-    // Case-insensitive check for the GRAPH keyword.
-    input.to_ascii_uppercase().contains("GRAPH")
+    input.contains('{')
+        || input
+            .as_bytes()
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"GRAPH"))
 }
 
 /// Parser state for TriG metadata extraction.
@@ -452,14 +341,17 @@ struct TrigMetaParser<'a> {
     input: &'a str,
     tokens: &'a [Token],
     pos: usize,
-    /// Prefix mappings: prefix -> namespace IRI
-    prefixes: FxHashMap<String, String>,
+    /// Prefix mappings: prefix -> namespace IRI. Shared with the blocks parsed
+    /// since the last directive; a directive copies it only if one is.
+    prefixes: Arc<FxHashMap<String, String>>,
     /// Base IRI
     base: Option<String>,
     /// Collected directives (for reconstructing Turtle output)
     directives: Vec<(usize, usize)>, // (start, end) byte ranges
     /// Default graph triple ranges
     default_triples: Vec<(usize, usize)>,
+    /// Ends of default-graph statements closed by a `}` instead of a `.`.
+    dotless_ends: Vec<usize>,
     /// All GRAPH blocks (supports multiple named graphs)
     graph_blocks: Vec<GraphBlock>,
     /// Triples of the statement currently being parsed inside a GRAPH
@@ -477,23 +369,6 @@ struct TrigMetaParser<'a> {
     /// Non-zero while parsing a `{| … |}` body: star constructs there are
     /// the deferred annotation-of-annotation shape.
     annotation_depth: u32,
-    /// Skip labeled blocks' contents, recording where their delimiters are
-    /// (see [`unwrap_trig_graph_blocks`]).
-    unwrap_blocks: bool,
-    unwrapped: Vec<UnwrappedBlock>,
-    /// Byte ranges of txn-meta blocks, when unwrapping.
-    excised: Vec<(usize, usize)>,
-}
-
-/// Where a skipped labeled block's delimiters are.
-struct UnwrappedBlock {
-    iri: String,
-    /// `GRAPH <iri> {` (or `<iri> {`), as a byte range.
-    header: (usize, usize),
-    /// Byte offset of the closing `}`.
-    close: usize,
-    /// Whether the block's last triple ends without a `.`.
-    needs_dot: bool,
 }
 
 /// Information about a GRAPH block.
@@ -504,6 +379,10 @@ struct GraphBlock {
     triples: Vec<ParsedTriple>,
     /// Reifier attachments inside the GRAPH block (TriG-star)
     reified: Vec<ParsedReified>,
+    /// The prefix map where the block appears. Its prefixed names expand with
+    /// this map, not the document's final one: a later `@prefix` must not
+    /// rewrite them. (Directives cannot occur inside a block.)
+    prefixes: Arc<FxHashMap<String, String>>,
 }
 
 /// A reifier attachment before namespace resolution (see [`RawReifiedTriple`]).
@@ -559,6 +438,7 @@ enum ObjectValue {
         value: String,
         lang: String,
     },
+    TripleTerm(Box<(TermValue, TermValue, ObjectValue)>),
 }
 
 impl<'a> TrigMetaParser<'a> {
@@ -567,19 +447,17 @@ impl<'a> TrigMetaParser<'a> {
             input,
             tokens,
             pos: 0,
-            prefixes: FxHashMap::default(),
+            prefixes: Arc::default(),
             base: None,
             directives: Vec::new(),
             default_triples: Vec::new(),
+            dotless_ends: Vec::new(),
             graph_blocks: Vec::new(),
             stmt_triples: Vec::new(),
             reified: Vec::new(),
             anon_reifiers: 0,
             star_depth: 0,
             annotation_depth: 0,
-            unwrap_blocks: false,
-            unwrapped: Vec::new(),
-            excised: Vec::new(),
         }
     }
 
@@ -653,7 +531,7 @@ impl<'a> TrigMetaParser<'a> {
             }
             TokenKind::KwGraph => {
                 self.advance(); // consume the GRAPH keyword
-                self.parse_graph_block(start_pos)?;
+                self.parse_graph_block()?;
             }
             // W3C-compliant compact graph block: `<iri> { ... }` or
             // `prefix:name { ... }` (the GRAPH keyword is optional per the TriG
@@ -666,21 +544,10 @@ impl<'a> TrigMetaParser<'a> {
             | TokenKind::PrefixedNameNs
                 if matches!(self.peek_kind(1), Some(TokenKind::LBrace)) =>
             {
-                self.parse_graph_block(start_pos)?;
+                self.parse_graph_block()?;
             }
-            // Anonymous default-graph wrapped block `{ ... }`. Valid W3C TriG
-            // (it denotes the default graph), but unsupported here: this parser
-            // separates default-graph Turtle from labeled graph blocks. Reject
-            // cleanly rather than letting the brace leak into the reconstructed
-            // Turtle and surface as a misleading low-level parse error.
-            TokenKind::LBrace => {
-                return Err(TransactError::Parse(
-                    "anonymous default-graph block `{ ... }` is not supported; \
-                     write default-graph triples directly (outside any block), \
-                     or use a labeled graph block `<iri> { ... }`"
-                        .to_string(),
-                ));
-            }
+            // `{ … }`: the default graph, its statements default-graph Turtle.
+            TokenKind::LBrace => self.parse_default_block()?,
             // Blank-node graph label (`_:b { ... }`). Valid W3C TriG, but not
             // supported here in either form (the keyword form rejects it too).
             // Emit a clear error instead of a silent mis-parse.
@@ -722,8 +589,8 @@ impl<'a> TrigMetaParser<'a> {
         // Get namespace IRI
         let namespace = self.parse_iri()?;
 
-        // Register prefix
-        self.prefixes.insert(prefix, namespace);
+        // Register prefix, copying the map only if a block still holds it
+        Arc::make_mut(&mut self.prefixes).insert(prefix, namespace);
 
         // Consume trailing dot if not SPARQL style
         if !is_sparql && self.check(&TokenKind::Dot) {
@@ -821,7 +688,7 @@ impl<'a> TrigMetaParser<'a> {
     /// Parse a graph block starting at the graph label (the optional `GRAPH`
     /// keyword, if present, must already be consumed by the caller). Handles
     /// both `GRAPH <iri> { ... }` and the compact `<iri> { ... }` form.
-    fn parse_graph_block(&mut self, start_pos: usize) -> Result<()> {
+    fn parse_graph_block(&mut self) -> Result<()> {
         // Parse graph IRI
         let graph_iri = match self.current().kind.clone() {
             TokenKind::Iri => {
@@ -841,7 +708,7 @@ impl<'a> TrigMetaParser<'a> {
                 let span = self.span_text(s, e);
                 let (prefix, local) = split_prefixed_name(span);
                 self.advance();
-                self.expand_prefixed_name(prefix, local)?
+                self.expand_prefixed_name(prefix, &local)?
             }
             _ => {
                 return Err(TransactError::Parse(format!(
@@ -858,10 +725,6 @@ impl<'a> TrigMetaParser<'a> {
             ));
         }
         self.advance();
-
-        if self.unwrap_blocks && graph_iri != TXN_META_GRAPH_IRI {
-            return self.skip_graph_block(graph_iri, start_pos);
-        }
 
         // Parse triples inside the GRAPH block
         let mut triples = Vec::new();
@@ -889,44 +752,14 @@ impl<'a> TrigMetaParser<'a> {
             ));
         }
 
-        if self.unwrap_blocks {
-            let end = self.tokens[self.pos - 1].end as usize;
-            self.excised.push((start_pos, end));
-        }
-
         // Store the graph block (supports multiple GRAPH blocks)
         self.graph_blocks.push(GraphBlock {
             iri: graph_iri,
             triples,
             reified,
+            prefixes: Arc::clone(&self.prefixes),
         });
 
-        Ok(())
-    }
-
-    /// Skip a labeled block's contents (positioned just past its `{`),
-    /// recording its delimiters. The contents are left for the Turtle parser,
-    /// which also reports their errors.
-    fn skip_graph_block(&mut self, iri: String, start_pos: usize) -> Result<()> {
-        let header = (start_pos, self.tokens[self.pos - 1].end as usize);
-        let mut needs_dot = false;
-        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            needs_dot = !self.check(&TokenKind::Dot);
-            self.advance();
-        }
-        if !self.check(&TokenKind::RBrace) {
-            return Err(TransactError::Parse(
-                "expected '}' to close GRAPH block".to_string(),
-            ));
-        }
-        let close = self.current().start as usize;
-        self.advance();
-        self.unwrapped.push(UnwrappedBlock {
-            iri,
-            header,
-            close,
-            needs_dot,
-        });
         Ok(())
     }
 
@@ -934,16 +767,27 @@ impl<'a> TrigMetaParser<'a> {
     // RDF 1.2 star constructs inside GRAPH blocks (TriG-star)
     // ---------------------------------------------------------------------
     //
-    // Mirrors the streaming Turtle parser's asserting forms: the reified
-    // base triple is asserted, each anonymous occurrence mints a fresh
-    // reifier, `<<( … )>>` is a value only as the object of `rdf:reifies`,
-    // and star constructs inside an annotation body are deferred.
+    // Mirrors the streaming Turtle parser: each anonymous occurrence mints a
+    // fresh reifier, `<<( … )>>` is a value only in object position, and star
+    // constructs inside an annotation body are deferred.
+
+    /// An anonymous blank node or a collection, which this block parser does
+    /// not read: say which construct and what to write instead, where the
+    /// token alone (`'['`) left the fix to guess.
+    fn unsupported_in_block_error(&self) -> TransactError {
+        let construct = match self.current().kind {
+            TokenKind::LBracket | TokenKind::Anon => "anonymous blank nodes ('[ … ]')",
+            _ => "collections ('( … )')",
+        };
+        TransactError::Parse(format!(
+            "{construct} are not supported inside a TriG GRAPH block here; give the node \
+             a label such as _:b1 and state its properties as triples of their own"
+        ))
+    }
 
     fn triple_term_value_error(&self) -> TransactError {
         TransactError::Parse(
-            "RDF 1.2 triple terms as values ('<<( … )>>') are deferred; inside a TriG \
-             GRAPH block a triple term is accepted only as the object of rdf:reifies"
-                .to_string(),
+            "a triple term ('<<( … )>>') is a value and cannot be a subject".to_string(),
         )
     }
 
@@ -985,21 +829,6 @@ impl<'a> TrigMetaParser<'a> {
         });
     }
 
-    /// Assert the reified base triple (Fluree's documented divergence from
-    /// RDF 1.2's non-asserting `<< … >>` / `rdf:reifies`).
-    fn assert_base_triple(
-        &mut self,
-        subject: &TermValue,
-        predicate: &TermValue,
-        object: &ObjectValue,
-    ) {
-        self.stmt_triples.push(ParsedTriple {
-            subject: subject.clone(),
-            predicate: predicate.clone(),
-            objects: vec![object.clone()],
-        });
-    }
-
     /// `<< rtSubject predicate rtObject ( ~ reifier )? >>` — returns the
     /// reifier term, which is what the construct denotes in its position.
     fn parse_reified_triple(&mut self) -> Result<TermValue> {
@@ -1021,10 +850,7 @@ impl<'a> TrigMetaParser<'a> {
         self.advance(); // `<<`
         let subject = self.parse_subject()?;
         let predicate = self.parse_predicate()?;
-        let object = match self.current().kind {
-            TokenKind::TripleTermStart => return Err(self.triple_term_value_error()),
-            _ => self.parse_object()?,
-        };
+        let object = self.parse_object()?;
         let reifier = if self.check(&TokenKind::Tilde) {
             self.advance();
             self.parse_reifier_term()?
@@ -1038,7 +864,6 @@ impl<'a> TrigMetaParser<'a> {
             )));
         }
         self.advance();
-        self.assert_base_triple(&subject, &predicate, &object);
         self.attach_reifier(&subject, &predicate, &object, &reifier);
         Ok(reifier)
     }
@@ -1049,6 +874,24 @@ impl<'a> TrigMetaParser<'a> {
         if self.annotation_depth > 0 {
             return Err(self.annotation_of_annotation_error());
         }
+        let (subject, predicate, object) = self.parse_triple_term_parts()?;
+        if matches!(
+            self.current().kind,
+            TokenKind::Tilde | TokenKind::AnnotationOpen
+        ) {
+            return Err(TransactError::Parse(
+                "an annotation tail on an 'rdf:reifies <<( … )>>' statement would reify \
+                 the reification itself (annotation-of-annotation), which is deferred; \
+                 annotate the base triple instead"
+                    .to_string(),
+            ));
+        }
+        self.attach_reifier(&subject, &predicate, &object, reifier);
+        Ok(())
+    }
+
+    /// `<<( ttSubject predicate ttObject )>>`, the `<<(` token current.
+    fn parse_triple_term_parts(&mut self) -> Result<(TermValue, TermValue, ObjectValue)> {
         self.advance(); // `<<(`
         let subject = match self.current().kind {
             TokenKind::ReifiedTripleStart | TokenKind::TripleTermStart => {
@@ -1060,7 +903,6 @@ impl<'a> TrigMetaParser<'a> {
         };
         let predicate = self.parse_predicate()?;
         let object = match self.current().kind {
-            TokenKind::TripleTermStart => return Err(self.triple_term_value_error()),
             TokenKind::ReifiedTripleStart => {
                 return Err(TransactError::Parse(
                     "reified triples ('<< … >>') are not allowed inside a triple term".to_string(),
@@ -1075,20 +917,7 @@ impl<'a> TrigMetaParser<'a> {
             )));
         }
         self.advance();
-        if matches!(
-            self.current().kind,
-            TokenKind::Tilde | TokenKind::AnnotationOpen
-        ) {
-            return Err(TransactError::Parse(
-                "an annotation tail on an 'rdf:reifies <<( … )>>' statement would reify \
-                 the reification itself (annotation-of-annotation), which is deferred; \
-                 annotate the base triple instead"
-                    .to_string(),
-            ));
-        }
-        self.assert_base_triple(&subject, &predicate, &object);
-        self.attach_reifier(&subject, &predicate, &object, reifier);
-        Ok(())
+        Ok((subject, predicate, object))
     }
 
     /// `reifier ::= '~' (iri | BlankNode)?` — the `~` is already consumed;
@@ -1139,12 +968,11 @@ impl<'a> TrigMetaParser<'a> {
                             r
                         }
                     };
-                    if !self.check(&TokenKind::AnnotationClose) {
-                        self.annotation_depth += 1;
-                        let body = self.parse_predicate_object_list(&reifier);
-                        self.annotation_depth -= 1;
-                        body?;
-                    }
+                    // `{| |}` needs a predicate-object list, as in Turtle.
+                    self.annotation_depth += 1;
+                    let body = self.parse_predicate_object_list(&reifier);
+                    self.annotation_depth -= 1;
+                    body?;
                     if !self.check(&TokenKind::AnnotationClose) {
                         return Err(TransactError::Parse(format!(
                             "expected '|}}' to close annotation block, found {}",
@@ -1236,6 +1064,9 @@ impl<'a> TrigMetaParser<'a> {
             }
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
             TokenKind::TripleTermStart => Err(self.triple_term_value_error()),
+            TokenKind::LBracket | TokenKind::Anon | TokenKind::LParen | TokenKind::Nil => {
+                Err(self.unsupported_in_block_error())
+            }
             _ => Err(TransactError::Parse(format!(
                 "expected subject, found {}",
                 self.current().kind
@@ -1287,10 +1118,7 @@ impl<'a> TrigMetaParser<'a> {
     ) -> Result<Vec<ObjectValue>> {
         let mut objects = Vec::with_capacity(1);
         loop {
-            if self.check(&TokenKind::TripleTermStart) {
-                if !self.predicate_is_reifies(predicate)? {
-                    return Err(self.triple_term_value_error());
-                }
+            if self.check(&TokenKind::TripleTermStart) && self.predicate_is_reifies(predicate)? {
                 self.parse_reifies_triple_term(subject)?;
             } else {
                 let object = self.parse_object()?;
@@ -1406,7 +1234,16 @@ impl<'a> TrigMetaParser<'a> {
                 }
                 TermValue::BlankNode(label) => ObjectValue::BlankNode(label),
             }),
-            TokenKind::TripleTermStart => Err(self.triple_term_value_error()),
+            TokenKind::TripleTermStart => {
+                if self.annotation_depth > 0 {
+                    return Err(self.annotation_of_annotation_error());
+                }
+                let (s, p, o) = self.parse_triple_term_parts()?;
+                Ok(ObjectValue::TripleTerm(Box::new((s, p, o))))
+            }
+            TokenKind::LBracket | TokenKind::Anon | TokenKind::LParen | TokenKind::Nil => {
+                Err(self.unsupported_in_block_error())
+            }
             _ => Err(TransactError::Parse(format!(
                 "expected object, found {}",
                 self.current().kind
@@ -1452,7 +1289,7 @@ impl<'a> TrigMetaParser<'a> {
                         let span = self.span_text(s, e);
                         let (prefix, local) = split_prefixed_name(span);
                         self.advance();
-                        self.expand_prefixed_name(prefix, local)?
+                        self.expand_prefixed_name(prefix, &local)?
                     }
                     _ => {
                         return Err(TransactError::Parse(format!(
@@ -1465,6 +1302,50 @@ impl<'a> TrigMetaParser<'a> {
             }
             _ => Ok(ObjectValue::String(value)),
         }
+    }
+
+    /// A `{ … }` default-graph block, positioned at its `{`. Its last
+    /// statement may omit the `.` a Turtle statement needs.
+    fn parse_default_block(&mut self) -> Result<()> {
+        self.advance();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            if matches!(
+                self.current().kind,
+                TokenKind::KwPrefix
+                    | TokenKind::KwSparqlPrefix
+                    | TokenKind::KwBase
+                    | TokenKind::KwSparqlBase
+                    | TokenKind::KwVersion
+                    | TokenKind::KwSparqlVersion
+            ) {
+                return Err(TransactError::Parse(
+                    "directives are not allowed inside a graph block".to_string(),
+                ));
+            }
+            let start = self.current().start as usize;
+            while !self.check(&TokenKind::Dot)
+                && !self.check(&TokenKind::RBrace)
+                && !self.is_at_end()
+            {
+                self.advance();
+            }
+            let needs_dot = !self.check(&TokenKind::Dot);
+            if !needs_dot {
+                self.advance();
+            }
+            let end = self.tokens[self.pos.saturating_sub(1)].end as usize;
+            self.default_triples.push((start, end));
+            if needs_dot {
+                self.dotless_ends.push(end);
+            }
+        }
+        if !self.check(&TokenKind::RBrace) {
+            return Err(TransactError::Parse(
+                "expected '}' to close the default graph block".to_string(),
+            ));
+        }
+        self.advance();
+        Ok(())
     }
 
     fn parse_default_triple(&mut self, start_pos: usize) -> Result<()> {
@@ -1480,93 +1361,27 @@ impl<'a> TrigMetaParser<'a> {
         Ok(())
     }
 
-    /// Extract txn-meta entries, named graphs, and reconstruct Turtle content.
-    fn extract(
-        self,
-        ns_registry: &mut NamespaceRegistry,
-    ) -> Result<(String, Vec<TxnMetaEntry>, Vec<NamedGraphBlock>)> {
-        let mut txn_meta = Vec::new();
-        let mut named_graphs = Vec::new();
-
-        // Process GRAPH blocks
-        for block in &self.graph_blocks {
-            if block.iri == TXN_META_GRAPH_IRI {
-                // txn-meta graph: extract as TxnMetaEntry
-                for triple in &block.triples {
-                    // Validate subject is fluree:commit:this
-                    let subject_iri = match &triple.subject {
-                        TermValue::Iri(iri) => iri.clone(),
-                        TermValue::PrefixedName { prefix, local } => {
-                            self.expand_prefixed_name(prefix, local)?
-                        }
-                        TermValue::BlankNode(_) => {
-                            return Err(TransactError::Parse(
-                                "blank nodes not allowed as txn-meta subject".to_string(),
-                            ))
-                        }
-                    };
-
-                    if !is_commit_this_iri(&subject_iri) {
-                        return Err(TransactError::Parse(format!(
-                            "txn-meta subject must be fluree:commit:this, found: {subject_iri}"
-                        )));
-                    }
-
-                    // Get predicate IRI
-                    let predicate_iri = match &triple.predicate {
-                        TermValue::Iri(iri) => iri.clone(),
-                        TermValue::PrefixedName { prefix, local } => {
-                            self.expand_prefixed_name(prefix, local)?
-                        }
-                        TermValue::BlankNode(_) => {
-                            return Err(TransactError::Parse(
-                                "blank nodes not allowed as txn-meta predicate".to_string(),
-                            ))
-                        }
-                    };
-
-                    // Convert predicate to ns_code + name
-                    let pred_sid = ns_registry.sid_for_iri(&predicate_iri);
-
-                    // Convert each object to TxnMetaEntry
-                    for obj in &triple.objects {
-                        let value = self.object_to_txn_meta_value(obj, ns_registry)?;
-                        txn_meta.push(TxnMetaEntry::new(
-                            pred_sid.namespace_code,
-                            pred_sid.name.to_string(),
-                            value,
-                        ));
-                    }
-                }
-            } else {
-                // Named graph: convert to RawTriples for later processing
-                let raw_triples = self.convert_to_raw_triples(&block.triples)?;
-                let reified = self.convert_reified_to_raw(&block.reified)?;
-                named_graphs.push(NamedGraphBlock {
-                    iri: block.iri.clone(),
-                    triples: raw_triples,
-                    reified,
-                    prefixes: self.prefixes.clone(),
-                });
-            }
-        }
-
-        // Reconstruct Turtle content (directives + default triples)
+    /// The default graph as Turtle: its triples and the document's directives
+    /// in document order, so each `@prefix`/`@base` applies only to what
+    /// follows it. Emitting every directive first let a later redefinition
+    /// rewrite the triples before it.
+    fn default_graph_turtle(&self) -> String {
+        let mut spans: Vec<(usize, usize)> = self
+            .directives
+            .iter()
+            .chain(&self.default_triples)
+            .copied()
+            .collect();
+        spans.sort_unstable();
         let mut turtle = String::new();
-
-        // Add directives
-        for (start, end) in &self.directives {
-            turtle.push_str(&self.input[*start..*end]);
+        for (start, end) in spans {
+            turtle.push_str(&self.input[start..end]);
+            if self.dotless_ends.contains(&end) {
+                turtle.push_str(" .");
+            }
             turtle.push('\n');
         }
-
-        // Add default graph triples
-        for (start, end) in &self.default_triples {
-            turtle.push_str(&self.input[*start..*end]);
-            turtle.push('\n');
-        }
-
-        Ok((turtle, txn_meta, named_graphs))
+        turtle
     }
 
     /// Convert ParsedTriples to RawTriples for named graph blocks.
@@ -1653,6 +1468,19 @@ impl<'a> TrigMetaParser<'a> {
     /// Convert an ObjectValue to RawObject.
     fn convert_object_to_raw(&self, obj: &ObjectValue) -> Result<RawObject> {
         match obj {
+            ObjectValue::TripleTerm(term) => {
+                let (subject, predicate, object) = &**term;
+                if matches!(predicate, TermValue::BlankNode(_)) {
+                    return Err(TransactError::Parse(
+                        "blank nodes not allowed as predicate".to_string(),
+                    ));
+                }
+                Ok(RawObject::TripleTerm {
+                    subject: Self::convert_node_to_raw(subject),
+                    predicate: Self::convert_node_to_raw(predicate),
+                    object: Box::new(self.convert_object_to_raw(object)?),
+                })
+            }
             ObjectValue::String(s) => Ok(RawObject::String(s.clone())),
             ObjectValue::Integer(n) => Ok(RawObject::Integer(*n)),
             ObjectValue::Double(n) => {
@@ -1684,78 +1512,15 @@ impl<'a> TrigMetaParser<'a> {
         }
     }
 
-    fn object_to_txn_meta_value(
-        &self,
-        obj: &ObjectValue,
-        ns_registry: &mut NamespaceRegistry,
-    ) -> Result<TxnMetaValue> {
-        match obj {
-            ObjectValue::String(s) => Ok(TxnMetaValue::String(s.clone())),
-            ObjectValue::Integer(n) => Ok(TxnMetaValue::Long(*n)),
-            ObjectValue::Double(n) => {
-                if !n.is_finite() {
-                    return Err(TransactError::Parse(
-                        "txn-meta does not support non-finite double values".to_string(),
-                    ));
-                }
-                Ok(TxnMetaValue::Double(*n))
-            }
-            ObjectValue::Boolean(b) => Ok(TxnMetaValue::Boolean(*b)),
-            ObjectValue::Iri(iri) => {
-                let sid = ns_registry.sid_for_iri(iri);
-                Ok(TxnMetaValue::Ref {
-                    ns: sid.namespace_code,
-                    name: sid.name.to_string(),
-                })
-            }
-            ObjectValue::PrefixedName { prefix, local } => {
-                let iri = self.expand_prefixed_name(prefix, local)?;
-                let sid = ns_registry.sid_for_iri(&iri);
-                Ok(TxnMetaValue::Ref {
-                    ns: sid.namespace_code,
-                    name: sid.name.to_string(),
-                })
-            }
-            ObjectValue::BlankNode(_) => Err(TransactError::Parse(
-                "blank nodes not allowed in txn-meta objects".to_string(),
-            )),
-            ObjectValue::LangString { value, lang } => Ok(TxnMetaValue::LangString {
-                value: value.clone(),
-                lang: lang.clone(),
-            }),
-            ObjectValue::TypedLiteral { value, datatype } => {
-                let dt_sid = ns_registry.sid_for_iri(datatype);
-                Ok(TxnMetaValue::TypedLiteral {
-                    value: value.clone(),
-                    dt_ns: dt_sid.namespace_code,
-                    dt_name: dt_sid.name.to_string(),
-                })
-            }
-        }
-    }
-
     /// Phase 1 extraction: return raw triples without namespace resolution.
-    fn extract_phase1(self) -> Result<TrigPhase1Result> {
-        // Reconstruct Turtle content (directives + default triples)
-        let mut turtle = String::new();
-
-        // Add directives
-        for (start, end) in &self.directives {
-            turtle.push_str(&self.input[*start..*end]);
-            turtle.push('\n');
-        }
-
-        // Add default graph triples
-        for (start, end) in &self.default_triples {
-            turtle.push_str(&self.input[*start..*end]);
-            turtle.push('\n');
-        }
+    fn extract_phase1(mut self) -> Result<TrigPhase1Result<'static>> {
+        let turtle = self.default_graph_turtle();
 
         let mut raw_meta: Option<RawTrigMeta> = None;
         let mut named_graphs: Vec<NamedGraphBlock> = Vec::new();
 
-        // Process all GRAPH blocks
-        for block in &self.graph_blocks {
+        // Process all GRAPH blocks, moving each one's prefix map out
+        for block in std::mem::take(&mut self.graph_blocks) {
             if block.iri == TXN_META_GRAPH_IRI {
                 // txn-meta graph: convert to RawTrigMeta
                 let mut triples = Vec::new();
@@ -1765,7 +1530,7 @@ impl<'a> TrigMetaParser<'a> {
                     let subject_iri = match &triple.subject {
                         TermValue::Iri(iri) => iri.clone(),
                         TermValue::PrefixedName { prefix, local } => {
-                            self.expand_prefixed_name(prefix, local)?
+                            expand_prefixed_name(&block.prefixes, prefix, local)?
                         }
                         TermValue::BlankNode(_) => {
                             return Err(TransactError::Parse(
@@ -1821,6 +1586,9 @@ impl<'a> TrigMetaParser<'a> {
                             ObjectValue::BlankNode(_) => Err(TransactError::Parse(
                                 "blank nodes not allowed in txn-meta objects".to_string(),
                             )),
+                            ObjectValue::TripleTerm(_) => Err(TransactError::Parse(
+                                "txn-meta does not support triple-term values".to_string(),
+                            )),
                             ObjectValue::LangString { value, lang } => Ok(RawObject::LangString {
                                 value: value.clone(),
                                 lang: lang.clone(),
@@ -1842,7 +1610,7 @@ impl<'a> TrigMetaParser<'a> {
                 }
 
                 raw_meta = Some(RawTrigMeta {
-                    prefixes: self.prefixes.clone(),
+                    prefixes: block.prefixes,
                     triples,
                 });
             } else {
@@ -1850,16 +1618,16 @@ impl<'a> TrigMetaParser<'a> {
                 let raw_triples = self.convert_to_raw_triples(&block.triples)?;
                 let reified = self.convert_reified_to_raw(&block.reified)?;
                 named_graphs.push(NamedGraphBlock {
-                    iri: block.iri.clone(),
+                    iri: block.iri,
                     triples: raw_triples,
                     reified,
-                    prefixes: self.prefixes.clone(),
+                    prefixes: block.prefixes,
                 });
             }
         }
 
         Ok(TrigPhase1Result {
-            turtle,
+            turtle: Cow::Owned(turtle),
             raw_meta,
             named_graphs,
         })
@@ -1867,15 +1635,24 @@ impl<'a> TrigMetaParser<'a> {
 }
 
 /// Split a prefixed name into prefix and local parts.
-fn split_prefixed_name(span: &str) -> (&str, &str) {
-    match span.find(':') {
+/// A prefixed name's prefix and its local part with `\x` escapes resolved.
+fn split_prefixed_name(span: &str) -> (&str, Cow<'_, str>) {
+    let (prefix, local) = match span.find(':') {
         Some(pos) => (&span[..pos], &span[pos + 1..]),
         None => (span, ""),
+    };
+    if local.contains('\\') {
+        (
+            prefix,
+            Cow::Owned(fluree_graph_turtle::parser::unescape_pn_local(local)),
+        )
+    } else {
+        (prefix, Cow::Borrowed(local))
     }
 }
 
 /// Validate txn-meta limits.
-fn validate_limits(entries: &[TxnMetaEntry]) -> Result<()> {
+pub(crate) fn validate_limits(entries: &[TxnMetaEntry]) -> Result<()> {
     if entries.len() > MAX_TXN_META_ENTRIES {
         return Err(TransactError::Parse(format!(
             "txn-meta entry count {} exceeds maximum {}",
@@ -1918,6 +1695,142 @@ mod tests {
 
     fn test_registry() -> NamespaceRegistry {
         NamespaceRegistry::new()
+    }
+
+    /// A TriG document as bulk import reads it: phase 1, then the txn-meta
+    /// resolution. Transactions read TriG with `parse::rdf_text` instead.
+    #[derive(Debug)]
+    struct TrigMetaResult {
+        turtle: String,
+        txn_meta: Vec<TxnMetaEntry>,
+        named_graphs: Vec<NamedGraphBlock>,
+    }
+
+    fn extract_trig_txn_meta(
+        input: &str,
+        ns_registry: &mut NamespaceRegistry,
+    ) -> Result<TrigMetaResult> {
+        let phase1 = parse_trig_phase1(input)?;
+        let txn_meta = match &phase1.raw_meta {
+            Some(raw) => resolve_trig_meta(raw, ns_registry)?,
+            None => Vec::new(),
+        };
+        Ok(TrigMetaResult {
+            turtle: phase1.turtle.into_owned(),
+            txn_meta,
+            named_graphs: phase1.named_graphs,
+        })
+    }
+
+    #[test]
+    fn graph_block_check_matches_the_keyword_in_any_case() {
+        for trig in [
+            "<http://example.org/g> { <s> <p> <o> . }",
+            "GRAPH <http://example.org/g>",
+            "graph <http://example.org/g>",
+            "Graph <http://example.org/g>",
+        ] {
+            assert!(might_contain_graph_block(trig), "{trig}");
+        }
+        assert!(!might_contain_graph_block(
+            "@prefix ex: <http://example.org/> . ex:a ex:b \"grap\" ."
+        ));
+    }
+
+    #[test]
+    fn phase1_borrows_a_document_with_no_graph_blocks() {
+        let turtle = "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .";
+        let phase1 = parse_trig_phase1(turtle).unwrap();
+        assert!(matches!(phase1.turtle, Cow::Borrowed(t) if t == turtle));
+    }
+
+    /// The triples the full Turtle parser reads from phase 1's default graph,
+    /// as text.
+    fn default_graph_triples(input: &str) -> String {
+        let phase1 = parse_trig_phase1(input).unwrap();
+        let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+        fluree_graph_turtle::parse(&phase1.turtle, &mut sink).unwrap();
+        format!("{:?}", sink.into_graph())
+    }
+
+    /// A redefined prefix applies only after it: the default graph keeps its
+    /// directives in document order, and each block expands with the prefix
+    /// map where it appears. Emitting every directive first let the later
+    /// `ex:` rewrite `ex:x`, and blocks expanded with the final map.
+    #[test]
+    fn phase1_applies_a_redefined_prefix_only_after_it() {
+        let input = "@prefix ex: <http://a.org/> .\n\
+                     ex:x ex:p \"mentions the graph word\" .\n\
+                     GRAPH <http://example.org/g1> { ex:y ex:p \"1\" . }\n\
+                     @prefix ex: <http://b.org/> .\n\
+                     ex:z ex:p \"2\" .\n\
+                     GRAPH <http://example.org/g2> { ex:w ex:p \"2\" . }\n";
+        let triples = default_graph_triples(input);
+        for iri in ["http://a.org/x", "http://a.org/p", "http://b.org/z"] {
+            assert!(triples.contains(iri), "{iri} missing: {triples}");
+        }
+        assert!(
+            !triples.contains("http://b.org/x"),
+            "ex:x was rewritten: {triples}"
+        );
+
+        let phase1 = parse_trig_phase1(input).unwrap();
+        let ex = |i: usize| phase1.named_graphs[i].prefixes.get("ex").cloned();
+        assert_eq!(ex(0).as_deref(), Some("http://a.org/"), "block before it");
+        assert_eq!(ex(1).as_deref(), Some("http://b.org/"), "block after it");
+    }
+
+    /// `@base` twin: a relative IRI resolves against the base in effect where
+    /// it is written.
+    #[test]
+    fn phase1_applies_a_redefined_base_only_after_it() {
+        let triples = default_graph_triples(
+            "@base <http://a.org/> .\n\
+             <x> <p> \"mentions the graph word\" .\n\
+             @base <http://b.org/> .\n\
+             <y> <p> \"2\" .\n",
+        );
+        for iri in ["http://a.org/x", "http://a.org/p", "http://b.org/y"] {
+            assert!(triples.contains(iri), "{iri} missing: {triples}");
+        }
+        assert!(
+            !triples.contains("http://b.org/x"),
+            "<x> was re-based: {triples}"
+        );
+    }
+
+    /// The txn-meta block expands with the prefixes where it appears, on
+    /// both extraction paths.
+    #[test]
+    fn txn_meta_expands_with_the_prefixes_where_it_appears() {
+        let input = "@prefix ex: <http://a.org/> .\n\
+                     @prefix fluree: <https://ns.flur.ee/db#> .\n\
+                     GRAPH <#txn-meta> { fluree:commit:this ex:batch ex:b1 . }\n\
+                     @prefix ex: <http://b.org/> .\n";
+        let raw = parse_trig_phase1(input)
+            .unwrap()
+            .raw_meta
+            .expect("txn-meta");
+        assert_eq!(
+            raw.prefixes.get("ex").map(String::as_str),
+            Some("http://a.org/")
+        );
+
+        let mut ns = test_registry();
+        let entry = &extract_trig_txn_meta(input, &mut ns).unwrap().txn_meta[0];
+        let a = ns.sid_for_iri("http://a.org/batch");
+        assert_eq!(
+            (entry.predicate_ns, entry.predicate_name.as_str()),
+            (a.namespace_code, a.name.as_ref()),
+            "predicate expanded with the later prefix"
+        );
+        let b1 = ns.sid_for_iri("http://a.org/b1");
+        assert!(
+            matches!(&entry.value, TxnMetaValue::Ref { ns, name }
+                if *ns == b1.namespace_code && name == b1.name.as_ref()),
+            "object expanded with the later prefix: {:?}",
+            entry.value
+        );
     }
 
     #[test]
@@ -2483,20 +2396,45 @@ GRAPH <http://example.org/products> {
     }
 
     #[test]
-    fn test_anonymous_default_graph_block_clean_error() {
-        // Anonymous `{ ... }` is valid W3C TriG but unsupported here; it must
-        // produce a clear error, not a silent mis-parse / misleading downstream
-        // Turtle error.
-        let mut ns = test_registry();
-        let input = "@prefix ex: <http://example.org/> .\n{\n    ex:a ex:b ex:c .\n}\n";
+    fn anonymous_default_graph_block_is_default_graph_turtle() {
+        // `{ … }` is the default graph; its last statement may omit the `.`.
+        for input in [
+            "@prefix ex: <http://example.org/> .\n{ ex:a ex:b ex:c . ex:d ex:e ex:f }\n<urn:g> { ex:x ex:y ex:z }\n",
+            "@prefix ex: <http://example.org/> .\n{ ex:a ex:b ex:c . ex:d ex:e ex:f . }\n<urn:g> { ex:x ex:y ex:z }\n",
+        ] {
+            let phase1 = parse_trig_phase1(input).unwrap();
+            assert_eq!(phase1.named_graphs.len(), 1, "{input}");
+            assert!(!phase1.turtle.contains('{'), "{}", phase1.turtle);
+            let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+            fluree_graph_turtle::parse(&phase1.turtle, &mut sink)
+                .unwrap_or_else(|e| panic!("{e}: {}", phase1.turtle));
+            assert_eq!(sink.into_graph().len(), 2, "{}", phase1.turtle);
+        }
+    }
 
-        let err = extract_trig_txn_meta(input, &mut ns)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("anonymous default-graph block"),
-            "expected a clear anonymous-block error, got: {err}"
-        );
+    #[test]
+    fn test_anonymous_blank_nodes_and_collections_in_a_block_name_the_construct() {
+        // The block parser reads neither; the error says which construct it
+        // met and how to write it, not just the token.
+        for (body, construct) in [
+            ("ex:a ex:b [ ex:c ex:d ] .", "anonymous blank nodes"),
+            ("ex:a ex:b [] .", "anonymous blank nodes"),
+            ("[ ex:c ex:d ] ex:b ex:e .", "anonymous blank nodes"),
+            ("ex:a ex:b ( ex:c ) .", "collections"),
+            ("ex:a ex:b () .", "collections"),
+            ("( ex:c ) ex:b ex:e .", "collections"),
+        ] {
+            let mut ns = test_registry();
+            let input =
+                format!("@prefix ex: <http://example.org/> .\nGRAPH <urn:g> {{ {body} }}\n");
+            let err = extract_trig_txn_meta(&input, &mut ns)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(construct) && err.contains("_:b1"),
+                "{body}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2567,16 +2505,29 @@ ex:alice ex:note "value with a { brace" .
                                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n";
 
     #[test]
-    fn test_trig_star_every_spelling_yields_one_attachment_and_asserts_the_base() {
-        for (label, body) in [
-            ("annotation block", "ex:s ex:p ex:o {| ex:q ex:z |} ."),
-            ("tilde reifier", "ex:s ex:p ex:o ~ ex:r ."),
-            ("tilde + block", "ex:s ex:p ex:o ~ ex:r {| ex:q ex:z |} ."),
-            ("reified subject", "<< ex:s ex:p ex:o ~ ex:r >> ex:q ex:z ."),
-            ("reified object", "ex:z ex:q << ex:s ex:p ex:o ~ ex:r >> ."),
+    fn test_trig_star_every_spelling_yields_one_attachment_and_annotations_assert_the_base() {
+        for (label, body, asserts) in [
+            ("annotation block", "ex:s ex:p ex:o {| ex:q ex:z |} .", true),
+            ("tilde reifier", "ex:s ex:p ex:o ~ ex:r .", true),
+            (
+                "tilde + block",
+                "ex:s ex:p ex:o ~ ex:r {| ex:q ex:z |} .",
+                true,
+            ),
+            (
+                "reified subject",
+                "<< ex:s ex:p ex:o ~ ex:r >> ex:q ex:z .",
+                false,
+            ),
+            (
+                "reified object",
+                "ex:z ex:q << ex:s ex:p ex:o ~ ex:r >> .",
+                false,
+            ),
             (
                 "rdf:reifies triple term",
                 "ex:r rdf:reifies <<( ex:s ex:p ex:o )>> .",
+                false,
             ),
         ] {
             let block = star_block(&format!("{STAR_PREFIX}GRAPH ex:g {{ {body} }}\n"));
@@ -2586,9 +2537,10 @@ ex:alice ex:note "value with a { brace" .
             assert_eq!(raw_iri(&r.predicate), "ex:p", "[{label}]");
             assert!(matches!(&r.object, RawObject::PrefixedName { local, .. } if local == "o"));
             let triples = triple_strs(&block);
-            assert!(
+            assert_eq!(
                 triples.iter().any(|(s, p, _)| s == "ex:s" && p == "ex:p"),
-                "[{label}] base triple must be asserted: {triples:?}"
+                asserts,
+                "[{label}] only the annotation syntax asserts the triple: {triples:?}"
             );
             assert!(
                 !triples.iter().any(|(_, p, _)| p == "rdf:reifies"),
@@ -2660,14 +2612,9 @@ ex:alice ex:note "value with a { brace" .
         let mut ns = test_registry();
         for (label, body, needle) in [
             (
-                "triple term as value",
-                "ex:a ex:q <<( ex:s ex:p ex:o )>> .",
-                "triple terms as values",
-            ),
-            (
-                "nested triple term",
-                "ex:r rdf:reifies <<( ex:s ex:p <<( ex:x ex:y ex:z )>> )>> .",
-                "triple terms as values",
+                "triple term as subject",
+                "<<( ex:s ex:p ex:o )>> ex:q ex:z .",
+                "cannot be a subject",
             ),
             (
                 "star inside annotation body",
@@ -2742,54 +2689,5 @@ ex:alice ex:note "value with a { brace" .
             .expect_err("unquoted version specifier")
             .to_string();
         assert!(err.contains("version specifier"), "{err}");
-    }
-
-    #[test]
-    fn unwrap_keeps_block_triples_in_place() {
-        let input = "@prefix ex: <http://example.org/> .\n\
-                     GRAPH ex:g { ex:a ex:p [ ex:q \"}\" ] }\n\
-                     GRAPH <#txn-meta> { <fluree:commit:this> ex:m \"x\" . }\n\
-                     <http://example.org/g> {\n  ex:b ex:p ( 1 2 ) .\n}\n";
-        let unwrapped = unwrap_trig_graph_blocks(input).unwrap();
-        assert_eq!(unwrapped.turtle.len(), input.len(), "edits are same-length");
-        assert_eq!(
-            unwrapped.turtle.lines().count(),
-            input.lines().count(),
-            "newlines survive"
-        );
-        assert_eq!(
-            unwrapped.graph_iris,
-            ["http://example.org/g", "http://example.org/g"]
-        );
-        assert!(!unwrapped.mixes_default_and_named);
-        assert_eq!(unwrapped.raw_meta.map(|m| m.triples.len()), Some(1));
-
-        let lines: Vec<&str> = unwrapped.turtle.lines().map(str::trim).collect();
-        // The `}` in the string literal is left alone; the block's own `}`
-        // becomes the missing `.`.
-        assert_eq!(lines[1], "ex:a ex:p [ ex:q \"}\" ] .");
-        assert_eq!(lines[2], "", "the txn-meta block is removed");
-        assert_eq!(lines[3], "");
-        assert_eq!(lines[4], "ex:b ex:p ( 1 2 ) .");
-        assert_eq!(lines[5], "", "a block ending in `.` needs no second one");
-    }
-
-    #[test]
-    fn unwrap_reports_default_triples_beside_blocks() {
-        let input = "@prefix ex: <http://example.org/> .\n\
-                     ex:a ex:p ex:o .\nGRAPH ex:g { ex:b ex:p ex:o . }\n";
-        assert!(
-            unwrap_trig_graph_blocks(input)
-                .unwrap()
-                .mixes_default_and_named
-        );
-    }
-
-    #[test]
-    fn unwrap_passes_plain_turtle_through() {
-        let input = "@prefix ex: <http://example.org/> .\nex:a ex:p ex:o .\n";
-        let unwrapped = unwrap_trig_graph_blocks(input).unwrap();
-        assert_eq!(unwrapped.turtle, input);
-        assert!(unwrapped.graph_iris.is_empty());
     }
 }

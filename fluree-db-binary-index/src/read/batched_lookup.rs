@@ -278,118 +278,25 @@ pub fn batched_lookup_subject_properties(
     subjects: &[u64],
     to_t: i64,
 ) -> io::Result<SubjectPropertyFlakes> {
-    let mut out: HashMap<u64, Vec<(u32, u16, u64)>> = HashMap::new();
-    if subjects.is_empty() {
-        return Ok(out);
-    }
-
-    let mut sorted_subjects = subjects.to_vec();
-    sorted_subjects.sort_unstable();
-    sorted_subjects.dedup();
-
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
-        return Ok(out);
-    };
-    let branch = Arc::clone(branch);
-
-    const MAX_SPAN: u64 = 100_000;
-    const MAX_CHUNK: usize = 1000;
-    let chunks = chunk_subjects(&sorted_subjects, MAX_SPAN, MAX_CHUNK);
-
-    // Need s_id (to filter), p_id, o_type, o_key (to reconstruct datatype/lang/ref).
-    let mut needed = ColumnSet::EMPTY;
-    needed.insert(ColumnId::SId);
-    needed.insert(ColumnId::PId);
-    needed.insert(ColumnId::OType);
-    needed.insert(ColumnId::OKey);
-    let projection = ColumnProjection {
-        output: needed,
-        internal: ColumnSet::EMPTY,
-    };
-
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    register_routed_wants(
-        store,
-        &branch,
-        RunSortOrder::Spot,
-        chunks.iter().map(|chunk| {
-            let (min_s, max_s) = (chunk[0], *chunk.last().unwrap());
-            (
-                RunRecordV2 {
-                    s_id: SubjectId::from_u64(min_s),
-                    o_key: 0,
-                    p_id: 0,
-                    t: 0,
-                    o_i: 0,
-                    o_type: 0,
-                    g_id,
-                },
-                RunRecordV2 {
-                    s_id: SubjectId::from_u64(max_s),
-                    o_key: u64::MAX,
-                    p_id: u32::MAX,
-                    t: 0,
-                    o_i: u32::MAX,
-                    o_type: u16::MAX,
-                    g_id,
-                },
-            )
-        }),
+    let mut out: SubjectPropertyFlakes = HashMap::new();
+    let mut cursor = BatchedWildcardCursor::new(
+        Arc::clone(store),
+        g_id,
+        subjects,
+        to_t,
+        WildcardDirection::Outgoing,
+        property_projection(),
     );
-
-    for chunk in &chunks {
-        let min_s = chunk[0];
-        let max_s = *chunk.last().unwrap();
-
-        let min_key = RunRecordV2 {
-            s_id: SubjectId::from_u64(min_s),
-            o_key: 0,
-            p_id: 0,
-            t: 0,
-            o_i: 0,
-            o_type: 0,
-            g_id,
-        };
-        let max_key = RunRecordV2 {
-            s_id: SubjectId::from_u64(max_s),
-            o_key: u64::MAX,
-            p_id: u32::MAX,
-            t: 0,
-            o_i: u32::MAX,
-            o_type: u16::MAX,
-            g_id,
-        };
-
-        let mut cursor = BinaryCursor::new(
-            Arc::clone(store),
-            RunSortOrder::Spot,
-            Arc::clone(&branch),
-            &min_key,
-            &max_key,
-            BinaryFilter::default(),
-            projection,
-        );
-        cursor.set_to_t(to_t);
-
-        // Batches are leaflet-granular and spill far past the wanted
-        // subjects, so testing every row is the dominant cost for small
-        // subject sets (a single-node hydration paid a full-leaflet
-        // membership scan). SPOT's primary sort key is `s_id`, so gallop
-        // instead: binary-search each wanted subject's contiguous run and
-        // copy only those rows. Spillover rows for a neighboring chunk's
-        // subjects are excluded by construction (only this chunk's ids are
-        // searched), preserving the no-double-collect invariant the
-        // per-chunk membership set used to provide.
-        while let Some(batch) = cursor.next_batch()? {
-            for_each_subject_run(&batch, chunk, |s_id, i, batch| {
-                let p_id = batch.p_id.get_or(i, 0);
-                let o_type = batch.o_type.get_or(i, 0);
-                let o_key = batch.o_key.get(i);
-                out.entry(s_id).or_default().push((p_id, o_type, o_key));
-            });
+    while let Some(matches) = cursor.next_batch()? {
+        for (s_id, i) in matches.rows {
+            let batch = &matches.batch;
+            out.entry(s_id).or_default().push((
+                batch.p_id.get_or(i, 0),
+                batch.o_type.get_or(i, 0),
+                batch.o_key.get(i),
+            ));
         }
     }
-
     Ok(out)
 }
 
@@ -487,121 +394,201 @@ pub fn batched_lookup_inbound_refs(
     to_t: i64,
 ) -> io::Result<HashMap<u64, Vec<(u32, u64)>>> {
     let mut out: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
-    if objects.is_empty() {
-        return Ok(out);
-    }
-
-    let mut sorted = objects.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
-        return Ok(out);
-    };
-    let branch = Arc::clone(branch);
-    let iri_ref = OType::IRI_REF.as_u16();
-
-    const MAX_SPAN: u64 = 100_000;
-    const MAX_CHUNK: usize = 1000;
-    // chunk_subjects operates on a sorted &[u64] span — identical logic applies
-    // to object o_key spans, so reuse it verbatim.
-    let chunks = chunk_subjects(&sorted, MAX_SPAN, MAX_CHUNK);
-
-    // Need s_id (inbound subject), p_id, o_key (filter to set), o_type (ref check).
-    let mut needed = ColumnSet::EMPTY;
-    needed.insert(ColumnId::SId);
-    needed.insert(ColumnId::PId);
-    needed.insert(ColumnId::OType);
-    needed.insert(ColumnId::OKey);
-    let projection = ColumnProjection {
-        output: needed,
-        internal: ColumnSet::EMPTY,
-    };
-
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    register_routed_wants(
-        store,
-        &branch,
-        RunSortOrder::Opst,
-        chunks.iter().map(|chunk| {
-            let (min_o, max_o) = (chunk[0], *chunk.last().unwrap());
-            (
-                RunRecordV2 {
-                    s_id: SubjectId::from_u64(0),
-                    o_key: min_o,
-                    p_id: 0,
-                    t: 0,
-                    o_i: 0,
-                    o_type: iri_ref,
-                    g_id,
-                },
-                RunRecordV2 {
-                    s_id: SubjectId::from_u64(u64::MAX),
-                    o_key: max_o,
-                    p_id: u32::MAX,
-                    t: 0,
-                    o_i: u32::MAX,
-                    o_type: iri_ref,
-                    g_id,
-                },
-            )
-        }),
+    let mut cursor = BatchedWildcardCursor::new(
+        Arc::clone(store),
+        g_id,
+        objects,
+        to_t,
+        WildcardDirection::IncomingRefs,
+        property_projection(),
     );
-
-    for chunk in &chunks {
-        let min_o = chunk[0];
-        let max_o = *chunk.last().unwrap();
-
-        // OPST order = (o_type, o_key, o_i, p_id, s_id); pin o_type = IRI_REF.
-        let min_key = RunRecordV2 {
-            s_id: SubjectId::from_u64(0),
-            o_key: min_o,
-            p_id: 0,
-            t: 0,
-            o_i: 0,
-            o_type: iri_ref,
-            g_id,
-        };
-        let max_key = RunRecordV2 {
-            s_id: SubjectId::from_u64(u64::MAX),
-            o_key: max_o,
-            p_id: u32::MAX,
-            t: 0,
-            o_i: u32::MAX,
-            o_type: iri_ref,
-            g_id,
-        };
-
-        let mut cursor = BinaryCursor::new(
-            Arc::clone(store),
-            RunSortOrder::Opst,
-            Arc::clone(&branch),
-            &min_key,
-            &max_key,
-            BinaryFilter::default(),
-            projection,
-        );
-        cursor.set_to_t(to_t);
-
-        // OPST sorts by (o_type, o_key, ...): binary-search the IRI_REF
-        // o_type run (boundary leaflets can carry neighboring o_types),
-        // then gallop the chunk's wanted o_keys within it. Spillover rows
-        // for a neighboring chunk's objects are excluded by construction.
-        while let Some(batch) = cursor.next_batch()? {
-            let (lo, hi) = o_type_run(&batch, iri_ref);
-            for_each_wanted_run(&batch.o_key, lo, hi, chunk, |o_key, i| {
-                out.entry(o_key)
-                    .or_default()
-                    .push((batch.p_id.get_or(i, 0), batch.s_id.get(i)));
-            });
+    while let Some(matches) = cursor.next_batch()? {
+        for (o_key, i) in matches.rows {
+            out.entry(o_key)
+                .or_default()
+                .push((matches.batch.p_id.get_or(i, 0), matches.batch.s_id.get(i)));
         }
     }
-
     for v in out.values_mut() {
         v.sort_unstable();
         v.dedup();
     }
     Ok(out)
+}
+
+fn property_projection() -> ColumnProjection {
+    let mut needed = ColumnSet::EMPTY;
+    needed.insert(ColumnId::SId);
+    needed.insert(ColumnId::PId);
+    needed.insert(ColumnId::OType);
+    needed.insert(ColumnId::OKey);
+    ColumnProjection {
+        output: needed,
+        internal: ColumnSet::EMPTY,
+    }
+}
+
+/// Which endpoint of a wildcard-predicate lookup is bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WildcardDirection {
+    Outgoing,
+    /// Only reference-valued objects; literal probes must use another path.
+    IncomingRefs,
+}
+
+impl WildcardDirection {
+    fn order(self) -> RunSortOrder {
+        match self {
+            Self::Outgoing => RunSortOrder::Spot,
+            Self::IncomingRefs => RunSortOrder::Opst,
+        }
+    }
+}
+
+/// One leaflet and the `(bound key, row index)` matches within it. Keeping the
+/// source columns preserves list position, time, and datatype metadata for
+/// query consumers; stats and hydration can project only the columns they need.
+pub struct WildcardMatches {
+    pub batch: super::column_types::ColumnBatch,
+    pub rows: Vec<(u64, usize)>,
+}
+
+/// Streaming, gap-aware wildcard lookup shared by joins, stats and hydration.
+/// Reads persisted snapshot state at `to_t`; the caller must merge or decline
+/// novelty and enforce policy/graph visibility. Does not deduplicate facts.
+/// Each call yields at most one leaflet, including empty match sets so callers
+/// can check cancellation while traversing gaps. Output follows index order,
+/// not the order (or multiplicity) of the input keys.
+pub struct BatchedWildcardCursor {
+    store: Arc<BinaryIndexStore>,
+    branch: Option<Arc<crate::BranchManifest>>,
+    g_id: GraphId,
+    to_t: i64,
+    direction: WildcardDirection,
+    projection: ColumnProjection,
+    chunks: Vec<Vec<u64>>,
+    chunk_idx: usize,
+    cursor: Option<BinaryCursor>,
+}
+
+impl BatchedWildcardCursor {
+    pub fn new(
+        store: Arc<BinaryIndexStore>,
+        g_id: GraphId,
+        keys: &[u64],
+        to_t: i64,
+        direction: WildcardDirection,
+        projection: ColumnProjection,
+    ) -> Self {
+        let mut sorted = keys.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let chunks: Vec<Vec<u64>> = chunk_subjects(&sorted, 100_000, 1000)
+            .into_iter()
+            .map(<[u64]>::to_vec)
+            .collect();
+        let branch = store.branch_for_order(g_id, direction.order()).cloned();
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if let Some(branch) = &branch {
+            register_routed_wants(
+                &store,
+                branch,
+                direction.order(),
+                chunks
+                    .iter()
+                    .map(|chunk| Self::bounds(g_id, direction, chunk)),
+            );
+        }
+        Self {
+            store,
+            branch,
+            g_id,
+            to_t,
+            direction,
+            projection,
+            chunks,
+            chunk_idx: 0,
+            cursor: None,
+        }
+    }
+
+    fn bounds(
+        g_id: GraphId,
+        direction: WildcardDirection,
+        keys: &[u64],
+    ) -> (RunRecordV2, RunRecordV2) {
+        let mut lo = RunRecordV2 {
+            s_id: SubjectId(0),
+            o_key: 0,
+            p_id: 0,
+            t: 0,
+            o_i: 0,
+            o_type: 0,
+            g_id,
+        };
+        let mut hi = RunRecordV2 {
+            s_id: SubjectId::from_u64(u64::MAX),
+            o_key: u64::MAX,
+            p_id: u32::MAX,
+            t: 0,
+            o_i: u32::MAX,
+            o_type: u16::MAX,
+            g_id,
+        };
+        match direction {
+            WildcardDirection::Outgoing => {
+                lo.s_id = SubjectId::from_u64(keys[0]);
+                hi.s_id = SubjectId::from_u64(*keys.last().unwrap());
+            }
+            WildcardDirection::IncomingRefs => {
+                lo.o_type = OType::IRI_REF.as_u16();
+                hi.o_type = lo.o_type;
+                lo.o_key = keys[0];
+                hi.o_key = *keys.last().unwrap();
+            }
+        }
+        (lo, hi)
+    }
+
+    pub fn next_batch(&mut self) -> io::Result<Option<WildcardMatches>> {
+        let Some(branch) = &self.branch else {
+            return Ok(None);
+        };
+        while let Some(chunk) = self.chunks.get(self.chunk_idx) {
+            if self.cursor.is_none() {
+                let (lo, hi) = Self::bounds(self.g_id, self.direction, chunk);
+                let mut cursor = BinaryCursor::new(
+                    Arc::clone(&self.store),
+                    self.direction.order(),
+                    Arc::clone(branch),
+                    &lo,
+                    &hi,
+                    BinaryFilter::default(),
+                    self.projection,
+                );
+                cursor.set_to_t(self.to_t);
+                self.cursor = Some(cursor);
+            }
+            if let Some(batch) = self.cursor.as_mut().unwrap().next_batch()? {
+                let mut rows = Vec::new();
+                match self.direction {
+                    WildcardDirection::Outgoing => {
+                        for_each_subject_run(&batch, chunk, |key, row, _| rows.push((key, row)));
+                    }
+                    WildcardDirection::IncomingRefs => {
+                        let (lo, hi) = o_type_run(&batch, OType::IRI_REF.as_u16());
+                        for_each_wanted_run(&batch.o_key, lo, hi, chunk, |key, row| {
+                            rows.push((key, row));
+                        });
+                    }
+                }
+                return Ok(Some(WildcardMatches { batch, rows }));
+            }
+            self.cursor = None;
+            self.chunk_idx += 1;
+        }
+        Ok(None)
+    }
 }
 
 /// Residency mode: record every non-resident leaf the routed key ranges will

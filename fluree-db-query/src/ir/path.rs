@@ -92,17 +92,7 @@ pub struct PropertyPathPattern {
 impl PropertyPathPattern {
     /// Create a single-predicate property path pattern (`p*` / `p+`).
     pub fn new(subject: Ref, predicate: Sid, modifier: PathModifier, object: Ref) -> Self {
-        Self {
-            subject,
-            predicates: vec![predicate],
-            first_inverse: false,
-            sequence_steps: Vec::new(),
-            wildcard: false,
-            modifier,
-            min_hops: None,
-            max_hops: None,
-            object,
-        }
+        Self::new_alternatives(subject, vec![predicate], modifier, object)
     }
 
     /// Create an alternation-transitive path `(a|b|…)*` over `predicates`
@@ -168,15 +158,9 @@ impl PropertyPathPattern {
         );
         let first = steps.remove(0);
         Self {
-            subject,
-            predicates: first.predicates,
             first_inverse: first.inverse,
             sequence_steps: steps,
-            wildcard: false,
-            modifier,
-            min_hops: None,
-            max_hops: None,
-            object,
+            ..Self::new_alternatives(subject, first.predicates, modifier, object)
         }
     }
 

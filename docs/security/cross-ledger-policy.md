@@ -173,6 +173,13 @@ bypasses the cross-ledger dispatch. A configured `f:policySource`
 in `#config` is **not** enough on its own to force enforcement at
 the HTTP query layer today.
 
+The graph-scoped read paths do not gate this way. A SPARQL query
+that resolves to a mapped graph source, and the MCP `sparql_query`
+tool, both read through `fluree.graph(<ledger>).query()`, which
+applies a ledger's or source's configured defaults whether or not
+the request carries policy inputs. A cross-ledger `f:policySource`
+reached through those defaults is resolved there.
+
 To engage cross-ledger policy on an HTTP query, send a request
 with at least one of:
 

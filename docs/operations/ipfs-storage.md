@@ -2,8 +2,13 @@
 
 Fluree can use [IPFS](https://ipfs.tech/) as a content-addressed storage backend via the [Kubo](https://github.com/ipfs/kubo) HTTP RPC API. This enables decentralized, content-addressed data storage where every piece of data is identified by its cryptographic hash.
 
-> **Feature flag:** Requires the `ipfs` feature to be enabled at compile time.
-> Build with: `cargo build --features ipfs`
+> **Status: experimental, Rust API only.** IPFS storage is available to programs that embed
+> Fluree through the Rust API (`fluree-db-api` with the `ipfs` feature). The server and the
+> `fluree` CLI cannot use it, and a connection config cannot select it (a storage node with
+> `ipfsApiUrl` is rejected). The Rust builder pairs IPFS with an **in-memory nameservice**: the
+> blocks persist in IPFS, but the record of each ledger's current commit does not survive a
+> restart, so a restarted process no longer finds its ledgers. Treat it as a way to publish and
+> fetch content-addressed Fluree data, not as durable primary storage.
 
 ## Overview
 
@@ -72,59 +77,26 @@ The Kubo HTTP RPC API (port 5001) provides full administrative access to the IPF
 
 The IPFS gateway (port 8080) is read-only and can be exposed publicly if desired.
 
-## Configuration
+## Using IPFS Storage
 
-### JSON-LD Configuration
+Enable the `ipfs` feature on `fluree-db-api`:
 
-```json
-{
-  "@context": {
-    "@base": "https://ns.flur.ee/config/connection/",
-    "@vocab": "https://ns.flur.ee/system#"
-  },
-  "@graph": [
-    {
-      "@id": "ipfsStorage",
-      "@type": "Storage",
-      "ipfsApiUrl": "http://127.0.0.1:5001",
-      "ipfsPinOnPut": true
-    },
-    {
-      "@id": "connection",
-      "@type": "Connection",
-      "indexStorage": { "@id": "ipfsStorage" }
-    }
-  ]
-}
+```toml
+[dependencies]
+fluree-db-api = { version = "...", features = ["ipfs"] }
 ```
 
-### Flat JSON Configuration
+Build a Fluree instance against a running Kubo node:
 
-```json
-{
-  "indexStorage": {
-    "@type": "IpfsStorage",
-    "ipfsApiUrl": "http://127.0.0.1:5001",
-    "ipfsPinOnPut": true
-  }
-}
+```rust
+use fluree_db_api::FlureeBuilder;
+
+let fluree = FlureeBuilder::memory().build_ipfs("http://127.0.0.1:5001");
 ```
 
-### Configuration Fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `ipfsApiUrl` | string | `http://127.0.0.1:5001` | Kubo HTTP RPC API base URL |
-| `ipfsPinOnPut` | boolean | `true` | Pin blocks after writing (prevents garbage collection) |
-
-Both fields support `ConfigurationValue` indirection (env vars):
-
-```json
-{
-  "ipfsApiUrl": { "envVar": "FLUREE_IPFS_API_URL", "defaultVal": "http://127.0.0.1:5001" },
-  "ipfsPinOnPut": true
-}
-```
+`build_ipfs` takes the Kubo HTTP RPC API base URL. It pins every block it writes, enables
+background indexing, and keeps the nameservice (ledger heads and branch metadata) in memory.
+There is no builder yet that pairs IPFS storage with a persistent nameservice.
 
 ## Architecture
 
@@ -194,19 +166,11 @@ IPFS nodes periodically garbage-collect unpinned blocks to free disk space. Pinn
 
 ### Default Behavior
 
-Fluree pins every block on write when `ipfsPinOnPut` is `true` (the default). This ensures that:
+`build_ipfs` pins every block it writes. This ensures that:
 
 - All committed data survives Kubo garbage collection
 - The local node serves as a reliable storage backend
 - Blocks remain available even if no other node has them
-
-### When to Disable Pinning
-
-Set `ipfsPinOnPut: false` when:
-
-- Running integration tests (faster, less disk usage)
-- Using a separate pinning service (Pinata, web3.storage, etc.)
-- The Kubo node is configured with `--enable-gc=false`
 
 ### Pinning Services
 
@@ -224,19 +188,19 @@ ipfs pin remote add --service=pinata bafybeig...
 
 ### No Prefix Listing
 
-IPFS is a content-addressed store with no concept of directory listing or prefix enumeration. The `list_prefix()` operation returns an error. Operations that require listing (e.g., ledger discovery, GC scans) must use an alternative strategy such as manifest-based tracking.
+IPFS is a content-addressed store with no concept of directory listing or prefix enumeration. Admin operations that depend on listing (such as the fast path for dropping a ledger) fall back to walking the commit chain by CID, which is slower but correct.
 
 ### No Deletion
 
-IPFS content is immutable. The `delete()` operation is a no-op. Data removal is handled through:
+IPFS content is immutable. When Fluree releases a block (index garbage collection, dropping a ledger), it unpins it:
 
-1. **Unpinning** the block on the local node
-2. Waiting for Kubo's **garbage collector** to reclaim space
-3. The block may still exist on other IPFS nodes
+1. The block is **unpinned** on the local node
+2. Kubo's **garbage collector** reclaims the space on its next run
+3. The block may still exist on other IPFS nodes, or stay if it is pinned elsewhere
 
 ### Nameservice
 
-IPFS storage currently requires a separate nameservice (file-based or DynamoDB) for ledger metadata. A future phase will add IPNS and/or ENS-based decentralized nameservices.
+IPFS stores immutable blocks, but a ledger also needs a mutable pointer to its current commit (the nameservice record). `build_ipfs` keeps those records in memory, so they are lost when the process exits. A future phase may add IPNS or ENS-based nameservices.
 
 ### Latency
 
@@ -396,7 +360,6 @@ Future versions may support:
 ## Related Documentation
 
 - [Storage modes](storage.md) - Overview of all storage backends
-- [Configuration](configuration.md) - Server configuration options
-- [JSON-LD connection config](../reference/connection-config-jsonld.md) - Full config reference
+- [Rust API](../getting-started/rust-api.md) - Embedding Fluree, including feature flags
 - [ContentId and ContentStore](../design/content-id-and-contentstore.md) - Content addressing design
 - [Storage traits](../design/storage-traits.md) - Storage backend architecture

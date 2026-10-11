@@ -369,11 +369,9 @@ impl super::Parser<'_> {
         })
     }
 
-    /// Parse a GRAPH pattern - `GRAPH <iri>|?var { ... }`
-    pub(super) fn parse_graph_pattern(&mut self) -> Option<GraphPattern> {
-        let start = self.stream.current_span();
-        self.stream.advance(); // consume GRAPH
-
+    /// Parse the graph name and opening brace after an already-consumed
+    /// `GRAPH` keyword, shared by WHERE, CONSTRUCT and UPDATE blocks.
+    pub(super) fn parse_graph_block_start(&mut self) -> Option<GraphName> {
         // Parse the graph name (IRI or variable)
         let name = if let Some((var_name, var_span)) = self.stream.consume_var() {
             GraphName::Var(Var::new(var_name.as_ref(), var_span))
@@ -391,6 +389,15 @@ impl super::Parser<'_> {
                 .error_at_current("expected '{' after GRAPH name");
             return None;
         }
+
+        Some(name)
+    }
+
+    /// Parse a GRAPH pattern - `GRAPH <iri>|?var { ... }`
+    pub(super) fn parse_graph_pattern(&mut self) -> Option<GraphPattern> {
+        let start = self.stream.current_span();
+        self.stream.advance(); // consume GRAPH
+        let name = self.parse_graph_block_start()?;
 
         // Parse the inner group graph pattern
         let inner = self.parse_group_graph_pattern()?;
@@ -581,6 +588,18 @@ impl super::Parser<'_> {
 
         let span = start.union(self.stream.previous_span());
         Some(GraphPattern::Bind { expr, var, span })
+    }
+
+    /// Parse the optional `ValuesClause` that follows a query's
+    /// `SolutionModifier`. The grammar allows one after every query form
+    /// (`Query ::= Prologue ( SelectQuery | ConstructQuery | DescribeQuery |
+    /// AskQuery ) ValuesClause`) and after a sub-SELECT.
+    pub(super) fn parse_trailing_values(&mut self) -> Option<Box<GraphPattern>> {
+        if self.stream.check_keyword(TokenKind::KwValues) {
+            self.parse_values_pattern().map(Box::new)
+        } else {
+            None
+        }
     }
 
     /// Parse a VALUES clause.
@@ -845,11 +864,7 @@ impl super::Parser<'_> {
         // `SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause`
         // (same position as a top-level query's post-query VALUES;
         // W3C bindings#inline2).
-        let values = if self.stream.check_keyword(TokenKind::KwValues) {
-            self.parse_values_pattern().map(Box::new)
-        } else {
-            None
-        };
+        let values = self.parse_trailing_values();
 
         // Expect closing brace for the subquery
         if !self.stream.match_token(&TokenKind::RBrace) {

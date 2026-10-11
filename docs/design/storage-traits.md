@@ -214,8 +214,8 @@ visible or when it is safe against power loss; that is each backend's contract:
 | `S3Storage` | Atomic (object PUT). | Acknowledged after replication. |
 
 `FileStorage` also narrows durability by `ContentKind`: kinds for which
-`ContentKind::is_derived()` is true (index nodes, dictionaries, sketches,
-annotation arenas) are written `PageCache` in either mode, because they are
+`ContentKind::is_derived()` is true (index nodes, dictionaries, sketches) are
+written `PageCache` in either mode, because they are
 rebuildable from the commit chain and are written at much higher volume than
 commits. Source-of-truth kinds — `Commit`, `Txn`, `LedgerConfig`,
 `GraphSourceMapping` — follow the instance setting. The match is exhaustive, so
@@ -327,10 +327,16 @@ pub trait StorageCas: Debug + Send + Sync {
 
     /// Atomic read-modify-write. The closure may be called more than once on
     /// retry, so it must be a pure function of its input.
+    ///
+    /// The closure is `'static` so an implementation can run it off the
+    /// calling task, for example on a blocking thread.
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send;
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static;
 }
 ```
 

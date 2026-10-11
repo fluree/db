@@ -718,3 +718,67 @@ async fn jsonld_from_named_accepts_either_graph_selector_spelling() {
         "the whole ledger must not be selected: {with_at:?}"
     );
 }
+
+/// Connection route: a named graph addressed as `ledger#graph`, the form
+/// `docs/query/datasets.md` documents, reads that graph. v4.2.2 answered 400
+/// "Invalid ID format ... branch cannot contain '#'", because the SQL lane's
+/// graph-source probe looked the IRI up as a source id.
+#[tokio::test]
+async fn connection_route_reads_a_named_graph_addressed_by_ledger_fragment() {
+    let (_tmp, app) = seeded_app().await;
+    let g1 = format!("{LEDGER}#{G1}");
+
+    let (status, _warning, json) = sparql_connection(
+        &app,
+        &format!(
+            "PREFIX ex: <http://ex.org/> \
+             SELECT ?n FROM NAMED <{g1}> WHERE {{ GRAPH <{g1}> {{ ?s ex:name ?n }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut names: Vec<&str> = bindings(&json)
+        .iter()
+        .map(|row| binding_value(row, "n"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["A", "B"], "{json}");
+
+    // The reserved `#txn-meta` graph beside the default graph (datasets.md,
+    // "Mixed Patterns").
+    let (status, _warning, json) = sparql_connection(
+        &app,
+        &format!(
+            "PREFIX ex: <http://ex.org/> \
+             SELECT ?n ?t FROM <{LEDGER}> FROM NAMED <{LEDGER}#txn-meta> \
+             WHERE {{ ?s ex:name ?n . \
+                      GRAPH <{LEDGER}#txn-meta> {{ ?c <https://ns.flur.ee/db#t> ?t }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let rows_nt: Vec<(&str, &str)> = bindings(&json)
+        .iter()
+        .map(|row| (binding_value(row, "n"), binding_value(row, "t")))
+        .collect();
+    assert_eq!(rows_nt, [("D", "1")], "{json}");
+
+    // The JSON-LD twin.
+    let (status, _warning, json) = jsonld_connection(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": [g1],
+            "select": ["?n"],
+            "where": [["graph", g1, {"@id": "?s", "ex:name": "?n"}]]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut names: Vec<&str> = rows(&json)
+        .iter()
+        .map(|row| row[0].as_str().unwrap_or_else(|| panic!("row {row}")))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["A", "B"], "{json}");
+}

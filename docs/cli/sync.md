@@ -23,9 +23,9 @@ fluree sync [LEDGER] [DATA] [--graph <IRI>] [OPTIONS]
 |--------|-------------|
 | `-g, --graph <IRI>` | Target named graph IRI — the sync scope. The payload never widens or narrows it. Omit it to sync the default graph. |
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
-| `-e, --expr <EXPR>` | Inline data expression (Turtle or JSON-LD) |
+| `-e, --expr <EXPR>` | Inline data expression (Turtle, TriG or JSON-LD) |
 | `-f, --file <FILE>` | Read data from a file |
-| `--format <FORMAT>` | Data format: `turtle` or `jsonld` (auto-detected if omitted) |
+| `--format <FORMAT>` | Data format: `turtle` (`nt` for N-Triples), `trig` or `jsonld` (auto-detected if omitted) |
 | `--dry-run` | Compute and report the delta (asserted / retracted counts) without committing |
 | `--allow-empty` | Allow an empty payload, which clears the graph (off by default so a truncated export cannot silently wipe it) |
 | `--json` | Emit the report as JSON — the same shape as the server's dry-run response — instead of a sentence |
@@ -42,11 +42,28 @@ produce no flakes, and an identical payload produces **no commit**. History
 is preserved. See [Sync (graph synchronization)](../transactions/sync.md)
 for the full semantics, safety rails, and blank-node behavior.
 
-Turtle input is converted to JSON-LD client-side before submission, so a
-Turtle export works against any server that implements the `/sync`
-endpoint, including servers from before it accepted Turtle bodies. The CLI
-does not read TriG yet; `POST` a TriG file to
-[`/sync`](../transactions/sync.md#payload-formats) directly.
+Turtle input is sent as written and parsed where it is staged, the way
+every write reads RDF text (see
+[How RDF text is read](../transactions/turtle.md#how-rdf-text-is-read)).
+A `.nt` file is read as Turtle, of which N-Triples is a subset. With
+`--remote`, a server from before `/sync` accepted Turtle bodies refuses
+one: v4.2.0 and v4.2.1 answer 400 (`convert Turtle payloads client-side`),
+others 415. For that server the CLI converts the Turtle to JSON-LD, sends
+it again, and prints a warning. The conversion loses collection order and
+refuses some IRI schemes (`tag:`, `kb:`), so upgrading the server is the
+better fix.
+
+TriG is sent as TriG. It is recognized by a `.trig` name or
+`--format trig`, and also when a body read as Turtle turns out to hold
+graph blocks, as when it is piped in. Its blocks must name the `--graph`
+target, and cannot sit beside default-graph triples (see
+[payload formats](../transactions/sync.md#payload-formats)):
+
+```bash
+fluree sync mydb --graph http://example.org/graphs/ontology -f ontology.trig
+```
+
+With `--remote`, the server must accept TriG on `/sync`.
 
 ### Sources
 

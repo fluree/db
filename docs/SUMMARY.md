@@ -67,6 +67,7 @@
   - [Quickstart: query data (JSON-LD Query + SPARQL)](getting-started/quickstart-query.md)
   - [Tutorial: end-to-end (search, time travel, branching, policies)](getting-started/tutorial-end-to-end.md)
   - [Using Fluree as a Rust library](getting-started/rust-api.md)
+  - [Using Fluree from Python](getting-started/python.md)
 
 - [Concepts](concepts/README.md)
   - [Ledgers and the nameservice](concepts/ledgers-and-nameservice.md)
@@ -272,6 +273,7 @@
 - [Troubleshooting](troubleshooting/README.md)
   - [Common errors](troubleshooting/common-errors.md)
   - [Missing results at a historical `t`](troubleshooting/historical-results-missing.md)
+  - [Typed values wrong after indexing](troubleshooting/typed-values-wrong-after-indexing.md)
   - [Debugging queries](troubleshooting/debugging-queries.md)
   - [Performance investigation with distributed tracing](troubleshooting/performance-tracing.md)
 
@@ -283,6 +285,7 @@
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
   - [Crate map](reference/crate-map.md)
+  - [License FAQ](reference/license-faq.md)
 
 - [Contributing](contributing/README.md)
   - [Linking issues from PRs](contributing/issue-linking.md)

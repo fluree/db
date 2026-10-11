@@ -10,7 +10,7 @@
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{CompareOp, Function, Grouping, Pattern, SubqueryPattern};
 use crate::var_registry::VarId;
-use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
+use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
 use std::collections::{HashMap, HashSet};
 
 // =============================================================================
@@ -131,6 +131,53 @@ fn property_stats<'a>(stats: &'a StatsView, pred: &Ref) -> Option<&'a PropertySt
         return stats.get_property_by_iri(iri);
     }
     None
+}
+
+/// Estimate the size of a DISTINCT projection from mandatory triple domains.
+/// Their NDVs are approximate: use this only for costing, never to cap results.
+/// Multiplying the per-variable domains avoids assuming independence/selectivity
+/// will reduce the projection. Missing domains and computed bindings stay unknown.
+pub(crate) fn estimate_projected_distinct_rows(
+    patterns: &[Pattern],
+    vars: &[VarId],
+    stats: &StatsView,
+) -> Option<f64> {
+    if vars.is_empty()
+        || !patterns.iter().all(|p| {
+            matches!(
+                p,
+                Pattern::Triple(_) | Pattern::Filter(_) | Pattern::Values { .. }
+            )
+        })
+    {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut rows = 1.0;
+    for &var in vars {
+        if !seen.insert(var) {
+            continue;
+        }
+        let ndv = patterns
+            .iter()
+            .filter_map(|pattern| {
+                let Pattern::Triple(tp) = pattern else {
+                    return None;
+                };
+                let prop = property_stats(stats, &tp.p)?;
+                [
+                    (tp.s.as_var() == Some(var)).then_some(prop.ndv_subjects),
+                    (tp.o.as_var() == Some(var)).then_some(prop.ndv_values),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|&n| n > 0)
+                .min()
+            })
+            .min()?;
+        rows *= ndv as f64;
+    }
+    Some(rows)
 }
 
 fn property_known_absent(stats: &StatsView, pred: &Ref) -> bool {
@@ -812,6 +859,9 @@ pub fn extract_object_bounds_for_var(
     filter: &Expression,
     object_var: VarId,
 ) -> Option<ObjectBounds> {
+    if let Some(bounds) = term_component_constraint(filter, object_var) {
+        return Some(bounds);
+    }
     // Only proceed if filter is range-safe
     let constraints = extract_range_constraints(filter)?;
 
@@ -832,6 +882,66 @@ pub fn extract_object_bounds_for_var(
 // =============================================================================
 // Generalized Selectivity Scoring for All Pattern Types
 // =============================================================================
+
+/// A constant on one component of a triple-term variable — `PREDICATE(?t) =
+/// <p>`, `sameTerm(SUBJECT(?t), <s>)`, `sameTerm(OBJECT(?t), "v"^^dt)` —
+/// in either operand order, as bounds the scan enforces on the handle: the
+/// predicate as one handle interval, the subject and object against the
+/// handle's dictionary key. An object literal must come as a resolved
+/// binding under `sameTerm`, which carries its datatype or tag; a plain
+/// `=` on a literal is value equality and stays a filter.
+fn term_component_constraint(filter: &Expression, object_var: VarId) -> Option<ObjectBounds> {
+    let Expression::Call { func, args } = filter else {
+        return None;
+    };
+    let same_term = match func {
+        Function::SameTerm => true,
+        Function::Eq => false,
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let accessor = |e: &Expression| match e {
+        Expression::Call { func, args }
+            if args.len() == 1 && args[0] == Expression::Var(object_var) =>
+        {
+            match func {
+                Function::TripleSubject | Function::TriplePredicate | Function::TripleObject => {
+                    Some(func.clone())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (func, constant) = accessor(&args[0])
+        .map(|f| (f, &args[1]))
+        .or_else(|| accessor(&args[1]).map(|f| (f, &args[0])))?;
+    match (func, constant) {
+        (Function::TriplePredicate, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_predicate(sid.clone()))
+        }
+        (Function::TripleSubject, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_subject(sid.clone()))
+        }
+        (Function::TripleObject, Expression::Const(FlakeValue::Ref(sid))) => {
+            Some(ObjectBounds::term_object(
+                FlakeValue::Ref(sid.clone()),
+                fluree_db_core::DatatypeConstraint::Explicit(
+                    fluree_db_core::edge::id_datatype_sid(),
+                ),
+            ))
+        }
+        (Function::TripleObject, Expression::Resolved(b)) if same_term => match b.as_ref() {
+            crate::binding::Binding::Lit { val, dtc, .. } => {
+                Some(ObjectBounds::term_object(val.clone(), dtc.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// Cardinality estimate for a generalized pattern.
 ///
@@ -1050,6 +1160,26 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
+        // A bound term is one dictionary decode; a bound subject or object is
+        // a reverse-tree prefix range. Otherwise the link scan should bind the
+        // term first, so this ranks after any real scan.
+        Pattern::TermComponents(tc) => {
+            let anchors = |c: &crate::ir::Component| match c {
+                crate::ir::Component::Var(v) => bound_vars.contains(v),
+                crate::ir::Component::Node(_) | crate::ir::Component::Literal(..) => true,
+                crate::ir::Component::Any => false,
+            };
+            let anchored = anchors(&tc.subject) || anchors(&tc.object);
+            let row_count = if bound_vars.contains(&tc.term) {
+                HIGHLY_SELECTIVE
+            } else if anchored {
+                MODERATELY_SELECTIVE
+            } else {
+                FULL_SCAN
+            };
+            PatternEstimate::Source { row_count }
+        }
+
         Pattern::PropertyPath(pp) => {
             // Anchored at a bound endpoint => a bounded closure from a fixed node,
             // not a full predicate scan. Estimating it as a world scan made reorder
@@ -1098,104 +1228,18 @@ pub fn estimate_pattern(
             row_count: DEFAULT_SERVICE_ROW_COUNT,
         },
 
-        // Edge-annotation patterns (M0): treated as a `Source` with the
-        // wrapped edge's cardinality as a first approximation. Real
-        // cost-based selection between edge-first and annotation-first
-        // scans arrives in M3 alongside `AnnotationStats`.
-        Pattern::EdgeAnnotation { edge, .. } | Pattern::AnnotationTarget { edge, .. } => {
-            PatternEstimate::Source {
-                row_count: estimate_triple_row_count(edge, bound_vars, stats),
-            }
-        }
+        // Edge-annotation patterns expand before planning; estimated by the
+        // wrapped edge's cardinality as a first approximation.
+        Pattern::EdgeAnnotation { edge, .. } => PatternEstimate::Source {
+            row_count: estimate_triple_row_count(edge, bound_vars, stats),
+        },
 
         // DefaultGraphSource wraps an expanded edge-annotation chain and
-        // runs it once per default-graph source. The chain has its own
-        // cardinality model (one reifier per matching base edge); anything
-        // the chain recognizer rejects falls back to the branch model.
+        // runs it once per default-graph source.
         Pattern::DefaultGraphSource { patterns, .. } => PatternEstimate::Source {
-            row_count: estimate_annotation_chain_cardinality(patterns, bound_vars, stats)
-                .unwrap_or_else(|| estimate_branch_cardinality_from(patterns, bound_vars, stats)),
+            row_count: estimate_branch_cardinality_from(patterns, bound_vars, stats),
         },
     }
-}
-
-/// The two entry points of an expanded edge-annotation chain, costed with
-/// `bound_vars` already bound: rows the base-edge scan yields (edge-first)
-/// and rows the cheaper of the `f:reifiesSubject` / `f:reifiesObject`
-/// lookups yields (reifier-first). `f:reifiesPredicate` is left out on
-/// purpose: its bound-object estimate divides the arena evenly across
-/// predicates, which put `TREATS` at 31k reifiers when it has 1.1M and
-/// made the lane choice sweep 952k edges per reifier probe the wrong way
-/// round; the endpoint lookups only get small when a binding makes them
-/// small. `None` when `patterns` is not a recognized chain. Shared by the
-/// wrapper's cardinality estimate and by the delegate's lane choice.
-pub(crate) fn annotation_chain_entry_rows(
-    patterns: &[Pattern],
-    bound_vars: &HashSet<VarId>,
-    stats: Option<&StatsView>,
-) -> Option<(f64, f64)> {
-    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
-    let triple_rows = |p: &Pattern| match p {
-        Pattern::Triple(tp) => Some(estimate_triple_row_count(tp, bound_vars, stats)),
-        _ => None,
-    };
-    let edge_first = triple_rows(&shape.base)?;
-    let reifier_first = [&patterns[1], &patterns[3]]
-        .into_iter()
-        .filter_map(triple_rows)
-        .fold(f64::INFINITY, f64::min);
-    Some((edge_first, reifier_first))
-}
-
-/// Reifier candidates the chain's cheapest `f:reifies*` lookup yields with
-/// the child's variables bound — the rows a per-reifier chain must point-check
-/// before the body runs. Unlike [`annotation_chain_entry_rows`] this includes
-/// `f:reifiesPredicate`: its uniform per-predicate estimate is too coarse to
-/// size the wrapper's OUTPUT by, but as a lane entry it is exactly the POST
-/// range a predicate-only chain drives from, and it is never larger than the
-/// truth by more than the endpoint lookups already are.
-pub(crate) fn annotation_chain_probe_rows(
-    patterns: &[Pattern],
-    bound_vars: &HashSet<VarId>,
-    stats: Option<&StatsView>,
-) -> Option<f64> {
-    crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
-    let rows = patterns[1..=3]
-        .iter()
-        .filter_map(|p| match p {
-            Pattern::Triple(tp) => Some(estimate_triple_row_count(tp, bound_vars, stats)),
-            _ => None,
-        })
-        .fold(f64::INFINITY, f64::min);
-    rows.is_finite().then_some(rows)
-}
-
-/// Cardinality of an expanded edge-annotation chain — `[base edge, three
-/// `f:reifies*` triples, body…]`, the only shape `Pattern::DefaultGraphSource`
-/// wraps. The generic branch model multiplies the chain's triples in
-/// standalone-selectivity order with no regard for connectivity, so
-/// `<< ?s :P ?o >>` came out as reifiesPredicate × base edge (3,846 × 102,555
-/// ≈ 4e8 on StarBench P11) and the wrapper sorted behind its own 6.5M-row
-/// body triple, which then drove the chain once per row. The chain binds one
-/// reifier per matching base edge, so its cardinality is the cheaper of its
-/// two entry points — the base edge, or the most selective `f:reifies*`
-/// lookup — times the body's expansion with the edge and reifier bound.
-pub(crate) fn estimate_annotation_chain_cardinality(
-    patterns: &[Pattern],
-    bound_vars: &HashSet<VarId>,
-    stats: Option<&StatsView>,
-) -> Option<f64> {
-    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
-    let (edge_first, reifier_first) = annotation_chain_entry_rows(patterns, bound_vars, stats)?;
-    let reifiers = edge_first.min(reifier_first).max(HIGHLY_SELECTIVE);
-    if shape.body.is_empty() {
-        return Some(reifiers);
-    }
-    let mut bound = bound_vars.clone();
-    bound.extend(shape.base.produced_vars());
-    bound.insert(shape.ann_var);
-    let body = estimate_branch_cardinality_from(&shape.body, &bound, stats);
-    Some((reifiers * body).max(HIGHLY_SELECTIVE))
 }
 
 /// Estimate cardinality for a sequence of patterns (UNION branch or subquery body).
@@ -1318,14 +1362,6 @@ pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) 
         .any(|v| bound_vars.contains(v))
 }
 
-/// Collect the variables that a slice of patterns guarantees to bind.
-fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
-    patterns
-        .iter()
-        .flat_map(super::ir::Pattern::produced_vars)
-        .collect()
-}
-
 /// Try to nest a deferred pattern into a compound pattern's inner lists.
 ///
 /// Returns `true` if the pattern was nested, `false` if the pattern is not
@@ -1338,14 +1374,13 @@ fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
 /// parent scope and available inside each branch, so only the UNION-specific
 /// variables need the intersection check.
 ///
-/// For Graph and Service all inner variables are guaranteed, so the deferred
-/// pattern is nested unconditionally.
+/// For Graph and Service the deferred pattern is nested unconditionally.
 fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool {
     match compound {
         Pattern::Union(branches) => {
-            let guaranteed_vars = branches
+            let produced_in_every_branch = branches
                 .iter()
-                .map(|b| collect_guaranteed_vars(b))
+                .map(|b| crate::ir::pattern::produced_vars_of(b))
                 .reduce(|mut union_vars, branch_vars| {
                     union_vars.retain(|v| branch_vars.contains(v));
                     union_vars
@@ -1354,7 +1389,7 @@ fn try_nest_deferred(compound: &mut Pattern, deferred: &DeferredPattern) -> bool
             if !deferred
                 .required_vars
                 .iter()
-                .any(|v| guaranteed_vars.contains(v))
+                .any(|v| produced_in_every_branch.contains(v))
             {
                 return false;
             }
@@ -1390,6 +1425,97 @@ struct RankedPattern {
     /// left-join ordering barrier (see [`left_join_order_barriers`]). Empty
     /// unless an OPTIONAL in the group shares a not-yet-certain variable with it.
     after_indices: Vec<usize>,
+    /// The inner predicate a sibling filter pins on this link triple's term
+    /// (see [`link_triple_pin`]).
+    link_pin: Option<Sid>,
+}
+
+impl RankedPattern {
+    fn estimate(&self, bound_vars: &HashSet<VarId>, stats: Option<&StatsView>) -> PatternEstimate {
+        estimate_pinned(&self.pattern, self.link_pin.as_ref(), bound_vars, stats)
+    }
+}
+
+/// [`estimate_pattern`], except that a link scan `?r rdf:reifies ?t` whose
+/// term a filter pins to inner predicate `pin` reads only that predicate's
+/// handle interval: its live links, not every link.
+fn estimate_pinned(
+    pattern: &Pattern,
+    pin: Option<&Sid>,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> PatternEstimate {
+    if let (Some(pin), Some(stats), Pattern::Triple(tp)) = (pin, stats, pattern) {
+        if classify_pattern(tp, bound_vars) == PatternType::PropertyScan {
+            if let Some(links) = stats.link_count(pin) {
+                return PatternEstimate::Source {
+                    row_count: links as f64,
+                };
+            }
+        }
+    }
+    estimate_pattern(pattern, bound_vars, stats)
+}
+
+/// The inner predicates a group's filters pin on its term variables.
+pub fn link_pins(patterns: &[Pattern]) -> HashMap<VarId, Sid> {
+    patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Filter(expr) => term_predicate_pin(expr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`estimate_pattern`] for a pattern of a group whose filters pin `pins`.
+pub fn estimate_in_group(
+    pattern: &Pattern,
+    pins: &HashMap<VarId, Sid>,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> PatternEstimate {
+    estimate_pinned(
+        pattern,
+        link_triple_pin(pattern, pins).as_ref(),
+        bound_vars,
+        stats,
+    )
+}
+
+/// The inner predicate `sameTerm(PREDICATE(?t), <p>)` pins on term variable
+/// `?t`, as the link lowering writes it.
+fn term_predicate_pin(filter: &Expression) -> Option<(VarId, Sid)> {
+    let Expression::Call { args, .. } = filter else {
+        return None;
+    };
+    let var = args.iter().find_map(|arg| match arg {
+        Expression::Call {
+            func: Function::TriplePredicate,
+            args,
+        } => match args.as_slice() {
+            [Expression::Var(v)] => Some(*v),
+            _ => None,
+        },
+        _ => None,
+    })?;
+    term_component_constraint(filter, var)?
+        .term_predicate
+        .map(|p| (var, p))
+}
+
+/// The pinned inner predicate of a link triple `?r rdf:reifies ?t`.
+fn link_triple_pin(pattern: &Pattern, pins: &HashMap<VarId, Sid>) -> Option<Sid> {
+    let Pattern::Triple(tp) = pattern else {
+        return None;
+    };
+    let Ref::Sid(p) = &tp.p else {
+        return None;
+    };
+    if !fluree_db_core::is_rdf_reifies(p) {
+        return None;
+    }
+    pins.get(&tp.o.as_var()?).cloned()
 }
 
 /// A deferred pattern (FILTER/BIND) with pre-computed input variables.
@@ -1427,6 +1553,107 @@ struct DeferredPattern {
     /// `?b` otherwise drains the VALUES before the OPTIONAL that introduces `?b`
     /// is placed at all. Empty for every dependency-placed deferral.
     after_indices: Vec<usize>,
+    /// For FILTER, EXISTS, NOT EXISTS, BIND and UNWIND: who binds each variable
+    /// the pattern reads (see [`attach_filter_binders`]). Empty for everything
+    /// else.
+    binders: Vec<VarBinders>,
+}
+
+/// The patterns in a group that bind one variable a filter reads.
+///
+/// A variable can be in the schema while unbound on some rows: VALUES with
+/// UNDEF, an OPTIONAL, or one UNION branch leaves it unbound, and a later
+/// pattern may still fill it in. A filter applies to its whole group, so it
+/// must see the value those rows end up with. That value is settled once a
+/// pattern binding the variable on every row has been placed, or once every
+/// pattern that can bind it has.
+struct VarBinders {
+    every_row: Vec<usize>,
+    any: Vec<usize>,
+}
+
+impl VarBinders {
+    fn settled(&self, placed: &HashSet<usize>) -> bool {
+        self.every_row.iter().any(|i| placed.contains(i))
+            || self.any.iter().all(|i| placed.contains(i))
+    }
+}
+
+/// Fill [`DeferredPattern::binders`] for each deferred FILTER, EXISTS, NOT
+/// EXISTS, BIND and UNWIND: one [`VarBinders`] per variable it reads that
+/// another pattern in the group binds, by original index. SPARQL applies a
+/// FILTER to its group wherever it is written (§18.2.2.6), so binders written
+/// after it count too. BIND and UNWIND are placed by their dependencies rather
+/// than where they are written, so they wait on the same binders; otherwise a
+/// VALUES UNDEF column lets them run before the triple that actually binds the
+/// variable.
+///
+/// What a pattern reads is [`deferred_required_vars`]. A BIND or UNWIND target
+/// is an output: a pattern that also binds it joins on the value the BIND or
+/// UNWIND produces, so it is not a binder to wait for. An UNWIND held behind
+/// one overwrites the value that pattern bound.
+///
+/// `seed_bound_in_every_row` are the seed variables no pattern can change;
+/// any other seed variable may be unbound on some rows and gets binders too.
+fn attach_filter_binders(
+    deferred: &mut [DeferredPattern],
+    patterns: &[Pattern],
+    seed_bound_in_every_row: &HashSet<VarId>,
+) {
+    let waits_for_binders = |p: &Pattern| {
+        matches!(
+            p,
+            Pattern::Filter(_)
+                | Pattern::Exists(_)
+                | Pattern::NotExists(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
+        )
+    };
+    if !deferred.iter().any(|dp| waits_for_binders(&dp.pattern)) {
+        return;
+    }
+    let produced: Vec<Vec<VarId>> = patterns.iter().map(Pattern::produced_vars).collect();
+    let mut every_row_vars: Vec<Option<HashSet<VarId>>> = vec![None; patterns.len()];
+    for dp in deferred
+        .iter_mut()
+        .filter(|dp| waits_for_binders(&dp.pattern))
+    {
+        let mut reads = deferred_required_vars(&dp.pattern);
+        reads.sort_unstable();
+        reads.dedup();
+        for v in reads {
+            if seed_bound_in_every_row.contains(&v) {
+                continue;
+            }
+            let any: Vec<usize> = (0..patterns.len())
+                .filter(|&j| j != dp.orig_index && produced[j].contains(&v))
+                .collect();
+            if any.is_empty() {
+                continue;
+            }
+            let every_row = any
+                .iter()
+                .copied()
+                .filter(|&j| {
+                    every_row_vars[j]
+                        .get_or_insert_with(|| must_bind_vars(&patterns[j], BindTargets::Bound))
+                        .contains(&v)
+                })
+                .collect();
+            dp.binders.push(VarBinders { every_row, any });
+        }
+    }
+}
+
+/// How [`must_bind_vars`] counts the target of a BIND.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindTargets {
+    /// Bound on every row. Subquery correlation needs this: a variable a
+    /// WITH-pipeline BIND produces is the subquery's own, not an input.
+    Bound,
+    /// Unbound on a row whose expression errors, so not bound on every row.
+    MayBeUnbound,
 }
 
 /// Variables `pattern` binds in **every** solution it emits.
@@ -1439,28 +1666,27 @@ struct DeferredPattern {
 /// genuinely introduces it — the barrier stopped firing and #1690 came back one
 /// UNION away from the shape it was written for.
 ///
-/// **`Bind` is a known may-bind variant this function deliberately counts, so
-/// the contract above is not unconditional.** `Pattern::Bind` binds nothing on
-/// a row whose expression errors — `bind.rs` yields `Binding::Unbound` — and a
-/// BIND-then-OPTIONAL lead can therefore fabricate exactly as a UNION lead
-/// does. It is counted anyway because [`subquery_correlation_vars`] needs it
-/// counted: a variable the subquery produces through a WITH-pipeline binder
-/// must not be read as an external correlation, or the subquery is deferred on
-/// a variable only it can bind. That is the one concept where the two call
-/// sites genuinely want different answers, and it is resolved in the
-/// correlation site's favour — so tightening `Bind` here on the strength of the
-/// stated contract would quietly break subquery correlation. It needs a fix at
-/// both sites or at neither.
+/// **`Bind` is the one may-bind variant, so callers choose ([`BindTargets`]).**
+/// `Pattern::Bind` binds nothing on a row whose expression errors — `bind.rs`
+/// yields `Binding::Unbound`. [`subquery_correlation_vars`] counts it anyway: a
+/// variable the subquery produces through a WITH-pipeline binder must not be
+/// read as an external correlation, or the subquery is deferred on a variable
+/// only it can bind. Join-chain placement does not count it (see
+/// `where_plan::build_where_operators_seeded_with_needed`). The barrier and
+/// binder sites here still count it, so a BIND-then-OPTIONAL lead can fabricate
+/// exactly as a UNION lead does; tightening them changes placement and wants
+/// its own tests.
 ///
 /// Shared with [`subquery_correlation_vars`], which needs the same rule to
 /// decide whether a shared SELECT-list variable is a join key or a correlation
-/// input — it used to state it as an inline `matches!` allow-list. One relation
-/// over one concept, with `Bind` above as the single knowing exception.
-///
-/// Note `collect_guaranteed_vars` is NOT this function despite the name: it is
-/// plain `produced_vars`, with the branch intersection done at its
-/// `try_nest_deferred` call site.
-fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
+/// input — it used to state it as an inline `matches!` allow-list.
+pub(crate) fn must_bind_vars(pattern: &Pattern, bind_targets: BindTargets) -> HashSet<VarId> {
+    let all = |patterns: &[Pattern]| -> HashSet<VarId> {
+        patterns
+            .iter()
+            .flat_map(|p| must_bind_vars(p, bind_targets))
+            .collect()
+    };
     match pattern {
         // A left join binds nothing unconditionally.
         Pattern::Optional(_) => HashSet::new(),
@@ -1471,12 +1697,7 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // A UNION guarantees only what EVERY branch guarantees.
         Pattern::Union(branches) => branches
             .iter()
-            .map(|branch| {
-                branch
-                    .iter()
-                    .flat_map(must_bind_vars)
-                    .collect::<HashSet<_>>()
-            })
+            .map(|branch| all(branch))
             .reduce(|mut acc, branch_vars| {
                 acc.retain(|v| branch_vars.contains(v));
                 acc
@@ -1485,20 +1706,18 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // Containers: whatever their body guarantees. A `GRAPH ?g` that emits a
         // row has always bound `?g`.
         Pattern::Graph { name, patterns } => {
-            let mut vars: HashSet<VarId> = patterns.iter().flat_map(must_bind_vars).collect();
+            let mut vars = all(patterns);
             if let crate::ir::GraphName::Var(v) = name {
                 vars.insert(*v);
             }
             vars
         }
-        Pattern::DefaultGraphSource { patterns } => {
-            patterns.iter().flat_map(must_bind_vars).collect()
-        }
-        Pattern::Service(sp) => sp.patterns.iter().flat_map(must_bind_vars).collect(),
+        Pattern::DefaultGraphSource { patterns } => all(patterns),
+        Pattern::Service(sp) => all(&sp.patterns),
         // A subquery exposes only its SELECT list, and only the members of it
         // its own body binds unconditionally.
         Pattern::Subquery(sq) => {
-            let body: HashSet<VarId> = sq.patterns.iter().flat_map(must_bind_vars).collect();
+            let body = all(&sq.patterns);
             sq.select
                 .iter()
                 .copied()
@@ -1509,17 +1728,14 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
             edge,
             annotation,
             body,
-        }
-        | Pattern::AnnotationTarget {
-            annotation,
-            edge,
-            body,
+            term,
         } => {
             let mut vars: HashSet<VarId> = edge.produced_vars().into_iter().collect();
             if let Ref::Var(v) = annotation {
                 vars.insert(*v);
             }
-            vars.extend(body.iter().flat_map(must_bind_vars));
+            vars.insert(*term);
+            vars.extend(all(body));
             vars
         }
         // A constant table guarantees only the columns with no UNDEF cell. Both
@@ -1537,18 +1753,14 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
         // and `empty_path_result` are both this). Cypher's WITH-pipeline
         // binders never emit `Unbound`, so this narrowing cannot reach the
         // `self_produced` set [`subquery_correlation_vars`] builds for them.
-        Pattern::Values { vars, rows } => vars
-            .iter()
-            .enumerate()
-            .filter(|(col, _)| {
-                rows.iter().all(|row| {
-                    row.get(*col)
-                        .is_some_and(|cell| !matches!(cell, crate::binding::Binding::Unbound))
-                })
-            })
-            .map(|(_, v)| *v)
-            .collect(),
-        // Triples, property paths, BIND/UNWIND, search adapters: every solution
+        Pattern::Values { vars, rows } => {
+            crate::ir::pattern::values_bound_in_every_row(vars, rows).collect()
+        }
+        Pattern::Bind { var, .. } => match bind_targets {
+            BindTargets::Bound => HashSet::from([*var]),
+            BindTargets::MayBeUnbound => HashSet::new(),
+        },
+        // Triples, property paths, UNWIND, search adapters: every solution
         // they emit carries their produced vars.
         other => other.produced_vars().into_iter().collect(),
     }
@@ -1591,10 +1803,10 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
             }
         }
         Pattern::Subquery(sq) => {
-            let body = must_bind_vars(pattern);
+            let body = must_bind_vars(pattern, BindTargets::Bound);
             out.extend(sq.select.iter().copied().filter(|v| !body.contains(v)));
         }
-        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+        Pattern::EdgeAnnotation { body, .. } => {
             for p in body {
                 left_join_introduced_vars(p, out);
             }
@@ -1638,7 +1850,7 @@ fn left_join_introduced_vars(pattern: &Pattern, out: &mut HashSet<VarId>) {
 fn values_optional_barrier_indices(
     values_vars: &[VarId],
     preceding: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<usize> {
     let mut blockers = Vec::new();
     if values_vars.is_empty() {
@@ -1646,7 +1858,7 @@ fn values_optional_barrier_indices(
     }
     let wanted: HashSet<VarId> = values_vars.iter().copied().collect();
     // Variables bound REQUIREDLY before the pattern under test.
-    let mut required_before: HashSet<VarId> = initial_bound_vars.clone();
+    let mut required_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, p) in preceding.iter().enumerate() {
         let mut introduced = HashSet::new();
         left_join_introduced_vars(p, &mut introduced);
@@ -1656,7 +1868,7 @@ fn values_optional_barrier_indices(
         {
             blockers.push(i);
         }
-        required_before.extend(must_bind_vars(p));
+        required_before.extend(must_bind_vars(p, BindTargets::Bound));
     }
     blockers
 }
@@ -1690,16 +1902,16 @@ fn values_optional_barrier_indices(
 /// the variable before it), which keeps it ahead of the OPTIONAL and so makes
 /// the exemption hold in the reordered plan too.
 ///
-/// A FILTER is never the earlier side: it constrains the whole group wherever
-/// it is written, so an OPTIONAL after it must not be held behind it.
+/// A FILTER, EXISTS or NOT EXISTS is never the earlier side: it constrains the
+/// whole group wherever it is written, so an OPTIONAL after it must not be held
+/// behind it. It waits for the OPTIONAL instead (see [`VarBinders`]).
 ///
-/// Only an OPTIONAL anchors an edge. MINUS, EXISTS and NOT EXISTS are
-/// order-sensitive too, but `reorder_patterns` already defers each until every
-/// variable produced by the patterns written before it is bound, which keeps
-/// it behind them.
+/// Only an OPTIONAL anchors an edge. MINUS is order-sensitive too, but
+/// `reorder_patterns` already gives it positional dependencies on the
+/// preceding binding-producing patterns.
 fn left_join_order_barriers(
     patterns: &[Pattern],
-    initial_bound_vars: &HashSet<VarId>,
+    seed_bound_in_every_row: &HashSet<VarId>,
 ) -> Vec<Vec<usize>> {
     let mut barriers: Vec<Vec<usize>> = vec![Vec::new(); patterns.len()];
     if !patterns.iter().any(|p| matches!(p, Pattern::Optional(_))) {
@@ -1709,9 +1921,12 @@ fn left_join_order_barriers(
         .iter()
         .map(|p| p.referenced_vars().into_iter().collect())
         .collect();
-    let mut certain_before: HashSet<VarId> = initial_bound_vars.clone();
+    let mut certain_before: HashSet<VarId> = seed_bound_in_every_row.clone();
     for (i, earlier) in patterns.iter().enumerate() {
-        if !matches!(earlier, Pattern::Filter(_)) {
+        if !matches!(
+            earlier,
+            Pattern::Filter(_) | Pattern::Exists(_) | Pattern::NotExists(_)
+        ) {
             let earlier_is_optional = matches!(earlier, Pattern::Optional(_));
             for (j, later) in patterns.iter().enumerate().skip(i + 1) {
                 if !earlier_is_optional && !matches!(later, Pattern::Optional(_)) {
@@ -1725,7 +1940,7 @@ fn left_join_order_barriers(
                 }
             }
         }
-        certain_before.extend(must_bind_vars(earlier));
+        certain_before.extend(must_bind_vars(earlier, BindTargets::Bound));
     }
     barriers
 }
@@ -1769,11 +1984,46 @@ pub fn reorder_patterns(
     stats: Option<&StatsView>,
     initial_bound_vars: &HashSet<VarId>,
 ) -> Vec<Pattern> {
+    reorder_patterns_with_seed(
+        patterns,
+        stats,
+        &SeedVars::all_bound(initial_bound_vars.clone()),
+    )
+}
+
+/// The variables a seed operator hands to the group planned on top of it.
+#[derive(Clone, Debug, Default)]
+pub struct SeedVars {
+    /// Every variable of the seed's schema: available to join on and to cost.
+    pub schema: HashSet<VarId>,
+    /// The ones bound on every row. Any other may be unbound on some rows, and
+    /// a pattern of the group can still bind it, so it settles nothing: not a
+    /// FILTER or BIND reading it, and not a left-join barrier.
+    pub bound_in_every_row: HashSet<VarId>,
+}
+
+impl SeedVars {
+    /// A seed that binds every variable of `schema` on every row.
+    pub fn all_bound(schema: HashSet<VarId>) -> Self {
+        Self {
+            bound_in_every_row: schema.clone(),
+            schema,
+        }
+    }
+}
+
+/// [`reorder_patterns`] for a group planned on top of `seed`.
+pub fn reorder_patterns_with_seed(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    seed: &SeedVars,
+) -> Vec<Pattern> {
     if patterns.len() <= 1 {
         return patterns.to_vec();
     }
 
-    let mut bound_vars = initial_bound_vars.clone();
+    let mut bound_vars = seed.schema.clone();
+    let link_pins = link_pins(patterns);
 
     // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
@@ -1829,14 +2079,15 @@ pub fn reorder_patterns(
     let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
     for (i, p) in patterns.iter().enumerate() {
         if let Pattern::Values { vars, .. } = p {
-            if values_optional_barrier_indices(vars, &patterns[..i], initial_bound_vars).is_empty()
+            if values_optional_barrier_indices(vars, &patterns[..i], &seed.bound_in_every_row)
+                .is_empty()
             {
                 seed_anchor_vars.extend(vars.iter().copied());
             }
         }
     }
 
-    let barriers = left_join_order_barriers(patterns, initial_bound_vars);
+    let barriers = left_join_order_barriers(patterns, &seed.bound_in_every_row);
 
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
@@ -1845,10 +2096,15 @@ pub fn reorder_patterns(
     let mut deferred: Vec<DeferredPattern> = Vec::new();
 
     for (i, pattern) in patterns.iter().enumerate() {
-        // MINUS, EXISTS, and NOT EXISTS are order-sensitive: they operate on
-        // the solution produced by ALL preceding patterns. Treat them as
-        // deferred with required_vars = variables from all preceding patterns
-        // so the reorder cannot hoist them above sources that feed them.
+        // MINUS, EXISTS, and NOT EXISTS are order-sensitive: MINUS operates on
+        // the solution produced by ALL preceding patterns, and EXISTS/NOT
+        // EXISTS on the whole group (their `binders` cover patterns written
+        // after them). Treat them as deferred until the preceding
+        // binding-producing patterns are placed. Variable readiness alone is
+        // insufficient: VALUES/OPTIONAL may leave a shared variable unbound,
+        // and a later triple fills it in without adding a new schema variable.
+        // Hoisting negation ahead of that triple changes which mappings it can
+        // remove.
         if matches!(
             pattern,
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_)
@@ -1868,7 +2124,10 @@ pub fn reorder_patterns(
                 required_vars: required,
                 pattern: pattern.clone(),
                 nestable: true,
-                after_indices: Vec::new(),
+                after_indices: (0..i)
+                    .filter(|&j| !patterns[j].produced_vars().is_empty())
+                    .collect(),
+                binders: Vec::new(),
             });
             continue;
         }
@@ -1903,7 +2162,7 @@ pub fn reorder_patterns(
         // them.
         if let Pattern::Values { vars, .. } = pattern {
             let blockers =
-                values_optional_barrier_indices(vars, &patterns[..i], initial_bound_vars);
+                values_optional_barrier_indices(vars, &patterns[..i], &seed.bound_in_every_row);
             if !blockers.is_empty() {
                 deferred.push(DeferredPattern {
                     orig_index: i,
@@ -1914,6 +2173,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: false,
                     after_indices: blockers,
+                    binders: Vec::new(),
                 });
                 continue;
             }
@@ -1939,6 +2199,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: true,
                     after_indices: Vec::new(),
+                    binders: Vec::new(),
                 });
                 continue;
             }
@@ -1970,26 +2231,31 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: true,
                     after_indices: Vec::new(),
+                    binders: Vec::new(),
                 });
                 continue;
             }
         }
 
-        match estimate_pattern(pattern, &bound_vars, stats) {
+        let link_pin = link_triple_pin(pattern, &link_pins);
+        match estimate_pinned(pattern, link_pin.as_ref(), &bound_vars, stats) {
             PatternEstimate::Source { .. } => sources.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Reducer { .. } => reducers.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Expander { .. } => expanders.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
                 after_indices: barriers[i].clone(),
+                link_pin,
             }),
             PatternEstimate::Deferred => {
                 let mut required_vars: HashSet<VarId> =
@@ -2032,6 +2298,7 @@ pub fn reorder_patterns(
                     pattern: pattern.clone(),
                     nestable: true,
                     after_indices: Vec::new(),
+                    binders: Vec::new(),
                 });
             }
         }
@@ -2044,6 +2311,7 @@ pub fn reorder_patterns(
             }
         }
     }
+    attach_filter_binders(&mut deferred, patterns, &seed.bound_in_every_row);
 
     let mut result: Vec<Pattern> = Vec::with_capacity(patterns.len());
     // Original indices already emitted into `result`, for the positional
@@ -2228,8 +2496,8 @@ fn try_place_reducer(
         .enumerate()
         .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
         .min_by(|(_, a), (_, b)| {
-            let ca = estimate_pattern(&a.pattern, bound_vars, stats);
-            let cb = estimate_pattern(&b.pattern, bound_vars, stats);
+            let ca = a.estimate(bound_vars, stats);
+            let cb = b.estimate(bound_vars, stats);
             ca.multiplier()
                 .partial_cmp(&cb.multiplier())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2426,8 +2694,8 @@ fn rank_seed_candidates(
         | Pattern::S2Search(_) => 0_u8,
         _ => 1_u8,
     };
-    let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
-    let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
+    let ci = remaining[i].estimate(bound_vars, stats);
+    let cj = remaining[j].estimate(bound_vars, stats);
 
     // 1. Search sources seed first — but only before anything is bound.
     let by_search = if has_bound {
@@ -2671,8 +2939,8 @@ fn try_place_expander(
         .enumerate()
         .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
         .min_by(|(_, a), (_, b)| {
-            let ca = estimate_pattern(&a.pattern, bound_vars, stats);
-            let cb = estimate_pattern(&b.pattern, bound_vars, stats);
+            let ca = a.estimate(bound_vars, stats);
+            let cb = b.estimate(bound_vars, stats);
             ca.multiplier()
                 .partial_cmp(&cb.multiplier())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2722,6 +2990,7 @@ fn drain_ready_deferred(
             .filter(|(_, dp)| {
                 dp.required_vars.is_subset(bound_vars)
                     && dp.after_indices.iter().all(|i| placed.contains(i))
+                    && dp.binders.iter().all(|b| b.settled(placed))
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -2762,12 +3031,6 @@ fn drain_ready_deferred(
     }
 }
 
-/// Return the *input* variables that must be bound before a deferred pattern
-/// can execute.
-///
-/// - FILTER: all referenced variables
-/// - BIND: the expression's variables (not the target variable)
-///
 /// Variables a subquery correlates on: its SELECT-list variables that are also
 /// produced by some OTHER pattern in the enclosing group. These must be bound
 /// before the subquery runs, so the planner defers it until they are. An empty
@@ -2778,7 +3041,7 @@ fn drain_ready_deferred(
 /// seeding it per outer row is equivalent to evaluating the subquery once and
 /// filtering its output to that value, so it can run once and be hash-joined.
 ///
-/// Two safety conditions on this declassification:
+/// Three safety conditions on this declassification:
 /// 1. **No inner slice.** With `LIMIT`/`OFFSET`, the per-row restriction changes
 ///    which rows survive the slice (e.g. `ORDER BY DESC(?x) LIMIT 1` means "top
 ///    row per outer binding"), so such a subquery stays genuinely correlated.
@@ -2789,6 +3052,12 @@ fn drain_ready_deferred(
 ///    key would scan rather than filter). That is exactly [`must_bind_vars`],
 ///    which this site shares with the VALUES/OPTIONAL barrier so the two
 ///    cannot drift apart.
+/// 3. **Not a pinned import.** A Cypher `CALL (p)` import
+///    ([`SubqueryPattern::pinned_vars`]) is a per-row binding by contract. The
+///    body can nest a sliced, `DISTINCT` or aggregating `WITH` that reads it,
+///    where per-row seeding and one evaluation differ, so the import stays a
+///    correlation input and the CALL waits for its producer. The executor
+///    still evaluates once and hash-joins when the body allows it.
 fn subquery_correlation_vars(
     sq: &SubqueryPattern,
     siblings: &[Pattern],
@@ -2812,7 +3081,10 @@ fn subquery_correlation_vars(
     // but was flat (no Graph/Service recursion) and treated UNION as wholly
     // absent rather than intersecting its branches.
     let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
-        sq.patterns.iter().flat_map(must_bind_vars).collect()
+        sq.patterns
+            .iter()
+            .flat_map(|p| must_bind_vars(p, BindTargets::Bound))
+            .collect()
     } else {
         HashSet::new()
     };
@@ -2832,7 +3104,7 @@ fn subquery_correlation_vars(
     for (j, p) in siblings.iter().enumerate().take(self_idx) {
         debug_assert!(j < self_idx);
         for v in p.produced_vars() {
-            if select.contains(&v) && !self_produced.contains(&v) {
+            if select.contains(&v) && (!self_produced.contains(&v) || sq.pinned_vars.contains(&v)) {
                 corr.insert(v);
             }
         }
@@ -2894,6 +3166,13 @@ fn subquery_pipeline_output_vars(
     outputs
 }
 
+/// The *input* variables of a deferred pattern: the ones that must be bound
+/// before it can execute, and the ones [`attach_filter_binders`] waits on.
+///
+/// - FILTER: all referenced variables
+/// - BIND / UNWIND: the expression's variables, not the target variable
+/// - ShortestPath: its start anchors
+/// - EXISTS / NOT EXISTS: every variable they mention
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
@@ -2902,7 +3181,8 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
         // Only the start anchors an Enumerate path search; requiring the end
         // would deadlock when no other pattern produces it.
         Pattern::ShortestPath(sp) => sp.required_input_vars(),
-        // Other patterns should not be classified as Deferred, but handle
+        // EXISTS / NOT EXISTS correlate on everything they mention. Other
+        // patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),
     }
@@ -2962,6 +3242,60 @@ mod tests {
         ];
         let barriers = left_join_order_barriers(&patterns, &HashSet::new());
         assert_eq!(barriers, vec![vec![], vec![0], vec![1]]);
+    }
+
+    /// A seed variable unbound on some rows settles nothing: the OPTIONAL can
+    /// still introduce `?org` on those rows, so the triple reading it stays
+    /// behind the OPTIONAL. Only a seed binding `?org` on every row frees it.
+    #[test]
+    fn left_join_barrier_ignores_a_seed_var_unbound_on_some_rows() {
+        let (p, y, org) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![optional(p, "worksFor", org), triple(y, "worksFor", org)];
+        let schema: HashSet<VarId> = [p, org].into_iter().collect();
+
+        let partly_bound = SeedVars {
+            schema: schema.clone(),
+            bound_in_every_row: [p].into_iter().collect(),
+        };
+        let reordered = reorder_patterns_with_seed(&patterns, None, &partly_bound);
+        assert!(
+            matches!(reordered.first(), Some(Pattern::Optional(_))),
+            "{reordered:?}"
+        );
+
+        let barriers = left_join_order_barriers(&patterns, &schema);
+        assert_eq!(barriers, vec![Vec::<usize>::new(), vec![]]);
+    }
+
+    /// #1690 under a seed: the trailing VALUES stays behind the OPTIONAL that
+    /// introduces `?f` when the seed leaves `?f` unbound on some rows.
+    #[test]
+    fn values_barrier_ignores_a_seed_var_unbound_on_some_rows() {
+        let (s, n, f) = (VarId(0), VarId(1), VarId(2));
+        let values = Pattern::Values {
+            vars: vec![f],
+            rows: vec![vec![crate::binding::Binding::iri("ex:alice")]],
+        };
+        let patterns = vec![triple(s, "name", n), optional(s, "friend", f), values];
+        let is_values = |p: &Pattern| matches!(p, Pattern::Values { .. });
+        let is_optional = |p: &Pattern| matches!(p, Pattern::Optional(_));
+
+        let partly_bound = SeedVars {
+            schema: [f].into_iter().collect(),
+            bound_in_every_row: HashSet::new(),
+        };
+        let reordered = reorder_patterns_with_seed(&patterns, None, &partly_bound);
+        assert!(
+            reordered.iter().position(is_optional) < reordered.iter().position(is_values),
+            "{reordered:?}"
+        );
+
+        let all_bound = SeedVars::all_bound([f].into_iter().collect());
+        let reordered = reorder_patterns_with_seed(&patterns, None, &all_bound);
+        assert!(
+            reordered.iter().position(is_values) < reordered.iter().position(is_optional),
+            "with `?f` bound on every row the VALUES may seed: {reordered:?}"
+        );
     }
 
     /// #1925: two OPTIONALs sharing `?f` keep their written order, even though
@@ -3048,9 +3382,9 @@ mod tests {
                         function: AggregateFn::Avg(input, InputSemantics::List),
                         output_var: average,
                     }),
-                    binds: vec![],
                 }),
                 having: None,
+                binds: vec![],
             }),
         );
         let pipeline = Pattern::Subquery(
@@ -3177,6 +3511,89 @@ mod tests {
             );
         }
         stats
+    }
+
+    #[test]
+    fn projected_distinct_estimate_uses_domains_without_collapsing_columns() {
+        let s = VarId(0);
+        let city = VarId(1);
+        let category = VarId(2);
+        let mut stats = stats_with(&[("city", 50_000, 500), ("category", 50_000, 10)]);
+        stats
+            .properties
+            .get_mut(&Sid::new(100, "city"))
+            .unwrap()
+            .ndv_subjects = 50_000;
+        let patterns = vec![
+            Pattern::Triple(make_pattern(s, "city", city)),
+            Pattern::Triple(make_pattern(s, "category", category)),
+        ];
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &stats),
+            Some(500.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, category], &stats),
+            Some(5000.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, city], &stats),
+            Some(500.0)
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns[..1], &[s], &stats),
+            Some(50_000.0)
+        );
+
+        // A second mandatory domain can tighten the estimate of the same var.
+        let constrained = vec![
+            patterns[0].clone(),
+            Pattern::Triple(make_pattern(s, "category", city)),
+        ];
+        assert_eq!(
+            estimate_projected_distinct_rows(&constrained, &[city], &stats),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn projected_distinct_estimate_keeps_unknown_and_computed_domains_unknown() {
+        let s = VarId(0);
+        let city = VarId(1);
+        let stats = stats_with(&[("city", 50_000, 500)]);
+        let mut patterns = vec![Pattern::Triple(make_pattern(s, "city", city))];
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &StatsView::default()),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city, VarId(2)], &stats),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(
+                &patterns,
+                &[city],
+                &stats_with(&[("city", 50_000, 0)])
+            ),
+            None
+        );
+        patterns.push(Pattern::Bind {
+            var: city,
+            expr: crate::ir::Expression::Var(s),
+        });
+        assert_eq!(
+            estimate_projected_distinct_rows(&patterns, &[city], &stats),
+            None
+        );
+        assert_eq!(
+            estimate_projected_distinct_rows(
+                &[Pattern::Optional(vec![patterns[0].clone()])],
+                &[city],
+                &stats
+            ),
+            None
+        );
     }
 
     /// A `GRAPH <iri>` block naming one of this ledger's own named graphs must
@@ -3434,16 +3851,19 @@ mod tests {
                 orig_index: 0,
                 pattern: Pattern::Triple(make_pattern(product, "vendor", vendor)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
             RankedPattern {
                 orig_index: 1,
                 pattern: Pattern::Triple(make_pattern(product, "numeric", numeric)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
             RankedPattern {
                 orig_index: 2,
                 pattern: Pattern::Triple(make_pattern(VarId(3), "reviewer", vendor)),
                 after_indices: Vec::new(),
+                link_pin: None,
             },
         ];
         let bound = HashSet::from([product]);
@@ -3456,6 +3876,7 @@ mod tests {
             )),
             nestable: false,
             after_indices: Vec::new(),
+            binders: Vec::new(),
         }];
         assert_eq!(
             unlocked_object_hash_scan(0, &remaining, &bound, Some(&stats)),
@@ -3963,89 +4384,6 @@ mod tests {
             Some("http://example.org/z"),
             "expected stats-driven ordering to pick the most selective predicate first; got ordered[0]={:?}",
             ordered[0]
-        );
-    }
-
-    #[test]
-    fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
-        // After `StatsView::merge_annotation_stats` runs with per-slot
-        // NDVs, the planner's classifier should produce arena-aligned
-        // BoundObject estimates: `count / ndv_values` for the matching
-        // slot's NDV, not the conservative fallback.
-
-        use fluree_db_core::AnnotationStats;
-        use fluree_vocab::db as p;
-        use fluree_vocab::namespaces::FLUREE_DB;
-
-        let mut stats = StatsView::default();
-        let ann = AnnotationStats {
-            forward_rows: 1_000,
-            reverse_rows: 1_000,
-            distinct_edges: 200,
-            distinct_annotations: 800,
-            live_attachment_pairs: 800,
-            distinct_reified_subjects: 50,
-            distinct_reified_predicates: 4,
-            distinct_reified_objects: 200,
-            ..Default::default()
-        };
-        let mut ns = std::collections::HashMap::new();
-        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
-        stats.merge_annotation_stats(&ann, &ns);
-
-        // PropertyScan: `?ann f:reifiesObject ?o` — total annotations.
-        let scan = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
-            Term::Var(VarId(1)),
-        );
-        let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            scan_est, 800.0,
-            "PropertyScan should equal annotation count"
-        );
-
-        // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
-        // slot NDV the estimate is `800 / 200 = 4` — annotations per
-        // pinned object.
-        let bound_o = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
-            Term::Sid(Sid::new(7, "obj1")),
-        );
-        let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            bound_o_est, 4.0,
-            "BoundObject on reifiesObject should be distinct_annotations / distinct_reified_objects"
-        );
-
-        // BoundSubject: a known annotation subject probing its slot.
-        let mut bound_subj_ctx = HashSet::new();
-        bound_subj_ctx.insert(VarId(0));
-        let bound_s = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_SUBJECT)),
-            Term::Var(VarId(2)),
-        );
-        let bound_s_est = estimate_triple_row_count(&bound_s, &bound_subj_ctx, Some(&stats));
-        assert_eq!(
-            bound_s_est, 1.0,
-            "BoundSubject on reifiesSubject should be ~1 row per known annotation"
-        );
-
-        // BoundObject on reifiesPredicate: 800 / 4 = 200 annotations
-        // per pinned predicate. Larger than reifiesObject's
-        // selectivity here, which is realistic — predicates are
-        // typically a small set even at scale.
-        let bound_p = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
-            Term::Sid(Sid::new(7, "worksFor")),
-        );
-        let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
-        assert_eq!(
-            bound_p_est, 200.0,
-            "BoundObject on reifiesPredicate should be distinct_annotations / distinct_reified_predicates"
         );
     }
 
@@ -5240,6 +5578,144 @@ mod tests {
     }
 
     #[test]
+    fn negation_waits_for_preceding_patterns_even_when_schema_is_already_bound() {
+        let p = VarId(0);
+        let values = Pattern::Values {
+            vars: vec![p],
+            rows: vec![vec![crate::binding::Binding::Unbound]],
+        };
+        // This triple supplies the value missing from VALUES, but produces
+        // no new schema variable. A variable-readiness check alone is unsound.
+        let person = Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(Sid::new(100, "type")),
+            Term::Sid(Sid::new(100, "Person")),
+        ));
+        let inner = vec![triple(p, "worksFor", VarId(1))];
+        for negation in [
+            Pattern::Minus(inner.clone()),
+            Pattern::Exists(inner.clone()),
+            Pattern::NotExists(inner),
+        ] {
+            let patterns = vec![values.clone(), person.clone(), negation.clone()];
+            for seed in [HashSet::new(), HashSet::from([p])] {
+                let reordered = reorder_patterns(&patterns, None, &seed);
+                assert_eq!(
+                    format!("{:?}", reordered.last().unwrap()),
+                    format!("{negation:?}"),
+                    "negation must follow both binders: {reordered:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_placed_last(reordered: &[Pattern], pattern: &Pattern) {
+        assert_eq!(
+            format!("{:?}", reordered.last().unwrap()),
+            format!("{pattern:?}"),
+            "{reordered:?}"
+        );
+    }
+
+    #[test]
+    fn filters_wait_for_binders_written_after_them() {
+        let p = VarId(0);
+        let values = Pattern::Values {
+            vars: vec![p],
+            rows: vec![vec![crate::binding::Binding::Unbound]],
+        };
+        let person = Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(Sid::new(100, "type")),
+            Term::Sid(Sid::new(100, "Person")),
+        ));
+        let inner = vec![triple(p, "worksFor", VarId(1))];
+        let bound = Pattern::Filter(Expression::Call {
+            func: Function::Bound,
+            args: vec![Expression::Var(p)],
+        });
+        // A FILTER applies to its whole group, so each waits for the triple
+        // that fills the UNDEF row even though it is written first.
+        for filter in [
+            Pattern::Exists(inner.clone()),
+            Pattern::NotExists(inner),
+            bound,
+        ] {
+            let patterns = vec![values.clone(), filter.clone(), person.clone()];
+            let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+            assert_placed_last(&reordered, &filter);
+        }
+    }
+
+    #[test]
+    fn filters_wait_for_a_required_binder_after_an_optional() {
+        let (p, f, org, x) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let knows = triple(p, "knows", f);
+        let works = optional(p, "worksFor", org);
+        // Fills `?org` on the rows the OPTIONAL left unbound.
+        let fills = triple(f, "worksFor", org);
+        let bound = Pattern::Filter(Expression::Call {
+            func: Function::Bound,
+            args: vec![Expression::Var(org)],
+        });
+        for patterns in [
+            vec![knows.clone(), works.clone(), fills.clone(), bound.clone()],
+            vec![knows.clone(), works.clone(), bound.clone(), fills],
+        ] {
+            let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+            assert_placed_last(&reordered, &bound);
+        }
+
+        // A NOT EXISTS written before the OPTIONAL that binds one of its
+        // variables waits for it, rather than the OPTIONAL waiting for it.
+        let negation = Pattern::NotExists(vec![triple(p, "knows", x), triple(x, "worksFor", org)]);
+        let reordered = reorder_patterns(&[knows, negation.clone(), works], None, &HashSet::new());
+        assert_placed_last(&reordered, &negation);
+    }
+
+    #[test]
+    fn filters_on_a_required_variable_do_not_wait_for_an_optional() {
+        let (s, a, b) = (VarId(0), VarId(1), VarId(2));
+        let first = triple(s, "a", a);
+        // Binds `?s` too, but the triple already binds it on every row.
+        let opt = optional(s, "b", b);
+        let filter = Pattern::Filter(Expression::Call {
+            func: Function::Bound,
+            args: vec![Expression::Var(s)],
+        });
+        let reordered = reorder_patterns(&[first, opt, filter], None, &HashSet::new());
+        assert!(
+            position_of(&reordered, |p| matches!(p, Pattern::Filter(_)))
+                < position_of(&reordered, |p| matches!(p, Pattern::Optional(_))),
+            "{reordered:?}"
+        );
+    }
+
+    /// A BIND or UNWIND target is its output, so a triple that also binds it
+    /// joins on that value instead of holding it back. Placed after the
+    /// triple, an UNWIND overwrote the value the triple matched.
+    #[test]
+    fn bind_and_unwind_run_before_a_triple_that_binds_their_target() {
+        let (s, x) = (VarId(0), VarId(1));
+        let lookup = triple(s, "num", x);
+        let long = |n| Expression::Const(FlakeValue::Long(n));
+        let bind = Pattern::Bind {
+            var: x,
+            expr: long(3),
+        };
+        let unwind = Pattern::Unwind {
+            var: x,
+            list: Expression::call(Function::Range, vec![long(1), long(3)]),
+        };
+        let held: Vec<Vec<Pattern>> = [bind, unwind]
+            .into_iter()
+            .map(|binder| reorder_patterns(&[binder, lookup.clone()], None, &HashSet::new()))
+            .filter(|reordered| matches!(reordered[0], Pattern::Triple(_)))
+            .collect();
+        assert!(held.is_empty(), "held behind the triple: {held:?}");
+    }
+
+    #[test]
     fn test_reorder_expander_after_sources() {
         // OPTIONAL should be placed after all sources and reducers. A required
         // triple binds ?s ahead of it, so the OPTIONAL only restricts ?s and the
@@ -6376,91 +6852,6 @@ mod tests {
     }
 
     #[test]
-    fn annotation_wrapper_estimate_is_one_reifier_per_edge() {
-        // StarBench P11: the wrapper's cardinality must not multiply the
-        // reifiesPredicate lookup by the base edge (3,846 × 102,555 ≈ 4e8),
-        // which sorted the wrapper behind its own 6.5M-row body triple so
-        // that triple drove the chain once per row.
-        use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
-        let (s, o, ann, x) = (VarId(0), VarId(1), VarId(2), VarId(3));
-        let fsid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
-        let chain = vec![
-            Pattern::Triple(make_pattern(s, "TREATS", o)),
-            Pattern::Triple(TriplePattern::new(
-                Ref::Var(ann),
-                fsid(REIFIES_SUBJECT),
-                Term::Var(s),
-            )),
-            Pattern::Triple(TriplePattern::new(
-                Ref::Var(ann),
-                fsid(REIFIES_PREDICATE),
-                Term::Sid(Sid::new(100, "TREATS")),
-            )),
-            Pattern::Triple(TriplePattern::new(
-                Ref::Var(ann),
-                fsid(REIFIES_OBJECT),
-                Term::Var(o),
-            )),
-        ];
-        let body = Pattern::Triple(make_pattern(ann, "derives_from", x));
-        let mut stats = stats_with(&[
-            ("TREATS", 102_555, 6_000),
-            ("derives_from", 6_500_000, 300_000),
-        ]);
-        for (name, ndv_values) in [
-            (REIFIES_SUBJECT, 34_000),
-            (REIFIES_PREDICATE, 78),
-            (REIFIES_OBJECT, 32_000),
-        ] {
-            stats.properties.insert(
-                Sid::new(fluree_vocab::namespaces::FLUREE_DB, name),
-                PropertyStatData {
-                    count: 300_000,
-                    ndv_values,
-                    ndv_subjects: 300_000,
-                },
-            );
-        }
-        let row_count = |patterns: Vec<Pattern>| match estimate_pattern(
-            &Pattern::DefaultGraphSource { patterns },
-            &HashSet::new(),
-            Some(&stats),
-        ) {
-            PatternEstimate::Source { row_count } => row_count,
-            other => panic!("wrapper must be a Source: {other:?}"),
-        };
-
-        // Bare chain: the base edge (102,555 TREATS rows) bounds the reifier
-        // count — the endpoint lookups estimate the whole 300k arena and the
-        // reifiesPredicate lookup is deliberately not consulted (its uniform
-        // per-predicate split said 3,846 where the slice has 98,641).
-        let bare = row_count(chain.clone());
-        assert!(
-            (100_000.0..110_000.0).contains(&bare),
-            "bare chain ≈ 102,555 reifiers, got {bare}"
-        );
-        // With the body nested: reifiers × ~22 derives_from rows each, still
-        // well under the 6.5M-row body triple on its own.
-        let mut with_body = chain.clone();
-        with_body.push(body.clone());
-        let nested = row_count(with_body);
-        assert!(
-            (2_000_000.0..2_500_000.0).contains(&nested),
-            "chain × body ≈ 2.26M, got {nested}"
-        );
-        // And the wrapper drives its body triple, not the other way round.
-        let ordered = reorder_patterns(
-            &[Pattern::DefaultGraphSource { patterns: chain }, body],
-            Some(&stats),
-            &HashSet::new(),
-        );
-        assert!(
-            matches!(&ordered[0], Pattern::DefaultGraphSource { .. }),
-            "the annotation wrapper must seed before its 6.5M-row body triple: {ordered:?}"
-        );
-    }
-
-    #[test]
     fn producer_then_consumer_order_not_regressed() {
         // IC9 shape: the WITH producer seeds, then its consumer (`HAS_CREATOR`,
         // which references `friend`) drains immediately after.
@@ -6485,9 +6876,13 @@ mod tests {
 
     /// A grouped sub-SELECT: `SELECT <select> { <body> } GROUP BY <group_key>`.
     fn grouped_sq(select: Vec<VarId>, group_key: VarId, body: Vec<Pattern>) -> Pattern {
-        Pattern::Subquery(crate::ir::SubqueryPattern::new(select, body).with_grouping(
-            crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None).unwrap(),
-        ))
+        Pattern::Subquery(
+            crate::ir::SubqueryPattern::new(select, body).with_grouping(
+                crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None)
+                    .expect("valid grouping")
+                    .unwrap(),
+            ),
+        )
     }
 
     #[test]
@@ -6726,6 +7121,7 @@ mod tests {
             vec![],
             None,
         )
+        .expect("valid grouping")
         .expect("aggregate present")
     }
 
@@ -6777,5 +7173,63 @@ mod tests {
         // producer estimate does not apply, so it is not a trustworthy seed.
         let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_distinct();
         assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    /// S7's shape: a link scan whose term a filter pins to a rare inner
+    /// predicate drives the join once the stats count that predicate's live
+    /// links; ranked at every link, it loses to a smaller scan.
+    #[test]
+    fn a_pinned_link_scan_is_ranked_by_its_inner_predicates_links() {
+        let (source, ty, ann, term) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let reifies = fluree_db_core::rdf_reifies_sid().clone();
+        let part_of = Sid::new(100, "PART_OF");
+        let patterns = vec![
+            triple(source, "type", ty),
+            triple(ann, "derives_from", source),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(ann),
+                Ref::Sid(reifies.clone()),
+                Term::Var(term),
+            )),
+            Pattern::Filter(Expression::Call {
+                func: Function::SameTerm,
+                args: vec![
+                    Expression::Call {
+                        func: Function::TriplePredicate,
+                        args: vec![Expression::Var(term)],
+                    },
+                    Expression::Const(FlakeValue::Ref(part_of.clone())),
+                ],
+            }),
+        ];
+        let mut stats = stats_with(&[("type", 600_000, 100), ("derives_from", 3_000_000, 1_000)]);
+        stats.properties.insert(
+            reifies.clone(),
+            PropertyStatData {
+                count: 2_000_000,
+                ndv_values: 2_000_000,
+                ndv_subjects: 2_000_000,
+            },
+        );
+        let first =
+            |stats: &StatsView| match &reorder_patterns(&patterns, Some(stats), &HashSet::new())[0]
+            {
+                Pattern::Triple(tp) => tp.p.clone(),
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(first(&stats), Ref::Sid(Sid::new(100, "type")));
+
+        stats.links = Some(HashMap::from([(part_of.clone(), 120_000)]));
+        assert_eq!(first(&stats), Ref::Sid(reifies));
+        let pins = link_pins(&patterns);
+        assert_eq!(
+            estimate_in_group(&patterns[2], &pins, &HashSet::new(), Some(&stats)).row_count(),
+            120_000.0
+        );
+        // Once the reifier is bound the scan is a probe, pinned or not.
+        assert!(
+            estimate_in_group(&patterns[2], &pins, &HashSet::from([ann]), Some(&stats)).row_count()
+                < 10.0
+        );
     }
 }

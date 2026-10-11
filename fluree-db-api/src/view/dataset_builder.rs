@@ -33,17 +33,33 @@ macro_rules! build_dataset_view_from_spec {
             Ok(DataSetDb::single(view).with_history_range(from_t, to_t))
         } else {
             let mut dataset_db = DataSetDb::new();
+            let mut members = Vec::with_capacity(spec.default_graphs.len());
 
             // Load default graphs, applying per-source policy
             for source in &spec.default_graphs {
                 let view = ($load_view)(source).await?;
                 let view = ($apply_policy)(view, source).await?;
+                members.push(view.graph_source_id.clone());
                 // If this is a graph source, also register as a named graph
                 // so GRAPH <gs_id> patterns can resolve it during execution.
                 if let Some(ref gs_id) = view.graph_source_id {
                     dataset_db = dataset_db.with_named(gs_id.as_ref(), view.clone());
                 }
                 dataset_db = dataset_db.with_default(view);
+            }
+
+            // A graph source is read by its own scan, which a default graph shared
+            // with other sources does not union in: refuse rather than silently
+            // answer from only some of them.
+            if let Some(gs_id) = members.iter().flatten().next() {
+                if members.iter().any(|m| m.as_ref() != Some(gs_id)) {
+                    return Err(ApiError::invalid_query(format!(
+                        "graph source {gs_id} cannot share the default graph with other \
+                         sources; name it with FROM NAMED and read it inside \
+                         GRAPH <{gs_id}> {{ ... }} (JSON-LD: \"fromNamed\" and \
+                         [\"graph\", \"{gs_id}\", ...])"
+                    )));
+                }
             }
 
             // Load named graphs, applying per-source policy

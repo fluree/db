@@ -37,7 +37,7 @@ use crate::error::{QueryError, Result};
 use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
-use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::operator::{count_operator, BoxedOperator, Operator, OperatorState};
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
@@ -212,7 +212,7 @@ struct DatasetMember {
 /// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
 /// (see [`DatasetOperator::open`]).
 ///
-/// MEMORY CLIFF (documented like `scan_graph_flakes`'s): unlike a
+/// MEMORY CLIFF (documented like `whole_graph_facts`'s): unlike a
 /// single-graph scan, a `>= 2`-member default union is no longer
 /// bounded-memory streaming — the seen-set grows O(distinct emitted rows)
 /// with full normalized `Binding` signatures as keys, exactly like a
@@ -302,6 +302,9 @@ pub struct DatasetOperator {
     /// True when members span multiple distinct ledger IDs, requiring
     /// `Binding::Sid` → `Binding::IriMatch` conversion.
     needs_provenance: bool,
+    /// True when members are several graphs of one ledger, whose rows must
+    /// leave decoded; see [`Self::member_ctx`].
+    decode_members: bool,
     /// Temporal mode captured at planner-time. Set-deduplication of the default
     /// union is only sound in current mode (history rows carry per-event
     /// assert/retract metadata that the dedup key deliberately ignores).
@@ -323,6 +326,35 @@ pub struct DatasetOperator {
 }
 
 impl DatasetOperator {
+    /// The context member `graph` runs under.
+    ///
+    /// Members that are several graphs of one ledger keep the binary cursor,
+    /// but their rows leave for a scope of several graphs, which has no single
+    /// graph view to decode an encoded binding against (`ctx.graph_view()` is
+    /// `None`). A join substituting an undecodable `EncodedSid` would leave the
+    /// position unbound and pair every row with every other, and a NUM_BIG
+    /// handle decodes only against its own graph's arena. So such members
+    /// decode as they scan, where their own view is at hand.
+    fn member_ctx<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        graph: &crate::dataset::GraphRef<'a>,
+    ) -> ExecutionContext<'a> {
+        Self::member_ctx_for(self.decode_members, ctx, graph)
+    }
+
+    fn member_ctx_for<'a>(
+        decode_members: bool,
+        ctx: &ExecutionContext<'a>,
+        graph: &crate::dataset::GraphRef<'a>,
+    ) -> ExecutionContext<'a> {
+        let mut member = ctx.with_graph_ref(graph);
+        if decode_members {
+            member.eager_materialization = true;
+        }
+        member
+    }
+
     /// Create a new dataset operator driven by the given builder.
     pub fn new(builder: Box<dyn DatasetBuilder>) -> Self {
         Self {
@@ -331,6 +363,7 @@ impl DatasetOperator {
             members: Vec::new(),
             current_member: 0,
             needs_provenance: false,
+            decode_members: false,
             mode: TemporalMode::Current,
             dedup: None,
             row_budget: None,
@@ -503,24 +536,6 @@ fn sid_to_iri_match(
     ))
 }
 
-/// Count a single member to exhaustion, preferring its `drain_count`
-/// (count-only, no binding materialization) and falling back to a streaming
-/// `next_batch` row count when the member declines count-only mode.
-async fn count_member(op: &mut BoxedOperator, ctx: &ExecutionContext<'_>) -> Result<u64> {
-    if let Some(n) = op.drain_count(ctx).await? {
-        return Ok(n);
-    }
-    let mut n: u64 = 0;
-    while let Some(batch) = op.next_batch(ctx).await? {
-        ctx.check_cancelled()?;
-        n = n
-            .checked_add(batch.len() as u64)
-            .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
-    }
-    ctx.check_cancelled()?;
-    Ok(n)
-}
-
 #[async_trait]
 impl Operator for DatasetOperator {
     fn schema(&self) -> &[VarId] {
@@ -647,10 +662,12 @@ impl Operator for DatasetOperator {
                     None
                 };
 
+                self.decode_members = !multi_ledger && graphs.len() >= 2;
+
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;
                     self.apply_member_directives(inner.as_mut());
-                    let mut per_graph_ctx = ctx.with_graph_ref(graph);
+                    let mut per_graph_ctx = self.member_ctx(ctx, graph);
 
                     // When provenance stamping is needed (multi-ledger),
                     // force the range fallback path so inner scans produce
@@ -702,7 +719,8 @@ impl Operator for DatasetOperator {
                 let member = &mut self.members[self.current_member];
                 match &graphs {
                     ActiveGraphs::Many(g) => {
-                        let graph_ctx = ctx.with_graph_ref(g[self.current_member]);
+                        let graph_ctx =
+                            Self::member_ctx_for(self.decode_members, ctx, g[self.current_member]);
                         member.operator.next_batch(&graph_ctx).await?
                     }
                     ActiveGraphs::Single => member.operator.next_batch(ctx).await?,
@@ -798,11 +816,14 @@ impl Operator for DatasetOperator {
             let n = match &graphs {
                 ActiveGraphs::Many(g) => {
                     let graph_ctx = ctx.with_graph_ref(g[self.current_member]);
-                    count_member(&mut self.members[self.current_member].operator, &graph_ctx)
-                        .await?
+                    count_operator(
+                        self.members[self.current_member].operator.as_mut(),
+                        &graph_ctx,
+                    )
+                    .await?
                 }
                 ActiveGraphs::Single => {
-                    count_member(&mut self.members[self.current_member].operator, ctx).await?
+                    count_operator(self.members[self.current_member].operator.as_mut(), ctx).await?
                 }
             };
             total = total

@@ -522,7 +522,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     let fluree = if args.dry_run {
         None
     } else {
-        let fluree = build_fluree(dirs)?;
+        let fluree = build_fluree(dirs).await?;
         if !fluree.ledger_exists(&ledger_id).await? {
             fluree.create_ledger(&ledger_id).await?;
             eprintln!("{} created ledger {alias}", "→".dimmed());
@@ -1106,7 +1106,7 @@ async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {
 
 async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(args.ledger.as_deref(), dirs)?;
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
 
     let (text_id, _) = text_index_id(&alias);
     // The vector lane needs embeddings on the chunks, not an index: it

@@ -332,6 +332,23 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A graph the addressed ledger does not have (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`]: that condition means "no
+    /// such ledger" and sends a lookup on to graph sources, while here the
+    /// ledger exists and only the graph is missing.
+    #[error("Graph not found: {0}")]
+    GraphNotFound(String),
+
+    /// A commit reference (a CID, a hex prefix, a `t`) that names no commit of
+    /// the ledger it is resolved in (404).
+    ///
+    /// Deliberately not [`ApiError::is_not_found`], for the reason
+    /// [`ApiError::GraphNotFound`] is not: the ledger exists, and a time pin
+    /// that resolves to no commit must not read as a missing ledger.
+    #[error("{0}")]
+    CommitNotFound(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
@@ -656,7 +673,8 @@ impl ApiError {
             e if e.is_lifecycle_conflict() => 409,
             ApiError::BranchConflict(_) => 409,
             ApiError::GraphSourceSuspended(_) => 409,
-            ApiError::NotFound(_) => 404,
+            ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
+            ApiError::CommitNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
@@ -691,6 +709,13 @@ impl ApiError {
                 | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
                 | fluree_db_query::QueryError::CatalogAccessDenied { .. },
             ) => 403,
+            // The write was understood but refused by its policy. Other
+            // policy errors (invalid definitions, evaluation failures) are
+            // not authorization denials.
+            ApiError::Policy(fluree_db_policy::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(fluree_db_transact::TransactError::PolicyViolation(
+                fluree_db_policy::PolicyError::ModifyDenied { .. },
+            )) => 403,
             // A malformed ledger config graph is the operator's to fix, and no
             // change to the request can clear it.
             ApiError::LedgerConfig(_) => 500,
@@ -736,6 +761,11 @@ impl ApiError {
                 fluree_db_transact::TransactError::NoveltyAtMax
                 | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
             ) => 503,
+            // 422: well-formed, but the ledger has no room for its new
+            // datatypes. Permanent: datatype IDs are never released.
+            ApiError::Transact(fluree_db_transact::TransactError::DatatypeLimitExceeded {
+                ..
+            }) => 422,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
             // Cross-ledger model dependency could not be resolved /
@@ -825,6 +855,23 @@ mod tests {
         // errors.
         assert_eq!(
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn only_actual_policy_denials_are_forbidden() {
+        use fluree_db_policy::PolicyError;
+        use fluree_db_transact::TransactError;
+
+        let denied = || PolicyError::modify_denied("write refused");
+        assert_eq!(ApiError::Policy(denied()).status_code(), 403);
+        assert_eq!(
+            ApiError::Transact(TransactError::PolicyViolation(denied())).status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Transact(TransactError::InvalidTerm("bad term".into())).status_code(),
             400
         );
     }

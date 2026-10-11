@@ -11,10 +11,9 @@
 //! first big value under one predicate and the first under another are both
 //! handle `0` and collapse into one group.
 //!
-//! Two consequences shape this file. Every `xsd:decimal` lands in that arena
-//! unconditionally (the resolver has no inline branch), and so does any
-//! `xsd:integer` too large for `i64` — so the scope is not "decimals" but "the
-//! NumBig arena". And because handles are sequential per predicate, the result
+//! Two consequences shape this file. Decimals beyond the inline precision
+//! land in that arena, as do integers too large for `i64`. The scope is the
+//! NumBig arena. Because handles are sequential per predicate, the result
 //! was `max` over predicates of their distinct big-value counts rather than the
 //! size of the union: a silent undercount that can never over-report, which is
 //! why nothing downstream ever tripped on it.
@@ -50,53 +49,54 @@ const EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 
 const Q_COUNT: &str = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }";
 
-/// The reported fixture: two different decimals under two different predicates.
+/// The reported shape, with precision beyond the inline limit so the two
+/// different decimals under different predicates still exercise NumBig.
 const F_REPORTED: &str = r#"
-<http://valuenet/ontop/treatments/treatment_id=11> <http://valuenet/ontop/treatments#cost_of_treatment> "514.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://valuenet/ontop/charges/charge_id=3> <http://valuenet/ontop/charges#charge_amount> "640.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://valuenet/ontop/treatments/treatment_id=11> <http://valuenet/ontop/treatments#cost_of_treatment> "514.000000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://valuenet/ontop/charges/charge_id=3> <http://valuenet/ontop/charges#charge_amount> "640.000000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
-/// Two decimals under ONE predicate: handles 0 and 1 in a single arena, so this
-/// answered correctly even unfixed. It now takes the exact arena branch, as
+/// Two overflow decimals under ONE predicate: handles 0 and 1 in one arena,
+/// so this answered correctly even unfixed. It takes the exact arena branch, as
 /// does every graph with NumBig objects and no explicit entries cap.
 const F_ONE_PRED: &str = r#"
-<http://ex/s1> <http://ex/p1> "514.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/s2> <http://ex/p1> "640.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s1> <http://ex/p1> "514.000000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s2> <http://ex/p1> "640.000000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
 /// The same decimal VALUE under two predicates: two handles, one term. Correct
 /// by accident before the fix (both are handle 0).
 const F_SAME_VALUE: &str = r#"
-<http://ex/s1> <http://ex/p1> "5.5000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/s2> <http://ex/p2> "5.5000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s1> <http://ex/p1> "5.500000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s2> <http://ex/p2> "5.500000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
 /// 3 distinct decimals under p1, 1 disjoint under p2: union 4, `max` 3.
 const F_MAXPRED: &str = r#"
-<http://ex/a1> <http://ex/p1> "1.1000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a2> <http://ex/p1> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a3> <http://ex/p1> "3.3000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b1> <http://ex/p2> "9.9000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a1> <http://ex/p1> "1.100000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a2> <http://ex/p1> "2.200000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a3> <http://ex/p1> "3.300000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b1> <http://ex/p2> "9.900000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
 /// 3 and 3, all disjoint: union 6, `max` 3. Also the ledger the must-fire
 /// guards below run on.
 const F_LOSS3: &str = r#"
-<http://ex/a1> <http://ex/p1> "1.1000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a2> <http://ex/p1> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a3> <http://ex/p1> "3.3000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b1> <http://ex/p2> "4.4000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b2> <http://ex/p2> "5.5000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b3> <http://ex/p2> "6.6000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a1> <http://ex/p1> "1.100000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a2> <http://ex/p1> "2.200000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a3> <http://ex/p1> "3.300000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b1> <http://ex/p2> "4.400000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b2> <http://ex/p2> "5.500000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b3> <http://ex/p2> "6.600000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
 /// Decimals across predicates PLUS strings and small integers, so the correctly
 /// counted non-NumBig slice is exercised alongside the broken one.
 const F_MIXED: &str = r#"
-<http://ex/a1> <http://ex/p1> "1.1000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a2> <http://ex/p1> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b1> <http://ex/p2> "3.3000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b2> <http://ex/p2> "4.4000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a1> <http://ex/p1> "1.100000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a2> <http://ex/p1> "2.200000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b1> <http://ex/p2> "3.300000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b2> <http://ex/p2> "4.400000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 <http://ex/c1> <http://ex/p3> "alpha" .
 <http://ex/c2> <http://ex/p3> "beta" .
 <http://ex/d1> <http://ex/p4> 7 .
@@ -109,15 +109,15 @@ const F_MIXED: &str = r#"
 /// arena handles follow insertion order, so the global min and max sit at
 /// non-extreme handle positions.
 const F_LIFECYCLE: &str = r#"
-<http://ex/a1> <http://ex/p1> "5.5000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a2> <http://ex/p1> "6.6000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a3> <http://ex/p1> "7.7000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a4> <http://ex/p1> "8.8000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/a5> <http://ex/p1> "9.9000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b1> <http://ex/p2> "9.9000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b2> <http://ex/p2> "1.1000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b3> <http://ex/p2> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/b4> <http://ex/p2> "3.3000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a1> <http://ex/p1> "5.500000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a2> <http://ex/p1> "6.600000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a3> <http://ex/p1> "7.700000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a4> <http://ex/p1> "8.800000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/a5> <http://ex/p1> "9.900000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b1> <http://ex/p2> "9.900000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b2> <http://ex/p2> "1.100000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b3> <http://ex/p2> "2.200000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/b4> <http://ex/p2> "3.300000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
 /// `xsd:integer` beyond `i64`: the same per-predicate arena as decimals. The
@@ -131,11 +131,23 @@ const F_BIGINT_CROSS: &str = r#"
 /// POST leaflet carries an `o_type` column and straddles the NumBig range, so
 /// its live handles must be decoded rather than read from `lead_group_count`.
 const F_MIXED_PRED: &str = r#"
-<http://ex/s1> <http://ex/p1> "1.1000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
-<http://ex/s2> <http://ex/p1> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s1> <http://ex/p1> "1.100000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s2> <http://ex/p1> "2.200000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 <http://ex/s3> <http://ex/p1> "alpha" .
 <http://ex/s4> <http://ex/p1> 7 .
-<http://ex/s5> <http://ex/p2> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s5> <http://ex/p2> "2.200000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+"#;
+
+/// The original reported values now inline, so metadata alone is exact.
+const F_INLINE_DECIMAL_CROSS: &str = r#"
+<http://ex/s1> <http://ex/p1> "514.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s2> <http://ex/p2> "640.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+"#;
+
+/// One inline decimal and one overflow decimal still require the arena branch.
+const F_INLINE_AND_OVERFLOW: &str = r#"
+<http://ex/s1> <http://ex/p1> "1.1"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s2> <http://ex/p2> "1.100000000000000001"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 "#;
 
 /// `xsd:integer` within `i64`: an inline, value-faithful `o_key`.
@@ -173,6 +185,18 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
+    Case {
+        name: "CTRL inline decimals across two predicates",
+        ttl: F_INLINE_DECIMAL_CROSS,
+        truth: 2,
+        routing: Routing::MetadataOnly,
+    },
+    Case {
+        name: "inline and overflow decimals across two predicates",
+        ttl: F_INLINE_AND_OVERFLOW,
+        truth: 2,
+        routing: Routing::ExactBranch,
+    },
     Case {
         name: "reported: two decimals, two predicates",
         ttl: F_REPORTED,
@@ -473,12 +497,12 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
             (
                 "MIN(?o) whole-graph",
                 "SELECT (MIN(?o) AS ?n) WHERE { ?s ?p ?o }",
-                "1.1",
+                "1.100000000000000001",
             ),
             (
                 "MAX(?o) whole-graph",
                 "SELECT (MAX(?o) AS ?n) WHERE { ?s ?p ?o }",
-                "6.6",
+                "6.600000000000000001",
             ),
         ] {
             let got = scalar(&run(&fluree, &ledger, q).await);
@@ -600,7 +624,7 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
         let ctx = json!({"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
         check_liveness(&fluree, &ledger_id, initial, slug, &mut failures).await;
 
-        // Retract 5.5 (p1 only: the term is gone) and p2's 9.9 (the term
+        // Retract a1's value (p1 only: the term is gone) and b1's (the term
         // survives under p1). Decimal union 8 → 7, plus the mixed fixture's
         // string; both arenas keep a stale handle.
         let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
@@ -610,8 +634,8 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
                 &json!({
                     "@context": ctx,
                     "delete": [
-                        {"@id": "ex:a1", "ex:p1": {"@value": "5.5000", "@type": "xsd:decimal"}},
-                        {"@id": "ex:b1", "ex:p2": {"@value": "9.9000", "@type": "xsd:decimal"}},
+                        {"@id": "ex:a1", "ex:p1": {"@value": "5.500000000000000001", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b1", "ex:p2": {"@value": "9.900000000000000001", "@type": "xsd:decimal"}},
                     ]
                 }),
             )
@@ -636,9 +660,9 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
                 &json!({
                     "@context": ctx,
                     "delete": [
-                        {"@id": "ex:b2", "ex:p2": {"@value": "1.1000", "@type": "xsd:decimal"}},
-                        {"@id": "ex:b3", "ex:p2": {"@value": "2.2000", "@type": "xsd:decimal"}},
-                        {"@id": "ex:b4", "ex:p2": {"@value": "3.3000", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b2", "ex:p2": {"@value": "1.100000000000000001", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b3", "ex:p2": {"@value": "2.200000000000000001", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b4", "ex:p2": {"@value": "3.300000000000000001", "@type": "xsd:decimal"}},
                     ]
                 }),
             )

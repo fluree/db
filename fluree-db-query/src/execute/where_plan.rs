@@ -15,7 +15,7 @@ use crate::bm25::Bm25SearchOperator;
 use crate::cyclic_bgp::{analyze_cyclic_bgp, CyclicBgpOperator};
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
-use crate::eval::PreparedBoolExpression;
+use crate::eval::{expression_is_duplication_safe, PreparedBoolExpression};
 use crate::exists::ExistsOperator;
 use crate::filter::{contains_exists, FilterOperator};
 use crate::hash_join::HashJoinPlanner;
@@ -24,9 +24,12 @@ use crate::ir::{CompareOp, Expression, Function, Pattern};
 use crate::join::NestedLoopJoinOperator;
 use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
-use crate::operator::BoxedOperator;
+use crate::operator::{BoxedOperator, Operator};
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
-use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
+use crate::planner::{
+    analyze_property_join, is_property_join, must_bind_vars, reorder_patterns_with_seed,
+    BindTargets, SeedVars,
+};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::PropertyPathOperator;
 use crate::range_semijoin::{RangeSemiJoinCondition, RangeSemiJoinOperator};
@@ -47,18 +50,14 @@ use super::pushdown::extract_bounds_from_filters;
 // Edge-annotation IR expansion (M1b)
 // ============================================================================
 //
-// `Pattern::EdgeAnnotation { edge, annotation, body }` and
-// `Pattern::AnnotationTarget { annotation, edge, body }` are flattened
-// at planner time into the equivalent triple chain over the
-// `f:reifies*` system predicates. The standard scan / join machinery
-// handles the rest. This avoids a custom operator and exercises the
-// existing visibility / policy / dedup paths automatically — the
-// base edge triple's standard scan provides the visibility check for
-// the reverse direction "for free".
+// `Pattern::EdgeAnnotation { edge, annotation, body }` is flattened
+// at planner time into the body, the reifier's `rdf:reifies` link with
+// its term components, and an existence check on the base edge. The
+// standard scan / join machinery handles the rest. Policy on the link is
+// checked on its triple term (`QueryPolicyEnforcer::term_visible`).
 
-/// Expand every `Pattern::EdgeAnnotation` / `Pattern::AnnotationTarget`
-/// in `patterns` into its triple-chain equivalent, recursing through
-/// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
+/// Expand every `Pattern::EdgeAnnotation` in `patterns` into its
+/// triple-chain equivalent, recursing through every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
 /// `NotExists`, `Graph`, `Service`, `Subquery`).
 ///
 /// Each expanded triple chain is wrapped in
@@ -73,23 +72,31 @@ use super::pushdown::extract_bounds_from_filters;
 /// the executor does — otherwise edge-annotation queries would
 /// surface as empty in the explain output.
 pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+    expand_edge_annotation_patterns_for(patterns, true)
+}
+
+/// [`expand_edge_annotation_patterns`], wrapping each chain in
+/// [`Pattern::DefaultGraphSource`] only when `union` says the default graph
+/// is a union of two or more graphs. Otherwise the chain stays in the
+/// enclosing block, where the planner orders it with everything else.
+pub fn expand_edge_annotation_patterns_for(patterns: &[Pattern], union: bool) -> Vec<Pattern> {
     let mut out = Vec::with_capacity(patterns.len());
     for p in patterns {
-        expand_one_into(p.clone(), &mut out, false);
+        expand_one_into(p.clone(), &mut out, !union);
     }
     sink_filters_into_annotation_chains(&mut out);
     out
 }
 
-/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation` /
-/// `Pattern::AnnotationTarget` anywhere in the tree. Lets the WHERE
+/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation`
+/// anywhere in the tree. Lets the WHERE
 /// planner skip the `expand_edge_annotation_patterns` clone+rebuild on
 /// the common non-RDF-1.2 path. Exhaustive over `Pattern` so a new
 /// container variant forces a decision here rather than silently hiding
 /// an annotation from expansion.
 pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
     patterns.iter().any(|p| match p {
-        Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => true,
+        Pattern::EdgeAnnotation { .. } => true,
         Pattern::Optional(inner)
         | Pattern::Minus(inner)
         | Pattern::Exists(inner)
@@ -101,6 +108,7 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
         Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
         Pattern::Triple(_)
         | Pattern::PropertyPath(_)
+        | Pattern::TermComponents(_)
         | Pattern::ShortestPath(_)
         | Pattern::Filter(_)
         | Pattern::Bind { .. }
@@ -114,105 +122,65 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
     })
 }
 
-fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool) {
+fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, one_graph: bool) {
     match pattern {
         Pattern::EdgeAnnotation {
             edge,
             annotation,
             body,
-        }
-        | Pattern::AnnotationTarget {
-            annotation,
-            edge,
-            body,
+            term,
         } => {
-            // Build the triple chain (base edge + three f:reifies*
-            // triples + recursively expanded body) into a local
-            // vector. The whole chain then gets wrapped in
-            // `Pattern::DefaultGraphSource` so the per-source
-            // iteration correlates them; the wrapper is skipped when
-            // we're already inside an explicit `Pattern::Graph`,
-            // which provides graph correlation by construction.
+            // Build the chain (the body, the annotation's link to the edge,
+            // and the edge) into a local vector. It is wrapped in
+            // `Pattern::DefaultGraphSource` when the default graph is a union,
+            // so the per-source iteration correlates them; otherwise one graph
+            // is in scope and the chain joins its enclosing block.
+            //
+            // The order is the planner's tie-break: the body and the link are
+            // probes by reifier, and the term's components then decode from
+            // the bound term. Estimates still decide where they differ (a
+            // constant subject anchors the components through the term
+            // dictionary).
+            //
+            // Annotation syntax asserts its triple (RDF 1.2): a reifier may
+            // reify a triple that is not asserted, and such a link must not
+            // match `s p o {| … |}`. The components bind every position of the
+            // edge, so the edge only checks existence; as a joined triple the
+            // planner drove from it, scanning the whole predicate (LDBC IC7).
+            let base_edge = Pattern::Exists(vec![Pattern::Triple(edge.clone())]);
             let mut chain: Vec<Pattern> = Vec::new();
 
-            // 1. Base edge triple: provides visibility for both
-            //    directions. The standard scan applies snapshot rules
-            //    + policy filters here, so an `AnnotationTarget`
-            //    operator-style visibility check is redundant.
-            chain.push(Pattern::Triple(edge.clone()));
-
-            // 2. Three required `f:reifies*` lookup triples that bind
-            //    the annotation to the edge.
-            let ann_ref = annotation.clone();
-            // `f:reifiesSubject` / `f:reifiesPredicate` objects are refs by
-            // construction, so on a VARIABLE object the `@id` constraint is
-            // a no-op filter — and it costs the batched subject-join lane
-            // (`is_batched_eligible` needs no dtc), which is what turns the
-            // per-reifier probes into one sorted SPOT walk. A constant
-            // object keeps the constraint so the lookup key encodes as a
-            // ref rather than a same-lexical string.
-            let id_dt = fluree_db_core::edge::id_datatype_sid();
-            let id_dtc_for = |o: &Ref| match o {
-                Ref::Var(_) => None,
-                _ => Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
-            };
-            chain.push(Pattern::Triple(TriplePattern {
-                s: ann_ref.clone(),
-                p: reifies_subject_ref(),
-                o: edge.s.clone().into(),
-                dtc: id_dtc_for(&edge.s),
-            }));
-            chain.push(Pattern::Triple(TriplePattern {
-                s: ann_ref.clone(),
-                p: reifies_predicate_ref(),
-                o: edge.p.clone().into(),
-                dtc: id_dtc_for(&edge.p),
-            }));
-            // f:reifiesObject — preserves the original object's
-            // datatype constraint via `dtc` so typed-equality matches
-            // round-trip. For language-tagged literals
-            // (`DatatypeConstraint::LangTag`) this same clone is the
-            // intended per-language disambiguator: the writer DOES
-            // store the language tag on the f:reifiesObject flake's
-            // `m.lang` (verified by `it_edge_annotations::
-            // cross_language_annotation_does_not_cross_match` —
-            // both flakes carry `dt=rdf:langString,
-            // m.lang=Some(<tag>)`), so the LangTag dtc filter in
-            // `binary_scan` should pick exactly one annotation per
-            // language. This per-language disambiguation is exercised
-            // and green via `it_edge_annotations::
-            // cross_language_annotation_does_not_cross_match` (the
-            // executor honors the `dtc` LangTag filter; the earlier
-            // `#[ignore]`d gap was fixed in commit c3117574e).
-            chain.push(Pattern::Triple(TriplePattern {
-                s: ann_ref,
-                p: reifies_object_ref(),
-                o: edge.o.clone(),
-                dtc: edge.dtc.clone(),
-            }));
-
-            // 3. Body patterns (recursively expanded so nested
-            //    annotations — though M0 rejects them — flatten too).
-            //    The body inherits this expansion's wrapper context
-            //    (already inside the chain we'll wrap below).
+            // 1. Body patterns (recursively expanded so nested annotations —
+            //    though M0 rejects them — flatten too). The body inherits
+            //    this expansion's wrapper context.
             for inner in body {
                 expand_one_into(inner, &mut chain, true);
             }
 
-            // f:reifiesGraph is NOT emitted as a separate constraint
-            // triple — the `DefaultGraphSource` wrapper handles
-            // per-source correlation by switching execution context to
-            // one source at a time, so all f:reifies* triples scope to
-            // the same graph per iteration. The cross-graph misjoin
-            // (N×M cross-product under `from: [g1, g2]`) that
-            // motivated this wrapper is resolved by the per-source
-            // iteration.
+            // 2. The annotation's `rdf:reifies` link to the edge's triple
+            //    term, related to its components.
+            let reifies = Ref::Sid(fluree_db_core::Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::rdf_names::REIFIES,
+            ));
+            crate::ir::term_components::link_patterns(
+                annotation,
+                edge,
+                reifies,
+                || term,
+                &|_| None,
+                &mut chain,
+            );
+            chain.push(base_edge);
 
-            if inside_graph {
-                // Already inside a `Pattern::Graph` wrapper — the
-                // existing wrapper scopes the inner subplan to one
-                // graph per iteration, so no extra correlation
-                // layer is needed.
+            // Under a default-graph union the `DefaultGraphSource` wrapper
+            // switches the execution context to one member at a time, so the
+            // body and the link come from the same graph.
+
+            if one_graph {
+                // One graph is in scope (an enclosing `Pattern::Graph`, or a
+                // default graph that is not a union), so no correlation layer
+                // is needed and the chain joins its enclosing block.
                 out.extend(chain);
             } else {
                 out.push(Pattern::DefaultGraphSource { patterns: chain });
@@ -226,7 +194,7 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
         Pattern::Graph { .. } => {
             // Inside an explicit Pattern::Graph, expansion must
             // suppress the DefaultGraphSource wrapper — propagate
-            // `inside_graph = true`.
+            // `one_graph = true`.
             let expanded = pattern
                 .map_subpatterns(&mut |inner| expand_edge_annotation_patterns_inside_graph(&inner));
             out.push(expanded);
@@ -239,9 +207,8 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
         | Pattern::Service(_)
         | Pattern::Subquery(_)
         | Pattern::DefaultGraphSource { .. } => {
-            // Container patterns inherit the current `inside_graph`
-            // context.
-            let was_inside = inside_graph;
+            // Container patterns inherit the current `one_graph` context.
+            let was_inside = one_graph;
             let expanded = pattern.map_subpatterns(&mut |inner| {
                 let mut out = Vec::with_capacity(inner.len());
                 for p in inner {
@@ -257,7 +224,7 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
     }
 }
 
-/// Recursive entry that propagates `inside_graph = true`. Used by the
+/// Recursive entry that propagates `one_graph = true`. Used by the
 /// `Pattern::Graph` arm above so its inner subtree doesn't synthesize
 /// a redundant `DefaultGraphSource`.
 fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pattern> {
@@ -408,27 +375,6 @@ fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
     }
 }
 
-fn reifies_subject_ref() -> Ref {
-    Ref::Sid(fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_SUBJECT,
-    ))
-}
-
-fn reifies_predicate_ref() -> Ref {
-    Ref::Sid(fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_PREDICATE,
-    ))
-}
-
-fn reifies_object_ref() -> Ref {
-    Ref::Sid(fluree_db_core::Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_OBJECT,
-    ))
-}
-
 #[inline]
 fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
     match expr {
@@ -529,9 +475,7 @@ fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) 
         // re-opened the #1443 cross-encoding hash mismatch this fallback
         // exists to close.
         Pattern::Service(sp) => has_outer_correlated_graph_var(&sp.patterns, outer),
-        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
-            has_outer_correlated_graph_var(body, outer)
-        }
+        Pattern::EdgeAnnotation { body, .. } => has_outer_correlated_graph_var(body, outer),
         Pattern::Filter(expr) => expr_embeds(expr, outer),
         Pattern::Bind { expr, .. } => expr_embeds(expr, outer),
         Pattern::Unwind { var: _, list } => expr_embeds(list, outer),
@@ -588,6 +532,53 @@ pub(crate) fn choose_exists_strategy(
     }
 }
 
+/// Row estimate for the patterns ahead of an EXISTS. A term decomposition
+/// whose term a triple of the block binds decodes one term per row, joining
+/// its components to that triple; the branch estimate would price it as a
+/// scan of every term. Estimate it as that join: each component variable
+/// stands for the term variable.
+fn estimate_outer_rows(patterns: &[Pattern], stats: &StatsView) -> f64 {
+    let triple_vars: HashSet<VarId> = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::Triple(_)))
+        .flat_map(Pattern::produced_vars)
+        .collect();
+    let mut alias: HashMap<VarId, VarId> = HashMap::new();
+    for p in patterns {
+        if let Pattern::TermComponents(tc) = p {
+            if triple_vars.contains(&tc.term) {
+                for c in tc.components() {
+                    if let crate::ir::Component::Var(v) = c {
+                        alias.insert(*v, tc.term);
+                    }
+                }
+            }
+        }
+    }
+    let aliased = |v: &VarId| *alias.get(v).unwrap_or(v);
+    let rows: Vec<Pattern> = patterns
+        .iter()
+        .filter(|p| !matches!(p, Pattern::TermComponents(tc) if triple_vars.contains(&tc.term)))
+        .map(|p| match p {
+            Pattern::Triple(tp) if !alias.is_empty() => {
+                let mut tp = tp.clone();
+                if let Ref::Var(v) = &mut tp.s {
+                    *v = aliased(v);
+                }
+                if let Ref::Var(v) = &mut tp.p {
+                    *v = aliased(v);
+                }
+                if let Term::Var(v) = &mut tp.o {
+                    *v = aliased(v);
+                }
+                Pattern::Triple(tp)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    crate::planner::estimate_branch_cardinality(&rows, Some(stats))
+}
+
 /// Build the operator for an EXISTS / NOT EXISTS using [`choose_exists_strategy`].
 ///
 /// Picks `SemijoinOperator` (build-once + hash probe) when the inner pattern is
@@ -596,8 +587,12 @@ pub(crate) fn choose_exists_strategy(
 /// / `Pattern::NotExists` dispatch and the `OPTIONAL { ... } FILTER(!bound(?v))`
 /// rewrite — the latter relied on `ExistsOperator` unconditionally before this
 /// helper existed, which timed out on large outer streams.
+///
+/// `outer_patterns` are the patterns the child evaluates, whose estimate
+/// against the inner body's lets the semijoin choose a seeded build.
 fn build_exists_strategy(
     child: BoxedOperator,
+    outer_patterns: &[Pattern],
     inner_patterns: &[Pattern],
     negated: bool,
     stats: Option<Arc<StatsView>>,
@@ -613,14 +608,24 @@ fn build_exists_strategy(
                 inner_pattern_count = inner_patterns.len(),
                 "exists dispatch",
             );
-            Box::new(SemijoinOperator::new(
+            let estimates = stats.as_deref().map(|s| {
+                (
+                    estimate_outer_rows(outer_patterns, s),
+                    crate::planner::estimate_branch_cardinality(inner_patterns, Some(s)),
+                )
+            });
+            let op = SemijoinOperator::new(
                 child,
                 inner_patterns.to_vec(),
                 key_vars,
                 negated,
                 stats,
                 planning,
-            ))
+            );
+            Box::new(match estimates {
+                Some((outer, inner)) => op.with_estimates(outer, inner),
+                None => op,
+            })
         }
         ExistsStrategy::Exists { reason } => {
             tracing::debug!(
@@ -777,6 +782,12 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                Pattern::TermComponents(tc) => {
+                    for v in tc.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
                 Pattern::ShortestPath(sp) => {
                     for v in sp.referenced_vars() {
                         bump_count(counts, v);
@@ -809,7 +820,7 @@ pub fn collect_var_stats(
                 // positions, the reifier and the body: the chain elision
                 // treats a variable they miss as unread and drops the
                 // `f:reifies*` lookup that binds it.
-                Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                Pattern::EdgeAnnotation { .. } => {
                     for v in p.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
@@ -898,6 +909,10 @@ pub struct ValuesPattern {
 }
 
 impl ValuesPattern {
+    fn bound_in_every_row(&self) -> impl Iterator<Item = VarId> + '_ {
+        crate::ir::pattern::values_bound_in_every_row(&self.vars, &self.rows)
+    }
+
     pub fn new(vars: Vec<VarId>, rows: Vec<Vec<crate::binding::Binding>>) -> Self {
         Self { vars, rows }
     }
@@ -970,6 +985,8 @@ pub struct FilterPattern {
     pub required_vars: HashSet<VarId>,
     /// The filter expression to evaluate
     pub expr: Expression,
+    /// Whether an earlier step already runs its [`Settled::guarded_copy`]
+    guarded_copy_placed: bool,
 }
 
 impl FilterPattern {
@@ -979,6 +996,7 @@ impl FilterPattern {
             original_idx,
             required_vars,
             expr,
+            guarded_copy_placed: false,
         }
     }
 }
@@ -1322,19 +1340,78 @@ fn selective_object_values_seed(
     best
 }
 
+/// The variables a BIND or FILTER may read at one point of a join chain.
+///
+/// `bound` alone is not enough: a variable can be in the schema yet unbound on
+/// some rows (UNDEF in a VALUES table, an OPTIONAL, a BIND whose expression
+/// errored, a per-row seed). While a triple not yet joined can still bind it,
+/// it is `unsettled`, and a BIND or FILTER reading it would see the wrong value.
+#[derive(Clone, Debug, Default)]
+struct Settled {
+    bound: HashSet<VarId>,
+    unsettled: HashSet<VarId>,
+}
+
+impl Settled {
+    /// `bound`, with no triple left that could bind any of them again.
+    fn all(bound: HashSet<VarId>) -> Self {
+        Self {
+            bound,
+            unsettled: HashSet::new(),
+        }
+    }
+
+    fn admits(&self, required: &HashSet<VarId>) -> bool {
+        required.is_subset(&self.bound) && required.is_disjoint(&self.unsettled)
+    }
+
+    fn admits_var(&self, var: VarId) -> bool {
+        self.bound.contains(&var) && !self.unsettled.contains(&var)
+    }
+
+    /// A copy of `filter` that can run while some of its variables are only
+    /// unsettled: `!BOUND(?v) || … || filter`. A later join cannot change a
+    /// variable a row already binds, so the copy drops only rows the filter
+    /// itself drops. A row where one is unbound passes, and the filter decides
+    /// once the triple that binds it has run.
+    fn guarded_copy(&self, filter: &FilterPattern) -> Option<Expression> {
+        if !filter.required_vars.is_subset(&self.bound)
+            || !expression_is_duplication_safe(&filter.expr)
+        {
+            return None;
+        }
+        let mut unsettled: Vec<VarId> = filter
+            .required_vars
+            .intersection(&self.unsettled)
+            .copied()
+            .collect();
+        if unsettled.is_empty() {
+            return None;
+        }
+        unsettled.sort_unstable();
+        let mut args: Vec<Expression> = unsettled
+            .into_iter()
+            .map(|v| Expression::not(Expression::call(Function::Bound, vec![Expression::Var(v)])))
+            .collect();
+        args.push(filter.expr.clone());
+        Some(Expression::or(args))
+    }
+}
+
 /// Partition filters into those eligible for inline evaluation and those still waiting.
 ///
-/// Filters consumed by pushdown are silently dropped. Filters whose required
-/// variables are all in `bound` are returned as ready expressions (first element);
-/// the rest are returned as-is (second element).
+/// Filters consumed by pushdown are silently dropped. Filters `settled` admits
+/// are returned as ready expressions (first element); the rest are returned
+/// as-is (second element). A waiting filter held only by unsettled variables
+/// also contributes its [`Settled::guarded_copy`] to the ready ones, once.
 fn partition_eligible_filters(
     filters: Vec<FilterPattern>,
-    bound: &HashSet<VarId>,
+    settled: &Settled,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<Expression>, Vec<FilterPattern>) {
     let mut ready = Vec::new();
     let mut pending = Vec::new();
-    for pf in filters {
+    for mut pf in filters {
         if filter_idxs_consumed.contains(&pf.original_idx) {
             continue;
         }
@@ -1342,26 +1419,31 @@ fn partition_eligible_filters(
         // inline evaluation is synchronous, and both require the async path on
         // FilterOperator (EXISTS via filter_batch_with_exists, metadata via the
         // policy-filtered resolver). Defer them to a real FilterOperator.
-        if pf.required_vars.is_subset(bound)
-            && !contains_exists(&pf.expr)
-            && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr)
-        {
+        let inlinable = !contains_exists(&pf.expr)
+            && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr);
+        if inlinable && settled.admits(&pf.required_vars) {
             ready.push(pf.expr);
-        } else {
-            pending.push(pf);
+            continue;
         }
+        if inlinable && !pf.guarded_copy_placed {
+            if let Some(copy) = settled.guarded_copy(&pf) {
+                ready.push(copy);
+                pf.guarded_copy_placed = true;
+            }
+        }
+        pending.push(pf);
     }
     (ready, pending)
 }
 
-/// Apply eligible BINDs whose required variables are all bound.
+/// Apply the BINDs `settled` admits.
 ///
 /// Each ready BIND is fused with any filters that become ready once the BIND's
-/// variable enters `bound`.  Returns the updated operator, any BINDs whose
+/// variable enters `settled`.  Returns the updated operator, any BINDs whose
 /// dependencies are not yet satisfied, and the remaining filters.
 fn apply_eligible_binds(
     mut child: BoxedOperator,
-    bound: &mut HashSet<VarId>,
+    settled: &mut Settled,
     pending_binds: Vec<BindPattern>,
     mut pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
@@ -1370,11 +1452,11 @@ fn apply_eligible_binds(
     let mut remaining_binds = Vec::new();
 
     for pending in pending_binds {
-        if pending.required_vars.is_subset(bound) {
-            bound.insert(pending.var);
+        if settled.admits(&pending.required_vars) {
+            settled.bound.insert(pending.var);
 
             let (bind_filters, still_pending) =
-                partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
+                partition_eligible_filters(pending_filters, settled, filter_idxs_consumed);
             pending_filters = still_pending;
 
             child = Box::new(
@@ -1389,13 +1471,12 @@ fn apply_eligible_binds(
     (child, remaining_binds, pending_filters)
 }
 
-/// Apply BINDs and FILTERs whose required variables are all bound.
+/// Apply the BINDs and FILTERs `settled` admits.
 ///
 /// Returns the updated operator and the remaining items.
-#[allow(clippy::too_many_arguments)]
 fn apply_deferred_patterns(
     child: BoxedOperator,
-    bound: &mut HashSet<VarId>,
+    settled: &mut Settled,
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
@@ -1403,7 +1484,7 @@ fn apply_deferred_patterns(
 ) -> (BoxedOperator, Vec<BindPattern>, Vec<FilterPattern>) {
     let (mut child, remaining_binds, pending_filters) = apply_eligible_binds(
         child,
-        bound,
+        settled,
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
@@ -1411,7 +1492,7 @@ fn apply_deferred_patterns(
     );
 
     let (ready, remaining_filters) =
-        partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
+        partition_eligible_filters(pending_filters, settled, filter_idxs_consumed);
     for expr in ready {
         child = Box::new(FilterOperator::new_with_planning(child, expr, *planning));
     }
@@ -1419,7 +1500,10 @@ fn apply_deferred_patterns(
     (child, remaining_binds, remaining_filters)
 }
 
-/// Apply all remaining BINDs and FILTERs at the end of a block.
+/// Apply all remaining BINDs and FILTERs at the end of a block. Every block
+/// builder ends with this, so no BIND or FILTER it collected is dropped: one
+/// that could not be inlined (EXISTS, a metadata read) or that reads a
+/// variable nothing binds still applies here.
 ///
 /// Filters are fused into each BindOperator when the BIND's variable is the
 /// last dependency the filter was waiting on.  Any filters still remaining
@@ -1431,11 +1515,11 @@ fn apply_all_remaining(
     filter_idxs_consumed: &[usize],
     planning: &PlanningContext,
 ) -> BoxedOperator {
-    let mut bound: HashSet<VarId> = child.schema().iter().copied().collect();
+    let mut settled = Settled::all(child.schema().iter().copied().collect());
 
     let (mut child, _, remaining_filters) = apply_eligible_binds(
         child,
-        &mut bound,
+        &mut settled,
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
@@ -1584,7 +1668,7 @@ fn build_property_join_block(
     let (inline_ops, pending_binds, pending_filters) = build_inline_ops(
         pending_binds,
         pending_filters,
-        &available_vars,
+        Settled::all(available_vars),
         &pushdown.consumed_indices,
     );
     for op in &inline_ops {
@@ -1611,17 +1695,14 @@ fn build_property_join_block(
         operator = apply_values(operator, block_values);
     }
 
-    let mut bound = bound_vars_from_operator(&operator);
     if let Some(child) = operator.take() {
-        let (child, _, _) = apply_deferred_patterns(
+        operator = Some(apply_all_remaining(
             child,
-            &mut bound,
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
             planning,
-        );
-        operator = Some(child);
+        ));
     }
 
     Ok(operator)
@@ -1638,11 +1719,10 @@ fn build_property_join_block(
 fn build_inline_ops(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
-    available_vars: &HashSet<VarId>,
+    mut available: Settled,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<InlineOperator>, Vec<BindPattern>, Vec<FilterPattern>) {
     let mut ops = Vec::new();
-    let mut available = available_vars.clone();
 
     let remaining_filters =
         inline_eligible_filters(&mut ops, pending_filters, &available, filter_idxs_consumed);
@@ -1662,7 +1742,7 @@ fn build_inline_ops(
 fn inline_eligible_filters(
     ops: &mut Vec<InlineOperator>,
     pending_filters: Vec<FilterPattern>,
-    available: &HashSet<VarId>,
+    available: &Settled,
     filter_idxs_consumed: &[usize],
 ) -> Vec<FilterPattern> {
     let (ready, remaining) =
@@ -1682,7 +1762,7 @@ fn inline_chain(
     ops: &mut Vec<InlineOperator>,
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
-    available: &mut HashSet<VarId>,
+    available: &mut Settled,
     filter_idxs_consumed: &[usize],
 ) -> (Vec<BindPattern>, Vec<FilterPattern>) {
     let mut remaining_binds = pending_binds;
@@ -1697,10 +1777,10 @@ fn inline_chain(
             // is synchronous and so cannot run the async view-policy filter. Keep
             // it as a deferred `BindOperator`, which resolves metadata through the
             // policy-filtered async path. Cheap to defer — metadata calls are rare.
-            if bind.required_vars.is_subset(available)
+            if available.admits(&bind.required_vars)
                 && !crate::eval::metadata_resolve::contains_metadata_read(&bind.expr)
             {
-                available.insert(bind.var);
+                available.bound.insert(bind.var);
                 ops.push(InlineOperator::Bind {
                     var: bind.var,
                     expr: bind.expr,
@@ -1739,13 +1819,44 @@ pub(crate) struct TriplePlanContext<'a> {
     stats: Option<&'a StatsView>,
 }
 
+impl<'a> TriplePlanContext<'a> {
+    fn hash_planner(&self, left: &Option<BoxedOperator>) -> HashJoinPlanner<'a> {
+        HashJoinPlanner::new(self.stats)
+            .with_row_goal(self.planning.row_goal)
+            .with_left_estimate(left.as_ref().and_then(|op| op.estimated_rows()))
+    }
+}
+
+/// Variables the not-yet-joined, not-folded `remaining` triples bind that are
+/// not already bound in every row (see [`Settled`]).
+fn unsettled_vars(
+    remaining: &[TriplePattern],
+    folded: &[bool],
+    guaranteed: &HashSet<VarId>,
+) -> HashSet<VarId> {
+    remaining
+        .iter()
+        .zip(folded)
+        .filter(|(_, folded)| !**folded)
+        .flat_map(|(tp, _)| tp.produced_vars())
+        .filter(|var| !guaranteed.contains(var))
+        .collect()
+}
+
 /// Build an operator tree for a sequential scan/join block of triples.
 ///
 /// Applies VALUES first (if any), then iterates triples building scan/join
 /// operators, inlining eligible filters and binds into each step and applying
 /// deferred BINDs/FILTERs as their dependencies become bound.
+///
+/// `guaranteed_upstream` holds the variables `operator` binds in every row.
+/// Any other variable in its schema may be unbound on some rows, and a triple
+/// of this block can still bind it, so a BIND or FILTER reading it waits for
+/// that triple.
+#[allow(clippy::too_many_arguments)]
 fn build_sequential_join_block(
     operator: Option<BoxedOperator>,
+    guaranteed_upstream: &HashSet<VarId>,
     triples: &[TriplePattern],
     block_values: Vec<ValuesPattern>,
     pending_binds: Vec<BindPattern>,
@@ -1755,11 +1866,15 @@ fn build_sequential_join_block(
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
+    let mut guaranteed = guaranteed_upstream.clone();
+    for vp in &block_values {
+        guaranteed.extend(vp.bound_in_every_row());
+    }
     if !block_values.is_empty() {
         operator = apply_values(operator, block_values);
     }
 
-    let mut bound = bound_vars_from_operator(&operator);
+    let mut settled = Settled::all(bound_vars_from_operator(&operator));
     let mut pending_binds = pending_binds;
     let mut pending_filters = pending_filters;
 
@@ -1774,19 +1889,18 @@ fn build_sequential_join_block(
     // Seed it from the incoming LEFT operator's estimate (e.g. a subquery producing
     // `WITH DISTINCT friend`) so the first probe is costed against the producer size,
     // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
-        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut hash_planner = ctx.hash_planner(&operator);
     let mut dead_before_step = 0usize;
     let mut folded = vec![false; triples.len()];
     for (k, tp) in triples.iter().enumerate() {
         if folded[k] {
             continue;
         }
-        hash_planner.before_step(tp, &bound);
-        let mut vars_after: HashSet<VarId> = bound.clone();
-        for v in tp.produced_vars() {
-            vars_after.insert(v);
-        }
+        hash_planner.before_step(tp, &settled.bound);
+        guaranteed.extend(tp.produced_vars());
+        settled.unsettled = unsettled_vars(&triples[k + 1..], &folded[k + 1..], &guaranteed);
+        let mut after = settled.clone();
+        after.bound.extend(tp.produced_vars());
 
         // Later `?s <p> ?v . FILTER(range on ?v)` pairs answered as a semi-join
         // behind this step — see `RangeSemiJoinOperator`.
@@ -1796,8 +1910,8 @@ fn build_sequential_join_block(
                 k,
                 triples,
                 &folded,
-                &bound,
-                &vars_after,
+                &settled.bound,
+                &after,
                 base,
                 &pending_binds,
                 &pending_filters,
@@ -1825,7 +1939,7 @@ fn build_sequential_join_block(
         let (inline_ops, remaining_binds, remaining_filters) = build_inline_ops(
             pending_binds,
             pending_filters,
-            &vars_after,
+            after.clone(),
             &pushdown.consumed_indices,
         );
         pending_binds = remaining_binds;
@@ -1848,14 +1962,23 @@ fn build_sequential_join_block(
                     .iter()
                     .flat_map(|f| f.expr.referenced_vars()),
             );
-            live.extend(pending_binds.iter().flat_map(|b| b.expr.referenced_vars()));
+            // A pending bind reads its target too: once an earlier step binds
+            // that variable, the bind is an equality check against it (the
+            // reified-edge lowering joins component positions this way).
+            live.extend(pending_binds.iter().flat_map(|b| {
+                b.expr
+                    .referenced_vars()
+                    .into_iter()
+                    .chain(std::iter::once(b.var))
+            }));
             live.into_iter().collect::<Vec<VarId>>()
         });
 
         let pruned_vars: Option<HashSet<VarId>> = if ctx.where_dedup_safe {
             live_vars.as_ref().map(|live| {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
-                vars_after
+                after
+                    .bound
                     .iter()
                     .copied()
                     .filter(|v| !live_set.contains(v))
@@ -1904,13 +2027,13 @@ fn build_sequential_join_block(
                 *ctx.planning,
             ))
         };
-        bound.extend(op.schema().iter().copied());
+        settled.bound.extend(op.schema().iter().copied());
         operator = Some(op);
 
         if let Some(child) = operator.take() {
             let (child, new_binds, new_filters) = apply_deferred_patterns(
                 child,
-                &mut bound,
+                &mut settled,
                 pending_binds,
                 pending_filters,
                 &pushdown.consumed_indices,
@@ -2074,6 +2197,19 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
     }
 }
 
+/// What `seed` hands the group planned on top of it. An operator that cannot see
+/// its rows reports every schema variable as bound on every row.
+fn seed_vars(seed: &dyn Operator) -> SeedVars {
+    let schema: HashSet<VarId> = seed.schema().iter().copied().collect();
+    match seed.bound_in_every_row() {
+        Some(vars) => SeedVars {
+            schema,
+            bound_in_every_row: vars.into_iter().collect(),
+        },
+        None => SeedVars::all_bound(schema),
+    }
+}
+
 /// Build WHERE operators with an optional initial seed operator (back-compat wrapper).
 ///
 /// Treats all WHERE-bound vars as needed and does not provide GROUP BY hints.
@@ -2189,6 +2325,161 @@ fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
         crate::binding::Binding::IriMatch { iri, .. } => Some(Term::Iri(iri.clone())),
         _ => None,
     }
+}
+
+/// Drop a reified-edge component nobody reads: a `TermComponents` position
+/// (or a `BIND(SUBJECT|PREDICATE|OBJECT(?term) AS ?v)`) whose variable no
+/// other pattern, the seed, the post-WHERE pipeline or the projection reads.
+/// A variable the seed binds keeps its position, which is then the equality
+/// check. A `TermComponents` left with no variable and no constant subject
+/// to anchor on goes too: its constants are the link scan's filters. The
+/// `f:reifies*` twin of this rule is `elide_redundant_chain`.
+pub(crate) fn elide_unread_term_binds(
+    patterns: &[Pattern],
+    needed_vars: &HashSet<VarId>,
+    required_where_vars: Option<&[VarId]>,
+    seed_schema: &HashSet<VarId>,
+) -> Option<Vec<Pattern>> {
+    fn is_term_accessor(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Call {
+                func: Function::TripleSubject | Function::TriplePredicate | Function::TripleObject,
+                args,
+            } if matches!(args.as_slice(), [Expression::Var(_)])
+        )
+    }
+    if !patterns.iter().any(|p| {
+        matches!(p, Pattern::Bind { expr, .. } if is_term_accessor(expr))
+            || matches!(p, Pattern::TermComponents(_))
+    }) {
+        return None;
+    }
+    let mut counts: HashMap<VarId, usize> = HashMap::new();
+    let mut all_vars: HashSet<VarId> = HashSet::new();
+    collect_var_stats(patterns, &mut counts, &mut all_vars);
+    let unread = |var: VarId| {
+        counts.get(&var).copied().unwrap_or(0) <= 1
+            && !needed_vars.contains(&var)
+            && !required_where_vars.is_some_and(|r| r.contains(&var))
+            && !seed_schema.contains(&var)
+    };
+    let mut changed = false;
+    let kept: Vec<Pattern> = patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Bind { var, expr } if is_term_accessor(expr) && unread(*var) => {
+                changed = true;
+                None
+            }
+            Pattern::TermComponents(tc) => {
+                let mut tc = tc.clone();
+                for c in [&mut tc.subject, &mut tc.predicate, &mut tc.object] {
+                    if c.var().is_some_and(unread) {
+                        *c = crate::ir::Component::Any;
+                        changed = true;
+                    }
+                }
+                // Constant components are also the link scan's filters; the
+                // pattern stays for a variable to bind or an endpoint to
+                // anchor.
+                let keep = tc.components().into_iter().any(|c| c.var().is_some())
+                    || matches!(tc.subject, crate::ir::Component::Node(_))
+                    || matches!(
+                        tc.object,
+                        crate::ir::Component::Node(_) | crate::ir::Component::Literal(..)
+                    );
+                if !keep {
+                    changed = true;
+                }
+                keep.then_some(Pattern::TermComponents(tc))
+            }
+            other => Some(other.clone()),
+        })
+        .collect();
+    changed.then_some(kept)
+}
+
+/// Drop VALUES columns that are UNDEF in every row, and a VALUES left with no
+/// columns and exactly one row.
+///
+/// Such a column constrains nothing, yet planning reads its variable as bound:
+/// the cost model prices triples on it as lookups, and BINDs and FILTERs on it
+/// must be held back until a triple really binds it. Without it,
+/// `VALUES ?x { UNDEF }` (a parameterized query's "any value") plans exactly
+/// like the query written without the VALUES.
+///
+/// A column is dropped only while another pattern of the group still binds its
+/// variable, so the variable stays in scope for `SELECT *` and projection. A
+/// table with no column left keeps its row count, so one with several rows (a
+/// multiplicity) or none (an empty result) stays as written.
+///
+/// Returns `None` when nothing changed, so callers keep borrowing the original
+/// slice.
+fn drop_undef_values_columns(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
+    use crate::ir::pattern::values_column_all_undef;
+
+    let bound_elsewhere = |at: usize, var: VarId| {
+        patterns.iter().enumerate().any(|(j, p)| {
+            j != at
+                && match p {
+                    Pattern::Values { vars, rows } => vars
+                        .iter()
+                        .position(|v| *v == var)
+                        .is_some_and(|col| !values_column_all_undef(rows, col)),
+                    other => other.produced_vars().contains(&var),
+                }
+        })
+    };
+
+    let mut rewrites: Vec<(usize, Option<Pattern>)> = Vec::new();
+    for (at, p) in patterns.iter().enumerate() {
+        let Pattern::Values { vars, rows } = p else {
+            continue;
+        };
+        let dropped: Vec<usize> = (0..vars.len())
+            .filter(|&col| values_column_all_undef(rows, col) && bound_elsewhere(at, vars[col]))
+            .collect();
+        if dropped.is_empty() {
+            continue;
+        }
+        if dropped.len() == vars.len() {
+            if rows.len() == 1 {
+                rewrites.push((at, None));
+            }
+            continue;
+        }
+        let kept = |col: &usize| !dropped.contains(col);
+        rewrites.push((
+            at,
+            Some(Pattern::Values {
+                vars: (0..vars.len()).filter(kept).map(|col| vars[col]).collect(),
+                rows: rows
+                    .iter()
+                    .map(|row| {
+                        (0..row.len())
+                            .filter(kept)
+                            .map(|col| row[col].clone())
+                            .collect()
+                    })
+                    .collect(),
+            }),
+        ));
+    }
+    if rewrites.is_empty() {
+        return None;
+    }
+
+    let mut out = patterns.to_vec();
+    for (at, replacement) in rewrites.into_iter().rev() {
+        match replacement {
+            Some(values) => out[at] = values,
+            None => {
+                out.remove(at);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Substitute a single-row VALUES' IRI into the object position of the triples
@@ -2352,15 +2643,13 @@ pub fn build_where_operators_seeded_with_needed(
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
     }
 
-    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation /
-    // Pattern::AnnotationTarget are flattened into the equivalent base
-    // edge plus four `f:reifies*` triple lookups plus the body. The
-    // standard scan/join machinery handles the rest. The base-edge
-    // triple is always emitted, which gives the
-    // `Pattern::AnnotationTarget` reverse direction its required
-    // visibility check for free: the base edge must be currently
-    // asserted under the snapshot's normal policy/visibility rules,
-    // or no row survives the join.
+    // Edge-annotation expansion: Pattern::EdgeAnnotation is flattened into
+    // the equivalent base edge plus the reifier's `rdf:reifies` link plus
+    // the body. The standard scan/join machinery
+    // handles the rest. The base-edge triple is always emitted, which
+    // gives the annotation its visibility check for free: the base edge
+    // must be currently asserted under the snapshot's normal
+    // policy/visibility rules, or no row survives the join.
     // Skip the clone+rebuild entirely when the block has no edge-annotation
     // patterns (the overwhelmingly common, non-RDF-1.2 case): borrow the
     // original slice instead of allocating an expanded copy. The presence
@@ -2368,7 +2657,10 @@ pub fn build_where_operators_seeded_with_needed(
     // whenever annotations are actually present.
     let expanded_storage: std::borrow::Cow<'_, [Pattern]> =
         if pattern_tree_has_edge_annotation(patterns) {
-            std::borrow::Cow::Owned(expand_edge_annotation_patterns(patterns))
+            std::borrow::Cow::Owned(expand_edge_annotation_patterns_for(
+                patterns,
+                planning.default_graph_union,
+            ))
         } else {
             std::borrow::Cow::Borrowed(patterns)
         };
@@ -2380,11 +2672,26 @@ pub fn build_where_operators_seeded_with_needed(
     let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
     let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
 
+    let undef_dropped_storage = drop_undef_values_columns(patterns);
+    let patterns: &[Pattern] = undef_dropped_storage.as_deref().unwrap_or(patterns);
+
     // Within each inner-join region, fold a single-row VALUES' IRI into the
     // object position it constrains, so reordering and the scan layer both see
     // a constant instead of a variable the VALUES wrapper only filters later.
     let inlined_storage = inline_singleton_values_objects(patterns);
     let patterns: &[Pattern] = inlined_storage.as_deref().unwrap_or(patterns);
+
+    let seed_vars = seed.as_deref().map(|op| seed_vars(op)).unwrap_or_default();
+
+    // A reified-edge position nobody reads costs a dictionary lookup per row
+    // and removes none; the link lowering relates every variable position.
+    let term_bind_storage = elide_unread_term_binds(
+        patterns,
+        needed_vars,
+        required_where_vars,
+        &seed_vars.schema,
+    );
+    let patterns: &[Pattern] = term_bind_storage.as_deref().unwrap_or(patterns);
 
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
@@ -2392,11 +2699,7 @@ pub fn build_where_operators_seeded_with_needed(
     // (triples, compound patterns like UNION/OPTIONAL/MINUS/EXISTS/Subquery)
     // using selectivity-based cost estimation. This subsumes the per-block
     // reorder_patterns_seeded calls that previously handled triple-only blocks.
-    let initial_bound = seed
-        .as_ref()
-        .map(|op| op.schema().iter().copied().collect::<HashSet<_>>())
-        .unwrap_or_default();
-    let reordered_storage = reorder_patterns(patterns, stats.as_deref(), &initial_bound);
+    let reordered_storage = reorder_patterns_with_seed(patterns, stats.as_deref(), &seed_vars);
     let patterns = &reordered_storage;
 
     // Compute variable stats for emission pruning and join heuristics.
@@ -2436,11 +2739,19 @@ pub fn build_where_operators_seeded_with_needed(
         )
     };
 
+    // Variables bound in every row of `operator`, grown as patterns are applied.
+    let mut guaranteed = seed_vars.bound_in_every_row;
+    let mut guaranteed_through = 0;
+
     let mut i = 0;
     while i < patterns.len() {
         match &patterns[i] {
             Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } => {
                 let start = i;
+                for applied in &patterns[guaranteed_through..start] {
+                    guaranteed.extend(must_bind_vars(applied, BindTargets::MayBeUnbound));
+                }
+                guaranteed_through = start;
                 let block = collect_inner_join_block(patterns, start);
                 let end = block.end_index;
 
@@ -2764,6 +3075,7 @@ pub fn build_where_operators_seeded_with_needed(
                     };
                     operator = build_sequential_join_block(
                         operator,
+                        &guaranteed,
                         &triples_for_exec,
                         block.values,
                         pending_binds,
@@ -2814,6 +3126,7 @@ pub fn build_where_operators_seeded_with_needed(
                             if !v_bound_in_outer && !v_appears_later && v_bound_by_inner {
                                 operator = Some(build_exists_strategy(
                                     child,
+                                    &patterns[..i],
                                     inner_patterns,
                                     true,
                                     stats.clone(),
@@ -2862,27 +3175,6 @@ pub fn build_where_operators_seeded_with_needed(
                             i += 1;
                             continue;
                         }
-                    }
-
-                    // Value-only edge-annotation probe (a Cypher relationship
-                    // binding): answer the whole batch with three set-wise
-                    // reifies scans + hash lookups instead of per-row chains.
-                    if let Some(builder) = crate::optional::AnnotationValueOptionalBuilder::try_new(
-                        required_schema.clone(),
-                        inner_patterns.clone(),
-                        stats.clone(),
-                        *planning,
-                    ) {
-                        operator = Some(Box::new(
-                            OptionalOperator::with_builder(
-                                child,
-                                required_schema,
-                                Box::new(builder),
-                            )
-                            .with_out_schema(augmented_ref),
-                        ));
-                        i += 1;
-                        continue;
                     }
 
                     // General path: use PlanTreeOptionalBuilder for multi-pattern or
@@ -2940,10 +3232,21 @@ pub fn build_where_operators_seeded_with_needed(
                 let negated = matches!(&patterns[i], Pattern::NotExists(_));
                 operator = Some(build_exists_strategy(
                     child,
+                    &patterns[..i],
                     inner_patterns,
                     negated,
                     stats.clone(),
                     *planning,
+                ));
+                i += 1;
+            }
+
+            Pattern::TermComponents(tc) => {
+                operator = Some(Box::new(
+                    crate::term_components::TermComponentsOperator::new(
+                        get_or_empty_seed(operator.take()),
+                        tc.clone(),
+                    ),
                 ));
                 i += 1;
             }
@@ -3111,29 +3414,16 @@ pub fn build_where_operators_seeded_with_needed(
             Pattern::DefaultGraphSource {
                 patterns: inner_patterns,
             } => {
-                // Internal — synthesized by `expand_edge_annotation_patterns`
-                // to correlate the f:reifies* triple chain with a single
-                // default-graph source under multi-source default queries.
+                // Internal — synthesized by the edge-annotation expansion to
+                // correlate an annotated edge's chain with a single
+                // default-graph source under a default-graph union.
                 let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
-                // Variables anything outside the wrapper still reads: the
-                // post-WHERE pipeline (projection pushdown set when there is
-                // one, else every needed var) plus every later pattern in
-                // this block. Earlier patterns reach the wrapper through the
-                // child's schema. The wrapper drops the `f:reifies*` lookups
-                // whose variable appears in neither.
-                let mut needed_outside: HashSet<VarId> = match required_where_vars {
-                    Some(required) => required.iter().copied().collect(),
-                    None => needed_vars.clone(),
-                };
-                let mut outside_counts: HashMap<VarId, usize> = HashMap::new();
-                collect_var_stats(&patterns[i + 1..], &mut outside_counts, &mut needed_outside);
                 operator = Some(Box::new(
                     crate::default_graph_source::DefaultGraphSourceOperator::new(
                         child,
                         inner_patterns.clone(),
                         *planning,
                         stats.clone(),
-                        needed_outside,
                     ),
                 ));
                 i += 1;
@@ -3156,7 +3446,7 @@ pub fn build_where_operators_seeded_with_needed(
             // dispatch arm is unreachable from any standard entry
             // point. Keep the guard for safety in case a future
             // caller bypasses the expansion pass.
-            Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+            Pattern::EdgeAnnotation { .. } => {
                 return Err(QueryError::Internal(
                     "edge-annotation pattern reached the operator dispatch \
                      without being flattened by expand_edge_annotation_patterns"
@@ -3332,21 +3622,24 @@ pub(crate) fn build_scan_or_join(
                 }
             }
 
-            Box::new(
-                NestedLoopJoinOperator::new(
-                    left,
-                    left_schema,
-                    tp.clone(),
-                    bounds,
-                    inline_ops,
-                    EmitMask::ALL,
-                    planning.mode(),
-                )
-                .with_out_schema(downstream_vars)
-                // A shape-eligible-but-rejected hash join attaches its reason; a
-                // non-candidate (subject chain, bounds, etc.) attaches nothing.
-                .with_hash_join_decision(decision),
+            let mut join = NestedLoopJoinOperator::new(
+                left,
+                left_schema,
+                tp.clone(),
+                bounds,
+                inline_ops,
+                EmitMask::ALL,
+                planning.mode(),
             )
+            .with_out_schema(downstream_vars)
+            // A shape-eligible-but-rejected hash join attaches its reason; a
+            // non-candidate (subject chain, bounds, etc.) attaches nothing.
+            .with_hash_join_decision(decision);
+            if let Some(goal) = planning.row_goal {
+                // This only sizes probe windows; it never truncates input.
+                join.set_row_budget(goal);
+            }
+            Box::new(join)
         }
     }
 }
@@ -3517,8 +3810,7 @@ fn build_sequential_triple_chain(
     // friend` subquery's ~producer size) — otherwise the first probe is weighed
     // against 1 and a large object predicate falsely trips scan-ratio-too-high.
     let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
-        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut hash_planner = ctx.hash_planner(&operator);
     let mut dead_before_step = 0usize;
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
@@ -3633,7 +3925,7 @@ fn collect_range_semijoin_folds(
     triples: &[TriplePattern],
     folded: &[bool],
     bound_before: &HashSet<VarId>,
-    vars_after: &HashSet<VarId>,
+    after: &Settled,
     base_vars: &HashSet<VarId>,
     pending_binds: &[BindPattern],
     pending_filters: &[FilterPattern],
@@ -3676,7 +3968,7 @@ fn collect_range_semijoin_folds(
         };
         if !produced.contains(s)
             || subject.is_some_and(|chosen| chosen != *s)
-            || vars_after.contains(v)
+            || after.bound.contains(v)
             || base_vars.contains(v)
         {
             continue;
@@ -3703,7 +3995,7 @@ fn collect_range_semijoin_folds(
             .expr
             .referenced_vars()
             .iter()
-            .all(|x| x == v || vars_after.contains(x))
+            .all(|x| x == v || after.admits_var(*x))
         {
             continue;
         }
@@ -5038,7 +5330,7 @@ mod tests {
         );
 
         let as_patterns: Vec<Pattern> = block.triples.into_iter().map(Pattern::Triple).collect();
-        let ordered = reorder_patterns(&as_patterns, Some(&stats), &HashSet::new());
+        let ordered = crate::planner::reorder_patterns(&as_patterns, Some(&stats), &HashSet::new());
         let first_triple = ordered[0]
             .as_triple()
             .expect("first reordered pattern should be a triple");
@@ -5235,6 +5527,9 @@ mod tests {
             ObjectBounds {
                 lower: Some((FlakeValue::String("2026-01-01".to_string()), true)),
                 upper: None,
+                term_predicate: None,
+                term_subject: None,
+                term_object: None,
             },
         );
 
@@ -5872,7 +6167,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             Vec::new(),
             vec![FilterPattern::new(0, filter_expr.clone())],
-            &available,
+            Settled::all(available),
             &[],
         );
 
@@ -5883,6 +6178,57 @@ mod tests {
         );
         assert!(remaining_binds.is_empty());
         assert!(remaining_filters.is_empty());
+    }
+
+    #[test]
+    fn filter_on_an_unsettled_var_runs_a_guarded_copy_once() {
+        // BIND(… AS ?t) . ?t :val ?v . FILTER(?t > 18): the triple can still
+        // bind ?t where the BIND errored, so the filter waits for it, and a
+        // `!BOUND(?t) || filter` copy prunes the rows that do bind ?t now.
+        let t = VarId(1);
+        let filter_expr =
+            Expression::gt(Expression::Var(t), Expression::Const(FlakeValue::Long(18)));
+        let guarded = Expression::or(vec![
+            Expression::not(Expression::call(Function::Bound, vec![Expression::Var(t)])),
+            filter_expr.clone(),
+        ]);
+        let settled = Settled {
+            bound: [VarId(0), t].into(),
+            unsettled: [t].into(),
+        };
+
+        let (ready, pending) = partition_eligible_filters(
+            vec![FilterPattern::new(0, filter_expr.clone())],
+            &settled,
+            &[],
+        );
+        assert_eq!(format!("{ready:?}"), format!("{:?}", [&guarded]));
+        assert_eq!(pending.len(), 1, "the filter itself still waits");
+
+        let (ready, pending) = partition_eligible_filters(pending, &settled, &[]);
+        assert!(ready.is_empty(), "the copy is placed once: {ready:?}");
+
+        let (ready, pending) =
+            partition_eligible_filters(pending, &Settled::all(settled.bound.clone()), &[]);
+        assert_eq!(format!("{ready:?}"), format!("{:?}", [&filter_expr]));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn filter_that_differs_per_evaluation_gets_no_guarded_copy() {
+        let t = VarId(1);
+        let filter_expr = Expression::lt(
+            Expression::call(Function::Rand, Vec::new()),
+            Expression::Var(t),
+        );
+        let settled = Settled {
+            bound: [t].into(),
+            unsettled: [t].into(),
+        };
+        let (ready, pending) =
+            partition_eligible_filters(vec![FilterPattern::new(0, filter_expr)], &settled, &[]);
+        assert!(ready.is_empty(), "{ready:?}");
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -5899,7 +6245,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![make_bind(age2, bind_expr)],
             Vec::new(),
-            &available,
+            Settled::all(available),
             &[],
         );
 
@@ -5931,7 +6277,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![make_bind(y, bind_expr)],
             vec![FilterPattern::new(0, filter_expr)],
-            &available,
+            Settled::all(available),
             &[],
         );
 
@@ -5966,8 +6312,12 @@ mod tests {
         );
         let available: HashSet<VarId> = [VarId(0), age].into();
 
-        let (ops, remaining_binds, remaining_filters) =
-            build_inline_ops(vec![bind_a, bind_b], Vec::new(), &available, &[]);
+        let (ops, remaining_binds, remaining_filters) = build_inline_ops(
+            vec![bind_a, bind_b],
+            Vec::new(),
+            Settled::all(available),
+            &[],
+        );
 
         assert_eq!(ops.len(), 2, "both binds should be inlined");
         assert!(
@@ -5994,7 +6344,7 @@ mod tests {
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
             vec![make_bind(alias, bind_expr)],
             Vec::new(),
-            &available,
+            Settled::all(available),
             &[],
         );
 
@@ -6169,18 +6519,14 @@ mod tests {
     // Edge-annotation expansion — `f:reifiesObject` dtc propagation
     // ---------------------------------------------------------------------
 
-    fn find_reifies_object_triple(chain: &[Pattern]) -> &TriplePattern {
-        let reifies_object = Ref::Sid(Sid::new(
-            fluree_vocab::namespaces::FLUREE_DB,
-            fluree_vocab::db::REIFIES_OBJECT,
-        ));
+    fn find_term_components(chain: &[Pattern]) -> &crate::ir::TermComponentsPattern {
         chain
             .iter()
             .find_map(|p| match p {
-                Pattern::Triple(tp) if tp.p == reifies_object => Some(tp),
+                Pattern::TermComponents(tc) => Some(tc),
                 _ => None,
             })
-            .expect("synthesized f:reifiesObject lookup triple must be present in chain")
+            .expect("the link's term components must be present in chain")
     }
 
     fn unwrap_default_graph_source(p: &Pattern) -> &[Pattern] {
@@ -6191,7 +6537,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_edge_annotation_propagates_explicit_dtc_to_reifies_object() {
+    fn expand_edge_annotation_keeps_explicit_dtc_on_the_term_object() {
         let xsd_string = fluree_db_core::DatatypeConstraint::Explicit(Sid::new(2, "string"));
         let edge = TriplePattern {
             s: Ref::Var(VarId(0)),
@@ -6203,6 +6549,7 @@ mod tests {
             edge,
             annotation: Ref::Var(VarId(1)),
             body: Vec::new(),
+            term: VarId(3),
         }];
         let expanded = expand_edge_annotation_patterns(&patterns);
         assert_eq!(
@@ -6211,15 +6558,16 @@ mod tests {
             "expansion produces one DefaultGraphSource wrapper"
         );
         let chain = unwrap_default_graph_source(&expanded[0]);
-        let reifies_obj = find_reifies_object_triple(chain);
-        assert_eq!(reifies_obj.dtc, Some(xsd_string));
+        assert_eq!(
+            find_term_components(chain).object,
+            crate::ir::Component::Literal(FlakeValue::String("Alice".to_string()), xsd_string)
+        );
     }
 
     #[test]
-    fn expand_edge_annotation_propagates_lang_tag_dtc_to_reifies_object() {
-        // The regression that motivates per-language disambiguation:
-        // a language-tagged literal on the base edge must constrain the
-        // synthesized f:reifiesObject lookup by the same lang tag, or
+    fn expand_edge_annotation_keeps_the_lang_tag_on_the_term_object() {
+        // Per-language disambiguation: a language-tagged literal on the base
+        // edge must constrain the link's term by the same tag, or
         // same-lexical strings in different languages would cross-match.
         let lang_fr = fluree_db_core::DatatypeConstraint::LangTag(std::sync::Arc::from("fr"));
         let edge = TriplePattern {
@@ -6232,21 +6580,19 @@ mod tests {
             edge,
             annotation: Ref::Var(VarId(1)),
             body: Vec::new(),
+            term: VarId(3),
         }];
         let expanded = expand_edge_annotation_patterns(&patterns);
         let chain = unwrap_default_graph_source(&expanded[0]);
-        let reifies_obj = find_reifies_object_triple(chain);
-        match &reifies_obj.dtc {
-            Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
-                assert_eq!(tag.as_ref(), "fr");
-            }
-            other => panic!("expected LangTag dtc on f:reifiesObject, got {other:?}"),
-        }
+        assert_eq!(
+            find_term_components(chain).object,
+            crate::ir::Component::Literal(FlakeValue::String("chat".to_string()), lang_fr)
+        );
     }
 
     #[test]
-    fn expand_edge_annotation_no_dtc_when_edge_has_none() {
-        // Ref-object edge: no constraint on either side.
+    fn expand_edge_annotation_variable_object_stays_a_variable() {
+        // Ref-object edge: the term's object joins the edge's variable.
         let edge = TriplePattern {
             s: Ref::Var(VarId(0)),
             p: Ref::Sid(Sid::new(100, "worksFor")),
@@ -6257,11 +6603,14 @@ mod tests {
             edge,
             annotation: Ref::Var(VarId(1)),
             body: Vec::new(),
+            term: VarId(3),
         }];
         let expanded = expand_edge_annotation_patterns(&patterns);
         let chain = unwrap_default_graph_source(&expanded[0]);
-        let reifies_obj = find_reifies_object_triple(chain);
-        assert!(reifies_obj.dtc.is_none());
+        assert_eq!(
+            find_term_components(chain).object,
+            crate::ir::Component::Var(VarId(2))
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -6290,6 +6639,7 @@ mod tests {
                 Ref::Sid(Sid::new(100, "confidence")),
                 Term::Var(VarId(body_var)),
             ))],
+            term: VarId(100 + ann),
         }
     }
 
@@ -6303,11 +6653,38 @@ mod tests {
         ))
     }
 
+    /// FILTERs other than the link's own `sameTerm(PREDICATE(?t), <p>)`.
     fn filter_count(patterns: &[Pattern]) -> usize {
+        let link_filter = |e: &Expression| {
+            matches!(e, Expression::Call { func: crate::ir::Function::SameTerm, args }
+            if matches!(args.first(), Some(Expression::Call {
+                func: crate::ir::Function::TripleSubject
+                    | crate::ir::Function::TriplePredicate
+                    | crate::ir::Function::TripleObject,
+                ..
+            })))
+        };
         patterns
             .iter()
-            .filter(|p| matches!(p, Pattern::Filter(_)))
+            .filter(|p| matches!(p, Pattern::Filter(e) if !link_filter(e)))
             .count()
+    }
+
+    /// The annotated edge only checks that its triple is asserted: the term's
+    /// components bind every position, and as a joined triple the planner
+    /// drove from it.
+    #[test]
+    fn annotated_edge_is_an_existence_check() {
+        let expanded = expand_edge_annotation_patterns(&[annotated_hop(0, 1, 2, 3)]);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let knows = |p: &Pattern| matches!(p, Pattern::Triple(tp) if matches!(&tp.p, Ref::Sid(sid) if &*sid.name == "knows"));
+        assert!(!chain.iter().any(knows), "no joined edge: {chain:?}");
+        assert!(
+            chain
+                .iter()
+                .any(|p| matches!(p, Pattern::Exists(inner) if matches!(inner.as_slice(), [e] if knows(e)))),
+            "the edge is an EXISTS: {chain:?}"
+        );
     }
 
     #[test]
@@ -6315,7 +6692,8 @@ mod tests {
         let patterns = vec![annotated_hop(0, 1, 2, 3), gt(3, 0.97)];
         let expanded = expand_edge_annotation_patterns(&patterns);
         let chain = unwrap_default_graph_source(&expanded[0]);
-        // base + 3 f:reifies* + body triple + the sunk FILTER
+        // body triple + link + its predicate filter + term components +
+        // the base edge + the sunk FILTER
         assert_eq!(chain.len(), 6);
         assert_eq!(filter_count(chain), 1);
         assert!(
@@ -6635,6 +7013,7 @@ mod tests {
                 name: crate::ir::GraphName::Var(g),
                 patterns: vec![Pattern::Triple(make_pattern(VarId(13), "q", VarId(14)))],
             }],
+            term: VarId(15),
         }];
 
         let strategy = choose_exists_strategy(&outer_schema, &inner);

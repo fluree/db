@@ -119,7 +119,7 @@ pub async fn resolve_query_target(
         return Ok(QueryTarget::Ledger(mode));
     }
 
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
 
     // Check if local ledger exists (local wins)
     let ledger_id = to_ledger_id(ledger_part)?;
@@ -539,7 +539,7 @@ pub fn resolve_ledger(explicit: Option<&str>, dirs: &FlureeDir) -> CliResult<Str
 ///
 /// Honors `[server].storage_path` and `[server.indexing]` thresholds
 /// from the config file if set, otherwise falls back to defaults.
-pub fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
+pub async fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
     let storage = config::resolve_storage_path(dirs);
     let storage_str = storage.to_string_lossy().to_string();
     let mut builder = FlureeBuilder::file(storage_str).without_ledger_caching();
@@ -562,7 +562,8 @@ pub fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
         .with_novelty_thresholds(min_bytes, max_bytes);
 
     builder
-        .build()
+        .build_async()
+        .await
         .map_err(|e| CliError::Config(format!("failed to initialize Fluree: {e}")))
 }
 
@@ -799,7 +800,7 @@ mod tests {
     /// `fluree iceberg map` (which needs a live catalog) so the resolution
     /// branch can be tested in isolation.
     async fn register_graph_source(dirs: &FlureeDir, name: &str) {
-        let fluree = build_fluree(dirs).unwrap();
+        let fluree = build_fluree(dirs).await.unwrap();
         fluree
             .publisher()
             .unwrap()

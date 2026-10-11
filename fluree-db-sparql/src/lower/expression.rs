@@ -13,6 +13,9 @@ use fluree_vocab::xsd;
 
 use super::{LowerError, LoweringContext, Result};
 
+/// `f:fulltext(?text, "query")`, the namespaced spelling of `fulltext`.
+const FULLTEXT_FUNCTION: &str = "https://ns.flur.ee/db#fulltext";
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn lower_expression(&mut self, expr: &AstExpression) -> Result<Expression> {
         match expr {
@@ -211,7 +214,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         | FlakeValue::Decimal(_)
                         | FlakeValue::BigInt(_)
                         | FlakeValue::Boolean(_)
-                        | FlakeValue::String(_),
+                        | FlakeValue::String(_)
+                        | FlakeValue::Vector(_)
+                        | FlakeValue::GeoPoint(_),
                 ) || fv.is_temporal()
                     || fv.is_duration()
                 {
@@ -227,24 +232,38 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         name: &FunctionName,
         args: &[AstExpression],
-        span: SourceSpan,
+        _span: SourceSpan,
     ) -> Result<Expression> {
-        // SPARQL 1.2 triple-term functions are accepted and arity-validated at
-        // parse time, but have no evaluable implementation yet: defer per
-        // burn-down decision D-1 (accept-then-defer). A query that reaches here
-        // fails at lower time with a clean `not_implemented`, not a parse error.
-        if matches!(
-            name,
-            FunctionName::Triple
-                | FunctionName::Subject
-                | FunctionName::Predicate
-                | FunctionName::Object
-                | FunctionName::IsTriple
-        ) {
-            return Err(LowerError::not_implemented(
-                "SPARQL 1.2 triple-term functions (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE)",
-                span,
-            ));
+        // A literal component keeps its datatype or language tag, which a
+        // constant in expression position would drop: `TRIPLE(:s, :p,
+        // "5"^^xsd:int)` names a different term from the one with `5`.
+        if matches!(name, FunctionName::Triple) {
+            let args = args
+                .iter()
+                .map(|a| match a {
+                    AstExpression::Literal(lit) => {
+                        match self.lower_literal_with_constraint(lit)? {
+                            (fluree_db_query::ir::Term::Value(val), Some(dtc)) => {
+                                Ok(Expression::Resolved(Box::new(
+                                    fluree_db_query::binding::Binding::Lit {
+                                        val,
+                                        dtc,
+                                        t: None,
+                                        op: None,
+                                        p_id: None,
+                                    },
+                                )))
+                            }
+                            _ => self.lower_expression(a),
+                        }
+                    }
+                    other => self.lower_expression(other),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Expression::Call {
+                func: Function::Triple,
+                args,
+            });
         }
 
         let func = match name {
@@ -326,15 +345,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::DotProduct => Function::DotProduct,
             FunctionName::CosineSimilarity => Function::CosineSimilarity,
             FunctionName::EuclideanDistance => Function::EuclideanDistance,
+            FunctionName::Fulltext => Function::Fulltext,
 
-            // Handled by the `not_implemented` early return above.
-            FunctionName::Triple
-            | FunctionName::Subject
-            | FunctionName::Predicate
-            | FunctionName::Object
-            | FunctionName::IsTriple => {
-                unreachable!("triple-term functions defer via the early return")
-            }
+            // SPARQL 1.2 triple-term accessors over `FlakeValue::TripleTerm`.
+            FunctionName::Subject => Function::TripleSubject,
+            FunctionName::Predicate => Function::TriplePredicate,
+            FunctionName::Object => Function::TripleObject,
+            FunctionName::IsTriple => Function::IsTriple,
+            // Handled by the early return above.
+            FunctionName::Triple => unreachable!("TRIPLE() lowers above"),
 
             // Extension functions
             FunctionName::Extension(iri) => {
@@ -343,6 +362,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     "http://www.opengis.net/def/function/geosparql/distance" => {
                         Function::GeofDistance
                     }
+                    FULLTEXT_FUNCTION => Function::Fulltext,
                     // XSD datatype constructor (cast) functions — W3C SPARQL 1.1 §17.5
                     xsd::BOOLEAN => Function::XsdBoolean,
                     xsd::INTEGER => Function::XsdInteger,

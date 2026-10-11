@@ -87,6 +87,7 @@ The request is malformed or contains invalid data.
 - Invalid SPARQL syntax
 - Invalid IRI format
 - Type mismatch
+- Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
 
 **Error typing:**
 
@@ -135,21 +136,33 @@ Authentication is required but not provided or invalid.
 
 #### 403 Forbidden
 
-Authentication succeeded but authorization failed.
+The server understood the request but refused the operation under its access policy.
 
 **Common Causes:**
 - Insufficient permissions for operation
 - Policy denies access
 - Ledger access restricted
 
+A write rejected by a modify policy returns `403` with
+`@type: "err:policy/AccessDenied"`, and `error` carries the policy's
+`f:exMessage` when it has one. Malformed transactions still return `400`.
+
 **Example:**
 ```json
 {
-  "error": "access denied (403)",
+  "error": "Employees may not modify document content.",
   "status": 403,
-  "@type": "err:db/Forbidden"
+  "@type": "err:policy/AccessDenied"
 }
 ```
+
+A query over a graph source also returns `403` when the source's catalog or object store refuses the read, with an `@type` naming which one refused:
+
+- `err:catalog/AccessDenied`: the catalog refused the table to the principal the source uses. This covers Iceberg REST catalogs (a `403` from `loadTable`, or a `401` that persists after one token refresh), AWS Glue and S3 Tables (the server's AWS identity lacks the catalog permission or a Lake Formation grant), and Unity Catalog for Delta sources. `error` reads `Catalog denied access to table '<table>': …`, followed by the catalog's own reply. On a query, AWS identities in that reply (the server's role and account, as `arn:…`) are replaced with `arn:<redacted>`; the full text is in the server log.
+- `err:catalog/CredentialsNotVended`: an Iceberg REST catalog authorized the table but vended no storage credentials, and the source requires them. The read is refused rather than made with the server's own AWS identity.
+- `err:storage/AccessDenied`: the catalog answered, but the object store refused a read of the table's files (`Storage access denied for s3://…`). As above, a query's error redacts AWS identities from the store's reason and the server logs the full text.
+
+See [Iceberg → Connection Issues](../graph-sources/iceberg.md#connection-issues) for causes and fixes.
 
 **How to Fix:**
 - Verify user has required permissions
@@ -178,6 +191,23 @@ The requested resource doesn't exist.
 - Verify ledger name spelling
 - Check if ledger was created
 - Verify entity IRI
+
+A dataset member (`FROM` / `FROM NAMED`, JSON-LD `from` / `fromNamed`, or a
+`graph()` / `db()` address) that names a graph its ledger does not have is a
+404 with `@type` `err:db/GraphNotFound`:
+
+```json
+{
+  "error": "Graph not found: ...",
+  "status": 404,
+  "@type": "err:db/GraphNotFound"
+}
+```
+
+A commit reference that names no commit of the ledger (an `@commit:` pin,
+`at`, commit show's `commit`, or a revert's commits) is a 404 with `@type`
+`err:db/CommitNotFound`. A malformed one (too short, an abbreviated CID, or a
+prefix that matches several commits) is a 400.
 
 #### 408 Request Timeout
 
@@ -211,6 +241,7 @@ The request conflicts with current server state.
 **Common Causes:**
 - Concurrent modification conflict
 - Ledger already exists
+- Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
 - Resource state conflict
 
 **Example:**
@@ -345,6 +376,28 @@ The request is well-formed but semantically invalid.
 - Validate data before submitting
 - Check business rules
 - Review constraint requirements
+
+**`err:db/DatatypeLimitExceeded`**: the write would bring the ledger past the
+number of distinct datatypes its index can store. Fifteen common datatypes
+are reserved and never count, among them `xsd:string`, `xsd:integer`, and
+`rdf:langString`. A ledger holds at most 16,369 others, including other XSD
+types such as `xsd:int`. Each datatype IRI counts once, from the first write
+that uses it, and still counts after its data is retracted. See
+[Datatype Limit](../concepts/datatypes.md#datatype-limit). The write is refused before anything is committed, so the ledger
+is unchanged. Transactions, SPARQL updates, and pushed commits all return
+this code.
+
+```json
+{
+  "error": "datatype limit exceeded: the ledger holds 16369 of at most 16369 non-reserved datatypes, and this write would add 1 more",
+  "status": 422,
+  "@type": "err:db/DatatypeLimitExceeded"
+}
+```
+
+Datatype IDs are never released, so retrying the same write cannot succeed,
+and the response carries no `Retry-After`. Fix: type the new values with
+datatypes the ledger already holds.
 
 #### 429 Too Many Requests
 

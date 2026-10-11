@@ -249,6 +249,9 @@ async fn async_main() {
     fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
 
     let result = fluree_db_cli::run(cli).await;
+    if let Some(report) = fluree_db_core::io_stats::report() {
+        eprintln!("{report}");
+    }
     shutdown_tracer().await;
 
     if let Err(e) = result {

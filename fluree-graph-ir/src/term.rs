@@ -234,6 +234,10 @@ pub enum Term {
         /// Language tag (only valid when datatype is rdf:langString)
         language: Option<Arc<str>>,
     },
+
+    /// RDF 1.2 triple term `<<( s p o )>>` used as a value: subject,
+    /// predicate, object.
+    TripleTerm(Arc<[Term; 3]>),
 }
 
 impl Term {
@@ -245,6 +249,11 @@ impl Term {
     /// Create a blank node term
     pub fn blank(label: impl AsRef<str>) -> Self {
         Term::BlankNode(BlankId::new(label))
+    }
+
+    /// Create a triple term `<<( s p o )>>`
+    pub fn triple(s: Term, p: Term, o: Term) -> Self {
+        Term::TripleTerm(Arc::new([s, p, o]))
     }
 
     /// Create a plain string literal (xsd:string)
@@ -393,6 +402,7 @@ impl PartialEq for Term {
                     language: l2,
                 },
             ) => v1 == v2 && d1 == d2 && l1 == l2,
+            (Term::TripleTerm(a), Term::TripleTerm(b)) => a == b,
             _ => false,
         }
     }
@@ -415,6 +425,7 @@ impl Hash for Term {
                 datatype.hash(state);
                 language.hash(state);
             }
+            Term::TripleTerm(t) => t.hash(state),
         }
     }
 }
@@ -427,12 +438,13 @@ impl PartialOrd for Term {
 
 impl Ord for Term {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Type ordering: BlankNode < Iri < Literal
+        // Type ordering: BlankNode < Iri < Literal < TripleTerm
         let type_ord = |t: &Term| -> u8 {
             match t {
                 Term::BlankNode(_) => 0,
                 Term::Iri(_) => 1,
                 Term::Literal { .. } => 2,
+                Term::TripleTerm(_) => 3,
             }
         };
 
@@ -457,6 +469,7 @@ impl Ord for Term {
                     language: l2,
                 },
             ) => (d1, l1, v1).cmp(&(d2, l2, v2)),
+            (Term::TripleTerm(a), Term::TripleTerm(b)) => a.cmp(b),
             _ => Ordering::Equal, // Should not happen
         }
     }
@@ -503,6 +516,7 @@ impl std::fmt::Display for Term {
                     Ok(())
                 }
             }
+            Term::TripleTerm(t) => write!(f, "<<( {} {} {} )>>", t[0], t[1], t[2]),
         }
     }
 }

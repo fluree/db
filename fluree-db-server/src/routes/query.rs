@@ -765,7 +765,7 @@ pub async fn query(
             )));
         }
         if let Some(fmt) = headers
-            .graph_format()
+            .graph_format(GraphFormat::ALL)
             .filter(|f| *f != GraphFormat::JsonLd)
         {
             return Err(ServerError::not_acceptable(format!(
@@ -786,6 +786,8 @@ pub async fn query(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Connection-scoped SPARQL requires a FROM/FROM NAMED clause to specify the ledger.
         //
@@ -1156,6 +1158,8 @@ pub async fn query_ledger(
 
         // Log query text according to configuration
         log_query_text(&sparql, &state.telemetry_config, &span);
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
@@ -1302,8 +1306,9 @@ pub async fn query_get(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
-    if let Some(description) = service_description(&uri, &params, &credential)? {
-        return Ok(description);
+    if wants_service_description(&params, &credential) {
+        // The connection endpoint's default graph is whatever `FROM` names.
+        return service_description(&uri, &credential, false);
     }
     query(State(state), params, headers, bearer, credential).await
 }
@@ -1318,8 +1323,9 @@ pub async fn query_ledger_get(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
-    if let Some(description) = service_description(&uri, &params, &credential)? {
-        return Ok(description);
+    if wants_service_description(&params, &credential) {
+        let union = ledger_union_default_graph(&state, &ledger, &bearer, &credential).await;
+        return service_description(&uri, &credential, union);
     }
     query_ledger(
         State(state),
@@ -1334,18 +1340,49 @@ pub async fn query_ledger_get(
 }
 
 /// SPARQL Service Description §2: a `GET` on a SPARQL endpoint with no query
-/// returns an RDF description of the service, in the graph format `Accept`
-/// asks for. `None` when the request carries a query. It describes the
-/// endpoint's capabilities, not data; it sits behind the same authentication
-/// as the endpoint, which the extractors apply before this runs.
+/// returns an RDF description of the service, which a `GET` carrying a query
+/// or a body does not ask for.
+fn wants_service_description(params: &SparqlParams, credential: &MaybeCredential) -> bool {
+    params.query.is_none() && credential.body.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Whether `ledger`'s endpoint claims `sd:UnionDefaultGraph`: its
+/// `f:unionDefaultGraph` setting. Off when the caller's token may not read the
+/// ledger or the ledger cannot be loaded, so a description never becomes an
+/// error, nor a probe of a ledger the caller cannot see.
+async fn ledger_union_default_graph(
+    state: &AppState,
+    ledger: &str,
+    bearer: &MaybeDataBearer,
+    credential: &MaybeCredential,
+) -> bool {
+    let Ok(path) = PathLedger::parse(ledger) else {
+        return false;
+    };
+    if let Some(p) = bearer.0.as_ref() {
+        let readable = crate::error::scope_id(&path.ledger).is_ok_and(|id| p.can_read(&id));
+        if !credential.is_signed() && !readable {
+            return false;
+        }
+    }
+    let Ok(view) = state.fluree.db(&path.ledger).await else {
+        return false;
+    };
+    view.ledger_config()
+        .and_then(|c| c.query.as_ref())
+        .and_then(|q| q.union_default_graph)
+        .unwrap_or(false)
+}
+
+/// The endpoint's SPARQL service description, in the graph format `Accept`
+/// asks for. It describes the endpoint's capabilities, not data; it sits
+/// behind the same authentication as the endpoint, which the extractors apply
+/// before this runs.
 fn service_description(
     uri: &axum::http::Uri,
-    params: &SparqlParams,
     credential: &MaybeCredential,
-) -> Result<Option<Response>> {
-    if params.query.is_some() || !credential.body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
-    }
+    union_default_graph: bool,
+) -> Result<Response> {
     let header = |name: &str| {
         credential
             .headers
@@ -1354,27 +1391,30 @@ fn service_description(
             .map(|v| v.split(',').next().unwrap_or(v).trim())
             .filter(|v| !v.is_empty())
     };
-    let format = negotiate_graph_format(header("accept")).ok_or_else(|| {
-        ServerError::not_acceptable(
-            "a service description is available as application/ld+json, text/turtle, \
+    let format =
+        negotiate_graph_format(header("accept"), GraphFormat::SINGLE_GRAPH).ok_or_else(|| {
+            ServerError::not_acceptable(
+                "a service description is available as application/ld+json, text/turtle, \
              application/n-triples or application/rdf+xml",
-        )
-    })?;
+            )
+        })?;
     // `sd:endpoint` is the URL the client asked for, as it addressed us.
     let scheme = header("x-forwarded-proto").unwrap_or("http");
     let host = header("x-forwarded-host")
         .or_else(|| header("host"))
         .unwrap_or("localhost");
     let endpoint = format!("{scheme}://{host}{}", uri.path());
-    let body = fluree_db_api::sparql_service_description(&endpoint, &format.formatter())
-        .map_err(|e| ServerError::internal(e.to_string()))?;
-    Ok(Some(
-        (
-            [(axum::http::header::CONTENT_TYPE, format.content_type())],
-            body,
-        )
-            .into_response(),
-    ))
+    let body = fluree_db_api::sparql_service_description(
+        &endpoint,
+        union_default_graph,
+        &format.formatter(),
+    )
+    .map_err(|e| ServerError::internal(e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, format.content_type())],
+        body,
+    )
+        .into_response())
 }
 
 pub async fn query_ledger_tail(
@@ -1477,6 +1517,8 @@ pub async fn explain_ledger(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
+            // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+            let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Enforce bearer ledger scope for unsigned requests
             if let Some(p) = bearer.0.as_ref() {
@@ -1826,15 +1868,30 @@ fn is_graph_query(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
 }
 
 /// The byte serialization a SPARQL result gets: for a CONSTRUCT / DESCRIBE, the
-/// Turtle, N-Triples or RDF/XML that `Accept` prefers (JSON-LD stays on the
-/// JSON paths). A SELECT / ASK whose `Accept` admits only graph formats is a
-/// `406`.
+/// graph text format `Accept` prefers (JSON-LD stays on the JSON paths). A
+/// CONSTRUCT whose template writes into named graphs (`GRAPH` blocks) produces
+/// a dataset, so only TriG, N-Quads and JSON-LD can carry it: asking for only
+/// a triples format is a `406`. A SELECT / ASK whose `Accept` admits only
+/// graph formats is a `406`.
 fn sparql_graph_format(
     ast: Option<&fluree_db_sparql::ast::SparqlAst>,
     headers: &FlureeHeaders,
 ) -> Result<Option<GraphFormat>> {
-    if is_graph_query(ast) {
-        Ok(headers.graph_format().filter(|f| *f != GraphFormat::JsonLd))
+    let not_json = |f: &GraphFormat| *f != GraphFormat::JsonLd;
+    if template_names_graphs(ast) {
+        match headers.graph_format(GraphFormat::DATASET) {
+            Some(fmt) => Ok(Some(fmt).filter(not_json)),
+            None if headers.graph_format(GraphFormat::ALL).is_some() => {
+                Err(ServerError::not_acceptable(
+                    "this CONSTRUCT template writes into named graphs, which Turtle, \
+                     N-Triples and RDF/XML cannot express; accept application/trig, \
+                     application/n-quads or application/ld+json",
+                ))
+            }
+            None => Ok(None),
+        }
+    } else if is_graph_query(ast) {
+        Ok(headers.graph_format(GraphFormat::ALL).filter(not_json))
     } else if headers.accepts_only_graph_formats() {
         Err(ServerError::not_acceptable(
             "Turtle, N-Triples and RDF/XML are only available for SPARQL \
@@ -1843,6 +1900,15 @@ fn sparql_graph_format(
     } else {
         Ok(None)
     }
+}
+
+/// Whether a CONSTRUCT's template has `GRAPH` blocks.
+fn template_names_graphs(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
+    matches!(
+        ast.map(|a| &a.body),
+        Some(fluree_db_sparql::ast::QueryBody::Construct(q))
+            if q.template.as_ref().is_some_and(fluree_db_sparql::ast::ConstructTemplate::names_graphs)
+    )
 }
 
 /// Pick the formatter config and response `Content-Type` for a SPARQL query that
@@ -1896,6 +1962,16 @@ pub(crate) struct PathPin {
 impl PathLedger {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let parsed = fluree_db_api::LedgerRef::parse(raw)?;
+        // `LedgerRef` splits at `#` before `@`, so `<ledger>#g@t:1` arrives as a
+        // fragment carrying the pin. Refuse it as `<ledger>@t:1#g` is refused,
+        // rather than read head.
+        let pin_in_fragment = parsed.fragment.as_deref().is_some_and(|f| f.contains('@'));
+        if parsed.fragment.is_some() && (parsed.at.is_some() || pin_in_fragment) {
+            return Err(ServerError::bad_request(format!(
+                "Ledger path '{raw}' combines a time pin with a graph fragment; \
+                 select the graph in the query instead"
+            )));
+        }
         let Some(at) = parsed.at else {
             return Ok(Self {
                 ledger: raw.to_string(),
@@ -1903,12 +1979,6 @@ impl PathLedger {
                 pin: None,
             });
         };
-        if parsed.fragment.is_some() {
-            return Err(ServerError::bad_request(format!(
-                "Ledger path '{raw}' combines a time pin with a graph fragment; \
-                 select the graph in the query instead"
-            )));
-        }
         // The grammar a body `from: "<ledger>@..."` is parsed with.
         let spec = TimeSpec::parse_address_suffix(&at).map_err(|e| {
             ServerError::bad_request(format!("Invalid time pin in ledger path '{raw}': {e}"))
@@ -4116,6 +4186,8 @@ pub async fn explain(
         if is_sparql_request(&headers, &credential, &params) {
             let sparql = resolve_sparql_text(&params, &credential)?;
             log_query_text(&sparql, &state.telemetry_config, &span);
+            // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+            let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
             // Determine target ledger: header wins, otherwise require a single FROM ledger id.
             // FROM may carry a time-travel suffix (`@t:N` / `@iso:` / `@commit:`);
@@ -4654,6 +4726,12 @@ fn collect_multi_query_min_t_requirements(
             }
             SubqueryLanguage::Sparql => {
                 if let Some(sparql) = sub.query.as_str() {
+                    // `# PRAGMA min-t` is the alias's body option, so it wins
+                    // over the alias's `opts`.
+                    let sub_min_t = fluree_db_sparql::request_pragmas(sparql)
+                        .map_err(ServerError::bad_request)?
+                        .min_t
+                        .or(sub_min_t);
                     // The envelope already applied any `Fluree-Min-T` header to
                     // every distinct ledger; the sub-collector only needs to pick
                     // up per-query `@t:` pins, so pass no header here.
@@ -4989,7 +5067,7 @@ fn negotiate_multi_query_format(
         || headers.wants_csv()
         || headers.wants_sparql_results_xml()
         || headers
-            .graph_format()
+            .graph_format(GraphFormat::ALL)
             .is_some_and(|f| f != GraphFormat::JsonLd)
     {
         return Err(ServerError::not_acceptable(
@@ -5053,11 +5131,70 @@ fn apply_envelope_sparql_auth(
     envelope_opts: Option<&JsonValue>,
     headers: &FlureeHeaders,
 ) -> Result<()> {
-    let merged = fluree_db_api::query::multi::merged_opts(envelope_opts, sub.opts.as_ref());
+    use fluree_db_api::query::multi::merged_opts;
+
+    let selection = |opts: Option<JsonValue>| {
+        fluree_db_api::GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
+            .map_err(|e| ServerError::bad_request(e.to_string()))
+    };
+
+    // The alias's `# PRAGMA` options are its body opts, which the dispatcher
+    // lays over `sub.opts`: authorize the selection it will actually run with.
+    // Under a bound credential the envelope's selection is the holder's, and
+    // the pragmas may only repeat it, as they may only repeat its headers.
+    let pragma_opts = sparql_alias_pragma_opts(sub)?;
+    let outer = merged_opts(envelope_opts, sub.opts.as_ref());
+    if let (Some(pragma_opts), Some(_)) = (&pragma_opts, &headers.policy_authorization) {
+        crate::extract::validate_pragma_selection(
+            &selection(Some(pragma_opts.clone()))?,
+            &selection(outer.clone())?,
+        )?;
+    }
+    let mut merged = merged_opts(outer.as_ref(), pragma_opts.as_ref());
+    fluree_db_api::query::multi::hold_pragma_tracking(&mut merged, outer.as_ref());
     let mut synthetic = serde_json::json!({"opts": merged});
     crate::routes::policy_auth::apply_authorization_to_opts(&mut synthetic, headers)?;
     sub.opts = synthetic.get("opts").cloned();
+
+    // Authorization accepts a pragma selection only where it matches the
+    // bound one, so laying the pragmas back over the result changes nothing.
+    // Hold that here rather than lean on it: a difference would be a pragma
+    // replacing the authorized selection.
+    if let Some(pragma_opts) = &pragma_opts {
+        let authorized = selection(sub.opts.clone())?;
+        let dispatched = selection(merged_opts(sub.opts.as_ref(), Some(pragma_opts)))?;
+        if !same_policy_selection(&authorized, &dispatched) {
+            return Err(fluree_db_api::ApiError::http(
+                403,
+                "Credential does not permit policy selection: a SPARQL alias's pragmas \
+                 conflict with the authorized selection",
+            )
+            .into());
+        }
+    }
     Ok(())
+}
+
+/// A SPARQL alias's pragmas as `opts`, with a malformed pragma as a 400.
+fn sparql_alias_pragma_opts(sub: &MultiQuerySubquery) -> Result<Option<JsonValue>> {
+    fluree_db_api::query::multi::sparql_pragma_opts(sub.query.as_str().unwrap_or_default())
+        .map_err(ServerError::bad_request)
+}
+
+/// Whether two policy selections pick the same policies; class order and
+/// repeats do not change the set.
+fn same_policy_selection(
+    a: &fluree_db_api::GovernanceOptions,
+    b: &fluree_db_api::GovernanceOptions,
+) -> bool {
+    fn classes(o: &fluree_db_api::GovernanceOptions) -> Option<BTreeSet<&String>> {
+        o.policy_class.as_ref().map(|c| c.iter().collect())
+    }
+    a.identity == b.identity
+        && classes(a) == classes(b)
+        && a.policy == b.policy
+        && a.policy_values == b.policy_values
+        && a.default_allow == b.default_allow
 }
 
 /// Merge envelope, alias, and body options before authorization, using the

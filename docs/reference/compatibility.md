@@ -25,6 +25,7 @@ Fluree implements the W3C RDF 1.1 specification:
 Fluree implements the RDF 1.2 reification model used for edge annotations:
 - `rdf:reifies` with triple terms (`<<( s p o )>>`) as the reified object
 - Reifiers identified by IRI, blank node, or variable
+- Triple terms as values under any predicate, on every write surface
 
 Fluree also exposes a non-standard extension that reads commit metadata off a
 quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
@@ -34,18 +35,16 @@ Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
 tails, the `~` reifier, `<< s p o >>` reified triples and
 `r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
 import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
-N-Quads files. All forms assert the base triple: Fluree reifies asserted
-edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
-non-asserting. The `VERSION "1.2"` / `@version`
+N-Quads files. As in RDF 1.2, only the annotation syntax asserts the triple;
+`<< s p o >>` and `rdf:reifies <<( s p o )>>` reify it without asserting it.
+The `VERSION "1.2"` / `@version`
 directive and `--ltr` / `--rtl` base-direction language tags are accepted.
-The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
-(`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
+The vendored W3C RDF 1.1 and RDF 1.2 Turtle, N-Triples, N-Quads and TriG
+suites run in CI (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the
+skip register.
 
 Not yet supported:
-- Triple terms as arbitrary object values: `<<( ... )>>` is accepted on
-  ingest only as the object of `rdf:reifies`
-- Triple terms in subject position and nested triple terms
-- Multiple triples reified by a single annotation
+- Annotation-of-annotation (a `{| ... |}` or `<< ... >>` inside an annotation body)
 
 See [Edge annotations](../concepts/edge-annotations.md).
 
@@ -99,11 +98,18 @@ Supported SPARQL features:
 - Property paths (`+`, `*`, `?`, `^`, `|`, `/`, `!` negated sets, and transitive over a sequence including inverse steps `(^a/b)+`; see [SPARQL docs](../query/sparql.md#property-paths))
 - MINUS, VALUES, and FILTER EXISTS / NOT EXISTS
 - SERVICE against local ledgers (`fluree:ledger:<name>`); remote HTTP endpoints are not supported
-- Result formats: SELECT/ASK as SPARQL-results JSON or XML, CSV or TSV; CONSTRUCT/DESCRIBE as JSON-LD, Turtle, N-Triples or RDF/XML (see [SPARQL output negotiation](../api/endpoints.md#post-queryledger))
+- Result formats: SELECT/ASK as SPARQL-results JSON or XML, CSV or TSV; CONSTRUCT/DESCRIBE as JSON-LD, Turtle, N-Triples, RDF/XML, TriG or N-Quads (see [SPARQL output negotiation](../api/endpoints.md#post-queryledger))
+- `GRAPH` blocks in a CONSTRUCT template, writing into named graphs (an extension, as in Apache Jena ARQ; see [CONSTRUCT](../query/construct.md#named-graphs-in-the-template))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
 **Empty-group aggregates:** Over an implicit single group (no `GROUP BY`) whose pattern matches nothing, `COUNT`, `SUM`, and `AVG` return their identity `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1); `MIN`, `MAX`, and `SAMPLE` have no identity element and return unbound. A query *with* `GROUP BY` over an empty pattern returns zero rows.
+
+**Grouped queries:** A query groups when it has a `GROUP BY` or an aggregate anywhere in SELECT, HAVING or ORDER BY (§18.2.4.1). Its SELECT expressions are evaluated once per group, in SELECT order (§18.2.4.4), after HAVING unless HAVING reads them (below), and `SELECT *` projects its GROUP BY keys. In HAVING and ORDER BY, a variable that is neither a key nor aggregated means `SAMPLE(?v)` (§18.2.4.1); HAVING without grouping filters the solutions (§18.2.4.2). ASK and CONSTRUCT group the same way: ASK is true when some group passes HAVING, and CONSTRUCT instantiates its template once per group, where a template variable that is not a GROUP BY key is unbound and the triples that read it are skipped (DESCRIBE refuses GROUP BY and HAVING). Two shapes are rejected rather than evaluated literally: a projected variable that is neither a GROUP BY key nor aggregated (§11.4, including when the only aggregate is in HAVING or ORDER BY), and an aggregate over an alias of the same SELECT clause, which the spec would evaluate as unbound (`COUNT` = 0 for every group).
+
+**HAVING reads SELECT aliases (extension of §18.2.4):** In a grouped query, HAVING can read an alias of the same SELECT clause, whether the alias names an aggregate (`(COUNT(?e) AS ?n) … HAVING (?n > 1)`) or an expression (`(COUNT(?e) + 0 AS ?n)`, `(IF(?a = "Net", "network", "other") AS ?seg) … HAVING (?seg = "network")`). The expressions HAVING reads, and the aliases they read in turn, are evaluated before HAVING; the others after it. Each is evaluated once per group either way, so HAVING tests the value the query returns, even for `RAND()` or `STRUUID()`. SPARQL 1.1 evaluates every SELECT expression after HAVING, so there such an alias is unbound and the HAVING condition fails. Many SPARQL engines make the same extension, and the W3C aggregate tests always repeat the aggregate in HAVING, so they pin neither reading. For a query that behaves the same everywhere, repeat the aggregate or expression in HAVING instead of reading its alias. JSON-LD `having` and Cypher `WITH … WHERE` follow the same rule.
+
+**Trailing VALUES in a grouped query (deviation from §18.2.4.3):** A `VALUES` block after the WHERE clause, at the top level of any query form or in a sub-SELECT, is joined with the WHERE solutions before grouping, so it restricts what the aggregates count: `SELECT ?a (COUNT(?e) AS ?n) WHERE { ?e ex:area ?a } GROUP BY ?a VALUES ?e { ex:e1 }` counts `ex:e1` alone. The spec joins it after HAVING instead, pairing each group row with each VALUES row. The expressions the level evaluates before grouping (an aggregate's input expression, a `GROUP BY` expression, and the SELECT expressions placed before grouping: all of them in a query that does not group) run after the join, so they read the VALUES variables: `SELECT (SUM(?n * ?v) AS ?s) WHERE { ?e ex:n ?n } VALUES ?v { 2 }` doubles the sum, at the top level as in a sub-SELECT. HAVING still reads a VALUES variable as unbound, as it would in the spec's order, unless the WHERE binds it or it is a GROUP BY key. For queries that behave the same on any SPARQL processor, put the `VALUES` block inside the WHERE clause to restrict the aggregates' input, or move the grouped query into a sub-SELECT and put the `VALUES` block after the outer WHERE to join it with the grouped rows.
 
 **Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity, an unknown datatype IRI — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.)
 
@@ -173,8 +179,10 @@ A `GET` on `/v1/fluree/query` or `/v1/fluree/query/{ledger}` with no `query`
 parameter returns a description of the endpoint in JSON-LD, Turtle, N-Triples
 or RDF/XML, chosen by `Accept`. It names the endpoint, the SPARQL query
 language (`sd:SPARQLQuery` at versions 1.0 through 1.2, and `sd:SPARQL11Query`
-for older clients), the result formats, and simple entailment. See
-[Service description](../api/endpoints.md#service-description).
+for older clients), the result formats, and simple entailment, plus
+`sd:UnionDefaultGraph` on a ledger whose
+[union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph)
+is on. See [Service description](../api/endpoints.md#service-description).
 
 **Specification:** https://www.w3.org/TR/sparql11-service-description/ and the
 SPARQL 1.2 Service Description draft
@@ -188,14 +196,17 @@ Supported query and update annotation syntax:
 - Named reifiers: `?s ?p ?o ~ ?r {| ... |}` (IRI, blank-node, or variable reifier)
 - `rdf:reifies` form with `<<( s p o )>>` triple terms
 - Annotations in `INSERT DATA` / `DELETE DATA`
+- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, `<< s p o >>` reified triples and
+  `?r rdf:reifies <<( s p o )>>`),
+  written by every result format
+
+Also supported: triple terms as values, nested ones included, in patterns, `VALUES`,
+`INSERT DATA` / `DELETE DATA` / `DELETE WHERE` and templates; value equality (`=`) on
+triple terms; and the triple-term functions `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
+`OBJECT()` and `isTRIPLE()`.
 
 Not yet supported:
-- Triple-term accessor functions: `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
-  `OBJECT()`, `isTRIPLE()`
-- Triple terms as arbitrary values, in `CONSTRUCT` patterns, or in subject
-  position; multi-triple and nested annotations
-- Named-graph edge annotations in SPARQL UPDATE (default graph only)
-- W3C SPARQL 1.2 test-suite execution (manifests present but not yet run)
+- Nested annotations (annotation-of-annotation)
 
 **Specification:** https://www.w3.org/TR/sparql12-query/
 
@@ -383,8 +394,8 @@ Supported SPARQL versions:
 | JSON-LD | Yes | Yes |
 | Turtle | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
 | N-Triples | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
-| N-Quads | Yes | Yes |
-| TriG | Yes | Yes |
+| N-Quads | Yes | Yes (export, CONSTRUCT/DESCRIBE results) |
+| TriG | Yes | Yes (export, CONSTRUCT/DESCRIBE results) |
 | RDF/XML | No | CONSTRUCT/DESCRIBE results and Graph Store `GET` only |
 
 Import accepts `.ttl`, `.nt`, `.nq`, `.trig`, and `.jsonld`/`.jsonl` files, each
@@ -470,7 +481,7 @@ Fluree can import from:
 
 Export Fluree data to:
 - Turtle, N-Triples, N-Quads, TriG or JSON-LD, with `fluree export` or the export endpoint
-- SPARQL CONSTRUCT / DESCRIBE results as JSON-LD, Turtle, N-Triples or RDF/XML
+- SPARQL CONSTRUCT / DESCRIBE results as JSON-LD, Turtle, N-Triples, RDF/XML, TriG or N-Quads
 - One graph at a time through the Graph Store Protocol
 
 ## Feature Roadmap
@@ -482,7 +493,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
 - Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; edge annotations in CONSTRUCT and Graph Store `GET` output (export already writes them); the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
+- RDF 1.2 / SPARQL 1.2: annotation-of-annotation
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

@@ -107,6 +107,7 @@ impl Hash for FlakeValueKey {
             FlakeValue::DayTimeDuration(v) => v.hash(state),
             FlakeValue::Duration(v) => v.hash(state),
             FlakeValue::GeoPoint(v) => v.hash(state),
+            FlakeValue::TripleTerm(t) => t.hash(state),
         }
     }
 }
@@ -522,23 +523,15 @@ impl Materializer {
             } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)? {
                 FlakeValue::Ref(sid) => Binding::sid(sid),
                 val => {
-                    // NUM_BIG arena values share one EncodedLit whose dt_id is
-                    // hardcoded to decimal — recover xsd:integer vs xsd:decimal
-                    // from the decoded value, not dt_id (issue #1329).
-                    let dt_sid = match val.overflow_numeric_datatype_sid() {
-                        Some(sid) => sid,
-                        None => self
-                            .graph_view
-                            .store()
-                            .dt_sids()
-                            .get(*dt_id as usize)
-                            .cloned()
-                            .ok_or_else(|| {
-                                QueryError::dictionary_lookup(format!(
-                                    "materialize literal: unknown dt_id {dt_id}"
-                                ))
-                            })?,
-                    };
+                    let dt_sid = self
+                        .graph_view
+                        .store()
+                        .resolve_dt_id_sid_for_value(*dt_id, &val)
+                        .ok_or_else(|| {
+                            QueryError::dictionary_lookup(format!(
+                                "materialize literal: unknown dt_id {dt_id}"
+                            ))
+                        })?;
                     let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -675,6 +668,7 @@ fn flake_value_to_comparable(val: &FlakeValue) -> Option<ComparableValue> {
         FlakeValue::DayTimeDuration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
         FlakeValue::Duration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
         FlakeValue::GeoPoint(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::TripleTerm(_) => Some(ComparableValue::String(Arc::from(val.to_string()))),
     }
 }
 

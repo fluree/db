@@ -8,8 +8,8 @@ use super::ast::{
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
     UnresolvedForwardItem, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions,
     UnresolvedPathExpr, UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
-    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
-    UnresolvedValue,
+    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTermObject,
+    UnresolvedTermPattern, UnresolvedTriplePattern, UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -94,55 +94,29 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Resolve aggregate output VarIds up front so we can classify each
-    // SELECT-clause computation as pre- or post-aggregation. Mirrors
-    // `fluree_db_sparql::lower::select::lower_select_expression_binds` so
-    // SPARQL and JSON-LD queries produce the same IR shape.
-    let aggregate_output_vars: std::collections::HashSet<VarId> = ast
-        .options
-        .aggregates
-        .iter()
-        .map(|spec| vars.get_or_insert(&spec.output_var))
-        .collect();
-
-    // Desugar SELECT-clause scalar expressions to BIND patterns. Pre/Post
-    // placement is decided per-column by `lower_select_expr_bind`; we
-    // accumulate post-bind aliases as we go so chained derivations
-    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
-    // in source order.
-    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
-    for column in ast.select.columns() {
-        if let UnresolvedColumn::Computation { expr, alias } = column {
-            let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
-                expr,
-                alias,
-                encoder,
-                vars,
-                &mut pp_counter,
-                &aggregate_output_vars,
-                &post_bind_aliases,
-            )?;
-            match placement {
-                SelectExprPlacement::Post => {
-                    post_bind_aliases.insert(alias_var);
-                    post_binds.push((alias_var, lowered_expr));
-                }
-                SelectExprPlacement::Pre => {
-                    patterns.push(Pattern::Bind {
-                        var: alias_var,
-                        expr: lowered_expr,
-                    });
-                }
-            }
-        }
-    }
+    // Desugar SELECT-clause scalar expressions: WHERE binds before grouping,
+    // or per-group binds after it, by the rule SPARQL uses too.
+    let (post_binds, select_aliases) = lower_select_computations(
+        ast.select.columns(),
+        &ast.options,
+        encoder,
+        vars,
+        &mut pp_counter,
+        &mut patterns,
+    )?;
 
     // Lower the reasoning config, ordering, and grouping (each is its own axis).
     // Post-aggregation binds collected above ride inside the grouping phase.
     let reasoning = lower_options(&ast.options);
-    let ordering = lower_ordering(&ast.options, vars);
-    let grouping = lower_grouping(&ast.options, vars, post_binds)?;
+    let mut ordering = lower_ordering(&ast.options, vars);
+    let grouping = lower_grouping(
+        &ast.options,
+        vars,
+        post_binds,
+        &mut patterns,
+        &mut ordering,
+        &select_aliases,
+    )?;
     let limit = ast.options.limit;
     let offset = ast.options.offset;
 
@@ -155,15 +129,22 @@ pub(crate) fn lower_query<E: IriEncoder>(
         _ => None,
     };
     let output = match select_mode {
+        // `Reject` by default: the JSON-LD user-query entry (`parse_query`)
+        // allows per-group lists; datalog rule bodies, which also lower here,
+        // do not.
         SelectMode::Many | SelectMode::One => QueryOutput::Select {
             projection,
             restriction,
+            ungrouped: crate::ir::UngroupedProjection::Reject,
         },
         SelectMode::Construct => {
-            let template = match ast.construct_template {
+            let mut template = match ast.construct_template {
                 Some(ref t) => lower_construct_template(t, encoder, vars)?,
                 None => ConstructTemplate::new(Vec::new()),
             };
+            if let Some(grouping) = &grouping {
+                template.unbind_outside_group_row(grouping, vars);
+            }
             QueryOutput::Construct(template)
         }
         SelectMode::Ask => QueryOutput::Ask,
@@ -183,6 +164,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         reasoning,
         post_values: None,
         include_system_facts: ast.options.include_system_facts,
+        union_default_graph: ast.options.union_default_graph,
         cypher_vocab: None,
         unmatched_optional: Default::default(),
     })
@@ -450,6 +432,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 edge: lowered_edge,
                 annotation: lowered_annotation,
                 body: lowered_body,
+                term: crate::ir::term_components::fresh_term_var(vars),
             }])
         }
         UnresolvedPattern::AnnotationTarget {
@@ -458,13 +441,29 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
             body,
         } => {
             let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
-            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
-            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
-            Ok(vec![Pattern::AnnotationTarget {
-                annotation: lowered_annotation,
-                edge: lowered_edge,
-                body: lowered_body,
-            }])
+            let mut out = Vec::new();
+            let lowered_edge = lower_term_pattern(edge, encoder, vars, &mut out)?;
+            crate::ir::lower_reified_link(
+                lowered_annotation,
+                lowered_edge,
+                encoder,
+                vars,
+                &mut out,
+            );
+            out.extend(lower_unresolved_patterns(body, encoder, vars, pp_counter)?);
+            Ok(out)
+        }
+        UnresolvedPattern::TripleTermValue {
+            subject,
+            predicate,
+            term,
+        } => {
+            let subject = lower_ref_term(subject, encoder, vars)?;
+            let predicate = lower_ref_term(predicate, encoder, vars)?;
+            let mut out = Vec::new();
+            let term = lower_term_pattern(term, encoder, vars, &mut out)?;
+            crate::ir::lower_term_value(subject, predicate, term, encoder, vars, &mut out);
+            Ok(out)
         }
     }
 }
@@ -496,6 +495,43 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 .encode_iri(iri)
                 .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?;
             Ok(Binding::sid(sid))
+        }
+        UnresolvedValue::TripleTerm {
+            subject,
+            predicate,
+            object,
+        } => {
+            let encode = |iri: &str| {
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))
+            };
+            let (o, dt, lang) = match lower_values_cell(object, encoder)? {
+                Binding::Sid { sid, .. } => (
+                    FlakeValue::Ref(sid),
+                    fluree_db_core::edge::id_datatype_sid(),
+                    None,
+                ),
+                Binding::Lit { val, dtc, .. } => {
+                    let lang = dtc.lang_tag().map(str::to_string);
+                    (val, dtc.datatype().clone(), lang)
+                }
+                _ => {
+                    return Err(ParseError::InvalidWhere(
+                        "a triple term's object in values must be a constant".to_string(),
+                    ))
+                }
+            };
+            Ok(Binding::lit(
+                FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+                    s: encode(subject)?,
+                    p: encode(predicate)?,
+                    o,
+                    dt,
+                    lang,
+                })),
+                fluree_db_core::triple_term_datatype_sid().clone(),
+            ))
         }
         UnresolvedValue::Literal { value, dtc } => {
             // Build initial FlakeValue from the literal
@@ -583,6 +619,38 @@ pub fn coerce_value_by_datatype(value: FlakeValue, datatype_iri: &str) -> Result
 }
 
 /// Lower an unresolved triple pattern to a resolved TriplePattern
+/// A triple term's triple; a nested term object lowers to a term variable
+/// (or a composed constant) whose patterns go into `out`.
+fn lower_term_pattern<E: IriEncoder>(
+    tp: &UnresolvedTermPattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut Vec<Pattern>,
+) -> Result<TriplePattern> {
+    match &tp.o {
+        UnresolvedTermObject::Value { o, dtc } => lower_triple_pattern(
+            &UnresolvedTriplePattern {
+                s: tp.s.clone(),
+                p: tp.p.clone(),
+                o: o.clone(),
+                dtc: dtc.clone(),
+            },
+            encoder,
+            vars,
+        ),
+        UnresolvedTermObject::Term(inner) => {
+            let inner = lower_term_pattern(inner, encoder, vars, out)?;
+            let (o, dtc) = crate::ir::lower_term_object(inner, encoder, vars, out);
+            Ok(TriplePattern {
+                s: lower_ref_term(&tp.s, encoder, vars)?,
+                p: lower_ref_term(&tp.p, encoder, vars)?,
+                o,
+                dtc,
+            })
+        }
+    }
+}
+
 fn lower_triple_pattern<E: IriEncoder>(
     pattern: &UnresolvedTriplePattern,
     encoder: &E,
@@ -1205,50 +1273,103 @@ fn path_expr_name(expr: &UnresolvedPathExpr) -> &'static str {
     }
 }
 
-/// Where a SELECT-clause scalar expression must run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectExprPlacement {
-    /// Pre-aggregation: append to the WHERE pattern list as `Pattern::Bind`.
-    Pre,
-    /// Post-aggregation: append to `options.post_binds`.
-    Post,
-}
+/// What [`lower_select_computations`] returns: the per-group binds (for the
+/// grouping phase) and every select-expression alias.
+type SelectComputations = (Vec<(VarId, Expression)>, std::collections::HashSet<VarId>);
 
-/// Lower a single `UnresolvedColumn::Computation` to its placement plus
-/// resolved (alias VarId, Expression).
+/// Lower a query level's SELECT-clause computations (`(as <expr> ?alias)`), in
+/// SELECT order, by the placement rule SPARQL shares
+/// ([`crate::ir::SelectExprPlacer`]).
 ///
-/// The decision is purely about which pipeline stage the BIND belongs to:
+/// In a query that groups (a `groupBy`, or an aggregate anywhere), an
+/// expression that reads only group keys, aggregate outputs and earlier
+/// per-group aliases — or nothing, a constant — is evaluated once per group,
+/// after `having`: it returns the post-group binds for the grouping phase. An
+/// expression over a variable that is neither a key nor an aggregate is a
+/// WHERE bind appended to `patterns`, so its alias is a per-group list (the
+/// documented JSON-LD behavior), and so is an expression whose alias is a
+/// `groupBy` key or an aggregate input. In a query that does not group, every
+/// expression is a WHERE bind.
 ///
-///   - `Post` if the lowered expression references any aggregate output
-///     variable, **or** any earlier-in-this-SELECT post-bind alias (passed
-///     in via `post_bind_aliases` so the caller can chain dependencies).
-///   - `Pre` otherwise.
-///
-/// Both `lower_query` and `lower_subquery` call this and route the result by
-/// placement: `Pre` binds append to WHERE, `Post` binds ride inside the
-/// grouping's aggregation stage (applied by the shared `apply_solution_modifiers`
-/// tail).
-fn lower_select_expr_bind<E: IriEncoder>(
-    expr: &UnresolvedExpression,
-    alias: &Arc<str>,
+/// Also returns every alias, for the HAVING-as-filter rename.
+fn lower_select_computations<'a, E: IriEncoder>(
+    columns: impl IntoIterator<Item = &'a UnresolvedColumn>,
+    opts: &UnresolvedOptions,
     encoder: &E,
     vars: &mut VarRegistry,
     pp_counter: &mut u32,
-    aggregate_output_vars: &std::collections::HashSet<VarId>,
-    post_bind_aliases: &std::collections::HashSet<VarId>,
-) -> Result<(SelectExprPlacement, VarId, Expression)> {
-    let alias_var = vars.get_or_insert(alias);
-    let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
-    let placement = if lowered
-        .referenced_vars()
+    patterns: &mut Vec<Pattern>,
+) -> Result<SelectComputations> {
+    let keys: Vec<VarId> = opts
+        .group_by
         .iter()
-        .any(|v| aggregate_output_vars.contains(v) || post_bind_aliases.contains(v))
-    {
-        SelectExprPlacement::Post
+        .map(|v| vars.get_or_insert(v))
+        .collect();
+    let aggregates: Vec<AggregateSpec> = opts
+        .aggregates
+        .iter()
+        .map(|a| lower_aggregate_spec(a, vars))
+        .collect();
+
+    // (alias name, alias, expression), in SELECT order.
+    let mut computed: Vec<(&str, VarId, Expression)> = Vec::new();
+    for column in columns {
+        let UnresolvedColumn::Computation { expr, alias } = column else {
+            continue;
+        };
+        let alias_var = vars.get_or_insert(alias);
+        let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
+        computed.push((alias, alias_var, lowered));
+    }
+    if computed.is_empty() {
+        return Ok((Vec::new(), std::collections::HashSet::new()));
+    }
+    // The WHERE's variables matter only to a grouping level's placement (and
+    // its per-group alias check below), so only a grouping level collects them.
+    let (placer, where_vars) = if keys.is_empty() && aggregates.is_empty() {
+        (
+            crate::ir::SelectExprPlacer::ungrouped(),
+            std::collections::HashSet::new(),
+        )
     } else {
-        SelectExprPlacement::Pre
+        let where_vars = crate::ir::pattern::produced_vars_of(patterns);
+        (
+            crate::ir::SelectExprPlacer::grouped(keys, &aggregates, where_vars.clone()),
+            where_vars,
+        )
     };
-    Ok((placement, alias_var, lowered))
+    let placements = placer.place_all(
+        &computed
+            .iter()
+            .map(|(_, alias_var, expr)| (*alias_var, expr, false))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
+    let mut aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for ((alias, alias_var, lowered), placement) in computed.into_iter().zip(placements) {
+        aliases.insert(alias_var);
+        match placement {
+            crate::ir::SelectExprPlacement::PostGroup => {
+                // A per-group bind onto a variable the WHERE binds would
+                // replace that variable's value — a group key's included —
+                // after grouping. SPARQL rejects the same alias (V6).
+                if where_vars.contains(&alias_var) {
+                    return Err(ParseError::InvalidSelect(format!(
+                        "select alias {alias} is already bound by the where clause; a \
+                         select expression evaluated per group would silently replace \
+                         its value. Alias to a fresh variable."
+                    )));
+                }
+                post_binds.push((alias_var, lowered));
+            }
+            crate::ir::SelectExprPlacement::PreGroup => patterns.push(Pattern::Bind {
+                var: alias_var,
+                expr: lowered,
+            }),
+        }
+    }
+    Ok((post_binds, aliases))
 }
 
 /// Expect a path expression to be a simple IRI. Returns the Arc'd IRI string.
@@ -1347,45 +1468,37 @@ fn lower_subquery<E: IriEncoder>(
     // Lower WHERE patterns, then append select-expression BINDs.
     let mut patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
 
-    // SELECT-expression binds split into pre-aggregation (appended to WHERE)
-    // and post-aggregation (referencing an aggregate output or an earlier
-    // post-bind). Post-binds ride inside the grouping's aggregation stage and
-    // are applied by the shared `apply_solution_modifiers` tail — the same
-    // channel the top-level SELECT uses, so subquery post-aggregation binds
-    // now work identically.
-    let aggregate_output_vars: std::collections::HashSet<VarId> = subquery
+    // SELECT-expression binds: WHERE binds before grouping, or per-group
+    // binds after it (applied by the shared `apply_solution_modifiers` tail,
+    // the same channel the top-level SELECT uses).
+    let (post_binds, select_aliases) = lower_select_computations(
+        columns,
+        &subquery.options,
+        encoder,
+        vars,
+        pp_counter,
+        &mut patterns,
+    )?;
+
+    // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
+    // subqueries used in filters/unions). Post-binds collected above ride in
+    // the grouping phase's `binds`; a HAVING on a subquery that does not group
+    // becomes a filter on its patterns, and a grouped `orderBy` read of a
+    // non-key variable a SAMPLE.
+    let mut ordering: Vec<SortSpec> = subquery
         .options
-        .aggregates
+        .order_by
         .iter()
-        .map(|spec| vars.get_or_insert(&spec.output_var))
+        .map(|s| lower_sort_spec(s, vars))
         .collect();
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
-    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
-    for column in columns {
-        if let UnresolvedColumn::Computation { expr, alias } = column {
-            let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
-                expr,
-                alias,
-                encoder,
-                vars,
-                pp_counter,
-                &aggregate_output_vars,
-                &post_bind_aliases,
-            )?;
-            match placement {
-                SelectExprPlacement::Post => {
-                    post_binds.push((alias_var, lowered_expr));
-                    post_bind_aliases.insert(alias_var);
-                }
-                SelectExprPlacement::Pre => {
-                    patterns.push(Pattern::Bind {
-                        var: alias_var,
-                        expr: lowered_expr,
-                    });
-                }
-            }
-        }
-    }
+    let grouping = lower_grouping(
+        &subquery.options,
+        vars,
+        post_binds,
+        &mut patterns,
+        &mut ordering,
+        &select_aliases,
+    )?;
 
     // Build SubqueryPattern with options
     let mut sq = SubqueryPattern::new(select, patterns);
@@ -1399,42 +1512,121 @@ fn lower_subquery<E: IriEncoder>(
     if subquery.options.distinct {
         sq = sq.with_distinct();
     }
-    if !subquery.options.order_by.is_empty() {
-        let sort_specs: Vec<_> = subquery
-            .options
-            .order_by
-            .iter()
-            .map(|s| lower_sort_spec(s, vars))
-            .collect();
-        sq = sq.with_ordering(sort_specs);
+    if !ordering.is_empty() {
+        sq = sq.with_ordering(ordering);
     }
-
-    // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
-    // subqueries used in filters/unions). Post-binds collected above ride inside
-    // the grouping's aggregation stage.
-    sq.grouping = lower_grouping(&subquery.options, vars, post_binds)?;
+    sq.grouping = grouping;
 
     Ok(sq)
 }
 
 /// Lower an unresolved CONSTRUCT template to a resolved ConstructTemplate
 ///
-/// Only processes triple patterns from the template (filters/optionals are ignored).
+/// Triples, edge annotations and named-graph blocks become template patterns,
+/// reifier attachments and per-pattern graphs; other patterns (filters,
+/// optionals, binds) are ignored.
 fn lower_construct_template<E: IriEncoder>(
     template: &UnresolvedConstructTemplate,
     encoder: &E,
     vars: &mut VarRegistry,
 ) -> Result<ConstructTemplate> {
-    let mut patterns = Vec::new();
+    let mut out = ConstructTemplate::new(Vec::new());
+    lower_construct_patterns(&template.patterns, None, encoder, vars, &mut out)?;
+    // An `@annotation` block without an `@id` names its reifier with a
+    // synthetic variable no WHERE clause binds: mint a fresh blank node for
+    // it on each row, as SPARQL does for a `[ ]` reifier.
+    out.bnode_vars = out
+        .reifications()
+        .iter()
+        .filter_map(|r| r.reifier.as_var())
+        .filter(|&v| vars.try_name(v).is_some_and(|n| n.starts_with("?__ann")))
+        .collect();
+    Ok(out)
+}
 
-    for unresolved in &template.patterns {
-        if let UnresolvedPattern::Triple(tp) = unresolved {
-            patterns.push(lower_triple_pattern(tp, encoder, vars)?);
+fn lower_construct_patterns<E: IriEncoder>(
+    patterns: &[UnresolvedPattern],
+    graph: Option<&Ref>,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut ConstructTemplate,
+) -> Result<()> {
+    for unresolved in patterns {
+        match unresolved {
+            UnresolvedPattern::Triple(tp) => {
+                out.push_pattern(lower_triple_pattern(tp, encoder, vars)?, graph.cloned());
+            }
+            UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => {
+                let triple =
+                    out.push_pattern(lower_triple_pattern(edge, encoder, vars)?, graph.cloned());
+                out.push_reification(triple, lower_ref_term(annotation, encoder, vars)?);
+                lower_construct_patterns(body, graph, encoder, vars, out)?;
+            }
+            UnresolvedPattern::Graph { name, patterns } => {
+                let name = if name.starts_with('?') {
+                    Ref::Var(vars.get_or_insert(name))
+                } else {
+                    Ref::Iri(std::sync::Arc::from(name.as_ref()))
+                };
+                lower_construct_patterns(patterns, Some(&name), encoder, vars, out)?;
+            }
+            UnresolvedPattern::TripleTermValue {
+                subject,
+                predicate,
+                term,
+            } => {
+                let o = construct_term_var(term, encoder, vars, out)?;
+                out.push_pattern(
+                    TriplePattern::new(
+                        lower_ref_term(subject, encoder, vars)?,
+                        lower_ref_term(predicate, encoder, vars)?,
+                        Term::Var(o),
+                    ),
+                    graph.cloned(),
+                );
+            }
+            // Filters, optionals and binds have no meaning in a template.
+            _ => {}
         }
-        // Ignore non-triple patterns in templates (filters, optionals, binds)
     }
+    Ok(())
+}
 
-    Ok(ConstructTemplate::new(patterns))
+/// A template variable standing for the triple term `term` instantiates to,
+/// its nested term registered first.
+fn construct_term_var<E: IriEncoder>(
+    term: &UnresolvedTermPattern,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    out: &mut ConstructTemplate,
+) -> Result<VarId> {
+    let pattern = match &term.o {
+        UnresolvedTermObject::Value { o, dtc } => lower_triple_pattern(
+            &UnresolvedTriplePattern {
+                s: term.s.clone(),
+                p: term.p.clone(),
+                o: o.clone(),
+                dtc: dtc.clone(),
+            },
+            encoder,
+            vars,
+        )?,
+        UnresolvedTermObject::Term(inner) => {
+            let o = construct_term_var(inner, encoder, vars, out)?;
+            TriplePattern::new(
+                lower_ref_term(&term.s, encoder, vars)?,
+                lower_ref_term(&term.p, encoder, vars)?,
+                Term::Var(o),
+            )
+        }
+    };
+    let var = vars.get_or_insert(&format!("?__tt{}", vars.len()));
+    out.push_term_template(var, pattern);
+    Ok(var)
 }
 
 // ============================================================================
@@ -1771,6 +1963,12 @@ fn lower_function_name(name: &str) -> Function {
         "datatype" => Function::Datatype { strict: false },
         "langmatches" => Function::LangMatches,
         "sameterm" => Function::SameTerm,
+        // RDF 1.2 triple terms (SPARQL's TRIPLE, SUBJECT, PREDICATE, OBJECT, isTRIPLE)
+        "triple" => Function::Triple,
+        "subject" => Function::TripleSubject,
+        "predicate" => Function::TriplePredicate,
+        "object" => Function::TripleObject,
+        "istriple" | "is-triple" => Function::IsTriple,
         // Fluree-specific: transaction time
         "t" => Function::T,
         "op" => Function::Op,
@@ -2006,30 +2204,63 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 /// post-aggregation binds).
 ///
 /// `post_binds` are derived bindings that fire after every aggregate has
-/// been computed; they ride inside the resulting `Aggregation`. Both top-level
+/// been computed and HAVING has filtered the groups; they ride in the
+/// resulting `Grouping`'s `binds`. Both top-level
 /// and subquery callers populate them from post-aggregation SELECT expressions.
+///
+/// The spec edges get SPARQL 1.1 semantics, as on the SPARQL surface (both
+/// share the IR helpers):
+/// - in a grouping query, a `having` / `orderBy` read of a non-key variable
+///   means `SAMPLE(?v)` (§18.2.4.1), so `ordering` may be rewritten;
+/// - a `having` on a query that does not group is a filter over its solutions
+///   (§18.2.4.2), appended to `patterns`; it cannot see the query's SELECT
+///   expressions (`select_aliases`).
 fn lower_grouping(
     opts: &UnresolvedOptions,
     vars: &mut VarRegistry,
     post_binds: Vec<(VarId, Expression)>,
+    patterns: &mut Vec<Pattern>,
+    ordering: &mut [SortSpec],
+    select_aliases: &std::collections::HashSet<VarId>,
 ) -> Result<Option<Grouping>> {
     let group_by: Vec<VarId> = opts
         .group_by
         .iter()
         .map(|v| vars.get_or_insert(v))
         .collect();
-    let aggregates: Vec<AggregateSpec> = opts
+    let mut aggregates: Vec<AggregateSpec> = opts
         .aggregates
         .iter()
         .map(|a| lower_aggregate_spec(a, vars))
         .collect();
-    let having = opts
+    let mut having = opts
         .having
         .as_ref()
         .map(|e| lower_filter_expr(e, vars))
         .transpose()?;
 
-    Ok(Grouping::assemble(group_by, aggregates, post_binds, having))
+    if group_by.is_empty() && aggregates.is_empty() {
+        if let Some(having) = having.take() {
+            patterns.push(crate::ir::having_as_filter(
+                having,
+                select_aliases,
+                &mut |_| vars.get_or_insert(&format!("?__having_unbound_{}", vars.len())),
+            ));
+        }
+    } else {
+        crate::ir::sample_ungrouped_reads(
+            &group_by,
+            &mut aggregates,
+            having.as_mut(),
+            &mut [],
+            ordering,
+            || crate::ir::pattern::produced_vars_of(patterns),
+            &mut |_| vars.get_or_insert(&format!("?__sample_{}", vars.len())),
+        );
+    }
+
+    Grouping::assemble(group_by, aggregates, post_binds, having)
+        .map_err(|e| ParseError::InvalidOption(format!("grouping: {e}")))
 }
 
 #[cfg(test)]

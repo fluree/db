@@ -1,0 +1,51 @@
+{
+  "bucket": "fluree-glue-it",
+  "database": "glue_it",
+  "non_iceberg_tables": [
+    {
+      "location": "s3://fluree-glue-it/warehouse/glue_it.db/hive_table",
+      "name": "hive_table",
+      "parameters": {
+        "classification": "parquet"
+      },
+      "table_type": "EXTERNAL_TABLE"
+    }
+  ],
+  "orphan_metadata_file": "00099-29a82d10-53c5-4d92-beae-155afdf7512c.metadata.json",
+  "tables": [
+    {
+      "location": "s3://fluree-glue-it/warehouse/glue_it.db/customers",
+      "name": "customers",
+      "parameters": {
+        "metadata_location": "s3://fluree-glue-it/warehouse/glue_it.db/customers/metadata/00001-18be1726-cedc-424e-b776-9049538b6b34.metadata.json",
+        "previous_metadata_location": "s3://fluree-glue-it/warehouse/glue_it.db/customers/metadata/00000-1a621bc8-030f-46ba-a423-905879cb508d.metadata.json",
+        "table_type": "ICEBERG"
+      },
+      "rows": 50,
+      "table_type": "EXTERNAL_TABLE"
+    },
+    {
+      "location": "s3://fluree-glue-it/warehouse/glue_it.db/orders",
+      "name": "orders",
+      "parameters": {
+        "metadata_location": "s3://fluree-glue-it/warehouse/glue_it.db/orders/metadata/00002-f1d37ded-fe51-4279-9866-205a27c90725.metadata.json",
+        "previous_metadata_location": "s3://fluree-glue-it/warehouse/glue_it.db/orders/metadata/00001-4e95e719-fdef-4a15-a0e5-99c34cb3ddb4.metadata.json",
+        "table_type": "ICEBERG"
+      },
+      "rows": 200,
+      "table_type": "EXTERNAL_TABLE"
+    },
+    {
+      "location": "s3://fluree-glue-it/warehouse/glue_it.db/orders_orphan",
+      "name": "orders_orphan",
+      "parameters": {
+        "metadata_location": "s3://fluree-glue-it/warehouse/glue_it.db/orders_orphan/metadata/00001-5e96c9fa-5013-4629-901e-eaf361ff26b8.metadata.json",
+        "previous_metadata_location": "s3://fluree-glue-it/warehouse/glue_it.db/orders_orphan/metadata/00000-84de4cfb-0e97-4366-881d-8b7ff5c7c9f8.metadata.json",
+        "table_type": "ICEBERG"
+      },
+      "rows": 100,
+      "table_type": "EXTERNAL_TABLE"
+    }
+  ],
+  "warehouse": "s3://fluree-glue-it/warehouse"
+}

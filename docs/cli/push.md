@@ -76,6 +76,7 @@ error: no upstream configured for 'mydb:main'
 | No upstream configured | Run `fluree upstream set <ledger> <remote>` first |
 | Push rejected (409) | Remote head changed, histories diverged, or first commit `t` does not match next-t |
 | Push rejected (422) | Invalid commit bytes, missing required referenced blob, or retraction invariant violation |
+| Push rejected (422, `err:db/DatatypeLimitExceeded`) | The commits would bring the remote ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit) |
 | History contains a merge | The remote does not support pushing merges. Upgrade the remote server. |
 | 404 for a push containing a merge | The remote advertises support, but the node that handled the request does not have it. A node may still be on an earlier release. |
 

@@ -48,9 +48,9 @@ pub use runner::ExecutableQuery;
 
 // Re-export internal helpers for use in lib.rs
 pub use where_plan::build_where_operators_seeded;
-pub(crate) use where_plan::collect_var_stats;
-pub use where_plan::expand_edge_annotation_patterns;
+
 pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block};
+pub use where_plan::{expand_edge_annotation_patterns, expand_edge_annotation_patterns_for};
 
 // Re-export operator tree builder and runner for custom execution pipelines
 pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
@@ -115,6 +115,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -146,6 +147,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -161,8 +163,9 @@ mod tests {
         );
     }
 
+    /// A sort key nothing binds orders nothing: dropped, not a plan error.
     #[test]
-    fn test_build_operator_tree_validates_sort_vars() {
+    fn test_build_operator_tree_drops_sort_keys_nothing_binds() {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -170,12 +173,13 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             reasoning: ReasoningConfig::default(),
             grouping: None,
-            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            ordering: vec![SortSpec::asc(VarId(99))], // nothing binds ?99
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
         };
@@ -185,10 +189,7 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("Sort variable")),
-            Ok(_) => panic!("Expected error for invalid sort var"),
-        }
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
@@ -349,10 +350,16 @@ mod tests {
         let a = ObjectBounds {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
+            term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
+            term_predicate: None,
+            term_subject: None,
+            term_object: None,
         };
 
         let merged = merge_object_bounds(&a, &b);

@@ -10,7 +10,8 @@ use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, 
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
-    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
+    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI,
+    TXN_META_GRAPH_ID,
 };
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
@@ -41,7 +42,7 @@ impl Fluree {
     /// so the ledger_id always matches the nameservice alias.
     ///
     /// Supported fragments:
-    /// - *(none)* → default graph (g_id = 0)
+    /// - *(none)* or `#urn:default` → default graph (g_id = 0)
     /// - `#txn-meta` → txn metadata graph (g_id = 1)
     /// - `#config` → ledger config graph (g_id = 2)
     /// - `#<iri>` → user-defined named graph by exact IRI
@@ -53,12 +54,13 @@ impl Fluree {
             None => Ok((ledger_id, GraphRef::Default)),
             Some((ledger_id, frag)) => {
                 if ledger_id.is_empty() {
-                    return Err(ApiError::query("Missing ledger before '#'"));
+                    return Err(ApiError::invalid_query("Missing ledger before '#'"));
                 }
                 if frag.is_empty() {
-                    return Err(ApiError::query("Missing named graph after '#'"));
+                    return Err(ApiError::invalid_query("Missing named graph after '#'"));
                 }
                 match frag {
+                    DEFAULT_GRAPH_IRI => Ok((ledger_id, GraphRef::Default)),
                     "txn-meta" => Ok((ledger_id, GraphRef::TxnMeta)),
                     // The config graph is reserved and slot-addressed exactly
                     // like `txn-meta`; the baseline gave `txn-meta` a fragment
@@ -103,7 +105,7 @@ impl Fluree {
                         .as_ref()
                         .and_then(|s| s.graph_id_for_iri(&iri))
                 })
-                .ok_or_else(|| ApiError::query(format!("Unknown named graph '#{iri}'")))?,
+                .ok_or_else(|| ApiError::GraphNotFound(format!("<{iri}>")))?,
         };
 
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {
@@ -425,6 +427,26 @@ impl Fluree {
                         .augment_namespace_codes(view.snapshot.namespaces())
                         .map_err(|e| ApiError::internal(format!("augment namespace codes: {e}")))?;
                     store.set_ns_split_mode(view.snapshot.ns_split_mode());
+                    let store = Arc::new(store);
+                    if view.snapshot.has_annotations {
+                        if let Some(novelty) = view.novelty.as_mut() {
+                            let base = fluree_db_novelty::LinkBase::new(
+                                Arc::new(fluree_db_query::IndexAttachments::new(Arc::clone(
+                                    &store,
+                                ))),
+                                view.snapshot.t,
+                            );
+                            Arc::make_mut(novelty)
+                                .set_attachment_base(base)
+                                .map_err(|e| {
+                                    ApiError::internal(format!("derive reification links: {e}"))
+                                })?;
+                            // The view reads novelty through `overlay`, which
+                            // still holds the copy without links.
+                            view.overlay =
+                                Arc::clone(novelty) as Arc<dyn fluree_db_core::OverlayProvider>;
+                        }
+                    }
 
                     // Populate dict novelty safely (persisted dict wins).
                     populate_dict_novelty_from_view(
@@ -433,7 +455,7 @@ impl Fluree {
                         view.novelty.as_ref(),
                     )?;
                     view.dict_novelty = Some(Arc::new(dict_novelty));
-                    view.binary_store = Some(Arc::new(store));
+                    view.binary_store = Some(store);
 
                     // Historical views loaded from an index root are metadata-only by default
                     // (`LedgerSnapshot::from_root_bytes` sets `range_provider = None`).
@@ -742,11 +764,13 @@ impl Fluree {
         let (base_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
         let gs_id = fluree_db_core::LedgerId::parse(base_id)?;
 
+        // A drop leaves the record as a tombstone.
         let Some(record) = self
             .nameservice()
             .lookup_graph_source(&gs_id)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
+            .filter(|record| !record.retracted)
         else {
             return Ok(None);
         };

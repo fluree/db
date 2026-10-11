@@ -14,8 +14,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::{
-    format, Batch, FormatterConfig, FuelExceededError, OverlayProvider, PolicyContext, PolicyStats,
-    Tracker, TrackingTally, VarRegistry,
+    format, Batch, FormatterConfig, FuelExceededError, GraphDb, OverlayProvider, PolicyContext,
+    PolicyStats, Tracker, TrackingTally, VarRegistry,
 };
 
 use fluree_db_binary_index::BinaryGraphView;
@@ -51,6 +51,9 @@ pub struct QueryExecutionOptions {
     /// Same contract as `GovernanceOptions::server_identity`: set by an auth
     /// layer, never derived from the request body or headers.
     pub server_identity: Option<VerifiedIdentity>,
+    /// SPARQL parameters: variable name → JSON-LD value, substituted into the
+    /// parsed query before lowering (see [`fluree_db_sparql::substitute_params`]).
+    params: Option<Arc<fluree_db_sparql::ParamMap>>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
 }
 
@@ -60,6 +63,7 @@ impl fmt::Debug for QueryExecutionOptions {
             .field("cancellation", &self.cancellation)
             .field("trust_fk_refs", &self.trust_fk_refs)
             .field("server_identity", &self.server_identity)
+            .field("params", &self.params)
             .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
             .finish()
     }
@@ -91,6 +95,28 @@ impl QueryExecutionOptions {
     pub fn with_server_identity(mut self, identity: VerifiedIdentity) -> Self {
         self.server_identity = Some(identity);
         self
+    }
+
+    /// Bind SPARQL variables to values for this query: each named variable
+    /// (`?name` or `$name`) is replaced by its value wherever it appears. A
+    /// name the query does not mention is an error, as are parameters on a
+    /// JSON-LD query.
+    pub fn with_params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.params = (!params.is_empty()).then(|| Arc::new(params));
+        self
+    }
+
+    /// The SPARQL parameters for `input`; JSON-LD queries take none.
+    pub(crate) fn sparql_params(
+        &self,
+        input: &crate::view::QueryInput<'_>,
+    ) -> crate::Result<Option<&fluree_db_sparql::ParamMap>> {
+        match (&self.params, input) {
+            (Some(_), crate::view::QueryInput::JsonLd(_)) => Err(crate::ApiError::invalid_query(
+                "parameters apply to SPARQL queries; a JSON-LD query takes its values in the query",
+            )),
+            (params, _) => Ok(params.as_deref()),
+        }
     }
 
     /// Attach an opaque guard that lives as long as these execution options.
@@ -587,6 +613,47 @@ impl QueryResult {
         config: &FormatterConfig,
     ) -> format::Result<JsonValue> {
         format::format_results_async(self, &self.context, db, config, None, None).await
+    }
+
+    /// Format against a view, filtered by whatever policy that view carries.
+    ///
+    /// Prefer this over [`Self::format_async`] and [`Self::format_async_with_policy`]
+    /// whenever a `&GraphDb` is in hand. Those take a `GraphDbRef`, which does not
+    /// carry policy, so the caller has to remember to pass it separately; three of
+    /// the sites that forgot were the hydration bypasses fixed in #1935.
+    pub async fn format_async_for_view(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            None,
+        )
+        .await
+    }
+
+    /// Tracked twin of [`Self::format_async_for_view`]: hydration counts fuel and
+    /// policy against `tracker`.
+    pub async fn format_async_for_view_tracked(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            Some(tracker),
+        )
+        .await
     }
 
     // ========================================================================

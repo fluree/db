@@ -89,9 +89,12 @@ async fn head_t(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> i64 {
 }
 
 fn assert_shacl_violation(err: ApiError, context: &str) {
+    let ApiError::Transact(TransactError::ShaclViolation(violations)) = err else {
+        panic!("{context}: expected ShaclViolation, got: {err:?}");
+    };
     assert!(
-        matches!(err, ApiError::Transact(TransactError::ShaclViolation(_))),
-        "{context}: expected ShaclViolation, got: {err:?}"
+        !violations.results().is_empty(),
+        "{context}: the rejection keeps its results: {violations:?}"
     );
 }
 

@@ -308,7 +308,22 @@ curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
   }'
 ```
 
-### SPARQL (headers — no `opts` block in SPARQL)
+### SPARQL (pragmas or headers)
+
+SPARQL carries the same options as `# PRAGMA` comments in the query text (see
+[Request options](../query/sparql.md#request-options--pragma)). On an
+unauthenticated request they win over the headers below; on an authenticated one,
+a policy pragma may only repeat the selection the headers make:
+
+```sparql
+# PRAGMA identity: ex:aliceIdentity
+# PRAGMA policy-class: ex:CorpPolicy
+# PRAGMA default-allow: false
+PREFIX ex: <http://example.org/ns/>
+SELECT ?name WHERE { ?p <http://schema.org/name> ?name }
+```
+
+Or as headers:
 
 ```bash
 curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \

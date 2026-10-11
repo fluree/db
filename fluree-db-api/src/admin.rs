@@ -15,9 +15,10 @@ use fluree_db_core::ContentId;
 use fluree_db_core::{format_ledger_id, DEFAULT_BRANCH};
 use fluree_db_core::{InstanceId, LedgerId, LedgerName, StorageNamespace, StorageRoot};
 use fluree_db_indexer::{
-    current_sibling_heads, execute_sweep, nested_roots, plan_garbage, plan_sweep,
-    rebuild_index_from_commits_with_tracker, release_garbage_plan, shared_refs_of_branches,
-    siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
+    current_sibling_heads, execute_sweep, nested_namespaces, nested_prefixes, plan_garbage,
+    plan_sweep, rebuild_index_from_commits_with_tracker, release_garbage_plan,
+    shared_refs_of_branches, siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard,
+    SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::lifecycle::{self, BranchDrop};
 use fluree_db_nameservice::{
@@ -226,6 +227,8 @@ pub struct DropNamedGraphReport {
     /// Current commit `t` for the branch after the drop. Equal to the
     /// pre-drop `t` when `committed = false`.
     pub t: i64,
+    /// The drop commit's id; `None` when `committed = false`.
+    pub commit_id: Option<ContentId>,
 }
 
 /// Options for [`Fluree::sync_named_graph`].
@@ -237,6 +240,8 @@ pub struct SyncGraphOpts {
     /// graph. Off by default so a truncated or accidentally-empty export
     /// cannot silently wipe the graph.
     pub allow_empty: bool,
+    /// Recorded as the commit's `f:message`.
+    pub message: Option<String>,
 }
 
 /// Report of a [`Fluree::sync_named_graph`] call.
@@ -260,6 +265,8 @@ pub struct SyncGraphReport {
     /// Whether a new commit was created. `false` when the payload matched
     /// the graph exactly, and always `false` for a dry run.
     pub committed: bool,
+    /// The new commit, when `committed`.
+    pub commit_id: Option<fluree_db_core::ContentId>,
     /// Whether this was a dry run (staged and counted, nothing committed).
     pub dry_run: bool,
     /// Current commit `t` for the branch after the call. Equal to the
@@ -1407,6 +1414,7 @@ impl crate::Fluree {
             retracted,
             committed,
             t: new_t,
+            commit_id: committed.then(|| result.receipt.commit_id.clone()),
         })
     }
 
@@ -1549,15 +1557,25 @@ impl crate::Fluree {
                 asserted,
                 retracted,
                 committed: false,
+                commit_id: None,
                 dry_run: true,
                 t: staged_against_t,
             });
         }
 
+        let mut commit_opts = fluree_db_transact::CommitOpts::default();
+        if let Some(message) = opts.message {
+            commit_opts = commit_opts.with_txn_meta(vec![fluree_db_core::TxnMetaEntry::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                "message",
+                fluree_db_core::TxnMetaValue::string(message),
+            )]);
+        }
         let mut builder = self
             .stage(&handle)
             .sync_graph_payload(graph.clone(), payload, opts.allow_empty)
-            .txn_opts(txn_opts);
+            .txn_opts(txn_opts)
+            .commit_opts(commit_opts);
         if let Some(policy) = policy {
             builder = builder.policy(policy);
         }
@@ -1591,6 +1609,7 @@ impl crate::Fluree {
             asserted: result.receipt.assert_count,
             retracted: result.receipt.retract_count,
             committed,
+            commit_id: committed.then_some(result.receipt.commit_id),
             dry_run: false,
             t,
         })
@@ -1630,6 +1649,15 @@ impl crate::Fluree {
             .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
             .await?;
         Ok(!flakes.is_empty())
+    }
+
+    /// Whether the ledger holds, or has held, an RDF 1.2 edge annotation
+    /// (indexed or in novelty). Lets a reader skip annotation lookups on the
+    /// many ledgers that have none.
+    pub async fn has_annotations(&self, ledger_id: &str) -> Result<bool> {
+        let handle = self.ledger_cached(ledger_id).await?;
+        let ledger = handle.snapshot().await.to_ledger_state();
+        Ok(ledger.snapshot.has_annotations || ledger.novelty.has_annotations())
     }
 
     /// Stop indexing the branch and delete its own artifacts. Returns the
@@ -1803,7 +1831,7 @@ impl crate::Fluree {
     /// Delete the branch-scoped storage artifacts for a single branch.
     ///
     /// Enumerates the per-branch subprefixes (`commit/`, `txn/`, `index/`,
-    /// `config/`). Cross-branch `@shared/dicts/` is **not** touched here —
+    /// `config/`, `blob/`). Cross-branch `@shared/dicts/` is **not** touched here —
     /// `drop_ledger` cleans it up via [`drop_shared_artifacts`] once every
     /// branch has been dropped.
     ///
@@ -1842,11 +1870,10 @@ impl crate::Fluree {
         // to delete rather than guess: leftovers are recoverable, deleting
         // another ledger's data is not.
         let foreign: Vec<String> = match self.nameservice().all_records().await {
-            Ok(records) => nested_roots(&records, namespace.root())
-                .iter()
-                // The whole root: its branches and its `@shared/` namespace alike.
-                .map(|root| format!("fluree:{storage_method}://{root}/"))
-                .collect(),
+            Ok(records) => nested_prefixes(
+                storage_method,
+                &nested_namespaces(&records, namespace.root()),
+            ),
             Err(e) => {
                 warnings.push(format!(
                     "Not deleting artifacts for '{ledger_id}': could not list ledgers to exclude nested ones: {e}"
@@ -1860,12 +1887,14 @@ impl crate::Fluree {
         // each lists one tier. `index/` covers index roots, garbage,
         // and all object subkinds (branches, leaves, dicts when per-branch);
         // `config/` covers the LedgerConfig blob and the default-context blob,
-        // both stored as `ContentKind::LedgerConfig`.
+        // both stored as `ContentKind::LedgerConfig`; `blob/` holds every kind
+        // with no layout of its own, which includes the legacy edge-annotation arenas.
         let subprefixes = vec![
             format!("fluree:{storage_method}://{branch_prefix}/commit/"),
             format!("fluree:{storage_method}://{branch_prefix}/txn/"),
             format!("fluree:{storage_method}://{branch_prefix}/index/"),
             format!("fluree:{storage_method}://{branch_prefix}/config/"),
+            format!("fluree:{storage_method}://{branch_prefix}/blob/"),
         ];
 
         let mut total = 0usize;
@@ -2498,8 +2527,7 @@ impl crate::Fluree {
         // background build racing this reindex may have published between
         // the lookup above and the cancel. The stale record's
         // `index_head_id` (None, or an older root) would make the rebuild
-        // lose sight of the just-published root — including a sealed
-        // annotation arena the Augment merge in root assembly needs.
+        // lose sight of the just-published root.
         let record = self
             .nameservice()
             .lookup(&ledger_id)
@@ -2511,27 +2539,6 @@ impl crate::Fluree {
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
 
-        // Resolve attachment events and read fulltext config off a single
-        // `LedgerState` load so the reindex doesn't pay for two snapshot
-        // hydrations on the non-annotation hot path.
-        //
-        // **Attachment-events resolution.** The rebuild path
-        // (`rebuild_index_from_commits`) only consumes the concrete
-        // `IndexerConfig.attachment_events` field; the `attachment_events_provider`
-        // trait is consumed only by the orchestrator's per-job dispatch
-        // loop. So we resolve here whenever no concrete envelope is set,
-        // preferring a caller-supplied provider over the API's own and
-        // falling back to the API provider when neither is supplied.
-        // (A caller-supplied **concrete** envelope is respected as-is.)
-        //
-        // **Sticky-bit gate.** We only resolve for ledgers that have
-        // actually observed a `f:reifies*` flake. On non-annotation
-        // ledgers, going through the provider has been observed to
-        // disturb novelty bookkeeping for unrelated facts
-        // (regression caught by
-        // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`).
-        // The gate keeps the M2b arena-seal path intact for annotation
-        // ledgers while restoring the pre-M2b behavior elsewhere.
         let ledger_state = match self.ledger(&ledger_id).await {
             Ok(state) => Some(state),
             Err(e) => {
@@ -2542,59 +2549,6 @@ impl crate::Fluree {
                 None
             }
         };
-
-        if indexer_config.attachment_events.is_none() {
-            let ledger_has_annotations = ledger_state
-                .as_ref()
-                .map(|st| st.snapshot.has_annotations || st.novelty.attachments.has_annotations())
-                .unwrap_or(false);
-            if ledger_has_annotations {
-                // Caller-supplied provider wins; fall back to the API's
-                // own provider. The provider trait is consumed via a
-                // ref so we don't `take()` either field — the trait
-                // implementation may itself be reusable downstream.
-                let caller_provider = indexer_config.attachment_events_provider.as_deref();
-                let api_provider = self.attachment_events_provider();
-                let chosen_caller = caller_provider;
-                let chosen_api = api_provider.as_ref().map(AsRef::as_ref);
-                let provider_ref: Option<&dyn fluree_db_indexer::AttachmentEventsProvider> =
-                    chosen_caller.or(chosen_api);
-                if let Some(provider) = provider_ref {
-                    // Pre-load via the cached path so the provider's
-                    // `try_running_attachment_events` finds the running
-                    // ledger handle even when the only LedgerState we
-                    // hold above came from a fresh-load.
-                    let _ = self.ledger_cached(&ledger_id).await;
-                    indexer_config.attachment_events = provider.attachment_events(&ledger_id).await;
-                }
-                // No provider (the CLI's client carries no ledger manager) or
-                // the provider found nothing: derive coverage from the ledger
-                // state loaded above the way the provider would, including the
-                // base-index bootstrap for a fresh bulk import. Without this
-                // the indexer receives `None`, seals no arena, and every
-                // quoted-triple query on the imported ledger takes the
-                // generic join chain.
-                #[cfg(not(target_arch = "wasm32"))]
-                if indexer_config.attachment_events.is_none() {
-                    if let Some(state) = ledger_state.as_ref() {
-                        indexer_config.attachment_events =
-                            crate::indexer_attachment_provider::attachment_events_from_state(state)
-                                .await;
-                    }
-                }
-                match indexer_config.attachment_events.as_ref() {
-                    Some(fluree_db_indexer::AttachmentEventCoverage::Authoritative(ev)) => {
-                        info!(ledger_id = %ledger_id, events = ev.len(), "reindex: sealing annotation arena from authoritative attachment events");
-                    }
-                    Some(fluree_db_indexer::AttachmentEventCoverage::Augment(ev)) => {
-                        info!(ledger_id = %ledger_id, events = ev.len(), "reindex: augmenting the previous annotation arena");
-                    }
-                    Some(fluree_db_indexer::AttachmentEventCoverage::Unknown) | None => {
-                        tracing::warn!(ledger_id = %ledger_id, "reindex: no attachment-event coverage resolved; annotation arena will not be sealed this pass");
-                    }
-                }
-            }
-        }
 
         // Read the current ledger's `f:fullTextDefaults` so the reindex routes
         // configured plain-string values into BM25 arena building. Reuses the
@@ -2902,9 +2856,9 @@ impl crate::Fluree {
     /// no prefix to scan — but dict blobs are shared across a ledger's
     /// branches, so omitting one would reclaim dicts it still reads.
     ///
-    /// Also returns the ledger's storage root, and the roots of the other
-    /// ledgers whose storage nests under it (see [`nested_roots`]), from the
-    /// same listing.
+    /// Also returns the ledger's storage root, and the branches of the other
+    /// ledgers whose storage nests under it (see [`nested_namespaces`]), from
+    /// the same listing.
     async fn hold_ledger_for_maintenance(
         &self,
         ledger_name: &LedgerName,
@@ -2912,7 +2866,7 @@ impl crate::Fluree {
         Vec<MaintenanceGuard>,
         Vec<BranchIndexHead>,
         StorageRoot,
-        Vec<StorageRoot>,
+        Vec<StorageNamespace>,
     )> {
         let all = self.nameservice().all_records().await?;
         let records: Vec<_> = all
@@ -2926,7 +2880,7 @@ impl crate::Fluree {
                 "Ledger not found: {ledger_name}"
             )));
         };
-        let nested = nested_roots(&all, &root);
+        let nested = nested_namespaces(&all, &root);
 
         // Holds are per-branch, so a ledger-wide sweep must hold them all.
         // Guards release on drop, so an early return frees whatever was taken.

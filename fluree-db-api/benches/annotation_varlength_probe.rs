@@ -9,13 +9,14 @@
 //! `*1..1` is 1 hop, `*1..3` is 1+2+3 = 6, `*1..5` is 15 — so anything paid
 //! *per probe operator* is multiplied by that count.
 //!
-//! Each probe plans to an `AnnotationValueOptionalBuilder`
-//! (`fluree-db-query/src/optional.rs`), which answers its rows from sidecar
-//! maps drained out of the three `f:reifies*` predicates. The drain is
-//! O(#annotations in the ledger) and is **independent of the result size**, so
-//! it is the term this bench is built to hold down: the scenarios below bind a
-//! relationship variable and never read an edge property, which is the shape
-//! that pays the drain for nothing.
+//! Each probe expands to the reifier's `rdf:reifies` link, its term
+//! components and an existence check on the base edge, which the OPTIONAL
+//! batched hash-join lane (`PlanTreeOptionalBuilder::build_batch`,
+//! `fluree-db-query/src/optional.rs`) evaluates once per batch of driving rows
+//! rather than per row. Whatever a probe operator pays up front is
+//! **independent of the result size**, so it is the term this bench is built
+//! to hold down: the scenarios below bind a relationship variable and never
+//! read an edge property.
 //!
 //! ## Scenarios
 //!
@@ -24,28 +25,28 @@
 //!
 //! 1. **`unbound_1_3`** — `-[:KNOWS*1..3]->` with no relationship variable.
 //!    Zero probes: the floor, and the control for scenarios 2-4.
-//! 2. **`bound_1_1`** — `-[rs:KNOWS*1..1]->`. One probe — one sidecar drain.
+//! 2. **`bound_1_1`** — `-[rs:KNOWS*1..1]->`. One probe.
 //! 3. **`bound_1_3`** — `-[rs:KNOWS*1..3]->`. Six probes.
 //! 4. **`bound_1_5`** — `-[rs:KNOWS*1..5]->`. Fifteen probes.
 //!
-//! With a per-query sidecar cache, 2-4 all cost one drain and the gap between
-//! them is join work only. Without one, 3 and 4 are 6x and 15x scenario 2, and
-//! every multiple grows with the ledger's annotation count rather than with
-//! anything the query asked for. That divergence is what a regression here
-//! means.
+//! The gap between 2-4 should be join work only. If a probe starts paying in
+//! proportion to the ledger's annotation count (a scan of every link, say),
+//! 3 and 4 become 6x and 15x scenario 2 and every multiple grows with the
+//! ledger rather than with anything the query asked for. That divergence is
+//! what a regression here means.
 //!
 //! ## Setup discipline
 //!
 //! Mirrors `query_hot_optional.rs`: build once per scale, populate a
 //! file-backed ledger, full reindex behind the binary columnar index, then
 //! reuse one `GraphDb` for every `b.iter` call (warm-cache). Indexed matters —
-//! the sidecar drain runs as ordinary planned scans, and an unindexed ledger
-//! answers them from novelty instead.
+//! the link reads take the index lanes, and an unindexed ledger answers them
+//! from novelty instead.
 //!
 //! ## Matrix
 //!
 //!   inputs:    BenchScale -> n_claims, reified `KNOWS` edges NOT reachable
-//!              from the anchor, so they inflate the sidecar without
+//!              from the anchor, so they inflate the link set without
 //!              inflating the result (Tiny=1_000, Small=5_000, Medium=20_000,
 //!              Large=50_000), plus a 5-hop reified anchor chain
 //!   metric:    ns/query (criterion default)
@@ -83,7 +84,7 @@ fn scale_n_claims(scale: BenchScale) -> usize {
 }
 
 /// Zero probes: the range binds no relationship variable, so the lowering
-/// emits plain join chains and never touches the annotation sidecar.
+/// emits plain join chains and never reads a link.
 const Q_UNBOUND_1_3: &str = r#"MATCH (a:Person {name: "Anchor"})-[:KNOWS*1..3]->(b) RETURN b"#;
 
 /// One probe. The pre-existing single-hop cost, and the unit scenarios 3 and 4
@@ -120,8 +121,8 @@ fn anchor_chain() -> Vec<JsonValue> {
 }
 
 /// One batch of reified `KNOWS` edges over disjoint node pairs — unreachable
-/// from the anchor, so they enlarge the `f:reifies*` sidecar (and therefore
-/// every drain) without enlarging any scenario's result.
+/// from the anchor, so they enlarge the ledger's link set without enlarging
+/// any scenario's result.
 fn claim_batch(start: usize, end: usize) -> JsonValue {
     let graph: Vec<JsonValue> = (start..end)
         .map(|i| {

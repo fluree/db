@@ -861,34 +861,13 @@ async fn run_source_import(
         .await
         .map_err(|e| e.to_string())?;
 
-    // The bulk-imported root carries `annotation_index: None`. One reindex
-    // through the api's attachment provider runs the bulk-import bootstrap
-    // scan and seals an authoritative annotation arena, so relationship-
-    // binding queries take the arena probe instead of scan-fallback —
-    // mirroring what `fluree create --from` does after a local import.
-    let sealed_root_id = if result.has_annotations {
-        Some(
-            state
-                .fluree
-                .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
-                .await
-                .map_err(|e| format!("post-import annotation-arena seal (reindex): {e}"))?
-                .root_id,
-        )
-    } else {
-        None
-    };
-
     Ok(serde_json::json!({
         "kind": "bulk-import",
         "ledger_id": result.ledger_id,
         "t": result.t,
         "flake_count": result.flake_count,
         "commit_head_id": result.commit_head_id.to_string(),
-        "root_id": sealed_root_id
-            .as_ref()
-            .or(result.root_id.as_ref())
-            .map(std::string::ToString::to_string),
+        "root_id": result.root_id.as_ref().map(std::string::ToString::to_string),
         "index_t": result.index_t,
         "has_annotations": result.has_annotations,
     }))

@@ -98,6 +98,8 @@ All Fluree Bearer tokens (Mode 2 and Mode 3) share the same claim set. The serve
 
 Scopes control which endpoints and ledgers a token can access.
 
+Ledger lists hold ledger IDs, parsed when the token is verified. A bare name means its `main` branch (`mydb` grants `mydb:main`), and no scope covers every branch of a ledger. An entry that is not a valid ledger ID grants nothing; [`GET /v1/fluree/whoami`](../operations/admin-and-health.md) reports the scopes a token actually grants.
+
 #### Query scopes (`fluree.ledger.*`)
 
 | Claim | Type | Description |

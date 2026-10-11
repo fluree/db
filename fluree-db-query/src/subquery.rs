@@ -265,6 +265,23 @@ impl SubqueryOperator {
         stats: Option<Arc<StatsView>>,
         planning: PlanningContext,
     ) -> Self {
+        // A sort key nothing in the sub-query binds orders nothing: drop it
+        // once here, not per parent row in `build_inner_plan`.
+        let mut subquery = subquery;
+        let kept = match crate::execute::operator_tree::bindable_sort_keys(
+            &subquery.ordering,
+            Some(&subquery.select),
+            subquery.grouping.as_ref(),
+            &subquery.order_binds,
+            &subquery.patterns,
+            None,
+        ) {
+            std::borrow::Cow::Owned(kept) => Some(kept),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+        if let Some(kept) = kept {
+            subquery.ordering = kept;
+        }
         let parent_schema: HashSet<VarId> = child.schema().iter().copied().collect();
         let subquery_select_vars: HashSet<VarId> = subquery.select.iter().copied().collect();
 
@@ -926,8 +943,7 @@ impl SubqueryOperator {
             Box::new(EmptyOperator::new())
         } else {
             let seed_schema: Arc<[VarId]> = Arc::from(self.join_keys.clone().into_boxed_slice());
-            let seed_row = vec![Binding::Unbound; self.join_keys.len()];
-            Box::new(SeedOperator::from_row(seed_schema, seed_row))
+            Box::new(SeedOperator::placeholder(seed_schema))
         };
 
         self.build_inner_plan(seed)
@@ -951,6 +967,8 @@ impl SubqueryOperator {
             &self.subquery.order_binds,
             &self.subquery.ordering,
             select_vars,
+            // A per-group list never crosses a sub-query boundary.
+            crate::ir::UngroupedProjection::Reject,
             self.subquery.distinct,
             self.subquery.offset,
             self.subquery.limit,

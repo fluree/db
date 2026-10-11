@@ -33,7 +33,7 @@ GRAPH <urn:fluree:mydb:main#config> {
 
 ## Writing from the CLI
 
-`fluree insert` accepts Turtle and JSON-LD but not TriG, so the TriG recipe above is not runnable from the command line. Write the config graph with SPARQL UPDATE through `fluree update` instead:
+`fluree insert` and `fluree upsert` read the TriG recipe above as written, anonymous blank nodes (`[ … ]`) inside the `GRAPH` block included. The same settings can also be written with SPARQL UPDATE through `fluree update`:
 
 ```bash
 fluree update -l mydb:main --format sparql -e '

@@ -686,6 +686,7 @@ impl crate::Fluree {
         graph_source_id: &str,
         as_of_t: i64,
     ) -> Result<Option<SnapshotSelection>> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let manifest = self.load_bm25_manifest(graph_source_id).await?;
 
         match manifest.select_snapshot(as_of_t) {
@@ -707,6 +708,7 @@ impl crate::Fluree {
         graph_source_id: &str,
         as_of_t: i64,
     ) -> Result<(Arc<fluree_db_query::bm25::Bm25Index>, i64)> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let selection = self
             .select_bm25_snapshot(graph_source_id, as_of_t)
             .await?
@@ -732,6 +734,7 @@ impl crate::Fluree {
         &self,
         graph_source_id: &str,
     ) -> Result<Arc<fluree_db_query::bm25::Bm25Index>> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let manifest = self.load_bm25_manifest(graph_source_id).await?;
         let head = manifest.head().ok_or_else(|| {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
@@ -971,6 +974,7 @@ impl crate::Fluree {
     ///
     /// This is a lightweight check that only looks up nameservice records.
     pub async fn check_bm25_staleness(&self, graph_source_id: &str) -> Result<Bm25StalenessCheck> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         // Look up graph source record
         let record = self
             .nameservice()
@@ -1059,6 +1063,7 @@ impl crate::Fluree {
         use fluree_db_core::trace_first_parent_commits_by_id;
         use fluree_db_query::bm25::{CompiledPropertyDeps, IncrementalUpdater};
         use futures::StreamExt;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting BM25 index sync");
 
@@ -1349,6 +1354,7 @@ impl crate::Fluree {
     /// and rebuilds the index from scratch.
     pub async fn resync_bm25_index(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
         use fluree_db_query::bm25::IncrementalUpdater;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting BM25 full resync");
 
@@ -1461,6 +1467,7 @@ impl crate::Fluree {
         Arc<fluree_db_query::bm25::Bm25Index>,
         Option<Bm25SyncResult>,
     )> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         // Look up graph source record
         let record = self
             .nameservice()
@@ -1529,6 +1536,7 @@ impl crate::Fluree {
         timeout_ms: Option<u64>,
     ) -> Result<Bm25SyncResult> {
         use fluree_db_query::bm25::{Bm25IndexBuilder, IncrementalUpdater, PropertyDeps};
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(
             graph_source_id = %graph_source_id,
@@ -1685,6 +1693,7 @@ impl crate::Fluree {
     /// 2. Deletes all snapshot files from storage
     pub async fn drop_full_text_index(&self, graph_source_id: &str) -> Result<Bm25DropResult>
 where {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         info!(graph_source_id = %graph_source_id, "Dropping BM25 full-text index");
 
         // 1. Look up graph source record to verify it exists

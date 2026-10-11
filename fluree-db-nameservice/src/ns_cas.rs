@@ -18,6 +18,7 @@ use fluree_db_core::{CasAction, CasOutcome, StorageCas, StorageRead};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize)]
 struct VersionedFile<T> {
@@ -66,21 +67,23 @@ pub(crate) async fn cas_versioned<S, T>(
 ) -> Result<RegistryCas<T>>
 where
     S: StorageCas + ?Sized,
-    T: Serialize + DeserializeOwned + Clone + Send + Sync,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let written = AtomicU64::new(0);
+    let written = Arc::new(AtomicU64::new(0));
+    let in_cas = Arc::clone(&written);
+    let new_value = new.cloned();
     let outcome = storage
-        .compare_and_swap(key, |bytes| {
+        .compare_and_swap(key, move |bytes| {
             let current: Option<VersionedFile<T>> = bytes.map(deserialize_json).transpose()?;
             let live_version = current.as_ref().and_then(|f| f.value.as_ref().map(|_| f.v));
             if live_version != expected {
                 return Ok(CasAction::Abort(current.and_then(VersionedFile::live)));
             }
             let v = current.as_ref().map_or(1, |f| f.v + 1);
-            written.store(v, Ordering::SeqCst);
+            in_cas.store(v, Ordering::SeqCst);
             let file = VersionedFile {
                 v,
-                value: new.cloned(),
+                value: new_value.clone(),
             };
             Ok(CasAction::Write(serialize_json(&file)?))
         })
@@ -108,11 +111,16 @@ async fn read_record<S: StorageRead + ?Sized>(
         return Ok(None);
     };
     let main: NsFileV2 = serde_json::from_slice(&bytes)?;
+    let Some(ledger_id) =
+        crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, keys.main)
+    else {
+        return Ok(None);
+    };
     let index = match read_bytes(storage, keys.index).await? {
         Some(bytes) => Some(serde_json::from_slice::<NsIndexFileV2>(&bytes)?),
         None => None,
     };
-    main.into_record(index)
+    main.into_record(ledger_id, index)
 }
 
 /// The record as stored, live or not; `None` for no file or a tombstone.
@@ -155,7 +163,7 @@ where
         None => {
             let main_bytes = serialize_json(&NsFileV2::for_record(record))?;
             let outcome = storage
-                .compare_and_swap(keys.main, |bytes| {
+                .compare_and_swap(keys.main, move |bytes| {
                     let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
                     match current {
                         Some(file) if !file.is_deleted() => Ok(CasAction::Abort(())),
@@ -193,15 +201,16 @@ where
     S: StorageCas + StorageRead + ?Sized,
 {
     let index_bytes = serialize_json(&empty_index_file(fence, false))?;
-    let replaced = parking_lot::Mutex::new(None);
+    let replaced = Arc::new(parking_lot::Mutex::new(None));
+    let (in_cas, reset_bytes) = (Arc::clone(&replaced), index_bytes.clone());
     let outcome = storage
-        .compare_and_swap(keys.index, |bytes| {
+        .compare_and_swap(keys.index, move |bytes| {
             let current: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
             match current {
                 Some(file) if file.fence == fence => Ok(CasAction::Abort(())),
                 _ => {
-                    *replaced.lock() = bytes.map(<[u8]>::to_vec);
-                    Ok(CasAction::Write(index_bytes.clone()))
+                    *in_cas.lock() = bytes.map(<[u8]>::to_vec);
+                    Ok(CasAction::Write(reset_bytes.clone()))
                 }
             }
         })
@@ -213,11 +222,11 @@ where
     if owner == fence {
         return Ok(());
     }
-    let Some(previous) = replaced.into_inner() else {
+    let Some(previous) = replaced.lock().take() else {
         return Ok(());
     };
     storage
-        .compare_and_swap(keys.index, |bytes| match bytes {
+        .compare_and_swap(keys.index, move |bytes| match bytes {
             Some(current) if current == index_bytes.as_slice() => {
                 Ok(CasAction::Write(previous.clone()))
             }
@@ -237,10 +246,10 @@ async fn update_fenced<S, F>(
 ) -> Result<FenceOutcome>
 where
     S: StorageCas + ?Sized,
-    F: Fn(&mut NsFileV2) -> std::result::Result<(), FenceOutcome> + Send + Sync,
+    F: Fn(&mut NsFileV2) -> std::result::Result<(), FenceOutcome> + Send + Sync + 'static,
 {
     let outcome = storage
-        .compare_and_swap(main_key, |bytes| {
+        .compare_and_swap(main_key, move |bytes| {
             let Some(data) = bytes else {
                 return Ok(CasAction::Abort(FenceOutcome::Missing));
             };
@@ -289,7 +298,7 @@ where
     }
 
     storage
-        .compare_and_swap(keys.index, |bytes| {
+        .compare_and_swap(keys.index, move |bytes| {
             let file = match bytes.map(deserialize_json::<NsIndexFileV2>).transpose()? {
                 Some(file) if file.fence == Some(fence) => return Ok(CasAction::Abort(())),
                 Some(mut file) if file.fence.is_none() => {
@@ -303,7 +312,7 @@ where
         .await?;
 
     let outcome = storage
-        .compare_and_swap(keys.main, |bytes| {
+        .compare_and_swap(keys.main, move |bytes| {
             let Some(data) = bytes else {
                 return Ok(CasAction::Abort(FenceOutcome::Missing));
             };
@@ -341,7 +350,7 @@ where
     .await?;
     if outcome == FenceOutcome::Applied {
         storage
-            .compare_and_swap(keys.index, |bytes| {
+            .compare_and_swap(keys.index, move |bytes| {
                 let mut file = match bytes.map(deserialize_json::<NsIndexFileV2>).transpose()? {
                     Some(file) if file.fence == Some(fence) => file,
                     _ => empty_index_file(Some(fence), false),

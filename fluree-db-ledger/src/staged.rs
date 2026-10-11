@@ -39,16 +39,17 @@ impl StagedStore {
     fn len(&self) -> usize {
         self.flakes.len()
     }
-
-    fn is_empty(&self) -> bool {
-        self.flakes.is_empty()
-    }
 }
 
 /// Staged overlay - maintains sorted vectors like Novelty, with per-flake graph IDs
 /// for efficient graph filtering.
 struct StagedOverlay {
+    /// The staged flakes, then the links they derive (see
+    /// [`StagedOverlay::with_links`]).
     store: StagedStore,
+    /// How many of `store.flakes` are staged; the rest are derived links,
+    /// which reads see and the commit never carries.
+    staged_len: usize,
     /// Pre-computed GraphId per flake (parallel to store.flakes, same indices)
     flake_graph_ids: Vec<GraphId>,
     spot: Vec<FlakeId>,
@@ -65,17 +66,6 @@ impl StagedOverlay {
         staged_t: i64,
         reverse_graph: &HashMap<Sid, GraphId>,
     ) -> Result<Self, LedgerError> {
-        if flakes.is_empty() {
-            return Ok(Self {
-                store: StagedStore::new(vec![]),
-                flake_graph_ids: vec![],
-                spot: vec![],
-                psot: vec![],
-                post: vec![],
-                opst: vec![],
-            });
-        }
-
         // Single pass: stamp `t` and pre-compute graph IDs for all flakes —
         // strict, no silent fallback. Unknown graph Sids are a programming
         // error (reverse_graph is built from build_reverse_graph() which is
@@ -94,6 +84,29 @@ impl StagedOverlay {
             flake_graph_ids.push(g_id);
         }
 
+        Ok(Self::indexed(flakes, flake_graph_ids))
+    }
+
+    /// Add the links the staged attachment ops derive, each with its graph.
+    fn with_links(self, links: Vec<(GraphId, Flake)>) -> Self {
+        if links.is_empty() {
+            return self;
+        }
+        let staged_len = self.staged_len;
+        let mut flakes = self.store.flakes;
+        let mut flake_graph_ids = self.flake_graph_ids;
+        for (g_id, link) in links {
+            flake_graph_ids.push(g_id);
+            flakes.push(link);
+        }
+        Self {
+            staged_len,
+            ..Self::indexed(flakes, flake_graph_ids)
+        }
+    }
+
+    fn indexed(flakes: Vec<Flake>, flake_graph_ids: Vec<GraphId>) -> Self {
+        let staged_len = flakes.len();
         let store = StagedStore::new(flakes);
         let ids: Vec<FlakeId> = (0..store.len() as FlakeId).collect();
 
@@ -111,14 +124,15 @@ impl StagedOverlay {
         let mut opst = ids;
         opst.sort_by(|&a, &b| IndexType::Opst.compare(store.get(a), store.get(b)));
 
-        Ok(Self {
+        Self {
             store,
+            staged_len,
             flake_graph_ids,
             spot,
             psot,
             post,
             opst,
-        })
+        }
     }
 
     fn get_index(&self, index: IndexType) -> &[FlakeId] {
@@ -222,8 +236,16 @@ impl StagedLedger {
     ) -> Result<Self, LedgerError> {
         let staged_epoch = base.novelty.epoch + 1;
         let staged_t = base.t() + 1;
+        let staged = StagedOverlay::from_flakes(flakes, staged_t, reverse_graph)?;
+        let links = base.novelty.links_for(
+            staged
+                .flake_graph_ids
+                .iter()
+                .copied()
+                .zip(&staged.store.flakes),
+        )?;
         Ok(Self {
-            staged: StagedOverlay::from_flakes(flakes, staged_t, reverse_graph)?,
+            staged: staged.with_links(links),
             staged_epoch,
             content_version: fluree_db_core::overlay::next_overlay_content_version(),
             dicts_cover_staged: false,
@@ -270,17 +292,17 @@ impl StagedLedger {
 
     /// Get the number of staged flakes
     pub fn staged_len(&self) -> usize {
-        self.staged.store.len()
+        self.staged.staged_len
     }
 
     /// Check if there are staged flakes
     pub fn has_staged(&self) -> bool {
-        !self.staged.store.is_empty()
+        self.staged.staged_len > 0
     }
 
     /// Get a reference to the staged flakes
     pub fn staged_flakes(&self) -> &[Flake] {
-        &self.staged.store.flakes
+        &self.staged.store.flakes[..self.staged.staged_len]
     }
 
     /// Each staged flake with the ledger graph id staging routed it to.
@@ -289,7 +311,7 @@ impl StagedLedger {
             .flake_graph_ids
             .iter()
             .copied()
-            .zip(&self.staged.store.flakes)
+            .zip(self.staged_flakes())
     }
 
     /// Get a reference to the underlying database
@@ -299,7 +321,9 @@ impl StagedLedger {
 
     /// Consume the view and return the base state and staged flakes
     pub fn into_parts(self) -> (LedgerState, Vec<Flake>) {
-        (self.base, self.staged.store.flakes)
+        let mut flakes = self.staged.store.flakes;
+        flakes.truncate(self.staged.staged_len);
+        (self.base, flakes)
     }
 
     /// The effective as-of time for this staged view.
@@ -455,10 +479,59 @@ mod tests {
         assert!(!a.dicts_cover_staged());
     }
 
+    /// The links a staged attachment derives are read through the view, and
+    /// the flakes a commit takes from it are only the staged ones.
+    #[test]
+    fn staged_attachments_overlay_links_the_commit_never_carries() {
+        use fluree_db_core::namespaces::{
+            reifies_object_sid, reifies_predicate_sid, reifies_subject_sid,
+        };
+        use fluree_db_core::{is_rdf_reifies, LedgerSnapshot};
+
+        let state = LedgerState::new(LedgerSnapshot::genesis("test:main"), Novelty::new(0));
+        let reifier = Sid::new(100, "r");
+        let slot = |p: &Sid, o: FlakeValue, dt: Sid| {
+            Flake::new(reifier.clone(), p.clone(), o, dt, 1, true, None)
+        };
+        let bundle = vec![
+            slot(
+                reifies_subject_sid(),
+                FlakeValue::Ref(Sid::new(100, "a")),
+                fluree_db_core::edge::id_datatype_sid(),
+            ),
+            slot(
+                reifies_predicate_sid(),
+                FlakeValue::Ref(Sid::new(100, "p")),
+                fluree_db_core::edge::id_datatype_sid(),
+            ),
+            slot(
+                reifies_object_sid(),
+                FlakeValue::String("x".into()),
+                fluree_db_core::edge::xsd_string_datatype_sid(),
+            ),
+        ];
+        let view = StagedLedger::new(state, bundle, &HashMap::new()).unwrap();
+        assert_eq!(view.staged_len(), 3);
+        assert_eq!(view.staged_flakes().len(), 3);
+        assert_eq!(view.staged_flakes_by_graph().count(), 3);
+        let mut links = Vec::new();
+        view.for_each_overlay_flake(0, IndexType::Psot, None, None, true, i64::MAX, &mut |f| {
+            if is_rdf_reifies(&f.p) {
+                links.push(f.clone());
+            }
+        });
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].s, reifier);
+        assert_eq!(links[0].t, 1);
+        let (_, flakes) = view.into_parts();
+        assert_eq!(flakes.len(), 3);
+        assert!(!flakes.iter().any(|f| is_rdf_reifies(&f.p)));
+    }
+
     #[test]
     fn test_staged_overlay_empty() {
         let staged = StagedOverlay::from_flakes(vec![], 1, &HashMap::new()).unwrap();
-        assert!(staged.store.is_empty());
+        assert!(staged.store.flakes.is_empty());
     }
 
     #[test]

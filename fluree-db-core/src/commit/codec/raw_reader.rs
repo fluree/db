@@ -24,6 +24,9 @@ use super::op_codec::ReadDicts;
 use super::reader::load_dicts;
 use super::varint::{decode_varint, read_exact, read_u8, zigzag_decode};
 use super::CodecEnvelope;
+use crate::FlakeValue;
+use fluree_vocab::datatype::KnownDatatype;
+use fluree_vocab::{geo_names, namespaces, xsd_names};
 
 // ============================================================================
 // CommitOps
@@ -159,6 +162,7 @@ pub struct RawOp<'a> {
 }
 
 /// Object value without allocation. Borrows from ops buffer or dicts.
+#[derive(Clone)]
 pub enum RawObject<'a> {
     /// IRI reference: namespace code + local name from object_ref dict.
     Ref { ns_code: u16, name: &'a str },
@@ -204,6 +208,19 @@ pub enum RawObject<'a> {
     GeoPoint { lat: f64, lng: f64 },
     /// Vector of f64 elements (embedding).
     Vector(Vec<f64>),
+    /// An RDF 1.2 triple term.
+    TripleTerm(Box<RawTripleTerm<'a>>),
+}
+
+/// A triple term's components as the commit stores them: names borrowed from
+/// the commit's subject, predicate and datatype dictionaries.
+#[derive(Clone)]
+pub struct RawTripleTerm<'a> {
+    pub s: (u16, &'a str),
+    pub p: (u16, &'a str),
+    pub dt: (u16, &'a str),
+    pub lang: Option<&'a str>,
+    pub o: RawObject<'a>,
 }
 
 impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
@@ -223,6 +240,16 @@ impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
         }
 
         match raw {
+            RawObject::TripleTerm(term) => {
+                let RawTripleTerm { s, p, dt, lang, o } = *term;
+                Ok(FlakeValue::TripleTerm(Box::new(crate::TripleTermValue {
+                    s: Sid::new(s.0, s.1),
+                    p: Sid::new(p.0, p.1),
+                    o: FlakeValue::try_from(o)?,
+                    dt: Sid::new(dt.0, dt.1),
+                    lang: lang.map(str::to_string),
+                })))
+            }
             RawObject::Ref { ns_code, name } => Ok(FlakeValue::Ref(Sid::new(ns_code, name))),
             RawObject::Long(n) => Ok(FlakeValue::Long(n)),
             RawObject::Double(n) => Ok(FlakeValue::Double(n)),
@@ -403,7 +430,11 @@ fn decode_raw_op<'a>(
 
     // Object tag
     let o_tag = OTag::from_u8(read_u8(data, pos)?)?;
-    let o = decode_raw_object(o_tag, data, pos, dicts)?;
+    let o = retype_string_literal(
+        decode_raw_object(o_tag, data, pos, dicts)?,
+        dt_ns_code,
+        dt_name,
+    );
 
     // Flags
     let flags = read_u8(data, pos)?;
@@ -443,6 +474,60 @@ fn decode_raw_op<'a>(
         lang,
         i,
     })
+}
+
+/// Read a string object under a typed XSD datatype as that datatype's value,
+/// and a `geo:wktLiteral` POINT as a geo point.
+///
+/// SPARQL UPDATE used to commit well-typed literals such as
+/// `"2026-09-08"^^xsd:date` as plain strings (#1987), while every other
+/// surface commits the parsed value. Retagging on read gives those commits the
+/// same fact identity, index encoding and query semantics. A lexical that does
+/// not parse as its datatype is an ill-typed literal and stays a string, as
+/// does WKT other than a POINT.
+pub(super) fn retype_string_literal<'a>(
+    raw: RawObject<'a>,
+    dt_ns_code: u16,
+    dt_name: &str,
+) -> RawObject<'a> {
+    let RawObject::Str(lexical) = raw else {
+        return raw;
+    };
+    if dt_ns_code == namespaces::OGC_GEO && dt_name == geo_names::WKT_LITERAL {
+        // Mirrors the wktLiteral arm of `coerce_string_value`, without its
+        // allocation for non-POINT geometries.
+        return match crate::geo::try_extract_point(lexical) {
+            Some((lat, lng)) if crate::GeoPointBits::new(lat, lng).is_some() => {
+                RawObject::GeoPoint { lat, lng }
+            }
+            _ => raw,
+        };
+    }
+    if dt_ns_code != namespaces::XSD || xsd_names::is_string_like_name(dt_name) {
+        return raw;
+    }
+    let Some(datatype) = KnownDatatype::from_xsd_local(dt_name) else {
+        return raw;
+    };
+    match crate::coerce::coerce_string_value(lexical, datatype.canonical_form()) {
+        Ok(FlakeValue::Long(n)) => RawObject::Long(n),
+        Ok(FlakeValue::BigInt(_)) => RawObject::BigIntStr(lexical),
+        Ok(FlakeValue::Decimal(_)) => RawObject::DecimalStr(lexical),
+        Ok(FlakeValue::Double(d)) => RawObject::Double(d),
+        Ok(FlakeValue::Boolean(b)) => RawObject::Boolean(b),
+        Ok(FlakeValue::DateTime(_)) => RawObject::DateTimeStr(lexical),
+        Ok(FlakeValue::Date(_)) => RawObject::DateStr(lexical),
+        Ok(FlakeValue::Time(_)) => RawObject::TimeStr(lexical),
+        Ok(FlakeValue::GYear(_)) => RawObject::GYearStr(lexical),
+        Ok(FlakeValue::GYearMonth(_)) => RawObject::GYearMonthStr(lexical),
+        Ok(FlakeValue::GMonth(_)) => RawObject::GMonthStr(lexical),
+        Ok(FlakeValue::GDay(_)) => RawObject::GDayStr(lexical),
+        Ok(FlakeValue::GMonthDay(_)) => RawObject::GMonthDayStr(lexical),
+        Ok(FlakeValue::Duration(_)) => RawObject::DurationStr(lexical),
+        Ok(FlakeValue::DayTimeDuration(_)) => RawObject::DayTimeDurationStr(lexical),
+        Ok(FlakeValue::YearMonthDuration(_)) => RawObject::YearMonthDurationStr(lexical),
+        _ => raw,
+    }
 }
 
 /// Decode an object value without allocation. String-like values borrow
@@ -550,6 +635,29 @@ pub(super) fn decode_raw_object<'a>(
                 vec.push(element);
             }
             Ok(RawObject::Vector(vec))
+        }
+        OTag::TripleTerm => {
+            let mut name = |dict: &'a super::string_dict::StringDict| -> Result<(u16, &'a str), CommitCodecError> {
+                let ns_code = decode_varint(data, pos)? as u16;
+                let name_id = decode_varint(data, pos)? as u32;
+                Ok((ns_code, dict.get(name_id)?))
+            };
+            let s = name(&dicts.subject)?;
+            let p = name(&dicts.predicate)?;
+            let dt = name(&dicts.datatype)?;
+            let lang = match read_u8(data, pos)? {
+                0 => None,
+                _ => Some(decode_inline_str(data, pos)?),
+            };
+            let o_tag = OTag::from_u8(read_u8(data, pos)?)?;
+            let o = retype_string_literal(decode_raw_object(o_tag, data, pos, dicts)?, dt.0, dt.1);
+            Ok(RawObject::TripleTerm(Box::new(RawTripleTerm {
+                s,
+                p,
+                dt,
+                lang,
+                o,
+            })))
         }
     }
 }

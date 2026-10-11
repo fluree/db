@@ -178,7 +178,13 @@ Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-
 }
 ```
 
-Scalar select expressions desugar to a `bind` in the WHERE pattern list. If the expression references an aggregate's output variable (e.g. `(as (+ ?count 1) ?adjusted)`) the bind runs after aggregation; otherwise it runs before, so the alias is also a valid `groupBy` key.
+In a query that does not group, a scalar select expression desugars to a `bind` in the WHERE pattern list. In a query that groups (a `groupBy`, or an aggregate anywhere in `select` or `having`), where it runs depends on what it reads — the same rule SPARQL uses:
+
+- An expression over `groupBy` keys, aggregate outputs and earlier such aliases — or a constant — runs **once per group**, after aggregation (before `having` when `having` reads its alias, after it otherwise): its alias is a single value per group. `(as (+ ?count 1) ?adjusted)` and `(as (strlen ?category) ?len)` under `"groupBy": ["?category"]` both give one value per row.
+- An expression over a variable that is neither a `groupBy` key nor an aggregate runs **before grouping**, once per solution, so its alias is a per-group list like any other ungrouped variable (see [groupBy](#groupby)).
+- An alias that is itself a `groupBy` key, or that an aggregate reads, is computed before grouping — so an alias is a valid `groupBy` key.
+
+A per-group expression cannot reuse the name of a variable the `where` clause binds.
 
 The same expression language is shared with `bind` and `filter`. The one exception is `in` / `not-in`, which require the bracketed-list form and are not accepted in select expressions — rewrite as `(or (= ?x 1) (= ?x 2) …)` instead.
 
@@ -205,6 +211,19 @@ Single-pattern shorthand (object instead of array):
 ```
 
 Returns `true` if at least one solution exists, `false` otherwise. Internally, `LIMIT 1` is applied for efficiency.
+
+`values`, `offset` and `limit` apply as they do to `select`: `ask` is `true` when a solution remains after them (`"offset": 1` needs a second solution, `"limit": 0` is always `false`). As for `select`, `offset` and `limit` must be non-negative integers; anything else is a 400.
+
+`groupBy` and `having` group the solutions first: `ask` is then `true` when at least one group passes `having`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "ask": { "@id": "?product", "ex:category": "?category" },
+  "groupBy": ["?category"],
+  "having": "(> (count ?product) 10)"
+}
+```
 
 ### from
 
@@ -243,6 +262,17 @@ Specifies which ledger(s) to query:
 ```json
 {
   "from": "mydb:main@commit:bafybeig..."
+}
+```
+
+**Union default graph:** a ledger's default graph holds only the triples written outside any named graph, unless the ledger reads a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). `opts.unionDefaultGraph` decides for one query, whatever the ledger's setting (the SPARQL counterpart is `# PRAGMA union-default-graph`):
+
+```json
+{
+  "from": "mydb:main",
+  "opts": { "unionDefaultGraph": true },
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" }
 }
 ```
 
@@ -317,12 +347,14 @@ a subject:
 
 Variable-predicate scans return every stored triple, including data written
 with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
-`f:AccessPolicy` definitions). The one exception is the seven `f:reifies*`
-predicates — the internal storage encoding of edge annotations. They are
-system-written (user transactions cannot assert them), redundant with the
-edge and annotation content already in the results, and therefore hidden from
-variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` to
-surface them for debugging or inspection. Commit metadata (`f:t`, `f:address`,
+`f:AccessPolicy` definitions) and an annotation's `rdf:reifies` link. The one
+exception is the seven `f:reifies*` predicates, which ledgers written by
+earlier releases used to store edge annotations. They are system-written
+(user transactions cannot assert them), redundant with the `rdf:reifies`
+links derived from them, and therefore hidden from variable-predicate scans.
+Pass `"opts": {"includeSystemFacts": true}` (in SPARQL,
+`# PRAGMA include-system-facts: true`) to surface them for debugging or
+inspection. Commit metadata (`f:t`, `f:address`,
 …) lives in the ledger's txn-meta graph, not the default graph, so it never
 appears in default-graph scans either way.
 
@@ -601,9 +633,9 @@ Apply conditions to filter results:
 
 **Comparing against IRIs:**
 
-An unquoted prefixed name or `<...>` IRI is an IRI operand wherever RDF terms
-are compared — `=`, `!=`, `in`, `not-in`, `sameTerm` — and compares by
-identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
+An unquoted prefixed name or `<...>` IRI is an IRI operand wherever an
+operator reads RDF terms — `=`, `!=`, `in`, `not-in`, `sameTerm`, and `triple`
+— and compares by identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
 string `"ex:knows"`. In every other position it is the string it has always
 been:
 
@@ -1103,7 +1135,7 @@ Edge annotations attach metadata to a specific `(subject, predicate, object)` ed
 - **Inline form** with `@annotation` — match an edge and pull metadata about it.
 - **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
 
-`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
+`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc.
 
 **Inline form (`@annotation`):**
 
@@ -1153,7 +1185,24 @@ Filter by annotation metadata first, then surface the reified edge.
 }
 ```
 
-The base edge identified by `@reifies` is also matched as an ordinary triple, so the visibility check is automatic — if the edge is currently retracted or hidden by policy, the row drops.
+As in RDF 1.2, `@reifies` matches the reifier's link only, so it also finds reifiers of triples that are not asserted. To require the edge, add it as an ordinary pattern, or query with `@annotation`.
+
+**Triple terms as values:** a value whose `@id` is a node describing one triple matches a stored triple term, by its components when they are variables:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?doc", "?o"],
+  "where": {
+    "@id": "?doc",
+    "ex:mentions": { "@id": { "@id": "ex:alice", "ex:knows": "?o" } }
+  }
+}
+```
+
+The same shape, with constant components, is a triple term in a `values` cell: `"values": ["?t", [{ "@id": { "@id": "ex:alice", "ex:knows": { "@id": "ex:bob" } } }]]`.
+
+See [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values).
 
 **Subject expansion output:**
 
@@ -1268,6 +1317,31 @@ Function names are case-insensitive. See [Vector Search](../indexing-and-search/
 - `(isIRI ?x)` - Is an IRI
 - `(isBlank ?x)` - Is a blank node
 - `(isLiteral ?x)` - Is a literal
+- `(isTriple ?x)` - Is a triple term
+
+### Triple-Term Functions
+
+The RDF 1.2 functions over triple terms, the JSON-LD names for SPARQL's
+`TRIPLE`, `SUBJECT`, `PREDICATE` and `OBJECT`. A reifier's `rdf:reifies` value
+is a triple term:
+
+- `(triple ex:alice ex:knows ex:bob)` - The triple term `<<( ex:alice ex:knows ex:bob )>>`
+- `(subject ?t)`, `(predicate ?t)`, `(object ?t)` - A triple term's components
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  },
+  "select": ["?r", "?s", "?o"],
+  "where": [
+    { "@id": "?r", "rdf:reifies": "?t" },
+    ["filter", "(sameTerm (predicate ?t) ex:knows)"],
+    ["bind", "?s", "(subject ?t)", "?o", "(object ?t)"]
+  ]
+}
+```
 
 ## Query Modifiers
 
@@ -1294,6 +1368,16 @@ Sort results:
 ```json
 {
   "orderBy": ["?last", ["desc", "?age"]]
+}
+```
+
+Sort keys are variables. To sort on an expression or an aggregate, select it under an alias and sort on the alias:
+
+```json
+{
+  "select": ["?category", "(as (count ?product) ?n)"],
+  "groupBy": ["?category"],
+  "orderBy": [["desc", "?n"]]
 }
 ```
 
@@ -1332,6 +1416,8 @@ Group results:
 }
 ```
 
+A selected variable that is neither a `groupBy` key nor an aggregate comes back as a **per-group list** of its values (SPARQL rejects this shape; the JSON-LD surface keeps it). Two limits apply: a subquery cannot return a per-group list (it is an error — aggregate the variable, e.g. with `collect`), and SPARQL JSON and SPARQL XML results and the [streaming endpoint](../api/streaming-query.md) refuse one, since they have no list type (CSV and TSV join the values with `;`). On the streaming endpoint this includes `select "*"` under `groupBy` when the `where` binds a variable that is not a key.
+
 ### having
 
 Filter grouped results:
@@ -1340,12 +1426,14 @@ Filter grouped results:
 {
   "select": ["?category", "(count ?product)"],
   "groupBy": ["?category"],
-  "having": [["filter", "(> (count ?product) 10)"]],
+  "having": "(> (count ?product) 10)",
   "where": [
     { "@id": "?product", "ex:category": "?category" }
   ]
 }
 ```
+
+`having` and `orderBy` in a grouped query follow SPARQL 1.1: a variable they read that is neither a `groupBy` key nor an aggregate means `(sample ?v)` — an arbitrary value from the group. `having` can read a select expression's alias as well as an aggregate's: the expression runs once per group, before `having` (the SPARQL rule, a Fluree extension there). On a query that does not group, `having` filters the solutions, like a `filter`.
 
 ## Aggregation Functions
 
@@ -1632,7 +1720,7 @@ Note: `f:*` keys used for graph source queries should be defined in your `@conte
     "(as (avg ?price) ?avgPrice)"
   ],
   "groupBy": ["?category"],
-  "having": [["filter", "(> (count ?product) 5)"]],
+  "having": "(> (count ?product) 5)",
   "where": [
     { "@id": "?product", "ex:category": "?category", "ex:price": "?price" }
   ],
@@ -1664,7 +1752,7 @@ The default is `true`. Disable only when you are intentionally working with bare
 1. **Always Provide @context**: Makes queries readable and maintainable
 2. **Use Specific Patterns**: More specific patterns are more efficient
 3. **Limit Result Sets**: Use `limit` for large result sets
-4. **Flexible Filter Placement**: Filters can be placed anywhere in `where` clauses - the query engine automatically applies each filter as soon as all its required variables are bound
+4. **Flexible Filter Placement**: Filters, including `exists` and `not-exists`, can be placed anywhere in `where` clauses - the query engine applies each one to the whole clause, as soon as every variable it reads has its final value. A variable that an `optional` or a `null` in `values` leaves unbound on some rows waits for any later pattern that fills it in
 5. **Use Time Specifiers**: Use `@t:` when transaction numbers are known (fastest)
 6. **Graph Source Selection**: Choose appropriate graph sources for query patterns
 

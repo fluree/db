@@ -81,6 +81,10 @@ pub const FIELD_S3_MAX_CONCURRENT_REQUESTS: &str =
 /// `fluree:{addressIdentifier}:s3://...`.
 pub const FIELD_ADDRESS_IDENTIFIER: &str = "https://ns.flur.ee/system#addressIdentifier";
 
+/// IPFS API URL. Recognized only to reject it: IPFS storage is reachable
+/// through the Rust API alone.
+pub const FIELD_IPFS_API_URL: &str = "https://ns.flur.ee/system#ipfsApiUrl";
+
 // ConfigurationValue fields
 
 /// Environment variable name for ConfigurationValue

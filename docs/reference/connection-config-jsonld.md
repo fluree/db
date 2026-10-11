@@ -77,7 +77,7 @@ Supported:
   - `defaults.indexing.reindexMinBytes` / `reindexMaxBytes` are applied as the default `IndexConfig` for writes
   - `defaults.indexing.indexingEnabled=false` suppresses background index triggers
   - `defaults.indexing.maxOldIndexes` sets the maximum number of old index versions to retain before GC (default: 5)
-  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 30)
+  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 15)
 
 ### addressIdentifiers (read routing)
 
@@ -85,14 +85,21 @@ The `addressIdentifiers` field maps identifier strings to storage backends, enab
 
 ```json
 {
-  "@id": "connection",
-  "@type": "Connection",
-  "indexStorage": {"@id": "indexS3"},
-  "commitStorage": {"@id": "commitS3"},
-  "addressIdentifiers": {
-    "commit-storage": {"@id": "commitS3"},
-    "index-storage": {"@id": "indexS3"}
-  }
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [
+    {"@id": "indexS3", "@type": "Storage", "s3Bucket": "my-index-bucket"},
+    {"@id": "commitS3", "@type": "Storage", "s3Bucket": "my-commit-bucket"},
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "indexStorage": {"@id": "indexS3"},
+      "commitStorage": {"@id": "commitS3"},
+      "addressIdentifiers": {
+        "commit-storage": {"@id": "commitS3"},
+        "index-storage": {"@id": "indexS3"}
+      }
+    }
+  ]
 }
 ```
 
@@ -302,37 +309,11 @@ rather than by two storage nodes.
 }
 ```
 
-### IPFS storage (requires `ipfs`)
+### IPFS storage (not available here)
 
-Supported:
-- `ipfsApiUrl` (default `http://127.0.0.1:5001`): Kubo HTTP RPC API base URL
-- `ipfsPinOnPut` (default `true`): pin blocks after writing
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": "http://127.0.0.1:5001",
-  "ipfsPinOnPut": true
-}
-```
-
-With env var indirection:
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": { "envVar": "FLUREE_IPFS_API_URL", "defaultVal": "http://127.0.0.1:5001" },
-  "ipfsPinOnPut": true
-}
-```
-
-Notes:
-- Requires a running Kubo node at the specified URL
-- Fluree's CIDs (SHA-256 + private-use multicodec) are stored directly into IPFS
-- No encryption support (`AES256Key` is not applicable)
-- See [IPFS Storage Guide](../operations/ipfs-storage.md) for Kubo setup and operational details
+A connection config cannot select IPFS storage: a storage node with `ipfsApiUrl` is rejected
+with an error. IPFS storage is experimental and available only through the Rust API
+(`FlureeBuilder::build_ipfs`); see the [IPFS Storage Guide](../operations/ipfs-storage.md).
 
 ## Publisher (nameservice) node fields
 

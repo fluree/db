@@ -22,7 +22,6 @@ pub use crate::query_bounds::{ObjectBounds, RangeMatch, RangeOptions, RangeTest}
 
 use crate::comparator::IndexType;
 use crate::db::LedgerSnapshot;
-use crate::dt_compatible;
 use crate::error::Result;
 use crate::flake::{Flake, FlakeMeta};
 use crate::ids::GraphId;
@@ -290,7 +289,7 @@ pub fn flake_matches_range_eq(f: &Flake, match_val: &RangeMatch) -> bool {
         }
     }
     if let Some(ref dt) = match_val.dt {
-        if !dt_compatible(dt, &f.dt) {
+        if *dt != f.dt {
             return false;
         }
     }

@@ -320,10 +320,30 @@ async fn time_travel_iso_too_early_errors() {
         "orderBy": ["?name"]
     });
 
-    let err = fluree.query_connection(&q).await.unwrap_err().to_string();
+    let err = fluree.query_connection(&q).await.unwrap_err();
+    assert_eq!(
+        err.status_code(),
+        400,
+        "a pre-genesis time is a bad request: {err}"
+    );
+    let err = err.to_string();
     assert!(
         err.contains("There is no data as of"),
         "expected no-data-as-of error, got: {err}"
+    );
+
+    let err = fluree
+        .query_from()
+        .sparql(&format!(
+            "SELECT ?s FROM <{ledger_id}@iso:{too_early}> WHERE {{ ?s ?p ?o }}"
+        ))
+        .execute_formatted()
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), 400, "SPARQL FROM: {err}");
+    assert!(
+        err.to_string().contains("There is no data as of"),
+        "SPARQL FROM: {err}"
     );
 
     // sanity: querying at t=1 still works

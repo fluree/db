@@ -52,9 +52,18 @@ pub fn eval_is_literal<R: RowAccess>(
     check_arity(args, 1, "isLiteral")?;
     let val = args[0].eval_to_comparable(row, ctx)?;
     Ok(Some(ComparableValue::Bool(val.is_some_and(|v| {
-        // In SPARQL, a term is a literal iff it is not an IRI and not a blank node.
-        // At this layer, non-literals are represented as `Sid` (node ref) or `Iri`.
-        !matches!(v, ComparableValue::Sid(_) | ComparableValue::Iri(_))
+        // In SPARQL, a term is a literal iff it is not an IRI, a blank node or
+        // a triple term. At this layer, IRIs and blank nodes are `Sid` (node
+        // ref) or `Iri`; a triple term is a `TypedLiteral` holding one.
+        !matches!(
+            v,
+            ComparableValue::Sid(_)
+                | ComparableValue::Iri(_)
+                | ComparableValue::TypedLiteral {
+                    val: fluree_db_core::FlakeValue::TripleTerm(_),
+                    ..
+                }
+        )
     }))))
 }
 

@@ -59,28 +59,46 @@ pub(crate) mod sparql;
 mod sparql_xml;
 mod typed;
 
-/// Registry-name predicate: does this variable name belong to a
-/// non-projected internal / non-distinguished variable that should be
-/// hidden from `SELECT *` wildcard output?
-///
-/// Three categories are reserved:
-/// - `?__*` — planner / aggregate / property-path synthetics.
-/// - `?#*`  — annotation-reifier synthetics (the `#` is comment-start
-///   in the SPARQL lexer so users cannot lex this prefix).
-/// - `_:*`  — SPARQL blank nodes used in WHERE patterns. Per SPARQL
-///   §4.1.4 these are non-distinguished variables; they bind values
-///   but are not part of the SELECT scope, so they don't appear in
-///   `SELECT *` results. Hiding them here also covers
-///   blank-node-labelled reifiers (`~ _:ann`, `_:ann rdf:reifies …`)
-///   that the edge-annotation lowering registers under their literal
-///   blank-node label.
-///
-/// Every wildcard formatter (SPARQL JSON, SPARQL XML, JSON-LD, typed,
-/// agent-JSON, delimited) routes through this predicate so the rule
-/// stays consistent across output shapes.
-pub(crate) fn is_internal_var_name(name: &str) -> bool {
-    name.starts_with("?__") || name.starts_with("?#") || name.starts_with("_:")
+/// A triple term's subject, predicate and object as the bindings a formatter
+/// renders: nodes, or an object literal with its datatype or language tag (a
+/// nested term among them, which the formatter renders recursively).
+pub(crate) fn triple_term_components(
+    term: &fluree_db_core::TripleTermValue,
+) -> [fluree_db_query::binding::Binding; 3] {
+    use fluree_db_query::binding::Binding;
+    [
+        Binding::sid(term.s.clone()),
+        Binding::sid(term.p.clone()),
+        Binding::term_object(term),
+    ]
 }
+
+/// A triple term as a JSON-LD-star embedded node, `{"@id": {"@id": s, p: o}}`
+/// (JSON-LD 1.1 has no triple terms). `object` renders a literal object, or a
+/// nested term, as the calling formatter renders that value anywhere else.
+pub(crate) fn triple_term_node(
+    term: &fluree_db_core::TripleTermValue,
+    compactor: &IriCompactor,
+    object: impl FnOnce(&fluree_db_query::binding::Binding) -> Result<JsonValue>,
+) -> Result<JsonValue> {
+    let [_, _, o] = triple_term_components(term);
+    let o = match &term.o {
+        fluree_db_core::FlakeValue::Ref(sid) => json!({ "@id": compactor.compact_id_sid(sid)? }),
+        _ => object(&o)?,
+    };
+    let mut node = serde_json::Map::with_capacity(2);
+    node.insert(
+        "@id".to_string(),
+        JsonValue::String(compactor.compact_id_sid(&term.s)?),
+    );
+    node.insert(compactor.compact_sid(&term.p)?, o);
+    Ok(json!({ "@id": node }))
+}
+
+// Every wildcard formatter (SPARQL JSON, SPARQL XML, JSON-LD, typed,
+// agent-JSON, delimited) routes through this predicate so the rule stays
+// consistent across output shapes.
+pub(crate) use fluree_db_query::var_registry::is_internal_var_name;
 mod xml_escape;
 
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
@@ -217,6 +235,10 @@ pub enum FormatError {
     /// Fuel limit exceeded during formatting (expansion)
     #[error(transparent)]
     FuelExceeded(#[from] FuelExceededError),
+
+    /// A read the ledger's index cannot answer
+    #[error(transparent)]
+    Query(#[from] fluree_db_query::QueryError),
 }
 
 /// Result type for formatting operations
@@ -364,12 +386,14 @@ pub fn format_results(
             "SPARQL XML produces String, not JsonValue. Use format_results_string() instead."
                 .to_string(),
         )),
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
-            Err(FormatError::InvalidBinding(format!(
-                "{:?} produces String, not JsonValue. Use format_results_string() instead.",
-                config.format
-            )))
-        }
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => Err(FormatError::InvalidBinding(format!(
+            "{:?} produces String, not JsonValue. Use format_results_string() instead.",
+            config.format
+        ))),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -442,7 +466,11 @@ pub fn format_results_string(
                 .with_absolute_iris(config.absolute_iris);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
             return graph_text::format(result, &compactor, config);
         }
@@ -593,12 +621,14 @@ pub async fn format_results_async(
             "SPARQL XML produces String, not JsonValue. Use format_results_string_async() instead."
                 .to_string(),
         )),
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
-            Err(FormatError::InvalidBinding(format!(
-                "{:?} produces String, not JsonValue. Use format_results_string_async() instead.",
-                config.format
-            )))
-        }
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => Err(FormatError::InvalidBinding(format!(
+            "{:?} produces String, not JsonValue. Use format_results_string_async() instead.",
+            config.format
+        ))),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -693,7 +723,11 @@ pub async fn format_results_string_async(
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return graph_text::format(result, &compactor, config);
         }
@@ -740,7 +774,11 @@ pub async fn format_results_string_async_dataset(
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return graph_text::format(result, &compactor, config);
         }

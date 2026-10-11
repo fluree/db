@@ -378,6 +378,7 @@ impl HistoricalLedgerView {
             }
             novelty.apply_commit(flakes, commit_t, &reverse_graph)?;
         }
+        crate::link_base_without_annotations(&mut novelty, snapshot)?;
 
         tracing::trace!(
             commit_count,

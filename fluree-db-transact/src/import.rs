@@ -576,6 +576,7 @@ mod inner {
         let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
 
         for block in &phase1.named_graphs {
+            crate::stage::refuse_default_graph_name(&block.iri)?;
             // Refuse by literal IRI, mirroring the staged-write guard's shape.
             if block.iri == txn_meta_iri {
                 return Err(TransactError::ReservedGraphTarget {
@@ -652,7 +653,9 @@ mod inner {
 
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
-                    if let Some(sc) = spool_ctx.as_mut() {
+                    if let (Some(sc), FlakeValue::TripleTerm(term)) = (spool_ctx.as_mut(), &o) {
+                        sc.push_named_graph_term(g_id, &s, Some(&p), term, new_t)?;
+                    } else if let Some(sc) = spool_ctx.as_mut() {
                         sc.push_named_graph_record(
                             g_id,
                             crate::import_sink::FlakeRecord {
@@ -664,7 +667,7 @@ mod inner {
                                 list_index: None,
                                 t: new_t,
                             },
-                        );
+                        )?;
                     }
 
                     let meta = lang.as_deref().map(FlakeMeta::with_lang);
@@ -686,9 +689,7 @@ mod inner {
                 }
             }
 
-            // TriG-star: `f:reifies*` bundles in the same graph as the edge
-            // they reify — the bundle the default-graph `ImportSink` emits,
-            // with `f:reifiesGraph` set.
+            // TriG-star: each reified triple's link, in the triple's graph.
             for r in &block.reified {
                 let ann = expand_term(&r.reifier, &block.prefixes, &mut worker_cache, skolem_base)?;
                 let s = expand_term(&r.subject, &block.prefixes, &mut worker_cache, skolem_base)?;
@@ -704,7 +705,7 @@ mod inner {
                     Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang)),
                     None => fluree_db_core::DatatypeConstraint::Explicit(dt),
                 };
-                let bundle = crate::generate::flakes::reified_triple_bundle(
+                let link = crate::generate::flakes::reified_triple_link(
                     Some(graph_sid.clone()),
                     s,
                     p,
@@ -713,26 +714,13 @@ mod inner {
                     &ann,
                     new_t,
                 )?;
-                for flake in bundle {
-                    if let Some(sc) = spool_ctx.as_mut() {
-                        sc.push_named_graph_record(
-                            g_id,
-                            crate::import_sink::FlakeRecord {
-                                s: &flake.s,
-                                p: &flake.p,
-                                o: &flake.o,
-                                dt: &flake.dt,
-                                lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
-                                list_index: None,
-                                t: new_t,
-                            },
-                        );
-                    }
-                    writer.push_flake(&flake).map_err(|e| {
-                        TransactError::Parse(format!("failed to encode reifier bundle flake: {e}"))
-                    })?;
-                    op_count += 1;
+                if let (Some(sc), FlakeValue::TripleTerm(term)) = (spool_ctx.as_mut(), &link.o) {
+                    sc.push_named_graph_term(g_id, &ann, None, term, new_t)?;
                 }
+                writer.push_flake(&link).map_err(|e| {
+                    TransactError::Parse(format!("failed to encode link flake: {e}"))
+                })?;
+                op_count += 1;
             }
         }
 
@@ -925,6 +913,26 @@ mod inner {
                 let (fv, dt) =
                     convert_string_literal(value, datatype, &mut NsAllocator::Cached(ns));
                 Ok((fv, dt, None))
+            }
+            RawObject::TripleTerm {
+                subject,
+                predicate,
+                object,
+            } => {
+                let s = expand_term(subject, prefixes, ns, skolem_base)?;
+                let p = expand_term(predicate, prefixes, ns, skolem_base)?;
+                let (o, dt, lang) = expand_object(object, prefixes, ns, skolem_base)?;
+                let dtc = match lang {
+                    Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang)),
+                    None => fluree_db_core::DatatypeConstraint::Explicit(dt),
+                };
+                let term = crate::flake_sink::triple_term_value(Some(s), Some(p), Some((o, dtc)))
+                    .map_err(|e| TransactError::Parse(e.to_string()))?;
+                Ok((
+                    term,
+                    fluree_db_core::triple_term_datatype_sid().clone(),
+                    None,
+                ))
             }
         }
     }

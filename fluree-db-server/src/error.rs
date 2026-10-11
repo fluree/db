@@ -72,6 +72,13 @@ pub enum ServerError {
     /// `NoveltyBackpressure`.
     #[error("{0}")]
     NoveltyDeltaTooLarge(String),
+
+    /// The write would bring the ledger past the number of distinct
+    /// datatypes its index can store (422 + `err:db/DatatypeLimitExceeded`,
+    /// no `Retry-After`). Same consensus-boundary role as
+    /// `NoveltyBackpressure`.
+    #[error("{0}")]
+    DatatypeLimitExceeded(String),
 }
 
 impl ServerError {
@@ -84,6 +91,10 @@ impl ServerError {
             //
             // Map common statuses to stable error types so clients can branch on `@type`.
             ServerError::Api(ApiError::Http { status, .. }) => match status {
+                // The committer flattens typed errors to this shape (merge,
+                // rebase and revert's `InvalidBranch`, among others), so a 400
+                // must not read as an internal error here.
+                400 => errors::BAD_REQUEST,
                 401 => errors::UNAUTHORIZED,
                 403 => errors::ACCESS_DENIED,
                 409 => errors::COMMIT_CONFLICT,
@@ -98,6 +109,8 @@ impl ServerError {
             },
 
             // Not Found
+            ServerError::Api(ApiError::GraphNotFound(_)) => errors::GRAPH_NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => errors::COMMIT_NOT_FOUND,
             ServerError::Api(ApiError::NotFound(msg)) => {
                 // Distinguish graph source not found from ledger not found
                 if msg.contains("Graph source") || msg.contains("graph source") {
@@ -118,6 +131,9 @@ impl ServerError {
             }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
             ServerError::Api(ApiError::GraphSourceSuspended(_)) => errors::GRAPH_SOURCE_SUSPENDED,
+            // The code a merge or rebase conflict already gets from the
+            // committer as a flattened 409.
+            ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
 
             // Index operations
             ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,
@@ -176,6 +192,12 @@ impl ServerError {
             // Not retryable, unlike the conflicts below: the writer must reload.
             ServerError::Api(e) if e.is_fenced() => errors::FENCED,
             ServerError::Api(e) if e.is_lifecycle_conflict() => errors::LIFECYCLE_CONFLICT,
+            ServerError::Api(
+                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                    fluree_db_api::PolicyError::ModifyDenied { .. },
+                )),
+            ) => errors::ACCESS_DENIED,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
             // clients can branch on `@type` (and the 409 status below).
             ServerError::Api(ApiError::Transact(
@@ -203,11 +225,21 @@ impl ServerError {
                 | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
             ))
             | ServerError::NoveltyBackpressure(_) => errors::NOVELTY_AT_MAX,
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
+            ))
+            | ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
             ServerError::MissingLedger => errors::MISSING_LEDGER,
-            ServerError::BadRequest(_) => errors::BAD_REQUEST,
+            // The same code as an id refused at the edge (`From<LedgerIdParseError>`).
+            ServerError::BadRequest(_)
+            | ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => errors::BAD_REQUEST,
             ServerError::InvalidHeader(_) => errors::INVALID_HEADER,
             ServerError::NotImplemented(_) => errors::NOT_IMPLEMENTED,
             ServerError::Unauthorized(_) => errors::UNAUTHORIZED,
@@ -219,12 +251,6 @@ impl ServerError {
             // Auth/Policy (requires credential feature)
             #[cfg(feature = "credential")]
             ServerError::Api(ApiError::Credential(_)) => errors::INVALID_CREDENTIAL,
-
-            ServerError::Api(
-                ApiError::InvalidLedgerId(_)
-                | ApiError::InvalidBranch(_)
-                | ApiError::NameService(NameServiceError::InvalidId(_)),
-            ) => errors::BAD_REQUEST,
 
             // System errors
             ServerError::Api(ApiError::Connection(_)) => errors::CONNECTION,
@@ -281,11 +307,14 @@ impl ServerError {
             // Every form `ApiError` gives a missing ledger, not only `NotFound`:
             // the ledger loader's own error is one, and read as a 500 here.
             ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::GraphNotFound(_)) => StatusCode::NOT_FOUND,
+            ServerError::Api(ApiError::CommitNotFound(_)) => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
             ServerError::Api(e) if e.is_fenced() => StatusCode::CONFLICT,
             ServerError::Api(e) if e.is_lifecycle_conflict() => StatusCode::CONFLICT,
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
+            ServerError::Api(ApiError::BranchConflict(_)) => StatusCode::CONFLICT,
             // Optimistic-concurrency / namespace-allocation conflicts are
             // retryable: 409 lets clients distinguish "retry" from a 400 "bad
             // request". (After server-side reconcile-and-retry these only reach
@@ -308,6 +337,14 @@ impl ServerError {
                 },
             )) if delta_bytes >= max_bytes => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+
+            // 422 - well-formed, but the ledger has no room for the new
+            // datatypes. Permanent, so no `Retry-After`. MUST precede the
+            // generic `ApiError::Transact(_)` arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
+            ))
+            | ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
 
             // 503 - novelty backpressure. The same retryable capacity class
             // as `NoveltyDeferred` above: only the indexer draining clears
@@ -332,6 +369,12 @@ impl ServerError {
                     | fluree_db_query::QueryError::CatalogAccessDenied { .. },
                 ),
             ) => StatusCode::FORBIDDEN,
+            ServerError::Api(
+                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                    fluree_db_api::PolicyError::ModifyDenied { .. },
+                )),
+            ) => StatusCode::FORBIDDEN,
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
@@ -351,6 +394,11 @@ impl ServerError {
             // Operator data, not caller input. See `ApiError::LedgerConfig`.
             ServerError::Api(ApiError::LedgerConfig(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(
+                ApiError::InvalidLedgerId(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::NameService(NameServiceError::InvalidId(_)),
+            ) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,
             ServerError::Json(_) => StatusCode::BAD_REQUEST,
@@ -638,6 +686,43 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 mod tests {
     use super::*;
     use fluree_vocab::errors;
+
+    #[test]
+    fn policy_denied_write_is_forbidden_with_access_denied_type() {
+        let denied = || fluree_db_api::PolicyError::modify_denied("write refused");
+        for err in [
+            ApiError::Policy(denied()),
+            ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(denied())),
+        ] {
+            let response = ServerError::Api(err).into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.headers().get(axum::http::header::RETRY_AFTER),
+                None
+            );
+        }
+        let err = ServerError::Api(ApiError::Transact(
+            fluree_db_api::TransactError::PolicyViolation(denied()),
+        ));
+        assert_eq!(err.error_type(), errors::ACCESS_DENIED);
+    }
+
+    /// An id refused below the edge is still the caller's input.
+    #[test]
+    fn an_invalid_ledger_id_is_a_bad_request_wherever_it_is_refused() {
+        let parse = fluree_db_api::LedgerIdParseError::new("Invalid ledger id 'a@b'");
+        for err in [
+            ServerError::from(parse.clone()),
+            ServerError::Api(ApiError::InvalidLedgerId(parse)),
+            ServerError::Api(ApiError::InvalidBranch("a@b".into())),
+            ServerError::Api(ApiError::NameService(NameServiceError::InvalidId(
+                "a@b".into(),
+            ))),
+        ] {
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{err:?}");
+            assert_eq!(err.error_type(), errors::BAD_REQUEST, "{err:?}");
+        }
+    }
 
     fn storage_denied_direct() -> ApiError {
         ApiError::StorageAccessDenied {
@@ -1037,6 +1122,59 @@ mod tests {
                     .is_none(),
                 "413 must not invite a retry"
             );
+        }
+    }
+
+    /// The datatype limit is a permanent refusal: 422 +
+    /// `err:db/DatatypeLimitExceeded` with no `Retry-After`, in both the
+    /// raw-variant and consensus-flattened shapes.
+    #[test]
+    fn datatype_limit_is_422_with_distinct_code_and_no_retry_after() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::DatatypeLimitExceeded {
+                    used: 16_369,
+                    adding: 1,
+                    max: 16_369,
+                },
+            )),
+            ServerError::DatatypeLimitExceeded("datatype limit exceeded".into()),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::UNPROCESSABLE_ENTITY, "{se}");
+            assert_eq!(se.error_type(), errors::DATATYPE_LIMIT_EXCEEDED, "{se}");
+            let resp = se.into_response();
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "422 must not invite a retry"
+            );
+        }
+    }
+
+    /// Merge, rebase and revert reach the HTTP layer through the committer,
+    /// which flattens a typed error to `ApiError::Http { status }`; previews
+    /// and sweeps return it typed. A branch error answers the same either way.
+    #[test]
+    fn branch_errors_answer_the_same_typed_or_flattened() {
+        for (api, status, code) in [
+            (
+                ApiError::InvalidBranch("Branch main has no source branch".into()),
+                StatusCode::BAD_REQUEST,
+                errors::BAD_REQUEST,
+            ),
+            (
+                ApiError::BranchConflict("another maintenance operation holds db:main".into()),
+                StatusCode::CONFLICT,
+                errors::COMMIT_CONFLICT,
+            ),
+        ] {
+            let flattened = ServerError::Api(ApiError::http(api.status_code(), api.to_string()));
+            for se in [ServerError::Api(api), flattened] {
+                assert_eq!(se.status_code(), status, "{se}");
+                assert_eq!(se.error_type(), code, "{se}");
+            }
         }
     }
 

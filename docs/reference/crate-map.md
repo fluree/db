@@ -968,7 +968,7 @@ cargo build --release
 ### Build Server Only
 
 ```bash
-cargo build --release --bin fluree-db-server
+cargo build --release --bin fluree-server
 ```
 
 ### Run Tests

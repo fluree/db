@@ -100,8 +100,8 @@ struct NodePartition {
 /// those earlier states, reviving a CID an already-consumed manifest named.
 /// Checked directly against `all_cas_ids()` rather than expanded, since a
 /// resurrected CID this pass must not delete is exactly one still directly
-/// reachable from a surviving root — nothing behind a named-graph or
-/// annotation branch manifest changes that.
+/// reachable from a surviving root — nothing behind a branch manifest
+/// changes that.
 fn retained_refs(
     index_chain: &[IndexChainEntry],
     first_released: usize,
@@ -324,7 +324,7 @@ pub struct GarbagePlan {
 /// Both thresholds must be satisfied for GC to occur:
 /// - `max_old_indexes`: Maximum old index versions to keep (default: 5)
 ///   With max_old_indexes=5, we keep current + 5 old = 6 total
-/// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
+/// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 15)
 ///
 /// Age is determined by the garbage record's `created_at_ms` field. A record
 /// with no timestamp predates the field and is treated as past the window.
@@ -1781,7 +1781,7 @@ mod tests {
         );
     }
 
-    /// Production's regime — a live 30-minute age guard and fresh garbage
+    /// Production's regime — a live age guard and fresh garbage
     /// records — with no ceiling set, which is the default. Every version is
     /// inside the guard, so GC must leave all of them alone. That is the
     /// reader-safety property the guard exists for: a query that started
@@ -2307,6 +2307,7 @@ mod tests {
             namespace_codes: BTreeMap::new(),
             commit_derived_ns: HashMap::new(),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
             predicate_sids: Vec::new(),
             uploaded_dicts: UploadedDicts {
                 dict_refs: DictRefs {
@@ -2340,8 +2341,8 @@ mod tests {
             db_stats: None,
             db_schema: None,
             sketch_ref: None,
-            attachment_events: None,
             prev_index,
+            term_dict: None,
         }
     }
 

@@ -374,16 +374,43 @@ Inline `@annotation` queries return one row per occurrence.
 }
 ```
 
+**Triple terms as values:** a value whose `@id` is the node of one triple stores that triple term, without asserting or reifying the triple (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)):
+
+```json
+{
+  "@id": "ex:doc",
+  "ex:mentions": { "@id": { "@id": "ex:alice", "ex:knows": { "@id": "ex:bob" } } }
+}
+```
+
 **Deferred shapes** error with explicit messages:
 
 - Annotations on list-occurrence triples (`@list` membership).
-- Reifiers for unasserted triples (`@reifies` must point at an asserted edge).
-- Multi-triple `@reifies` (more than one predicate-object pair under `@reifies`).
+- More than one predicate-object pair in one `@reifies` block (use an array of blocks to
+  reify several triples).
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).
-- `@reifies` on the insert side (use the inline `@annotation` form instead).
 - Hand-authored mention of the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations (compact or full IRI form).
 
-For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
+For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For what a retraction leaves, and the LPG-mode cascade, see [Retractions](retractions.md#edge-annotation-cascade).
+
+## Turtle and TriG
+
+`/insert` also takes RDF text. Turtle (`text/turtle`) is parsed straight to flakes. TriG (`application/trig`) adds graph blocks, which land in their named graphs; a `GRAPH <#txn-meta> { ... }` block becomes commit metadata instead:
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/trig" \
+  --data-binary '
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:name "Alice" .
+
+GRAPH <http://example.org/graphs/hr> {
+  ex:alice ex:salary 95000 .
+}'
+```
+
+A body with graph blocks is read as TriG even when sent as `text/turtle`. From the CLI, `fluree insert -f data.trig` does the same. See [Turtle and TriG](turtle.md) for the syntax, the TriG rules, and querying named graphs.
 
 ## Insert Semantics
 
@@ -664,6 +691,7 @@ Use compact contexts:
 
 - [Overview](overview.md) - Transaction overview
 - [Upsert](upsert.md) - Replace mode inserts
+- [Turtle and TriG](turtle.md) - RDF text formats and named graphs
 - [Update](update-where-delete-insert.md) - Updating existing data
 - [Data Types](../concepts/datatypes.md) - Supported datatypes
 - [API Endpoints](../api/endpoints.md) - HTTP API details

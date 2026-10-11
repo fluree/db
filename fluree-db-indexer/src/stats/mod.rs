@@ -31,7 +31,7 @@ pub use id_hook::{
     stats_record_from_v2, GraphPropertyKey, IdPropertyHll, IdStatsHook, IdStatsResult, StatsRecord,
 };
 pub use schema_extractor::{SchemaEntry, SchemaExtractor};
-pub use sketch_cas::{load_sketch_blob, HllPropertyEntry, HllSketchBlob};
+pub use sketch_cas::{HllPropertyEntry, HllSketchBlob, SketchDecodeError};
 
 use fluree_db_core::Flake;
 use fluree_db_core::{GraphStatsEntry, PrefixTrie, PropertyStatEntry};
@@ -86,6 +86,30 @@ where
             None => (0u16, iri),
         }
     })
+}
+
+/// The live `rdf:reifies` links per inner predicate, from the hook's
+/// triple-term row counts, with each inner predicate's SID. Empty when the
+/// ledger has no `rdf:reifies` predicate.
+pub fn link_stat_entries<F>(
+    term_rows: &[(u32, u32, u64)],
+    reifies_p_id: Option<u32>,
+    mut resolve_predicate_sid: F,
+) -> Vec<fluree_db_core::LinkStatEntry>
+where
+    F: FnMut(u32) -> (u16, String),
+{
+    let Some(reifies) = reifies_p_id else {
+        return Vec::new();
+    };
+    term_rows
+        .iter()
+        .filter(|&&(p_id, _, _)| p_id == reifies)
+        .map(|&(_, inner, count)| fluree_db_core::LinkStatEntry {
+            sid: resolve_predicate_sid(inner),
+            count,
+        })
+        .collect()
 }
 
 /// The same roll-up for a caller that already holds each predicate's SID — the

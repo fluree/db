@@ -81,6 +81,14 @@ pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
 /// or raise `reindex_max_bytes` there).
 pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
 
+/// The write would bring the ledger past the number of distinct datatypes
+/// its index can store.
+///
+/// A permanent refusal, surfaced as HTTP 422 with no `Retry-After`.
+/// Datatype IDs are never released, so neither retrying nor waiting for the
+/// indexer admits the write. The ledger is left unchanged.
+pub const DATATYPE_LIMIT_EXCEEDED: &str = "err:db/DatatypeLimitExceeded";
+
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 
@@ -101,6 +109,12 @@ pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
 /// A graph source over a ledger that was dropped and its name reused: it
 /// indexes nothing from the new ledger until it is recreated over it
 pub const GRAPH_SOURCE_SUSPENDED: &str = "err:db/GraphSourceSuspended";
+
+/// A graph the target ledger does not have
+pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
+
+/// A commit reference that names no commit of the ledger
+pub const COMMIT_NOT_FOUND: &str = "err:db/CommitNotFound";
 
 /// Graph source index stale
 pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";

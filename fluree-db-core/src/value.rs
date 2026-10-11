@@ -102,11 +102,49 @@ impl fmt::Debug for GeoPointBits {
 }
 
 impl fmt::Display for GeoPointBits {
+    /// WKT, longitude first. Each coordinate is the shortest decimal that
+    /// encodes to this point, so `POINT(2.2945 48.8584)` reads back as
+    /// written rather than as the binary expansion of its decoded cell.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // WKT format: POINT(lng lat) - note: longitude first!
+        const LNG_BITS: u64 = (1 << 30) - 1;
         let (lat, lng) = ObjKey::from_u64(self.0).decode_geo_point();
-        write!(f, "POINT({lng} {lat})")
+        let lat_text = shortest_decimal(lat, |c| {
+            GeoPointBits::new(c, lng).map(|p| p.0 & !LNG_BITS) == Some(self.0 & !LNG_BITS)
+        });
+        let lng_text = shortest_decimal(lng, |c| {
+            GeoPointBits::new(lat, c).map(|p| p.0 & LNG_BITS) == Some(self.0 & LNG_BITS)
+        });
+        write!(f, "POINT({lng_text} {lat_text})")
     }
+}
+
+/// An RDF 1.2 triple term: the identity of a triple `(s, p, o)`, carrying the
+/// object's datatype and language tag.
+///
+/// Graph-independent and without a list index, per RDF 1.2 Concepts: identical
+/// triples in different graphs are the same term, and the link flake's own
+/// graph scopes a reification to an occurrence. This is the materialized form
+/// carried by commits and novelty; the index stores a dictionary handle in
+/// `o_key` under [`crate::o_type::OType::TRIPLE_TERM`].
+///
+/// Serializes as a map (`s`, `p`, `o`, `dt`, `lang`), which no other
+/// `FlakeValue` variant accepts, so it is unambiguous under `serde(untagged)`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TripleTermValue {
+    pub s: Sid,
+    pub p: Sid,
+    pub o: FlakeValue,
+    pub dt: Sid,
+    pub lang: Option<String>,
+}
+
+/// The shortest fixed-point rendering of `value` that `same` accepts.
+fn shortest_decimal(value: f64, same: impl Fn(f64) -> bool) -> String {
+    (0..=12)
+        .map(|digits| format!("{value:.digits$}"))
+        .map(|text| if text == "-0" { "0".to_string() } else { text })
+        .find(|text| text.parse().is_ok_and(&same))
+        .unwrap_or_else(|| value.to_string())
 }
 
 /// Polymorphic value type for flake objects
@@ -166,6 +204,9 @@ pub enum FlakeValue {
     Json(String),
     /// Geographic point (geo:wktLiteral POINT) — packed 60-bit lat/lng
     GeoPoint(GeoPointBits),
+    /// RDF 1.2 triple term (`<<( s p o )>>`). Boxed: the term embeds a
+    /// full object value, and the enum must stay narrow on the scan path.
+    TripleTerm(Box<TripleTermValue>),
     /// Null/None value
     Null,
 }
@@ -227,8 +268,9 @@ impl FlakeValue {
             FlakeValue::String(_) => 18,
             FlakeValue::Json(_) => 19,
             FlakeValue::GeoPoint(_) => 20,
+            FlakeValue::TripleTerm(_) => 21,
             // Vector MUST be highest discriminant: empty Vector is used as max() sentinel
-            FlakeValue::Vector(_) => 21,
+            FlakeValue::Vector(_) => 22,
         }
     }
 
@@ -304,6 +346,19 @@ impl FlakeValue {
     /// Check if this is a vector type
     pub fn is_vector(&self) -> bool {
         matches!(self, FlakeValue::Vector(_))
+    }
+
+    /// Check if this is an RDF 1.2 triple term
+    pub fn is_triple_term(&self) -> bool {
+        matches!(self, FlakeValue::TripleTerm(_))
+    }
+
+    /// Borrow the triple term, if this is one
+    pub fn as_triple_term(&self) -> Option<&TripleTermValue> {
+        match self {
+            FlakeValue::TripleTerm(t) => Some(t),
+            _ => None,
+        }
     }
 
     /// Try to get as i64
@@ -544,6 +599,7 @@ impl FlakeValue {
             }
             // GeoPoint: compare by packed u64 (latitude-primary ordering)
             (FlakeValue::GeoPoint(a), FlakeValue::GeoPoint(b)) => a.cmp(b),
+            (FlakeValue::TripleTerm(a), FlakeValue::TripleTerm(b)) => a.cmp(b),
             // Should not happen since discriminants are equal
             _ => Ordering::Equal,
         }
@@ -746,6 +802,25 @@ impl FlakeValue {
                 buf[1..].copy_from_slice(&bits.as_u64().to_le_bytes());
                 xxh64(&buf, 0)
             }
+            FlakeValue::TripleTerm(t) => {
+                use xxhash_rust::xxh64::Xxh64;
+                let mut hasher = Xxh64::new(0);
+                hasher.update(&[0x16]); // type tag for TripleTerm
+                hasher.update(&t.s.namespace_code.to_le_bytes());
+                hasher.update(t.s.name.as_bytes());
+                hasher.update(&[0]);
+                hasher.update(&t.p.namespace_code.to_le_bytes());
+                hasher.update(t.p.name.as_bytes());
+                hasher.update(&[0]);
+                hasher.update(&t.o.canonical_hash().to_le_bytes());
+                hasher.update(&t.dt.namespace_code.to_le_bytes());
+                hasher.update(t.dt.name.as_bytes());
+                hasher.update(&[0]);
+                if let Some(lang) = &t.lang {
+                    hasher.update(lang.as_bytes());
+                }
+                hasher.digest()
+            }
         }
     }
 }
@@ -791,6 +866,7 @@ impl PartialEq for FlakeValue {
                             .all(|(x, y)| x.to_bits() == y.to_bits())
                 }
                 (FlakeValue::GeoPoint(a), FlakeValue::GeoPoint(b)) => a == b,
+                (FlakeValue::TripleTerm(a), FlakeValue::TripleTerm(b)) => a == b,
                 // Numeric and temporal types already handled above
                 _ => false,
             }
@@ -993,6 +1069,10 @@ impl std::hash::Hash for FlakeValue {
                 self.type_discriminant().hash(state);
                 bits.hash(state);
             }
+            FlakeValue::TripleTerm(t) => {
+                self.type_discriminant().hash(state);
+                t.hash(state);
+            }
         }
     }
 }
@@ -1034,6 +1114,7 @@ impl fmt::Display for FlakeValue {
                 write!(f, "]")
             }
             FlakeValue::GeoPoint(bits) => write!(f, "{bits}"),
+            FlakeValue::TripleTerm(t) => write!(f, "<<( {} {} {} )>>", t.s, t.p, t.o),
         }
     }
 }
@@ -1263,6 +1344,26 @@ fn count_significant_digits(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point reads back as the WKT it was written as: each coordinate is
+    /// the shortest decimal that encodes to the stored point.
+    #[test]
+    fn geo_point_displays_as_written() {
+        for (lng, lat, wkt) in [
+            (2.2945, 48.8584, "POINT(2.2945 48.8584)"),
+            (-122.4194, 37.7749, "POINT(-122.4194 37.7749)"),
+            (0.0, 0.0, "POINT(0 0)"),
+            (180.0, -90.0, "POINT(180 -90)"),
+            (12.5, 41.9, "POINT(12.5 41.9)"),
+        ] {
+            let point = GeoPointBits::new(lat, lng).expect("in range");
+            let shown = point.to_string();
+            assert_eq!(shown, wkt);
+            // And it parses back to the same point.
+            let (lat, lng) = crate::geo::try_extract_point(&shown).expect("wkt");
+            assert_eq!(GeoPointBits::new(lat, lng), Some(point));
+        }
+    }
 
     /// `FlakeValue::Vector` is `Arc<[f64]>` behind a `serde(with)` adapter
     /// inside a `serde(untagged)` enum — verify it still round-trips as a

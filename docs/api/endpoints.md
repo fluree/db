@@ -88,7 +88,7 @@ Note: Cypher targets a ledger directly and must use the path form
 raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the
 [Cypher reference](../query/cypher.md) for details.
 
-Note: Turtle/TriG are not accepted on `/update`. Use `/insert` (Turtle) or `/upsert` (Turtle/TriG).
+Note: Turtle/TriG are not accepted on `/update`. Use `/insert` or `/upsert`.
 
 **Request Body (JSON-LD):**
 
@@ -246,7 +246,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
       WHERE { ?s ex:name "Alice" . ?s ex:age ?old }'
 ```
 
-Note: Turtle and TriG are not accepted on `/update`. Use `/insert` (Turtle) or `/upsert` (Turtle/TriG).
+Note: Turtle and TriG are not accepted on `/update`. Use `/insert` or `/upsert`.
 
 ### POST /insert
 
@@ -262,8 +262,7 @@ POST /insert/{ledger-id}
 - `application/json` - JSON-LD
 - `text/turtle` - Turtle (fast direct flake path)
 - `application/n-triples` - N-Triples (parsed as Turtle)
-
-**Note:** TriG (`application/trig`) is **not supported** on the insert endpoint. Named graph ingestion via GRAPH blocks requires the upsert path. Use `/upsert` for TriG data, or [`/sync`](#post-sync) to replace one named graph's contents.
+- `application/trig` - TriG: `GRAPH` blocks land in their named graphs, and a `<#txn-meta>` block becomes commit metadata. A `text/turtle` body with graph blocks is read the same way. To replace one named graph's contents instead, use [`/sync`](#post-sync).
 
 **Example (JSON-LD):**
 ```bash
@@ -458,6 +457,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 - `400 Bad Request`: the body carries `merged_commits`
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
+- `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
 
 ### POST /push-merges/*ledger
 
@@ -544,7 +544,7 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 - `200 OK`: Decoded commit returned
 - `400 Bad Request`: Missing or invalid `commit` parameter
 - `401 Unauthorized`: Bearer token required but missing
-- `404 Not Found`: Ledger or commit not found
+- `404 Not Found`: Ledger or commit not found; a `commit` that names no commit is typed `err:db/CommitNotFound`
 - `501 Not Implemented`: Proxy storage mode (no local index available)
 
 **Peer mode:** Forwards to the transactor.
@@ -1229,10 +1229,10 @@ The SPARQL Protocol's form-encoded POST is also accepted: `Content-Type: applica
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
-| `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger. |
+| `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger, where `urn:default` (the name [`/info`](#get-infoledger-id) lists the default graph under) names the default graph. |
 | `named-graph-uri` | IRI, repeatable | — | SPARQL only. A named graph for the query, as `FROM NAMED <iri>` would name it. |
 
-When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`.
+When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`. A graph the ledger does not hold is a `404` with `@type` `err:db/GraphNotFound`.
 
 **Request Headers:**
 ```http
@@ -1328,20 +1328,23 @@ The full byte-format negotiation below is available on the **ledger-scoped**
 [`POST /query/{ledger}`](#post-queryledger) route. The **connection-scoped**
 `POST /query` route (SPARQL with `FROM <ledger>`) returns pre-formatted JSON only
 — it supports the JSON family (JSON-LD, SPARQL-results JSON, AgentJson) but not the
-byte formats; Turtle, N-Triples, RDF/XML, SPARQL-results XML, and CSV/TSV require
-the ledger-scoped route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
+byte formats; Turtle, N-Triples, RDF/XML, TriG, N-Quads, SPARQL-results XML, and CSV/TSV
+require the ledger-scoped route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
 
-| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `text/turtle` / `application/n-triples` / `application/rdf+xml` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
+| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `text/turtle` / `application/n-triples` / `application/rdf+xml` / `application/trig` / `application/n-quads` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
 |---|---|---|---|---|---|---|---|
 | `SELECT` / `ASK` | SPARQL-results JSON | JSON-LD | **406** | SPARQL-results JSON | CSV / TSV | SPARQL-results XML | AgentJson |
-| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | Turtle / N-Triples / RDF/XML | JSON-LD | **406** | **406** | **406** |
+| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | the requested format | JSON-LD | **406** | **406** | **406** |
 
 A `CONSTRUCT` / `DESCRIBE` produces an RDF graph, which has no solution/binding-table
 form. It is returned as **JSON-LD** (`Content-Type: application/ld+json`) unless
 `Accept` prefers one of the graph text formats: among `application/ld+json`,
-`application/json`, `text/turtle`, `application/n-triples` and `application/rdf+xml`
-the highest `q` wins (equal weights keep the header's order; `text/*` means Turtle).
-Turtle output declares the query's `PREFIX`es and uses them. The solution-table formats
+`application/json`, `text/turtle`, `application/n-triples`, `application/rdf+xml`,
+`application/trig` and `application/n-quads` the highest `q` wins (equal weights keep the
+header's order; `text/*` means Turtle). Turtle and TriG output declare the query's `PREFIX`es
+and use them. A `CONSTRUCT` whose template has `GRAPH` blocks produces a dataset, so it
+negotiates only among TriG, N-Quads and JSON-LD; an `Accept` that admits only Turtle,
+N-Triples or RDF/XML is a `406` (see [CONSTRUCT](../query/construct.md#named-graphs-in-the-template)). The solution-table formats
 (SPARQL-results XML, CSV/TSV, AgentJson) are rejected with `406`. A `SELECT` / `ASK`
 defaults to SPARQL-results JSON and only switches to JSON-LD when `application/ld+json`
 is requested explicitly — a bare `application/json` keeps the SPARQL-results-JSON
@@ -1352,7 +1355,7 @@ shape — and an `Accept` that admits only graph formats is rejected with `406`.
 > JSON only. The JSON-family columns above apply (CONSTRUCT/DESCRIBE → JSON-LD;
 > SELECT/ASK → SPARQL-results JSON, or JSON-LD with `Accept: application/ld+json`;
 > AgentJson via `application/vnd.fluree.agent+json`, rejected `406` for graph
-> queries). CSV/TSV, Turtle, N-Triples and RDF/XML are rejected with `406`, and
+> queries). CSV/TSV, Turtle, N-Triples, RDF/XML, TriG and N-Quads are rejected with `406`, and
 > `application/sparql-results+xml` is **not** negotiated here — use
 > `POST /query/{ledger}` for those byte formats.
 
@@ -1509,7 +1512,7 @@ _:service a sd:Service ;
 - **Format:** chosen by `Accept`: JSON-LD (the default), Turtle, N-Triples or RDF/XML. Any other `Accept` is a `406`.
 - **Endpoint IRI:** `sd:endpoint` is the URL the request addressed, taken from `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sets them, otherwise from `Host`.
 - **Auth:** the description sits behind the same authentication as the endpoint. With data auth required, a request without a credential is a `401`.
-- **Features:** no `sd:feature` is claimed. The default graph is not the union of the named graphs, and Fluree has no empty named graph.
+- **Features:** a ledger's endpoint claims `sd:feature sd:UnionDefaultGraph` while the ledger's [`f:unionDefaultGraph`](../ledger-config/setting-groups.md#fquerydefaults--query-defaults) setting is on (and the caller's token may read the ledger); see [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). No other `sd:feature` is claimed: `/query` reads whatever default graph `FROM` names, and Fluree has no empty named graph.
 
 ### History Queries via POST /query
 
@@ -2370,7 +2373,7 @@ POST /branch
 | `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
 | `branch` | string | Yes | New branch name to create (e.g., "feature-x") |
 | `source` | string | No | Source branch to create from. Default: `"main"` |
-| `at` | string | No | Commit on the source branch to start from. `"t:N"` for a transaction number, or a hex digest / full CID for prefix resolution. When omitted, the branch starts at the source's current HEAD. `t:` / prefix resolution requires the source to be indexed. |
+| `at` | string | No | Point on the source branch to start from, in the same spellings as the `at` of `POST /export/*ledger`: `t:<N>`, `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), `commit:<hex-prefix>`, `latest` / `t:latest`, or a bare transaction number, ISO-8601 timestamp, hex digest prefix or full CID. The branch starts at the commit a query at `@<at>` on the source would read, so `"time:2026-01-01T00:00:00Z"` branches from the data as of that instant. When omitted, the branch starts at the source's current HEAD. |
 
 **Response:**
 
@@ -2392,9 +2395,9 @@ POST /branch
 
 **Status Codes:**
 - `201 Created` - Branch created successfully
-- `400 Bad Request` - Invalid request body (including malformed `at` value)
+- `400 Bad Request` - Invalid request body (including malformed `at` value), the source branch has no commits yet, or `at` names no commit on it: a time before its first commit, a malformed timestamp, a transaction number below 1, or `snapshot:<id>` (a graph-source table snapshot)
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `404 Not Found` - Source branch does not exist, or `at` commit is not reachable from source HEAD
+- `404 Not Found` - Source branch does not exist, or `at` names no commit, or one not reachable from source HEAD (`@type` `err:db/CommitNotFound`)
 - `409 Conflict` - Branch already exists
 - `500 Internal Server Error` - Server error
 
@@ -2415,6 +2418,11 @@ curl -X POST http://localhost:8090/v1/fluree/branch \
 curl -X POST http://localhost:8090/v1/fluree/branch \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
+
+# Branch from the data as of a point in time
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "q2", "at": "time:2026-07-01T00:00:00Z"}'
 ```
 
 ### GET /branch/{ledger-name}
@@ -2694,7 +2702,9 @@ curl -X POST http://localhost:8090/v1/fluree/rebase \
 
 Merge a source branch into a target branch. Admin-protected.
 
-Fast-forward merges copy the source commit chain into the target namespace and advance the target HEAD. When the target has diverged, Fluree performs a general merge: it computes the source and target deltas since their common ancestor, resolves overlapping `(s, p, g)` conflicts according to the requested strategy, and creates a merge commit on the target branch.
+A merge fast-forwards when the target's HEAD is on the source's line of first parents: Fluree copies the source's commits the target lacks into the target namespace and advances the target HEAD. Otherwise it performs a general merge: it folds each side's commits since the two branches diverged, resolves keys both sides changed according to the requested strategy, and creates a merge commit on the target branch.
+
+Each branch numbers its commits from its own fork point, so the two sides are compared by commit identity rather than by `t`. Any branch can be the source, `main` included, as long as `target` names where the changes go.
 
 **URL:**
 ```
@@ -2881,7 +2891,7 @@ Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first a
 
 When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
 
-**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), keeping each touched fact's **newest** op. That op is the fact's state at the source head, which is exactly what the merge applies, so a fact created and then deleted within the range shows as a deletion rather than disappearing from the diff. Nothing is inferred about whether the fact existed before the range: a range can re-assert a value the ledger already holds, so a vanishing pair would hide a real deletion. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
+**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), keeping each touched fact's **newest** op. That op is the fact's state at the source head, which is exactly what the merge applies, so a fact created and then deleted within the range shows as a deletion rather than disappearing from the diff. Nothing is inferred about whether the fact existed before the range: a range can re-assert a value the ledger already holds, so a vanishing pair would hide a real deletion. A merge on the source's line that brought the target in contributes only its resolution, so a branch that synced the target in does not report the target's own changes as its own. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
 
 - `assert_count` / `retract_count` / `subject_count` are exact across the full divergence, never truncated — a UI can render "showing X of Y".
 - `entries[]` groups net changes by subject, subjects ordered by full IRI. Each flake uses the same resolved tuple format as conflict details.
@@ -2894,6 +2904,7 @@ When `include_conflict_details=true`, `conflicts.details[]` contains one entry f
 - `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, `strategy=abort` with `include_conflicts=false`, or `changes_after_subject` without `include_changes=true`
 - `401 Unauthorized` — Bearer token required
 - `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+- `409 Conflict` — The source's namespace allocations conflict with the target's (`@type` `err:db/CommitConflict`)
 
 **Examples:**
 
@@ -3193,12 +3204,15 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `mode` | string | `rest` (default) or `direct` |
+| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
-| `table` | string | Table identifier `namespace.table` (required in `rest` mode) |
-| `table_location` | string | S3 table location (required in `direct` mode) |
-| `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
-| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Required in `rest`, `glue` and `s3tables` modes unless `r2rml` is given, whose `rr:tableName` entries then name the tables |
+| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
+| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
+| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
+| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle. Omit to register a plain Iceberg source with no mapping. |
+| `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
 | `branch` | string | Branch name (default: `main`) |
 | `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
 | `auth_bearer_env` | string | In place of `auth_bearer`: the name of an environment variable of the server holding the token, so the token is not stored. The name must be listed in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning); any other is refused with 400 |
@@ -3206,13 +3220,31 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
 | `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
 | `warehouse` | string | Warehouse identifier |
-| `no_vended_credentials` | bool | Disable vended credentials |
-| `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for `direct` mode |
+| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
 | `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
 | `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+In `glue` and `s3tables` modes the catalog is called through the native AWS SDK, and both the catalog call and the S3 reads use the server's ambient AWS credential chain:
+
+```json
+{
+  "name": "warehouse-orders",
+  "mode": "glue",
+  "region": "us-east-1",
+  "catalog_id": "123456789012",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle"
+}
+```
+
+For S3 Tables, send `"mode": "s3tables"` with `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `catalog_id` (and usually no `region`). See [Iceberg → Catalog Modes](../graph-sources/iceberg.md#catalog-modes).
+
+In `direct`, `glue` and `s3tables` modes the server reads with its own AWS identity, not the caller's, so anyone allowed to call this endpoint can map any table that identity can reach. Scope the server's IAM role (and its Lake Formation grants and bucket policies) to the tables it should serve; see [Iceberg → AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
 
 **Response:**
 
@@ -3230,15 +3262,17 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 
 **Status Codes:**
 - `201 Created` — graph source created
-- `400 Bad Request` — missing required fields or invalid R2RML
+- `400 Bad Request` — missing required fields, or an `r2rml` that does not parse or compile
 - `401/403` — admin auth required
-- `500 Internal Server Error` — catalog connection or mapping failure
+- `500 Internal Server Error` — the graph source could not be published
+
+A REST catalog that cannot be reached does not fail the request; the response carries `connection_tested: false`.
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 ### POST {api_base_url}/iceberg/catalog/verify
 
-Checks that a REST-catalog connection's credentials can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. It is read-only and admin-protected.
+Checks that a catalog connection's credentials (`rest`, `glue` or `s3tables` mode) can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. When the catalog returns no inline table metadata (AWS Glue and S3 Tables never do), the metadata file at `metadata_location` is read from storage first, with the same credentials. It is read-only and admin-protected.
 
 The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
 
@@ -3252,7 +3286,7 @@ The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NA
 |---|---|---|
 | The table can be read | `200` | `"readable": true` |
 | The table cannot be read | `200` | `"readable": false`, the reason in `error` |
-| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode or a catalog that returns no inline table metadata) |
+| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode) |
 | The admin token is missing or invalid | `401` | An error |
 
 "Cannot be read" covers every reason that belongs to the table rather than to the request:
@@ -3689,6 +3723,8 @@ Materialize a graph source into a native ledger (so BM25 / vector / reasoning ca
 
 `committed: false` means a no-delta poll (nothing changed since the watermark). `from_snapshot_id`/`to_snapshot_id` are populated for single-table mappings (multi-table watermarks live per `(source, target, table)` in the shared `fluree_materialize_state:main` state ledger, not in the target).
 
+The source is read with the same credentials a query of it would use, on full and incremental reads alike (and so by `track`): a REST source with vended credentials on whose catalog vends none is refused with `err:catalog/CredentialsNotVended` rather than read with the server's own AWS identity.
+
 **Status Codes:** `200 OK`; `400` invalid request / config; `401/403` admin auth; `500` scan or commit failure.
 
 ### POST {api_base_url}/iceberg/track
@@ -3968,12 +4004,12 @@ Enable admin authentication with CLI flags:
 
 ```bash
 # Production: require trusted tokens
-fluree-server \
+fluree server run -- \
   --admin-auth-mode=required \
   --admin-auth-trusted-issuer=did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 
 # Development: no authentication (default)
-fluree-server --admin-auth-mode=none
+fluree server run -- --admin-auth-mode=none
 ```
 
 **Environment Variables:**

@@ -1,6 +1,5 @@
 //! SPARQL Update parsing: INSERT, DELETE, and related operations.
 
-use crate::ast::pattern::GraphName;
 use crate::ast::update::{
     Create, DeleteData, DeleteWhere, GraphMgmtRef, GraphOrDefault, GraphRefAll, GraphTransfer,
     InsertData, Load, Modify, QuadData, QuadPattern, QuadPatternElement, UpdateOperation,
@@ -603,22 +602,7 @@ impl super::Parser<'_> {
         let start = self.stream.current_span();
         self.stream.advance(); // consume GRAPH
 
-        // Parse graph name (IRI or variable) using the same rules as query GRAPH patterns.
-        let name = if let Some((var_name, var_span)) = self.stream.consume_var() {
-            GraphName::Var(crate::ast::Var::new(var_name.as_ref(), var_span))
-        } else if let Some(iri) = self.parse_iri_term() {
-            GraphName::Iri(iri)
-        } else {
-            self.stream
-                .error_at_current("expected IRI or variable after GRAPH");
-            return None;
-        };
-
-        if !self.stream.match_token(&TokenKind::LBrace) {
-            self.stream
-                .error_at_current("expected '{' after GRAPH name");
-            return None;
-        }
+        let name = self.parse_graph_block_start()?;
 
         // Parse the inner triples (same construct-template grammar as other UPDATE templates).
         let mut triples: Vec<crate::ast::TriplePattern> = Vec::new();

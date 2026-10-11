@@ -27,14 +27,16 @@ Fluree supports Turtle and TriG on different endpoints with different semantics:
 
 | Endpoint | Turtle (`text/turtle`) | TriG (`application/trig`) |
 |----------|------------------------|---------------------------|
-| `/insert` | Supported (fast direct path) | Not supported (400 error) |
+| `/insert` | Supported (fast direct path) | Supported |
 | `/upsert` | Supported | Supported |
 | `/sync` | Supported | Supported (one graph per request) |
 | `/data` ([Graph Store](../api/graph-store.md) `PUT` / `POST`) | Supported | Supported (one graph per request) |
 
-- **Insert** (`/insert`): Pure insert semantics. Uses fast direct flake parsing. Will fail if subjects already exist with conflicting data. TriG is not supported because named graphs require the upsert path for GRAPH block extraction.
-- **Upsert** (`/upsert`): For each (subject, predicate) pair, existing values are retracted before new values are asserted. Supports TriG with GRAPH blocks for named graph ingestion.
-- **Sync** (`/sync?graph=<iri>`): The body becomes the named graph's entire contents, committing only the difference; an unchanged body commits nothing. N-Triples (`application/n-triples`) is accepted too. See [Sync](sync.md#payload-formats) for the TriG rules.
+- **Insert** (`/insert`): Pure insert semantics: triples are added and existing values are kept. Turtle is parsed straight to flakes. A TriG body's graph blocks land in their named graphs and a `<#txn-meta>` block becomes commit metadata; a body with graph blocks is read as TriG under either content type.
+- **Upsert** (`/upsert`): For each (graph, subject, predicate) the document names, the stored values, every language tag and list position included, are retracted and the document's values asserted (see [Upsert](upsert.md#language-tags-lists-and-blank-nodes)). A TriG body's blocks upsert into their graphs.
+- **Sync** (`/sync?graph=<iri>`): The body becomes the named graph's entire contents, committing only the difference; an unchanged body commits nothing. See [Sync](sync.md#payload-formats) for the TriG rules.
+
+N-Triples is a subset of Turtle and is accepted wherever Turtle is: as `application/n-triples` over HTTP, and as a `.nt` file or `--format nt` from the CLI.
 
 ## Basic Turtle Transaction
 
@@ -283,11 +285,10 @@ riot --output=turtle data.jsonld > data.ttl
 rapper -i rdfxml -o turtle data.rdf > data.ttl
 ```
 
-### From N-Triples to Turtle
+### N-Triples
 
-```bash
-rapper -i ntriples -o turtle data.nt > data.ttl
-```
+N-Triples needs no conversion. Send it as `application/n-triples`, or pass a
+`.nt` file to the CLI.
 
 ## Validation
 
@@ -456,7 +457,7 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 *asserting* forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them produce the same on-disk `f:reifies*` bundle that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so cascade retracts, hydration, and the annotation arena treat every surface as one, and the annotations are queryable from every query surface:
+The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 reifying forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them store the same `rdf:reifies` link that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so retractions and hydration treat every surface as one, and the annotations are queryable from every query surface:
 
 ```turtle
 @prefix ex:  <http://example.org/> .
@@ -481,8 +482,8 @@ ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
 
 Two rules to know:
 
-- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well and attaches the reifier to it. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
-- **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
+- **Only the annotation syntax asserts the triple.** As RDF 1.2 defines them, `s p o ~ r` and `s p o {| … |}` put `s p o` in the graph and attach the reifier to it, while `<< s p o >>` and `r rdf:reifies <<( s p o )>>` attach the reifier without asserting `s p o`. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
+- **`<<( ... )>>` is a value.** Under `rdf:reifies` it is a reifier's triple; under any other predicate (`ex:doc ex:mentions <<( ... )>>`) it is stored as a value, without asserting or reifying its triple (see [Triple terms as values](../concepts/edge-annotations.md#triple-terms-as-values)). A triple term's object may be another triple term. As a subject, or inside an annotation body, it is rejected with a specific error rather than silently dropped.
 
 TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:
 
@@ -510,7 +511,7 @@ ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
 
 This one is documented rather than refused, and the line is worth stating because Fluree draws it elsewhere too. The reversed form is well-formed SPARQL-star with defined semantics: four rows is the *correct* answer to what was written, and no parser can know the author meant the other thing. Fluree refuses a construct only when there is no correct answer to give — a property read on an enumerated variable-length relationship is refused (see `docs/query/cypher.md`) because the enumeration operator does not retain per-hop edge identity, so every answer, nulls included, would be a fiction. A right answer to the wrong question gets a warning in the docs; no right answer gets an error.
 
-**TriG goes through `upsert` or `/sync`, not `insert`.** `fluree insert` routes a file to the streaming Turtle parser, which has no `GRAPH` keyword and reports `expected subject, found 'GRAPH'`. Named-graph blocks are read by `fluree upsert -f file.trig`, or by `POST /sync` for one graph.
+**TriG works on `insert`, `upsert` and `/sync`.** An annotation inside a `GRAPH { }` block is written into that graph: `fluree insert -f file.trig`, `fluree upsert -f file.trig`, or `POST /sync` for one graph.
 
 **Anonymous reifiers have no identity you can refer to, and the two re-send paths differ.** `~ ex:claim1` is an identity: re-ingesting the file finds the same claim and replaces its body, on every path. A bare `{| … |}` block has no such handle, so what happens on a re-send depends on where the path scopes blank-node identity.
 
@@ -526,13 +527,12 @@ Rejected with a clear parse or stage error, never silently dropped:
 - the parenthesized triple term `<<( :s :p :o )>>` anywhere other than the object of `rdf:reifies` (RDF 1.2 triple terms as values are not representable yet), and a triple term nested inside another;
 - an annotation block nested inside an annotation body (`{| :q :v {| … |} |}`), and an annotation tail on an `rdf:reifies <<( … )>>` statement (it would annotate the reification itself);
 - an annotation on a collection object (`( :a :b ) {| … |}`);
-- one named reifier on two different triples — a reifier denotes exactly one edge (see [the single-target invariant](../concepts/edge-annotations.md#one-annotation-one-edge-single-target-invariant));
 - an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
 - TriG: annotations in a `<#txn-meta>` block — its triples become commit metadata, not edges.
 
 The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error. They are stored as an `rdf:langString` whose language is the whole `en--ltr` string, not yet as `rdf:dirLangString` with a separate direction — so `LANG()` returns `en--ltr` and `langMatches(?l, "en")` will not match it.
 
-Export writes annotations back out in RDF 1.2 syntax in every format (see [export](../cli/export.md#edge-annotations-rdf-12)). SPARQL CONSTRUCT and the Graph Store `GET` do not include them yet, in any format. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model — `rdf:reifies` for annotation-rooted queries, the per-operation rules for SPARQL UPDATE templates, and the deferred shapes — see the [Edge annotations concept doc](../concepts/edge-annotations.md).
+Annotations are written back out in RDF 1.2 syntax (`~ r` in Turtle and TriG, `rdf:reifies <<( … )>>` in N-Triples and N-Quads) by export (see [export](../cli/export.md#edge-annotations-rdf-12)), by a SPARQL CONSTRUCT whose template carries them (see [CONSTRUCT](../query/construct.md#edge-annotations-in-the-template)), and by the Graph Store `GET`. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model — `rdf:reifies` for annotation-rooted queries, the per-operation rules for SPARQL UPDATE templates, and the deferred shapes — see the [Edge annotations concept doc](../concepts/edge-annotations.md).
 
 ## Comparing Formats
 
@@ -602,20 +602,67 @@ GRAPH <http://example.org/graphs/inventory> {
 }
 ```
 
+Default-graph triples can also be wrapped in an unlabeled `{ ... }` block. Graph labels must be IRIs; a blank-node label (`_:g { ... }`, `[] { ... }`) is refused. Inside a labeled block, blank-node property lists (`[ ... ]`, `[]`) and collections (`( ... )`) are not supported yet; use labeled blank nodes (`_:b`) there instead.
+
 ### Submitting TriG Data
 
-TriG is supported on the **upsert** endpoint, and on **sync** for replacing one named graph's contents ([Sync](sync.md#payload-formats)). Use the `application/trig` content type:
+TriG is supported on the **insert** and **upsert** endpoints, and on **sync** for replacing one named graph's contents ([Sync](sync.md#payload-formats)). Use the `application/trig` content type:
 
 ```bash
-# TriG requires upsert (for named graph support)
+# Insert: add the document's triples to each graph
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/trig" \
+  --data-binary '@data.trig'
+
+# Upsert: replace existing values within each graph
 curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
   -H "Content-Type: application/trig" \
   --data-binary '@data.trig'
 ```
 
-TriG on the `/insert` endpoint will return a 400 error because named graph extraction requires the upsert path.
+From the CLI, `fluree insert -f data.trig` and `fluree upsert -f data.trig` do the same.
 
-**Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** on `/upsert` and bulk import, a `GRAPH` block's contents are read by a smaller parser that rejects anonymous blank nodes (`[ … ]`) and collections (`( … )`) with `expected object, found '['`. Triples outside blocks are unaffected. `/sync` and the [Graph Store Protocol](../api/graph-store.md) read block contents with the full Turtle parser, so they accept both; for `/upsert`, use labeled blank nodes (`_:b1`) inside blocks.
+A `GRAPH` block's contents are Turtle like the rest of the document: anonymous blank nodes (`[ … ]`), collections (`( … )`) and RDF 1.2 annotations work inside blocks on every transaction endpoint. **Known limitation ([#1930](https://github.com/fluree/db/issues/1930)):** bulk import (`fluree create --from data.trig`) still reads block contents with a smaller parser that rejects `[ … ]` and `( … )` with an error naming the construct; use labeled blank nodes (`_:b1`) inside blocks there.
+
+### How RDF Text Is Read
+
+Every transaction endpoint reads Turtle and TriG with the same parser, once, and stores what it reads; nothing is converted to JSON-LD on the way. So the same document stores the same facts through `/insert`, `/upsert`, `/sync` and the Graph Store routes:
+
+- **Directives apply in document order.** A `@prefix` or `@base` applies to what follows it, in the default graph and in blocks alike; redefining a prefix later does not change the IRIs before it. A block label is resolved under the declarations in force where the block appears.
+- **Relative IRIs resolve against the base.** `<x>` resolves against the `@base` in force. With no base, a relative reference in the default graph is a parse error, while one in a `GRAPH` block, as its label or in its contents, is kept exactly as written: ledger configuration names a ledger by its id, and an id such as `org/governance:main` is a relative reference (`f:ledger <org/governance:main>`). `<#txn-meta>` with no base in force names the commit-metadata block, as always.
+- **Literals are stored as written.** A lexical form that does not fit its datatype (`"abc"^^xsd:integer`) is kept, with its declared datatype, on every endpoint, as insert always did.
+- **Any IRI scheme works.** `tag:`, `kb:` and other schemes are stored verbatim, however they are spelled.
+- **Collections keep their order and repeats**, and `rdf:type` takes a blank node or a literal like any other predicate.
+- **Blank-node labels are document-scoped:** `_:b` in the default graph and in two blocks is one node. Each `[ ]` is a new node.
+- **Errors point into the document as sent:** a parse error in a block reports its position in the whole document, and a malformed block (nested, unclosed, a directive inside it, a blank-node label) is named as such.
+
+An upsert scopes a document's blank nodes to its content, so upserting the same document again addresses the same nodes and commits nothing. The scope ignores statement order (anonymous `[ ]` nodes are numbered in document order, so moving statements that contain them relative to each other gives a new scope); any change to the statements, or to how they are written beyond IRI and quote style (`1` vs `"1"^^xsd:integer`, a language tag's case, a repeated statement, a renamed blank-node label), gives a new scope and new nodes, and the previous nodes stay. To find blank-node subjects that nothing references any more:
+
+```sparql
+SELECT DISTINCT ?b WHERE {
+  ?b ?p ?o .
+  FILTER(isBlank(?b))
+  FILTER NOT EXISTS { ?s ?q ?b }
+  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }
+}
+```
+
+That query lists subjects in the default graph. Blank nodes a TriG upsert wrote inside `GRAPH` blocks live in those graphs; the same check, graph by graph:
+
+```sparql
+SELECT DISTINCT ?g ?b WHERE {
+  GRAPH ?g {
+    ?b ?p ?o .
+    FILTER(isBlank(?b))
+  }
+  FILTER NOT EXISTS { ?s ?q ?b }
+  FILTER NOT EXISTS { GRAPH ?h { ?s2 ?q2 ?b } }
+}
+```
+
+Both look for references in every graph. A blank-node label names one node across a TriG document, so a node described in one graph can be referenced from another, and a check within its own graph would list it.
+
+Review the list before deleting: a document can hold unreferenced blank-node subjects on purpose. Deleting an orphaned node leaves the nodes it referenced orphaned in turn, so repeat until the query returns nothing.
 
 ### Querying Named Graphs
 
@@ -666,11 +713,11 @@ Fluree assigns internal graph IDs to named graphs:
 
 ### TriG with Transaction Metadata
 
-You can combine named graphs with transaction metadata using the special `#txn-meta` graph fragment:
+You can combine named graphs with transaction metadata using the special `#txn-meta` graph fragment (with no `@base` in force). This works on both `insert` and `upsert`:
 
 ```trig
 @prefix ex: <http://example.org/ns/> .
-@prefix f: <https://ns.flur.ee/db#> .
+@prefix fluree: <https://ns.flur.ee/db#> .
 
 # Transaction metadata (stored in txn-meta graph)
 GRAPH <#txn-meta> {

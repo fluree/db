@@ -38,7 +38,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{AggregateFn, InputSemantics};
+use crate::ir::AggregateFn;
 // Note: JoinKey and Materializer would be used for multi-ledger/dataset mode
 // but for now we use GroupKeyOwned for single-ledger simplicity
 use crate::operator::{
@@ -186,9 +186,7 @@ pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView
                 Ok(fluree_db_core::FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
                     let dt_sid = store
-                        .dt_sids()
-                        .get(*dt_id as usize)
-                        .cloned()
+                        .resolve_dt_id_sid_for_value(*dt_id, &val)
                         .unwrap_or_else(|| Sid::new(0, ""));
                     let meta = store.decode_meta(*lang_id, *i_val);
                     let dtc = meta
@@ -531,7 +529,13 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             // Plain IRI string
             GroupKeyOwned::MaterializedSid(0, iri.clone())
         }
-        Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
+        // Unreachable: a per-group list never leaves its grouping stage (the
+        // plan-time `Grouping::first_ungrouped_read` check). This function
+        // cannot fail, so a list here would merge every group into one.
+        Binding::Grouped(_) => {
+            debug_assert!(false, "Grouped binding used as a group key");
+            GroupKeyOwned::Absent
+        }
         // A path groups per distinct (nodes, per-hop edges) identity — needed
         // for `WITH path, collect(...)` over allShortestPaths (IC14). Edges are
         // included to match PartialEq/Hash: two paths over the same node
@@ -801,32 +805,10 @@ impl GroupAggregateOperator {
         self
     }
 
-    /// Check if all aggregates are streamable (for planner optimization decisions).
-    ///
-    /// `DISTINCT SUM`/`AVG` aren't streamable because the dedup pass must collect
-    /// every value before reducing. `Median`/`Variance`/`Stddev`/`GroupConcat`
-    /// are non-streamable regardless of DISTINCT — they likewise need every
-    /// value in hand. `COUNT(DISTINCT)` is streamable because its state machine
-    /// is a `HashSet` (the dedup IS the streaming state), and `Min`/`Max`/`Sample`
-    /// don't carry a DISTINCT flag at all.
+    /// Check if all aggregates are streamable (for planner optimization
+    /// decisions); see [`AggregateFn::is_streamable`].
     pub fn all_streamable(specs: &[StreamingAggSpec]) -> bool {
-        specs.iter().all(|spec| match &spec.function {
-            AggregateFn::Count(_)
-            | AggregateFn::CountAll
-            | AggregateFn::CountDistinct(_)
-            | AggregateFn::CountDistinctAll(_)
-            | AggregateFn::Min(_)
-            | AggregateFn::Max(_)
-            | AggregateFn::Sample(_) => true,
-            AggregateFn::Sum(_, semantics) | AggregateFn::Avg(_, semantics) => {
-                matches!(semantics, InputSemantics::List)
-            }
-            AggregateFn::Median { .. }
-            | AggregateFn::Variance { .. }
-            | AggregateFn::Stddev { .. }
-            | AggregateFn::GroupConcat { .. }
-            | AggregateFn::Collect(..) => false,
-        })
+        specs.iter().all(|spec| spec.function.is_streamable())
     }
 
     /// Write a row's composite group key into `key`, reusing its allocation.
@@ -934,6 +916,39 @@ impl Operator for GroupAggregateOperator {
                 let batch = Batch::new(schema, vec![vec![count_binding]])?;
                 self.state = OperatorState::Exhausted;
                 return Ok(Some(batch));
+            }
+        }
+
+        // A join can count matches before expanding them into output rows when
+        // all group keys come from its driving side. Other aggregates and
+        // DISTINCT retain ordinary row consumption.
+        if self.emit_iter.is_none()
+            && !self.group_key_indices.is_empty()
+            && !self.agg_specs.is_empty()
+            && self
+                .agg_specs
+                .iter()
+                .all(|spec| matches!(spec.function, AggregateFn::CountAll))
+        {
+            let group_vars = &self.in_schema[..self.group_key_indices.len()];
+            if let Some(groups) = self.child.drain_grouped_count(ctx, group_vars).await? {
+                let states = groups
+                    .into_iter()
+                    .map(|group| {
+                        i64::try_from(group.count).map_err(|_| {
+                            QueryError::execution("grouped COUNT(*) exceeds i64::MAX")
+                        })?;
+                        Ok(GroupState {
+                            key_bindings: group.keys,
+                            agg_states: self
+                                .agg_specs
+                                .iter()
+                                .map(|_| AggState::Count { n: group.count })
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.emit_iter = Some(GroupEmitIter::Vec(states.into_iter()));
             }
         }
 
@@ -1286,6 +1301,7 @@ fn extract_numeric_with_gv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::InputSemantics;
     use fluree_db_core::LedgerSnapshot;
     use std::collections::HashMap;
 

@@ -57,6 +57,10 @@ pub const KIND_STRING_FWD: u8 = 0;
 /// Pack kind: subject forward dictionary (one pack per namespace).
 pub const KIND_SUBJECT_FWD: u8 = 1;
 
+/// Pack kind: triple-term forward dictionary (one pack stream per inner
+/// predicate; entries are encoded `TermKey`s keyed by per-predicate sequence).
+pub const KIND_TERM_FWD: u8 = 2;
+
 // ============================================================================
 // Pack header
 // ============================================================================

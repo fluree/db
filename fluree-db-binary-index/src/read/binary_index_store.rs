@@ -31,13 +31,14 @@ use parking_lot::RwLock;
 use crate::dict::forward_pack::{KIND_STRING_FWD, KIND_SUBJECT_FWD};
 use crate::dict::global_dict::{LanguageTagDict, PredicateDict};
 use crate::dict::pack_reader::ForwardPackReader;
+use crate::dict::term_dict::TermDictReader;
 use crate::dict::DictTreeReader;
 use crate::format::branch::{read_branch_from_bytes, BranchManifest};
 use crate::format::index_root::{IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
-use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
+use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid, uses_disk_cache};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
@@ -61,6 +62,8 @@ pub(crate) struct DictionarySet {
     /// String forward pack reader (all string IDs in one stream).
     pub(crate) string_forward_packs: ForwardPackReader,
     pub(crate) string_reverse_tree: Option<Arc<DictTreeReader>>,
+    /// Triple-term dictionary; `None` when the root carries no term section.
+    pub(crate) term_dict: Option<TermDictReader>,
     // Kept for: DictOverlay watermark computation (query overlay resolution).
     // Use when: DictOverlay is wired into V3 query execution for overlay transactions.
     #[expect(dead_code)]
@@ -243,16 +246,12 @@ struct GraphIndex {
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whole-leaf bytes: a shared memory mapping when the leaf is local
-/// (saving the per-call open/read/copy), or an owned buffer for remote
-/// leaves.
+/// (saving the per-call open/read/copy), a shared view of bytes the store
+/// already holds in memory (`resolve_cached_bytes`), or an owned buffer
+/// for remote leaves.
 pub enum SharedLeafBytes {
     Mmap(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
-    /// Zero-copy view of the content store's resident tier
-    /// (`resolve_cached_bytes`). Compiled only for residency-capable builds
-    /// (wasm32, or native with the `residency` feature) so default native
-    /// match sites and layout stay exactly as they were.
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     Shared(Arc<[u8]>),
 }
 
@@ -262,7 +261,6 @@ impl std::ops::Deref for SharedLeafBytes {
         match self {
             SharedLeafBytes::Mmap(mmap) => mmap,
             SharedLeafBytes::Owned(bytes) => bytes,
-            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             SharedLeafBytes::Shared(bytes) => bytes,
         }
     }
@@ -314,6 +312,9 @@ pub struct BinaryIndexStore {
     base_t: i64,
     language_tags: Vec<String>,
     lex_sorted_string_ids: bool,
+    /// Decimal-encoding policy of the loaded root. Governs how query constants
+    /// encode so they match stored rows (inline vs NumBig arena).
+    decimal_encoding: fluree_db_core::DecimalEncoding,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set from the snapshot's `ns_split_mode` via `set_ns_split_mode()`.
     ns_split_mode: NsSplitMode,
@@ -324,6 +325,7 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    scan_hidden_p_ids: std::sync::OnceLock<Box<[u32]>>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
@@ -367,6 +369,7 @@ impl BinaryIndexStore {
                 subject_reverse_tree: None,
                 string_forward_packs: ForwardPackReader::empty(),
                 string_reverse_tree: None,
+                term_dict: None,
                 subject_count: 0,
                 string_count: 0,
                 namespace_codes: Arc::new(HashMap::new()),
@@ -390,9 +393,11 @@ impl BinaryIndexStore {
             base_t: 0,
             language_tags: Vec::new(),
             lex_sorted_string_ids: false,
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            scan_hidden_p_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
@@ -572,9 +577,11 @@ impl BinaryIndexStore {
             base_t: root.base_t,
             language_tags: normalize_root_lang_tags(&root.language_tags),
             lex_sorted_string_ids: root.lex_sorted_string_ids,
+            decimal_encoding: root.decimal_encoding(),
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            scan_hidden_p_ids: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
@@ -608,6 +615,13 @@ impl BinaryIndexStore {
     #[inline]
     pub fn lex_sorted_string_ids(&self) -> bool {
         self.lex_sorted_string_ids
+    }
+
+    /// The loaded root's decimal-encoding policy. Query constants must encode
+    /// under this policy so they match stored `(o_type, o_key)` rows.
+    #[inline]
+    pub fn decimal_encoding(&self) -> fluree_db_core::DecimalEncoding {
+        self.decimal_encoding
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -655,9 +669,10 @@ impl BinaryIndexStore {
     /// comparator the read path uses, so the warmed leaves are exactly those the
     /// scan reads. Only warms the disk cache — results are byte-identical.
     ///
-    /// Remote-only: no CAS, or leaves that resolve to a local path, are skipped
-    /// (a local read is already cheap). Bounded by the shared `budget`; per-leaf
-    /// failures are logged and ignored — the scan fetches them the old way.
+    /// Only for a store the disk cache serves (see `uses_disk_cache`); leaves
+    /// that resolve to a local path are skipped too (a local read is already
+    /// cheap). Bounded by the shared `budget`; per-leaf failures are logged
+    /// and ignored — the scan fetches them the old way.
     pub async fn prefetch_leaves_for_range(
         &self,
         g_id: GraphId,
@@ -672,6 +687,9 @@ impl BinaryIndexStore {
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
+        if !uses_disk_cache(cs.as_ref()) {
+            return;
+        }
         let Some(branch) = self.branch_for_order(g_id, order) else {
             return;
         };
@@ -938,7 +956,7 @@ impl BinaryIndexStore {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
-            if local.is_none() && cs.permits_plaintext_cache() {
+            if local.is_none() && uses_disk_cache(cs.as_ref()) {
                 let promoted = self.cache_dir.join(leaf_cid.to_string());
                 if promoted.exists() {
                     local = Some(promoted);
@@ -963,6 +981,9 @@ impl BinaryIndexStore {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
                 }
+            }
+            if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+                return Ok(SharedLeafBytes::Shared(bytes));
             }
         }
         self.get_leaf_bytes_sync(leaf_cid)
@@ -1000,10 +1021,16 @@ impl BinaryIndexStore {
             }
         }
 
-        // Check cache. A store that decrypts on read gets no disk cache:
-        // nothing is written there, and nothing left there by an earlier run
-        // is consulted.
-        let persist = cs.permits_plaintext_cache();
+        // Bytes the store holds in memory: one copy into the owned buffer
+        // this returns. The shared readers borrow them instead.
+        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+            return Ok(bytes.to_vec());
+        }
+
+        // Check cache, for a store the cache serves at all. Any other store
+        // gets nothing written there, and nothing left there by an earlier
+        // run is consulted.
+        let persist = uses_disk_cache(cs.as_ref());
         let cache_path = self.cache_dir.join(leaf_cid.to_string());
         if persist {
             match std::fs::read(&cache_path) {
@@ -1049,6 +1076,8 @@ impl BinaryIndexStore {
     /// Open a leaf for reading, choosing the optimal access strategy.
     ///
     /// - Local filesystem: returns `FullBlobLeafHandle` (OS page cache is optimal)
+    /// - Held in memory by the store: returns `SharedBlobLeafHandle` (borrowed,
+    ///   no copy)
     /// - Cached locally: returns `FullBlobLeafHandle` (read from disk cache)
     /// - Remote (S3/etc): returns `RangeReadLeafHandle` (header+dir only, lazy
     ///   column fetch via byte-range reads)
@@ -1128,10 +1157,16 @@ impl BinaryIndexStore {
             return self.open_mmapped_leaf(&local_path, leaf_id, sidecar_cid, need_replay);
         }
 
+        // Fast path 1b: the store holds the bytes in memory — borrow them,
+        // with the directory shared through the cache as for a mapped leaf.
+        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+            return self.leaf_handle_from_resident(bytes, leaf_id, sidecar_cid, need_replay);
+        }
+
         // Fast path 2: locally cached (remote-promoted) — same mmap path; a
         // missing cache file falls through to the range-read paths below.
-        // Skipped for a store that forbids a plaintext copy outside it.
-        if cs.permits_plaintext_cache() {
+        // Skipped for a store the cache does not serve.
+        if uses_disk_cache(cs.as_ref()) {
             let cache_path = self.cache_dir.join(leaf_cid.to_string());
             match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
                 Ok(handle) => return Ok(handle),
@@ -1283,6 +1318,34 @@ impl BinaryIndexStore {
         )))
     }
 
+    /// Build the handle for a leaf whose bytes the store holds in memory,
+    /// sharing the decoded directory through the cache.
+    fn leaf_handle_from_resident(
+        &self,
+        bytes: Arc<[u8]>,
+        leaf_id: u128,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        let decode = || {
+            let header = crate::format::leaf::decode_leaf_header_v3(&bytes)?;
+            crate::format::leaf::decode_leaf_dir_v3_with_base(&bytes, &header).map(Arc::new)
+        };
+        let dir = if let Some(cache) = &self.leaflet_cache {
+            cache.try_get_or_load_leaf_dir(leaf_id, decode)?
+        } else {
+            decode()?
+        };
+        let sidecar = if need_replay {
+            self.fetch_sidecar_bytes_sync(sidecar_cid)?.map(Arc::from)
+        } else {
+            None
+        };
+        Ok(Box::new(
+            super::leaf_access::SharedBlobLeafHandle::with_dir(bytes, dir, sidecar, leaf_id),
+        ))
+    }
+
     /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
     pub fn open_leaf_dir(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
         let key = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
@@ -1356,6 +1419,7 @@ impl BinaryIndexStore {
             DecodeKind::Bool => Ok(FlakeValue::Boolean(o_key != 0)),
             DecodeKind::I64 => Ok(FlakeValue::Long(key.decode_i64())),
             DecodeKind::F64 => Ok(FlakeValue::Double(key.decode_f64())),
+            DecodeKind::Decimal => Ok(FlakeValue::Decimal(Box::new(key.decode_decimal()))),
             // The temporal types own their canonical form; building them from
             // the key directly is what makes an indexed value identical to the
             // same value parsed from a commit (see fluree_db_core::temporal).
@@ -1517,6 +1581,7 @@ impl BinaryIndexStore {
             DecodeKind::SpatialArena => Err(io::Error::other(
                 "spatial arena decode not yet implemented in V6",
             )),
+            DecodeKind::TripleTermDict => self.decode_triple_term(o_key),
         }
     }
 
@@ -1891,6 +1956,19 @@ impl BinaryIndexStore {
         })
     }
 
+    /// Persisted p_ids of the predicates wildcard scans hide
+    /// ([`fluree_db_core::is_scan_hidden_predicate`]). Empty unless the
+    /// ledger's history holds legacy annotation bundles, so a
+    /// variable-predicate scan of any other ledger checks no row.
+    pub fn scan_hidden_p_ids(&self) -> &[u32] {
+        self.scan_hidden_p_ids.get_or_init(|| {
+            fluree_vocab::reifies_iris::ALL
+                .iter()
+                .filter_map(|iri| self.find_predicate_id(iri))
+                .collect()
+        })
+    }
+
     /// Lookup a predicate IRI → p_id.
     pub fn find_predicate_id(&self, iri: &str) -> Option<u32> {
         self.dicts.predicate_reverse.get(iri).copied()
@@ -1989,6 +2067,7 @@ impl BinaryIndexStore {
             OType::XSD_DOUBLE => Some(Sid::new(namespaces::XSD, xsd_names::DOUBLE)),
             OType::XSD_FLOAT => Some(Sid::new(namespaces::XSD, xsd_names::FLOAT)),
             OType::XSD_DECIMAL => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
+            OType::XSD_DECIMAL_INLINE => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
             OType::XSD_DATE => Some(Sid::new(namespaces::XSD, xsd_names::DATE)),
             OType::XSD_TIME => Some(Sid::new(namespaces::XSD, xsd_names::TIME)),
             OType::XSD_DATE_TIME => Some(Sid::new(namespaces::XSD, xsd_names::DATE_TIME)),
@@ -2022,6 +2101,7 @@ impl BinaryIndexStore {
             OType::VECTOR => Some(Sid::new(namespaces::FLUREE_DB, "embeddingVector")),
             OType::FULLTEXT => Some(Sid::new(namespaces::FLUREE_DB, "fullText")),
             OType::GEO_POINT => Some(Sid::new(namespaces::OGC_GEO, geo_names::WKT_LITERAL)),
+            OType::TRIPLE_TERM => Some(fluree_db_core::triple_term_datatype_sid().clone()),
 
             // Types without a stable datatype (or not representable as typed literals)
             // return None so callers can either skip constraints or use a safe fallback.
@@ -2043,6 +2123,28 @@ impl BinaryIndexStore {
     pub fn resolve_datatype_sid_for_value(&self, o_type: u16, val: &FlakeValue) -> Option<Sid> {
         self.resolve_datatype_sid(o_type)
             .or_else(|| val.overflow_numeric_datatype_sid())
+    }
+
+    /// Resolve the datatype Sid of a decoded `EncodedLit` — the `dt_id`-keyed
+    /// twin of [`resolve_datatype_sid_for_value`].
+    ///
+    /// Every NUM_BIG `EncodedLit` carries `dt_id = DECIMAL`, because the scan
+    /// cannot tell an overflow `xsd:integer` from an `xsd:decimal` without
+    /// decoding. The decoded value's variant therefore wins over `dt_id`. Any
+    /// site that turns a decoded `EncodedLit` into a typed term must resolve
+    /// its datatype here; one that reads `dt_sids()` directly reports overflow
+    /// integers as `xsd:decimal` and keys them apart from decoded copies of
+    /// the same value (issue #1329). A triple-term `EncodedLit` carries no
+    /// `dt_id` either.
+    ///
+    /// [`resolve_datatype_sid_for_value`]: Self::resolve_datatype_sid_for_value
+    pub fn resolve_dt_id_sid_for_value(&self, dt_id: u16, val: &FlakeValue) -> Option<Sid> {
+        val.overflow_numeric_datatype_sid()
+            .or_else(|| {
+                val.is_triple_term()
+                    .then(|| fluree_db_core::triple_term_datatype_sid().clone())
+            })
+            .or_else(|| self.dt_sids().get(dt_id as usize).cloned())
     }
 
     /// Look up an o_type table entry by o_type value. O(1).
@@ -2234,6 +2336,107 @@ impl BinaryIndexStore {
         Some(proven)
     }
 
+    /// True when the index carries a triple-term dictionary.
+    pub fn has_term_dict(&self) -> bool {
+        self.dicts.term_dict.is_some()
+    }
+
+    /// The triple-term dictionary, if the index carries one.
+    pub fn term_dict(&self) -> Option<&TermDictReader> {
+        self.dicts.term_dict.as_ref()
+    }
+
+    /// The `OType::TRIPLE_TERM` handle for an encoded base edge, if interned.
+    pub fn find_term_handle(
+        &self,
+        key: &fluree_db_core::triple_term::TermKey,
+    ) -> io::Result<Option<u64>> {
+        match &self.dicts.term_dict {
+            Some(td) => td.find_handle(key),
+            None => Ok(None),
+        }
+    }
+
+    /// The encoded base edge behind a triple-term handle.
+    pub fn resolve_term_key(
+        &self,
+        handle: u64,
+    ) -> io::Result<Option<fluree_db_core::triple_term::TermKey>> {
+        match &self.dicts.term_dict {
+            Some(td) => td.resolve(handle),
+            None => Ok(None),
+        }
+    }
+
+    /// A term key's object. Every kind the main index keys graph-wide decodes
+    /// as it does there; a decimal, big-integer or vector object is keyed by
+    /// the string id of its canonical form instead of an arena handle.
+    pub fn decode_term_object(
+        &self,
+        key: &fluree_db_core::triple_term::TermKey,
+    ) -> io::Result<FlakeValue> {
+        use fluree_db_core::triple_term::{is_lexical_term_object, parse_lexical_term_object};
+        if !is_lexical_term_object(key.o_type) {
+            return self.decode_value_v3(
+                key.o_type.as_u16(),
+                key.o_key,
+                key.p_id,
+                fluree_db_core::DEFAULT_GRAPH_ID,
+            );
+        }
+        let form = self.resolve_string_value(key.o_key as u32)?;
+        parse_lexical_term_object(key.o_type, &form).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "term object form {form:?} is not a {:#06x} value",
+                    key.o_type.as_u16()
+                ),
+            )
+        })
+    }
+
+    /// Materialize a triple-term handle: the base edge's subject, predicate
+    /// and object as SIDs and a value, with the object's datatype and tag.
+    fn decode_triple_term(&self, handle: u64) -> io::Result<FlakeValue> {
+        let key = self.resolve_term_key(handle)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("triple-term handle {handle:#x} not in the term dictionary"),
+            )
+        })?;
+        let (ns, suffix) = self.resolve_subject_parts(key.s_id)?;
+        let p = self.predicate_sid(key.p_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "triple-term handle {handle:#x}: unknown predicate id {}",
+                    key.p_id
+                ),
+            )
+        })?;
+        let o_type = key.o_type.as_u16();
+        let o = self.decode_term_object(&key)?;
+        let dt = self
+            .resolve_datatype_sid_for_value(o_type, &o)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("triple-term handle {handle:#x}: no datatype for o_type {o_type:#06x}"),
+                )
+            })?;
+        let lang = self.resolve_lang_tag(o_type).map(str::to_string);
+        Ok(FlakeValue::TripleTerm(Box::new(
+            fluree_db_core::TripleTermValue {
+                s: Sid::new(ns, suffix),
+                p,
+                o,
+                dt,
+                lang,
+            },
+        )))
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
@@ -2242,6 +2445,23 @@ impl BinaryIndexStore {
                 tree.reverse_lookup(&key)
             }
             None => Ok(None),
+        }
+    }
+
+    /// [`Self::find_subject_id_by_parts`] for many subjects, reading each
+    /// reverse-tree leaf once.
+    pub fn find_subject_ids_by_parts(&self, parts: &[(u16, &str)]) -> io::Result<Vec<Option<u64>>> {
+        match &self.dicts.subject_reverse_tree {
+            Some(tree) => {
+                let keys: Vec<Vec<u8>> = parts
+                    .iter()
+                    .map(|&(ns_code, suffix)| {
+                        crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+                    })
+                    .collect();
+                tree.reverse_lookup_many(keys.iter().map(Vec::as_slice))
+            }
+            None => Ok(vec![None; parts.len()]),
         }
     }
 
@@ -2528,16 +2748,16 @@ impl BinaryIndexStore {
         Ok(0)
     }
 
-    /// Pre-warm forward-dictionary pages (string + subject packs) into the OS
-    /// page cache, up to `budget_bytes` total across all packs. Returns the
-    /// number of bytes touched.
+    /// Pre-warm forward-dictionary pages (string, subject, then triple-term
+    /// packs) into the OS page cache, up to `budget_bytes` total across all
+    /// packs. Returns the number of bytes touched.
     ///
     /// The index root and reverse-dict tree readers are already resident after
     /// [`load_from_root_v6`](Self::load_from_root_v6); this targets the forward
     /// packs, which are opened lazily and otherwise load on the first query
     /// that resolves an IRI/string ID. String packs are warmed first (broadest
-    /// query impact), then per-namespace subject packs. Warming stops once the
-    /// budget is exhausted.
+    /// query impact), then per-namespace subject packs, then triple-term packs.
+    /// Warming stops once the budget is exhausted.
     ///
     /// Blocking (page faults / sequential reads) — call from a blocking context
     /// such as `tokio::task::spawn_blocking`, never on the hot async path.
@@ -2548,6 +2768,11 @@ impl BinaryIndexStore {
                 break;
             }
             warmed += reader.prewarm(budget_bytes - warmed);
+        }
+        if let Some(terms) = &self.dicts.term_dict {
+            if warmed < budget_bytes {
+                warmed += terms.prewarm(budget_bytes - warmed);
+            }
         }
         warmed
     }
@@ -2828,6 +3053,26 @@ impl BinaryGraphView {
         self.namespace_codes_fallback.clone()
     }
 
+    /// A provisional triple-term handle's term, from dictionary novelty;
+    /// `None` for an indexed handle.
+    fn novelty_term(
+        dn: &fluree_db_core::dict_novelty::DictNovelty,
+        handle: u64,
+    ) -> Option<io::Result<FlakeValue>> {
+        let index = fluree_db_core::triple_term::novelty_term_index(handle)?;
+        Some(
+            dn.terms
+                .resolve(index)
+                .map(|term| FlakeValue::TripleTerm(Box::new(term.clone())))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("provisional triple-term handle {handle:#x} not in novelty"),
+                    )
+                }),
+        )
+    }
+
     /// Decode a value from `(o_type, o_key)`. Novelty-aware when `dict_novelty`
     /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
     /// watermark checks; all other types delegate directly to the store.
@@ -2850,6 +3095,11 @@ impl BinaryGraphView {
                     DecodeKind::JsonArena => {
                         if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
                             return Ok(FlakeValue::Json(s));
+                        }
+                    }
+                    DecodeKind::TripleTermDict => {
+                        if let Some(term) = Self::novelty_term(dn, o_key) {
+                            return term;
                         }
                     }
                     DecodeKind::Duration => {
@@ -2911,6 +3161,10 @@ impl BinaryGraphView {
                 } else if o_kind == ObjKind::JSON_ID.as_u8() {
                     if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
                         return Ok(FlakeValue::Json(s));
+                    }
+                } else if o_kind == ObjKind::TRIPLE_TERM.as_u8() {
+                    if let Some(term) = Self::novelty_term(dn, o_key) {
+                        return term;
                     }
                 }
             }
@@ -3219,6 +3473,21 @@ async fn build_dictionary_set(
     let string_reverse_us = phase.elapsed().as_micros() as u64;
     let phase = Instant::now();
 
+    // Triple-term dictionary (optional section).
+    let term_dict = match &root.term_dict {
+        Some(refs) => Some(
+            TermDictReader::from_refs_reusing(
+                Arc::clone(&cs),
+                cache_dir,
+                refs,
+                leaflet_cache,
+                prev.and_then(|p| p.term_dict.as_ref()),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     // Namespace codes: shared with the previous store when it already holds
     // every entry of the root's table. Codes are never reassigned within a
     // ledger, and the previous store's extras (codes the snapshot augmented
@@ -3321,6 +3590,7 @@ async fn build_dictionary_set(
         subject_reverse_tree,
         string_forward_packs,
         string_reverse_tree,
+        term_dict,
         subject_count,
         string_count: root.string_watermark,
         namespace_codes,
@@ -3336,9 +3606,9 @@ async fn build_dictionary_set(
 // ============================================================================
 
 /// Where a vector shard's bytes come from: its local CAS file when one
-/// exists, else the disk cache — which counts as present only when the store
-/// permits a plaintext copy outside it, so a stale shard left there by an
-/// earlier unencrypted run is fetched afresh rather than served.
+/// exists, else the disk cache — which counts as present only for a store the
+/// cache serves, so a stale shard left there by an earlier run is fetched
+/// afresh rather than served.
 fn vector_shard_source(
     cs: &dyn ContentStore,
     shard_cid: &ContentId,
@@ -3354,7 +3624,7 @@ fn vector_shard_source(
         };
     }
     let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
-    let on_disk = cs.permits_plaintext_cache() && cache_path.exists();
+    let on_disk = uses_disk_cache(cs) && cache_path.exists();
     crate::arena::vector::ShardSource {
         cid_hash,
         cid: Some(shard_cid.clone()),
@@ -3576,10 +3846,19 @@ impl ContentStoreRangeFetcher {
             Ok(Some(buf))
         }
 
+        let kind = || {
+            id.content_kind().map_or_else(
+                || "unknown".to_string(),
+                |k| format!("{k:?}").to_lowercase(),
+            )
+        };
         // Try local path first — positional read.
         if let Some(local_path) = self.cs.resolve_local_path(id) {
             match read_range_from_file(&local_path, range.clone())? {
-                Some(buf) => return Ok(buf),
+                Some(buf) => {
+                    fluree_db_core::io_stats::record(kind, "local-range", buf.len());
+                    return Ok(buf);
+                }
                 None => {
                     tracing::debug!(
                         path = %local_path.display(),
@@ -3590,10 +3869,18 @@ impl ContentStoreRangeFetcher {
             }
         }
 
-        // Check cache, unless the store forbids a plaintext copy outside it.
-        if self.cs.permits_plaintext_cache() {
+        // Bytes the store holds in memory: slice them.
+        if let Some(bytes) = self.cs.resolve_cached_bytes(id) {
+            let start = (range.start as usize).min(bytes.len());
+            let end = (range.end as usize).min(bytes.len());
+            return Ok(bytes[start..end].to_vec());
+        }
+
+        // Check cache, for a store the cache serves.
+        if uses_disk_cache(self.cs.as_ref()) {
             let cache_path = self.cache_dir.join(id.to_string());
             if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
+                fluree_db_core::io_stats::record(kind, "cache-range", buf.len());
                 return Ok(buf);
             }
         }
@@ -3712,6 +3999,10 @@ pub(crate) mod tests {
 
         fn permits_plaintext_cache(&self) -> bool {
             self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            true
         }
     }
 
@@ -3858,6 +4149,10 @@ pub(crate) mod tests {
     impl ContentStore for FailNthContentStore {
         fn permits_plaintext_cache(&self) -> bool {
             self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
         }
 
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
@@ -4580,6 +4875,10 @@ pub(crate) mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -4614,6 +4913,146 @@ pub(crate) mod tests {
             self.local_path_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.local.read().get(id).cloned()
         }
+    }
+
+    /// A store that holds its blobs in memory and hands them out shared, as
+    /// `MemoryStorage` does through the bridge. Every fetch counts.
+    #[derive(Debug, Clone)]
+    struct ResidentContentStore {
+        inner: CountingContentStore,
+        resident: Arc<RwLock<HashMap<ContentId, Arc<[u8]>>>>,
+    }
+
+    impl ResidentContentStore {
+        fn new() -> Self {
+            Self {
+                inner: CountingContentStore::new(),
+                resident: Arc::new(RwLock::new(HashMap::new())),
+            }
+        }
+
+        async fn put_resident(&self, kind: ContentKind, bytes: &[u8]) -> ContentId {
+            let cid = self.inner.put(kind, bytes).await.expect("put");
+            self.resident.write().insert(cid.clone(), Arc::from(bytes));
+            cid
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for ResidentContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get_range(id, range).await
+        }
+
+        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+            self.resident.read().get(id).cloned()
+        }
+    }
+
+    #[test]
+    fn resident_leaves_open_without_fetching_or_copying() {
+        let store = ResidentContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let leaf_bytes = leaf_bytes.clone();
+            async move {
+                io::Result::Ok(
+                    store
+                        .put_resident(ContentKind::IndexLeaf, &leaf_bytes)
+                        .await,
+                )
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+
+        // Without a leaflet cache, then with one: a full open, a
+        // directory-only open and whole-leaf bytes all borrow the resident
+        // blob, so the store sees no fetch of any kind and nothing lands in
+        // the disk cache.
+        for cache in [None, Some(Arc::new(LeafletCache::with_max_mb(4)))] {
+            binary_store.leaflet_cache = cache;
+            for _ in 0..2 {
+                let handle = binary_store
+                    .open_leaf_handle(&leaf_cid, None, false)
+                    .expect("resident open");
+                assert_eq!(handle.dir().entries[0].row_count, 5);
+                let dir = binary_store
+                    .open_leaf_dir(&leaf_cid)
+                    .expect("resident dir open");
+                assert_eq!(dir.entries.len(), 1);
+                let shared = binary_store
+                    .get_leaf_bytes_shared(&leaf_cid)
+                    .expect("resident bytes");
+                let resident = store.resolve_cached_bytes(&leaf_cid).unwrap();
+                assert!(
+                    matches!(shared, SharedLeafBytes::Shared(ref bytes) if Arc::ptr_eq(bytes, &resident)),
+                    "whole-leaf bytes must be the store's own allocation"
+                );
+                assert_eq!(
+                    binary_store
+                        .get_leaf_bytes_sync(&leaf_cid)
+                        .expect("owned copy"),
+                    leaf_bytes,
+                    "an owned copy is taken from the resident bytes"
+                );
+            }
+        }
+        assert_eq!(
+            store.inner.get_calls(),
+            0,
+            "resident leaves must not be fetched"
+        );
+        assert_eq!(
+            store.inner.range_calls(),
+            0,
+            "resident leaves must not be range-read"
+        );
+        assert!(
+            binary_store.remote_leaf_metadata.read().is_empty(),
+            "a resident leaf must not take the remote range-read path"
+        );
+        assert!(
+            std::fs::read_dir(&cache_dir)
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "nothing of a resident leaf lands in the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -4839,6 +5278,29 @@ pub(crate) mod tests {
             store.find_subject_sid(full_iri).unwrap(),
             Some(Sid::new(namespaces::OVERFLOW, full_iri))
         );
+    }
+
+    /// A dt id past the `OType` payload width can only come from a damaged or
+    /// future-format row. Decoding it yields an unknown value.
+    #[test]
+    fn decode_value_from_kind_dt_past_payload_width_is_null() {
+        use fluree_db_core::o_type::OType;
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::new(CountingContentStore::new());
+        let store = empty_store(cs, cache_dir);
+
+        for dt in [OType::MAX_PAYLOAD + 1, u16::MAX] {
+            let o_kind = ObjKind::LEX_ID.as_u8();
+            assert_eq!(
+                store.o_type_from_kind(o_kind, dt, 0),
+                OType::RESERVED.as_u16()
+            );
+            let val = store
+                .decode_value_from_kind(o_kind, 7, 0, dt, 0, 0)
+                .unwrap();
+            assert_eq!(val, FlakeValue::Null, "dt {dt}");
+        }
     }
 
     /// Regression test for fluree/db-r#142: legacy data where integral doubles

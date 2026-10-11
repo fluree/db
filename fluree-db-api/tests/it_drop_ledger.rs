@@ -9,6 +9,7 @@
 
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig};
+use fluree_db_core::{ContentKind, StorageNamespace};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use tokio::time::{timeout, Duration};
@@ -70,6 +71,58 @@ async fn drop_ledger_soft_mode_keeps_files() {
         .await
         .expect("list");
     assert!(!files.is_empty(), "Commit files should remain in soft mode");
+}
+
+/// The legacy edge-annotation arenas have no storage layout of their own and
+/// sit under the branch's `blob/` prefix; a hard drop must take them too.
+/// Builds no longer write them, so the test places one where an older build
+/// left it, in a ledger rooted at its name as an older build's is: an
+/// instance root is purged whole.
+#[tokio::test]
+async fn hard_drop_removes_legacy_annotation_arenas_under_blob() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ledger_id = "drop-blob-test:main";
+    fluree_db_nameservice::testing::create_at_name_root(fluree.publisher().unwrap(), ledger_id)
+        .await
+        .expect("a ledger from before name bindings");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let storage = fluree.admin_storage().expect("managed backend");
+    let namespace = StorageNamespace::parse_legacy(ledger_id).unwrap();
+    let blob_prefix = format!("fluree:file://{}/blob/", namespace.branch_prefix());
+    let arena = storage
+        .content_write_bytes(ContentKind::AnnotationForwardLeaf, &namespace, b"EAFL1")
+        .await
+        .expect("write arena leaf");
+    assert!(
+        arena.address.starts_with(&blob_prefix),
+        "an annotation arena leaf belongs under blob/: {}",
+        arena.address
+    );
+
+    fluree
+        .drop_ledger("drop-blob-test", DropMode::Hard)
+        .await
+        .expect("drop");
+    let left = storage.list_prefix(&blob_prefix).await.expect("list");
+    assert!(
+        left.is_empty(),
+        "hard drop left files under blob/: {left:?}"
+    );
 }
 
 /// Test that hard drop deletes all files and retracts from nameservice.
@@ -982,4 +1035,61 @@ async fn orphan_sweep_deletes_only_unreferenced_instance_folders() {
         .await
         .expect("the soft-dropped ledger still restores");
     assert!(fluree.db("kept:main").await.expect("load kept").t > 0);
+}
+
+/// A branch drop that cannot list ledgers keeps the branch's files, and its
+/// listing, so nothing is left unreachable: dropping it again finishes.
+#[tokio::test]
+async fn drop_branch_keeps_its_files_when_ledgers_cannot_be_listed() {
+    use fluree_db_api::{Fluree, NameServiceMode};
+    use std::sync::Arc;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = |id: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": id, "ex:val": 1}]
+        })
+    };
+    let main = fluree.create_ledger("drop-listing").await.unwrap();
+    fluree.insert(main, &txn("ex:a")).await.unwrap();
+    fluree
+        .create_branch("drop-listing", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("drop-listing:dev").await.unwrap();
+    let dev_commits = tmp.path().join(format!(
+        "{}/commit",
+        dev.storage_namespace().branch_prefix()
+    ));
+    fluree.insert(dev, &txn("ex:b")).await.unwrap();
+    assert!(dev_commits.read_dir().unwrap().next().is_some());
+
+    let failing = Arc::new(crate::race_nameservice::PausingNameService::new(
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+    ));
+    failing.fail_listings();
+    let dropper = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        NameServiceMode::ReadWrite(failing),
+    );
+    let report = dropper
+        .drop_branch("drop-listing", "dev")
+        .await
+        .expect("drop");
+    assert!(!report.warnings.is_empty(), "{report:?}");
+    assert!(dev_commits.read_dir().unwrap().next().is_some());
+
+    let finished = fluree
+        .drop_branch("drop-listing", "dev")
+        .await
+        .expect("drop again");
+    assert!(finished.warnings.is_empty(), "{finished:?}");
+    assert!(
+        !dev_commits.exists() || dev_commits.read_dir().unwrap().next().is_none(),
+        "dropping again deletes the files"
+    );
 }

@@ -1,16 +1,22 @@
-//! Turtle-star on the JSON-LD-converted write paths (upsert, graph sync).
+//! Turtle-star on the write paths other than the streaming insert (upsert,
+//! graph sync, the JSON-LD conversion).
 //!
 //! `insert_turtle` streams Turtle straight into the transaction sink, which
 //! has accepted RDF 1.2 reifiers (`~ r`, `{| … |}`, `<< s p o >>`) since the
-//! edge-annotation M1 work. `upsert_turtle`, `sync_named_graph` and the
-//! memory importer instead convert Turtle to JSON-LD first
-//! (`fluree_graph_turtle::parse_to_json`), and that conversion used to
+//! edge-annotation M1 work. `upsert_turtle` and graph sync parse RDF text
+//! into transaction templates; the memory importer converts Turtle to
+//! JSON-LD (`fluree_graph_turtle::parse_to_json`), a conversion that used to
 //! refuse every star construct with "not supported on this ingest path".
 //!
-//! These tests pin that the converted path now yields the same reifier
-//! bundles as a direct insert, that the annotations are queryable on every
-//! query surface, and that the upsert semantics (replace the body, keep the
-//! edge) hold for annotated edges.
+//! These tests pin that those paths yield the same reifier bundles as a
+//! direct insert, that the annotations are queryable on every query surface,
+//! and that the upsert semantics (replace the body, keep the edge) hold for
+//! annotated edges.
+
+// The JSON-LD conversion is exercised on purpose: it is what the memory
+// importer uses and what `fluree sync` falls back to for a server that does
+// not take RDF bodies.
+#![allow(clippy::disallowed_methods)]
 
 use crate::support::{self, genesis_ledger};
 use fluree_db_api::{FlureeBuilder, SyncGraphOpts};
@@ -210,13 +216,33 @@ async fn upsert_turtle_and_insert_turtle_agree_on_the_claim_graph() {
     );
 }
 
+/// Rows of `sparql` over `ledger`'s `graph` (or default graph).
+async fn select(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    graph: Option<&str>,
+    pattern: &str,
+) -> Vec<JsonValue> {
+    let body = match graph {
+        Some(g) => format!("GRAPH <{g}> {{ {pattern} }}"),
+        None => pattern.to_string(),
+    };
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+    let result = support::query_sparql_formatted(fluree, ledger, &sparql)
+        .await
+        .expect("query");
+    rows(&result).to_vec()
+}
+
 #[tokio::test]
-async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
-    // The canonical RDF 1.2 spelling reaches the converted paths through the
-    // same collector events as `~ r`, so it must land the same claim.
+async fn rdf_reifies_triple_term_reifies_without_asserting_on_upsert_and_sync() {
+    // `r rdf:reifies <<( s p o )>>` reaches the converted paths as a
+    // reification of a triple the graph does not assert (RDF 1.2): the
+    // reifier links to it, and the triple stays unasserted.
     let turtle = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
                   ex:claim1 rdf:reifies <<( ex:alice ex:knows ex:bob )>> .\n\
                   ex:claim1 ex:confidence 0.9 .\n";
+    let reified = "<< ex:alice ex:knows ex:bob ~ ?r >> ex:confidence ?conf";
 
     let fluree = FlureeBuilder::memory().build_memory();
     let upserted = fluree
@@ -226,7 +252,18 @@ async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
         )
         .await
         .expect("upsert_turtle with rdf:reifies <<( )>>");
-    assert_eq!(confidences(&fluree, &upserted.ledger, None).await, ["0.9"]);
+    assert_eq!(
+        select(&fluree, &upserted.ledger, None, reified).await.len(),
+        1
+    );
+    assert!(
+        select(&fluree, &upserted.ledger, None, "ex:alice ex:knows ?o")
+            .await
+            .is_empty()
+    );
+    assert!(confidences(&fluree, &upserted.ledger, None)
+        .await
+        .is_empty());
 
     let ledger_id = "it/turtle-star-sync-rdf-reifies:main";
     fluree
@@ -239,10 +276,14 @@ async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
     assert!(sync(&fluree, ledger_id, turtle)
         .await
         .expect("sync with rdf:reifies <<( )>>"));
+    let synced = fluree.ledger(ledger_id).await.expect("reload");
     assert_eq!(
-        annotated_knows(&fluree, ledger_id).await,
-        [("alice".into(), "bob".into(), "0.9".into())]
+        select(&fluree, &synced, Some(CLAIMS_GRAPH), reified)
+            .await
+            .len(),
+        1
     );
+    assert!(annotated_knows(&fluree, ledger_id).await.is_empty());
 }
 
 #[tokio::test]
@@ -317,74 +358,84 @@ async fn upserting_trig_with_a_version_directive_keeps_the_prefixes_after_it() {
     );
 }
 
+/// Both Turtle lanes reify an `rdf:type` edge like any other edge. Upsert
+/// used to refuse one: its JSON-LD conversion had no `@annotation` home on
+/// a `@type` value.
 #[tokio::test]
-async fn annotated_type_edge_is_accepted_by_insert_and_refused_by_upsert() {
+async fn annotated_type_edge_is_accepted_by_insert_and_upsert() {
     let fluree = FlureeBuilder::memory().build_memory();
     let turtle = with_prefixes("ex:alice a ex:Person {| ex:source \"hr\" |} ; a ex:Employee .\n");
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  SELECT ?src WHERE { ex:alice a ex:Person {| ex:source ?src |} }";
 
-    // The direct Turtle path reifies the type edge like any other edge.
-    let committed = fluree
+    let inserted = fluree
         .insert_turtle(
             genesis_ledger(&fluree, "it/turtle-star-type-edge-insert:main").await,
             &turtle,
         )
         .await
         .expect("insert_turtle with an annotated rdf:type edge");
-    let sparql = "PREFIX ex: <http://example.org/>\n\
-                  SELECT ?src WHERE { ex:alice a ex:Person {| ex:source ?src |} }";
-    let result = support::query_sparql_formatted(&fluree, &committed.ledger, sparql)
-        .await
-        .expect("annotated type query");
-    let arr = rows(&result);
-    assert_eq!(arr.len(), 1, "{arr:#?}");
-    let cell = arr[0].as_array().and_then(|r| r.first()).unwrap_or(&arr[0]);
-    assert_eq!(cell, "hr");
-
-    // The JSON-LD-converted path has no `@annotation` home on a `@type`
-    // value: refuse with a message that names the shape and the way out,
-    // instead of dropping the claim or failing deep in the parser.
-    let err = fluree
+    let upserted = fluree
         .upsert_turtle(
             genesis_ledger(&fluree, "it/turtle-star-type-edge-upsert:main").await,
             &turtle,
         )
         .await
-        .expect_err("upsert_turtle must refuse an annotated rdf:type edge");
-    let msg = err.to_string();
-    assert!(msg.contains("rdf:type") && msg.contains("insert"), "{msg}");
+        .expect("upsert_turtle with an annotated rdf:type edge");
+    for (lane, ledger) in [("insert", &inserted.ledger), ("upsert", &upserted.ledger)] {
+        let result = support::query_sparql_formatted(&fluree, ledger, sparql)
+            .await
+            .expect("annotated type query");
+        let arr = rows(&result);
+        assert_eq!(arr.len(), 1, "{lane}: {arr:#?}");
+        let cell = arr[0].as_array().and_then(|r| r.first()).unwrap_or(&arr[0]);
+        assert_eq!(cell, "hr", "{lane}");
+    }
 }
 
 #[tokio::test]
-async fn one_named_reifier_on_two_edges_is_rejected_on_every_turtle_path() {
-    // A reifier denotes exactly one edge. Reusing an explicit reifier on
-    // two different triples in one document would store a bundle that
-    // `EdgeKey::from_reifies_facts` rejects, so every reader silently drops
-    // BOTH annotations. Fail loud at write time instead.
+async fn one_named_reifier_on_two_edges_names_both_on_every_turtle_path() {
+    // A reifier may reify several triples (RDF 1.2): reusing an explicit
+    // reifier on two triples links it to both, on the direct Turtle path and
+    // on the JSON-LD-converted one alike.
     let turtle = with_prefixes(
         "ex:alice ex:knows ex:bob ~ ex:claim1 .\n\
          ex:alice ex:knows ex:carol ~ ex:claim1 .\n",
     );
+    let query = "PREFIX ex: <http://example.org/>\n\
+                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 SELECT ?o WHERE { ex:claim1 rdf:reifies <<( ex:alice ex:knows ?o )>> } \
+                 ORDER BY ?o";
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let err = fluree
-        .insert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-reuse-insert:main").await,
-            &turtle,
-        )
-        .await
-        .expect_err("insert_turtle must reject a reifier reused on two edges");
-    let msg = err.to_string();
-    assert!(msg.contains("claim1"), "must name the reifier: {msg}");
-
-    let err = fluree
-        .upsert_turtle(
-            genesis_ledger(&fluree, "it/turtle-star-reuse-upsert:main").await,
-            &turtle,
-        )
-        .await
-        .expect_err("upsert_turtle must reject a reifier reused on two edges");
-    let msg = err.to_string();
-    assert!(msg.contains("claim1"), "must name the reifier: {msg}");
+    for (path, ledger_id) in [
+        ("insert", "it/turtle-star-reuse:insert"),
+        ("upsert", "it/turtle-star-reuse:upsert"),
+    ] {
+        let ledger = genesis_ledger(&fluree, ledger_id).await;
+        let committed = match path {
+            "insert" => fluree.insert_turtle(ledger, &turtle).await,
+            _ => fluree.upsert_turtle(ledger, &turtle).await,
+        }
+        .unwrap_or_else(|e| panic!("{path}_turtle: {e}"));
+        let result = support::query_sparql(&fluree, &committed.ledger, query)
+            .await
+            .expect("query");
+        let json = result
+            .to_sparql_json(&committed.ledger.snapshot)
+            .expect("sparql json");
+        let objects: Vec<&str> = json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .filter_map(|b| b["o"]["value"].as_str())
+            .collect();
+        assert_eq!(
+            objects,
+            ["http://example.org/bob", "http://example.org/carol"],
+            "{path}_turtle: claim1 names both edges"
+        );
+    }
 }
 
 #[tokio::test]

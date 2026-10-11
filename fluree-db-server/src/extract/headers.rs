@@ -31,6 +31,8 @@ pub enum GraphFormat {
     Turtle,
     NTriples,
     RdfXml,
+    TriG,
+    NQuads,
 }
 
 impl GraphFormat {
@@ -40,6 +42,8 @@ impl GraphFormat {
             GraphFormat::Turtle => "Turtle",
             GraphFormat::NTriples => "N-Triples",
             GraphFormat::RdfXml => "RDF/XML",
+            GraphFormat::TriG => "TriG",
+            GraphFormat::NQuads => "N-Quads",
         }
     }
 
@@ -49,6 +53,8 @@ impl GraphFormat {
             GraphFormat::Turtle => "text/turtle",
             GraphFormat::NTriples => "application/n-triples",
             GraphFormat::RdfXml => "application/rdf+xml",
+            GraphFormat::TriG => "application/trig",
+            GraphFormat::NQuads => "application/n-quads",
         }
     }
 
@@ -59,8 +65,33 @@ impl GraphFormat {
             GraphFormat::Turtle => "text/turtle; charset=utf-8",
             GraphFormat::NTriples => "application/n-triples; charset=utf-8",
             GraphFormat::RdfXml => "application/rdf+xml; charset=utf-8",
+            GraphFormat::TriG => "application/trig; charset=utf-8",
+            GraphFormat::NQuads => "application/n-quads; charset=utf-8",
         }
     }
+
+    /// Every format, for negotiating a CONSTRUCT / DESCRIBE result.
+    pub const ALL: &'static [GraphFormat] = &[
+        GraphFormat::JsonLd,
+        GraphFormat::Turtle,
+        GraphFormat::NTriples,
+        GraphFormat::RdfXml,
+        GraphFormat::TriG,
+        GraphFormat::NQuads,
+    ];
+
+    /// The formats that can express named graphs, for a CONSTRUCT whose
+    /// template writes into them.
+    pub const DATASET: &'static [GraphFormat] =
+        &[GraphFormat::JsonLd, GraphFormat::TriG, GraphFormat::NQuads];
+
+    /// The formats for one graph: a Graph Store `GET`.
+    pub const SINGLE_GRAPH: &'static [GraphFormat] = &[
+        GraphFormat::JsonLd,
+        GraphFormat::Turtle,
+        GraphFormat::NTriples,
+        GraphFormat::RdfXml,
+    ];
 
     pub fn formatter(self) -> fluree_db_api::FormatterConfig {
         match self {
@@ -68,6 +99,8 @@ impl GraphFormat {
             GraphFormat::Turtle => fluree_db_api::FormatterConfig::turtle(),
             GraphFormat::NTriples => fluree_db_api::FormatterConfig::ntriples(),
             GraphFormat::RdfXml => fluree_db_api::FormatterConfig::rdf_xml(),
+            GraphFormat::TriG => fluree_db_api::FormatterConfig::trig(),
+            GraphFormat::NQuads => fluree_db_api::FormatterConfig::nquads(),
         }
     }
 
@@ -83,6 +116,8 @@ impl GraphFormat {
             ("application/x-turtle", GraphFormat::Turtle),
             ("application/n-triples", GraphFormat::NTriples),
             ("application/rdf+xml", GraphFormat::RdfXml),
+            ("application/trig", GraphFormat::TriG),
+            ("application/n-quads", GraphFormat::NQuads),
         ];
         TYPES
             .iter()
@@ -120,23 +155,29 @@ fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
     ranges.into_iter()
 }
 
-/// The graph format an `Accept` value prefers: the highest-`q` media range a
-/// graph format satisfies. `*/*` and `application/*` are JSON-LD, `text/*` is
-/// Turtle, and no `Accept` at all is JSON-LD. `None` when no range matches.
-pub fn negotiate_graph_format(accept: Option<&str>) -> Option<GraphFormat> {
+/// The graph format an `Accept` value prefers among `allowed`: the highest-`q`
+/// media range an allowed format satisfies. `*/*` and `application/*` are
+/// JSON-LD, `text/*` is Turtle, and no `Accept` at all is JSON-LD. `None`
+/// when nothing allowed matches.
+pub fn negotiate_graph_format(
+    accept: Option<&str>,
+    allowed: &[GraphFormat],
+) -> Option<GraphFormat> {
     let Some(accept) = accept.filter(|a| !a.trim().is_empty()) else {
-        return Some(GraphFormat::JsonLd);
+        return Some(GraphFormat::JsonLd).filter(|f| allowed.contains(f));
     };
     media_ranges(accept).find_map(|(_, media)| {
-        GraphFormat::from_media_type(media).or_else(|| {
-            if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
-                Some(GraphFormat::JsonLd)
-            } else if media.eq_ignore_ascii_case("text/*") {
-                Some(GraphFormat::Turtle)
-            } else {
-                None
-            }
-        })
+        GraphFormat::from_media_type(media)
+            .or_else(|| {
+                if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
+                    Some(GraphFormat::JsonLd)
+                } else if media.eq_ignore_ascii_case("text/*") {
+                    Some(GraphFormat::Turtle)
+                } else {
+                    None
+                }
+            })
+            .filter(|f| allowed.contains(f))
     })
 }
 
@@ -343,6 +384,60 @@ impl FlureeHeaders {
         Ok(fluree_headers)
     }
 
+    /// Lay a SPARQL request's `# PRAGMA` options over the header values.
+    ///
+    /// A pragma is the request body's own option, so it wins over the header
+    /// that names the same thing — as a JSON-LD body's `opts` do — with three
+    /// exceptions, because the headers may be an application's while the text
+    /// is its end user's. `meta` adds to the tracking the headers ask for but
+    /// never removes it. `max-fuel` takes the tighter of the two caps. And
+    /// under a bound credential a policy pragma may only repeat the selection
+    /// the headers make (or narrow `default-allow`).
+    ///
+    /// Call after [`crate::routes::policy_auth::bind_authorization`]: the policy
+    /// selection lands in the same fields a caller's headers do, and
+    /// `bound_governance` then holds it to the bound credential exactly as it
+    /// holds a header.
+    pub fn with_sparql_pragmas(mut self, pragmas: &fluree_db_sparql::Pragmas) -> Result<Self> {
+        if self.policy_authorization.is_some() {
+            crate::extract::validate_pragma_selection(
+                &fluree_db_api::GovernanceOptions::from_sparql_pragmas(pragmas),
+                &self.policy_selection()?,
+            )?;
+        }
+        if let Some(meta) = pragmas.meta {
+            self.track_time |= meta.time;
+            self.track_fuel |= meta.fuel;
+            self.track_policy |= meta.policy;
+        }
+        if let Some(max_fuel) = pragmas.max_fuel {
+            self.max_fuel = Some(self.max_fuel.map_or(max_fuel, |cap| cap.min(max_fuel)));
+        }
+        if pragmas.min_t.is_some() {
+            self.min_t = pragmas.min_t;
+        }
+        if pragmas.identity.is_some() {
+            self.identity = pragmas.identity.clone();
+        }
+        if let Some(classes) = &pragmas.policy_class {
+            self.policy_class = classes.clone();
+        }
+        if let Some(values) = &pragmas.policy_values {
+            self.policy_values = Some(JsonValue::Object(values.clone()));
+        }
+        if pragmas.default_allow.is_some() {
+            self.default_allow = pragmas.default_allow;
+        }
+        Ok(self)
+    }
+
+    /// [`Self::with_sparql_pragmas`] for request text; a malformed pragma is a 400.
+    pub fn with_sparql_request_pragmas(self, sparql: &str) -> Result<Self> {
+        let pragmas =
+            fluree_db_sparql::request_pragmas(sparql).map_err(ServerError::bad_request)?;
+        self.with_sparql_pragmas(&pragmas)
+    }
+
     /// Check if tracking is enabled (any tracking header or max-fuel limit)
     pub fn has_tracking(&self) -> bool {
         self.track_meta
@@ -463,9 +558,10 @@ impl FlureeHeaders {
         get_header_str(&self.raw, "fluree-max-bytes").and_then(|v| v.parse().ok())
     }
 
-    /// The graph serialization `Accept` prefers; see [`negotiate_graph_format`].
-    pub fn graph_format(&self) -> Option<GraphFormat> {
-        negotiate_graph_format(self.accept.as_deref())
+    /// The graph serialization `Accept` prefers among `allowed`; see
+    /// [`negotiate_graph_format`].
+    pub fn graph_format(&self, allowed: &[GraphFormat]) -> Option<GraphFormat> {
+        negotiate_graph_format(self.accept.as_deref(), allowed)
     }
 
     /// Whether every media range `Accept` admits is a graph-only serialization
@@ -501,6 +597,22 @@ impl FlureeHeaders {
             .as_ref()
             .map(|ct| ct.contains("application/jwt"))
             .unwrap_or(false)
+    }
+
+    /// The policy selection these headers make, before credential
+    /// authorization resolves it.
+    pub(crate) fn policy_selection(&self) -> Result<fluree_db_api::GovernanceOptions> {
+        Ok(fluree_db_api::GovernanceOptions {
+            identity: self.identity.clone(),
+            policy_class: (!self.policy_class.is_empty()).then(|| self.policy_class.clone()),
+            policy: self.policy.clone(),
+            policy_values: self.policy_values_map()?,
+            default_allow: self.default_allow,
+            // Deliberately absent: this is the caller's *selection*, and the
+            // verified identity is not selectable. `bound_governance` stamps it
+            // after authorization resolution.
+            server_identity: None,
+        })
     }
 
     /// Convert policy_values to a HashMap for credential API
@@ -660,7 +772,7 @@ mod tests {
 
     #[test]
     fn graph_format_negotiation_follows_q() {
-        let n = negotiate_graph_format;
+        let n = |a| negotiate_graph_format(a, GraphFormat::ALL);
         assert_eq!(n(None), Some(GraphFormat::JsonLd));
         assert_eq!(n(Some("*/*")), Some(GraphFormat::JsonLd));
         assert_eq!(n(Some("text/turtle")), Some(GraphFormat::Turtle));
@@ -693,6 +805,21 @@ mod tests {
         );
         assert_eq!(n(Some("application/sparql-results+json")), None);
         assert_eq!(n(Some("text/turtle;q=0")), None);
+        assert_eq!(n(Some("application/trig")), Some(GraphFormat::TriG));
+
+        // A format outside `allowed` is skipped, not chosen.
+        let dataset = |a| negotiate_graph_format(Some(a), GraphFormat::DATASET);
+        assert_eq!(
+            dataset("text/turtle, application/n-quads;q=0.5"),
+            Some(GraphFormat::NQuads)
+        );
+        assert_eq!(dataset("text/turtle"), None);
+        assert_eq!(dataset("text/*"), None);
+        assert_eq!(
+            negotiate_graph_format(None, &[GraphFormat::Turtle]),
+            None,
+            "the no-Accept default is still subject to `allowed`"
+        );
     }
 
     #[test]
@@ -828,5 +955,145 @@ mod tests {
         parsed.inject_into_opts(&mut opts);
 
         assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(false)));
+    }
+
+    /// Every pragma the parser accepts reaches each translator that carries
+    /// its option: these headers, the API's policy selection and tracking, and
+    /// a multi-query alias's opts. A pragma this table does not list fails the
+    /// test, so a new one cannot be wired into one translator and missed in
+    /// another.
+    #[test]
+    fn every_pragma_reaches_its_translators() {
+        type Check = fn(&FlureeHeaders) -> bool;
+        // (sample value, update form, header check, selects policy, tracks, alias opts key)
+        for name in fluree_db_sparql::pragma_names() {
+            let (value, update, header, policy, tracks, opts_key): (
+                &str,
+                bool,
+                Option<Check>,
+                bool,
+                bool,
+                Option<&str>,
+            ) = match name {
+                // Applied where the request is lowered (query IR, `TxnOpts`)
+                // or by the update route, not by these translators.
+                "reasoning" => ("rdfs", false, None, false, false, None),
+                "reasoning-max-facts" | "reasoning-max-seconds" | "reasoning-max-memory-mb" => {
+                    ("10", false, None, false, false, None)
+                }
+                "include-system-facts" | "union-default-graph" => {
+                    ("true", false, None, false, false, None)
+                }
+                "event-time" => ("2020-01-01T00:00:00Z", true, None, false, false, None),
+                "validation-mode" => ("warn", true, None, false, false, None),
+                "unique-properties" => ("<urn:p>", true, None, false, false, None),
+                "min-t" => (
+                    "1",
+                    false,
+                    Some(|h| h.min_t == Some(1)),
+                    false,
+                    false,
+                    Some("min-t"),
+                ),
+                "meta" => (
+                    "time",
+                    false,
+                    Some(|h| h.track_time),
+                    false,
+                    true,
+                    Some("meta"),
+                ),
+                "max-fuel" => (
+                    "10",
+                    false,
+                    Some(|h| h.max_fuel == Some(10.0)),
+                    false,
+                    true,
+                    Some("max-fuel"),
+                ),
+                "identity" => (
+                    "<urn:id>",
+                    false,
+                    Some(|h| h.identity.is_some()),
+                    true,
+                    false,
+                    Some("identity"),
+                ),
+                "policy-class" => (
+                    "<urn:class>",
+                    false,
+                    Some(|h| !h.policy_class.is_empty()),
+                    true,
+                    false,
+                    Some("policy-class"),
+                ),
+                "policy-values" => (
+                    r#"{"?$x": 1}"#,
+                    false,
+                    Some(|h| h.policy_values.is_some()),
+                    true,
+                    false,
+                    Some("policy-values"),
+                ),
+                "default-allow" => (
+                    "true",
+                    false,
+                    Some(|h| h.default_allow == Some(true)),
+                    true,
+                    false,
+                    Some("default-allow"),
+                ),
+                other => panic!(
+                    "pragma `{other}` is new: apply it in FlureeHeaders::with_sparql_pragmas, \
+                     GovernanceOptions::from_sparql_pragmas, sparql_pragma_tracking and \
+                     sparql_pragma_opts wherever its JSON-LD `opts` twin applies, then list it here"
+                ),
+            };
+            let body = if update {
+                "INSERT DATA { <urn:s> <urn:p> 1 }"
+            } else {
+                "SELECT * WHERE { }"
+            };
+            let sparql = format!("# PRAGMA {name}: {value}\n{body}");
+            let pragmas = fluree_db_sparql::request_pragmas(&sparql)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_ne!(
+                pragmas,
+                Default::default(),
+                "{name}: the sample selects nothing"
+            );
+
+            let headers = FlureeHeaders::default()
+                .with_sparql_pragmas(&pragmas)
+                .unwrap();
+            match header {
+                Some(check) => assert!(check(&headers), "{name}: headers {headers:?}"),
+                None => assert_eq!(
+                    format!("{headers:?}"),
+                    format!("{:?}", FlureeHeaders::default()),
+                    "{name}: no header carries it"
+                ),
+            }
+            assert_eq!(
+                fluree_db_api::GovernanceOptions::from_sparql_pragmas(&pragmas)
+                    .has_any_policy_inputs(),
+                policy,
+                "{name}: policy selection"
+            );
+            let tracking = fluree_db_api::sparql_pragma_tracking(&pragmas);
+            assert_eq!(tracking.any_enabled(), tracks, "{name}: tracking");
+            let opts = fluree_db_api::query::multi::sparql_pragma_opts(&sparql)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let keys: Vec<&String> = opts
+                .as_ref()
+                .and_then(JsonValue::as_object)
+                .map(|o| o.keys().collect())
+                .unwrap_or_default();
+            assert_eq!(
+                keys,
+                opts_key.into_iter().collect::<Vec<_>>(),
+                "{name}: alias opts"
+            );
+        }
     }
 }

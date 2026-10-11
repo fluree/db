@@ -67,11 +67,9 @@ fluree upsert -f 01-data.ttl
 # → Committed t=1, 8 flakes
 ```
 
-> Use `upsert` (not `insert`) for any TriG document that contains `GRAPH`
-> blocks. The CLI's `insert` path parses Turtle straight to flakes and does
-> not extract `GRAPH` blocks; over HTTP, `/v1/fluree/insert` rejects
-> `Content-Type: application/trig` outright. `upsert` handles both Turtle
-> and TriG.
+> `insert` and `upsert` both read TriG `GRAPH` blocks. This guide uses
+> `upsert` so that re-running a step replaces values rather than adding a
+> second copy.
 
 ---
 

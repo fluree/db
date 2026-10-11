@@ -209,14 +209,27 @@ pub(super) fn parse_sparql_rule(
              nodes (every round would mint new ones and the fixpoint would never end)",
         ));
     }
-    if template.patterns.is_empty() {
+    if !template.term_templates().is_empty() {
+        return Err(invalid(
+            &label,
+            "the CONSTRUCT template writes a triple term; a rule head cannot",
+        ));
+    }
+    if template.patterns().is_empty() {
         return Err(invalid(
             &label,
             "the CONSTRUCT template has no triple patterns",
         ));
     }
+    if template.names_graphs() || !template.reifications().is_empty() {
+        return Err(invalid(
+            &label,
+            "the CONSTRUCT template writes into a named graph or annotates an edge; a rule \
+             head can only infer default-graph triples",
+        ));
+    }
     let heads = template
-        .patterns
+        .patterns()
         .iter()
         .map(|tp| head_from_triple(tp, snapshot, &label))
         .collect::<Result<Vec<_>>>()?;
@@ -298,8 +311,7 @@ fn collect_predicates(patterns: &[Pattern], out: &mut Vec<Sid>) {
                     }
                 }
             }
-            Pattern::EdgeAnnotation { edge, body, .. }
-            | Pattern::AnnotationTarget { edge, body, .. } => {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
                 if let Ref::Sid(p) = &edge.p {
                     if !out.contains(p) {
                         out.push(p.clone());

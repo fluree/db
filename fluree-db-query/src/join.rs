@@ -4,6 +4,9 @@
 //! where left results drive right scans. It enforces var unification - shared
 //! vars between left and right must match exactly.
 
+mod replay;
+mod wildcard;
+
 use crate::binary_scan::EmitMask;
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
@@ -13,18 +16,23 @@ use crate::fast_path_common::{
     object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
     RowFate,
 };
+use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::flush::FlushSchedule;
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{
-    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
+    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, CountGroup, Operator,
+    OperatorState,
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::read::batched_lookup::WildcardDirection;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
+use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
+use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
@@ -35,6 +43,68 @@ use tracing::Instrument;
 /// work; the per-join success path is otherwise far too noisy for perf captures.
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
+
+fn checked_join_count(count: u64, additional: u64) -> Result<u64> {
+    count
+        .checked_add(additional)
+        .ok_or_else(|| QueryError::execution("COUNT(*) overflow in nested-loop join drain_count"))
+}
+
+/// Counts folded once per driving row, after all matching right rows have been
+/// checked. Runtime fallback batches use the same normalized group keys.
+struct GroupedCountDrain {
+    left_columns: Vec<usize>,
+    output_columns: Vec<usize>,
+    groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
+    key: CompositeGroupKey,
+    graph_view: Option<BinaryGraphView>,
+    counted_rows: u64,
+}
+
+impl GroupedCountDrain {
+    fn add_row(&mut self, batch: &Batch, row: usize, count: u64, from_left: bool) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let columns = if from_left {
+            &self.left_columns
+        } else {
+            &self.output_columns
+        };
+        self.key.0.clear();
+        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        self.key.0.extend(columns.iter().map(|&col| {
+            binding_to_group_key_normalized(
+                batch.get_by_col(row, col),
+                store,
+                self.graph_view.as_ref(),
+            )
+        }));
+        let (_, group) = self
+            .groups
+            .raw_entry_mut()
+            .from_key(&self.key)
+            .or_insert_with(|| {
+                (
+                    self.key.clone(),
+                    CountGroup {
+                        keys: columns
+                            .iter()
+                            .map(|&col| batch.get_by_col(row, col).clone())
+                            .collect(),
+                        count: 0,
+                    },
+                )
+            });
+        group.count = checked_join_count(group.count, count)?;
+        Ok(())
+    }
+
+    fn record_growth(&self, ctx: &ExecutionContext<'_>, groups_before: usize) -> Result<()> {
+        ctx.record_alloc((self.groups.len() - groups_before) * crate::context::GROUP_EST_BYTES);
+        ctx.checkpoint()
+    }
+}
 
 /// Prepared per-leaf inputs shared by the batched probe paths and the range
 /// semijoin walk. Owns the leaf blob, decoded header/dir, the leaf-id hash,
@@ -218,6 +288,57 @@ pub(crate) fn prepare_leaf_for_scan(
 
 /// Binary search for the first row in `batch.s_id[start..end]` where `s_id >= target`.
 #[inline]
+/// Whether a PSOT leaflet's current rows can hold one of `s_ids` (sorted)
+/// under `p_id`, read from its directory keys alone, so a scattered probe set
+/// decodes only the leaflets it touches. Keys order by `(p_id, s_id)`: an
+/// end key bounds the predicate's subjects only where it carries `p_id`.
+/// Rows a history replay restores can lie outside these keys.
+fn psot_leaflet_may_hold(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+    p_id: u32,
+    s_ids: &[u64],
+) -> bool {
+    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+    use fluree_db_binary_index::RunSortOrder;
+    let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
+    let last = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key);
+    if first.p_id > p_id || last.p_id < p_id {
+        return false;
+    }
+    let lo = if first.p_id == p_id {
+        first.s_id.as_u64()
+    } else {
+        0
+    };
+    let hi = if last.p_id == p_id {
+        last.s_id.as_u64()
+    } else {
+        u64::MAX
+    };
+    s_ids.partition_point(|&x| x < lo) < s_ids.partition_point(|&x| x <= hi)
+}
+
+/// The row range of `p_id` in a PSOT leaflet; the whole leaflet when it holds
+/// one predicate.
+fn psot_predicate_run(
+    batch: &fluree_db_binary_index::ColumnBatch,
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+    p_id: u32,
+) -> (usize, usize) {
+    let row_count = batch.row_count;
+    if entry.p_const == Some(p_id) {
+        return (0, row_count);
+    }
+    let p_start = (0..row_count)
+        .position(|i| batch.p_id.get_or(i, 0) >= p_id)
+        .unwrap_or(row_count);
+    let p_end = (p_start..row_count)
+        .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
+        .map(|offset| p_start + offset)
+        .unwrap_or(row_count);
+    (p_start, p_end)
+}
+
 fn lower_bound_s_id(
     batch: &fluree_db_binary_index::ColumnBatch,
     start: usize,
@@ -390,8 +511,8 @@ fn is_batched_eligible(
 /// - subject is a new unbound variable (no BindInstruction for Subject)
 /// - no object bounds or datatype/language constraints
 ///
-/// This enables scanning OPST in bulk for a set of bound ref objects rather than
-/// opening one scan per left row.
+/// This enables scanning OPST in bulk for a set of bound ref (or triple-term)
+/// objects rather than opening one scan per left row.
 fn is_batched_object_eligible(
     bind_instructions: &[BindInstruction],
     right_pattern: &TriplePattern,
@@ -513,12 +634,18 @@ pub struct NestedLoopJoinOperator {
     /// draining an entire left batch up front, which makes top-level LIMITs much
     /// more responsive on wide joins like `?s rdf:type <Class> ; ?p ?o`.
     active_right_scan: Option<BoxedOperator>,
-    /// Left-row provenance for `active_right_scan`.
+    /// Left-row provenance for the active right scan or replay.
     active_right_batch_ref: Option<BatchRef>,
-    /// Left-row index for `active_right_scan`.
+    /// Left-row index for the active right scan or replay.
     active_right_left_row: usize,
+    /// Small independent scans can be replayed after the first streamed pass.
+    right_replay: Option<replay::ScanReplay>,
+    active_replay_batch: Option<usize>,
+    logged_replay: bool,
     /// Optional object bounds for range filter pushdown
     object_bounds: Option<ObjectBounds>,
+    wildcard_direction: Option<WildcardDirection>,
+    wildcard_stream: Option<wildcard::WildcardJoin>,
     /// Whether this join is eligible for batched subject join
     batched_eligible: bool,
     /// Whether this join is eligible for batched object join
@@ -538,6 +665,9 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
+    /// Object lane: the `OType` every accumulated key carries. Refs and
+    /// triple-term handles never share a flush.
+    batched_object_o_type: u16,
     /// Accumulator size that triggers a flush. `BATCHED_JOIN_SIZE` throughout
     /// unless `set_row_budget` starts it near the budget, so a small `LIMIT`
     /// doesn't buffer ~100k left rows before producing anything. Each flush
@@ -548,6 +678,11 @@ pub struct NestedLoopJoinOperator {
     stored_left_batches: Vec<Batch>,
     /// Pre-built output batches from the batched path, ready to emit
     batched_output: VecDeque<Batch>,
+    /// Present only during `drain_count`: matches counted without constructing
+    /// output batches. Runtime fallbacks still emit rows through `next_batch`.
+    count_only: Option<u64>,
+    /// Present during a grouped drain; only keys from the left are eligible.
+    grouped_count: Option<GroupedCountDrain>,
     /// Cached index into `stored_left_batches` for the currently active left batch.
     ///
     /// This prevents storing/cloning the same `current_left_batch` repeatedly.
@@ -774,9 +909,12 @@ impl NestedLoopJoinOperator {
 
         let has_bounds = object_bounds.is_some();
 
-        let batched_eligible = is_batched_eligible(&bind_instructions, &right_pattern);
+        let wildcard_direction = wildcard::eligible(&bind_instructions, &right_pattern, has_bounds);
+        let batched_eligible = is_batched_eligible(&bind_instructions, &right_pattern)
+            || wildcard_direction == Some(WildcardDirection::Outgoing);
         let batched_object_eligible = !batched_eligible
-            && is_batched_object_eligible(&bind_instructions, &right_pattern, has_bounds);
+            && (is_batched_object_eligible(&bind_instructions, &right_pattern, has_bounds)
+                || wildcard_direction == Some(WildcardDirection::IncomingRefs));
         let batched_exists_eligible = !batched_eligible
             && !batched_object_eligible
             && is_batched_subject_exists_eligible(&bind_instructions, &right_pattern);
@@ -823,7 +961,12 @@ impl NestedLoopJoinOperator {
             active_right_scan: None,
             active_right_batch_ref: None,
             active_right_left_row: 0,
+            right_replay: None,
+            active_replay_batch: None,
+            logged_replay: false,
             object_bounds,
+            wildcard_direction,
+            wildcard_stream: None,
             batched_eligible,
             batched_object_eligible,
             batched_exists_eligible,
@@ -832,9 +975,12 @@ impl NestedLoopJoinOperator {
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
+            batched_object_o_type: OType::IRI_REF.as_u16(),
             flush_schedule: FlushSchedule::fixed(BATCHED_JOIN_SIZE),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
+            count_only: None,
+            grouped_count: None,
             current_left_batch_stored_idx: None,
             inline_ops,
             right_scan_inline_ops,
@@ -1124,9 +1270,12 @@ impl NestedLoopJoinOperator {
                             // Leave as variable (Poisoned vars from OPTIONAL also remain unbound)
                         }
                         Binding::Grouped(_) => {
-                            // Grouped bindings shouldn't appear in join codepaths
-                            debug_assert!(false, "Grouped binding in join bind");
-                            // Leave as variable
+                            // A per-group list never leaves a grouping stage (the
+                            // plan-time `Grouping::first_ungrouped_read` check);
+                            // leaving the slot a variable would match anything.
+                            return Err(QueryError::Internal(
+                                "grouped (list-valued) binding reached a join".to_string(),
+                            ));
                         }
                         Binding::Path { .. } => {
                             // A path value is never a join key — leave as variable.
@@ -1213,6 +1362,24 @@ impl NestedLoopJoinOperator {
             .collect()
     }
 
+    /// Ordinary indexed scans whose inputs cannot depend on a driving row.
+    fn independent_scan_eligible(&self, ctx: &ExecutionContext<'_>) -> bool {
+        self.bind_instructions.is_empty()
+            && self.unify_instructions.is_empty()
+            && self.right_scan_inline_ops.is_empty()
+            && !self.left.is_identity_seed()
+            && !crate::execute::fast_paths_disabled()
+            && self.mode.is_current()
+            && ctx.from_t.is_none()
+            && ctx.binary_store.is_some()
+            && ctx.dataset.is_none()
+            && !ctx.is_multi_ledger()
+            && !ctx.eager_materialization
+            && !ctx.reasoning_active
+            && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+            && ctx.overlay().is_effectively_empty()
+    }
+
     fn bounds_for_row(
         &self,
         _left_batch: &Batch,
@@ -1270,6 +1437,8 @@ impl Operator for NestedLoopJoinOperator {
 
         // Reset state for fresh execution
         self.pending_output.clear();
+        self.count_only = None;
+        self.grouped_count = None;
         self.pending_right_row = 0;
         self.current_left_batch = None;
         self.current_left_row = 0;
@@ -1279,6 +1448,15 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
+        self.active_replay_batch = None;
+        self.logged_replay = false;
+        // No shared variables means substitution cannot change this scan.
+        // Do not cache pushed FILTERs: even a variable-free expression may be
+        // volatile (RAND/UUID) or inspect correlated state through EXISTS.
+        // Keep the initial scope to ordinary indexed single-graph snapshots.
+        self.right_replay = self
+            .independent_scan_eligible(ctx)
+            .then(|| replay::ScanReplay::new(ctx));
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1378,6 +1556,12 @@ impl Operator for NestedLoopJoinOperator {
         // Process until we have output or exhaust input
         loop {
             ctx.check_cancelled()?;
+            if let Some(mut stream) = self.wildcard_stream.take() {
+                if let Some(batch) = stream.next_batch(self, ctx)? {
+                    self.wildcard_stream = Some(stream);
+                    return Ok(trim_batch(&self.out_schema, batch));
+                }
+            }
             // 1. Pre-built output from batched flush
             if let Some(batch) = self.batched_output.pop_front() {
                 return Ok(trim_batch(&self.out_schema, batch));
@@ -1392,6 +1576,27 @@ impl Operator for NestedLoopJoinOperator {
                 continue;
             }
 
+            // Replay one batch at a time through the existing combination and
+            // inline-expression path. Duplicate rows and output backpressure
+            // have exactly the same handling as a freshly opened scan.
+            if let Some(index) = self.active_replay_batch {
+                let batch = self.right_replay.as_ref().and_then(|r| r.batch(index));
+                if let Some(batch) = batch {
+                    self.active_replay_batch = Some(index + 1);
+                    self.pending_output.push_back((
+                        self.active_right_batch_ref
+                            .clone()
+                            .expect("replay left batch"),
+                        self.active_right_left_row,
+                        batch,
+                    ));
+                } else {
+                    self.active_replay_batch = None;
+                    self.active_right_batch_ref = None;
+                }
+                continue;
+            }
+
             // 3. Resume an in-flight right scan for the current left row.
             if let Some(scan) = &mut self.active_right_scan {
                 ctx.check_cancelled()?;
@@ -1400,6 +1605,14 @@ impl Operator for NestedLoopJoinOperator {
 
                 match next {
                     Some(batch) if !batch.is_empty() => {
+                        if let Some(replay) = &mut self.right_replay {
+                            if !replay.record(&batch) {
+                                self.right_replay = None;
+                                tracing::debug!(
+                                    "independent scan replay declined at capacity or binding guard"
+                                );
+                            }
+                        }
                         let batch_ref = self
                             .active_right_batch_ref
                             .clone()
@@ -1413,6 +1626,9 @@ impl Operator for NestedLoopJoinOperator {
                     }
                     Some(_) => continue,
                     None => {
+                        if let Some(replay) = &mut self.right_replay {
+                            replay.finish();
+                        }
                         if let Some(mut scan) = self.active_right_scan.take() {
                             scan.close();
                         }
@@ -1479,7 +1695,7 @@ impl Operator for NestedLoopJoinOperator {
                     self.subject_left_col.unwrap()
                 };
 
-                let resolved: Option<u64> = {
+                let resolved: Option<(u16, u64)> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
                     let store = ctx.binary_store.as_deref();
                     // Persisted reverse dict first, then DictNovelty: a subject
@@ -1504,10 +1720,23 @@ impl Operator for NestedLoopJoinOperator {
                                     })
                             })
                     };
+                    let iri_ref = OType::IRI_REF.as_u16();
                     match left_batch.get_by_col(left_row, left_col) {
-                        Binding::EncodedSid { s_id, .. } => Some(*s_id),
-                        Binding::Sid { sid, .. } => resolve_subject(sid),
-                        Binding::IriMatch { primary_sid, .. } => resolve_subject(primary_sid),
+                        Binding::EncodedSid { s_id, .. } => Some((iri_ref, *s_id)),
+                        Binding::Sid { sid, .. } => resolve_subject(sid).map(|k| (iri_ref, k)),
+                        Binding::IriMatch { primary_sid, .. } => {
+                            resolve_subject(primary_sid).map(|k| (iri_ref, k))
+                        }
+                        // A term handle keys OPST like a ref; per row it would
+                        // decode the term only for the scan to re-derive it.
+                        // The wildcard cursor reads refs only.
+                        Binding::EncodedLit { o_kind, o_key, .. }
+                            if self.batched_object_eligible
+                                && self.wildcard_direction.is_none()
+                                && *o_kind == ObjKind::TRIPLE_TERM.as_u8() =>
+                        {
+                            Some((OType::TRIPLE_TERM.as_u16(), *o_key))
+                        }
                         Binding::Unbound => None,
                         _ => {
                             // For subject/predicate bindings we already screened invalid types.
@@ -1517,7 +1746,15 @@ impl Operator for NestedLoopJoinOperator {
                     }
                 };
 
-                if let Some(key) = resolved {
+                if let Some((o_type, key)) = resolved {
+                    if o_type != self.batched_object_o_type {
+                        if !self.batched_accumulator.is_empty() {
+                            ctx.check_cancelled()?;
+                            self.flush_batched_accumulator_for_ctx(ctx).await?;
+                            ctx.check_cancelled()?;
+                        }
+                        self.batched_object_o_type = o_type;
+                    }
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
                     if self.batched_accumulator.len() >= self.flush_schedule.size() {
@@ -1555,6 +1792,20 @@ impl Operator for NestedLoopJoinOperator {
                 // Non-batched path: existing per-row join
                 let batch_idx = self.ensure_current_batch_stored();
                 let batch_ref = BatchRef::Stored(batch_idx);
+                if self
+                    .right_replay
+                    .as_ref()
+                    .is_some_and(replay::ScanReplay::is_complete)
+                {
+                    self.active_replay_batch = Some(0);
+                    self.active_right_batch_ref = Some(batch_ref);
+                    self.active_right_left_row = left_row;
+                    if !self.logged_replay {
+                        tracing::debug!("independent scan replay engaged");
+                        self.logged_replay = true;
+                    }
+                    continue;
+                }
                 let left_batch = self.stored_left_batches.last().unwrap();
                 let bound_pattern =
                     self.substitute_pattern_with_store(left_batch, left_row, cached_gv.as_ref())?;
@@ -1576,8 +1827,156 @@ impl Operator for NestedLoopJoinOperator {
         }
     }
 
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        // Only a fresh stream can be counted as a product. Once next_batch has
+        // run, the remaining rows may start in the middle of a driving row.
+        // Pair-dependent FILTER/BIND expressions must use normal row evaluation.
+        if self.state == OperatorState::Open
+            && !self.logged_runtime_mode
+            && self.inline_ops.is_empty()
+            && self.independent_scan_eligible(ctx)
+        {
+            ctx.check_cancelled()?;
+            let left_count = crate::operator::count_operator(self.left.as_mut(), ctx).await?;
+            let right_count = if left_count == 0 {
+                0
+            } else {
+                let mut right = make_right_scan(
+                    self.right_pattern.clone(),
+                    self.object_bounds.clone(),
+                    self.right_emit,
+                    Vec::new(),
+                    self.right_index_hint,
+                    ctx,
+                    self.mode,
+                );
+                right.open(ctx).await?;
+                let count = crate::operator::count_operator(right.as_mut(), ctx).await;
+                right.close();
+                count?
+            };
+            let count = left_count
+                .checked_mul(right_count)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in independent join"))?;
+            ctx.check_cancelled()?;
+            self.right_replay = None;
+            self.state = OperatorState::Exhausted;
+            tracing::debug!(
+                left_count,
+                right_count,
+                "independent join count product engaged"
+            );
+            return Ok(Some(count));
+        }
+        // Reuse the regular driver and all its runtime admission/fallback
+        // rules. Only subject probes without BIND on joined rows avoid emission.
+        if !self.state.can_next()
+            || !self.batched_eligible
+            || self.right_new_vars.is_empty()
+            || self.inline_has_bind()
+        {
+            return Ok(None);
+        }
+        self.count_only = Some(0);
+        let result: Result<u64> = async {
+            let mut materialized_rows = 0;
+            loop {
+                ctx.checkpoint()?;
+                match self.next_batch(ctx).await? {
+                    Some(batch) => {
+                        // Includes buffered output from an earlier next_batch
+                        // call and rows from any per-row runtime fallback.
+                        materialized_rows =
+                            checked_join_count(materialized_rows, batch.len() as u64)?;
+                    }
+                    None => break,
+                }
+            }
+            ctx.checkpoint()?;
+            Ok(materialized_rows)
+        }
+        .await;
+        // Clear the mode even on cancellation/error, before propagating it.
+        let counted_rows = self.count_only.take().expect("count drain mode");
+        let materialized_rows = result?;
+        let total = checked_join_count(counted_rows, materialized_rows)?;
+        tracing::debug!(
+            counted_rows,
+            materialized_rows,
+            "nested-loop count drain complete"
+        );
+        Ok(Some(total))
+    }
+
+    async fn drain_grouped_count(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        group_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
+        if !self.state.can_next()
+            || !self.batched_eligible
+            || self.right_new_vars.is_empty()
+            || self.inline_has_bind()
+            || group_vars.is_empty()
+        {
+            return Ok(None);
+        }
+        let left_columns: Option<Vec<_>> = group_vars
+            .iter()
+            .map(|var| self.left_schema.iter().position(|v| v == var))
+            .collect();
+        let output_columns: Option<Vec<_>> = group_vars
+            .iter()
+            .map(|var| self.schema().iter().position(|v| v == var))
+            .collect();
+        let (Some(left_columns), Some(output_columns)) = (left_columns, output_columns) else {
+            return Ok(None);
+        };
+        self.grouped_count = Some(GroupedCountDrain {
+            left_columns,
+            output_columns,
+            groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
+            key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
+            graph_view: ctx.graph_view(),
+            counted_rows: 0,
+        });
+        let result: Result<u64> = async {
+            let mut materialized_rows = 0;
+            loop {
+                ctx.checkpoint()?;
+                let Some(batch) = self.next_batch(ctx).await? else {
+                    break;
+                };
+                // Buffered output and runtime fallbacks contain fully unified
+                // bindings, including previously unbound left subject keys.
+                let groups = self.grouped_count.as_mut().expect("grouped drain mode");
+                let before = groups.groups.len();
+                for row in 0..batch.len() {
+                    groups.add_row(&batch, row, 1, false)?;
+                }
+                groups.record_growth(ctx, before)?;
+                materialized_rows = checked_join_count(materialized_rows, batch.len() as u64)?;
+            }
+            ctx.checkpoint()?;
+            Ok(materialized_rows)
+        }
+        .await;
+        let groups = self.grouped_count.take().expect("grouped drain mode");
+        let materialized_rows = result?;
+        tracing::debug!(
+            counted_rows = groups.counted_rows,
+            materialized_rows,
+            groups = groups.groups.len(),
+            "nested-loop grouped count drain complete"
+        );
+        Ok(Some(groups.groups.into_values().collect()))
+    }
+
     fn close(&mut self) {
         self.left.close();
+        self.right_replay = None;
+        self.active_replay_batch = None;
+        self.wildcard_stream = None;
         self.current_left_batch = None;
         self.current_left_batch_stored_idx = None;
         self.pending_output.clear();
@@ -1590,6 +1989,8 @@ impl Operator for NestedLoopJoinOperator {
         self.batched_accumulator.clear();
         self.stored_left_batches.clear();
         self.batched_output.clear();
+        self.count_only = None;
+        self.grouped_count = None;
         self.state = OperatorState::Closed;
     }
 
@@ -1723,6 +2124,10 @@ impl NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<()> {
+        tracing::debug!(
+            input_rows = self.batched_accumulator.len(),
+            "join batched probe input"
+        );
         if ctx.binary_store.is_none() {
             return Err(crate::error::QueryError::execution(
                 "binary_store is required for batched joins — no non-binary fallback exists",
@@ -1730,6 +2135,11 @@ impl NestedLoopJoinOperator {
         }
 
         let accum_len = self.batched_accumulator.len();
+        if let Some(direction) = self.wildcard_direction {
+            self.wildcard_stream = Some(wildcard::WildcardJoin::new(self, ctx));
+            tracing::debug!(?direction, accum_len, "batched wildcard join engaged");
+            return Ok(());
+        }
         if self.batched_object_eligible {
             self.flush_batched_object_accumulator_binary(ctx)
                 .instrument(tracing::debug_span!(
@@ -1770,7 +2180,7 @@ impl NestedLoopJoinOperator {
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
-    /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
+    /// subject; the object (OPST) lane merges its key type's subset per probed
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
@@ -1783,7 +2193,32 @@ impl NestedLoopJoinOperator {
             Some(pred) => &[pred],
             None => &[],
         };
-        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
+        let admitted = crate::fast_path_common::probe_lane_admission(ctx, preds);
+        if self.wildcard_direction.is_some() {
+            // The shared cursor reads persisted state only. Keep the first
+            // query lane restricted to HEAD, one ledger/graph, and no novelty.
+            return Ok(
+                if !matches!(admitted, Some(ProbeLanePlan::Decline))
+                    && !crate::fast_paths_disabled()
+                    && self.mode.is_current()
+                    && ctx.from_t.is_none()
+                    && !ctx.is_multi_ledger()
+                    && !ctx.eager_materialization
+                    && !ctx.reasoning_active
+                    && matches!(ctx.active_graphs(), ActiveGraphs::Single)
+                    && ctx.overlay_free_single_graph()
+                    && ctx
+                        .binary_store
+                        .as_ref()
+                        .is_some_and(|s| ctx.to_t >= s.max_t())
+                {
+                    ProbeLanePlan::Clean
+                } else {
+                    ProbeLanePlan::Decline
+                },
+            );
+        }
+        if let Some(plan) = admitted {
             return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
@@ -1910,8 +2345,6 @@ impl NestedLoopJoinOperator {
         mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
-        use fluree_db_core::o_type::OType;
-
         let scan_start = Instant::now();
 
         let mut leaflets_scanned: u64 = 0;
@@ -1943,21 +2376,14 @@ impl NestedLoopJoinOperator {
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
+                if !needs_history_replay && !psot_leaflet_may_hold(entry, p_id, unique_s_ids) {
+                    continue;
+                }
 
                 let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
                 ctx.check_cancelled()?;
 
-                let row_count = batch.row_count;
-
-                // For PSOT, leaflets are sorted by p_id then s_id.
-                // Find the contiguous segment for our p_id.
-                let p_start = (0..row_count)
-                    .position(|i| batch.p_id.get_or(i, 0) >= p_id)
-                    .unwrap_or(row_count);
-                let p_end = (p_start..row_count)
-                    .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-                    .map(|offset| p_start + offset)
-                    .unwrap_or(row_count);
+                let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
                 if p_start == p_end {
                     continue;
                 }
@@ -2322,7 +2748,8 @@ impl NestedLoopJoinOperator {
         //    per accumulator slot). Inline FILTERs run against a `CombinedRowView`
         //    over the stored left row + right tail — no per-match `combined` Vec.
         //    `emit_right_scatter_to_output` writes left columns (cloned once) and
-        //    right tails directly into the output columns.
+        //    right tails directly into the output columns. During `drain_count`,
+        //    the same callback counts surviving matches without scatter/output.
         //  * Bind/general path: full combined rows scattered into
         //    `Vec<Vec<Vec<Binding>>>`, then transposed by `emit_scatter_to_output`.
         //    Binds may append or clobber columns, so the row must be materialized.
@@ -2330,7 +2757,20 @@ impl NestedLoopJoinOperator {
         if right_width >= 1 && !self.inline_has_bind() {
             let left_len = self.left_schema.len();
             let combined_schema = self.combined_schema.clone();
-            let mut scatter: Vec<Vec<Binding>> = vec![Vec::new(); self.batched_accumulator.len()];
+            let count_only = self.count_only.is_some();
+            let grouped_count = self.grouped_count.is_some();
+            let mut row_counts = if grouped_count {
+                vec![0u64; self.batched_accumulator.len()]
+            } else {
+                Vec::new()
+            };
+            let mut counted_rows = 0;
+            let mut scatter: Vec<Vec<Binding>> = if count_only || grouped_count {
+                ctx.checkpoint()?;
+                Vec::new()
+            } else {
+                vec![Vec::new(); self.batched_accumulator.len()]
+            };
             {
                 let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
                     // Right-side tail (object + any right-scan inline outputs) is
@@ -2340,6 +2780,11 @@ impl NestedLoopJoinOperator {
                         right_bindings.push(obj.clone());
                     }
                     if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        return Ok(());
+                    }
+                    if count_only && self.inline_ops.is_empty() {
+                        counted_rows =
+                            checked_join_count(counted_rows, accum_indices.len() as u64)?;
                         return Ok(());
                     }
                     for &accum_idx in accum_indices {
@@ -2356,7 +2801,13 @@ impl NestedLoopJoinOperator {
                                 continue;
                             }
                         }
-                        scatter[accum_idx].extend(right_bindings.iter().cloned());
+                        if count_only {
+                            counted_rows = checked_join_count(counted_rows, 1)?;
+                        } else if grouped_count {
+                            row_counts[accum_idx] = checked_join_count(row_counts[accum_idx], 1)?;
+                        } else {
+                            scatter[accum_idx].extend(right_bindings.iter().cloned());
+                        }
                     }
                     Ok(())
                 };
@@ -2373,7 +2824,34 @@ impl NestedLoopJoinOperator {
                     &mut on_match,
                 )?;
             }
-            self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+            if let Some(groups) = self.grouped_count.as_mut() {
+                // A flush may contain many input batches. Bound the interval
+                // between budget/deadline checks while growing the group map.
+                let batch_size = ctx.batch_size.max(1);
+                for (chunk_idx, counts) in row_counts.chunks(batch_size).enumerate() {
+                    let before = groups.groups.len();
+                    for (offset, &count) in counts.iter().enumerate() {
+                        let (batch_idx, row_idx, _) =
+                            self.batched_accumulator[chunk_idx * batch_size + offset];
+                        groups.add_row(
+                            &self.stored_left_batches[batch_idx],
+                            row_idx,
+                            count,
+                            true,
+                        )?;
+                        groups.counted_rows = checked_join_count(groups.counted_rows, count)?;
+                    }
+                    groups.record_growth(ctx, before)?;
+                }
+                self.clear_batched_state();
+            } else if let Some(total) = self.count_only.as_mut() {
+                ctx.checkpoint()?;
+                *total = checked_join_count(*total, counted_rows)?;
+                tracing::debug!(counted_rows, "join batched count flush complete");
+                self.clear_batched_state();
+            } else {
+                self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+            }
         } else {
             let mut scatter: Vec<Vec<Vec<Binding>>> =
                 vec![Vec::new(); self.batched_accumulator.len()];
@@ -2458,7 +2936,6 @@ impl NestedLoopJoinOperator {
             cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
         };
         use fluree_db_binary_index::RunSortOrder;
-        use fluree_db_core::o_type::OType;
 
         if self.batched_accumulator.is_empty() {
             return Ok(());
@@ -2495,7 +2972,7 @@ impl NestedLoopJoinOperator {
 
         // One reconciler per flush (see `flush_batched_accumulator_binary`).
         let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops, self.batched_object_o_type),
             _ => None,
         };
 
@@ -2507,7 +2984,7 @@ impl NestedLoopJoinOperator {
         // We build a set of leaf indices that contain any of our object IDs, then scan
         // those leaves. This avoids re-opening and re-decoding leaflets once per object
         // (which is the dominant cost in `BinaryCursor`-per-object approaches).
-        let iri_ref = OType::IRI_REF.as_u16();
+        let o_type = self.batched_object_o_type;
         let cmp = cmp_v2_for_order(RunSortOrder::Opst);
 
         let mut objs: Vec<u64> = o_to_accum.keys().copied().collect();
@@ -2527,7 +3004,7 @@ impl NestedLoopJoinOperator {
                 p_id,
                 t: 0,
                 o_i: 0,
-                o_type: iri_ref,
+                o_type,
                 g_id: ctx.binary_g_id,
             };
             let max_key = RunRecordV2 {
@@ -2536,7 +3013,7 @@ impl NestedLoopJoinOperator {
                 p_id,
                 t: u32::MAX,
                 o_i: u32::MAX,
-                o_type: iri_ref,
+                o_type,
                 g_id: ctx.binary_g_id,
             };
             let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
@@ -2563,7 +3040,7 @@ impl NestedLoopJoinOperator {
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
-                if entry.o_type_const.is_some() && entry.o_type_const != Some(iri_ref) {
+                if entry.o_type_const.is_some() && entry.o_type_const != Some(o_type) {
                     continue;
                 }
 
@@ -2622,7 +3099,7 @@ impl NestedLoopJoinOperator {
                     // which is extremely rare for OPST; fall back to row-scan in that case.
                     for row in 0..batch.row_count {
                         let ot = batch.o_type.get_or(row, 0);
-                        if ot != iri_ref {
+                        if ot != o_type {
                             continue;
                         }
                         let pid = batch.p_id.get_or(row, 0);
@@ -2659,7 +3136,7 @@ impl NestedLoopJoinOperator {
 
                 // Fast path: if o_type/p_id are const and already filtered by leaflet
                 // metadata, we can skip per-row checks.
-                let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == iri_ref;
+                let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == o_type;
                 let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
 
                 // Start scanning at the first possible match within this leaflet.
@@ -2698,7 +3175,7 @@ impl NestedLoopJoinOperator {
                     for r in row..run_end {
                         if !ot_const_ok {
                             let ot = batch.o_type.get_or(r, 0);
-                            if ot != iri_ref {
+                            if ot != o_type {
                                 continue;
                             }
                         }
@@ -3007,6 +3484,17 @@ fn decode_overlay_object(
                 ov.resolve_string_value(o_key as u32)
                     .map_err(|e| decode_err("resolve_string_value", &e))?,
             ),
+            (DecodeKind::TripleTermDict, _)
+                if fluree_db_core::triple_term::novelty_term_index(o_key).is_some() =>
+            {
+                let term = fluree_db_core::triple_term::novelty_term_index(o_key)
+                    .zip(ctx.dict_novelty.as_ref())
+                    .and_then(|(index, dn)| dn.terms.resolve(index))
+                    .ok_or_else(|| {
+                        decode_err("novelty term", &format!("no term for handle {o_key:#x}"))
+                    })?;
+                FlakeValue::TripleTerm(Box::new(term.clone()))
+            }
             _ => store
                 .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
                 .map_err(|e| decode_err("decode_value_v3", &e))?,
@@ -3066,9 +3554,7 @@ fn batched_subject_probe_binary_uncharged(
     params: &SubjectProbeParams<'_>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{
-        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
-    };
+    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
     if params.subject_ids.is_empty() {
@@ -3141,49 +3627,14 @@ fn batched_subject_probe_binary_uncharged(
                 continue;
             }
 
-            // Directory-level subject skip: for a predicate-homogeneous leaflet
-            // the stored keys ascend by subject, so first_key/last_key bound its
-            // subject range. A scattered probe set spans the whole predicate
-            // partition but only touches a few leaflets — decline the rest here,
-            // before the (expensive) column decode + p-run scan, rather than
-            // after it (the `subj_start >= subj_end` check below). Only sound on
-            // homogeneous leaflets — a mixed-predicate leaflet resets s_id at each
-            // predicate boundary, so its key range isn't a clean subject interval
-            // — and only when not replaying history (a current-state key range can
-            // omit subjects that existed at an earlier `t`).
-            if entry.p_const == Some(p_id) && !needs_history_replay {
-                let lo = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key)
-                    .s_id
-                    .as_u64();
-                let hi = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key)
-                    .s_id
-                    .as_u64();
-                let a = unique_s_ids.partition_point(|&x| x < lo);
-                let b = unique_s_ids.partition_point(|&x| x <= hi);
-                if a >= b {
-                    continue;
-                }
+            if !needs_history_replay && !psot_leaflet_may_hold(entry, p_id, &unique_s_ids) {
+                continue;
             }
 
             let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
             ctx.check_cancelled()?;
 
-            let row_count = batch.row_count;
-            // A p-homogeneous leaflet is entirely this predicate — its p-run is
-            // the whole leaflet, so skip the two linear scans that would walk
-            // every row only to rediscover [0, row_count).
-            let (p_start, p_end) = if entry.p_const == Some(p_id) {
-                (0, row_count)
-            } else {
-                let p_start = (0..row_count)
-                    .position(|i| batch.p_id.get_or(i, 0) >= p_id)
-                    .unwrap_or(row_count);
-                let p_end = (p_start..row_count)
-                    .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-                    .map(|offset| p_start + offset)
-                    .unwrap_or(row_count);
-                (p_start, p_end)
-            };
+            let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
             if p_start == p_end {
                 continue;
             }
@@ -3596,6 +4047,295 @@ fn batched_subject_star_spot_uncharged(
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+
+    fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        NestedLoopJoinOperator::new(
+            Box::new(crate::seed::BatchReplayOperator::new(
+                schema.clone(),
+                batches,
+            )),
+            schema,
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "edge")),
+                Term::Var(VarId(1)),
+            ),
+            None,
+            inline_ops,
+            EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
+        )
+    }
+
+    fn buffered_count_rows(join: &NestedLoopJoinOperator, rows: usize) -> Batch {
+        Batch::new(
+            join.combined_schema.clone(),
+            vec![vec![Binding::Unbound; rows]; join.combined_schema.len()],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn count_drain_counts_only_remaining_rows_and_exhausts() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[]));
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 2));
+        join.batched_output.push_back(buffered_count_rows(&join, 3));
+        // COUNT must preserve the row count even after projection to no columns.
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), Some(3));
+        assert!(join.count_only.is_none());
+        assert!(join.next_batch(&ctx).await.unwrap().is_none());
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        assert_eq!(join.state, OperatorState::Exhausted);
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_declines_bind_without_consuming_input() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(
+            vec![InlineOperator::Bind {
+                var: VarId(2),
+                expr: crate::ir::Expression::Var(VarId(1)),
+            }],
+            vec![],
+        );
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 3));
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(join.grouped_count.is_none());
+        assert!(join.count_only.is_none());
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 3);
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_skips_poisoned_and_invalid_subjects() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let batch = Batch::new(
+            Arc::from(vec![VarId(0)].into_boxed_slice()),
+            vec![vec![
+                Binding::Poisoned,
+                Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::xsd_integer()),
+            ]],
+        )
+        .unwrap();
+        let mut join = count_join(vec![], vec![batch]);
+        join.open(&ctx).await.unwrap();
+        assert_eq!(join.drain_count(&ctx).await.unwrap(), Some(0));
+        assert!(join.count_only.is_none());
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn count_drain_checks_budgets_and_clears_mode_on_error() {
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for cancelled in [false, true] {
+            let cancellation = QueryCancellation::new();
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            } else {
+                cancellation.set_memory_limit(1);
+                cancellation.record_alloc(2);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut join = count_join(vec![], vec![]);
+            join.open(&ctx).await.unwrap();
+            let err = join.drain_count(&ctx).await.unwrap_err();
+            if cancelled {
+                assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                    "{err:?}"
+                );
+            }
+            assert!(join.count_only.is_none());
+            join.close();
+        }
+        assert_eq!(checked_join_count(u64::MAX - 1, 1).unwrap(), u64::MAX);
+        assert!(checked_join_count(u64::MAX, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn grouped_drain_counts_remaining_rows_and_preserves_declined_input() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[VarId(0)]));
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .is_none());
+        join.open(&ctx).await.unwrap();
+        join.batched_output.push_back(buffered_count_rows(&join, 2));
+        let key = Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::xsd_integer());
+        join.batched_output.push_back(
+            Batch::new(
+                join.combined_schema.clone(),
+                vec![
+                    vec![key.clone(), Binding::Unbound, key.clone()],
+                    vec![Binding::Unbound; 3],
+                ],
+            )
+            .unwrap(),
+        );
+        // A key introduced on the right or absent after projection must decline
+        // without consuming even already-buffered output.
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(1)])
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
+        let groups = join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.keys == [key.clone()])
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.keys == [Binding::Unbound])
+                .unwrap()
+                .count,
+            1
+        );
+        assert!(join.grouped_count.is_none());
+        assert!(join.next_batch(&ctx).await.unwrap().is_none());
+        join.close();
+        let mut join = count_join(vec![], vec![]);
+        join.open(&ctx).await.unwrap();
+        assert!(join
+            .drain_grouped_count(&ctx, &[VarId(0)])
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        join.close();
+    }
+
+    #[tokio::test]
+    async fn grouped_drain_checks_group_growth_and_cancellation() {
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for cancelled in [false, true] {
+            let cancellation = QueryCancellation::new();
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            } else {
+                cancellation.set_memory_limit(1);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut join = count_join(vec![], vec![]);
+            join.open(&ctx).await.unwrap();
+            join.batched_output.push_back(buffered_count_rows(&join, 1));
+            let err = join
+                .drain_grouped_count(&ctx, &[VarId(0)])
+                .await
+                .unwrap_err();
+            if cancelled {
+                assert!(matches!(err, QueryError::Cancelled { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                    "{err:?}"
+                );
+                assert!(ctx.mem_used() >= crate::context::GROUP_EST_BYTES);
+            }
+            assert!(join.grouped_count.is_none());
+            join.close();
+        }
+    }
+
+    /// A leaflet is skipped only when no probed subject of the predicate can
+    /// lie between its directory keys, including where the leaflet spans
+    /// other predicates on either side.
+    #[test]
+    fn psot_leaflet_skip_reads_subject_bounds_per_predicate() {
+        use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
+        use fluree_db_binary_index::format::run_record_v2::{
+            write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+        };
+        use fluree_db_binary_index::RunSortOrder;
+        let key = |p_id: u32, s_id: u64| {
+            let mut buf = [0u8; ORDERED_KEY_V2_SIZE];
+            let rec = RunRecordV2 {
+                s_id: SubjectId(s_id),
+                o_key: 0,
+                p_id,
+                t: 0,
+                o_i: 0,
+                o_type: 0,
+                g_id: 0,
+            };
+            write_ordered_key_v2(RunSortOrder::Psot, &rec, &mut buf);
+            buf
+        };
+        let entry = |first: (u32, u64), last: (u32, u64)| LeafletDirEntryV3 {
+            row_count: 1,
+            lead_group_count: 0,
+            first_key: key(first.0, first.1),
+            last_key: key(last.0, last.1),
+            p_const: None,
+            o_type_const: None,
+            flags: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            column_refs: Vec::new(),
+            history_offset: 0,
+            history_len: 0,
+            history_min_t: 0,
+            history_max_t: 0,
+        };
+        // One predicate: subjects 100..=200.
+        let only = entry((7, 100), (7, 200));
+        assert!(psot_leaflet_may_hold(&only, 7, &[150]));
+        assert!(psot_leaflet_may_hold(&only, 7, &[100, 900]));
+        assert!(!psot_leaflet_may_hold(&only, 7, &[50, 250]));
+        assert!(!psot_leaflet_may_hold(&only, 8, &[150]));
+        // Starts in an earlier predicate: p=7 rows run from subject 0 to 40.
+        let starts_before = entry((5, 900), (7, 40));
+        assert!(psot_leaflet_may_hold(&starts_before, 7, &[3]));
+        assert!(!psot_leaflet_may_hold(&starts_before, 7, &[41]));
+        // Ends in a later predicate: p=7 rows run from subject 60 upward.
+        let ends_after = entry((7, 60), (9, 2));
+        assert!(psot_leaflet_may_hold(&ends_after, 7, &[10_000]));
+        assert!(!psot_leaflet_may_hold(&ends_after, 7, &[59]));
+        // Spans p=7 entirely: any subject.
+        let spans = entry((5, 900), (9, 2));
+        assert!(psot_leaflet_may_hold(&spans, 7, &[1]));
+        assert!(!psot_leaflet_may_hold(&spans, 4, &[1]));
+        assert!(!psot_leaflet_may_hold(&spans, 10, &[1]));
+    }
 
     #[test]
     fn test_bind_instruction_creation() {

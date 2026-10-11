@@ -18,7 +18,7 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let active = config::read_active_ledger(dirs.data_dir());
     let records = fluree.nameservice().all_records().await?;
     let gs_records = fluree.nameservice().all_graph_source_records().await?;

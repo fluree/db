@@ -2020,6 +2020,7 @@ ex:carol ex:age 42 ~ ex:claim2 .
                 panic!("chunk {i} must be valid Turtle-star: {e}\n{chunk_text}")
             });
             for node in json.as_array().unwrap() {
+                annotated_edges += usize::from(node.get("@reifies").is_some());
                 for (key, values) in node.as_object().unwrap() {
                     if key.starts_with('@') {
                         continue;
@@ -2444,6 +2445,7 @@ ex:t ex:u ex:v .
             let json = crate::parse_to_json(&text)
                 .unwrap_or_else(|e| panic!("chunk {idx} must be valid Turtle-star: {e}\n{text}"));
             for node in json.as_array().unwrap() {
+                annotated += usize::from(node.get("@reifies").is_some());
                 for (key, values) in node.as_object().unwrap() {
                     if key.starts_with('@') {
                         continue;

@@ -298,7 +298,8 @@ SELECT ?v FROM NAMED <http://example.org/g1> WHERE { GRAPH ?g { ?s ex:childName 
 /// fault; the code names what the fault is, and it must still say "config"
 /// even though the status moved off 400. The tracked tests cannot make this
 /// claim: `TrackedErrorResponse` carries a status and a message but no error
-/// kind, so the tracked path always reports `err:system/InternalError`.
+/// kind, so the tracked path's code follows its status alone
+/// (`err:system/InternalError` for a 500).
 #[tokio::test]
 async fn malformed_ledger_config_is_not_reported_as_a_client_error() {
     let (_tmp, app) = app_with_config(BAD_RULES_SOURCE_TRIG).await;

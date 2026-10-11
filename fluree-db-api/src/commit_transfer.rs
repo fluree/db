@@ -37,10 +37,11 @@ use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::lifecycle::PendingLedger;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{
-    drop_forged_commit_flakes, generate_commit_flakes, stamp_graph_on_commit_flakes,
-    warn_if_forged_commit_flakes_dropped, Novelty,
+    drop_forged_commit_flakes, generate_commit_flakes, is_forged_commit_flake,
+    stamp_graph_on_commit_flakes, warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_db_policy::PolicyContext;
+use fluree_db_transact::datatype_limit;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -428,6 +429,11 @@ impl Fluree {
         // including ones an earlier commit of the same push introduced.
         let mut pushed_namespaces: HashMap<u16, String> = HashMap::new();
 
+        // Datatypes the ledger holds, and those earlier commits of this push
+        // add, so every commit is checked against both.
+        let base_datatypes = datatype_limit::known_datatypes(&base_state);
+        let mut pushed_datatypes: HashSet<Sid> = HashSet::new();
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
@@ -456,6 +462,40 @@ impl Fluree {
                     .set_ns_split_mode(mode, c.commit.t)
                     .map_err(|e| PushError::Invalid(e.to_string()).into_api_error())?;
             }
+
+            // 4.0.2 Datatype limit, ahead of the costlier validation below. A
+            // sender that does not enforce it can push commits the index could
+            // never hold. The datatypes are those that reach novelty at 4.5:
+            // the blob's flakes other than forged commit records, and the
+            // typed txn-meta values. The other generated metadata flakes have
+            // reserved datatypes.
+            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
+            let txn_meta_g = base_state.snapshot.encode_iri(&txn_meta_iri);
+            let blob_datatypes = c
+                .commit
+                .flakes
+                .iter()
+                .filter(|f| {
+                    !txn_meta_g
+                        .as_ref()
+                        .is_some_and(|g| is_forged_commit_flake(f, g))
+                })
+                .map(|f| &f.dt);
+            let meta_datatypes = datatype_limit::txn_meta_datatypes(&c.commit.txn_meta);
+            let adding: Vec<Sid> = datatype_limit::new_datatypes(
+                &base_datatypes,
+                blob_datatypes.chain(&meta_datatypes),
+            )
+            .into_iter()
+            .filter(|dt| !pushed_datatypes.contains(*dt))
+            .cloned()
+            .collect();
+            datatype_limit::check_datatype_capacity(
+                &base_datatypes,
+                pushed_datatypes.len() + adding.len(),
+            )
+            .map_err(ApiError::Transact)?;
+            pushed_datatypes.extend(adding);
 
             // 4.1 Retraction invariant (strict).
             assert_retractions_exist(
@@ -1194,11 +1234,7 @@ async fn stage_commit_flakes(
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids)
-        // Push applies commits that were authored and written elsewhere, so
-        // authoring invariants are advisory here. See
-        // `StageOptions::replaying_commit`.
-        .replaying_commit();
+        .with_graph_sids(graph_sids);
     if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }
@@ -1425,6 +1461,10 @@ fn apply_pushed_commits_to_state(
     // the subjects and strings these commits introduce.
     let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
+    // Like the commit path, extend the runtime dictionaries with every
+    // predicate and datatype these commits introduce. Queries resolve through
+    // them, and the datatype limit counts them.
+    let mut runtime_small_dicts = base.runtime_small_dicts.clone();
 
     let store_opt: Option<&BinaryIndexStore> = base
         .binary_store
@@ -1441,16 +1481,26 @@ fn apply_pushed_commits_to_state(
         .map_err(|e| {
             PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
         })?;
+        Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
         // Apply to novelty.
-        novelty
+        let links = novelty
             .apply_commit(flakes.clone(), *t, &reverse_graph)
             .map_err(|e| {
                 PushError::Internal(format!("novelty apply_commit failed at t={t}: {e}"))
             })?;
+        fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+            Arc::make_mut(&mut dict_novelty),
+            store_opt,
+            links.iter(),
+        )
+        .map_err(|e| {
+            PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
+        })?;
     }
 
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
+    base.runtime_small_dicts = runtime_small_dicts;
     if let Some(store) = provider_store {
         fluree_db_transact::attach_binary_provider(&mut base, store);
     }

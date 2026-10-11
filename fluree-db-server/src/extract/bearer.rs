@@ -47,7 +47,7 @@ pub struct EventsPrincipal {
     /// fluree.storage.all claim
     pub storage_all: bool,
     /// fluree.storage.ledgers claim (HashSet for O(1) lookup)
-    pub storage_ledgers: HashSet<String>,
+    pub storage_ledgers: HashSet<fluree_db_api::LedgerId>,
 }
 
 impl EventsPrincipal {
@@ -57,8 +57,8 @@ impl EventsPrincipal {
     }
 
     /// Check if principal is authorized for a specific ledger alias (storage proxy)
-    pub fn is_storage_authorized_for_ledger(&self, alias: &str) -> bool {
-        self.storage_all || self.storage_ledgers.contains(alias)
+    pub fn is_storage_authorized_for_ledger(&self, id: &fluree_db_api::LedgerId) -> bool {
+        self.storage_all || self.storage_ledgers.contains(id)
     }
 }
 
@@ -236,12 +236,7 @@ fn build_principal(
         ),
         // Storage proxy permissions
         storage_all: payload.storage_all.unwrap_or(false),
-        storage_ledgers: payload
-            .storage_ledgers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
+        storage_ledgers: super::data_bearer::parse_scopes(payload.storage_ledgers.as_ref()),
     }
 }
 
@@ -392,15 +387,16 @@ mod tests_common {
             allowed_ledgers: HashSet::new(),
             allowed_graph_sources: HashSet::new(),
             storage_all: false,
-            storage_ledgers: vec!["books:main".to_string(), "users:main".to_string()]
-                .into_iter()
-                .collect(),
+            storage_ledgers: crate::extract::data_bearer::parse_scopes(Some(&vec![
+                "books".to_string(),
+                "users:main".to_string(),
+            ])),
         };
 
         assert!(principal.has_storage_permissions());
-        assert!(principal.is_storage_authorized_for_ledger("books:main"));
-        assert!(principal.is_storage_authorized_for_ledger("users:main"));
-        assert!(!principal.is_storage_authorized_for_ledger("other:main"));
+        assert!(principal.is_storage_authorized_for_ledger(&id("books:main")));
+        assert!(principal.is_storage_authorized_for_ledger(&id("users:main")));
+        assert!(!principal.is_storage_authorized_for_ledger(&id("other:main")));
     }
 
     #[test]
@@ -417,8 +413,8 @@ mod tests_common {
         };
 
         assert!(principal.has_storage_permissions());
-        assert!(principal.is_storage_authorized_for_ledger("any:ledger"));
-        assert!(principal.is_storage_authorized_for_ledger("books:main"));
+        assert!(principal.is_storage_authorized_for_ledger(&id("any:ledger")));
+        assert!(principal.is_storage_authorized_for_ledger(&id("books:main")));
     }
 }
 

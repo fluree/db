@@ -4,7 +4,7 @@
 //! - `application/json`: JSON-LD transaction format (update/insert/upsert)
 //! - `application/sparql-update`: SPARQL UPDATE syntax (update only)
 //! - `text/turtle`: Turtle RDF format (insert/upsert only)
-//! - `application/trig`: TriG format with named graphs (upsert only)
+//! - `application/trig`: TriG format with named graphs (insert/upsert only)
 //!
 //! # Ledger Selection Priority
 //!
@@ -17,7 +17,7 @@
 //! # Turtle vs TriG Semantics
 //!
 //! - **Turtle on `/insert`**: Uses fast direct flake path. Pure insert semantics.
-//! - **TriG on `/insert`**: Returns 400 error. Named graphs require upsert path.
+//! - **TriG on `/insert`**: Insert semantics; GRAPH blocks land in their named graphs.
 //! - **Turtle/TriG on `/upsert`**: Uses upsert path with GRAPH block extraction for named graphs.
 
 use crate::config::ServerRole;
@@ -200,6 +200,12 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::NoveltyDeltaTooLarge { message } => {
             return ServerError::NoveltyDeltaTooLarge(message.clone());
         }
+        SubmissionError::DatatypeLimitExceeded { message } => {
+            return ServerError::DatatypeLimitExceeded(message.clone());
+        }
+        SubmissionError::CommitNotFound { message } => {
+            return ServerError::Api(ApiError::CommitNotFound(message.clone()));
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -273,6 +279,24 @@ fn effective_did<'a>(
     author: Option<&'a str>,
 ) -> Option<&'a str> {
     governance.identity.as_deref().or(author)
+}
+
+/// Stamp a caller-supplied event time (`opts.eventTime`, `# PRAGMA
+/// event-time`) on the commit, for backdated historical loads.
+///
+/// Validated for RFC 3339 shape at the boundary; monotonicity/future bounds
+/// are enforced by the commit build path against the ledger head. Recording
+/// the wall-clock receipt time alongside flips the ledger into dual-stamp mode
+/// so `@recorded:` (audit-axis) time travel stays exact.
+fn with_event_time(commit_opts: CommitOpts, event_time: &str, field: &str) -> Result<CommitOpts> {
+    if chrono::DateTime::parse_from_rfc3339(event_time).is_err() {
+        return Err(ServerError::bad_request(format!(
+            "{field} is not a valid RFC 3339 timestamp: {event_time}"
+        )));
+    }
+    Ok(commit_opts
+        .with_timestamp(event_time.to_string())
+        .with_received_at(chrono::Utc::now().to_rfc3339()))
 }
 
 /// Build the [`CommitOpts`] for the transaction.
@@ -1515,6 +1539,7 @@ async fn dry_run_sync(
     let opts = fluree_db_api::SyncGraphOpts {
         dry_run: true,
         allow_empty,
+        ..Default::default()
     };
     let report = state
         .fluree
@@ -1985,12 +2010,6 @@ pub(crate) async fn execute_transaction(
         let did = effective_did(&prepared_transaction.governance, author);
         let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle).await;
 
-        // `opts.eventTime`: caller-supplied event time for this commit
-        // (backdated historical loads). Validated for RFC 3339 shape at the
-        // boundary; monotonicity/future bounds are enforced by the commit
-        // build path against the ledger head. Recording the wall-clock
-        // receipt time alongside flips the ledger into dual-stamp mode so
-        // `@recorded:` (audit-axis) time travel stays exact.
         if let Some(event_time_raw) = prepared_transaction
             .body
             .get("opts")
@@ -2002,15 +2021,8 @@ pub(crate) async fn execute_transaction(
                     "opts.eventTime must be an RFC 3339 timestamp string",
                 ));
             };
-            if chrono::DateTime::parse_from_rfc3339(event_time).is_err() {
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(ServerError::bad_request(format!(
-                    "opts.eventTime is not a valid RFC 3339 timestamp: {event_time}"
-                )));
-            }
-            commit_opts = commit_opts
-                .with_timestamp(event_time.to_string())
-                .with_received_at(chrono::Utc::now().to_rfc3339());
+            commit_opts = with_event_time(commit_opts, event_time, "opts.eventTime")
+                .inspect_err(|_| set_span_error_code(&span, "error:BadRequest"))?;
         }
 
         let txn_opts = txn_opts_from_body(&prepared_transaction.body, &span)?;
@@ -2088,14 +2100,13 @@ fn graph_iri(graph: &GraphSel) -> Option<String> {
 ///
 /// This function handles both:
 /// - text/turtle: Standard Turtle format (insert, upsert or sync)
-/// - application/trig: TriG format with GRAPH blocks for named graphs (upsert or sync)
+/// - application/trig: TriG format with GRAPH blocks for named graphs (insert, upsert or sync)
 ///
 /// # Insert vs Upsert Semantics
 ///
-/// - **Insert with Turtle** (`text/turtle` on `/insert`): Uses direct flake parsing (fast path).
-///   Pure insert - will fail if subjects already exist with conflicting data.
-/// - **Insert with TriG** (`application/trig` on `/insert`): Not supported - returns 400.
-///   Named graphs require the upsert path for GRAPH block extraction.
+/// - **Insert with Turtle/TriG** (`/insert`): Pure insert. Turtle parses directly to flakes;
+///   a TriG body (detected by the API, under either content type) lands its GRAPH blocks in
+///   their named graphs. Both travel as `TransactionBody::TurtleInsert`.
 /// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
 ///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
 ///   are retracted before new values are asserted.
@@ -2124,19 +2135,6 @@ pub(crate) async fn execute_turtle_transaction(
     );
     async move {
         let span = tracing::Span::current();
-
-        // TriG carries `GRAPH` blocks, which need the upsert path. The
-        // op-type is constrained by [`TurtleOp`] at the boundary; the
-        // is_trig check below is the one invariant that lives at runtime
-        // because content-type is parsed from HTTP.
-        if is_trig && op == TurtleOp::Insert {
-            set_span_error_code(&span, "error:BadRequest");
-            tracing::warn!("TriG format not supported on insert endpoint");
-            return Err(ServerError::bad_request(
-                "TriG format (application/trig) is not supported on the insert endpoint. \
-                 Named graph ingestion requires the upsert endpoint (/upsert or /:ledger/upsert).",
-            ));
-        }
 
         // Compute tx-id from Turtle string
         let tx_id = compute_tx_id_turtle(turtle);
@@ -2175,8 +2173,8 @@ pub(crate) async fn execute_turtle_transaction(
 
         // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
-        // (TriG, Insert) was rejected above. Sync reads GRAPH blocks from
-        // either content type.
+        // Sync, insert and upsert all read GRAPH blocks from either content
+        // type.
         let body = match op {
             TurtleOp::Graph {
                 graph,
@@ -2472,6 +2470,16 @@ pub(crate) async fn submit_sparql_update(
 ) -> Result<Response> {
     let tx_id = compute_tx_id_sparql(&sparql);
 
+    // `# PRAGMA` options merge with the headers as `with_sparql_pragmas`
+    // describes. The transaction-level ones (`validation-mode`,
+    // `unique-properties`) ride the text itself and are applied where it is
+    // lowered.
+    let pragmas = fluree_db_sparql::request_pragmas(&sparql).map_err(|e| {
+        set_span_error_code(parent_span, "error:BadRequest");
+        ServerError::bad_request(e)
+    })?;
+    let headers = &headers.clone().with_sparql_pragmas(&pragmas)?;
+
     // Resolve the ledger handle up front: a missing ledger surfaces as a 404
     // here, and the handle provides the canonical ledger ID for commit_opts.
     let handle = match state.fluree.ledger_cached(ledger_id).await {
@@ -2490,13 +2498,17 @@ pub(crate) async fn submit_sparql_update(
     let governance =
         crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
 
-    let commit_opts = build_commit_opts(
+    let mut commit_opts = build_commit_opts(
         effective_identity.as_deref(),
         credential,
         &state.fluree,
         &handle,
     )
     .await;
+    if let Some(event_time) = &pragmas.event_time {
+        commit_opts = with_event_time(commit_opts, event_time, "pragma `event-time`")
+            .inspect_err(|_| set_span_error_code(parent_span, "error:BadRequest"))?;
+    }
 
     // The query is parsed and lowered inside the consensus layer, under the
     // ledger write lock — so namespace allocation shares the staging
@@ -2585,6 +2597,12 @@ mod tests {
             SubmissionError::NoveltyDeltaTooLarge {
                 message: "Transaction would exceed novelty limit".into(),
             },
+            SubmissionError::DatatypeLimitExceeded {
+                message: "datatype limit exceeded".into(),
+            },
+            SubmissionError::CommitNotFound {
+                message: "No commit found with prefix: ffffffff".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2601,6 +2619,10 @@ mod tests {
                 SubmissionError::NoveltyDeltaTooLarge { .. } => {
                     (413, errors::NOVELTY_DELTA_TOO_LARGE)
                 }
+                SubmissionError::DatatypeLimitExceeded { .. } => {
+                    (422, errors::DATATYPE_LIMIT_EXCEEDED)
+                }
+                SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
             };
             let se = submission_error_to_server_error(variant);
             assert_eq!(se.status_code().as_u16(), expected_status, "{se}");

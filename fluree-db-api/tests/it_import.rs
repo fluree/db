@@ -1245,41 +1245,32 @@ async fn import_jsonld_user_authored_expanded_reifies_iri_is_rejected() {
     );
 }
 
-/// End-to-end: imported annotation-bearing ledger → follow-up
-/// `fluree.reindex(...)` (the same call the CLI's
-/// `fluree create --import` auto-seal step makes) seals the
-/// annotation arena.
-///
-/// Closes the bulk-import seal gap. `ApiAttachmentEventsProvider`
-/// scans the base index for `f:reifies*` flakes when the running
-/// `AttachmentNovelty` overlay is empty but the snapshot's sticky
-/// bit says annotations exist — so the freshly-imported state
-/// (where the f:reifies* flakes live in the base index, not the
-/// overlay) still produces a complete `Authoritative` event set
-/// for the indexer's arena builder.
+/// An export written before links carries each annotation as `f:reifies*`
+/// triples; importing it stores the annotation's `rdf:reifies` link and not
+/// the slots.
 #[tokio::test]
-async fn import_then_reindex_seals_annotation_arena() {
+async fn import_of_reifies_slots_writes_the_link() {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 
-    let ttl = r"
+    let ttl = r#"
 @prefix ex: <http://example.org/> .
 @prefix f:  <https://ns.flur.ee/db#> .
 
 ex:alice ex:worksFor ex:acme .
 
-_:ann1 f:reifiesSubject   ex:alice ;
-       f:reifiesPredicate ex:worksFor ;
-       f:reifiesObject    ex:acme .
-";
+ex:ann1 f:reifiesSubject   ex:alice ;
+        f:reifiesPredicate ex:worksFor ;
+        f:reifiesObject    ex:acme ;
+        ex:role            "Engineer" .
+"#;
     let ttl_path = write_ttl(data_dir.path(), "annotated.ttl", ttl);
 
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
-        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build()
         .expect("build file-backed Fluree");
 
-    let ledger_id = "test/import-then-reindex:main";
+    let ledger_id = "test/import-reifies-slots:main";
     let result = fluree
         .create(ledger_id)
         .import(&ttl_path)
@@ -1287,26 +1278,47 @@ _:ann1 f:reifiesSubject   ex:alice ;
         .execute()
         .await
         .expect("import should succeed");
-
     assert!(result.has_annotations, "annotation import must signal");
 
-    // Auto-seal step: same call the CLI's run_bulk_import makes when
-    // `result.has_annotations` is true.
-    fluree
-        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                  SELECT ?r ?o ?role WHERE { ?r rdf:reifies <<( ex:alice ex:worksFor ?o )>> ; ex:role ?role }";
+    let json = support::query_sparql(&fluree, &ledger, sparql)
         .await
-        .expect("reindex must succeed");
+        .expect("link query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(bindings.len(), 1, "{json:#}");
+    assert_eq!(bindings[0]["r"]["value"], "http://example.org/ann1");
+    assert_eq!(bindings[0]["o"]["value"], "http://example.org/acme");
+    assert_eq!(bindings[0]["role"]["value"], "Engineer");
 
-    let post = fluree.ledger(ledger_id).await.expect("reload");
+    let slots = fluree_db_core::range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        fluree_db_core::comparator::IndexType::Spot,
+        fluree_db_core::range::RangeTest::Eq,
+        fluree_db_core::range::RangeMatch::subject(
+            ledger
+                .snapshot
+                .encode_iri("http://example.org/ann1")
+                .expect("ann1"),
+        ),
+        fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan ann1");
     assert!(
-        post.snapshot.has_annotations,
-        "sticky bit must survive the seal pass"
-    );
-    assert!(
-        post.snapshot.annotation_index.is_some(),
-        "annotation arena must be sealed after the auto-seal reindex"
+        !slots
+            .iter()
+            .any(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p)),
+        "the slots are not stored: {slots:#?}"
     );
 }
+
 // N-Triples (.nt) import tests
 //
 // N-Triples is a strict subset of Turtle, so `.nt` files dispatch to the same
@@ -1516,6 +1528,89 @@ GRAPH <http://example.org/graphs/audit> {
     );
 }
 
+/// Bulk import reads a `.trig` file with graph blocks through TriG phase 1,
+/// which rebuilt the default graph with every directive first and expanded
+/// every block with the file's final prefix map. A redefined `@prefix` must
+/// apply only to what follows it, in the default graph and in the blocks.
+#[tokio::test]
+async fn import_trig_applies_a_redefined_prefix_only_after_it() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = "@prefix ex: <http://a.org/> .\n\
+                ex:x ex:p \"d1\" .\n\
+                GRAPH <http://example.org/g1> { ex:y ex:p \"g1\" . }\n\
+                @prefix ex: <http://b.org/> .\n\
+                ex:z ex:p \"d2\" .\n\
+                GRAPH <http://example.org/g2> { ex:w ex:p \"g2\" . }\n";
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/trig-directives:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+    let ledger = fluree
+        .ledger("test/trig-directives:main")
+        .await
+        .expect("load ledger");
+
+    let rows = |sparql: &'static str| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let result = support::query_sparql(fluree, ledger, sparql)
+                .await
+                .expect("query");
+            let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let cell = |c: &serde_json::Value| {
+                c.as_str()
+                    .or_else(|| c.get("@id").and_then(|v| v.as_str()))
+                    .or_else(|| c.get("@value").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| c.to_string())
+            };
+            let mut rows: Vec<String> = json
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| {
+                    r.as_array()
+                        .expect("row")
+                        .iter()
+                        .map(cell)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+    };
+    assert_eq!(
+        rows("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await,
+        [
+            "http://a.org/x http://a.org/p d1",
+            "http://b.org/z http://b.org/p d2",
+        ],
+        "default graph"
+    );
+    assert_eq!(
+        rows("SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }").await,
+        [
+            "http://example.org/g1 http://a.org/y http://a.org/p g1",
+            "http://example.org/g2 http://b.org/w http://b.org/p g2",
+        ],
+        "graph blocks"
+    );
+}
+
 /// TriG-star inside a `GRAPH` block on the bulk-import path: the reifier
 /// bundle is spooled into the named graph's index and the annotation is
 /// visible to a named-graph-scoped query.
@@ -1606,8 +1701,8 @@ GRAPH <http://example.org/graphs/audit> {
 #[tokio::test]
 async fn import_trig_compact_named_graph_is_queryable() {
     // Issue #1278: the compact W3C TriG form `<iri> { ... }` (no GRAPH keyword)
-    // must import through the bulk path too — `import_trig_commit` shares the
-    // same `parse_trig_phase1` parser as the upsert endpoint.
+    // must import through the bulk path too, which reads TriG with
+    // `parse_trig_phase1`.
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 

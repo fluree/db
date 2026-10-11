@@ -295,19 +295,27 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
 /// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
 /// - overflow big numerics / JSON / vector arena handles (equality-only).
 ///
+/// Inline decimals (`XSD_DECIMAL_INLINE`) ARE admitted: their key is an
+/// order-preserving base-10 float code (raw `u64` order == numeric order), so a
+/// single-`o_type` scan yields them in value order like the other numerics.
+///
 /// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
-/// `o_type`s under one predicate is rejected by the operator at runtime.
+/// `o_type`s under one predicate is rejected by the operator at runtime — which
+/// also means a predicate with both inline and arena (NUM_BIG) decimals can't
+/// use this path, so the inline-only scan never silently drops arena rows.
 #[inline]
 pub const fn is_post_desc_orderable(o_type: u16) -> bool {
     let ot = OType::from_u16(o_type);
     // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
-    // (is_numeric: 0x0003..=0x0012), and the order-preserving temporal types
+    // (is_numeric: 0x0003..=0x0012), the order-preserving temporal types
     // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D, minus XSD_DURATION
-    // which is dict-backed). Excludes GEO_POINT (0x001E), BLANK_NODE (0x001F),
-    // and every dict-backed/lang/arena type.
+    // which is dict-backed), and inline decimals (XSD_DECIMAL_INLINE 0x0020).
+    // Excludes GEO_POINT (0x001E), BLANK_NODE (0x001F), and every
+    // dict-backed/lang/arena type.
     o_type == OType::XSD_BOOLEAN.as_u16()
         || ot.is_numeric()
         || (ot.is_temporal() && o_type != OType::XSD_DURATION.as_u16())
+        || o_type == OType::XSD_DECIMAL_INLINE.as_u16()
 }
 
 // ---------------------------------------------------------------------------
@@ -2107,8 +2115,8 @@ pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, flure
 ///
 /// Returns `Ok(Some(ops))` on success (`ops` may be empty), or `Ok(None)` when
 /// any flake fails to translate — in which case the caller must disable the
-/// fast path for correctness. Only meaningful when an overlay carrying novelty
-/// is present (`epoch != 0`).
+/// fast path for correctness. Only meaningful when [`overlay_has_novelty`]
+/// reports pending flakes.
 ///
 /// For predicate-leading orders (Psot/Post) the overlay walk is range-bounded
 /// to the predicate via [`predicate_walk_bounds`], so its cost is
@@ -2479,13 +2487,15 @@ pub struct ObjectProbeOps {
 
 impl ObjectProbeOps {
     /// Filter `ops` (one predicate's resolved ops, any sort order) to the
-    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
+    /// `o_type` subset and index it object-major. Returns `None` when no op
     /// can affect the lane — callers then run their unmodified scan.
-    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
-        let iri_ref = OType::IRI_REF.as_u16();
+    pub fn new(
+        ops: &[fluree_db_binary_index::read::types::OverlayOp],
+        o_type: u16,
+    ) -> Option<Self> {
         let mut subset: Vec<ObjectProbeOp> = ops
             .iter()
-            .filter(|o| o.o_type == iri_ref)
+            .filter(|o| o.o_type == o_type)
             .map(|o| ObjectProbeOp {
                 o_key: o.o_key,
                 s_id: o.s_id,
@@ -2882,16 +2892,7 @@ pub fn build_overlay_cursor_for_predicate(
     // unchanged. (Production masks this via the cache's `all()` load; a
     // cache-less store would miscount. See `BinaryCursor::set_overlay_ops`.)
     let overlay_active = overlay_has_novelty(ctx);
-    let projection = if overlay_active {
-        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
-        ColumnProjection {
-            output: projection.output,
-            // Don't duplicate columns already materialized in `output`.
-            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
-        }
-    } else {
-        projection
-    };
+    let projection = overlay_cursor_projection(projection, overlay_active);
 
     let (min_key, max_key) = predicate_range_keys(p_id, g_id);
     let filter = BinaryFilter {
@@ -2906,10 +2907,10 @@ pub fn build_overlay_cursor_for_predicate(
     cursor.set_to_t(ctx.to_t);
 
     // Fold the novelty overlay in. Skip the walk entirely when there is no
-    // novelty (epoch 0): the persisted index alone is then exact. Ops come
+    // novelty: the persisted index alone is then exact. Ops come
     // from the per-execution cache, so N cursors over the same predicate
     // (flushes, partitions, cyclic edges) share one walk + translation.
-    if overlay_has_novelty(ctx) {
+    if overlay_active {
         match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
             Some(ops) => {
                 if !ops.is_empty() {
@@ -2977,8 +2978,8 @@ pub fn build_post_cursor_for_predicate(
 /// for parallelizing an overlay count: the partition harness hands each worker a
 /// subject range, and each worker scans only its leaves and merges only its ops.
 ///
-/// Takes `to_t`/`epoch` as values (not `&ExecutionContext`) so the caller can hoist
-/// them out of the parallel region and keep the reducer `Sync`. The cursor's leaf
+/// Takes `to_t` as a value (not `&ExecutionContext`) so the caller can hoist
+/// it out of the parallel region and keep the reducer `Sync`. The cursor's leaf
 /// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
 /// leaf shared with an adjacent partition still emits its out-of-range subjects — the
 /// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
@@ -2993,20 +2994,11 @@ pub fn build_overlay_cursor_for_subject_range(
     hi: u64,
     sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
     to_t: i64,
-    epoch: u64,
 ) -> Option<BinaryCursor> {
-    let overlay_active = epoch != 0;
+    let overlay_active = !sliced_ops.is_empty();
     // Identity columns must be present for merge_overlay_into_batch (see
     // build_overlay_cursor_for_predicate / set_overlay_ops).
-    let projection = if overlay_active {
-        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
-        ColumnProjection {
-            output: projection.output,
-            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
-        }
-    } else {
-        projection
-    };
+    let projection = overlay_cursor_projection(projection, overlay_active);
 
     let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
     min_key.s_id = SubjectId(lo);
@@ -3032,10 +3024,25 @@ pub fn build_overlay_cursor_for_subject_range(
         projection,
     )?;
     cursor.set_to_t(to_t);
-    if overlay_active && !sliced_ops.is_empty() {
+    if overlay_active {
         cursor.set_overlay_ops(sliced_ops.into());
     }
     Some(cursor)
+}
+
+/// Include the full fact identity internally whenever a cursor merges overlay rows.
+fn overlay_cursor_projection(
+    projection: ColumnProjection,
+    overlay_active: bool,
+) -> ColumnProjection {
+    if !overlay_active {
+        return projection;
+    }
+    let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+    ColumnProjection {
+        output: projection.output,
+        internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+    }
 }
 
 /// Slice a predicate's resolved overlay ops (sorted in PSOT order, i.e. by
@@ -3337,7 +3344,6 @@ where
         None => return Ok(None),
     };
     let to_t = ctx.to_t;
-    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
 
     let ops_ref = &ops;
@@ -3359,7 +3365,6 @@ where
                 hi,
                 sliced,
                 to_t,
-                epoch,
             ) else {
                 return Ok(0u128);
             };
@@ -3398,7 +3403,7 @@ where
 }
 
 /// Overlay COUNT(*) of a predicate via a **novelty-delta**, for the common
-/// live-write case (`epoch != 0`, HEAD): `base_total − base(touched) + merged(touched)`.
+/// live-write case (pending novelty, HEAD): `base_total − base(touched) + merged(touched)`.
 ///
 /// At HEAD the predicate count is metadata-only (instant). Under novelty the cursor
 /// path would rescan the whole predicate to fold a few uncommitted rows. Instead:
@@ -3409,7 +3414,7 @@ where
 /// novelty's footprint, not the predicate size.
 ///
 /// CALLER GATE: only valid for `to_t == max_t` (no time-travel replay) and
-/// `epoch != 0`; the base manifest count is the current-state base count only then.
+/// pending novelty; the base manifest count is the current-state base count only then.
 /// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
 /// plain manifest count when there is no novelty for the predicate.
 ///
@@ -3436,7 +3441,6 @@ pub fn count_predicate_overlay_delta(
         return Ok(Some(base_total));
     }
     let to_t = ctx.to_t;
-    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
 
     // Per-leaf subject ranges [lo, hi); the last extends to MAX so novelty subjects
@@ -3504,7 +3508,6 @@ pub fn count_predicate_overlay_delta(
             hi,
             sliced,
             to_t,
-            epoch,
         ) {
             while let Some(batch) = cursor
                 .next_batch()
@@ -3924,11 +3927,53 @@ pub fn cursor_fast_path_for_predicate(
     match ctx.policy_enforcer.as_ref() {
         Some(enforcer) => match enforcer.classify_view_predicate(pred_sid) {
             PredicateCoverage::Covered => PredicateFastPath::Decline,
+            // A triple-term object is checked as the triple it names, whose
+            // predicate the view may cover even when this one is not.
+            PredicateCoverage::UncoveredAllow
+                if enforcer.view_restricts_anything()
+                    && predicate_may_hold_triple_terms(ctx, pred_sid) =>
+            {
+                PredicateFastPath::Decline
+            }
             PredicateCoverage::UncoveredAllow => PredicateFastPath::Allow,
             PredicateCoverage::UncoveredDeny => PredicateFastPath::Empty,
         },
         None => PredicateFastPath::Allow,
     }
+}
+
+/// Whether `pred_sid`'s objects in the active graph may include triple terms.
+/// Triple terms carry no datatype tag of their own, so an `UNKNOWN` tag, an
+/// unknown set, or novelty the stats do not see answers yes. Without a store
+/// no lane reads raw rows, so there is nothing to decline.
+fn predicate_may_hold_triple_terms(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -> bool {
+    if fluree_db_core::is_rdf_reifies(pred_sid) {
+        return true;
+    }
+    let Some(store) = ctx.binary_store.as_ref() else {
+        return false;
+    };
+    let Some(p_id) = store.sid_to_p_id(pred_sid) else {
+        return true;
+    };
+    let overlay = ctx.overlay();
+    let stats_see_novelty = overlay
+        .as_any()
+        .downcast_ref::<fluree_db_novelty::Novelty>()
+        .is_some()
+        || overlay.epoch() == 0
+        || overlay.is_effectively_empty();
+    if !stats_see_novelty {
+        return true;
+    }
+    let stats_view = crate::stats_cache::cached_stats_view_for_db(
+        fluree_db_core::GraphDbRef::new(ctx.active_snapshot, ctx.binary_g_id, overlay, ctx.to_t)
+            .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
+        Some(store),
+        false,
+    );
+    crate::binary_scan::observed_datatypes(stats_view.as_deref(), ctx.binary_g_id, p_id)
+        .is_none_or(|tags| tags.contains(&fluree_db_core::ValueTypeTag::UNKNOWN))
 }
 
 /// Shared single-predicate fast-path gate: normalize `predicate` against
@@ -4369,6 +4414,12 @@ mod tests {
         assert_eq!(
             cursor_fast_path_for_predicate(&ctx_allow, &name),
             PredicateFastPath::Allow
+        );
+        // Links' triple terms are checked as the triples they name, which
+        // the view may cover: never a raw read under a restricting policy.
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, fluree_db_core::rdf_reifies_sid()),
+            PredicateFastPath::Decline
         );
         // Uncovered predicate + default-deny => short-circuit to Empty.
         let ctx_deny = make_ctx(false);

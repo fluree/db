@@ -46,13 +46,13 @@ fn create_node_with_properties() {
 }
 
 #[test]
-fn create_directed_relationship_emits_base_and_reifier_bundle() {
+fn create_directed_relationship_emits_base_and_reifier_link() {
     let txn = lower(r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#);
     // Every Cypher relationship reifies (LPG identity):
-    // 2 labels + 2 props + 1 base edge + 3 reifier bundle triples = 8 templates.
+    // 2 labels + 2 props + 1 base edge + 1 reifier link = 6 templates.
     assert_eq!(
         txn.insert_templates.len(),
-        8,
+        6,
         "templates: {:?}",
         txn.insert_templates
     );
@@ -96,10 +96,10 @@ fn optional_match_before_create_is_rejected() {
 #[test]
 fn create_relationship_with_properties_adds_body_triples() {
     let txn = lower("CREATE (a:Person)-[:KNOWS {since: 2020}]->(b:Person)");
-    // 2 labels + 1 base + 3 bundle + 1 ann body = 7
+    // 2 labels + 1 base + 1 link + 1 ann body = 5
     assert_eq!(
         txn.insert_templates.len(),
-        7,
+        5,
         "templates: {:?}",
         txn.insert_templates
     );
@@ -115,8 +115,7 @@ fn create_two_parallel_relationships_mints_distinct_annotation_subjects() {
               (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
               (a)-[:KNOWS]->(b)"#,
     );
-    // Verify two distinct annotation subjects appear in the reifies
-    // bundle.
+    // Verify two distinct annotation subjects carry the links.
     let subjects: std::collections::HashSet<String> = txn
         .insert_templates
         .iter()
@@ -170,11 +169,11 @@ fn create_bare_node_asserts_existence_marker() {
 #[test]
 fn create_bare_pattern_needs_no_marker() {
     // `CREATE ()-[:TempEdge]->()` — the edge anchors both endpoints:
-    // 1 base edge + 3 reifier bundle triples, no markers.
+    // 1 base edge + 1 reifier link, no markers.
     let txn = lower("CREATE ()-[:TempEdge]->()");
     assert_eq!(
         txn.insert_templates.len(),
-        4,
+        2,
         "templates: {:?}",
         txn.insert_templates
     );
@@ -230,8 +229,8 @@ fn deferred_write_shapes_are_rejected() {
         // A leading MATCH is allowed only before a *relationship* MERGE — a
         // node MERGE must stand alone.
         "MATCH (a:Person) MERGE (n:Person {name: \"A\"})",
-        // OPTIONAL MATCH before a relationship MERGE risks a partial reifier
-        // bundle (optionally-unbound endpoint), so it is rejected.
+        // OPTIONAL MATCH before a relationship MERGE risks a link to an
+        // optionally-unbound endpoint, so it is rejected.
         "MATCH (a:Person {name: \"A\"}) OPTIONAL MATCH (b:Person {name: \"B\"}) \
          MERGE (a)-[:KNOWS]->(b)",
     ] {
@@ -268,7 +267,7 @@ fn property_bearing_merge_relationship_guards_on_annotation_sidecar() {
         debug.contains("NotExists") && debug.contains("EdgeAnnotation"),
         "guard: {debug}"
     );
-    // Create branch fires the endpoints + edge + reifier bundle with props.
+    // Create branch fires the endpoints + edge + reifier link with props.
     assert!(!txn.insert_templates.is_empty());
 }
 
@@ -645,10 +644,10 @@ fn merge_relationship_emits_path_guard_and_create_branch() {
     if let UnresolvedPattern::NotExists(guard) = &txn.where_patterns[0] {
         assert_eq!(guard.len(), 5, "guard: {guard:?}");
     }
-    // Create branch: 2 labels + 2 names + base edge + 3 reifier triples = 8.
+    // Create branch: 2 labels + 2 names + base edge + reifier link = 6.
     assert_eq!(
         txn.insert_templates.len(),
-        8,
+        6,
         "inserts: {:?}",
         txn.insert_templates
     );
@@ -673,10 +672,10 @@ fn merge_relationship_on_create_set_routes_to_endpoint() {
         r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})
            ON CREATE SET b.note = "new""#,
     );
-    // 8 path inserts + 1 ON CREATE SET = 9.
+    // 6 path inserts + 1 ON CREATE SET = 7.
     assert_eq!(
         txn.insert_templates.len(),
-        9,
+        7,
         "inserts: {:?}",
         txn.insert_templates
     );
@@ -686,7 +685,7 @@ fn merge_relationship_on_create_set_routes_to_endpoint() {
 fn merge_relationship_incoming_direction_orients_edge() {
     // `<-[:KNOWS]-` puts the tail node on the subject side of the base edge.
     let txn = lower(r#"MERGE (a:Person {name: "Alice"})<-[:KNOWS]-(b:Person {name: "Bob"})"#);
-    assert_eq!(txn.insert_templates.len(), 8);
+    assert_eq!(txn.insert_templates.len(), 6);
 }
 
 #[test]
@@ -715,10 +714,10 @@ fn merge_relationship_with_bound_endpoints_uses_match_vars() {
         .expect("a NOT EXISTS guard");
     // Bound endpoints add no label/prop guard — just the rel triple.
     assert_eq!(guard.len(), 1, "guard: {guard:?}");
-    // Create branch: only the base edge + 3 reifier triples (endpoints exist).
+    // Create branch: only the base edge + reifier link (endpoints exist).
     assert_eq!(
         txn.insert_templates.len(),
-        4,
+        2,
         "inserts: {:?}",
         txn.insert_templates
     );
@@ -754,10 +753,10 @@ fn merge_relationship_mixed_bound_and_new_endpoint() {
         .expect("a NOT EXISTS guard");
     // Guard: the new tail's label + name (probe) + the rel triple = 3.
     assert_eq!(guard.len(), 3, "guard: {guard:?}");
-    // Create: new Pet's label + name + base edge + 3 reifier triples = 6.
+    // Create: new Pet's label + name + base edge + reifier link = 4.
     assert_eq!(
         txn.insert_templates.len(),
-        6,
+        4,
         "inserts: {:?}",
         txn.insert_templates
     );
@@ -788,10 +787,10 @@ fn match_create_relationship_references_bound_nodes() {
         "where: {:?}",
         txn.where_patterns
     );
-    // CREATE: base edge + 3 reifier bundle triples = 4 (no new labels).
+    // CREATE: base edge + reifier link = 2 (no new labels).
     assert_eq!(
         txn.insert_templates.len(),
-        4,
+        2,
         "inserts: {:?}",
         txn.insert_templates
     );

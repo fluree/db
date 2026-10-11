@@ -130,7 +130,7 @@ async fn local_namespace(
 }
 
 async fn build_sync_driver(dirs: &FlureeDir) -> CliResult<(SyncDriver, Arc<TomlSyncConfigStore>)> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let config_store = Arc::new(TomlSyncConfigStore::new(dirs.config_dir().to_path_buf()));
 
     let local: Arc<dyn fluree_db_nameservice::NameServicePublisher> = fluree
@@ -293,7 +293,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         .ok_or_else(|| CliError::Config("remote ledger-info response missing 't'".into()))?;
 
     // Resolve local head.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -850,7 +850,7 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         .and_then(|s| s.parse().ok());
 
     // Resolve local head.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let local_ref = fluree
         .nameservice_mode()
         .get_ref(&ledger_id, RefKind::CommitHead)
@@ -969,7 +969,7 @@ pub async fn run_publish(
     );
 
     // Resolve local head.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let local_ref = fluree
         .nameservice_mode()
         .get_ref(&ledger_id, RefKind::CommitHead)
@@ -1147,7 +1147,7 @@ pub async fn run_clone(
     }
 
     // Create the local ledger.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -1466,7 +1466,7 @@ pub async fn run_clone_origin(
     }
 
     // 4. Create the local ledger.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()
@@ -1811,7 +1811,7 @@ async fn run_pull_via_origins(
     no_indexes: bool,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let storage = fluree
         .backend()
         .admin_storage_cloned()

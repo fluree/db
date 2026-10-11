@@ -125,14 +125,14 @@ pub struct SweepResult {
 /// longest-resident leaves first, which are the hot ones. Query latency that
 /// dips after a sweep on a full cache is that, not a fault in the sweep.
 ///
-/// `nested` names the roots of other ledgers whose storage can sit under this
-/// one's prefixes (see [`nested_roots`]); their files are never this ledger's
-/// orphans.
+/// `nested` names the branches of other ledgers whose storage can sit under
+/// this one's prefixes (see [`nested_namespaces`]); their files are never this
+/// ledger's orphans.
 pub async fn plan_sweep<S>(
     storage: &S,
     root: &StorageRoot,
     branches: &[BranchIndexHead],
-    nested: &[StorageRoot],
+    nested: &[StorageNamespace],
     artifact_cache_dir: Option<&Path>,
 ) -> Result<SweepPlan>
 where
@@ -147,6 +147,27 @@ where
         live_addresses(storage, &method, branches, artifact_cache_dir),
         swept_addresses(storage, &method, root, branches, nested),
     )?;
+
+    // The difference is only sound if the listing names files the way the
+    // live set does. A listing in another form (a Windows path's `\` once)
+    // matches no live address, so every file it holds, live ones included,
+    // would read as an orphan. Each branch's head root, which the walk just
+    // read, must be in it.
+    for branch in branches {
+        let Some(head) = branch.index_head_id.as_ref() else {
+            continue;
+        };
+        let listed = candidate_addresses(&method, &branch.namespace, head)
+            .iter()
+            .any(|address| scanned.contains(address));
+        if !listed {
+            return Err(IndexerError::StorageRead(format!(
+                "the storage listing does not include {}'s index root {head} at any address \
+                 the index uses; refusing to sweep",
+                branch.ledger_id
+            )));
+        }
+    }
 
     let mut orphans: Vec<String> = scanned.difference(&live).cloned().collect();
     orphans.sort();
@@ -374,7 +395,7 @@ where
 ///
 /// Index artifacts are per-branch, so each branch contributes its own `index/`
 /// prefix. Dict blobs are shared across a ledger's branches and live in one
-/// namespace, listed once. Files under a `nested` ledger's own prefix are
+/// namespace, listed once. Files under a `nested` ledger's own prefixes are
 /// excluded: ledger names may contain `/`, so `a/main/index/child:main` keeps
 /// its commits inside `a:main`'s index directory.
 async fn swept_addresses<S>(
@@ -382,7 +403,7 @@ async fn swept_addresses<S>(
     method: &str,
     root: &StorageRoot,
     branches: &[BranchIndexHead],
-    nested: &[StorageRoot],
+    nested: &[StorageNamespace],
 ) -> Result<HashSet<String>>
 where
     S: Storage,
@@ -395,11 +416,7 @@ where
         ));
     }
     prefixes.push(format!("fluree:{method}://{}/dicts/", root.shared_prefix()));
-    let foreign: Vec<String> = nested
-        .iter()
-        // The whole root: its branches and its `@shared/` namespace alike.
-        .map(|nested| format!("fluree:{method}://{nested}/"))
-        .collect();
+    let foreign = nested_prefixes(method, nested);
 
     let mut scanned = HashSet::new();
     for prefix in &prefixes {
@@ -416,16 +433,31 @@ where
     Ok(scanned)
 }
 
-/// The roots of the ledgers whose storage can nest under `root`: every
-/// recorded ledger (retracted included) whose root extends `root/`.
-pub fn nested_roots(records: &[NsRecord], root: &StorageRoot) -> Vec<StorageRoot> {
-    let prefix = format!("{root}/");
-    let mut nested: Vec<StorageRoot> = records
+/// Address prefixes that `nested` ledgers own: each branch's directory and
+/// the ledger's `@shared/` namespace. Not the whole root: a root at the
+/// name, for a ledger named `{parent}/{branch}`, is the parent branch's own
+/// directory.
+pub fn nested_prefixes(method: &str, nested: &[StorageNamespace]) -> Vec<String> {
+    let mut prefixes: Vec<String> = nested
         .iter()
-        .map(NsRecord::storage_root)
-        .filter(|r| r.as_str().starts_with(&prefix))
+        .flat_map(|namespace| [namespace.branch_prefix(), namespace.shared_prefix()])
+        .map(|prefix| format!("fluree:{method}://{prefix}/"))
         .collect();
-    nested.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
+/// The branches whose storage can nest under `root`: every recorded branch
+/// (retracted included) of a ledger whose root extends `root/`.
+pub fn nested_namespaces(records: &[NsRecord], root: &StorageRoot) -> Vec<StorageNamespace> {
+    let prefix = format!("{root}/");
+    let mut nested: Vec<StorageNamespace> = records
+        .iter()
+        .map(NsRecord::storage_namespace)
+        .filter(|namespace| namespace.root().as_str().starts_with(&prefix))
+        .collect();
+    nested.sort_by(|a, b| a.branch_prefix().cmp(b.branch_prefix()));
     nested.dedup();
     nested
 }
@@ -592,8 +624,11 @@ mod tests {
             fluree_db_nameservice::NsRecord::new(MAIN),
             fluree_db_nameservice::NsRecord::new(&child),
         ];
-        let nested = nested_roots(&records, &root(NAME));
-        assert_eq!(nested, vec![root("mydb/main/index/child")]);
+        let nested = nested_namespaces(&records, &root(NAME));
+        assert_eq!(
+            nested,
+            [StorageNamespace::parse_legacy("mydb/main/index/child:main").unwrap()]
+        );
         let plan = plan_sweep(&storage, &root(NAME), &branches, &nested, None)
             .await
             .unwrap();
@@ -603,6 +638,37 @@ mod tests {
                 "another ledger's file was planned for deletion: {addr}"
             );
         }
+    }
+
+    /// A ledger named `mydb/main` owns `mydb/main/{branch}/`, not `mydb/main/`,
+    /// which is `mydb:main`'s own directory: excluding the whole name would
+    /// keep every orphan the parent branch has.
+    #[tokio::test]
+    async fn a_nested_ledger_named_like_a_branch_leaves_its_orphans_planned() {
+        let storage = MemoryStorage::new();
+        let roots = write_chain(&storage, MAIN, 1, &dict_cid(b"live-dict")).await;
+        let (_, orphan) = cid_and_addr_for(MAIN, ContentKind::IndexLeaf, b"unreferenced");
+        storage.write_bytes(&orphan, b"leaf").await.unwrap();
+        let branches = heads(&[(MAIN, roots.last())]);
+
+        let unaware = plan_sweep(&storage, &root(NAME), &branches, &[], None)
+            .await
+            .unwrap();
+        assert!(unaware.orphans.contains(&orphan), "fixture has no orphan");
+
+        let records = [
+            fluree_db_nameservice::NsRecord::new(MAIN),
+            fluree_db_nameservice::NsRecord::new("mydb/main:trunk"),
+        ];
+        let nested = nested_namespaces(&records, &root(NAME));
+        assert_eq!(
+            nested,
+            [StorageNamespace::parse_legacy("mydb/main:trunk").unwrap()]
+        );
+        let plan = plan_sweep(&storage, &root(NAME), &branches, &nested, None)
+            .await
+            .unwrap();
+        assert!(plan.orphans.contains(&orphan), "{:?}", plan.orphans);
     }
 
     /// Everything an intact chain references stays live, so a healthy ledger
@@ -673,7 +739,8 @@ mod tests {
     /// while every root it walks is still in storage.
     #[tokio::test]
     async fn a_cached_plan_matches_an_uncached_one() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -706,7 +773,8 @@ mod tests {
     /// failing the plan on the manifests that were released with it.
     #[tokio::test]
     async fn a_released_root_ends_the_chain_even_when_its_cache_entry_survives() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -772,7 +840,8 @@ mod tests {
     /// the cache, pinned by `an_unreadable_head_aborts_the_plan`.
     #[tokio::test]
     async fn a_released_head_aborts_the_plan_even_when_its_cache_entry_survives() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -1109,6 +1178,10 @@ mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
         fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
             self.inner.encryption_admin()
         }
@@ -1159,6 +1232,104 @@ mod tests {
         fn storage_method(&self) -> &str {
             self.inner.storage_method()
         }
+    }
+
+    /// Storage whose listing separates path segments with `\`, as file
+    /// storage on Windows once did, while reads and the index use `/`.
+    #[derive(Debug, Clone)]
+    struct BackslashListing(MemoryStorage);
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageRead for BackslashListing {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.0.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.0.is_remote()
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.0.encryption_admin()
+        }
+
+        async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+            self.0.read_bytes(address).await
+        }
+
+        async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
+            self.0.exists(address).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+            Ok(self
+                .0
+                .list_prefix(prefix)
+                .await?
+                .into_iter()
+                .map(|address| match address.split_once("://") {
+                    Some((scheme, path)) => format!("{scheme}://{}", path.replace('/', "\\")),
+                    None => address,
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageWrite for BackslashListing {
+        async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.0.write_bytes(address, bytes).await
+        }
+
+        async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
+            self.0.delete(address).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::ContentAddressedWrite for BackslashListing {
+        async fn content_write_bytes_with_hash(
+            &self,
+            kind: ContentKind,
+            namespace: &StorageNamespace,
+            content_hash_hex: &str,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
+            self.0
+                .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
+                .await
+        }
+    }
+
+    impl fluree_db_core::StorageMethod for BackslashListing {
+        fn storage_method(&self) -> &str {
+            self.0.storage_method()
+        }
+    }
+
+    /// A listing that names files in another form than the index does
+    /// matches no live address. Planned anyway, every file would be an
+    /// orphan, the current index's included, so the plan refuses.
+    #[tokio::test]
+    async fn a_listing_in_another_address_form_aborts_the_plan() {
+        let inner = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let roots = write_chain(&inner, MAIN, 2, &dict).await;
+
+        let result = plan_sweep(
+            &BackslashListing(inner),
+            &root(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a listing the live set cannot match must not plan: {:?}",
+            result.map(|plan| plan.orphans)
+        );
     }
 
     /// A root that still exists but cannot be read is not a chain ending. If

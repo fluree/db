@@ -185,6 +185,7 @@ impl NsFileV2 {
     /// fence: one left by an earlier incarnation of the key is stale.
     pub(crate) fn into_record(
         self,
+        ledger_id: LedgerId,
         index_file: Option<NsIndexFileV2>,
     ) -> crate::Result<Option<NsRecord>> {
         if self.is_deleted() {
@@ -192,7 +193,7 @@ impl NsFileV2 {
         }
         let parse = |s: Option<&str>| s.and_then(|s| s.parse::<ContentId>().ok());
         let mut record = NsRecord {
-            ledger_id: LedgerId::from_parts(&self.ledger.id, &self.branch)?,
+            ledger_id,
             name: self.ledger.id.clone(),
             branch: self.branch,
             commit_head_id: parse(self.commit_cid.as_deref()),
@@ -387,6 +388,23 @@ pub(crate) fn is_ledger_main_record(bytes: &[u8]) -> bool {
 /// Keys that may be sidecars rather than main records.
 pub(crate) fn has_sidecar_suffix(key: &str) -> bool {
     key.ends_with(".index.json") || key.ends_with(".snapshots.json")
+}
+
+/// A stored ledger record's identity, or `None` (logged) when even
+/// [`LedgerId::from_persisted_parts`] refuses it. Such a name (`/x`, `x/`,
+/// `a/../b`) has a storage path that can alias another ledger's: listing it
+/// would let GC or key rotation act on that ledger's files, and failing
+/// would take down every listing on the node.
+pub(crate) fn persisted_ledger_id(name: &str, branch: &str, record: &str) -> Option<LedgerId> {
+    LedgerId::from_persisted_parts(name, branch)
+        .inspect_err(|e| {
+            tracing::warn!(
+                record,
+                error = %e,
+                "Skipping nameservice record whose id is invalid; rename or remove it"
+            );
+        })
+        .ok()
 }
 
 #[cfg(test)]

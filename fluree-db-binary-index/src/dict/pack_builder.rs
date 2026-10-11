@@ -144,6 +144,22 @@ pub fn build_subject_forward_packs_for_ns(
 }
 
 /// Internal: partition contiguous entries into packs.
+/// Build forward packs of any `kind` for one contiguous id stream. The
+/// subject and term dictionaries share this; they differ only in the kind
+/// byte and what the `ns_code` header slot means.
+pub fn build_forward_packs_for_stream(
+    kind: u8,
+    ns_code: u16,
+    entries: &[(u64, &[u8])],
+    target_page_bytes: usize,
+    target_pack_bytes: usize,
+) -> io::Result<PackBuildResult> {
+    if entries.is_empty() {
+        return Ok(PackBuildResult { packs: Vec::new() });
+    }
+    build_packs_from_contiguous(entries, kind, ns_code, target_page_bytes, target_pack_bytes)
+}
+
 fn build_packs_from_contiguous(
     entries: &[(u64, &[u8])],
     kind: u8,

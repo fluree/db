@@ -150,6 +150,23 @@ fn encode_object(
             let name_id = dicts.object_ref.insert(sid.name.as_ref());
             encode_varint(name_id as u64, buf);
         }
+        FlakeValue::TripleTerm(term) => {
+            buf.push(OTag::TripleTerm as u8);
+            encode_varint(term.s.namespace_code as u64, buf);
+            encode_varint(dicts.subject.insert(term.s.name.as_ref()) as u64, buf);
+            encode_varint(term.p.namespace_code as u64, buf);
+            encode_varint(dicts.predicate.insert(term.p.name.as_ref()) as u64, buf);
+            encode_varint(term.dt.namespace_code as u64, buf);
+            encode_varint(dicts.datatype.insert(term.dt.name.as_ref()) as u64, buf);
+            match &term.lang {
+                Some(lang) => {
+                    buf.push(1);
+                    encode_len_prefixed_str(lang, buf);
+                }
+                None => buf.push(0),
+            }
+            encode_object(&term.o, dicts, buf)?;
+        }
         FlakeValue::Long(n) => {
             buf.push(OTag::Long as u8);
             encode_varint(zigzag_encode(*n), buf);
@@ -357,7 +374,7 @@ pub fn decode_op(
 
     // Object (tag + payload)
     let o_tag = OTag::from_u8(read_u8(data, pos)?)?;
-    let o = decode_object(o_tag, data, pos, dicts)?;
+    let o = decode_object(o_tag, data, pos, dicts, dt_ns_code, dt_name)?;
 
     // Flags
     let flags = read_u8(data, pos)?;
@@ -402,14 +419,21 @@ pub fn decode_op(
 /// Decode a binary object value into a [`FlakeValue`].
 ///
 /// Delegates binary parsing to [`raw_reader::decode_raw_object`] (shared with
-/// the zero-copy raw reader) and converts via `TryFrom<RawObject> for FlakeValue`.
+/// the zero-copy raw reader), applies the same datatype retagging, and converts
+/// via `TryFrom<RawObject> for FlakeValue`.
 fn decode_object(
     tag: OTag,
     data: &[u8],
     pos: &mut usize,
     dicts: &ReadDicts,
+    dt_ns_code: u16,
+    dt_name: &str,
 ) -> Result<FlakeValue, CommitCodecError> {
-    let raw = super::raw_reader::decode_raw_object(tag, data, pos, dicts)?;
+    let raw = super::raw_reader::retype_string_literal(
+        super::raw_reader::decode_raw_object(tag, data, pos, dicts)?,
+        dt_ns_code,
+        dt_name,
+    );
     FlakeValue::try_from(raw).map_err(|e| CommitCodecError::InvalidOp(e.to_string()))
 }
 
@@ -447,6 +471,54 @@ mod tests {
             predicate: StringDict::deserialize(&dicts.predicate.serialize()).unwrap(),
             datatype: StringDict::deserialize(&dicts.datatype.serialize()).unwrap(),
             object_ref: StringDict::deserialize(&dicts.object_ref.serialize()).unwrap(),
+        }
+    }
+
+    /// A link `r rdf:reifies <<( s p o )>>` round-trips with each kind of
+    /// term object: a node, a language-tagged string, and a decimal.
+    #[test]
+    fn test_round_trip_triple_term() {
+        use crate::TripleTermValue;
+        let ex = |name: &str| Sid::new(101, name);
+        let objects = [
+            (FlakeValue::Ref(ex("bob")), Sid::new(1, "id"), None),
+            (
+                FlakeValue::String("chat".into()),
+                Sid::new(3, "langString"),
+                Some("fr".to_string()),
+            ),
+            (
+                FlakeValue::Decimal(Box::new("1.50".parse().unwrap())),
+                Sid::new(2, "decimal"),
+                None,
+            ),
+        ];
+        for (o, dt, lang) in objects {
+            let term = TripleTermValue {
+                s: ex("alice"),
+                p: ex("knows"),
+                o,
+                dt,
+                lang,
+            };
+            let flake = Flake::new(
+                ex("claim1"),
+                crate::rdf_reifies_sid().clone(),
+                FlakeValue::TripleTerm(Box::new(term.clone())),
+                crate::triple_term_datatype_sid().clone(),
+                7,
+                true,
+                None,
+            );
+            let mut dicts = CommitDicts::new();
+            let mut buf = Vec::new();
+            encode_op(&flake, &mut dicts, &mut buf).unwrap();
+            let mut pos = 0;
+            let decoded = decode_op(&buf, &mut pos, &round_trip_dicts(&dicts), 7).unwrap();
+            assert_eq!(pos, buf.len());
+            assert_eq!(decoded.o, FlakeValue::TripleTerm(Box::new(term)));
+            assert_eq!(decoded.s, flake.s);
+            assert_eq!(decoded.dt, flake.dt);
         }
     }
 
@@ -703,5 +775,99 @@ mod tests {
         let decoded = decode_op(&buf, &mut pos, &read_dicts, 1).unwrap();
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.o, FlakeValue::Vector(vec![].into()));
+    }
+
+    fn decode_string_under(lexical: &str, dt_ns_code: u16, dt_name: &str) -> FlakeValue {
+        let flake = Flake::new(
+            Sid::new(101, "a"),
+            Sid::new(101, "p"),
+            FlakeValue::String(lexical.to_string()),
+            Sid::new(dt_ns_code, dt_name),
+            1,
+            true,
+            None,
+        );
+        let mut dicts = CommitDicts::new();
+        let mut buf = Vec::new();
+        encode_op(&flake, &mut dicts, &mut buf).unwrap();
+        let read_dicts = round_trip_dicts(&dicts);
+        let mut pos = 0;
+        let decoded = decode_op(&buf, &mut pos, &read_dicts, 1).unwrap();
+        assert_eq!(pos, buf.len());
+        decoded.o
+    }
+
+    /// Issue #1987: commits from SPARQL UPDATE stored well-typed literals as
+    /// strings. They read back as the typed value every other surface commits.
+    #[test]
+    fn string_under_typed_xsd_datatype_reads_as_typed_value() {
+        use crate::temporal::{Date, DateTime, GYear, Time};
+        assert_eq!(
+            decode_string_under("2026-09-08", 2, "date"),
+            FlakeValue::Date(Box::new(Date::parse("2026-09-08").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("2026-09-08T12:34:56Z", 2, "dateTime"),
+            FlakeValue::DateTime(Box::new(DateTime::parse("2026-09-08T12:34:56Z").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("12:34:56", 2, "time"),
+            FlakeValue::Time(Box::new(Time::parse("12:34:56").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("2026", 2, "gYear"),
+            FlakeValue::GYear(Box::new(GYear::parse("2026").unwrap()))
+        );
+        assert_eq!(
+            decode_string_under("20705", 2, "long"),
+            FlakeValue::Long(20705)
+        );
+        assert_eq!(
+            decode_string_under("true", 2, "boolean"),
+            FlakeValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn string_that_is_not_its_datatype_stays_a_string() {
+        for (lexical, dt_ns_code, dt_name) in [
+            ("1990-00-00", 2, "date"),
+            ("abc", 2, "integer"),
+            ("300", 2, "byte"),
+            ("2026-09-08", 2, "string"),
+            ("2026-09-08", 2, "anyURI"),
+            ("2026-09-08", 101, "date"),
+        ] {
+            assert_eq!(
+                decode_string_under(lexical, dt_ns_code, dt_name),
+                FlakeValue::String(lexical.to_string()),
+                "{lexical}^^{dt_ns_code}:{dt_name}"
+            );
+        }
+    }
+
+    /// SPARQL UPDATE also committed `geo:wktLiteral` POINTs as strings. They
+    /// read back as the point every other surface commits.
+    #[test]
+    fn wkt_point_string_reads_as_geo_point() {
+        use fluree_vocab::{geo, geo_names, namespaces};
+        let point = "POINT(2.35 48.85)";
+        let committed = crate::coerce::coerce_string_value(point, geo::WKT_LITERAL).unwrap();
+        assert!(matches!(committed, FlakeValue::GeoPoint(_)));
+        assert_eq!(
+            decode_string_under(point, namespaces::OGC_GEO, geo_names::WKT_LITERAL),
+            committed
+        );
+        for other in [
+            "POLYGON((0 0, 1 0, 1 1, 0 0))",
+            "POINT(0 91)",
+            "POINT EMPTY",
+        ] {
+            assert_eq!(
+                decode_string_under(other, namespaces::OGC_GEO, geo_names::WKT_LITERAL),
+                FlakeValue::String(other.to_string()),
+                "{other}"
+            );
+        }
     }
 }

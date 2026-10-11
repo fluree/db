@@ -291,7 +291,7 @@ fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 
 | | |
 |---|---|
-| **Performance** | [Columnar integer-ID engine, cost-based planner, 16 fast-path operators](docs/design/performance.md) — [benchmarks](https://github.com/fluree/benchmark-db) |
+| **Performance** | [Columnar integer-ID engine, cost-based planner, fused fast-path operators](docs/design/performance.md) — [benchmarks](https://github.com/fluree/benchmark-db) |
 | **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md), [GraphQL](docs/query/graphql.md) (schema derived from your data) |
 | **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
 | **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
@@ -340,3 +340,9 @@ The published docs are available as LLM-readable text following the [`llms.txt`]
 
 Licensed under the [Business Source License 1.1](LICENSE), with a Change Date
 to Apache License 2.0 as specified in that file.
+
+In short: you may use Fluree in production for anything except offering
+Fluree itself to others as a hosted or managed database. Building your own
+applications and data products on Fluree is permitted, including publishing a
+dataset you curate with a public, read-only query endpoint. See the
+[License FAQ](docs/reference/license-faq.md) for details.

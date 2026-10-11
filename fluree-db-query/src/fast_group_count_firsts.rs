@@ -112,11 +112,19 @@ impl PredicateGroupCountFirstsOperator {
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         use crate::dataset_operator::DatasetOperator;
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
         use crate::ir::AggregateFn;
         use crate::limit::LimitOperator;
         use crate::sort::{SortDirection, SortOperator, SortSpec};
+
+        // The plan stamped `Proceed` when the detector matched; a decline at
+        // open is stamped here, so planned and executed can be told apart.
+        stamp_fast_path(
+            "group_by_object_count_topk",
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -365,9 +373,17 @@ impl PredicateObjectCountFirstsOperator {
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         use crate::dataset_operator::DatasetOperator;
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
         use crate::ir::AggregateFn;
+
+        // As for the count top-k: the plan stamped `Proceed`; a decline at
+        // open is stamped here.
+        stamp_fast_path(
+            "predicate_object_count",
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -435,12 +451,24 @@ impl Operator for PredicateObjectCountFirstsOperator {
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
         if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
+                let stats_view = crate::stats_cache::cached_stats_view_for_db(
+                    fluree_db_core::GraphDbRef::new(
+                        ctx.active_snapshot,
+                        ctx.binary_g_id,
+                        ctx.overlay(),
+                        ctx.to_t,
+                    )
+                    .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
+                    Some(binary_index_store),
+                    false,
+                );
                 match count_bound_object_v6(
                     ctx.active_snapshot,
                     binary_index_store,
                     ctx.binary_g_id,
                     &self.predicate,
                     &self.object,
+                    stats_view.as_deref(),
                     &ctx.cancellation,
                 ) {
                     Ok(total) => {
@@ -597,9 +625,34 @@ fn count_bound_object_v6(
     g_id: GraphId,
     predicate: &Ref,
     object: &Term,
+    stats_view: Option<&fluree_db_core::StatsView>,
     cancellation: &QueryCancellation,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
+
+    // A bare number counts every numeric datatype holding an equal value: one
+    // (o_type, o_key) per datatype the predicate carries. A slice that needs
+    // the decoded-value filter declines to the generic count.
+    if let Term::Value(value @ (FlakeValue::Long(_) | FlakeValue::Double(_))) = object {
+        // This path reads the index at its max_t, so arena handles are current.
+        let slices = crate::binary_scan::untyped_numeric_slices(
+            store,
+            g_id,
+            Some(p_id),
+            crate::binary_scan::observed_datatypes(stats_view, g_id, p_id),
+            value,
+            true,
+        )
+        .ok_or_else(|| QueryError::Internal("non-finite numeric constant".to_string()))?;
+        let mut total = 0;
+        for (o_type, o_key) in slices {
+            let o_key = o_key.ok_or_else(|| {
+                QueryError::Internal("NumBig rows need the decoded-value filter".to_string())
+            })?;
+            total += count_object_key_v6(store, g_id, p_id, o_type.as_u16(), o_key, cancellation)?;
+        }
+        return Ok(total);
+    }
 
     // Translate the bound object term into V6 (o_type, o_key). A `None` here is
     // a *conclusive* base-dict miss (refs are resolved snapshot-aware); since
@@ -610,7 +663,18 @@ fn count_bound_object_v6(
     else {
         return Ok(0);
     };
+    count_object_key_v6(store, g_id, p_id, target_o_type, target_o_key, cancellation)
+}
 
+/// Rows of predicate `p_id` whose object is exactly `(target_o_type, target_o_key)`.
+fn count_object_key_v6(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    target_o_type: u16,
+    target_o_key: u64,
+    cancellation: &QueryCancellation,
+) -> Result<i64> {
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
@@ -1001,7 +1065,7 @@ pub(crate) fn group_count_v6(
 /// Return values:
 /// - `Ok(Some(..))` — resolved to a persisted `(o_type, o_key)`.
 /// - `Ok(None)` — the object is **conclusively absent from the base dict**.
-///   Combined with the caller's no-novelty (`epoch == 0`) gate, "absent from
+///   Combined with the caller's no-live-novelty gate, "absent from
 ///   base dict" implies "absent from the logical DB", so the caller reports a
 ///   0 count.
 /// - `Err(..)` — genuine error or unbound object; routes to the generic
@@ -1276,11 +1340,7 @@ fn collect_subject_counts_for_predicate_group(
     pred: &crate::ir::triple::Ref,
     restrict_to: Option<&FxHashMap<u64, u64>>,
 ) -> Result<Option<FxHashMap<u64, u64>>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     let sid = normalize_pred_sid(store, pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {
         return if overlay_has_rows {
@@ -1353,11 +1413,7 @@ fn compute_group_by_object_star_topk(
     sample_var: Option<VarId>,
     limit: usize,
 ) -> Result<Option<crate::binding::Batch>> {
-    let overlay_has_rows = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0;
+    let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
     // Scan group predicate PSOT for (s_id, o_type, o_key).
     let sid = normalize_pred_sid(store, group_pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {

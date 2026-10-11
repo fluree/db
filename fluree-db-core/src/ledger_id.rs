@@ -228,6 +228,34 @@ impl LedgerId {
         Ok(Self::new_unchecked(name, branch))
     }
 
+    /// Rebuild an identity from a stored nameservice record.
+    ///
+    /// Transition: releases before this grammar let `@` and `#` into ledger
+    /// and branch names. Such records stay listed so GC, drop and sync still
+    /// account for them, though no request can address them. Every other rule
+    /// applies, path safety included.
+    pub fn from_persisted_parts(name: &str, branch: &str) -> Result<Self, LedgerIdParseError> {
+        Self::from_parts(name, branch).or_else(|strict| {
+            let unreserve = |s: &str| s.replace(['@', '#'], "_");
+            Self::from_parts(&unreserve(name), &unreserve(branch)).map_err(|_| strict)?;
+            Ok(Self::new_unchecked(name, branch))
+        })
+    }
+
+    /// [`Self::from_persisted_parts`] for a stored `name[:branch]` string.
+    pub fn parse_persisted(input: &str) -> Result<Self, LedgerIdParseError> {
+        match input.split_once(':') {
+            Some((name, branch)) => Self::from_persisted_parts(name, branch),
+            None => Self::from_persisted_parts(input, DEFAULT_BRANCH),
+        }
+    }
+
+    /// Serde `deserialize_with` for stored or replicated records.
+    pub fn deserialize_persisted<'de, D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse_persisted(&s).map_err(serde::de::Error::custom)
+    }
+
     /// Accept only an already-canonical `name:branch` string.
     ///
     /// For seams that receive ids as strings from code that should already
@@ -380,8 +408,8 @@ impl<'de> Deserialize<'de> for LedgerId {
 ///
 /// A `LedgerId` passes through. A `&str` is for already-canonical literals
 /// (fixtures, constants): it trips in debug builds when not canonical and
-/// panics when it does not parse at all, since an unparseable id cannot have
-/// been created.
+/// panics when neither the current nor the persisted grammar accepts it,
+/// since no such id can have been created.
 pub trait IntoLedgerId {
     fn into_ledger_id(self) -> LedgerId;
 }
@@ -588,9 +616,27 @@ pub fn parse_time_travel_spec(
         Ok(LedgerIdTimeSpec::AtSnapshot(id))
     } else {
         Err(LedgerIdParseError::new(format!(
-            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}time:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix"
+            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}time:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix{}",
+            untagged_spec_hint(spec, sigil)
         )))
     }
+}
+
+/// The tagged spelling a spec written without its tag most likely meant: a
+/// transaction number, a timestamp, or a commit id. The tag stays required,
+/// since a bare `123456` is both a `t` and a commit prefix.
+fn untagged_spec_hint(spec: &str, sigil: &str) -> String {
+    let tag = if spec.parse::<i64>().is_ok() {
+        "t:"
+    } else if spec.starts_with(|c: char| c.is_ascii_digit()) && spec.contains('-') {
+        "time:"
+    } else if spec.len() >= COMMIT_PREFIX_MIN_LEN && spec.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        "commit:"
+    } else {
+        return String::new();
+    };
+    format!("; did you mean '{sigil}{tag}{spec}'?")
 }
 
 /// Split a ledger ID string into its base and optional time-travel suffix.
@@ -763,6 +809,32 @@ mod tests {
         assert!(TIME_TRAVEL_TAGS.contains(&"time:") && TIME_TRAVEL_TAGS.contains(&"iso:"));
     }
 
+    /// A ledger address needs its tag, as `--at` does not; the refusal of an
+    /// untagged spec names the tagged spelling it most likely meant.
+    #[test]
+    fn untagged_spec_is_refused_with_its_tagged_spelling() {
+        let cid = "bagaybqabciqlaerm7xhrb6eo4viqu7ym4asun2mlovojslqlmlri3qrjia66fji";
+        for (spec, meant) in [
+            (cid, format!("@commit:{cid}")),
+            ("3dd028ab", "@commit:3dd028ab".to_string()),
+            ("5", "@t:5".to_string()),
+            (
+                "2025-01-01T00:00:00Z",
+                "@time:2025-01-01T00:00:00Z".to_string(),
+            ),
+        ] {
+            let err = parse_ledger_id_with_time(&format!("ledger@{spec}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.ends_with(&format!("did you mean '{meant}'?")),
+                "{spec}: {err}"
+            );
+        }
+        let err = parse_time_travel_spec("abc", "@").unwrap_err().to_string();
+        assert!(!err.contains("did you mean"), "{err}");
+    }
+
     #[test]
     fn test_parse_ledger_id_with_time_commit() {
         let parsed = parse_ledger_id_with_time("ledger@commit:abc123").unwrap();
@@ -884,6 +956,78 @@ mod tests {
     fn split_rejects_time_suffix() {
         assert!(split_ledger_id("mydb@t:5").is_err());
         assert!(normalize_ledger_id("mydb@t:5").is_err());
+    }
+
+    #[test]
+    fn persisted_ids_allow_legacy_reserved_characters_only() {
+        for (name, branch) in [
+            ("rep@2026", "main"),
+            ("mydb", "feature#1"),
+            ("a#b/c", "x@y"),
+        ] {
+            assert!(
+                LedgerId::from_parts(name, branch).is_err(),
+                "{name}:{branch}"
+            );
+            let id = LedgerId::from_persisted_parts(name, branch).unwrap();
+            assert_eq!((id.name(), id.branch()), (name, branch));
+            assert_eq!(LedgerId::parse_persisted(&id).unwrap(), id);
+        }
+        assert_eq!(
+            LedgerId::parse_persisted("rep@2026").unwrap(),
+            "rep@2026:main"
+        );
+        for (name, branch) in [
+            ("/x", "main"),
+            ("x/", "main"),
+            ("a//b", "main"),
+            ("a/../b", "main"),
+            ("mydb", "../x"),
+            ("", "main"),
+            ("mydb", ""),
+            ("a:b", "main"),
+            ("mydb", "a:b"),
+        ] {
+            assert!(
+                LedgerId::from_persisted_parts(name, branch).is_err(),
+                "{name}:{branch}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_id_maps_to_the_paths_it_was_stored_under() {
+        use crate::storage::content_path;
+        use crate::{ContentKind, DictKind};
+        let dict = ContentKind::DictBlob {
+            dict: DictKind::Graphs,
+        };
+        for (id, own, shared) in [
+            ("rep@2026:main", "rep@2026/main/", "rep@2026/@shared/"),
+            ("mydb:feature#1", "mydb/feature#1/", "mydb/@shared/"),
+        ] {
+            let (name, branch) = id.split_once(':').unwrap();
+            let namespace = crate::StorageNamespace::legacy(
+                &LedgerId::from_persisted_parts(name, branch).unwrap(),
+            );
+            assert!(content_path(ContentKind::Commit, &namespace, "h").starts_with(own));
+            assert!(
+                content_path(dict, &namespace, "h").starts_with(shared),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn records_deserialize_legacy_ids_but_requests_do_not() {
+        #[derive(Deserialize)]
+        struct Record {
+            #[serde(deserialize_with = "LedgerId::deserialize_persisted")]
+            id: LedgerId,
+        }
+        let record: Record = serde_json::from_str(r#"{"id":"mydb:feature#1"}"#).unwrap();
+        assert_eq!(record.id, "mydb:feature#1");
+        assert!(serde_json::from_str::<LedgerId>(r#""mydb:feature#1""#).is_err());
     }
 
     #[test]

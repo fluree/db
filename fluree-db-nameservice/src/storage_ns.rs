@@ -322,7 +322,7 @@ where
 
         // Convert to GraphSourceRecord. The file is authoritative for
         // identity; a different name/branch at this path is another source.
-        let graph_source_id = LedgerId::from_parts(&main.name, &main.branch)?;
+        let graph_source_id = LedgerId::from_persisted_parts(&main.name, &main.branch)?;
         if graph_source_id.name() != name || graph_source_id.branch() != branch {
             return Ok(None);
         }
@@ -440,11 +440,16 @@ where
         }
 
         let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let Some(ledger_id) =
+            crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, main_key)
+        else {
+            return Ok(None);
+        };
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
-        main.into_record(index_file)
+        main.into_record(ledger_id, index_file)
     }
 
     /// Perform an atomic read-modify-write on a JSON value.
@@ -454,12 +459,12 @@ where
     /// no write is performed.
     async fn cas_update<T, F>(&self, key: &str, update_fn: F) -> Result<()>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        F: Fn(Option<T>) -> Option<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(Option<T>) -> Option<T> + Send + Sync + 'static,
     {
         let outcome = self
             .storage
-            .compare_and_swap(key, |current_bytes| {
+            .compare_and_swap(key, move |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
 
                 match update_fn(current) {
@@ -494,16 +499,19 @@ where
         update_fn: F,
     ) -> Result<()>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        A: Fn(Option<&T>) -> bool + Send + Sync,
-        F: Fn(Option<T>) -> Option<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        A: Fn(Option<&T>) -> bool + Send + Sync + 'static,
+        F: Fn(Option<T>) -> Option<T> + Send + Sync + 'static,
     {
-        self.cas_update_with_outcome_fenced(ledger_id, key, admits, |current| {
-            match update_fn(current) {
+        self.cas_update_with_outcome_fenced(
+            ledger_id,
+            key,
+            admits,
+            move |current| match update_fn(current) {
                 Some(value) => CasUpdateDecision::Apply(value),
                 None => CasUpdateDecision::Skip(CasResult::Updated),
-            }
-        })
+            },
+        )
         .await?;
         Ok(())
     }
@@ -519,13 +527,13 @@ where
         update_fn: F,
     ) -> Result<CasUpdateOutcome>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        A: Fn(Option<&T>) -> bool + Send + Sync,
-        F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        A: Fn(Option<&T>) -> bool + Send + Sync + 'static,
+        F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync + 'static,
     {
         let outcome = self
             .storage
-            .compare_and_swap(key, |current_bytes| {
+            .compare_and_swap(key, move |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
                 if !admits(current.as_ref()) {
                     return Ok(CasAction::Abort(Err(FenceRefused)));
@@ -793,7 +801,8 @@ where
             // A read failure must not silently shrink the result: callers
             // that decide what to delete treat a missing branch as one with
             // nothing to protect. `Ok(None)` is a legitimate skip
-            // (graph-source record, or a branch dropped since the listing).
+            // (graph-source record, a branch dropped since the listing, or an
+            // id whose path could alias another ledger's).
             if let Some(record) = self.read_record_at(&key).await? {
                 records.push(record);
             }
@@ -965,7 +974,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |bytes| {
+            .compare_and_swap(&key, move |bytes| {
                 let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
                 let Some(mut file) = current.filter(|f| !f.is_deleted()) else {
                     return Ok(CasAction::Abort(fence.is_some()));
@@ -1009,7 +1018,7 @@ where
         self.cas_update_fenced::<NsFileV2, _, _>(
             ledger_id,
             &key,
-            |current| main_admits(current, fence),
+            move |current| main_admits(current, fence),
             move |existing| match existing.filter(|f| !f.is_deleted()) {
                 Some(mut file) => {
                     // Only update if strictly newer
@@ -1061,7 +1070,7 @@ where
         self.cas_update_fenced::<NsIndexFileV2, _, _>(
             ledger_id,
             &key,
-            |current| index_admits(current, fence),
+            move |current| index_admits(current, fence),
             move |existing| {
                 // Only update if strictly newer
                 if let Some(ref file) = existing {
@@ -1105,8 +1114,8 @@ where
         self.cas_update_fenced::<NsIndexFileV2, _, _>(
             ledger_id,
             &index_key,
-            |current| index_admits(current, fence),
-            |existing| {
+            move |current| index_admits(current, fence),
+            move |existing| {
                 let should_update = match &existing {
                     Some(file) => index_t >= file.index.t, // Allow equal
                     None => true,
@@ -1236,7 +1245,7 @@ where
                     .cas_update_with_outcome_fenced::<NsFileV2, _, _>(
                         ledger_id,
                         &key,
-                        |current| main_admits(current, fence),
+                        move |current| main_admits(current, fence),
                         move |existing| {
                             let current_ref = existing.as_ref().map(|f| RefValue {
                                 id: f
@@ -1316,7 +1325,7 @@ where
                     .cas_update_with_outcome_fenced::<NsIndexFileV2, _, _>(
                         ledger_id,
                         &key,
-                        |current| index_admits(current, fence),
+                        move |current| index_admits(current, fence),
                         move |existing| {
                             let current_ref = existing.as_ref().map(|f| RefValue {
                                 id: f
@@ -1720,7 +1729,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |current_bytes| {
+            .compare_and_swap(&key, move |current_bytes| {
                 let current_file: Option<NsFileV2> =
                     current_bytes.map(deserialize_json).transpose()?;
                 if !main_admits(current_file.as_ref(), fence) {
@@ -1828,7 +1837,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |current_bytes| {
+            .compare_and_swap(&key, move |current_bytes| {
                 let current_file: Option<NsFileV2> =
                     current_bytes.map(deserialize_json).transpose()?;
                 if !main_admits(current_file.as_ref(), fence) {
@@ -1998,6 +2007,10 @@ mod tests {
             true
         }
 
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
             None
         }
@@ -2111,8 +2124,9 @@ mod tests {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
             let mut data = self.data.write().unwrap();
             let current = data.get(address).map(std::vec::Vec::as_slice);
@@ -2264,6 +2278,10 @@ mod tests {
             self.inner.permits_plaintext_cache()
         }
 
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
         fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
             self.inner.encryption_admin()
         }
@@ -2344,8 +2362,9 @@ mod tests {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
             // On the first call, run the closure but then call it again to
             // simulate a concurrent modification that invalidated the first read.
@@ -2492,6 +2511,44 @@ mod tests {
         // Same path, different identity: not this ledger.
         assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
         assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
+    }
+
+    /// Ids an older release could store but the current grammar rejects
+    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
+    /// them, and a name whose path can alias another ledger's is skipped.
+    #[tokio::test]
+    #[ignore = "a 4.2 store holding an `@`/`#` id fails the ns@v3 migration: \
+                bindings and storage roots parse names with the strict grammar"]
+    async fn legacy_ids_do_not_fail_the_listing() {
+        let ns = make_storage_ns();
+        let ids = [
+            ("plain", "main"),
+            ("rep@2026", "main"),
+            ("mydb", "feature#1"),
+        ];
+        for (name, branch) in ids.into_iter().chain([("unsafeQ", "main")]) {
+            let mut record = NsRecord::new(LedgerId::from_persisted_parts(name, branch).unwrap());
+            record.commit_t = 1;
+            let json = serde_json::to_string(&NsFileV2::for_record(&record))
+                .unwrap()
+                // A stored name whose path can alias another ledger's.
+                .replace("unsafeQ", "/unsafe");
+            ns.storage
+                .write_bytes(&format!("test/ns@v2/{name}/{branch}.json"), json.as_bytes())
+                .await
+                .unwrap();
+        }
+
+        ns.migrate().await.unwrap().expect("migrated");
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        all.sort();
+        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
     }
 
     #[tokio::test]
