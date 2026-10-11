@@ -2951,7 +2951,7 @@ fn drain_ready_deferred(
 /// seeding it per outer row is equivalent to evaluating the subquery once and
 /// filtering its output to that value, so it can run once and be hash-joined.
 ///
-/// Two safety conditions on this declassification:
+/// Three safety conditions on this declassification:
 /// 1. **No inner slice.** With `LIMIT`/`OFFSET`, the per-row restriction changes
 ///    which rows survive the slice (e.g. `ORDER BY DESC(?x) LIMIT 1` means "top
 ///    row per outer binding"), so such a subquery stays genuinely correlated.

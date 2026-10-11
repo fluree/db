@@ -445,6 +445,8 @@ follows the shape's `sh:severity` and the graph's validation mode, as a
 result does: on a Violation shape in a reject-mode graph, transactions on
 focus nodes the shape targets are rejected; on a Warning or Info shape, or
 in a warn-mode graph, the failure is logged and the transaction commits.
+That is a transaction's rule only: a [validation report](#validation-reports-fluree-validate)
+returns the failure as an error, whatever the shape's severity.
 `$shapesGraph` / `$currentShape` (optional per spec) are not supported.
 
 Like every other constraint, `sh:sparql` runs at transaction staging time

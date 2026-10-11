@@ -54,7 +54,7 @@ pub enum ParseError {
 
     /// Invalid orderBy clause
     #[error(
-        "orderBy takes variables: \"?x\", \"(desc ?x)\", [\"desc\", \"?x\"] or          {{\"var\": \"?x\", \"direction\": \"desc\"}}; to sort on an expression or an          aggregate, select it under an alias, (as <expr> ?k), and order by ?k"
+        "orderBy takes variables: \"?x\", \"(desc ?x)\", [\"desc\", \"?x\"] or {{\"var\": \"?x\", \"direction\": \"desc\"}}; to sort on an expression or an aggregate, select it under an alias, (as <expr> ?k), and order by ?k"
     )]
     InvalidOrderBy,
 
