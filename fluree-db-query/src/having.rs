@@ -2,7 +2,9 @@
 //!
 //! Implements SPARQL HAVING semantics:
 //! - Filters rows after GROUP BY and aggregation
-//! - Uses the same filter expression evaluation as WHERE FILTER
+//! - Uses the WHERE FILTER's evaluator ([`RowPredicate`]), EXISTS included:
+//!   an `EXISTS` in HAVING is evaluated per group row with the row's keys and
+//!   aggregate outputs bound
 //! - Operates on aggregate results (not Grouped values)
 //! - Rows where the expression evaluates to `false` or encounters an error
 //!   (type mismatch, unbound var) are filtered out (two-valued logic)
@@ -21,8 +23,7 @@
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::eval::PreparedBoolExpression;
-use crate::filter::filter_batch;
+use crate::filter::RowPredicate;
 use crate::ir::Expression;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -33,13 +34,13 @@ use std::sync::Arc;
 
 /// HAVING operator - filters rows after GROUP BY/aggregation
 ///
-/// This is functionally identical to FilterOperator but conceptually
-/// applies to grouped/aggregated results.
+/// A FILTER over the grouped rows (it shares FilterOperator's predicate),
+/// plus trimming of its output to what downstream needs.
 pub struct HavingOperator {
     /// Child operator (typically AggregateOperator or GroupByOperator)
     child: BoxedOperator,
-    /// Prepared filter expression to evaluate
-    prepared_expr: PreparedBoolExpression,
+    /// The HAVING predicate
+    predicate: RowPredicate,
     /// Output schema (same as child)
     in_schema: Arc<[VarId]>,
     /// Operator state
@@ -55,12 +56,16 @@ impl HavingOperator {
     ///
     /// * `child` - Child operator (typically GroupByOperator or AggregateOperator)
     /// * `expr` - Filter expression to evaluate
-    pub fn new(child: BoxedOperator, expr: Expression) -> Self {
+    /// * `planning` - Planning context for EXISTS subplans
+    pub fn new(
+        child: BoxedOperator,
+        expr: Expression,
+        planning: crate::temporal_mode::PlanningContext,
+    ) -> Self {
         let schema: Arc<[VarId]> = Arc::from(child.schema().to_vec().into_boxed_slice());
-        let prepared_expr = PreparedBoolExpression::new(expr);
         Self {
             child,
-            prepared_expr,
+            predicate: RowPredicate::new(expr, planning),
             in_schema: schema,
             state: OperatorState::Created,
             out_schema: None,
@@ -96,6 +101,7 @@ impl Operator for HavingOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
+        self.predicate.open(&self.in_schema, ctx)?;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -118,7 +124,7 @@ impl Operator for HavingOperator {
                 continue;
             }
 
-            if let Some(filtered) = filter_batch(batch, &self.prepared_expr, ctx)? {
+            if let Some(filtered) = self.predicate.filter(batch, ctx).await? {
                 return Ok(trim_batch(&self.out_schema, filtered));
             }
         }
@@ -208,7 +214,11 @@ mod tests {
             Expression::Const(FlakeValue::Long(10)),
         );
 
-        let mut op = HavingOperator::new(child, expr);
+        let mut op = HavingOperator::new(
+            child,
+            expr,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         op.open(&ctx).await.unwrap();
 
         let result = op.next_batch(&ctx).await.unwrap();
@@ -288,7 +298,11 @@ mod tests {
             Expression::Const(FlakeValue::Long(100)),
         );
 
-        let mut op = HavingOperator::new(child, expr);
+        let mut op = HavingOperator::new(
+            child,
+            expr,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         op.open(&ctx).await.unwrap();
 
         let result = op.next_batch(&ctx).await.unwrap();
@@ -320,7 +334,8 @@ mod tests {
         // Any expression that passes
         let expr = Expression::Const(FlakeValue::Boolean(true));
 
-        let mut op = HavingOperator::new(seed, expr);
+        let mut op =
+            HavingOperator::new(seed, expr, crate::temporal_mode::PlanningContext::current());
         op.open(&ctx).await.unwrap();
 
         // Schema should be preserved
@@ -389,7 +404,11 @@ mod tests {
             Expression::Const(FlakeValue::Long(10)),
         );
 
-        let mut op = HavingOperator::new(child, expr);
+        let mut op = HavingOperator::new(
+            child,
+            expr,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         op.open(&ctx).await.unwrap();
 
         // Should succeed (not error) and return only NYC

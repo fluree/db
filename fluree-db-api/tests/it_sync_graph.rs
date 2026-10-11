@@ -468,7 +468,7 @@ async fn staging_rejects_malformed_and_system_graph_targets() {
 /// An identical resync must still be a no-op after the graph has been
 /// indexed — the case the memory-backed tests cannot reach.
 ///
-/// `scan_graph_flakes` reads through the range provider, and
+/// `whole_graph_facts` reads through the range provider, and
 /// `BinaryRangeProvider` materializes flakes with `g: None`
 /// (`binary_range.rs:753`, `:1393`). The accumulator buckets on `flake.g`,
 /// so without the explicit stamp in the sync wave the retractions land in a
