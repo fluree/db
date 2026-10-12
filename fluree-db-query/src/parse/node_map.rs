@@ -513,6 +513,37 @@ fn parse_index_search_result(
     }
 }
 
+/// A node's own `@graph` selector, the GRAPH sugar both node parsers share:
+/// `parse` reads the node's other entries (in the written order), in the
+/// graph the selector names, or as they are when it names the `where`'s own
+/// default graph. `false` (nothing parsed) when the node has no selector.
+fn in_node_graph(
+    map: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+    parse: impl FnOnce(&serde_json::Map<String, JsonValue>, &mut UnresolvedQuery) -> Result<()>,
+) -> Result<bool> {
+    let Some((graph_key, raw)) = node_graph_selector(map, &ctx.context)? else {
+        return Ok(false);
+    };
+    let inner_map: serde_json::Map<String, JsonValue> = map
+        .iter()
+        .filter(|(k, _)| k.as_str() != graph_key)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    match resolve_where_graph(raw, ctx)? {
+        WhereGraph::Default => parse(&inner_map, query)?,
+        WhereGraph::Named(name) => {
+            let mut inner = UnresolvedQuery::new(ctx.context.clone());
+            ctx.in_graph_scope(|| parse(&inner_map, &mut inner))?;
+            query
+                .patterns
+                .push(UnresolvedPattern::graph(name, inner.patterns));
+        }
+    }
+    Ok(true)
+}
+
 /// Parse a node-map (single where clause object)
 ///
 /// Extracts triple patterns from JSON-LD node-map format.
@@ -533,43 +564,17 @@ pub fn parse_node_map(
     // the same key does in an insert or delete (`resolve_where_graph`), so
     // one document means one graph by it. (It used to be read as a predicate
     // named `@graph`, so the pattern matched nothing.)
-    if let Some((graph_key, raw)) = node_graph_selector(map, context)? {
-        // Every other entry, in order (pattern order is the written order).
-        let inner_map: serde_json::Map<String, JsonValue> = map
-            .iter()
-            .filter(|(k, _)| k.as_str() != graph_key)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        match resolve_where_graph(raw, ctx)? {
-            // The where's own default graph: the patterns match as they are.
-            WhereGraph::Default => {
-                return parse_node_map(
-                    &inner_map,
-                    ctx,
-                    query,
-                    subject_counter,
-                    nested_counter,
-                    object_var_parsing,
-                );
-            }
-            WhereGraph::Named(name) => {
-                let mut inner = UnresolvedQuery::new(context.clone());
-                ctx.in_graph_scope(|| {
-                    parse_node_map(
-                        &inner_map,
-                        ctx,
-                        &mut inner,
-                        subject_counter,
-                        nested_counter,
-                        object_var_parsing,
-                    )
-                })?;
-                query
-                    .patterns
-                    .push(UnresolvedPattern::graph(name, inner.patterns));
-                return Ok(());
-            }
-        }
+    if in_node_graph(map, ctx, query, |inner_map, query| {
+        parse_node_map(
+            inner_map,
+            ctx,
+            query,
+            subject_counter,
+            nested_counter,
+            object_var_parsing,
+        )
+    })? {
+        return Ok(());
     }
 
     // Check for vector search pattern first (has f:queryVector)
@@ -1754,39 +1759,17 @@ fn parse_nested_node_map(
     // A nested node's own `@graph` selects the graph its patterns match in,
     // as a nested selector scopes a node in an insert or delete. The edge to
     // it stays in the enclosing node's graph.
-    if let Some((graph_key, raw)) = node_graph_selector(map, context)? {
-        let inner_map: serde_json::Map<String, JsonValue> = map
-            .iter()
-            .filter(|(k, _)| k.as_str() != graph_key)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        return match resolve_where_graph(raw, ctx)? {
-            WhereGraph::Default => parse_nested_node_map(
-                &inner_map,
-                subject,
-                ctx,
-                query,
-                nested_counter,
-                object_var_parsing,
-            ),
-            WhereGraph::Named(name) => {
-                let mut inner = UnresolvedQuery::new(context.clone());
-                ctx.in_graph_scope(|| {
-                    parse_nested_node_map(
-                        &inner_map,
-                        subject,
-                        ctx,
-                        &mut inner,
-                        nested_counter,
-                        object_var_parsing,
-                    )
-                })?;
-                query
-                    .patterns
-                    .push(UnresolvedPattern::graph(name, inner.patterns));
-                Ok(())
-            }
-        };
+    if in_node_graph(map, ctx, query, |inner_map, query| {
+        parse_nested_node_map(
+            inner_map,
+            subject,
+            ctx,
+            query,
+            nested_counter,
+            object_var_parsing,
+        )
+    })? {
+        return Ok(());
     }
 
     // Check for explicit @id in nested object - it overrides the generated subject
