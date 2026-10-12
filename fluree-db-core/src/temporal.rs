@@ -203,6 +203,13 @@ fn to_micros(nanos: u32) -> u32 {
     nanos - nanos % 1_000
 }
 
+/// Nanoseconds since the epoch held to the microsecond, rounded down as
+/// [`DateTime::from_instant`] rounds: to the microsecond at or before the
+/// instant, before 1970 too. For readers of nanosecond timestamps.
+pub fn micros_from_epoch_nanos(nanos: i64) -> i64 {
+    nanos.div_euclid(1_000)
+}
+
 /// Whether a `dateTime` or `time` lexical form has a non-zero digit past the
 /// microsecond, which its value drops ([`DateTime::from_instant`]): the
 /// lexical then lies strictly between its value and the next microsecond.
