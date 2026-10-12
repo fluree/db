@@ -18,7 +18,9 @@
 use crate::support;
 use fluree_db_api::{Fluree, FlureeBuilder, LedgerState};
 use fluree_db_core::comparator::IndexType;
-use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
+use fluree_db_core::{
+    range_with_overlay, FlakeValue, OverlayProvider, RangeMatch, RangeOptions, RangeTest,
+};
 use serde_json::{json, Value as JsonValue};
 
 const EX: &str = "http://example.org/ns/";
@@ -577,4 +579,102 @@ async fn an_identical_reupsert_keeps_a_sub_microsecond_datetime() {
     h.reindex().await;
     h.upsert(&doc).await;
     assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
+}
+
+// =============================================================================
+// Ops on one index key are one stored fact
+// =============================================================================
+
+/// An integer past 64 bits: the index keys it by value, with no datatype.
+const BIG: &str = "123456789012345678901234567890";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+fn big(dt: &str) -> Payload {
+    jsonld(json!({"@id": "ex:s", "ex:n": {"@value": BIG, "@type": dt}}))
+}
+
+/// A delete of every `ex:s <p>` value, witnessed by its WHERE triple.
+fn delete_where(p: &str) -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "where": {"@id": "ex:s", p: "?o"},
+        "delete": {"@id": "ex:s", p: "?o"}
+    })
+}
+
+impl Harness {
+    async fn update(&mut self, txn: &JsonValue) -> fluree_db_api::CommitReceipt {
+        let ledger = self.ledger.take().expect("ledger");
+        let result = self.fluree.update(ledger, txn).await.expect("update");
+        self.ledger = Some(result.ledger);
+        result.receipt
+    }
+
+    /// The retractions in the default graph's novelty, as `(predicate local
+    /// name, datatype IRI)`.
+    fn novelty_retractions(&self) -> Vec<(String, String)> {
+        let ledger = self.ledger();
+        let mut out = Vec::new();
+        ledger.novelty.for_each_overlay_flake(
+            0,
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            ledger.t(),
+            &mut |f| {
+                if !f.op {
+                    let dt = ledger.snapshot.decode_sid(&f.dt).unwrap_or_default();
+                    out.push((f.p.name.to_string(), dt));
+                }
+            },
+        );
+        out
+    }
+
+    /// Upsert `payload`, which `ex:s` no longer holds, and check that it
+    /// writes the one value again, before and after the next index build.
+    async fn upsert_writes_it_again(&mut self, payload: &Payload, what: &str) {
+        assert!(self.facts(None, "s").await.is_empty(), "{what}: removed");
+        let t = self.ledger().t();
+        let receipt = self.upsert(payload).await;
+        assert!(
+            receipt.t > t && receipt.assert_count == 1,
+            "{what}: the upsert writes the value again: {receipt:?}"
+        );
+        assert_eq!(self.facts(None, "s").await.len(), 1, "{what}");
+        self.reindex().await;
+        assert_eq!(
+            self.facts(None, "s").await.len(),
+            1,
+            "{what}: after the next index build"
+        );
+    }
+}
+
+/// After a `DELETE WHERE` removes an indexed big integer, upserting the
+/// value writes it again: the delete retracts the fact the index holds.
+#[tokio::test]
+async fn an_upsert_after_a_delete_where_of_an_indexed_big_integer_writes_it() {
+    let mut h = Harness::new("key-delete-where").await;
+    h.insert(&big(XSD_INTEGER)).await;
+    h.reindex().await;
+    h.update(&delete_where("ex:n")).await;
+    h.upsert_writes_it_again(&big(XSD_INTEGER), "DELETE WHERE")
+        .await;
+}
+
+/// The retraction a `DELETE WHERE` stages for an indexed big integer
+/// carries the datatype it is stored with, `xsd:integer`, not the
+/// `xsd:decimal` the index reports for every big number.
+#[tokio::test]
+async fn a_delete_where_retracts_an_indexed_big_integer_as_xsd_integer() {
+    let mut h = Harness::new("key-delete-where-dt").await;
+    h.insert(&big(XSD_INTEGER)).await;
+    h.reindex().await;
+    h.update(&delete_where("ex:n")).await;
+    assert_eq!(
+        h.novelty_retractions(),
+        vec![("n".to_string(), XSD_INTEGER.to_string())]
+    );
 }
