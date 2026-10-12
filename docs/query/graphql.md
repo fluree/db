@@ -109,8 +109,9 @@ whatever its tag, which is also what omitting the argument does.
 
 See [`fluree graphql`](../cli/graphql.md#shapes-sharpen-the-schema) for the full
 SHACL → GraphQL table. In brief: `sh:maxCount 1` gives a single value,
-`sh:minCount ≥ 1` gives `!` where the ledger config enables SHACL, `sh:in` gives an `enum`, `sh:inversePath` gives a
-reverse field, and `sh:closed true` drops observed-but-undeclared properties.
+`sh:minCount ≥ 1` gives `!` where the ledger config enables SHACL, `sh:in`
+gives an `enum`, `sh:inversePath` gives a reverse field, and `sh:closed true`
+drops observed-but-undeclared properties.
 
 `fluree graphql --bootstrap <ledger>` emits the shapes your current schema
 implies, as a starting point to edit.

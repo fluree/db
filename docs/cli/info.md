@@ -95,8 +95,11 @@ graphs](../ledger-config/writing-config.md#repairing-a-config-split-across-graph
 `ambiguous-pointer` (a setting group pointer with several values),
 `multiple-ledger-configs` and `duplicate-graph-override` (several
 `f:GraphConfig` overrides for one graph, of which only one is used).
-`shacl-not-configured` means no graph enables SHACL: a config that enables it
-for one graph only is configured.
+`shacl-not-configured` means the ledger holds shapes (typed `sh:NodeShape` or
+`sh:PropertyShape`, or any subject with a SHACL target such as
+`sh:targetClass`) and no graph enables SHACL: a config that enables it for one
+graph only is configured, and one that sets `f:shaclEnabled false` has switched
+it off on purpose, so neither is reported.
 
 Graph source (Iceberg):
 ```

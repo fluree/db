@@ -298,8 +298,8 @@ mutation {
 
 Every mutation is an ordinary Fluree transaction, so policy applies, and SHACL
 validation applies where the ledger config enables SHACL; a rejected write
-comes back as a GraphQL error having written nothing. Mutations run serially, so a later field in the same document sees an
-earlier one's write.
+comes back as a GraphQL error having written nothing. Mutations run serially,
+so a later field in the same document sees an earlier one's write.
 
 ## Not yet supported
 

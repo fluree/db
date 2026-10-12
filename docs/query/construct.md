@@ -170,6 +170,9 @@ In a JSON-LD query, the block has the `where` clause's graph form, `["graph", <g
 }
 ```
 
+A template node's own `@graph` names the graph too, as it does in a `where` clause:
+`{"@id": "?person", "@graph": "ex:names", "ex:name": "?name"}` is the same block.
+
 Only formats that can express named graphs carry a dataset: TriG, N-Quads and JSON-LD (see
 [Output Formats](#output-formats)). A row that leaves the graph variable unbound writes nothing.
 
