@@ -408,6 +408,26 @@ where
     .await
 }
 
+/// Build `record`'s index incrementally over its published index, as
+/// [`build_index_for_record`] tries first, but with no fallback to a full
+/// rebuild: an incremental failure is returned. For tests that must know the
+/// incremental path ran. Only with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+pub async fn build_incremental_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    incremental_index(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
 /// Incremental index from an existing FIR6 root.
 ///
 /// Loads the existing `IndexRoot`, resolves only new commits, merges

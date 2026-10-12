@@ -1213,8 +1213,8 @@ impl TriggerHandle {
 
     /// Halt `ledger_id` as a build that started from `index_t` and stopped on
     /// committed data it cannot index would ([`IndexStatusSnapshot::halted`]),
-    /// for tests of what lifts a halt.
-    #[doc(hidden)]
+    /// for tests of what lifts a halt. Only with the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn halt_for_test(&self, ledger_id: &LedgerId, index_t: i64, error: &str) {
         let mut states = self.states.lock().await;
         let state = states.entry(ledger_id.clone()).or_default();
@@ -1415,8 +1415,9 @@ impl IndexerHandle {
         self.trigger.clear_halt(ledger_id).await;
     }
 
-    /// See [`TriggerHandle::halt_for_test`].
-    #[doc(hidden)]
+    /// See [`TriggerHandle::halt_for_test`]. Only with the `test-utils`
+    /// feature.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn halt_for_test(&self, ledger_id: &LedgerId, index_t: i64, error: &str) {
         self.trigger.halt_for_test(ledger_id, index_t, error).await;
     }

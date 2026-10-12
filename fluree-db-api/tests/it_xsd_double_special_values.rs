@@ -113,8 +113,10 @@ async fn reindexed(fluree: &Fluree, ledger_id: &str) -> LedgerState {
     fully_indexed(fluree, ledger_id).await
 }
 
+/// Built incrementally, with no fallback to a full rebuild, so this lane
+/// cannot quietly become a second rebuild lane.
 async fn incrementally_indexed(fluree: &Fluree, ledger_id: &str) -> LedgerState {
-    support::build_and_publish_index(fluree, ledger_id).await;
+    support::build_incrementally_and_publish_index(fluree, ledger_id).await;
     fully_indexed(fluree, ledger_id).await
 }
 
