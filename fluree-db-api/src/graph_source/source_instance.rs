@@ -76,6 +76,49 @@ pub(crate) fn check_source_instance(
     )))
 }
 
+impl crate::Fluree {
+    /// Refuse a query of `record`, a BM25 or vector index, while its source
+    /// ledger's name holds another ledger than the one it indexed; see
+    /// [`check_source_instance`]. A name that holds no ledger does not
+    /// suspend it: the dropped ledger can still be restored.
+    ///
+    /// The source's storage root comes from the ledger manager, which
+    /// remembers it once looked up and forgets it when an event says a
+    /// ledger was created, dropped or replaced under the name: a query pays
+    /// a lookup only the first time.
+    pub(crate) async fn check_index_query(&self, record: &GraphSourceRecord) -> Result<()> {
+        if !(record.is_bm25() || record.is_vector()) {
+            return Ok(());
+        }
+        let Some(source) = record.dependencies.first() else {
+            return Ok(());
+        };
+        match self.source_root(source).await? {
+            Some(root) => check_source_instance(record, source, &root),
+            None => Ok(()),
+        }
+    }
+
+    /// The storage root of the ledger `source` names now, if any.
+    async fn source_root(&self, source: &str) -> Result<Option<StorageRoot>> {
+        let id = fluree_db_core::LedgerId::parse(source)?;
+        let manager = self.ledger_manager();
+        if let Some(root) = manager.and_then(|m| m.remembered_root(&id)) {
+            return Ok(root);
+        }
+        let epoch = manager.map(|m| m.root_epoch());
+        let root = self
+            .nameservice()
+            .lookup(id.as_ref())
+            .await?
+            .map(|record| record.storage_root());
+        if let (Some(manager), Some(epoch)) = (manager, epoch) {
+            manager.remember_root(epoch, &id, root.clone());
+        }
+        Ok(root)
+    }
+}
+
 /// Refuse to govern `record` by `current`, the ledger its `model` names now,
 /// unless that is the ledger it was registered with, `recorded`.
 #[cfg(feature = "iceberg")]

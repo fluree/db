@@ -1682,6 +1682,9 @@ pub fn spawn_local_cache_event_listener(
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerCreated {
                     ledger_id, ..
                 }) => {
+                    if let Ok(id) = LedgerId::parse(&ledger_id) {
+                        ledger_manager.forget_root(&id);
+                    }
                     reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted {
@@ -1710,6 +1713,7 @@ pub fn spawn_local_cache_event_listener(
                     // this could re-trigger Lagged. Not observed in
                     // practice; revisit with a bound or a provably-behind
                     // scope only if it proves to arise.
+                    ledger_manager.forget_roots();
                     let aliases = ledger_manager.cached_aliases().await;
                     tracing::warn!(
                         skipped,

@@ -633,19 +633,28 @@ impl crate::Fluree {
         &self,
         graph_source_id: &str,
     ) -> Result<Bm25Manifest> {
-        match self
+        let record = self
             .nameservice()
             .lookup_graph_source(graph_source_id)
-            .await?
-        {
-            Some(record) if record.index_id.is_some() => {
-                let index_cid = record.index_id.as_ref().unwrap();
+            .await?;
+        self.bm25_manifest_of(graph_source_id, record.as_ref())
+            .await
+    }
+
+    /// [`Self::load_or_create_bm25_manifest`] for a record already in hand.
+    pub(crate) async fn bm25_manifest_of(
+        &self,
+        graph_source_id: &str,
+        record: Option<&fluree_db_nameservice::GraphSourceRecord>,
+    ) -> Result<Bm25Manifest> {
+        match record.and_then(|r| r.index_id.as_ref()) {
+            Some(index_cid) => {
                 let cs = self.graph_source_store(graph_source_id)?;
                 let bytes = cs.get(index_cid).await?;
                 let manifest: Bm25Manifest = serde_json::from_slice(&bytes)?;
                 Ok(manifest)
             }
-            _ => Ok(Bm25Manifest::new(graph_source_id)),
+            None => Ok(Bm25Manifest::new(graph_source_id)),
         }
     }
 
@@ -735,7 +744,17 @@ impl crate::Fluree {
         graph_source_id: &str,
     ) -> Result<Arc<fluree_db_query::bm25::Bm25Index>> {
         let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
-        let manifest = self.load_bm25_manifest(graph_source_id).await?;
+        let record = self
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await?
+            .ok_or_else(|| {
+                crate::ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
+            })?;
+        self.check_index_query(&record).await?;
+        let manifest = self
+            .bm25_manifest_of(graph_source_id, Some(&record))
+            .await?;
         let head = manifest.head().ok_or_else(|| {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
         })?;
@@ -1494,6 +1513,13 @@ impl crate::Fluree {
             .ok_or_else(|| {
                 crate::ApiError::NotFound(format!("Source ledger not found: {source_ledger}"))
             })?;
+
+        // Not over another ledger than the one it indexed.
+        crate::graph_source::source_instance::check_source_instance(
+            &record,
+            &source_ledger,
+            &ledger_record.storage_root(),
+        )?;
 
         let index_t = record.index_t;
         let ledger_t = ledger_record.commit_t;

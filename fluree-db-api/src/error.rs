@@ -672,7 +672,8 @@ impl ApiError {
             e if e.is_fenced() => 409,
             e if e.is_lifecycle_conflict() => 409,
             ApiError::BranchConflict(_) => 409,
-            ApiError::GraphSourceSuspended(_) => 409,
+            ApiError::GraphSourceSuspended(_)
+            | ApiError::Query(fluree_db_query::QueryError::GraphSourceSuspended(_)) => 409,
             ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
             ApiError::CommitNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,

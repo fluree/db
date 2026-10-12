@@ -2095,6 +2095,25 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
         .await
         .unwrap()
         .graph_source_id;
+    let search = |text: &str| {
+        json!({
+            "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "where": [{
+                "f:graphSource": &gs,
+                "f:searchText": text,
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+            }],
+            "select": ["?doc"]
+        })
+    };
+    // Searched before the drops below: whatever a search remembers about
+    // the ledger must not outlive them.
+    fluree
+        .query_connection(&search("original"))
+        .await
+        .expect("searched");
 
     // Dropped and restored: the same ledger, so the source keeps syncing.
     let dropped = fluree
@@ -2118,6 +2137,10 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
         .sync_bm25_index(&gs)
         .await
         .expect("a restored ledger is the one indexed");
+    fluree
+        .query_connection(&search("original"))
+        .await
+        .expect("the restored ledger's index is searched");
 
     // Dropped and its name reused: another ledger.
     fluree
@@ -2137,8 +2160,18 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
         assert!(matches!(err, ApiError::GraphSourceSuspended(_)), "{err}");
         assert_eq!(err.status_code(), 409);
     }
-    let idx = fluree.load_bm25_index(&gs).await.unwrap();
-    assert_eq!(hits(&idx, "replacement"), 0, "nothing synced from it");
+    // Nor is it searched, by a query through the path `POST /query` takes,
+    // or loaded: its hits are the dropped ledger's.
+    let err = fluree
+        .query_connection(&search("original"))
+        .await
+        .expect_err("a suspended index is not searched");
+    assert_eq!(err.status_code(), 409, "{err}");
+    let err = fluree
+        .load_bm25_index(&gs)
+        .await
+        .expect_err("a suspended index is not loaded");
+    assert_eq!(err.status_code(), 409, "{err}");
     // Staleness reports the suspension rather than comparing against the
     // replacement's head, which is behind the index.
     let check = fluree.check_bm25_staleness(&gs).await.unwrap();
@@ -2155,6 +2188,18 @@ async fn bm25_suspends_when_its_ledger_is_replaced() {
     let idx = fluree.load_bm25_index(&gs).await.unwrap();
     assert_eq!(hits(&idx, "replacement"), 1);
     assert_eq!(hits(&idx, "original"), 0);
+    let found = fluree
+        .query_connection(&search("replacement"))
+        .await
+        .expect("the recreated index is searched");
+    assert_eq!(
+        found
+            .batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .sum::<usize>(),
+        1
+    );
     assert!(!fluree.check_bm25_staleness(&gs).await.unwrap().suspended);
     fluree
         .sync_bm25_index(&gs)

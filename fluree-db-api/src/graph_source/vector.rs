@@ -330,6 +330,7 @@ impl crate::Fluree {
             .ok_or_else(|| {
                 crate::ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
             })?;
+        self.check_index_query(&record).await?;
 
         // Get index CID
         let index_cid = record.index_id.ok_or_else(|| {

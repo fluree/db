@@ -1342,6 +1342,20 @@ pub struct LedgerManager {
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
+    /// The storage roots of ledgers graph-source queries have checked their
+    /// indexes against, `None` for a name nothing holds; see
+    /// [`Self::remembered_root`]. Cleared, by [`Self::forget_root`] and
+    /// [`Self::forget_roots`], whenever an event says a ledger was created,
+    /// dropped or replaced, and by a disconnect.
+    source_roots: std::sync::RwLock<SourceRoots>,
+}
+
+/// [`LedgerManager::source_roots`], with the count of clears so far: a root
+/// looked up before a clear is not remembered after it.
+#[derive(Default)]
+struct SourceRoots {
+    roots: HashMap<LedgerId, Option<fluree_db_core::StorageRoot>>,
+    clears: u64,
 }
 
 impl LedgerManager {
@@ -1364,7 +1378,71 @@ impl LedgerManager {
             shutdown: AtomicBool::new(false),
             load_generation: AtomicU64::new(0),
             head_watermarks: std::sync::RwLock::new(HashMap::new()),
+            source_roots: std::sync::RwLock::new(SourceRoots::default()),
         }
+    }
+
+    /// The storage root remembered for `ledger_id`, if any: `Some(None)`
+    /// when the name held no ledger when last looked up.
+    pub fn remembered_root(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Option<Option<fluree_db_core::StorageRoot>> {
+        self.source_roots
+            .read()
+            .expect("source root lock never poisoned")
+            .roots
+            .get(ledger_id)
+            .cloned()
+    }
+
+    /// A token for [`Self::remember_root`], taken before the lookup whose
+    /// result it remembers.
+    pub fn root_epoch(&self) -> u64 {
+        self.source_roots
+            .read()
+            .expect("source root lock never poisoned")
+            .clears
+    }
+
+    /// Remember `root` for `ledger_id`, unless anything was forgotten since
+    /// `epoch` was taken: the lookup may have read the ledger the clear was
+    /// about.
+    pub fn remember_root(
+        &self,
+        epoch: u64,
+        ledger_id: &LedgerId,
+        root: Option<fluree_db_core::StorageRoot>,
+    ) {
+        let mut source_roots = self
+            .source_roots
+            .write()
+            .expect("source root lock never poisoned");
+        if source_roots.clears == epoch {
+            source_roots.roots.insert(ledger_id.clone(), root);
+        }
+    }
+
+    /// Forget `ledger_id`'s root: a ledger was created, dropped or replaced
+    /// under its name.
+    pub fn forget_root(&self, ledger_id: &LedgerId) {
+        let mut source_roots = self
+            .source_roots
+            .write()
+            .expect("source root lock never poisoned");
+        source_roots.clears += 1;
+        source_roots.roots.remove(ledger_id);
+    }
+
+    /// Forget every root: events were missed, or a snapshot replaced the
+    /// state they described.
+    pub fn forget_roots(&self) {
+        let mut source_roots = self
+            .source_roots
+            .write()
+            .expect("source root lock never poisoned");
+        source_roots.clears += 1;
+        source_roots.roots.clear();
     }
 
     /// Record that `ledger_id`'s authoritative commit head reached
@@ -1405,6 +1483,7 @@ impl LedgerManager {
     /// for it would: one dropped since is evicted, and one whose name now
     /// holds another activation is reloaded.
     pub async fn reconcile_cached(&self) {
+        self.forget_roots();
         let cached: Vec<LedgerId> = self.entries.read().await.keys().cloned().collect();
         for ledger_id in cached {
             let notify = NsNotify {
@@ -1765,6 +1844,7 @@ impl LedgerManager {
             .write()
             .expect("head watermark lock never poisoned: no panics inside critical section")
             .remove(&canonical_alias);
+        self.forget_root(&canonical_alias);
     }
 
     /// Remove all ledgers from cache (for shutdown)

@@ -130,7 +130,10 @@ impl ServerError {
                 }
             }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
-            ServerError::Api(ApiError::GraphSourceSuspended(_)) => errors::GRAPH_SOURCE_SUSPENDED,
+            ServerError::Api(
+                ApiError::GraphSourceSuspended(_)
+                | ApiError::Query(fluree_db_query::QueryError::GraphSourceSuspended(_)),
+            ) => errors::GRAPH_SOURCE_SUSPENDED,
             // The code a merge or rebase conflict already gets from the
             // committer as a flattened 409.
             ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
@@ -381,6 +384,9 @@ impl ServerError {
             ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
                 ..
             })) => StatusCode::REQUEST_TIMEOUT,
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::GraphSourceSuspended(_),
+            )) => StatusCode::CONFLICT,
             ServerError::Api(ApiError::Query(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Batch(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Transact(_)) => StatusCode::BAD_REQUEST,

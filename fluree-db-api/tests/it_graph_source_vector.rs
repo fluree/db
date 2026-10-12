@@ -1127,6 +1127,30 @@ async fn vector_suspends_when_its_ledger_is_replaced() {
     assert!(check.suspended);
     assert!(!check.is_stale);
     assert_eq!(check.lag, 0);
+    // Nor is it searched, by a query through the path `POST /query` takes,
+    // or loaded: its neighbours are the dropped ledger's.
+    let search = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": [{
+            "f:graphSource": &gs,
+            "f:queryVector": [0.1, 0.2, 1.0],
+            "f:distanceMetric": "cosine",
+            "f:searchLimit": 10,
+            "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+        }],
+        "select": ["?doc"]
+    });
+    let err = fluree
+        .query_connection(&search)
+        .await
+        .expect_err("a suspended index is not searched");
+    assert_eq!(err.status_code(), 409, "{err}");
+    let err = fluree
+        .load_vector_index(&gs)
+        .await
+        .expect_err("a suspended index is not loaded");
+    assert_eq!(err.status_code(), 409, "{err}");
 
     fluree.drop_vector_index(&gs).await.unwrap();
     fluree.create_vector_index(config()).await.unwrap();
