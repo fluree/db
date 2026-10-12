@@ -71,10 +71,10 @@ impl BranchOpValidation {
         self.into_result_with(|report| report)
     }
 
-    /// Like [`Self::into_result`], with `describe` wrapping a SHACL report in
-    /// the operation's own context (which commit a rebase stopped on, say).
-    /// A uniqueness violation or config refusal already names what it refuses
-    /// and is returned as it is.
+    /// Like [`Self::into_result`], with `describe` wrapping the refusal's
+    /// message in the operation's own context (which commit a rebase stopped
+    /// on, say): a SHACL report and a config refusal. A uniqueness violation
+    /// is returned as its typed error, which carries no free text.
     pub(crate) fn into_result_with(self, describe: impl FnOnce(String) -> String) -> Result<()> {
         match self.rejection {
             None => Ok(()),
@@ -89,10 +89,7 @@ impl BranchOpValidation {
                 let _ = describe;
                 Err(rejection.into())
             }
-            Some(Rejection::Config(message)) => {
-                let _ = describe;
-                Err(ApiError::BranchConflict(message))
-            }
+            Some(Rejection::Config(message)) => Err(ApiError::BranchConflict(describe(message))),
         }
     }
 }

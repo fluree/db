@@ -450,6 +450,113 @@ async fn rebase_rejected_when_replay_violates_shape() {
     assert_eq!(names(&fluree, "mydb:dev").await, vec!["A", "B"]);
 }
 
+/// A rebase stopped by a uniqueness violation is refused with that
+/// violation: a commit that held a value on the branch cannot be replayed
+/// onto a source that has since made the property unique and holds the value.
+#[tokio::test]
+async fn rebase_rejected_when_replay_violates_uniqueness() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("uniqdb").await.unwrap();
+    let main = fluree
+        .insert(ledger, &insert_name("ex:alice", "A"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("uniqdb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("uniqdb:dev").await.unwrap();
+    fluree
+        .insert(dev, &insert_name("ex:bob", "A"))
+        .await
+        .expect("nothing is unique on dev");
+    fluree
+        .stage_owned(main)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <{EX}> .
+             ex:name f:enforceUnique true .
+             GRAPH <{}> {{
+               <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:tx> .
+               <urn:config:tx> f:uniqueEnabled true .
+             }}",
+            config_graph_iri("uniqdb:main")
+        ))
+        .execute()
+        .await
+        .expect("main makes ex:name unique");
+
+    let err = fluree
+        .rebase_branch("uniqdb", "dev", ConflictStrategy::default())
+        .await
+        .expect_err("replaying bob's name onto main's constraint must be refused");
+    assert!(
+        matches!(
+            err,
+            ApiError::Transact(TransactError::UniqueConstraintViolation { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(names(&fluree, "uniqdb:dev").await, vec!["A", "A"]);
+}
+
+/// A rebase stopped by a config refusal names the commit it stopped on. The
+/// source links a setting group from its config graph after the fork; the
+/// branch wrote that group's field in the default graph, which was data on
+/// the branch. Replaying it onto the source would split the group.
+#[tokio::test]
+async fn rebase_refused_by_a_config_check_names_the_commit() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("cfgdb").await.unwrap();
+    let main = fluree
+        .insert(ledger, &insert_name("ex:alice", "A"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("cfgdb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("cfgdb:dev").await.unwrap();
+    let dev_t = fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:shacl",
+                "f:shaclEnabled": true
+            }),
+        )
+        .await
+        .expect("a field on a node nothing links is data on dev")
+        .ledger
+        .t();
+    fluree
+        .stage_owned(main)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+             }}",
+            config_graph_iri("cfgdb:main")
+        ))
+        .execute()
+        .await
+        .expect("main links the group");
+
+    let err = fluree
+        .rebase_branch("cfgdb", "dev", ConflictStrategy::default())
+        .await
+        .expect_err("the replay would split main's group");
+    assert_eq!(err.status_code(), 409, "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("replaying commit t={dev_t}"))
+            && message.contains("urn:config:shacl"),
+        "{message}"
+    );
+}
+
 // =============================================================================
 // Revert
 // =============================================================================
