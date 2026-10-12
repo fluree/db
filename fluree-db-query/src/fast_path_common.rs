@@ -3901,8 +3901,9 @@ pub enum PredicateFastPath {
 ///   uncovered + default-allow).
 /// - [`PredicateFastPath::Empty`] — uncovered + default-deny: emit the empty
 ///   result for this predicate without scanning.
-/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the query is
-///   multi-ledger / historical: take the filtered fallback.
+/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the scope
+///   reads more than one graph ([`ExecutionContext::reads_exactly_one_graph`])
+///   or is historical: take the filtered fallback.
 ///
 /// Only valid for an operator that scans exactly one ground predicate; multi- or
 /// wildcard-predicate fast paths must keep using [`allow_cursor_fast_path`]
@@ -3912,7 +3913,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.is_history_range() {
+    if !ctx.reads_exactly_one_graph() || ctx.is_history_range() {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.
