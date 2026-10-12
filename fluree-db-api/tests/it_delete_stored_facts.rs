@@ -122,6 +122,29 @@ async fn seeded(
     (dir, fluree, ledger)
 }
 
+/// [`seeded`], with the seed written by a SPARQL update.
+async fn seeded_with(
+    name: &str,
+    update: &str,
+    indexed: bool,
+) -> (tempfile::TempDir, Fluree, LedgerState) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("file fluree");
+    let id = format!("it/delete-stored-{name}-{indexed}:main");
+    let ledger = fluree.create_ledger(&id).await.expect("create");
+    let ledger = sparql_update(&fluree, ledger, update).await.ledger;
+    if !indexed {
+        return (dir, fluree, ledger);
+    }
+    drop(ledger);
+    support::rebuild_and_publish_index(&fluree, &id).await;
+    let ledger = fluree.ledger(&id).await.expect("reload");
+    assert!(ledger.snapshot.range_provider.is_some());
+    (dir, fluree, ledger)
+}
+
 fn no_commit(r: &TransactResult, t_before: i64, what: &str) {
     assert_eq!(
         (r.receipt.flake_count, r.ledger.t()),
@@ -1268,9 +1291,6 @@ async fn delete_insert_of_one_value_refused_by_policy_regardless_of_stored_value
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Restating a value the identity can view commits nothing, without modify
-/// permission, as it did before; a changed value is still refused. As root,
-/// a restatement commits nothing either.
 /// A transfer judges a fact the destination already holds as a restatement:
 /// `ADD` or `COPY` of a value the identity can neither view nor modify is
 /// refused with one answer whether or not the destination holds it. A held
@@ -1326,6 +1346,9 @@ async fn transfer_refused_by_policy_regardless_of_destination_contents() {
     }
 }
 
+/// Restating a value the identity can view commits nothing, without modify
+/// permission, as it did before; a changed value is still refused. As root,
+/// a restatement commits nothing either.
 #[tokio::test]
 async fn restating_a_viewable_value_commits_nothing_without_modify() {
     for indexed in [false, true] {
@@ -1360,6 +1383,80 @@ async fn restating_a_viewable_value_commits_nothing_without_modify() {
         .await
         .expect("restating a viewable value");
         no_commit(&r, t, &format!("SPARQL, indexed={indexed}"));
+    }
+}
+
+const G2: &str = "http://example.org/g2";
+
+/// `G1` holding Alice's name and salary, and with `dest_holds` `G2` holding
+/// the same facts; optionally indexed.
+async fn transfer_seed(
+    name: &str,
+    dest_holds: bool,
+    indexed: bool,
+) -> (tempfile::TempDir, Fluree, LedgerState) {
+    let alice = r#"ex:alice ex:name "Alice" ; ex:salary 100 ."#;
+    let dest = if dest_holds {
+        format!("GRAPH <{G2}> {{ {alice} }}")
+    } else {
+        String::new()
+    };
+    seeded_with(
+        name,
+        &format!("INSERT DATA {{ GRAPH <{G1}> {{ {alice} }} {dest} }}"),
+        indexed,
+    )
+    .await
+}
+
+/// ADD, COPY and MOVE into a graph are refused with one answer whether or
+/// not the destination already holds the source's facts, the source holding
+/// a name the identity may change beside the salary it may not. A fact the
+/// destination holds is restated, not skipped unseen: when the identity
+/// cannot view it, both sides go to the modify check, as for upsert and
+/// sync. (MOVE also retracts the source, which this identity may not.)
+#[tokio::test]
+async fn add_copy_and_move_are_refused_regardless_of_destination_contents() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for dest_holds in [false, true] {
+            for verb in ["ADD", "COPY", "MOVE"] {
+                let (_d, fluree, ledger) =
+                    transfer_seed("restate-transfer", dest_holds, indexed).await;
+                let policy = name_only(&ledger).await;
+                let r =
+                    sparql_update_as(&fluree, ledger, &format!("{verb} <{G1}> TO <{G2}>"), policy)
+                        .await;
+                failures.extend(not_refused(
+                    r,
+                    &format!("{verb}, dest_holds={dest_holds}, indexed={indexed}"),
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A destination fact the identity can view, restated by ADD or COPY,
+/// commits nothing without modify permission, as before; as root as well.
+#[tokio::test]
+async fn transferring_viewable_facts_the_destination_holds_commits_nothing() {
+    for indexed in [false, true] {
+        for verb in ["ADD", "COPY"] {
+            let body = format!("{verb} <{G1}> TO <{G2}>");
+            let (_d, fluree, ledger) = transfer_seed("restate-transfer-view", true, indexed).await;
+            let t = ledger.t();
+            let policy = view_all_modify_name(&ledger).await;
+            let r = sparql_update_as(&fluree, ledger, &body, policy)
+                .await
+                .expect(&body);
+            no_commit(&r, t, &format!("{body}, indexed={indexed}"));
+
+            let (_d, fluree, ledger) = transfer_seed("restate-transfer-root", true, indexed).await;
+            let t = ledger.t();
+            let r = sparql_update(&fluree, ledger, &body).await;
+            no_commit(&r, t, &format!("root, {body}, indexed={indexed}"));
+        }
     }
 }
 
