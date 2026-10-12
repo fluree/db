@@ -49,6 +49,19 @@ pub(crate) fn storage_ledger_id(
 /// reserved in ledger and branch names, so no name reaches an instance folder.
 const INSTANCE_SEPARATOR: &str = "/@";
 
+/// A ULID's 128 bits, decoded from its 26 Crockford base32 characters, or
+/// `None` when `id` is not one.
+fn ulid_bits(id: &str) -> Option<u128> {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    if id.len() != 26 {
+        return None;
+    }
+    id.bytes().try_fold(0u128, |bits, c| {
+        let digit = ALPHABET.iter().position(|&a| a == c)?;
+        bits.checked_mul(32)?.checked_add(digit as u128)
+    })
+}
+
 /// Identifies one incarnation of a ledger: created, imported, or restored from
 /// an archive. Unique across the whole registry and never reused, so nothing
 /// keyed by it can be confused with a later ledger of the same name.
@@ -143,6 +156,13 @@ impl StorageRoot {
     pub fn instance(&self) -> Option<InstanceId> {
         let (_, instance) = self.0.rsplit_once(INSTANCE_SEPARATOR)?;
         InstanceId::parse(instance).ok()
+    }
+
+    /// The 128 bits of this root's instance ULID, or `None` for a name
+    /// root. For keying caches by incarnation: no parse, no allocation.
+    pub fn instance_bits(&self) -> Option<u128> {
+        let (_, instance) = self.0.rsplit_once(INSTANCE_SEPARATOR)?;
+        ulid_bits(instance)
     }
 
     /// The ledger name this root sits under.
@@ -287,6 +307,24 @@ impl fmt::Debug for StorageNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An instance root's bits are its ULID's; a name root has none.
+    #[test]
+    fn instance_bits_decode_the_ulid() {
+        let name = LedgerName::parse("mydb").unwrap();
+        let root = |id: &str| StorageRoot::for_instance(&name, &InstanceId::parse(id).unwrap());
+        assert_eq!(root("00000000000000000000000001").instance_bits(), Some(1));
+        assert_eq!(root("0000000000000000000000000Z").instance_bits(), Some(31));
+        assert_eq!(
+            root("7ZZZZZZZZZZZZZZZZZZZZZZZZZ").instance_bits(),
+            Some(u128::MAX)
+        );
+        assert_ne!(
+            root("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").instance_bits(),
+            root("01JB8ZK4X5Y6Z7A8B9C0D1E2F4").instance_bits()
+        );
+        assert_eq!(StorageRoot::legacy(&name).instance_bits(), None);
+    }
 
     #[test]
     fn instance_root_sits_under_the_name() {

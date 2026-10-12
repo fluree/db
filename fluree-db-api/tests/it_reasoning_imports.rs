@@ -949,3 +949,89 @@ async fn owl2rl_domain_axiom_from_transitive_import_types_instance() {
          got {normalized:?}"
     );
 }
+
+// ============================================================================
+// A ledger recreated under a dropped one's name
+// ============================================================================
+
+/// A ledger whose schema source says `ex:Employee rdfs:subClassOf {parent}`,
+/// with `ex:alice` an `ex:Employee`, at t=2.
+async fn seed_schema_ledger(fluree: &fluree_db_api::Fluree, ledger_id: &str, parent: &str) {
+    let ledger = genesis_ledger(fluree, ledger_id).await;
+    let ledger = apply_trig(
+        fluree,
+        ledger,
+        r"
+        @prefix ex: <http://example.org/> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        ex:alice rdf:type ex:Employee .
+        ",
+    )
+    .await;
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix ex: <http://example.org/> .
+
+        GRAPH <http://example.org/ontology/core> {{
+            ex:Employee rdfs:subClassOf {parent} .
+        }}
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:schemaSource <urn:config:schema-ref> .
+            <urn:config:schema-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:schema-source> .
+            <urn:config:schema-source> f:graphSelector <http://example.org/ontology/core> .
+        }}
+        "
+    );
+    apply_trig(fluree, ledger, &trig).await;
+}
+
+async fn people(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec<serde_json::Value> {
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?s",
+        "where": {"@id": "?s", "@type": "ex:Person"},
+        "reasoning": "rdfs"
+    });
+    let view = fluree.db(ledger_id).await.unwrap();
+    let rows = fluree
+        .query(&view, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&view.snapshot)
+        .unwrap();
+    support::normalize_rows(&rows)
+}
+
+/// The resolved schema is cached by ledger and `t`. A ledger dropped and
+/// created again under its name reaches the same `t` with another schema,
+/// and must be reasoned over with its own, not the dropped one's.
+#[tokio::test]
+async fn a_recreated_ledger_is_not_reasoned_over_with_the_dropped_ones_schema() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-imports-recreated:main";
+
+    seed_schema_ledger(&fluree, ledger_id, "ex:Person").await;
+    assert_eq!(people(&fluree, ledger_id).await, [json!("ex:alice")]);
+
+    fluree
+        .drop_ledger(
+            "it/reasoning-imports-recreated",
+            fluree_db_api::DropMode::Soft,
+        )
+        .await
+        .unwrap();
+    seed_schema_ledger(&fluree, ledger_id, "ex:Agent").await;
+    assert_eq!(
+        people(&fluree, ledger_id).await,
+        Vec::<serde_json::Value>::new(),
+        "the recreated ledger's schema makes ex:Employee an ex:Agent, not an ex:Person"
+    );
+}

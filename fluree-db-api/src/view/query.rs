@@ -1821,6 +1821,7 @@ impl Fluree {
 
         let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
             db_ref.snapshot,
+            db.instance_bits,
             db_ref.overlay,
             db_ref.t,
             reasoning,

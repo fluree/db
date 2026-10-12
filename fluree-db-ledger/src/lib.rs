@@ -626,6 +626,17 @@ impl LedgerState {
     /// Where this branch's artifacts live, from its nameservice record. A
     /// state built without one belongs to no created ledger and holds no
     /// data; it reads from its id's namespace at the name.
+    /// The bits of the instance this state belongs to
+    /// ([`StorageRoot::instance_bits`](fluree_db_core::StorageRoot::instance_bits)),
+    /// `0` for a ledger rooted at its name or a state with no record.
+    pub fn instance_bits(&self) -> u128 {
+        self.ns_record
+            .as_ref()
+            .and_then(|r| r.storage_root.as_ref())
+            .and_then(fluree_db_core::StorageRoot::instance_bits)
+            .unwrap_or(0)
+    }
+
     pub fn storage_namespace(&self) -> fluree_db_core::StorageNamespace {
         match &self.ns_record {
             Some(record) => record.storage_namespace(),

@@ -63,6 +63,9 @@ pub struct HistoricalLedgerView {
     runtime_small_dicts: Option<Arc<RuntimeSmallDicts>>,
     /// Time bound for all queries
     to_t: i64,
+    /// The bits of the instance the view belongs to; see
+    /// [`LedgerState::instance_bits`](crate::LedgerState::instance_bits).
+    instance_bits: u128,
 }
 
 impl HistoricalLedgerView {
@@ -190,6 +193,11 @@ impl HistoricalLedgerView {
             overlay,
             runtime_small_dicts: None,
             to_t: target_t,
+            instance_bits: record
+                .storage_root
+                .as_ref()
+                .and_then(fluree_db_core::StorageRoot::instance_bits)
+                .unwrap_or(0),
         })
     }
 
@@ -410,7 +418,14 @@ impl HistoricalLedgerView {
             overlay,
             runtime_small_dicts,
             to_t,
+            instance_bits: 0,
         }
+    }
+
+    /// The bits of the instance the view belongs to; `0` for a ledger rooted
+    /// at its name or a view built from components.
+    pub fn instance_bits(&self) -> u128 {
+        self.instance_bits
     }
 
     /// Get the time bound for this view
