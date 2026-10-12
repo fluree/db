@@ -1880,6 +1880,115 @@ async fn typed_string_literals_under_a_view_policy() {
     failures.assert_none();
 }
 
+/// SPARQL parameters are substituted as constants before lowering, so a
+/// parameterized query answers as the inline one on the lanes that meet a
+/// value in two forms: a subject IRI whose predicates an OPTIONAL, a MINUS and
+/// an EXISTS correlate as subjects, a number a FILTER compares with an indexed
+/// value, and a predicate IRI, in every index state; and a language-tagged and a
+/// custom-datatype literal the range scan matches over a default graph of two
+/// ledgers.
+#[tokio::test(flavor = "current_thread")]
+async fn sparql_parameters_answer_as_the_inline_values() {
+    let param = |v: JsonValue| -> fluree_db_api::SparqlParamMap {
+        v.as_object().expect("a parameter object").clone()
+    };
+    let s1 = || json!({"s": {"@id": "http://example.org/s1"}});
+    let cases: Vec<(&str, &str, JsonValue, &[&str], Rows)> = vec![
+        (
+            "a subject IRI, OPTIONAL on its predicates",
+            "SELECT ?p ?l WHERE { $s ?p ?o OPTIONAL { ?p rdfs:label ?l } }",
+            s1(),
+            &["p", "l"],
+            rows(&[
+                &["derivedFrom", "derived from"],
+                &["mentions", "-"],
+                &["position", "-"],
+                &["text", "text"],
+            ]),
+        ),
+        (
+            "a subject IRI, MINUS on its predicates",
+            "SELECT ?p WHERE { $s ?p ?o MINUS { ?p rdfs:label ?l } }",
+            s1(),
+            &["p"],
+            rows(&[&["mentions"], &["position"]]),
+        ),
+        (
+            "a subject IRI, EXISTS on its predicates",
+            "SELECT ?p WHERE { $s ?p ?o FILTER EXISTS { ?p rdfs:label ?l } }",
+            s1(),
+            &["p"],
+            rows(&[&["derivedFrom"], &["text"]]),
+        ),
+        (
+            "a number a FILTER compares",
+            "SELECT ?s WHERE { ?s ex:position ?n FILTER(?n = $n) }",
+            json!({"n": 2}),
+            &["s"],
+            rows(&[&["s2"]]),
+        ),
+        (
+            "a predicate IRI",
+            "SELECT ?s ?o WHERE { ?s $p ?o }",
+            json!({"p": {"@id": "http://example.org/position"}}),
+            &["s", "o"],
+            rows(&[&["s1", "1"], &["s2", "2"], &["s3", "3"], &["s4", "4"]]),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) = ledger_in(state, "it/sparql-params:main").await;
+        for (label, body, values, vars, want) in &cases {
+            let query = format!("{PREFIXES}{body}");
+            match db(&handle)
+                .await
+                .query(&fluree)
+                .sparql(&query)
+                .params(param(values.clone()))
+                .execute_formatted()
+                .await
+            {
+                Ok(json) => failures.eq(
+                    sparql_rows(&json, vars),
+                    want.clone(),
+                    &format!("{state:?} / {label}"),
+                ),
+                Err(e) => failures
+                    .0
+                    .push(format!("{state:?} / {label}: query failed: {e}")),
+            }
+        }
+    }
+
+    let fluree = two_ledgers().await;
+    let both = format!("FROM <{LEDGER_A}> FROM <{LEDGER_B}>");
+    for (label, body, values) in [
+        (
+            "a language-tagged literal over two ledgers",
+            format!("{PREFIXES}SELECT ?s {both} WHERE {{ ?s ex:label $l }}"),
+            json!({"l": {"@value": "chat", "@language": "fr"}}),
+        ),
+        (
+            "a custom-datatype literal over two ledgers",
+            format!("{PREFIXES}SELECT ?s {both} WHERE {{ ?s ex:code $c }}"),
+            json!({"c": {"@value": "A1", "@type": "http://example.org/Code"}}),
+        ),
+    ] {
+        let result = fluree
+            .query_from()
+            .sparql(&body)
+            .params(param(values))
+            .format(fluree_db_api::FormatterConfig::sparql_json())
+            .execute_formatted()
+            .await;
+        match result {
+            Ok(json) => failures.eq(sparql_rows(&json, &["s"]), rows(&[&["a"], &["b"]]), label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //
