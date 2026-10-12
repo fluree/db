@@ -840,6 +840,56 @@ async fn a_delete_names_a_big_integer_in_a_named_graph() {
 }
 
 // =============================================================================
+// A WHERE-matched DELETE over a value stored more than once in a slot
+// =============================================================================
+
+/// A WHERE-matched DELETE removes every stored entry its WHERE matched: a list
+/// holding `"v"` twice empties, as does `"v"` stored both plain and in a list.
+/// The WHERE yields one row per stored entry, and identical rows take
+/// successive entries; they used to take the first one each, leaving a `"v"`.
+#[tokio::test]
+async fn a_where_matched_delete_removes_each_entry_of_a_repeated_value() {
+    let shapes = [
+        (
+            "repeated in a list",
+            json!({"@id": "ex:s", "ex:items": {"@list": ["v", "v", "w"]}}),
+            3,
+        ),
+        (
+            "plain and in a list",
+            json!({"@graph": [
+                {"@id": "ex:s", "ex:items": "v"},
+                {"@id": "ex:s", "ex:items": {"@list": ["v"]}}
+            ]}),
+            2,
+        ),
+    ];
+    for indexed in [false, true] {
+        for (shape, seed, stored) in &shapes {
+            for surface in ["SPARQL", "JSON-LD"] {
+                let (_d, fluree, ledger) = seeded("repeated-value", seed.clone(), indexed).await;
+                let r = if surface == "SPARQL" {
+                    sparql_update(&fluree, ledger, "DELETE WHERE { ex:s ex:items ?o }").await
+                } else {
+                    jsonld_update(
+                        &fluree,
+                        ledger,
+                        json!({
+                            "where": {"@id": "ex:s", "ex:items": "?o"},
+                            "delete": {"@id": "ex:s", "ex:items": "?o"}
+                        }),
+                    )
+                    .await
+                };
+                let what = format!("{shape}, {surface}, indexed={indexed}");
+                assert_eq!(r.receipt.retract_count, *stored, "{what}");
+                assert!(facts(&fluree, &r.ledger).await.is_empty(), "{what}");
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Modify policy judges every delete a transaction asks for
 // =============================================================================
 

@@ -3967,6 +3967,43 @@ pub(crate) fn value_to_otype_okey(
     }
 }
 
+/// Whether two different terms whose values are of `value`'s kind can share
+/// a key under [`value_to_otype_okey`]: the kinds whose key holds less than
+/// the term. A big number is keyed by its value alone, whatever datatype it
+/// was written with; temporal and duration values are keyed by an encoding
+/// that can hold less than the value (a `dateTime` or `time` keeps
+/// microseconds); a double with no order-preserving encoding takes the null
+/// key, as `Null` does. For every other kind, the key is a function of the
+/// term that no two terms share.
+///
+/// Exhaustive on purpose: a new kind of value has to say which it is.
+pub(crate) fn key_may_merge_terms(value: &FlakeValue) -> bool {
+    match value {
+        FlakeValue::Null
+        | FlakeValue::Double(_)
+        | FlakeValue::BigInt(_)
+        | FlakeValue::Decimal(_)
+        | FlakeValue::DateTime(_)
+        | FlakeValue::Date(_)
+        | FlakeValue::Time(_)
+        | FlakeValue::GYear(_)
+        | FlakeValue::GYearMonth(_)
+        | FlakeValue::GMonth(_)
+        | FlakeValue::GDay(_)
+        | FlakeValue::GMonthDay(_)
+        | FlakeValue::YearMonthDuration(_)
+        | FlakeValue::DayTimeDuration(_)
+        | FlakeValue::Duration(_) => true,
+        FlakeValue::Ref(_)
+        | FlakeValue::Boolean(_)
+        | FlakeValue::Long(_)
+        | FlakeValue::String(_)
+        | FlakeValue::Json(_)
+        | FlakeValue::GeoPoint(_)
+        | FlakeValue::Vector(_) => false,
+    }
+}
+
 /// Resolve a big numeric value to its `(NUM_BIG_OVERFLOW, arena handle)`
 /// encoding, or `Unsupported` when the value is not in the arena / no
 /// `(g_id, p_id)` context is available.

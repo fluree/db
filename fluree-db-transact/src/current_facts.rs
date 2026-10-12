@@ -22,15 +22,18 @@
 //! An intent names a stored fact when it holds the same term: value, exact
 //! datatype, and language tag compared case-insensitively. A fact read from
 //! the persisted index is also named by its index key, which keeps less
-//! than some terms carry (see [`SlotMatcher`]).
+//! than some terms carry (see [`IndexKeys`]).
 //!
 //! ## The read
 //!
 //! Per `(graph, subject, predicate)` slot (or subject): one seek into the
 //! persisted index through `NoOverlay` (no novelty translation, no shared
 //! LRU entry), plus a Sid-space seek into novelty bounded by the slot's
-//! sentinels, then [`resolve_current_flakes`]: the newest op per fact wins
-//! and retractions drop out. Index rows come back without their graph, so
+//! sentinels. The ops are then resolved the way storage resolves them. Ops
+//! that share an index key are one stored fact, whose newest op wins
+//! ([`IndexKeys::merge`]); the rest resolve by term identity
+//! ([`resolve_current_flakes`]): the newest op per fact wins and
+//! retractions drop out. Index rows come back without their graph, so
 //! every survivor is stamped with the slot's graph Sid.
 //!
 //! When a graph's novelty is small relative to the number of slots asked
@@ -49,6 +52,8 @@ use fluree_db_core::{
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_query::BinaryRangeProvider;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -60,12 +65,18 @@ use std::hash::{Hash, Hasher};
 /// seek's log factor and per-call overhead catch up with a probe per flake.
 pub const NOVELTY_WALK_RATIO: usize = 16;
 
+/// Facts in a slot beyond which [`DeleteResolver`] matches the slot through
+/// an index and keeps it for the rest of the transaction. At or below it a
+/// scan costs less than building one, and a later batch that names the slot
+/// reads it again.
+const NARROW_SLOT: usize = 16;
+
 /// Where a stored fact's surviving op was read from.
 ///
 /// Index rows are decodes, and some decodes are lossy — a big integer's
 /// declared XSD subtype is not stored, so it decodes as `xsd:integer`. The
 /// origin tells the resolver which facts it may name by index key
-/// ([`SlotMatcher`]).
+/// ([`IndexKeys`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     /// The persisted index.
@@ -107,7 +118,7 @@ impl StoredFact {
 ///
 /// The field is private to this module: a `Retraction` comes from
 /// [`StoredFact::retract`] or from a WHERE row proven to be the decode of a
-/// stored fact (see `resolve_intents`), and from nowhere else.
+/// stored fact (see [`DeleteResolver`]), and from nowhere else.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retraction(Flake);
 
@@ -131,8 +142,8 @@ impl Retraction {
 
 /// What one DELETE template instantiation asks to retract: the instantiated
 /// `(g, s, p, o, dt, m)` at the transaction's `t`. Not a retraction —
-/// [`CurrentFacts::resolve_intents`] turns it into one only if it names a
-/// stored fact, or it is a WHERE row proven to be the decode of one.
+/// [`DeleteResolver::resolve`] turns it into one only if it names a stored
+/// fact, or it is a WHERE row proven to be the decode of one.
 #[derive(Clone, Debug)]
 pub(crate) struct RetractIntent {
     flake: Flake,
@@ -171,8 +182,8 @@ impl ListFree {
 pub(crate) struct ResolveStats {
     /// Witnessed rows retracted as decoded, with no read.
     pub(crate) witnessed: usize,
-    /// Witnessed rows on a list-bearing ledger resolved to the stored facts
-    /// holding their term.
+    /// Witnessed rows on a list-bearing ledger, matched to the stored fact
+    /// they decode.
     pub(crate) enriched: usize,
     /// Intents matched to a stored fact.
     pub(crate) matched: usize,
@@ -225,164 +236,134 @@ fn same_term(stored: &Flake, intent: &Flake) -> bool {
         && lang_matches(lang_of(stored), lang_of(intent))
 }
 
-/// Which of `candidates` (positions of facts that hold an intent's term or
-/// key, in SPOT order) the intent names. An intent with a list position
-/// names that position. One without names the first list entry, else the
-/// plain value: the contract hydration had, under which a value asserted at
-/// N list positions loses exactly one entry per distinct DELETE row.
-fn pick(
-    facts: &[StoredFact],
-    candidates: impl Iterator<Item = usize> + Clone,
-    intent: &Flake,
-) -> Option<usize> {
-    let position = |n: &usize| list_index_of(&facts[*n].flake);
-    match list_index_of(intent) {
-        Some(i) => candidates.clone().find(|n| position(n) == Some(i)),
-        None => candidates
-            .clone()
-            .find(|n| position(n).is_some())
-            .or_else(|| candidates.clone().find(|n| position(n).is_none())),
-    }
-}
-
-/// A hash of a flake's term, consistent with [`same_term`]: value, exact
-/// datatype and the language tag lowercased.
+/// A hash of a flake's term that agrees with [`same_term`]: `FlakeValue`'s
+/// `Hash` agrees with its `Eq`, and the tag is hashed lowercased. In memory
+/// only; a collision costs a comparison, never a wrong match.
 fn term_hash(f: &Flake) -> u64 {
-    let mut h = rustc_hash::FxHasher::default();
+    let mut h = FxHasher::default();
     f.o.hash(&mut h);
     f.dt.hash(&mut h);
     match lang_of(f) {
-        Some(lang) => lang
-            .bytes()
-            .for_each(|b| b.to_ascii_lowercase().hash(&mut h)),
-        None => 0xffu8.hash(&mut h),
+        None => h.write_u8(0),
+        Some(lang) => {
+            h.write_u8(1);
+            for b in lang.bytes() {
+                h.write_u8(b.to_ascii_lowercase());
+            }
+        }
     }
     h.finish()
 }
 
-/// The ledger's binary index provider, the source of index keys.
-fn binary_provider(ledger: &LedgerState) -> Option<&BinaryRangeProvider> {
-    ledger
-        .snapshot
-        .range_provider
-        .as_ref()
-        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-}
+/// A fact's persisted index key, `(o_type, o_key)`.
+type IndexKey = (u16, u64);
 
-/// One slot's facts, indexed once so an intent finds its candidates by hash
-/// rather than by scanning the slot (a delete of every value of a wide slot
-/// was quadratic).
-struct SlotLookup {
-    /// Positions of the facts holding each term ([`term_hash`]), SPOT order.
-    by_term: HashMap<u64, Vec<usize>>,
-    /// Some fact of the slot is a list entry.
-    has_entries: bool,
-    /// Some list entry was read from the index.
-    has_indexed_entries: bool,
-    /// Some fact was read from the index.
-    has_indexed: bool,
-    /// Positions of the facts read from the index, by index key, built on
-    /// first use.
-    by_key: Option<HashMap<(u16, u64), Vec<usize>>>,
-    /// Facts a witnessed row has already retracted.
-    retracted: Vec<bool>,
-}
-
-impl SlotLookup {
-    fn new(facts: &[StoredFact]) -> Self {
-        let mut by_term: HashMap<u64, Vec<usize>> = HashMap::with_capacity(facts.len());
-        let (mut has_entries, mut has_indexed_entries, mut has_indexed) = (false, false, false);
-        for (n, f) in facts.iter().enumerate() {
-            by_term.entry(term_hash(&f.flake)).or_default().push(n);
-            let entry = list_index_of(&f.flake).is_some();
-            let indexed = f.origin == Origin::Index;
-            has_entries |= entry;
-            has_indexed_entries |= entry && indexed;
-            has_indexed |= indexed;
-        }
-        Self {
-            by_term,
-            has_entries,
-            has_indexed_entries,
-            has_indexed,
-            by_key: None,
-            retracted: vec![false; facts.len()],
-        }
-    }
-
-    /// Positions of the facts holding `intent`'s term, in SPOT order.
-    fn term_candidates<'a>(
-        &'a self,
-        facts: &'a [StoredFact],
-        intent: &'a Flake,
-    ) -> impl Iterator<Item = usize> + Clone + 'a {
-        self.by_term
-            .get(&term_hash(intent))
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(move |&n| same_term(&facts[n].flake, intent))
-    }
-}
-
-/// Matches intents against the facts of their slots: by term, and, for a
-/// fact read from the persisted index, by index key.
+/// Index keys, for the kinds of value whose key two terms can share.
 ///
 /// The index keeps less than some terms carry: a big integer keeps no XSD
-/// subtype, a `dateTime` or `time` keeps microseconds. An indexed fact's
-/// decode can therefore differ from the term that was written, and from
-/// the term a query row carries for it. Terms with one index key are one
-/// stored fact to the index, which merges every retraction by that key; so
-/// an intent whose key is an indexed fact's key names that fact, and the
-/// resolver retracts the fact as read.
-struct SlotMatcher<'l> {
+/// subtype, a `dateTime` or `time` keeps microseconds. Terms with one index
+/// key are one stored fact to storage, which merges every op by that key,
+/// in the index and in queries over novelty alike (`resolve_overlay_ops`).
+/// So an indexed fact's decode can differ from the term that was written,
+/// and from the term a query row carries for it, and an op on one term can
+/// retract a fact stored as another.
+///
+/// Only the kinds [`BinaryRangeProvider::key_may_merge_terms`] names can do
+/// that; for every other kind one term is one key. Keys are computed for
+/// those kinds alone, so a slot of strings, IRIs or integers never pays for
+/// one. With no index there are no keys, and storage resolves novelty by
+/// term too.
+struct IndexKeys<'l> {
     provider: Option<&'l BinaryRangeProvider>,
-    /// Per slot, built on first use.
-    lookups: Vec<Option<SlotLookup>>,
 }
 
-impl<'l> SlotMatcher<'l> {
-    fn new(ledger: &'l LedgerState, slots: usize) -> Self {
+impl<'l> IndexKeys<'l> {
+    fn new(ledger: &'l LedgerState) -> Self {
         Self {
-            provider: binary_provider(ledger),
-            lookups: (0..slots).map(|_| None).collect(),
+            provider: ledger
+                .snapshot
+                .range_provider
+                .as_ref()
+                .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>()),
         }
     }
 
-    fn lookup(&mut self, slot: usize, facts: &[StoredFact]) -> &mut SlotLookup {
-        self.lookups[slot].get_or_insert_with(|| SlotLookup::new(facts))
+    /// The persisted id of predicate `p`, for [`Self::key`].
+    fn p_id(&self, p: &Sid) -> Option<u32> {
+        self.provider?.persisted_p_id(p)
     }
 
-    /// Positions of the facts of slot `slot` (in graph `g_id`) read from the
-    /// index under `intent`'s key, in SPOT order. `None` when no fact can
-    /// be: no index, no indexed fact in the slot, or no key for the intent
-    /// (its value is in no persisted dictionary, so no indexed row holds it).
-    fn key_candidates(
-        &mut self,
-        slot: usize,
-        g_id: GraphId,
-        facts: &[StoredFact],
-        intent: &Flake,
-    ) -> Option<&[usize]> {
-        let provider = self.provider?;
-        let lookup = self.lookups[slot].get_or_insert_with(|| SlotLookup::new(facts));
-        if !lookup.has_indexed {
+    /// `f`'s index key in graph `g_id` under predicate `p_id` (`f.p`'s
+    /// persisted id), when its kind of value can share one with another term
+    /// and the index can key it. A value no persisted dictionary holds has
+    /// none: storage resolves it by term as well.
+    fn key(&self, g_id: GraphId, p_id: Option<u32>, f: &Flake) -> Option<IndexKey> {
+        if !BinaryRangeProvider::key_may_merge_terms(&f.o) {
             return None;
         }
-        let key = provider.persisted_object_key(g_id, intent)?;
-        let by_key = lookup.by_key.get_or_insert_with(|| {
-            let mut by_key: HashMap<(u16, u64), Vec<usize>> = HashMap::new();
-            for (n, f) in facts.iter().enumerate() {
-                if f.origin == Origin::Index {
-                    if let Some(k) = provider.persisted_object_key(g_id, &f.flake) {
-                        by_key.entry(k).or_default().push(n);
+        self.provider?.persisted_object_key_in(g_id, p_id?, f)
+    }
+
+    /// Merge the ops of one read that share an index key, the way storage
+    /// does: per predicate, key and list position the newest op wins, and on
+    /// one `t` the retraction; the others are dropped, so the term fold that
+    /// follows sees one op per key. Index rows are one per key already (the
+    /// index merged them), so a read changes only when it holds a novelty op
+    /// whose kind of value can share a key; any other read is returned as
+    /// is, with no key computed.
+    fn merge(&self, g_id: GraphId, flakes: Vec<Flake>, index_t: i64) -> Vec<Flake> {
+        if self.provider.is_none()
+            || !flakes
+                .iter()
+                .any(|f| f.t > index_t && BinaryRangeProvider::key_may_merge_terms(&f.o))
+        {
+            return flakes;
+        }
+        let dropped = {
+            let mut p_ids: HashMap<&Sid, Option<u32>> = HashMap::new();
+            let mut winner: HashMap<(&Sid, IndexKey, Option<i32>), usize> = HashMap::new();
+            let mut dropped = vec![false; flakes.len()];
+            for (n, f) in flakes.iter().enumerate() {
+                if !BinaryRangeProvider::key_may_merge_terms(&f.o) {
+                    continue;
+                }
+                let p_id = *p_ids.entry(&f.p).or_insert_with(|| self.p_id(&f.p));
+                let Some(key) = self.key(g_id, p_id, f) else {
+                    continue;
+                };
+                match winner.entry((&f.p, key, list_index_of(f))) {
+                    Entry::Vacant(e) => {
+                        e.insert(n);
+                    }
+                    Entry::Occupied(mut e) => {
+                        let best = *e.get();
+                        if newer(f, &flakes[best]) {
+                            dropped[best] = true;
+                            e.insert(n);
+                        } else {
+                            dropped[n] = true;
+                        }
                     }
                 }
             }
-            by_key
-        });
-        by_key.get(&key).map(Vec::as_slice)
+            dropped
+        };
+        if !dropped.contains(&true) {
+            return flakes;
+        }
+        flakes
+            .into_iter()
+            .zip(dropped)
+            .filter_map(|(f, dropped)| (!dropped).then_some(f))
+            .collect()
     }
+}
+
+/// Storage's rule for two ops on one fact (`resolve_overlay_ops`,
+/// [`resolve_current_flakes`]): the higher `t` wins, and on one `t` the
+/// retraction.
+fn newer(a: &Flake, b: &Flake) -> bool {
+    a.t > b.t || (a.t == b.t && !a.op && b.op)
 }
 
 /// A `(graph, subject, predicate)` slot to read.
@@ -402,6 +383,7 @@ pub struct Slot {
 pub struct CurrentFacts<'l> {
     ledger: &'l LedgerState,
     to_t: i64,
+    keys: IndexKeys<'l>,
 }
 
 impl<'l> CurrentFacts<'l> {
@@ -410,6 +392,7 @@ impl<'l> CurrentFacts<'l> {
         Self {
             ledger,
             to_t: ledger.t(),
+            keys: IndexKeys::new(ledger),
         }
     }
 
@@ -426,7 +409,7 @@ impl<'l> CurrentFacts<'l> {
             let rm = RangeMatch::subject_predicate(slot.s.clone(), slot.p.clone());
             let mut flakes = self.base(slot.g_id, rm).await?;
             novelty.collect_slot(self.ledger, slot, self.to_t, &mut flakes);
-            out.push(self.resolve(flakes, slot.g_id, slot.g_sid.as_ref()));
+            out.push(self.resolve(slot.g_id, flakes, slot.g_sid.as_ref()));
         }
         Ok(out)
     }
@@ -452,7 +435,7 @@ impl<'l> CurrentFacts<'l> {
             self.to_t,
             &mut |f| flakes.push(f.clone()),
         );
-        Ok(self.resolve(flakes, g_id, g_sid))
+        Ok(self.resolve(g_id, flakes, g_sid))
     }
 
     /// Every current fact of graph `g_id`, graph Sid stamped.
@@ -489,134 +472,13 @@ impl<'l> CurrentFacts<'l> {
                 return Err(TransactError::WholeGraphScanTooLarge { limit: l });
             }
         }
-        // Already lifecycle-resolved by the range read.
+        // Already lifecycle-resolved by the range read, which merges novelty
+        // into the index by key.
         let index_t = self.ledger.snapshot.t;
         Ok(flakes
             .into_iter()
             .map(|flake| stored(flake, g_sid, index_t))
             .collect())
-    }
-
-    /// Resolve DELETE intents to retractions.
-    ///
-    /// - A witnessed row on a list-free ledger (`list_free`) is retracted as
-    ///   decoded, with no read: the WHERE just matched that stored fact.
-    /// - A witnessed row on a list-bearing ledger reads its slot, since a
-    ///   WHERE binding does not carry a list position. The witnessing WHERE
-    ///   triple matched every stored fact holding the row's term, so the row
-    ///   retracts each of them as stored (list entries, by term or, for an
-    ///   indexed entry, by index key, and a plain value), each once however
-    ///   many rows name it; a row with no such fact stays as decoded.
-    /// - Every other intent — a template constant, `DELETE DATA`, a value
-    ///   bound by another pattern — is matched against the stored facts of
-    ///   its slot ([`pick`]): by term, else, for a fact read from
-    ///   the index, by index key ([`SlotMatcher`]). The fact is retracted as
-    ///   read. An intent that names no stored fact stages nothing; with
-    ///   `unmatched`, it is also appended there as instantiated, for the
-    ///   caller's modify-policy check.
-    ///
-    /// `graph_of` gives the ledger graph id of an intent's graph Sid.
-    pub(crate) async fn resolve_intents(
-        &self,
-        intents: Vec<RetractIntent>,
-        list_free: Option<&ListFree>,
-        graph_of: impl Fn(&Flake) -> Result<GraphId>,
-        mut unmatched: Option<&mut Vec<Flake>>,
-    ) -> Result<(Vec<Retraction>, ResolveStats)> {
-        let mut stats = ResolveStats::default();
-        let mut out = Vec::with_capacity(intents.len());
-        let mut pending = Vec::new();
-        for intent in intents {
-            if intent.witnessed && list_free.is_some() {
-                stats.witnessed += 1;
-                out.push(Retraction(intent.flake));
-            } else {
-                pending.push(intent);
-            }
-        }
-        if pending.is_empty() {
-            return Ok((out, stats));
-        }
-
-        let mut slot_of: HashMap<(GraphId, Sid, Sid), usize> = HashMap::new();
-        let mut slots: Vec<Slot> = Vec::new();
-        let mut pending_slots = Vec::with_capacity(pending.len());
-        for intent in &pending {
-            let f = &intent.flake;
-            let g_id = graph_of(f)?;
-            let idx = *slot_of
-                .entry((g_id, f.s.clone(), f.p.clone()))
-                .or_insert_with(|| {
-                    slots.push(Slot {
-                        g_id,
-                        g_sid: f.g.clone(),
-                        s: f.s.clone(),
-                        p: f.p.clone(),
-                    });
-                    slots.len() - 1
-                });
-            pending_slots.push(idx);
-        }
-        stats.slot_reads = slots.len();
-        let facts = self.of_slots(&slots).await?;
-        let mut matcher = SlotMatcher::new(self.ledger, slots.len());
-
-        for (intent, idx) in pending.into_iter().zip(pending_slots) {
-            let slot_facts = &facts[idx];
-            let g_id = slots[idx].g_id;
-            let t = intent.flake.t;
-            if intent.witnessed {
-                let flake = intent.flake;
-                let lookup = matcher.lookup(idx, slot_facts);
-                if list_index_of(&flake).is_none() && lookup.has_entries {
-                    let is_entry = |n: &usize| list_index_of(&slot_facts[*n].flake).is_some();
-                    let indexed_entries = lookup.has_indexed_entries;
-                    let mut held: Vec<usize> = lookup.term_candidates(slot_facts, &flake).collect();
-                    // Most witnessed rows are not list entries: no key
-                    // encoding unless an indexed entry could match.
-                    if indexed_entries {
-                        if let Some(keyed) = matcher.key_candidates(idx, g_id, slot_facts, &flake) {
-                            for n in keyed.iter().copied().filter(is_entry) {
-                                if !held.contains(&n) {
-                                    held.push(n);
-                                }
-                            }
-                        }
-                    }
-                    if !held.is_empty() {
-                        stats.enriched += 1;
-                        let retracted = &mut matcher.lookup(idx, slot_facts).retracted;
-                        for n in held {
-                            if !std::mem::replace(&mut retracted[n], true) {
-                                out.push(slot_facts[n].clone().retract(t));
-                            }
-                        }
-                        continue;
-                    }
-                }
-                out.push(Retraction(flake));
-            } else if let Some(n) = {
-                let lookup = matcher.lookup(idx, slot_facts);
-                pick(
-                    slot_facts,
-                    lookup.term_candidates(slot_facts, &intent.flake),
-                    &intent.flake,
-                )
-            }
-            .or_else(|| {
-                let candidates = matcher.key_candidates(idx, g_id, slot_facts, &intent.flake)?;
-                pick(slot_facts, candidates.iter().copied(), &intent.flake)
-            }) {
-                stats.matched += 1;
-                out.push(slot_facts[n].clone().retract(t));
-            } else {
-                stats.phantom_intents += 1;
-                if let Some(unmatched) = unmatched.as_deref_mut() {
-                    unmatched.push(intent.flake);
-                }
-            }
-        }
-        Ok((out, stats))
     }
 
     /// Persisted-index rows matching `rm` in graph `g_id`, read through
@@ -635,37 +497,17 @@ impl<'l> CurrentFacts<'l> {
         .await?)
     }
 
-    /// Resolve base rows plus novelty ops to the current facts, stamping
-    /// the graph and the origin.
-    ///
-    /// Ops merge by fact identity, but the index and queries merge by index
-    /// key: an index row is dropped when a novelty op of another identity
-    /// has its key (a revert of an indexed big integer retracts it under its
-    /// declared subtype, which the row does not keep). Otherwise the row
-    /// would stay current here after queries stopped seeing it.
-    fn resolve(&self, flakes: Vec<Flake>, g_id: GraphId, g_sid: Option<&Sid>) -> Vec<StoredFact> {
+    /// Resolve base rows plus novelty ops of graph `g_id` to the current
+    /// facts, stamping the graph and the origin: ops that share an index key
+    /// first ([`IndexKeys::merge`]), then by term.
+    fn resolve(&self, g_id: GraphId, flakes: Vec<Flake>, g_sid: Option<&Sid>) -> Vec<StoredFact> {
         if flakes.is_empty() {
             return Vec::new();
         }
         let index_t = self.ledger.snapshot.t;
-        let provider = binary_provider(self.ledger);
-        let novelty_keys: HashSet<(u16, u64)> = match provider {
-            Some(p) if flakes.iter().any(|f| f.t <= index_t) => flakes
-                .iter()
-                .filter(|f| f.t > index_t)
-                .filter_map(|f| p.persisted_object_key(g_id, f))
-                .collect(),
-            _ => HashSet::new(),
-        };
+        let flakes = self.keys.merge(g_id, flakes, index_t);
         resolve_current_flakes(flakes, IndexType::Spot)
             .into_iter()
-            .filter(|f| {
-                novelty_keys.is_empty()
-                    || f.t > index_t
-                    || !provider
-                        .and_then(|p| p.persisted_object_key(g_id, f))
-                        .is_some_and(|k| novelty_keys.contains(&k))
-            })
             .map(|flake| stored(flake, g_sid, index_t))
             .collect()
     }
@@ -683,6 +525,547 @@ fn stored(mut flake: Flake, g_sid: Option<&Sid>, index_t: i64) -> StoredFact {
         Origin::Novelty
     };
     StoredFact { flake, origin }
+}
+
+/// A slot, as the resolver keys it: `(graph, subject, predicate)`.
+type SlotKey = (GraphId, Sid, Sid);
+
+/// Resolves a transaction's DELETE intents to retractions, one WHERE batch
+/// at a time.
+///
+/// - A witnessed row on a list-free ledger ([`ListFree`]) is retracted as
+///   decoded, with no read: the WHERE just matched that stored fact.
+/// - A witnessed row on a list-bearing ledger reads its slot for what a
+///   WHERE binding does not carry, the list position. It is matched to the
+///   stored facts its decode can be: those with the same index key when its
+///   kind of value can share one ([`IndexKeys`]), else those with the same
+///   term; list entries in slot order, then the plain value. The k-th
+///   identical row of a slot, across batches, takes the k-th of them, so a
+///   value stored at several positions loses one per row that matched it;
+///   a row beyond that (a join repeating rows) takes the last again, which
+///   the accumulator collapses. The fact is retracted as read; a row that
+///   matches none is retracted as decoded.
+/// - Every other intent — a template constant, `DELETE DATA`, a value bound
+///   by another pattern — is matched against the stored facts of its slot:
+///   by term, else, for a fact read from the index, by index key. An intent
+///   with a list position names that position. One without names the first
+///   list entry holding the term, in slot order, else the plain value: the
+///   contract hydration had, under which a value asserted at N list
+///   positions loses exactly one entry per distinct DELETE row. The fact is
+///   retracted as read. An intent that names no stored fact stages
+///   nothing; with `unmatched`, it is also appended there as instantiated,
+///   for the caller's modify-policy check.
+///
+/// A slot with more than [`NARROW_SLOT`] facts is read once per
+/// transaction and matched through an index ([`SlotFacts`]), so retracting
+/// n values of one slot costs O(n) however the WHERE batches its rows. Such
+/// slots are held until staging ends; narrower ones are scanned and read
+/// again by a later batch that names them.
+pub(crate) struct DeleteResolver<'l> {
+    current: CurrentFacts<'l>,
+    list_free: Option<ListFree>,
+    /// Wide slots read so far, with their keys, and where each key's slot
+    /// is in them.
+    wide: Vec<(SlotKey, SlotFacts)>,
+    wide_index: HashMap<SlotKey, usize>,
+    /// Witnessed rows matched so far, by slot and by the first stored fact
+    /// of the facts they can be.
+    taken: HashMap<(SlotKey, u32), usize>,
+    /// [`NARROW_SLOT`], or another bound for tests.
+    narrow_slot: usize,
+}
+
+impl<'l> DeleteResolver<'l> {
+    /// A resolver over `ledger`'s current facts; `list_free` from
+    /// [`ListFree::check`].
+    pub(crate) fn new(ledger: &'l LedgerState, list_free: Option<ListFree>) -> Self {
+        Self {
+            current: CurrentFacts::new(ledger),
+            list_free,
+            wide: Vec::new(),
+            wide_index: HashMap::new(),
+            taken: HashMap::new(),
+            narrow_slot: NARROW_SLOT,
+        }
+    }
+
+    /// Resolve one batch of DELETE intents (see [`DeleteResolver`]).
+    /// `graph_of` gives the ledger graph id of an intent's graph Sid.
+    pub(crate) async fn resolve(
+        &mut self,
+        intents: Vec<RetractIntent>,
+        graph_of: impl Fn(&Flake) -> Result<GraphId>,
+        mut unmatched: Option<&mut Vec<Flake>>,
+    ) -> Result<(Vec<Retraction>, ResolveStats)> {
+        let mut stats = ResolveStats::default();
+        let mut out = Vec::with_capacity(intents.len());
+        let mut pending = Vec::new();
+        for intent in intents {
+            if intent.witnessed && self.list_free.is_some() {
+                stats.witnessed += 1;
+                out.push(Retraction(intent.flake));
+            } else {
+                pending.push(intent);
+            }
+        }
+        if pending.is_empty() {
+            return Ok((out, stats));
+        }
+
+        // Each intent's slot: a wide slot an earlier batch read, or one read
+        // now. One hash per intent, as many as the read itself takes.
+        let mut read_index: HashMap<SlotKey, usize> = HashMap::new();
+        let mut to_read: Vec<Slot> = Vec::new();
+        let mut at: Vec<SlotAt> = Vec::with_capacity(pending.len());
+        for intent in &pending {
+            let f = &intent.flake;
+            let key: SlotKey = (graph_of(f)?, f.s.clone(), f.p.clone());
+            if !self.wide_index.is_empty() {
+                if let Some(&w) = self.wide_index.get(&key) {
+                    at.push(SlotAt::Wide(w));
+                    continue;
+                }
+            }
+            let next = to_read.len();
+            match read_index.entry(key) {
+                Entry::Occupied(e) => at.push(SlotAt::Read(*e.get())),
+                Entry::Vacant(e) => {
+                    to_read.push(Slot {
+                        g_id: e.key().0,
+                        g_sid: f.g.clone(),
+                        s: f.s.clone(),
+                        p: f.p.clone(),
+                    });
+                    e.insert(next);
+                    at.push(SlotAt::Read(next));
+                }
+            }
+        }
+        stats.slot_reads = to_read.len();
+        let read_facts = self.current.of_slots(&to_read).await?;
+        let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
+        let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
+        for (slot, facts) in to_read.into_iter().zip(read_facts) {
+            let facts = SlotFacts::new(slot.g_id, slot.p.clone(), facts, self.narrow_slot);
+            let key = (slot.g_id, slot.s, slot.p);
+            if facts.is_wide() {
+                let w = self.wide.len();
+                self.wide_index.insert(key.clone(), w);
+                self.wide.push((key, facts));
+                read.push(ReadSlot::Wide(w));
+            } else {
+                read.push(ReadSlot::Narrow(narrow.len()));
+                narrow.push((key, facts));
+            }
+        }
+
+        let keys = &self.current.keys;
+        for (intent, at) in pending.into_iter().zip(at) {
+            let (slot, facts) = match at {
+                SlotAt::Wide(w) => {
+                    let (key, facts) = &mut self.wide[w];
+                    (&*key, facts)
+                }
+                SlotAt::Read(i) => match read[i] {
+                    ReadSlot::Narrow(n) => {
+                        let (key, facts) = &mut narrow[n];
+                        (&*key, facts)
+                    }
+                    ReadSlot::Wide(w) => {
+                        let (key, facts) = &mut self.wide[w];
+                        (&*key, facts)
+                    }
+                },
+            };
+            let t = intent.flake.t;
+            if intent.witnessed {
+                // A row that carries its list position names it already.
+                let matched = if list_index_of(&intent.flake).is_none() {
+                    let taken = &mut self.taken;
+                    facts.witnessed(&intent.flake, keys, |first| {
+                        let seen = taken.entry((slot.clone(), first)).or_insert(0);
+                        *seen += 1;
+                        *seen - 1
+                    })
+                } else {
+                    None
+                };
+                match matched {
+                    // The row holds the stored term: it takes the fact's tag
+                    // and list position, with no copy of its value.
+                    Some(n) if same_term(&facts.facts[n].flake, &intent.flake) => {
+                        stats.enriched += 1;
+                        let mut flake = intent.flake;
+                        flake.m.clone_from(&facts.facts[n].flake.m);
+                        out.push(Retraction(flake));
+                    }
+                    Some(n) => {
+                        stats.enriched += 1;
+                        out.push(facts.facts[n].clone().retract(t));
+                    }
+                    None => out.push(Retraction(intent.flake)),
+                }
+            } else if let Some(n) = facts.named(&intent.flake, keys) {
+                stats.matched += 1;
+                out.push(facts.facts[n].clone().retract(t));
+            } else {
+                stats.phantom_intents += 1;
+                if let Some(unmatched) = unmatched.as_deref_mut() {
+                    unmatched.push(intent.flake);
+                }
+            }
+        }
+        Ok((out, stats))
+    }
+}
+
+/// Where an intent's slot is: a wide slot an earlier batch read, by its
+/// place in [`DeleteResolver`]'s wide slots, or a slot this batch reads.
+enum SlotAt {
+    Wide(usize),
+    Read(usize),
+}
+
+/// A slot this batch read: narrow, kept for the batch, or wide, moved to the
+/// resolver's wide slots; each by its place.
+#[derive(Clone, Copy)]
+enum ReadSlot {
+    Narrow(usize),
+    Wide(usize),
+}
+
+/// The current facts of one slot, with what matching intents against them
+/// needs. A wide slot (more than the resolver's narrow bound) is grouped by
+/// term when read, and by index key when an intent first needs keys; a
+/// narrow one is scanned.
+struct SlotFacts {
+    g_id: GraphId,
+    /// The slot's predicate.
+    p: Sid,
+    /// Its persisted id, for index keys, looked up on first need.
+    p_id: Option<Option<u32>>,
+    facts: Vec<StoredFact>,
+    /// Whether any fact was read from the index (key matching names those).
+    has_index_rows: bool,
+    /// The term hash the term groups are keyed by: [`term_hash`], or one
+    /// that collides, for tests.
+    hash: fn(&Flake) -> u64,
+    /// A wide slot's facts by term.
+    terms: Option<Groups<u64>>,
+    /// A wide slot's list entries, by `(position, fact)`.
+    positions: Vec<(i32, u32)>,
+    /// Each fact's index key, computed when an intent first needs one.
+    keys: Option<Vec<Option<IndexKey>>>,
+    /// A wide slot's facts by index key, grouped with `keys`.
+    by_key: Option<Groups<IndexKey>>,
+}
+
+impl SlotFacts {
+    fn new(g_id: GraphId, p: Sid, facts: Vec<StoredFact>, narrow_slot: usize) -> Self {
+        Self::with_hash(g_id, p, facts, narrow_slot, term_hash)
+    }
+
+    fn with_hash(
+        g_id: GraphId,
+        p: Sid,
+        facts: Vec<StoredFact>,
+        narrow_slot: usize,
+        hash: fn(&Flake) -> u64,
+    ) -> Self {
+        let wide = facts.len() > narrow_slot;
+        let terms = wide.then(|| Groups::build(&facts, |_, f| Some(hash(&f.flake)), same_term));
+        let mut positions = Vec::new();
+        if wide {
+            positions = facts
+                .iter()
+                .enumerate()
+                .filter_map(|(n, f)| Some((list_index_of(&f.flake)?, n as u32)))
+                .collect();
+            positions.sort_unstable();
+        }
+        Self {
+            g_id,
+            p,
+            p_id: None,
+            has_index_rows: facts.iter().any(|f| f.origin == Origin::Index),
+            facts,
+            hash,
+            terms,
+            positions,
+            keys: None,
+            by_key: None,
+        }
+    }
+
+    fn is_wide(&self) -> bool {
+        self.terms.is_some()
+    }
+
+    /// The persisted id of the slot's predicate.
+    fn p_id(&mut self, keys: &IndexKeys) -> Option<u32> {
+        let p = &self.p;
+        *self.p_id.get_or_insert_with(|| keys.p_id(p))
+    }
+
+    /// `f`'s index key, when its kind of value can share one (see
+    /// [`IndexKeys::key`]).
+    fn key_of(&mut self, keys: &IndexKeys, f: &Flake) -> Option<IndexKey> {
+        if !BinaryRangeProvider::key_may_merge_terms(&f.o) {
+            return None;
+        }
+        let p_id = self.p_id(keys);
+        keys.key(self.g_id, p_id, f)
+    }
+
+    /// Compute every fact's index key, once.
+    fn ensure_keys(&mut self, keys: &IndexKeys) {
+        if self.keys.is_some() {
+            return;
+        }
+        let p_id = self.p_id(keys);
+        let fact_keys: Vec<Option<IndexKey>> = self
+            .facts
+            .iter()
+            .map(|f| keys.key(self.g_id, p_id, &f.flake))
+            .collect();
+        if self.is_wide() {
+            self.by_key = Some(Groups::build(&self.facts, |n, _| fact_keys[n], |_, _| true));
+        }
+        self.keys = Some(fact_keys);
+    }
+
+    /// The stored fact a DELETE intent names (see [`DeleteResolver`]).
+    fn named(&mut self, intent: &Flake, keys: &IndexKeys) -> Option<usize> {
+        let position = list_index_of(intent);
+        let by_term = |_: usize, f: &StoredFact| same_term(&f.flake, intent);
+        let hit = match &self.terms {
+            Some(terms) => self.first_in(terms.get((self.hash)(intent)), terms, position, by_term),
+            None => self.first(position, by_term),
+        };
+        if hit.is_some() || !self.has_index_rows {
+            return hit;
+        }
+        // A fact read from the index is also named by its index key.
+        let key = self.key_of(keys, intent)?;
+        self.ensure_keys(keys);
+        let fact_keys = self.keys.as_deref()?;
+        let by_key =
+            |n: usize, f: &StoredFact| f.origin == Origin::Index && fact_keys[n] == Some(key);
+        match &self.by_key {
+            Some(groups) => self.first_in(groups.get(key), groups, position, by_key),
+            None => self.first(position, by_key),
+        }
+    }
+
+    /// The stored fact a witnessed row decodes (see [`DeleteResolver`]).
+    /// `take(first)` counts the rows matched so far to the facts whose first
+    /// is fact `first`, and gives this row's place among them.
+    fn witnessed(
+        &mut self,
+        row: &Flake,
+        keys: &IndexKeys,
+        mut take: impl FnMut(u32) -> usize,
+    ) -> Option<usize> {
+        if let Some(key) = self.key_of(keys, row) {
+            self.ensure_keys(keys);
+            let fact_keys = self.keys.as_deref()?;
+            let by_key = |n: usize, _: &StoredFact| fact_keys[n] == Some(key);
+            let wide = self.by_key.as_ref().map(|g| (g, g.get(key)));
+            if let Some(n) = self.kth(wide, by_key, &mut take) {
+                return Some(n);
+            }
+        }
+        let by_term = |_: usize, f: &StoredFact| same_term(&f.flake, row);
+        let wide = self.terms.as_ref().map(|g| (g, g.get((self.hash)(row))));
+        self.kth(wide, by_term, &mut take)
+    }
+
+    /// Narrow slot: the first fact satisfying `pred` that `position` admits.
+    /// With a list position, a fact at that position; without one, the
+    /// first list entry, else the first plain value, in slot order.
+    fn first(
+        &self,
+        position: Option<i32>,
+        pred: impl Fn(usize, &StoredFact) -> bool,
+    ) -> Option<usize> {
+        let at = |admits: &dyn Fn(Option<i32>) -> bool| {
+            self.facts
+                .iter()
+                .enumerate()
+                .position(|(n, f)| admits(list_index_of(&f.flake)) && pred(n, f))
+        };
+        match position {
+            Some(i) => at(&|p| p == Some(i)),
+            None => at(&|p| p.is_some()).or_else(|| at(&|p| p.is_none())),
+        }
+    }
+
+    /// Wide slot: [`Self::first`] through `groups` (`group` is the one the
+    /// intent's key selects), or through the list positions.
+    fn first_in<K: Copy + Eq + Hash + Ord>(
+        &self,
+        group: Option<Group>,
+        groups: &Groups<K>,
+        position: Option<i32>,
+        pred: impl Fn(usize, &StoredFact) -> bool,
+    ) -> Option<usize> {
+        match position {
+            Some(i) => {
+                let from = self.positions.partition_point(|&(p, _)| p < i);
+                self.positions[from..]
+                    .iter()
+                    .take_while(|&&(p, _)| p == i)
+                    .map(|&(_, n)| n as usize)
+                    .find(|&n| pred(n, &self.facts[n]))
+            }
+            // A group lists its entries first, so its first member that
+            // satisfies `pred` is the rule's answer.
+            None => groups
+                .members(group?)
+                .iter()
+                .map(|&n| n as usize)
+                .find(|&n| pred(n, &self.facts[n])),
+        }
+    }
+
+    /// The facts satisfying `pred` — list entries in slot order, then plain
+    /// values — and of those, the one at this row's place (`take`), or the
+    /// last when the row is past them. `wide` is the slot's groups and the
+    /// row's group, for a wide slot. A single candidate is the answer
+    /// without counting.
+    fn kth<K: Copy + Eq + Hash + Ord>(
+        &self,
+        wide: Option<(&Groups<K>, Option<Group>)>,
+        pred: impl Fn(usize, &StoredFact) -> bool,
+        take: &mut impl FnMut(u32) -> usize,
+    ) -> Option<usize> {
+        let (facts, pred) = (&self.facts, &pred);
+        match wide {
+            Some((groups, group)) => {
+                let group = group?;
+                let members = groups.members(group);
+                if group.pure {
+                    let first = *members.first()? as usize;
+                    if !pred(first, &facts[first]) {
+                        return None;
+                    }
+                    if members.len() == 1 {
+                        return Some(first);
+                    }
+                    let k = take(first as u32);
+                    return members.get(k).or(members.last()).map(|&n| n as usize);
+                }
+                // A hash collision: filter the group's members.
+                pick(
+                    || {
+                        members
+                            .iter()
+                            .map(|&n| n as usize)
+                            .filter(move |&n| pred(n, &facts[n]))
+                    },
+                    take,
+                )
+            }
+            None => {
+                let is_entry = move |n: usize| list_index_of(&facts[n].flake).is_some();
+                pick(
+                    || {
+                        let candidate = move |entry: bool| {
+                            move |&n: &usize| is_entry(n) == entry && pred(n, &facts[n])
+                        };
+                        (0..facts.len())
+                            .filter(candidate(true))
+                            .chain((0..facts.len()).filter(candidate(false)))
+                    },
+                    take,
+                )
+            }
+        }
+    }
+}
+
+/// Of the candidates `candidates()` lists, the one at the row's place
+/// (`take`), or the last when the row is past them; a single candidate
+/// without counting.
+fn pick<I: Iterator<Item = usize>>(
+    candidates: impl Fn() -> I,
+    take: &mut impl FnMut(u32) -> usize,
+) -> Option<usize> {
+    let mut it = candidates();
+    let first = it.next()?;
+    if it.next().is_none() {
+        return Some(first);
+    }
+    let k = take(first as u32);
+    let mut last = first;
+    for (j, n) in candidates().enumerate() {
+        if j == k {
+            return Some(n);
+        }
+        last = n;
+    }
+    Some(last)
+}
+
+/// Fact positions of a wide slot grouped by a key — a term's hash, or an
+/// index key. A group holds its list entries in slot order, then its plain
+/// values in slot order.
+struct Groups<K> {
+    order: Vec<u32>,
+    groups: FxHashMap<K, Group>,
+}
+
+/// One group of [`Groups`]: its members' range in `order`.
+#[derive(Clone, Copy, Debug)]
+struct Group {
+    start: u32,
+    end: u32,
+    /// Every member holds the same term (`false` only for a hash collision,
+    /// whose members are then filtered).
+    pure: bool,
+}
+
+impl<K: Copy + Eq + Hash + Ord> Groups<K> {
+    /// Group `facts` by `key` (facts it gives none are left out). `same`
+    /// says whether two members hold the same term.
+    fn build(
+        facts: &[StoredFact],
+        key: impl Fn(usize, &StoredFact) -> Option<K>,
+        same: impl Fn(&Flake, &Flake) -> bool,
+    ) -> Self {
+        let mut keyed: Vec<(K, bool, u32)> = facts
+            .iter()
+            .enumerate()
+            .filter_map(|(n, f)| Some((key(n, f)?, list_index_of(&f.flake).is_none(), n as u32)))
+            .collect();
+        keyed.sort_unstable();
+        let mut order = Vec::with_capacity(keyed.len());
+        let mut groups = FxHashMap::default();
+        let mut i = 0;
+        while i < keyed.len() {
+            let k = keyed[i].0;
+            let start = order.len() as u32;
+            let first = keyed[i].2 as usize;
+            let mut pure = true;
+            while i < keyed.len() && keyed[i].0 == k {
+                let n = keyed[i].2;
+                pure = pure && same(&facts[first].flake, &facts[n as usize].flake);
+                order.push(n);
+                i += 1;
+            }
+            let end = order.len() as u32;
+            groups.insert(k, Group { start, end, pure });
+        }
+        Self { order, groups }
+    }
+
+    fn get(&self, key: K) -> Option<Group> {
+        self.groups.get(&key).copied()
+    }
+
+    fn members(&self, group: Group) -> &[u32] {
+        &self.order[group.start as usize..group.end as usize]
+    }
 }
 
 /// How each graph's novelty is read for a batch of slots.
@@ -1020,5 +1403,261 @@ mod tests {
         assert_eq!(retraction.g, stored_flake.g);
         assert_eq!(retraction.m, stored_flake.m);
         assert_eq!(retraction.dt, stored_flake.dt);
+    }
+
+    // =========================================================================
+    // DeleteResolver
+    // =========================================================================
+
+    /// A retraction intent on `ex:a <p> <o>` at t = 9: witnessed by a WHERE
+    /// triple or not, with an optional list position or tag.
+    fn intent(p: &str, o: &str, witnessed: bool, m: Option<FlakeMeta>) -> RetractIntent {
+        RetractIntent::new(flake("a", p, o, 9, false, m), witnessed)
+    }
+
+    fn term_of(f: &Flake) -> (String, Option<FlakeMeta>) {
+        match &f.o {
+            FlakeValue::String(s) => (s.clone(), f.m.clone()),
+            other => (format!("{other:?}"), f.m.clone()),
+        }
+    }
+
+    /// Resolve `batches` in order with one resolver, in the default graph;
+    /// slots with more than `narrow_slot` facts take the indexed path.
+    async fn resolve_batches(
+        ledger: &LedgerState,
+        batches: Vec<Vec<RetractIntent>>,
+        narrow_slot: usize,
+    ) -> Vec<(String, Option<FlakeMeta>)> {
+        let mut resolver = DeleteResolver::new(ledger, ListFree::check(ledger));
+        resolver.narrow_slot = narrow_slot;
+        let mut out = Vec::new();
+        for batch in batches {
+            let (retractions, _) = resolver
+                .resolve(batch, |_| Ok(0), None)
+                .await
+                .expect("resolve");
+            out.extend(retractions.iter().map(|r| term_of(r.flake())));
+        }
+        out
+    }
+
+    fn at(o: &str, i: i32) -> (String, Option<FlakeMeta>) {
+        (o.to_string(), Some(FlakeMeta::with_index(i)))
+    }
+
+    fn plain(o: &str) -> (String, Option<FlakeMeta>) {
+        (o.to_string(), None)
+    }
+
+    /// Identical witnessed rows take successive stored entries: a list
+    /// `["v", "v", "w"]` loses all three to three rows, in one batch or
+    /// across batches, on the scanned and on the indexed path.
+    #[tokio::test]
+    async fn identical_witnessed_rows_take_successive_list_entries() {
+        let ledger = ledger(
+            vec![vec![
+                flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(0))),
+                flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(1))),
+                flake("a", "items", "w", 1, true, Some(FlakeMeta::with_index(2))),
+            ]],
+            &HashMap::new(),
+        );
+        let row = |o: &str| intent("items", o, true, None);
+        for narrow_slot in [usize::MAX, 0] {
+            let one_batch = resolve_batches(
+                &ledger,
+                vec![vec![row("v"), row("v"), row("w")]],
+                narrow_slot,
+            )
+            .await;
+            let batched = resolve_batches(
+                &ledger,
+                vec![vec![row("v")], vec![row("v"), row("w")]],
+                narrow_slot,
+            )
+            .await;
+            let expected = vec![at("v", 0), at("v", 1), at("w", 2)];
+            assert_eq!(one_batch, expected, "narrow_slot={narrow_slot}");
+            assert_eq!(
+                batched, expected,
+                "narrow_slot={narrow_slot}, across batches"
+            );
+        }
+    }
+
+    /// A value stored as a list entry and as a plain value: identical
+    /// witnessed rows take the entry, then the plain value, and a row past
+    /// them takes the plain value again.
+    #[tokio::test]
+    async fn witnessed_rows_take_the_list_entries_then_the_plain_value() {
+        let ledger = ledger(
+            vec![vec![
+                flake("a", "items", "v", 1, true, None),
+                flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(0))),
+            ]],
+            &HashMap::new(),
+        );
+        let row = || intent("items", "v", true, None);
+        for narrow_slot in [usize::MAX, 0] {
+            assert_eq!(
+                resolve_batches(&ledger, vec![vec![row(), row(), row()]], narrow_slot).await,
+                vec![at("v", 0), plain("v"), plain("v")],
+                "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// An intent that is not witnessed names the first list entry holding
+    /// its term, so identical intents name one entry (the accumulator then
+    /// collapses them); an intent with a position names that position.
+    #[tokio::test]
+    async fn named_intents_name_the_first_entry_or_their_position() {
+        let ledger = ledger(
+            vec![vec![
+                flake("a", "items", "v", 1, true, None),
+                flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(0))),
+                flake("a", "items", "v", 1, true, Some(FlakeMeta::with_index(1))),
+            ]],
+            &HashMap::new(),
+        );
+        let named = |m: Option<FlakeMeta>| intent("items", "v", false, m);
+        for narrow_slot in [usize::MAX, 0] {
+            assert_eq!(
+                resolve_batches(
+                    &ledger,
+                    vec![vec![
+                        named(None),
+                        named(None),
+                        named(Some(FlakeMeta::with_index(1))),
+                        named(Some(FlakeMeta::with_index(7))),
+                    ]],
+                    narrow_slot,
+                )
+                .await,
+                vec![at("v", 0), at("v", 0), at("v", 1)],
+                "narrow_slot={narrow_slot}"
+            );
+        }
+    }
+
+    /// A slot with plain values, language variants, a value repeated in a
+    /// list and stored plain, and intents that name nothing.
+    fn mixed_slot() -> LedgerState {
+        let mut commit = Vec::new();
+        for i in 0..12 {
+            commit.push(flake("a", "p", &format!("v{i}"), 1, true, None));
+        }
+        for i in 0..8 {
+            commit.push(flake(
+                "a",
+                "p",
+                "x",
+                1,
+                true,
+                Some(FlakeMeta::with_index(i)),
+            ));
+        }
+        commit.push(flake("a", "p", "x", 1, true, None));
+        commit.push(flake(
+            "a",
+            "p",
+            "y",
+            1,
+            true,
+            Some(FlakeMeta::with_lang("en")),
+        ));
+        commit.push(flake(
+            "a",
+            "p",
+            "y",
+            1,
+            true,
+            Some(FlakeMeta::with_lang("EN-us")),
+        ));
+        ledger(vec![commit], &HashMap::new())
+    }
+
+    fn mixed_intents() -> Vec<RetractIntent> {
+        let lang = |tag: &str| Some(FlakeMeta::with_lang(tag));
+        let mut intents = vec![
+            intent("p", "v3", false, None),
+            intent("p", "v11", false, None),
+            intent("p", "nope", false, None),
+            intent("p", "x", false, None),
+            intent("p", "x", false, Some(FlakeMeta::with_index(5))),
+            intent("p", "x", false, Some(FlakeMeta::with_index(42))),
+            intent("p", "y", false, lang("en-US")),
+            intent("p", "y", false, lang("fr")),
+            intent("p", "v7", true, None),
+            intent("p", "y", true, lang("en")),
+        ];
+        // Eight entries, the plain value, and one row past them.
+        intents.extend((0..10).map(|_| intent("p", "x", true, None)));
+        intents
+    }
+
+    /// The indexed path answers every intent the way the scan does.
+    #[tokio::test]
+    async fn wide_and_narrow_slots_resolve_alike() {
+        let ledger = mixed_slot();
+        let narrow = resolve_batches(&ledger, vec![mixed_intents()], usize::MAX).await;
+        let wide = resolve_batches(&ledger, vec![mixed_intents()], 0).await;
+        assert_eq!(narrow, wide);
+        let mut expected = vec![
+            plain("v3"),
+            plain("v11"),
+            at("x", 0),
+            at("x", 5),
+            ("y".to_string(), Some(FlakeMeta::with_lang("EN-us"))),
+            plain("v7"),
+            ("y".to_string(), Some(FlakeMeta::with_lang("en"))),
+        ];
+        expected.extend((0..8).map(|i| at("x", i)));
+        expected.extend([plain("x"), plain("x")]);
+        assert_eq!(narrow, expected);
+    }
+
+    /// Facts whose terms collide in the term index are still told apart:
+    /// with every fact in one group, the indexed path answers as the scan.
+    #[tokio::test]
+    async fn colliding_term_hashes_still_match_by_term() {
+        let ledger = mixed_slot();
+        let facts = CurrentFacts::new(&ledger)
+            .of_slots(&[slot(0, None, "a", "p")])
+            .await
+            .unwrap()
+            .remove(0);
+        let keys = IndexKeys::new(&ledger);
+        let mut narrow = SlotFacts::new(0, sid("p"), facts.clone(), usize::MAX);
+        let mut colliding = SlotFacts::with_hash(0, sid("p"), facts, 0, |_| 0);
+        assert!(
+            colliding
+                .terms
+                .as_ref()
+                .and_then(|t| t.get(0))
+                .is_some_and(|g| !g.pure),
+            "every fact in one impure group"
+        );
+        let mut taken: [HashMap<u32, usize>; 2] = Default::default();
+        for intent in mixed_intents() {
+            let f = &intent.flake;
+            let mut answers = Vec::new();
+            for (facts, taken) in [&mut narrow, &mut colliding]
+                .into_iter()
+                .zip(taken.iter_mut())
+            {
+                answers.push(if intent.witnessed {
+                    facts.witnessed(f, &keys, |first| {
+                        let seen = taken.entry(first).or_insert(0);
+                        *seen += 1;
+                        *seen - 1
+                    })
+                } else {
+                    facts.named(f, &keys)
+                });
+            }
+            assert_eq!(answers[0], answers[1], "{:?}", term_of(f));
+        }
     }
 }

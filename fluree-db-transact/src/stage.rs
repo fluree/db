@@ -8,7 +8,9 @@
 //! When the `shacl` feature is enabled, [`validate_view_with_shacl`] validates a
 //! staged view against SHACL shapes.
 
-use crate::current_facts::{CurrentFacts, ListFree, ResolveStats, Retraction, Slot, StoredFact};
+use crate::current_facts::{
+    CurrentFacts, DeleteResolver, ListFree, ResolveStats, Retraction, Slot, StoredFact,
+};
 use crate::delete_witness::{witnessed_templates, WitnessContext};
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
@@ -2937,7 +2939,7 @@ async fn stream_where_into_accumulator(
     }
     // Which DELETE templates a WHERE triple witnesses, and whether the
     // ledger can hold a list position at all: together they decide which
-    // retractions need no read (see `CurrentFacts::resolve_intents`).
+    // retractions need no read (see `DeleteResolver`).
     //
     // Graphs compare as the ledger graph ids the dataset above reads: its
     // default graph when that is one ledger graph, and `named_reads` for
@@ -2978,7 +2980,7 @@ async fn stream_where_into_accumulator(
             },
         );
     }
-    let current_facts = CurrentFacts::new(ledger);
+    let mut resolver = DeleteResolver::new(ledger, list_free);
     let mut resolve_stats = ResolveStats::default();
     // Under a non-root policy, intents that name no stored fact still go to
     // the modify-policy check (see `stage_with_graph_delta`).
@@ -3037,10 +3039,9 @@ async fn stream_where_into_accumulator(
         };
         // Resolve BEFORE push (see the doc comment above).
         let routing: &HashMap<Sid, GraphId> = reverse_graph;
-        let (retractions, stats) = current_facts
-            .resolve_intents(
+        let (retractions, stats) = resolver
+            .resolve(
                 intents,
-                list_free.as_ref(),
                 |f| resolve_flake_graph_id(f, routing),
                 collect_unmatched.then_some(&mut unmatched_intents),
             )

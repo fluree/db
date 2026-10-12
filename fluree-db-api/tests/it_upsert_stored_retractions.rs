@@ -678,3 +678,74 @@ async fn a_delete_where_retracts_an_indexed_big_integer_as_xsd_integer() {
         vec![("n".to_string(), XSD_INTEGER.to_string())]
     );
 }
+
+const XSD_NON_NEGATIVE: &str = "http://www.w3.org/2001/XMLSchema#nonNegativeInteger";
+
+/// A revert retracts a big integer under the XSD subtype it was written
+/// with, which the index does not keep: once the insert is indexed, the
+/// retraction and the stored fact differ by datatype and share an index
+/// key, so storage removes the value. The resolver merges them the same
+/// way, and upserting the value afterwards writes it again.
+#[tokio::test]
+async fn an_upsert_after_reverting_an_indexed_subtyped_big_integer_writes_it() {
+    let mut h = Harness::new("key-revert").await;
+    // A first commit, so the reverted one is not the genesis commit.
+    h.insert(&jsonld(json!({"@id": "ex:unrelated", "ex:u": "u"})))
+        .await;
+    let Payload::JsonLd(doc) = big(XSD_NON_NEGATIVE) else {
+        unreachable!("a JSON-LD payload")
+    };
+    let ledger = h.ledger.take().expect("ledger");
+    let written = h.fluree.insert(ledger, &doc).await.expect("insert");
+    let commit = written.receipt.commit_id.clone();
+    h.ledger = Some(written.ledger);
+    h.reindex().await;
+    drop(h.ledger.take());
+    let (name, branch) = h.id.split_once(':').expect("ledger id");
+    h.fluree
+        .revert_commit(
+            name,
+            branch,
+            fluree_db_api::CommitRef::Exact(commit),
+            fluree_db_api::ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("revert");
+    h.ledger = Some(h.fluree.ledger(&h.id).await.expect("reload"));
+    assert!(h.facts(None, "s").await.is_empty(), "the revert removed it");
+    let t = h.ledger().t();
+    let receipt = h.upsert(&big(XSD_NON_NEGATIVE)).await;
+    assert!(
+        receipt.t > t && receipt.assert_count == 1,
+        "the upsert writes the value again: {receipt:?}"
+    );
+    assert_eq!(h.facts(None, "s").await.len(), 1);
+    // No index build after it: one over a revert commit trips a debug
+    // assertion on the commit's revert metadata, a separate issue.
+}
+
+/// The same between two novelty ops. Storage keeps a `dateTime` to the
+/// microsecond, so a WHERE row decodes a nanosecond term stored in novelty
+/// to the microsecond, and the retraction the witnessed lane stages for it,
+/// as decoded, shares the term's index key while differing from it as a
+/// term. Reads merge the two by key and the resolver now agrees, so the
+/// upsert asserts the value again; but novelty's set-semantics dedup
+/// tracks facts by term, still holds the nanosecond term as asserted, and
+/// drops the assertion, so the value reads as gone.
+#[tokio::test]
+#[ignore = "novelty dedups a re-assertion by term after a retraction by key (follow-up)"]
+async fn an_upsert_after_a_delete_where_of_a_sub_microsecond_datetime_writes_it() {
+    let xsd_datetime = "http://www.w3.org/2001/XMLSchema#dateTime";
+    let at = |id: &str, v: &str| {
+        jsonld(json!({"@id": id, "ex:d": {"@value": v, "@type": xsd_datetime}}))
+    };
+    let doc = at("ex:s", "2020-01-01T00:00:00.123456789Z");
+    let mut h = Harness::new("key-datetime").await;
+    // Index the predicate, then write the value in novelty on top.
+    h.insert(&at("ex:other", "2020-01-01T00:00:00Z")).await;
+    h.reindex().await;
+    h.insert(&doc).await;
+    h.update(&delete_where("ex:d")).await;
+    h.upsert_writes_it_again(&doc, "sub-microsecond DELETE WHERE")
+        .await;
+}
