@@ -107,14 +107,21 @@ pub trait OptionalBuilder: Send + Sync {
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<BoxedOperator>>;
 
-    /// Optionally build *and execute* all remaining required rows in the current
-    /// batch in one pass, returning each row's optional-side result batches.
+    /// Optionally build *and execute* the remaining required rows in the current
+    /// batch in one pass, returning each answered row's optional-side result
+    /// batches.
     ///
     /// Builders override this to implement batched paths for hot correlated
     /// OPTIONAL shapes — either synchronous index probes (see
     /// `GroupedPatternOptionalBuilder`) or a single seeded subplan execution
     /// hash-partitioned across rows (see `PlanTreeOptionalBuilder`). The method
     /// is `async` so the latter can drive a real operator subtree.
+    ///
+    /// A builder answers the rows it can, in row order, and leaves out a row it
+    /// cannot (an unbound or unresolvable correlation value, say): the operator
+    /// answers that row per row and keeps the lane's answers for the rest. The
+    /// operator offers each required batch once, so a row left out is never
+    /// walked again. `None` answers no row.
     /// Default: no batched execution (operator falls back to per-row `build`).
     async fn build_batch(
         &self,
@@ -190,6 +197,32 @@ fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<O
             None => Ok(None),
         },
         _ => Ok(None),
+    }
+}
+
+/// The rows of a window a batched lane leaves to the per-row path, flagged
+/// by slot. The flags are allocated at the first such row, so a window the
+/// lane answers whole allocates nothing.
+#[derive(Default)]
+struct LeftRows {
+    flags: Vec<bool>,
+    count: usize,
+}
+
+impl LeftRows {
+    /// Leave `slot` of a `slots`-row window to the per-row path.
+    fn leave(&mut self, slot: usize, slots: usize) {
+        if self.flags.is_empty() {
+            self.flags = vec![false; slots];
+        }
+        self.flags[slot] = true;
+        self.count += 1;
+    }
+
+    /// Whether `slot` was left to the per-row path.
+    #[inline]
+    fn contains(&self, slot: usize) -> bool {
+        self.flags.get(slot).copied().unwrap_or(false)
     }
 }
 
@@ -414,10 +447,10 @@ impl PatternOptionalBuilder {
     /// covered encoded objects, its own scan of the whole predicate (#1973).
     ///
     /// Declines — to the per-row path, which handles every form — when the
-    /// lane is not admitted, or when a row's object is not a ref with an id:
-    /// an unbound object (the triple's object is then free), a literal (the
-    /// OPST ref probe cannot see literal objects), or an IRI the dictionaries
-    /// do not hold.
+    /// lane is not admitted. Leaves to the per-row path each row whose object
+    /// is not a ref with an id: an unbound object (the triple's object is then
+    /// free), a literal (the OPST ref probe cannot see literal objects), or an
+    /// IRI the dictionaries do not hold.
     fn build_object_probe_batch(
         &self,
         required_batch: &Batch,
@@ -442,17 +475,19 @@ impl PatternOptionalBuilder {
 
         let slots = required_batch.len() - start_row;
         let mut object_slots: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        let mut left = LeftRows::default();
         for row in start_row..required_batch.len() {
             if self.has_poisoned_binding(required_batch, row) {
                 // A poisoned correlation value matches nothing.
                 continue;
             }
-            let Some(o_id) =
-                resolve_subject_id(required_batch.get_by_col(row, object_left_col), ctx)?
-            else {
-                return declined();
-            };
-            object_slots.entry(o_id).or_default().push(row - start_row);
+            match resolve_subject_id(required_batch.get_by_col(row, object_left_col), ctx)? {
+                Some(o_id) => object_slots.entry(o_id).or_default().push(row - start_row),
+                None => left.leave(row - start_row, slots),
+            }
+        }
+        if left.count == slots {
+            return declined();
         }
 
         let mut objects: Vec<u64> = object_slots.keys().copied().collect();
@@ -487,10 +522,20 @@ impl PatternOptionalBuilder {
         // Lanes that read leaflets directly pay their rows' fuel here.
         charge_probe_rows(ctx, matched)?;
         stamp_fast_path(OBJECT_PROBE_SITE, FastPathOutcome::Proceed);
+        if left.count > 0 {
+            // The rows left to the per-row path are this window's fallback.
+            stamp_fast_path(
+                OBJECT_PROBE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
+        }
 
         let schema: Arc<[VarId]> = Arc::from(vec![subject_var].into_boxed_slice());
-        let mut pending = Vec::with_capacity(slots);
+        let mut pending = Vec::with_capacity(slots - left.count);
         for (slot, subjects) in values.into_iter().enumerate() {
+            if left.contains(slot) {
+                continue;
+            }
             let optional_batches = if subjects.is_empty() {
                 Vec::new()
             } else {
@@ -500,6 +545,7 @@ impl PatternOptionalBuilder {
         }
         tracing::debug!(
             rows = pending.len(),
+            per_row = left.count,
             objects = objects.len(),
             matched,
             "optional bound-object probe complete"
@@ -794,11 +840,13 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         let emit_object_var = self.emit_object_var();
-        let mut row_slots: Vec<Option<Vec<Binding>>> =
-            vec![None; required_batch.len().saturating_sub(start_row)];
+        let slots = required_batch.len().saturating_sub(start_row);
+        let mut row_slots: Vec<Option<Vec<Binding>>> = vec![None; slots];
         let mut subject_rows: std::collections::HashMap<u64, Vec<usize>> =
             std::collections::HashMap::new();
         let mut subject_ids: Vec<u64> = Vec::new();
+        // Rows whose subject has no id: the per-row path answers them.
+        let mut left = LeftRows::default();
 
         for row in start_row..required_batch.len() {
             let slot = row - start_row;
@@ -808,7 +856,8 @@ impl OptionalBuilder for PatternOptionalBuilder {
             let Some(s_id) =
                 resolve_subject_id(required_batch.get_by_col(row, subject_left_col), ctx)?
             else {
-                return Ok(None);
+                left.leave(slot, slots);
+                continue;
             };
             subject_rows.entry(s_id).or_insert_with(|| {
                 subject_ids.push(s_id);
@@ -818,6 +867,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 .get_mut(&s_id)
                 .expect("entry inserted")
                 .push(slot);
+        }
+        if left.count == slots {
+            return Ok(None);
         }
 
         // One reconciler per probe call; the dict overlay decodes
@@ -857,6 +909,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
 
         let mut pending = Vec::with_capacity(row_slots.len());
         for (slot, maybe_values) in row_slots.into_iter().enumerate() {
+            if left.contains(slot) {
+                continue;
+            }
             let optional_batches = match maybe_values {
                 Some(values) if !values.is_empty() => {
                     if let Some(object_var) = emit_object_var {
@@ -1174,9 +1229,11 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
         }
 
         let mut subject_ids = Vec::new();
-        let mut row_subject_slots: Vec<Option<u64>> =
-            Vec::with_capacity(required_batch.len().saturating_sub(start_row));
+        let slots = required_batch.len().saturating_sub(start_row);
+        let mut row_subject_slots: Vec<Option<u64>> = Vec::with_capacity(slots);
         let mut subject_rows: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Rows the per-row chain answers instead.
+        let mut left = LeftRows::default();
 
         for row in start_row..required_batch.len() {
             let slot = row - start_row;
@@ -1189,34 +1246,21 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             // optional side bound. A per-subject probe has no subject to probe
             // with, and this lane's batches carry only optional-only vars, so
             // there would be nothing for `combine_rows` to read the subject
-            // back off. Hand the whole batch to the per-row chain, whose output
-            // does carry it. `resolve_subject_id` already declines here; saying
-            // so explicitly keeps the invariant `unify_instructions` relies on
-            // visible at the place that establishes it.
-            if matches!(
-                required_batch.get_by_col(row, self.subject_left_col),
-                Binding::Unbound
-            ) {
-                tracing::debug!(
-                    predicate_count = self.triples.len(),
-                    start_row,
-                    row,
-                    reason = "unbound-subject",
-                    "grouped optional builder fallback"
-                );
-                return Ok(None);
-            }
-            let Some(s_id) =
-                resolve_subject_id(required_batch.get_by_col(row, self.subject_left_col), ctx)?
-            else {
-                tracing::debug!(
-                    predicate_count = self.triples.len(),
-                    start_row,
-                    row,
-                    reason = "unresolved-subject-id",
-                    "grouped optional builder fallback"
-                );
-                return Ok(None);
+            // back off. Hand the row to the per-row chain, whose output does
+            // carry it. `resolve_subject_id` already leaves it out; saying so
+            // explicitly keeps the invariant `unify_instructions` relies on
+            // visible at the place that establishes it. A subject with no id
+            // goes per row too.
+            let subject = required_batch.get_by_col(row, self.subject_left_col);
+            let s_id = if matches!(subject, Binding::Unbound) {
+                None
+            } else {
+                resolve_subject_id(subject, ctx)?
+            };
+            let Some(s_id) = s_id else {
+                left.leave(slot, slots);
+                row_subject_slots.push(None);
+                continue;
             };
             row_subject_slots.push(Some(s_id));
             subject_rows.entry(s_id).or_insert_with(|| {
@@ -1227,6 +1271,18 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 .get_mut(&s_id)
                 .expect("entry inserted")
                 .push(slot);
+        }
+        if left.count > 0 {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                rows = left.count,
+                reason = "unbound-or-unresolved-subject",
+                "grouped optional builder leaves rows to the per-row chain"
+            );
+        }
+        if left.count == slots {
+            return Ok(None);
         }
 
         let dict_overlay = crate::join::make_dict_overlay(ctx, store);
@@ -1287,6 +1343,9 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
         let unmatched = self.planning.unmatched_optional.binding();
         let mut pending = Vec::with_capacity(row_values.len());
         for (slot, values_per_pred) in row_values.into_iter().enumerate() {
+            if left.contains(slot) {
+                continue;
+            }
             let rows = Self::generate_rows(&values_per_pred, &unmatched);
             let optional_batches = if rows.is_empty() {
                 Vec::new()
@@ -1662,8 +1721,14 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         // Per row: full correlation key (for matching) + distinct seed tuple
         // over the seeded subset. A poisoned/unbound correlation var can never
         // match -> no-match row.
+        enum RowKey {
+            Keyed(Vec<GroupKeyOwned>),
+            Unmatchable,
+            /// The per-row path answers this row.
+            PerRow,
+        }
         let n = required_batch.len();
-        let mut row_keys: Vec<Option<Vec<GroupKeyOwned>>> = Vec::with_capacity(n - start_row);
+        let mut row_keys: Vec<RowKey> = Vec::with_capacity(n - start_row);
         let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
         let mut seen_seed: HashSet<Vec<GroupKeyOwned>> = HashSet::new();
         for row in start_row..n {
@@ -1672,8 +1737,8 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             // correlation key cannot express — the key would have to match
             // every bucket at once, and the optional-side batches carry only
             // optional-only vars, so there is nothing for the merge to read the
-            // value back off. Hand the whole batch to the per-row path, which
-            // seeds the inner from the row and leaves the variable free.
+            // value back off. Hand the row to the per-row path, which seeds the
+            // inner from the row and leaves the variable free.
             //
             // Scoped to what the inner can bind, not to every correlation
             // column: `corr_cols` is every required column REFERENCED by the
@@ -1704,10 +1769,11 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 unmatchable |= b.is_poisoned();
             }
             if unbound_bindable {
-                return Ok(None);
+                row_keys.push(RowKey::PerRow);
+                continue;
             }
             if unmatchable {
-                row_keys.push(None);
+                row_keys.push(RowKey::Unmatchable);
                 continue;
             }
             let key: Vec<GroupKeyOwned> = corr_cols
@@ -1730,12 +1796,17 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                         .collect(),
                 );
             }
-            row_keys.push(Some(key));
+            row_keys.push(RowKey::Keyed(key));
         }
 
         if seed_rows.is_empty() {
-            // Every row had an unmatchable correlation var.
-            return Ok(Some((start_row..n).map(|row| (row, Vec::new())).collect()));
+            // Every row the lane can answer had an unmatchable correlation var.
+            let unmatched: Vec<OptionalBatchRow> = (start_row..n)
+                .zip(&row_keys)
+                .filter(|(_, key)| matches!(key, RowKey::Unmatchable))
+                .map(|(row, _)| (row, Vec::new()))
+                .collect();
+            return Ok((!unmatched.is_empty()).then_some(unmatched));
         }
 
         // Build the inner subplan ONCE seeded by the distinct subject-driving
@@ -1833,11 +1904,12 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let mut pending: Vec<OptionalBatchRow> = Vec::with_capacity(n - start_row);
         for (offset, row) in (start_row..n).enumerate() {
             let batches = match &row_keys[offset] {
-                Some(key) => key_batches
+                RowKey::Keyed(key) => key_batches
                     .get(key)
                     .map(|b| vec![b.clone()])
                     .unwrap_or_default(),
-                None => Vec::new(),
+                RowKey::Unmatchable => Vec::new(),
+                RowKey::PerRow => continue,
             };
             pending.push((row, batches));
         }
@@ -2450,6 +2522,12 @@ pub struct OptionalOperator {
     current_required_batch: Option<Batch>,
     /// Current row index in required batch
     current_required_row: usize,
+    /// The batched lane's answers for rows of the current required batch not
+    /// yet reached, in row order; a row between them is answered per row.
+    lane_answers: VecDeque<OptionalBatchRow>,
+    /// Whether the current required batch has been offered to the batched
+    /// lane, which happens once per batch.
+    lane_offered: bool,
     /// Pending output: (required_row_idx, optional_batches, current_batch_idx, current_row_in_batch)
     /// Empty vec means no matches for that required row.
     /// The batch_idx and row_idx track progress for resuming when batch_size limit is hit.
@@ -2605,6 +2683,8 @@ impl OptionalOperator {
             unmatched,
             state: OperatorState::Created,
             current_required_batch: None,
+            lane_answers: VecDeque::new(),
+            lane_offered: false,
             current_required_row: 0,
             pending_output: VecDeque::new(),
             out_schema: None,
@@ -2963,6 +3043,8 @@ impl Operator for OptionalOperator {
                     Some(batch) => {
                         self.current_required_batch = Some(batch);
                         self.current_required_row = 0;
+                        self.lane_answers.clear();
+                        self.lane_offered = false;
                     }
                     None => {
                         // Required exhausted
@@ -2977,31 +3059,73 @@ impl Operator for OptionalOperator {
 
             // Process current required row
             if self.current_required_row < required_batch.len() {
-                if self.pending_output.is_empty() {
-                    if let Some(batched_pending) = self
+                if !self.lane_offered && self.pending_output.is_empty() {
+                    self.lane_offered = true;
+                    if let Some(answers) = self
                         .optional_builder
                         .build_batch(required_batch, self.current_required_row, ctx)
                         .await?
                     {
+                        debug_assert!(
+                            answers.windows(2).all(|w| w[0].0 < w[1].0)
+                                && answers
+                                    .first()
+                                    .is_none_or(|(row, _)| *row >= self.current_required_row),
+                            "a batched lane answers rows in order, from its start row"
+                        );
                         batched_builds += 1;
-                        batched_rows += batched_pending.len();
-                        required_rows_seen += batched_pending.len();
-                        optional_result_batches += batched_pending
-                            .iter()
-                            .map(|(_, optional_batches)| optional_batches.len())
-                            .sum::<usize>();
-                        self.current_required_row = required_batch.len();
-                        self.pending_output.extend(batched_pending.into_iter().map(
-                            |(required_row, optional_batches)| PendingOptionalMatch {
-                                required_row,
-                                optional_batches,
-                                batch_idx: 0,
-                                row_idx: 0,
-                                matched: false,
-                            },
-                        ));
-                        continue;
+                        batched_rows += answers.len();
+                        if answers.len() == required_batch.len() - self.current_required_row {
+                            // Every row answered (the rows are in order, from
+                            // the start row): the window goes to the pending
+                            // queue at once.
+                            required_rows_seen += answers.len();
+                            optional_result_batches += answers
+                                .iter()
+                                .map(|(_, optional_batches)| optional_batches.len())
+                                .sum::<usize>();
+                            self.current_required_row = required_batch.len();
+                            self.pending_output.extend(answers.into_iter().map(
+                                |(required_row, optional_batches)| PendingOptionalMatch {
+                                    required_row,
+                                    optional_batches,
+                                    batch_idx: 0,
+                                    row_idx: 0,
+                                    matched: false,
+                                },
+                            ));
+                            continue;
+                        }
+                        // The answers reach the pending queue a run at a time;
+                        // room for all of them keeps it from growing per run.
+                        self.pending_output.reserve(answers.len());
+                        self.lane_answers = answers.into();
                     }
+                }
+                // The rows the lane answered, up to the next row it left to
+                // the per-row path.
+                let mut answered = false;
+                while self
+                    .lane_answers
+                    .front()
+                    .is_some_and(|(row, _)| *row == self.current_required_row)
+                {
+                    let (required_row, optional_batches) =
+                        self.lane_answers.pop_front().expect("front answer");
+                    required_rows_seen += 1;
+                    optional_result_batches += optional_batches.len();
+                    self.current_required_row += 1;
+                    self.pending_output.push_back(PendingOptionalMatch {
+                        required_row,
+                        optional_batches,
+                        batch_idx: 0,
+                        row_idx: 0,
+                        matched: false,
+                    });
+                    answered = true;
+                }
+                if answered {
+                    continue;
                 }
 
                 let required_row = self.current_required_row;
@@ -3176,6 +3300,7 @@ impl Operator for OptionalOperator {
         self.current_required_batch = None;
         self.required_pending = None;
         self.pending_output.clear();
+        self.lane_answers.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -4288,6 +4413,142 @@ mod tests {
         );
         // Left-join preserves every driving row (all OPTIONAL misses).
         assert_eq!(out_rows, 6, "every driving row survives the left join");
+    }
+
+    /// A batched lane that answers the rows it can key and leaves out the
+    /// ones it cannot (here: the IRI `x`), counting its offers and the per-row
+    /// builds of the rows it left. Each answered row is a hit on `hit`.
+    struct PartialLaneBuilder {
+        schema: Arc<[VarId]>,
+        opt_only: Vec<VarId>,
+        offers: Arc<std::sync::atomic::AtomicUsize>,
+        per_row: Arc<std::sync::atomic::AtomicUsize>,
+        /// Decline the whole window when any row cannot be keyed, as the
+        /// lanes did before they answered part of one.
+        all_or_nothing: bool,
+    }
+    #[async_trait]
+    impl OptionalBuilder for PartialLaneBuilder {
+        fn build(
+            &self,
+            _r: &Batch,
+            _row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<BoxedOperator>> {
+            self.per_row
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        async fn build_batch(
+            &self,
+            required_batch: &Batch,
+            start_row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<Vec<OptionalBatchRow>>> {
+            self.offers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let keyed = |row: usize| required_batch.get_by_col(row, 0) != &Binding::iri("x");
+            if self.all_or_nothing && !(start_row..required_batch.len()).all(keyed) {
+                return Ok(None);
+            }
+            let hit = Batch::new(
+                Arc::from(self.opt_only.clone().into_boxed_slice()),
+                vec![vec![Binding::iri("hit")]],
+            )?;
+            Ok(Some(
+                (start_row..required_batch.len())
+                    .filter(|row| keyed(*row))
+                    .map(|row| (row, vec![hit.clone()]))
+                    .collect(),
+            ))
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        fn optional_only_vars(&self) -> &[VarId] {
+            &self.opt_only
+        }
+        fn unify_instructions(&self) -> &[UnifyInstruction] {
+            &[]
+        }
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
+        }
+    }
+
+    /// Run a [`PartialLaneBuilder`] over one required batch of `vals`; the
+    /// output's `(required, optional)` rows in order, the lane's offers, and
+    /// the per-row builds.
+    fn run_partial_lane(vals: &[&str], all_or_nothing: bool) -> (Vec<String>, usize, usize) {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [iri_batch(&rs, vals)].into_iter().collect(),
+        };
+        let offers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let per_row = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opt = VarId(1);
+        let builder = PartialLaneBuilder {
+            schema: Arc::from(vec![VarId(0), opt].into_boxed_slice()),
+            opt_only: vec![opt],
+            offers: Arc::clone(&offers),
+            per_row: Arc::clone(&per_row),
+            all_or_nothing,
+        };
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let rows = futures::executor::block_on(async {
+            op.open(&ctx).await?;
+            let mut rows = Vec::new();
+            while let Some(b) = op.next_batch(&ctx).await? {
+                for r in 0..b.len() {
+                    let cell = |v: VarId| match b.get(r, v) {
+                        Some(Binding::Iri(iri)) => iri.to_string(),
+                        _ => "-".to_string(),
+                    };
+                    rows.push(format!("{}:{}", cell(VarId(0)), cell(opt)));
+                }
+            }
+            Result::<Vec<String>>::Ok(rows)
+        })
+        .unwrap();
+        (
+            rows,
+            offers.load(std::sync::atomic::Ordering::SeqCst),
+            per_row.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// A row the batched lane cannot key is answered per row, in its place,
+    /// and the lane keeps its answers for the rest of the window.
+    #[test]
+    fn rows_a_lane_leaves_out_are_answered_per_row_in_order() {
+        let (rows, offers, per_row) = run_partial_lane(&["a", "x", "b", "c", "x", "d"], false);
+        assert_eq!(
+            rows,
+            ["a:hit", "x:-", "b:hit", "c:hit", "x:-", "d:hit"],
+            "every row, in order"
+        );
+        assert_eq!(offers, 1, "one offer answers the window");
+        assert_eq!(per_row, 2, "only the rows the lane left out go per row");
+    }
+
+    /// A lane is offered each required batch once. One that declines the
+    /// window does not see it again from each later row, which walked the
+    /// window's prefix once per row before the lane could take it.
+    #[test]
+    fn a_lane_is_offered_each_required_batch_once() {
+        let vals: Vec<String> = (0..200).map(|i| format!("r{i}")).collect();
+        let mut vals: Vec<&str> = vals.iter().map(String::as_str).collect();
+        vals.push("x");
+        let (rows, offers, per_row) = run_partial_lane(&vals, true);
+        assert_eq!(rows.len(), 201, "every row survives the left join");
+        assert_eq!(offers, 1, "the declined window is not offered again");
+        assert_eq!(per_row, 201, "a declined window goes per row");
     }
 
     /// A grouped chain of single-triple OPTIONALs shares its SUBJECT with the

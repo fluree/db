@@ -110,6 +110,11 @@ async fn wait_for_index_t(handle: &LedgerHandle, t: i64) {
 
 /// A fresh Fluree holding the fixture, with its cached handle in `state`.
 async fn ledger_in(state: State, ledger_id: &str) -> (Fluree, LedgerHandle) {
+    ledger_with(state, ledger_id, &fixture()).await
+}
+
+/// A fresh Fluree holding `data`, indexed, with its cached handle in `state`.
+async fn ledger_with(state: State, ledger_id: &str, data: &JsonValue) -> (Fluree, LedgerHandle) {
     let fluree = FlureeBuilder::memory().build_memory();
     fluree
         .create_ledger(ledger_id)
@@ -121,7 +126,7 @@ async fn ledger_in(state: State, ledger_id: &str) -> (Fluree, LedgerHandle) {
         .expect("cache genesis");
     fluree
         .stage(&handle)
-        .insert(&fixture())
+        .insert(data)
         .execute()
         .await
         .expect("seed fixture");
@@ -2266,6 +2271,97 @@ async fn bind_onto_a_bound_variable_compares_terms_across_forms() {
                 &format!("{state:?} / bind onto a bound subject: {label}"),
             );
         }
+    }
+    failures.assert_none();
+}
+
+// ---------------------------------------------------------------------------
+// A batched lane over a window it can key only in part
+// ---------------------------------------------------------------------------
+
+/// Twenty `ex:link`s, r0..r19 to t0..t19, but r5 and r19 link to a string;
+/// `ex:cites` from c{i} to t{i} for even i; and one subject with no link.
+fn mixed_window_fixture() -> JsonValue {
+    let mut graph: Vec<JsonValue> = (0..20)
+        .map(|i| {
+            let link = if i == 5 || i == 19 {
+                json!(format!("lit{i}"))
+            } else {
+                json!({"@id": format!("ex:t{i}")})
+            };
+            json!({"@id": format!("ex:r{i}"), "ex:link": link})
+        })
+        .collect();
+    graph.extend(
+        (0..20)
+            .step_by(2)
+            .map(|i| json!({"@id": format!("ex:c{i}"), "ex:cites": {"@id": format!("ex:t{i}")}})),
+    );
+    graph.push(json!({"@id": "ex:orphan", "ex:kind": "orphan"}));
+    json!({"@context": context(), "@graph": graph})
+}
+
+/// The bound-object lane answers the rows of a window it can key and leaves
+/// the others (a string object, an unbound one) to the per-row lookups, in
+/// one pass over the window. It used to decline the whole window at the first
+/// such row and was offered it again from the next row, walking the same
+/// prefix once per row.
+#[tokio::test(flavor = "current_thread")]
+async fn object_lane_answers_the_rows_of_a_mixed_window_it_can_key() {
+    let body = "SELECT ?s ?c WHERE { { ?s ex:link ?o } UNION { ?s ex:kind ?k } \
+                OPTIONAL { ?c ex:cites ?o } }";
+    let mut expected: Vec<Vec<String>> = (0..20)
+        .map(|i| {
+            let c = if i % 2 == 0 && i != 5 && i != 19 {
+                format!("c{i}")
+            } else {
+                "-".to_string()
+            };
+            vec![format!("r{i}"), c]
+        })
+        .collect();
+    // The unbound object is compatible with every citation.
+    expected.extend(
+        (0..20)
+            .step_by(2)
+            .map(|i| vec!["orphan".to_string(), format!("c{i}")]),
+    );
+    expected.sort();
+    let jsonld_query = json!({
+        "@context": context(),
+        "select": ["?s", "?c"],
+        "where": [
+            ["union", {"@id": "?s", "ex:link": "?o"}, {"@id": "?s", "ex:kind": "?k"}],
+            ["optional", {"@id": "?c", "ex:cites": "?o"}]
+        ]
+    });
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) =
+            ledger_with(state, "it/mixed-window:main", &mixed_window_fixture()).await;
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let label = format!("{state:?} / mixed window");
+        let result = sparql(&fluree, &handle, body).await;
+        failures.eq(sparql_rows(&result, &["s", "c"]), expected.clone(), &label);
+        let seen = stamps(&store, before, OBJECT_PROBE_SITE);
+        let proceeded = seen.iter().filter(|o| *o == "proceed").count();
+        let declined = seen.len() - proceeded;
+        if proceeded > 1 || declined > 1 {
+            failures.0.push(format!(
+                "{label}: the lane must take the window in one pass; stamps: {seen:?}"
+            ));
+        }
+        if state != State::Novelty && proceeded != 1 {
+            failures.0.push(format!(
+                "{label}: the lane must answer the rows it can key; stamps: {seen:?}"
+            ));
+        }
+        failures.eq(
+            jsonld_rows(&jsonld(&fluree, &handle, &jsonld_query).await),
+            expected.clone(),
+            &format!("{label} (JSON-LD)"),
+        );
     }
     failures.assert_none();
 }

@@ -363,7 +363,8 @@ of its triple with a batched probe over the driving side: a PSOT probe when the
 subject comes from the required side (`OPTIONAL { ?s :email ?e }`), an OPST
 probe over at most 100,000 driving rows at a time when the object does
 (`OPTIONAL { ?c :subjectOf ?s }`), the window the join's own bound-object lane
-uses.
+uses. A row a probe cannot key, such as a literal or an unbound value, is looked
+up on its own, and the probe answers the rest of its window.
 Other shapes look the triple up per driving row with every correlated value
 bound into the scan, whichever form the row carries it in: an encoded subject,
 predicate or literal is decoded into its slot, so no row scans the whole
