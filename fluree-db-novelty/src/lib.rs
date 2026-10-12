@@ -1730,41 +1730,41 @@ mod tests {
     }
 
     /// Novelty records an assertion of a term its index key keeps less of (a
-    /// `dateTime` past the microsecond), and only an assertion: a retraction,
-    /// or a term the key holds whole, leaves the flag clear. Both apply paths
-    /// set it.
+    /// big integer written with an XSD subtype), and only an assertion: a
+    /// retraction, or a term the key holds whole, leaves the flag clear. Both
+    /// apply paths set it.
     #[test]
     fn a_lossy_term_assertion_sets_the_flag() {
-        let at = |v: &str, t: i64, op: bool| {
+        let big = |dt: &str, t: i64, op: bool| {
             Flake::new(
                 Sid::new(100, "s"),
                 Sid::new(100, "p"),
-                FlakeValue::DateTime(Box::new(fluree_db_core::DateTime::parse(v).unwrap())),
-                Sid::new(fluree_vocab::namespaces::XSD, "dateTime"),
+                FlakeValue::BigInt(Box::new("123456789012345678901234567890".parse().unwrap())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
                 t,
                 op,
                 None,
             )
         };
-        let exact = "2020-01-01T00:00:00.123456Z";
-        let lossy = "2020-01-01T00:00:00.123456789Z";
+        let exact = "integer";
+        let lossy = "nonNegativeInteger";
 
         let mut novelty = Novelty::new(0);
         novelty
             .apply_commit(
-                vec![at(exact, 1, true), at(lossy, 1, false)],
+                vec![big(exact, 1, true), big(lossy, 1, false)],
                 1,
                 &no_graphs(),
             )
             .unwrap();
         assert!(!novelty.has_lossy_index_terms);
         novelty
-            .apply_commit(vec![at(lossy, 2, true)], 2, &no_graphs())
+            .apply_commit(vec![big(lossy, 2, true)], 2, &no_graphs())
             .unwrap();
         assert!(novelty.has_lossy_index_terms);
 
         let mut bulk = Novelty::new(0);
-        bulk.bulk_apply_commits(vec![(vec![at(lossy, 1, true)], 1)], &no_graphs())
+        bulk.bulk_apply_commits(vec![(vec![big(lossy, 1, true)], 1)], &no_graphs())
             .unwrap();
         assert!(bulk.has_lossy_index_terms);
     }

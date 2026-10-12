@@ -27,6 +27,8 @@ mod it_rdf_text_parity;
 mod it_reserved_graph_writes;
 #[path = "it_stable_blank_nodes.rs"]
 mod it_stable_blank_nodes;
+#[path = "it_temporal_storage_precision.rs"]
+mod it_temporal_storage_precision;
 #[path = "it_transact.rs"]
 mod it_transact;
 #[path = "it_transact_conditional.rs"]

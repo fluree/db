@@ -287,21 +287,19 @@ impl FlakeValue {
     /// Whether two different terms whose values are of this kind can share a
     /// persisted index key, so that storage, which merges ops by key, holds
     /// them as one fact. A big integer is keyed by its value alone, whatever
-    /// XSD subtype it was written with; a `dateTime` or `time` is keyed to the
-    /// microsecond; a double with no order-preserving encoding takes the null
-    /// key, as a null does. For every other kind the key is a function of the
-    /// term that no two terms share.
+    /// XSD subtype it was written with; a double with no order-preserving
+    /// encoding takes the null key, as a null does. For every other kind the
+    /// key is a function of the term that no two terms share: a `dateTime` or
+    /// `time` is keyed to the microsecond, which is all it holds.
     ///
     /// Exhaustive on purpose: a new kind of value has to say which it is.
     /// The key encoding is `value_to_otype_okey` in `fluree-db-query`.
     pub fn index_key_may_merge_terms(&self) -> bool {
         match self {
-            FlakeValue::Null
-            | FlakeValue::Double(_)
-            | FlakeValue::BigInt(_)
-            | FlakeValue::DateTime(_)
-            | FlakeValue::Time(_) => true,
+            FlakeValue::Null | FlakeValue::Double(_) | FlakeValue::BigInt(_) => true,
             FlakeValue::Ref(_)
+            | FlakeValue::DateTime(_)
+            | FlakeValue::Time(_)
             | FlakeValue::Boolean(_)
             | FlakeValue::Long(_)
             | FlakeValue::Decimal(_)
@@ -324,18 +322,13 @@ impl FlakeValue {
     /// Whether this value, written with datatype `dt`, keeps less in its
     /// persisted index key than the term holds, so the key decodes to a
     /// different term: an integer too large for 64 bits written with an XSD
-    /// subtype (the key keeps no subtype), a `dateTime` or `time` with digits
-    /// past the microsecond, or a double with no order-preserving encoding.
+    /// subtype (the key keeps no subtype), or a double with no
+    /// order-preserving encoding.
     /// A query that reads such a term through its key gets the other term.
     /// See [`Self::index_key_may_merge_terms`] for the kinds.
     pub fn index_key_loses_detail(&self, dt: &Sid) -> bool {
         match self {
             FlakeValue::BigInt(v) => v.to_i64().is_none() && *dt != Sid::xsd_integer(),
-            FlakeValue::DateTime(v) => v.instant().timestamp_subsec_nanos() % 1_000 != 0,
-            FlakeValue::Time(v) => {
-                use chrono::Timelike;
-                v.time().nanosecond() % 1_000 != 0
-            }
             FlakeValue::Double(d) => !d.is_finite(),
             FlakeValue::Null => true,
             _ => false,
@@ -1361,8 +1354,10 @@ mod tests {
     }
 
     /// The terms whose index key keeps less than the term: a big integer
-    /// written with an XSD subtype, a `dateTime` or `time` past the
-    /// microsecond. The same values written as the index keeps them do not.
+    /// written with an XSD subtype. The same value written as `xsd:integer`
+    /// does not, and neither does a `dateTime` or `time` written past the
+    /// microsecond, which holds no more than its key from the moment it is
+    /// built.
     #[test]
     fn index_key_loses_detail_of_the_terms_its_key_keeps_less_of() {
         let xsd = |name: &str| Sid::new(fluree_vocab::namespaces::XSD, name);
@@ -1373,21 +1368,16 @@ mod tests {
 
         assert!(big().index_key_loses_detail(&xsd("nonNegativeInteger")));
         assert!(!big().index_key_loses_detail(&Sid::xsd_integer()));
-        assert!(at("2020-01-01T00:00:00.123456789Z").index_key_loses_detail(&xsd("dateTime")));
-        assert!(!at("2020-01-01T00:00:00.123456Z").index_key_loses_detail(&xsd("dateTime")));
-        assert!(time("12:00:00.123456789").index_key_loses_detail(&xsd("time")));
-        assert!(!time("12:00:00.123456").index_key_loses_detail(&xsd("time")));
+        assert!(!at("2020-01-01T00:00:00.123456789Z").index_key_loses_detail(&xsd("dateTime")));
+        assert!(!time("12:00:00.123456789").index_key_loses_detail(&xsd("time")));
         assert!(!FlakeValue::Long(5).index_key_loses_detail(&xsd("nonNegativeInteger")));
         assert!(!FlakeValue::String("x".into()).index_key_loses_detail(&xsd("string")));
 
-        // A term that loses detail is of a kind whose key can merge terms.
-        for v in [
-            big(),
-            at("2020-01-01T00:00:00.1234567Z"),
-            time("12:00:00.1234567"),
-        ] {
-            assert!(v.index_key_may_merge_terms(), "{v:?}");
-        }
+        // A term that loses detail is of a kind whose key can merge terms;
+        // a temporal's key is all it holds.
+        assert!(big().index_key_may_merge_terms());
+        assert!(!at("2020-01-01T00:00:00.1234567Z").index_key_may_merge_terms());
+        assert!(!time("12:00:00.1234567").index_key_may_merge_terms());
     }
 
     /// `FlakeValue::Vector` is `Arc<[f64]>` behind a `serde(with)` adapter

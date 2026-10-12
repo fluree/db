@@ -29,11 +29,16 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 
-/// XSD dateTime, held as a UTC instant.
+/// XSD dateTime, held as a UTC instant to the microsecond.
 ///
 /// A source offset is applied and then discarded: `2010-12-21T15:38:02-08:00`
 /// and `2010-12-21T23:38:02Z` are the same value, render the same and hash the
 /// same. A lexical form with no offset is read as UTC. See the module docs.
+///
+/// Digits past the microsecond are dropped when the value is built
+/// ([`Self::from_instant`]), because a commit writes six and the index keys
+/// microseconds: a value written and the value stored are then one value,
+/// before a reload and after one, in a write and in a query constant.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DateTime {
     instant: ChronoDateTime<Utc>,
@@ -67,8 +72,17 @@ impl DateTime {
         Err(format!("Cannot parse dateTime: {s}"))
     }
 
+    /// The value at `instant`, to the microsecond: digits past it are
+    /// dropped as a commit and the index drop them. Every constructor goes
+    /// through here.
     pub fn from_instant(instant: ChronoDateTime<Utc>) -> Self {
-        Self { instant }
+        let nanos = instant.nanosecond();
+        if nanos.is_multiple_of(1_000) {
+            return Self { instant };
+        }
+        Self {
+            instant: instant.with_nanosecond(to_micros(nanos)).unwrap_or(instant),
+        }
     }
 
     /// From the index key encoding (`ObjKey::encode_datetime`).
@@ -162,6 +176,12 @@ impl fmt::Display for DateTime {
 
 /// Fractional-seconds suffix of a canonical lexical: empty when zero, else
 /// `.` and the digits with trailing zeros removed (the XSD canonical form).
+/// `nanos` (a sub-second count, a leap second's included) with the digits past
+/// the microsecond dropped: the precision Fluree stores a temporal value at.
+fn to_micros(nanos: u32) -> u32 {
+    nanos - nanos % 1_000
+}
+
 fn canonical_fraction(micros: u32) -> String {
     if micros == 0 {
         String::new()
@@ -294,7 +314,8 @@ impl fmt::Display for Date {
     }
 }
 
-/// XSD time, held as a wall-clock time of day.
+/// XSD time, held as a wall-clock time of day to the microsecond (digits past
+/// it are dropped when the value is built, as for [`DateTime`]).
 ///
 /// A source offset is validated and then discarded — it is *not* applied:
 /// `17:00:00-06:00` is read as `17:00:00`, not `23:00:00`. The index has only
@@ -328,8 +349,16 @@ impl Time {
             .ok_or_else(err)
     }
 
+    /// The time of day `time`, to the microsecond (see [`DateTime::from_instant`]).
+    /// Every constructor goes through here.
     pub fn from_naive(time: NaiveTime) -> Self {
-        Self { time }
+        let nanos = time.nanosecond();
+        if nanos.is_multiple_of(1_000) {
+            return Self { time };
+        }
+        Self {
+            time: time.with_nanosecond(to_micros(nanos)).unwrap_or(time),
+        }
     }
 
     /// From the index key encoding (`ObjKey::encode_time`).

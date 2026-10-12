@@ -123,6 +123,8 @@ Temporal types:
 - **xsd:time**: Times without date (e.g., `14:30:00Z`)
 - **xsd:dateTime**: Full timestamps (e.g., `2024-01-15T14:30:00Z`)
 
+A `dateTime` or `time` is held to the microsecond: digits past the sixth fractional one are dropped the moment the value is read, in a write and in a query alike, so `"2024-01-15T14:30:00.123456789Z"` is the value `"2024-01-15T14:30:00.123456Z"`. A value written is then the value stored, before a restart and after one. See [Compatibility](../reference/compatibility.md).
+
 ### Other XSD Types
 
 ```json

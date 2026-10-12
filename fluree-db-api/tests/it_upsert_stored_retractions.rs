@@ -560,9 +560,8 @@ async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
 }
 
-/// The same for a `dateTime` past the microsecond: storage keeps six
-/// fractional digits, so the stored decode and the re-upserted term differ
-/// and share one storage key, and cancel as one fact.
+/// The same for a `dateTime` written past the microsecond, which is read to
+/// the microsecond storage keeps, so the re-upserted term is the stored one.
 #[tokio::test]
 async fn an_identical_reupsert_keeps_a_sub_microsecond_datetime() {
     let mut h = Harness::new("u5-datetime").await;

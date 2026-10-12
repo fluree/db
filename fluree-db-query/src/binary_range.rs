@@ -327,8 +327,8 @@ impl BinaryRangeProvider {
     /// it.
     ///
     /// The index keeps less than some values carry — a big integer keeps no
-    /// XSD subtype, a `dateTime` or `time` keeps microseconds — so distinct
-    /// terms can share a key. Terms that share one are one stored fact.
+    /// XSD subtype — so distinct terms can share a key. Terms that share one
+    /// are one stored fact.
     ///
     /// `None` when no persisted row can hold the object: its predicate,
     /// string, subject, language tag, datatype or big number is not in the

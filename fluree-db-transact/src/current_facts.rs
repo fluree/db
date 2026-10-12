@@ -356,7 +356,8 @@ type IndexKey = (u16, u64);
 /// Index keys, for the kinds of value whose key two terms can share.
 ///
 /// The index keeps less than some terms carry: a big integer keeps no XSD
-/// subtype, a `dateTime` or `time` keeps microseconds. Terms with one index
+/// subtype. (A `dateTime` or `time` is keyed to the microsecond, which is
+/// all it holds; see `fluree_db_core::DateTime`.) Terms with one index
 /// key are one stored fact to storage, which merges every op by that key,
 /// in the index and in queries over novelty alike (`resolve_overlay_ops`).
 /// So an indexed fact's decode can differ from the term that was written,

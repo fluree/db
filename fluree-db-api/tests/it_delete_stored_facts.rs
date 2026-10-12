@@ -16,8 +16,8 @@
 //! one.
 //!
 //! On an indexed ledger an intent also names a fact by its index key, which
-//! keeps less than some terms carry: a big integer's XSD subtype, a
-//! `dateTime`'s digits past the microsecond.
+//! keeps less than some terms carry: a big integer's XSD subtype. (A
+//! `dateTime` or `time` is read to the microsecond its key keeps.)
 
 use crate::support;
 use fluree_db_api::policy_builder::build_policy_context_from_opts;
@@ -768,7 +768,7 @@ async fn cypher_set_and_detach_delete_reach_big_integers() {
 }
 
 /// A `dateTime` or `time` written past the microsecond is deleted by the
-/// same literal on both lanes; the index keeps microseconds.
+/// same literal on both lanes: both are read to the microsecond.
 #[tokio::test]
 async fn delete_data_names_sub_microsecond_temporals() {
     let seed = json!({
@@ -1648,9 +1648,9 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
 /// One write that retracts a stored value and asserts it again, as written,
 /// keeps it. On an indexed ledger the delete side names the value as the
 /// index stores it, which holds less than the write for a big integer with
-/// an XSD subtype or a `dateTime` or `time` past the microsecond; the two
-/// are still one fact to storage, so they cancel, as a value stored exactly
-/// as written does:
+/// an XSD subtype; the two are still one fact to storage, so they cancel, as
+/// a value stored exactly as written does (as a `dateTime` or `time` written
+/// past the microsecond now is, read to the microsecond on both sides):
 /// - `DELETE { x } INSERT { x } WHERE {}` and its JSON-LD twin commit
 ///   nothing (`retractions.md`'s example);
 /// - an upsert or a graph sync of a payload that holds `x` keeps it.

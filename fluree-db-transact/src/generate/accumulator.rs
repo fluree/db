@@ -31,9 +31,9 @@
 //! ([`FactIdentity`]): by term, except that a value whose index key can merge
 //! terms is one fact per key and list position. A DELETE retracts the term
 //! the index stores, and an INSERT of the same value as written may carry
-//! more than that (a big integer's XSD subtype, a `dateTime` past the
-//! microsecond); told apart by term, both would commit at one `t`, which
-//! storage resolves as the retraction. Without an identity
+//! more than that (a big integer's XSD subtype); told apart by term, both
+//! would commit at one `t`, which storage resolves as the retraction.
+//! Without an identity
 //! ([`FlakeAccumulator::with_identity`]) facts are told apart by term.
 
 use crate::current_facts::{FactIdentity, MergeKey, Retraction};

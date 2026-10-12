@@ -389,7 +389,8 @@ async fn multi_op_reversal_nets_against_an_indexed_named_graph() {
 }
 
 /// A value the index keeps with less detail than written (a big integer's
-/// XSD subtype, a `dateTime` past the microsecond) is one fact to storage
+/// XSD subtype; a `dateTime` written past the microsecond, read to it) is one
+/// fact to storage
 /// however it is written, and a reversal nets by that fact. Read cold, so
 /// the base holds the value in the index alone: deleting and re-inserting it
 /// commits nothing and keeps it, and inserting and deleting it deletes it,

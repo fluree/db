@@ -333,12 +333,10 @@ stores `ex:alice schema:age 30` if it was absent, and commits nothing if it
 was present.
 
 Once a fact is indexed, a DELETE is matched against what the index stores,
-which is less than was written for two kinds of value: an integer too large
-for 64 bits keeps no XSD subtype, and a `dateTime` or `time` keeps six
-fractional digits. A DELETE naming the same big integer under another integer
-datatype, or the same instant to the microsecond, retracts such a fact. A
-DELETE and an INSERT of such a value in one transaction name one stored fact
-and cancel, so `DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as
+which is less than was written for an integer too large for 64 bits: the index
+keeps no XSD subtype. A DELETE naming the same big integer under another
+integer datatype retracts such a fact. A DELETE and an INSERT of such a value
+in one transaction name one stored fact and cancel, so `DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as
 for any value that is present.
 
 ### No Cascading by Default
