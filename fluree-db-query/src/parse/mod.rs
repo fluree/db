@@ -649,17 +649,12 @@ fn parse_construct_query(
     let template_patterns = match construct_val {
         JsonValue::Bool(true) => {
             // Shorthand: use the WHERE clause's triples (and their edge
-            // annotations) as the template
+            // annotations, and the graph blocks holding them) as the template
             query
                 .patterns
                 .iter()
-                .filter(|p| {
-                    matches!(
-                        p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
-                    )
-                })
                 .cloned()
+                .filter_map(construct_template_pattern)
                 .collect()
         }
         JsonValue::Bool(false) => {

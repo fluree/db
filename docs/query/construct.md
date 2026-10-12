@@ -57,7 +57,8 @@ shaped like the `where` clause, whose variables are filled from each solution.
 ```
 
 `"construct": true` uses the `where` clause's triples as the template, like SPARQL's
-`CONSTRUCT WHERE`.
+`CONSTRUCT WHERE`. A `where` node's own `@graph` is kept, so its triples come out in that
+graph (SPARQL's shorthand has no `GRAPH` form).
 
 ### Multiple Triples
 
