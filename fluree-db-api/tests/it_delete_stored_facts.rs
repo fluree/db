@@ -1965,3 +1965,72 @@ async fn changing_a_big_integers_subtype_keeps_it() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A list that holds one value twice holds two facts, one per position,
+/// for the kinds of value storage keys by value too (a double, an integer
+/// too large for 64 bits). A write that retracts the value and asserts
+/// something else retracts both entries, before and after an index build.
+#[tokio::test]
+async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    const TTL_PFX: &str = "@prefix ex: <http://example.org/ns/> .\n\
+                           @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
+    const BIG: &str = "\"123456789012345678901234567890\"^^xsd:integer";
+    let mut failures = Vec::new();
+    for (list, v) in [
+        ("( 1.5E0 1.5E0 2.5E0 )".to_string(), "1.5E0"),
+        (format!("( {BIG} {BIG} 7 )"), BIG),
+    ] {
+        for indexed in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let id = "it/list-twice:main";
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                fluree.create_ledger(id).await.expect("create");
+                fluree
+                    .graph(id)
+                    .transact()
+                    .upsert_turtle(&format!("{TTL_PFX}ex:s ex:l {list} ; ex:k \"keep\" .\n"))
+                    .commit()
+                    .await
+                    .expect("seed");
+                if indexed {
+                    support::rebuild_and_publish_index(&fluree, id).await;
+                }
+            }
+            let before = values_of(&path, id, "ex:l").await;
+            let receipt = {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let update = format!(
+                    "{PFX}DELETE {{ ex:s ex:l ?o }} INSERT {{ ex:s ex:q \"done\" }} \
+                     WHERE {{ ex:s ex:l ?o FILTER(?o = {v}) }}"
+                );
+                fluree
+                    .graph(id)
+                    .transact()
+                    .sparql_update(&update)
+                    .commit()
+                    .await
+                    .expect("write")
+                    .receipt
+            };
+            let after = values_of(&path, id, "ex:l").await;
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                support::rebuild_and_publish_index(&fluree, id).await;
+            }
+            let reindexed = values_of(&path, id, "ex:l").await;
+            let got = (receipt.flake_count, receipt.retract_count);
+            if before.len() != 3 || got != (3, 2) || after.len() != 1 || reindexed != after {
+                failures.push(format!(
+                    "{list}, indexed={indexed}: list {before:?}, (flakes, retractions) {got:?}, \
+                     list {after:?}, after reindex {reindexed:?}; expected three entries, (3, 2) \
+                     and one entry left"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
