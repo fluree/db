@@ -87,6 +87,10 @@ On every backend the upgrade:
 
 It is safe to run from several processes at once and to interrupt: the ids it
 issues are derived from the ledger names, and it resumes where it stopped.
+On file and object stores it resumes only while `ns@v2/` is as it found it:
+if a 4.2 process has written there since an attempt stopped, the copy that
+attempt left under `ns@v3/` is out of date, and the upgrade refuses to start
+until you delete `ns@v3/`.
 Its time grows with the number of ledgers and branches; expect seconds for a
 small store.
 

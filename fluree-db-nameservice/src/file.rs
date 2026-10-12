@@ -29,7 +29,8 @@ use crate::binding::{
 };
 use crate::lifecycle::MigrationReport;
 use crate::migration::{
-    FormatMarker, FORMAT_MARKER, LEGACY_BACKUP, LEGACY_NS_VERSION, RETIRED_FILE,
+    FormatMarker, ProgressMarker, FORMAT_MARKER, LEGACY_BACKUP, LEGACY_NS_VERSION, PROGRESS_MARKER,
+    RETIRED_FILE,
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
 use crate::ns_format::{
@@ -193,19 +194,39 @@ impl FileNameService {
 
         let legacy = base.join(LEGACY_NS_VERSION);
         let relatives = walk_files(&legacy)?;
-        let mut files = Vec::with_capacity(relatives.len());
+        let (mut files, mut retired) = (Vec::with_capacity(relatives.len()), Vec::new());
         for relative in &relatives {
             let bytes = tokio::fs::read(legacy.join(relative))
                 .await
                 .map_err(|e| NameServiceError::storage(format!("reading {relative}: {e}")))?;
             // Retired by an interrupted attempt, which copied it first.
-            if bytes != RETIRED_FILE {
+            if bytes == RETIRED_FILE {
+                retired.push(relative.clone());
+            } else {
                 files.push((relative.clone(), bytes));
             }
         }
         let refused = crate::migration::unmigratable_files(&files);
         if !refused.is_empty() {
             return Err(crate::migration::unmigratable_store(&refused));
+        }
+        let progress = ProgressMarker::of(&files);
+        let progress_address = format!("fluree:file://{NS_VERSION}/{PROGRESS_MARKER}");
+        if !self
+            .storage
+            .insert(&progress_address, &serde_json::to_vec(&progress)?)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("writing the progress marker: {e}")))?
+        {
+            let bytes = tokio::fs::read(base.join(NS_VERSION).join(PROGRESS_MARKER))
+                .await
+                .map_err(|e| {
+                    NameServiceError::storage(format!("reading the progress marker: {e}"))
+                })?;
+            let earlier: ProgressMarker = serde_json::from_slice(&bytes)?;
+            if !earlier.still_current(&files, &retired) {
+                return Err(crate::migration::stale_migration());
+            }
         }
         for (relative, bytes) in &files {
             self.storage
@@ -2075,6 +2096,56 @@ mod tests {
         assert!(serde_json::from_slice::<NsFileV2>(RETIRED_FILE).is_err());
         assert!(temp.path().join("ns@v3/@format.json").exists());
         assert!(ns.migrate().await.unwrap().is_none());
+    }
+
+    /// What a migration that stopped after its copy leaves: `ns@v2/`'s files
+    /// under `ns@v3/`, and the progress marker saying what they were.
+    fn stop_after_copy(root: &Path) {
+        let legacy = root.join("ns@v2");
+        let mut files = Vec::new();
+        for relative in walk_files(&legacy).unwrap() {
+            let bytes = std::fs::read(legacy.join(&relative)).unwrap();
+            let copy = root.join(NS_VERSION).join(&relative);
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            std::fs::write(copy, &bytes).unwrap();
+            files.push((relative, bytes));
+        }
+        std::fs::write(
+            root.join(NS_VERSION).join(PROGRESS_MARKER),
+            serde_json::to_vec(&ProgressMarker::of(&files)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A migration resuming one that stopped after its copy finishes it
+    /// while `ns@v2/` is as the copy found it, and refuses once an older
+    /// binary has rewritten or added a record there: binding the copy would
+    /// lose those changes.
+    #[tokio::test]
+    async fn a_resumed_migration_refuses_a_copy_an_older_binary_outdated() {
+        let unchanged = TempDir::new().unwrap();
+        write_legacy_record(unchanged.path(), &legacy_record("mydb:main", 3, false));
+        stop_after_copy(unchanged.path());
+        let ns = FileNameService::new(unchanged.path());
+        ns.migrate().await.unwrap().expect("resumed");
+        assert_eq!(ns.lookup("mydb:main").await.unwrap().unwrap().commit_t, 3);
+
+        for change in ["rewritten", "added"] {
+            let temp = TempDir::new().unwrap();
+            write_legacy_record(temp.path(), &legacy_record("mydb:main", 3, false));
+            stop_after_copy(temp.path());
+            let written = match change {
+                "rewritten" => legacy_record("mydb:main", 5, false),
+                _ => legacy_record("other:main", 1, false),
+            };
+            write_legacy_record(temp.path(), &written);
+            let err = FileNameService::new(temp.path())
+                .migrate()
+                .await
+                .expect_err(change)
+                .to_string();
+            assert!(err.contains("Delete ns@v3/"), "{change}: {err}");
+        }
     }
 
     /// A migration interrupted after retiring `ns@v2/` resumes without

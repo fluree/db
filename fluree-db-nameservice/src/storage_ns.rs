@@ -638,7 +638,8 @@ where
     /// from several processes at once.
     pub async fn migrate(&self) -> Result<Option<crate::lifecycle::MigrationReport>> {
         use crate::migration::{
-            FormatMarker, LegacyFiles, FORMAT_MARKER, LEGACY_NS_VERSION, RETIRED_FILE,
+            FormatMarker, LegacyFiles, ProgressMarker, FORMAT_MARKER, LEGACY_NS_VERSION,
+            PROGRESS_MARKER, RETIRED_FILE,
         };
 
         let marker_key = self.ns_root_key(FORMAT_MARKER);
@@ -666,7 +667,7 @@ where
         }
 
         let (legacy_root, relatives) = self.legacy_files().await?;
-        let mut files = Vec::with_capacity(relatives.len());
+        let (mut files, mut retired) = (Vec::with_capacity(relatives.len()), Vec::new());
         for relative in &relatives {
             let key = format!("{legacy_root}{relative}");
             let bytes = match self.storage.read_bytes(&key).await {
@@ -677,13 +678,31 @@ where
                 }
             };
             // Retired by an interrupted attempt, which copied it first.
-            if bytes != RETIRED_FILE {
+            if bytes == RETIRED_FILE {
+                retired.push(relative.clone());
+            } else {
                 files.push((relative.clone(), bytes));
             }
         }
         let refused = crate::migration::unmigratable_files(&files);
         if !refused.is_empty() {
             return Err(crate::migration::unmigratable_store(&refused));
+        }
+        let progress_key = self.ns_root_key(PROGRESS_MARKER);
+        let progress = serde_json::to_vec(&ProgressMarker::of(&files))?;
+        if !self
+            .storage
+            .insert(&progress_key, &progress)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("writing the progress marker: {e}")))?
+        {
+            let bytes = self.storage.read_bytes(&progress_key).await.map_err(|e| {
+                NameServiceError::storage(format!("reading the progress marker: {e}"))
+            })?;
+            let earlier: ProgressMarker = serde_json::from_slice(&bytes)?;
+            if !earlier.still_current(&files, &retired) {
+                return Err(crate::migration::stale_migration());
+            }
         }
         for (relative, bytes) in &files {
             self.storage
@@ -2223,6 +2242,45 @@ mod tests {
             serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap()
         );
         assert!(ns.migrate().await.unwrap().is_none());
+    }
+
+    /// A migration resuming one that stopped after its copy refuses once an
+    /// older binary has rewritten a record under `ns@v2/`, and finishes it
+    /// while nothing there changed.
+    #[tokio::test]
+    async fn a_resumed_migration_refuses_a_copy_an_older_binary_outdated() {
+        use crate::migration::{ProgressMarker, PROGRESS_MARKER};
+        let legacy = |t: i64| {
+            let mut record = NsRecord::new(LedgerId::parse("mydb:main").unwrap());
+            record.commit_t = t;
+            serde_json::to_vec(&NsFileV2::for_record(&record)).unwrap()
+        };
+        for rewritten in [false, true] {
+            let ns = make_storage_ns();
+            let key = "test/ns@v2/mydb/main.json";
+            ns.storage.write_bytes(key, &legacy(3)).await.unwrap();
+            // What an attempt that stopped after its copy leaves.
+            ns.storage
+                .write_bytes("test/ns@v3/mydb/main.json", &legacy(3))
+                .await
+                .unwrap();
+            let marker = ProgressMarker::of(&[("mydb/main.json".to_string(), legacy(3))]);
+            ns.storage
+                .write_bytes(
+                    &format!("test/ns@v3/{PROGRESS_MARKER}"),
+                    &serde_json::to_vec(&marker).unwrap(),
+                )
+                .await
+                .unwrap();
+            if rewritten {
+                ns.storage.write_bytes(key, &legacy(5)).await.unwrap();
+                let err = ns.migrate().await.unwrap_err().to_string();
+                assert!(err.contains("Delete ns@v3/"), "{err}");
+            } else {
+                ns.migrate().await.unwrap().expect("resumed");
+                assert_eq!(ns.lookup("mydb:main").await.unwrap().unwrap().commit_t, 3);
+            }
+        }
     }
 
     #[tokio::test]

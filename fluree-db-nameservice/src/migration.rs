@@ -37,6 +37,56 @@ under ns@v3/. Fluree 4.2 and earlier cannot use it. The file that was here is un
 /// version. `@` keeps it out of every record listing.
 pub(crate) const FORMAT_MARKER: &str = "@format.json";
 
+/// The marker a migration leaves before its first copy: what each file under
+/// [`LEGACY_NS_VERSION`] held, so that an attempt resuming one that stopped
+/// part way can tell whether the copy it left is still current.
+pub(crate) const PROGRESS_MARKER: &str = "@migrating.json";
+
+/// The contents of [`PROGRESS_MARKER`]: each file's SHA-256, by relative
+/// path.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProgressMarker {
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+impl ProgressMarker {
+    /// The marker for `files`, `(relative path, bytes)` as read.
+    pub fn of(files: &[(String, Vec<u8>)]) -> Self {
+        Self {
+            files: files
+                .iter()
+                .map(|(relative, bytes)| (relative.clone(), fluree_db_core::sha256_hex(bytes)))
+                .collect(),
+        }
+    }
+
+    /// Whether the files under [`LEGACY_NS_VERSION`] are as this marker
+    /// found them: `files` those not retired, `retired` the paths of those
+    /// the stopped attempt retired, which an older binary cannot rewrite.
+    pub fn still_current(&self, files: &[(String, Vec<u8>)], retired: &[String]) -> bool {
+        let now = Self::of(files);
+        now.files
+            .iter()
+            .all(|(relative, hash)| self.files.get(relative) == Some(hash))
+            && self
+                .files
+                .keys()
+                .all(|relative| now.files.contains_key(relative) || retired.contains(relative))
+    }
+}
+
+/// The error a migration resuming one that stopped part way refuses with
+/// when an older binary has changed the store since: the copy under the
+/// current address version is out of date, and binding it would lose those
+/// changes.
+pub fn stale_migration() -> NameServiceError {
+    NameServiceError::storage(format!(
+        "an earlier upgrade of this nameservice stopped part way, and an older Fluree has \
+         changed {LEGACY_NS_VERSION}/ since, so the copy it left under ns@v3/ is out of date. \
+         Delete ns@v3/ and start this release again"
+    ))
+}
+
 /// The contents of [`FORMAT_MARKER`].
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct FormatMarker {
