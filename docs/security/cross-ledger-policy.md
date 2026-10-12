@@ -492,7 +492,7 @@ Specifics:
   its namespace; a constraint over vocabulary D has never seen
   anywhere is silently inert (no rows, never an error).
 - **Steady-state cost is one nameservice lookup.** The wire is
-  cached per `(model, graph, resolved_t)` and the *compiled*
+  cached per `(model, graph, head)` and the *compiled*
   shapes (including parsed `sh:sparql` queries) are reused
   across transactions while M's head and D's shape-affecting
   epochs are unchanged. A commit on M invalidates both on the
@@ -658,9 +658,9 @@ clients can branch on the specific failure.
 ## Behavior on model ledger updates
 
 There is no explicit invalidation channel. The cache key includes
-the model ledger's `resolved_t` (its commit head at the time of
-capture), so new commits to M produce new cache keys
-automatically. The next request after M advances captures the
+the model ledger's head at the time of capture, its `t` and head
+commit id, so new commits to M, and a new ledger created under M's
+name after a drop, produce new cache keys automatically. The next request after M advances captures the
 new head; older entries age out under the cache's LRU/TinyLFU
 policy.
 

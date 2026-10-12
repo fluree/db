@@ -13,7 +13,7 @@
 //! must use the *staged* `NamespaceRegistry`, not D's pre-staging
 //! snapshot. See that method's docs for why.
 
-use super::types::{ShapesArtifactWire, WireObject, WireOrigin, WireTriple};
+use super::types::{ModelHead, ShapesArtifactWire, WireObject, WireOrigin, WireTriple};
 use super::CrossLedgerError;
 use super::ResolveCtx;
 use fluree_db_core::{
@@ -31,15 +31,16 @@ const OWL: &str = "http://www.w3.org/2002/07/owl#";
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
-        resolved_t = resolved_t,
+        resolved_t = head.t,
     ),
 )]
 pub(super) async fn materialize_shapes(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
+    head: &ModelHead,
     ctx: &ResolveCtx<'_>,
 ) -> Result<ShapesArtifactWire, CrossLedgerError> {
+    let resolved_t = head.t;
     let m_db = ctx
         .open_model_db(canonical_model_ledger_id, resolved_t)
         .await
@@ -192,6 +193,7 @@ pub(super) async fn materialize_shapes(
             model_ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
+            commit_id: head.commit_id.clone(),
         },
         triples,
     })

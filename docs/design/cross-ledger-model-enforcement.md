@@ -141,7 +141,8 @@ The helper performs, in order:
    `ctx.memo` and the global cache.
 7. **Caching.** On cache hit the materialized artifact is returned
    directly. On miss the artifact is inserted under the key
-   `(ArtifactKind, canonical_model_ledger_id, graph_iri, resolved_t)`.
+   `(ArtifactKind, canonical_model_ledger_id, graph_iri, head)`,
+   where `head` is M's `resolved_t` together with its head commit id.
 
 A `ResolvedGraph` is term-neutral and t-fixed:
 
@@ -307,11 +308,15 @@ stabilizes — keeping the two caches separate while artifact shapes
 are still evolving prevents premature coupling.
 
 The key is `(ArtifactKind, canonical_model_ledger_id, graph_iri,
-resolved_t)`. `ArtifactKind` is part of the key so a memoized
-`PolicyRules` entry never short-circuits a `Shapes` lookup of the
-same `(M, graph, t)`. New commits to M produce new keys without
-explicit invalidation; unreferenced entries age out under the
-cache's eviction policy. There is no "watermark-on-write" channel.
+head)`, where `head` is M's `resolved_t` and the commit id at that
+head. `ArtifactKind` is part of the key so a memoized `PolicyRules`
+entry never short-circuits a `Shapes` lookup of the same
+`(M, graph, head)`. `t` alone is not M's identity: a ledger dropped
+and created again under M's name restarts at `t` 1, so the head
+commit is what keeps it from being served the dropped ledger's
+artifacts. New commits to M produce new keys without explicit
+invalidation; unreferenced entries age out under the cache's eviction
+policy. There is no "watermark-on-write" channel.
 
 The cache value is the term-neutral `ResolvedGraph` (IRIs, not Sids).
 Per-data-ledger interning is not part of the cache key — the cache

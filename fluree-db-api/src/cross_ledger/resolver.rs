@@ -10,8 +10,8 @@
 //! See `docs/design/cross-ledger-model-enforcement.md`.
 
 use super::types::{
-    check_cycle, memo_hit, reject_if_reserved_graph, ArtifactKind, GovernanceArtifact, ResolveCtx,
-    ResolvedGraph,
+    check_cycle, memo_hit, reject_if_reserved_graph, ArtifactKind, GovernanceArtifact, ModelHead,
+    ResolutionKey, ResolveCtx, ResolvedGraph,
 };
 use super::CrossLedgerError;
 use fluree_db_core::ledger_config::GraphSourceRef;
@@ -31,15 +31,15 @@ use std::sync::Arc;
 ///    ledger is absent or retracted on this instance.
 /// 3. Reject `#config` / `#txn-meta` selectors before any storage
 ///    round-trip on M.
-/// 4. Capture `resolved_t` lazily: read `ctx.resolved_ts[model_id]`
-///    on hit, else read M's head `commit_t` once and store. Pinned
-///    `f:atT` is rejected at step (1) until Phase 3.
+/// 4. Capture M's head lazily: read `ctx.resolved_heads[model_id]`
+///    on hit, else read M's head `commit_t` and commit id once and
+///    store. Pinned `f:atT` is rejected at step (1) until Phase 3.
 /// 5. Form the resolution key
-///    `(ArtifactKind, canonical_model_ledger_id, graph_iri,
-///    resolved_t)` and check, in order: (a) `ctx.memo` (per-request
+///    `(ArtifactKind, canonical_model_ledger_id, graph_iri, head)`
+///    and check, in order: (a) `ctx.memo` (per-request
 ///    de-dup); (b) `fluree.governance_cache()` (per-instance, shared
 ///    across requests and across every data ledger that references
-///    the same (M, graph, t)). On hit at either layer, return —
+///    the same (M, graph, head)). On hit at either layer, return —
 ///    cross-subsystem de-dup runs before cycle detection, and a
 ///    governance-cache hit is also folded into `ctx.memo` so later
 ///    calls in the same request short-circuit at (a).
@@ -141,25 +141,26 @@ pub async fn resolve_graph_ref(
     // different alias spelling.
     reject_if_reserved_graph(&canonical_ledger_id, graph_iri)?;
 
-    // (4) resolved_t: lazy per-request capture. f:atT pins are
+    // (4) M's head: lazy per-request capture. f:atT pins are
     // rejected at step (1) above (Phase 3, not yet implemented), so
     // every cross-ledger reference resolves against M's current head
     // for the duration of the request. Per-model entries are written
     // once and reused; subsequent unpinned references to the same M
     // in the same request hit the cache.
-    let resolved_t = if let Some(t) = ctx.resolved_ts.get(&canonical_ledger_id) {
-        *t
-    } else {
-        let head_t = ns_record.commit_t;
-        ctx.resolved_ts.insert(canonical_ledger_id.clone(), head_t);
-        head_t
-    };
+    let head = ctx
+        .resolved_heads
+        .entry(canonical_ledger_id.clone())
+        .or_insert_with(|| ModelHead {
+            t: ns_record.commit_t,
+            commit_id: ns_record.commit_head_id.clone(),
+        })
+        .clone();
 
-    let key: (ArtifactKind, String, String, i64) = (
+    let key: ResolutionKey = (
         kind,
         canonical_ledger_id.clone().to_string(),
         graph_iri.to_string(),
-        resolved_t,
+        head.clone(),
     );
 
     // (5a) Memo hit — short-circuit cross-subsystem de-dup before
@@ -188,8 +189,7 @@ pub async fn resolve_graph_ref(
 
     // Materialize. Slice 3 provides the dispatch shape; the actual
     // projector lands in slice 4.
-    let materialize_result =
-        materialize(kind, &canonical_ledger_id, graph_iri, resolved_t, ctx).await;
+    let materialize_result = materialize(kind, &canonical_ledger_id, graph_iri, &head, ctx).await;
 
     // Always pop active, even on error, so a failure deeper in the
     // chain doesn't leave stale entries that trip cycle detection
@@ -208,7 +208,7 @@ pub async fn resolve_graph_ref(
     // write its own `Arc`. The cache ends up holding whichever
     // write completed last; the loser's `Arc` is dropped when
     // its request finishes. Wire artifacts are pure functions of
-    // `(kind, model_ledger, graph, resolved_t)`, so the two
+    // `(kind, model_ledger, graph, head)`, so the two
     // materialized values are structurally identical — duplicate
     // work, not duplicate semantics. Single-flight is a possible
     // future optimization but not a correctness requirement.
@@ -225,7 +225,7 @@ async fn materialize(
     kind: ArtifactKind,
     canonical_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
+    head: &ModelHead,
     ctx: &mut ResolveCtx<'_>,
 ) -> Result<ResolvedGraph, CrossLedgerError> {
     match kind {
@@ -233,14 +233,14 @@ async fn materialize(
             let wire = super::policy_materializer::materialize_policy_rules(
                 canonical_ledger_id,
                 graph_iri,
-                resolved_t,
+                head,
                 ctx,
             )
             .await?;
             Ok(ResolvedGraph {
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
-                resolved_t,
+                resolved_t: head.t,
                 artifact: GovernanceArtifact::PolicyRules(wire),
             })
         }
@@ -248,14 +248,14 @@ async fn materialize(
             let wire = super::constraints_materializer::materialize_constraints(
                 canonical_ledger_id,
                 graph_iri,
-                resolved_t,
+                head,
                 ctx,
             )
             .await?;
             Ok(ResolvedGraph {
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
-                resolved_t,
+                resolved_t: head.t,
                 artifact: GovernanceArtifact::Constraints(wire),
             })
         }
@@ -263,14 +263,14 @@ async fn materialize(
             let wire = super::schema_materializer::materialize_schema(
                 canonical_ledger_id,
                 graph_iri,
-                resolved_t,
+                head,
                 ctx,
             )
             .await?;
             Ok(ResolvedGraph {
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
-                resolved_t,
+                resolved_t: head.t,
                 artifact: GovernanceArtifact::SchemaClosure(wire),
             })
         }
@@ -278,14 +278,14 @@ async fn materialize(
             let wire = super::shapes_materializer::materialize_shapes(
                 canonical_ledger_id,
                 graph_iri,
-                resolved_t,
+                head,
                 ctx,
             )
             .await?;
             Ok(ResolvedGraph {
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
-                resolved_t,
+                resolved_t: head.t,
                 artifact: GovernanceArtifact::Shapes(wire),
             })
         }
@@ -293,14 +293,14 @@ async fn materialize(
             let wire = super::rules_materializer::materialize_rules(
                 canonical_ledger_id,
                 graph_iri,
-                resolved_t,
+                head,
                 ctx,
             )
             .await?;
             Ok(ResolvedGraph {
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
-                resolved_t,
+                resolved_t: head.t,
                 artifact: GovernanceArtifact::Rules(wire),
             })
         }
