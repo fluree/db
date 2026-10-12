@@ -114,9 +114,9 @@ current value is retracted exactly as it is stored.
 - **Language tags.** All languages of a predicate are replaced together. An
   upsert of `{"schema:name": {"@value": "Alicia", "@language": "es"}}` over
   `"Alice"@en` and `"Alice"@fr` leaves only `"Alicia"@es`. To change one
-  language and keep the others, use
-  [WHERE/DELETE/INSERT](update-where-delete-insert.md) with a `FILTER` on
-  `lang(?v)`, or include every language in the payload.
+  language and keep the others, include every language in the payload, or
+  replace that language with an update
+  ([Replacing One Language](#replacing-one-language)).
 - **Lists.** A `@list` value is replaced as a whole: every stored position is
   retracted, including repeated values, and positions the new list restates
   cancel. Replacing a list with plain values (or the reverse) works the same
@@ -138,6 +138,25 @@ current value is retracted exactly as it is stored.
 - **Named graphs.** The graph is part of the unit: an upsert into a named
   graph replaces that graph's values and leaves the same predicate's values
   in other graphs alone.
+
+### Replacing One Language
+
+A client that writes one language at a time, such as one `prefLabel` per
+language, cannot use upsert for it: each upsert replaces every language of
+the predicate. It replaces the one language with an update instead, which
+deletes the stored values in that language and inserts the new one. Over
+`"Alice"@en` and `"Alice"@fr`, this leaves `"Alice"@en` and `"Alicia"@fr`:
+
+```sparql
+PREFIX schema: <http://schema.org/>
+PREFIX ex: <http://example.org/ns/>
+
+DELETE { ex:alice schema:name ?o }
+INSERT { ex:alice schema:name "Alicia"@fr }
+WHERE  { OPTIONAL { ex:alice schema:name ?o FILTER(lang(?o) = "fr") } }
+```
+
+The `OPTIONAL` keeps the insert when no French name is stored yet.
 
 ## Idempotency
 

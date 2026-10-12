@@ -749,3 +749,77 @@ async fn an_upsert_after_a_delete_where_of_a_sub_microsecond_datetime_writes_it(
     h.upsert_writes_it_again(&doc, "sub-microsecond DELETE WHERE")
         .await;
 }
+
+// =============================================================================
+// upsert.md: replacing one language
+// =============================================================================
+
+/// `upsert.md`'s update that replaces one language of a predicate, read
+/// from the doc: the SPARQL block under "Replacing One Language".
+fn replace_one_language() -> &'static str {
+    const DOC: &str = include_str!("../../docs/transactions/upsert.md");
+    let section = DOC
+        .split_once("### Replacing One Language")
+        .expect("upsert.md has the section")
+        .1;
+    let block = section
+        .split_once("```sparql\n")
+        .expect("the section has a SPARQL block")
+        .1;
+    block.split_once("```").expect("the block closes").0
+}
+
+impl Harness {
+    async fn sparql_update(&mut self, text: &str) {
+        let ledger = self.ledger.take().expect("ledger");
+        let parsed = fluree_db_sparql::parse_sparql(text);
+        assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
+        let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+        let txn = fluree_db_transact::lower_sparql_update_ast(
+            &parsed.ast.expect("SPARQL AST"),
+            &mut ns,
+            fluree_db_transact::TxnOpts::default(),
+        )
+        .expect("lower");
+        let result = self
+            .fluree
+            .stage_owned(ledger)
+            .txn(txn)
+            .execute()
+            .await
+            .expect("update");
+        self.ledger = Some(result.ledger);
+    }
+}
+
+/// The recipe replaces the French name and keeps the English one, whether
+/// or not a French name is stored, where an upsert of the French name
+/// replaces every language.
+#[tokio::test]
+async fn upsert_md_replaces_one_language_and_keeps_the_others() {
+    let name = |v: &str, tag: &str| json!({"@value": v, "@language": tag});
+    for lane in [Lane::Novelty, Lane::Indexed] {
+        for (what, seed) in [
+            (
+                "french-stored",
+                json!([name("Alice", "en"), name("Alice", "fr")]),
+            ),
+            ("no-french", name("Alice", "en")),
+        ] {
+            let mut h = Harness::new(&format!("one-language-{what}-{lane:?}").to_lowercase()).await;
+            h.insert(&jsonld(
+                json!({"@id": "ex:alice", "http://schema.org/name": seed}),
+            ))
+            .await;
+            if matches!(lane, Lane::Indexed) {
+                h.reindex().await;
+            }
+            h.sparql_update(replace_one_language()).await;
+            assert_eq!(
+                h.facts(None, "alice").await,
+                vec!["name=Alice@en", "name=Alicia@fr"],
+                "{what} [{lane:?}]"
+            );
+        }
+    }
+}
