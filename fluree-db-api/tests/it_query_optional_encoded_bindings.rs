@@ -2627,6 +2627,76 @@ async fn geo_filter_over_a_dataset_spanning_ledgers_through_from_named() {
     failures.assert_none();
 }
 
+/// A `geof:distance` filter on a ledger with no binary index attached (before
+/// its first index): the geo index search needs one and has no fallback, so
+/// the planner keeps the patterns. Indexed, the same ledger answers the same
+/// through the geo index search.
+#[tokio::test(flavor = "current_thread")]
+async fn geo_filter_before_and_after_the_first_index() {
+    let ledger_id = "it/geo-before-index:main";
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            r#"
+            @prefix ex: <http://example.org/> .
+            @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+            ex:paris ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+            ex:london ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral .
+            ex:berlin ex:location "POINT(13.4050 52.5200)"^^geo:wktLiteral .
+        "#,
+        )
+        .execute()
+        .await
+        .expect("seed");
+    assert!(
+        handle.snapshot().await.binary_store.is_none(),
+        "no index yet"
+    );
+    let query = format!(
+        "{PREFIXES}PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+         PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+         SELECT ?place WHERE {{ ?place ex:location ?loc \
+         BIND(geof:distance(?loc, \"POINT(2.3522 48.8566)\"^^geo:wktLiteral) AS ?d) \
+         FILTER(?d <= 500000) }}"
+    );
+    let near = rows(&[&["london"], &["paris"]]);
+    let place: &'static [&'static str] = &["place"];
+    let mut failures = Failures::default();
+    check_lane_cases(
+        &fluree,
+        &handle,
+        "geo_search",
+        vec![(
+            "before the first index",
+            query.clone(),
+            place,
+            near.clone(),
+            false,
+        )],
+        &mut failures,
+    )
+    .await;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    assert!(handle.snapshot().await.binary_store.is_some(), "indexed");
+    check_lane_cases(
+        &fluree,
+        &handle,
+        "geo_search",
+        vec![("after the first index", query, place, near, true)],
+        &mut failures,
+    )
+    .await;
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //
