@@ -6973,8 +6973,10 @@ async fn annotation_on_a_reverse_property_reifies_the_stored_edge() {
     let fluree = FlureeBuilder::memory().build_memory();
     let mut reverse_ctx = ctx();
     reverse_ctx["childOf"] = json!({"@reverse": "ex:child"});
+    reverse_ctx["parent"] = json!({"@reverse": "ex:child", "@type": "@id"});
     for (i, node) in [
         json!({"@id": "ex:kid", "childOf": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "parent": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
         json!({"@id": "ex:kid", "@reverse": {"ex:child": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}}),
     ]
     .into_iter()

@@ -1936,7 +1936,8 @@ fn docs_repair_recipe(ledger_id: &str, which: usize) -> String {
 /// give it) restores each config the pre-fix JSON-LD parser could split
 /// across graphs: a setting group's fields in the default graph; the config
 /// subject's own group link and group there; a per-graph override's target
-/// and groups there; a group partly in the config graph; and (with the second
+/// and groups there; a group partly in the config graph; an anonymous group
+/// (a blank node, as the documented JSON-LD form wrote it); and (with the second
 /// recipe) a whole config on the recommended subject in the default graph,
 /// untyped, with no config subject in the config graph. Before the repair
 /// each reads without its SHACL setting (the forbidden record commits) and
@@ -2001,6 +2002,16 @@ async fn repair_recipe_restores_a_split_config() {
                 json!({"@id": "urn:config:shacl", "@graph": "config",
                        "f:validationMode": {"@id": "f:ValidationReject"}}),
                 json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "an anonymous group (a blank node) in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:shaclDefaults": {"@id": "_:group"}}),
+                json!({"@id": "_:group", "f:shaclEnabled": true,
+                       "f:validationMode": {"@id": "f:ValidationReject"}}),
             ],
         ),
     ];
