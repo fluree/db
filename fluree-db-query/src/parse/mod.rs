@@ -734,6 +734,24 @@ fn parse_construct_template(
     }
 }
 
+/// A pattern a CONSTRUCT template node produces, kept when it is template
+/// output: a triple or an edge annotation, and a graph block (a node's own
+/// `@graph` is GRAPH sugar, as in a `where`) holding them. Other patterns a
+/// node map can produce are not output.
+fn construct_template_pattern(pattern: UnresolvedPattern) -> Option<UnresolvedPattern> {
+    match pattern {
+        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. } => Some(pattern),
+        UnresolvedPattern::Graph { name, patterns } => Some(UnresolvedPattern::Graph {
+            name,
+            patterns: patterns
+                .into_iter()
+                .filter_map(construct_template_pattern)
+                .collect(),
+        }),
+        _ => None,
+    }
+}
+
 fn parse_construct_items(
     items: &[JsonValue],
     ctx: &JsonLdParseCtx,
@@ -753,12 +771,12 @@ fn parse_construct_items(
                     nested_counter,
                     true,
                 )?;
-                patterns.extend(temp_query.patterns.into_iter().filter(|p| {
-                    matches!(
-                        p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
-                    )
-                }));
+                patterns.extend(
+                    temp_query
+                        .patterns
+                        .into_iter()
+                        .filter_map(construct_template_pattern),
+                );
             }
             JsonValue::Array(arr) if arr.first().and_then(JsonValue::as_str) == Some("graph") => {
                 let name = arr.get(1).and_then(JsonValue::as_str).ok_or_else(|| {
