@@ -1703,11 +1703,10 @@ impl BinaryScanOperator {
     ///   (`(v, Sid::min())..(v, Sid::max())`) — constructible, and it would
     ///   capture every representation and datatype of the bound value.
     /// - The remaining proof burden is what keeps it out for now: window
-    ///   completeness would rest on `FlakeValue::Ord` being a valid total
-    ///   order across the numeric corners (`numeric_cmp` returns `None` for
-    ///   NaN and falls back to discriminant order, so run contiguity is not
-    ///   unconditional), and on the scan filter's match set never exceeding
-    ///   the comparator's equal-value run. Subject/predicate brackets compare
+    ///   completeness would rest on the scan filter's match set never
+    ///   exceeding the comparator's equal-value run. (`FlakeValue::Ord` is
+    ///   itself a total order across the numeric corners, NaN after `INF`
+    ///   and every NaN equal, so run contiguity holds.) Subject/predicate brackets compare
     ///   `Sid`s only and need none of that reasoning. Reference objects use
     ///   that same exact Sid ordering in `bounded_ref_object_walk` below.
     ///
