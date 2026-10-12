@@ -121,15 +121,20 @@ pub(crate) struct SequentialStager {
     scope: WriteScope,
 }
 
-/// Fact identity for the sequential fold (flake minus `t`/`op`).
-type SequentialFactKey = (
-    Option<Sid>,
-    Sid,
-    Sid,
-    FlakeValue,
-    Sid,
-    Option<fluree_db_core::FlakeMeta>,
-);
+/// Fact identity for the sequential fold: `(g, s, p)` and the object as
+/// storage tells it apart (see [`FoldTerm`]).
+type SequentialFactKey = (Option<Sid>, Sid, Sid, FoldTerm);
+
+/// How storage tells two ops on one `(g, s, p)` apart. A kind whose index
+/// key can merge terms is one fact per key and list position, whatever its
+/// term: a delete that retracts the stored term and an insert that writes
+/// the same value with more detail are one fact, as they are to storage.
+/// Any other fact is its term.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FoldTerm {
+    Term(FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>),
+    Key((u16, u64), Option<i32>),
+}
 
 impl SequentialStager {
     pub(crate) fn new(ledger: LedgerState) -> Self {
@@ -223,17 +228,22 @@ impl SequentialStager {
 
         let (mut state_i, flakes_i) = result.view.into_parts();
         let staged_count = flakes_i.len();
+        let base = fluree_db_transact::CurrentFacts::new(&self.original);
         for flake in &flakes_i {
             let mut merged = flake.clone();
             merged.t = self.final_t;
-            let key: SequentialFactKey = (
-                merged.g.clone(),
-                merged.s.clone(),
-                merged.p.clone(),
-                merged.o.clone(),
-                merged.dt.clone(),
-                merged.m.clone(),
-            );
+            let merge_key = if merged.o.index_key_may_merge_terms() {
+                crate::rebase::graph_id_in(&self.original, &merged.g)
+                    .and_then(|g_id| base.merge_key(g_id, &merged))
+            } else {
+                None
+            };
+            let term = match merge_key {
+                Some(key) => FoldTerm::Key(key, merged.m.as_ref().and_then(|m| m.i)),
+                None => FoldTerm::Term(merged.o.clone(), merged.dt.clone(), merged.m.clone()),
+            };
+            let key: SequentialFactKey =
+                (merged.g.clone(), merged.s.clone(), merged.p.clone(), term);
             match self.fold_index.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     self.folded[*entry.get()] = merged;
@@ -275,20 +285,36 @@ impl SequentialStager {
     /// stages an assert of a fact already present, so a first-op assert does
     /// not say what the base held. (A first-op retraction does: staging only
     /// retracts a stored fact.)
+    ///
+    /// The base is asked through [`CurrentFacts::named_by`], by the identity
+    /// the fold keyed the fact by, and a retraction that stays names the
+    /// fact as the base stores it: an earlier operation may have written the
+    /// value with more detail than the index keeps.
+    ///
+    /// [`CurrentFacts::named_by`]: fluree_db_transact::CurrentFacts::named_by
     async fn drop_reversed_facts(&mut self) -> Result<()> {
+        let base = fluree_db_transact::CurrentFacts::new(&self.original);
         let mut keep = vec![true; self.folded.len()];
+        let mut renamed = Vec::new();
         for (i, flake) in self.folded.iter().enumerate() {
             if flake.op == self.first_ops[i] {
                 continue;
             }
-            let key =
-                fluree_db_core::ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone());
-            let in_base = crate::rebase::current_asserted_for_key(&self.original, &key)
-                .await?
-                .iter()
-                .map(fluree_db_transact::StoredFact::flake)
-                .any(|f| f.o == flake.o && f.dt == flake.dt && f.m == flake.m);
-            keep[i] = flake.op != in_base;
+            let stored = match crate::rebase::slot_in(&self.original, &flake.g, &flake.s, &flake.p)
+            {
+                Some(slot) => base.named_by(&slot, flake).await?,
+                None => None,
+            };
+            keep[i] = flake.op != stored.is_some();
+            if let (true, false, Some(stored)) = (keep[i], flake.op, stored) {
+                let held = stored.flake();
+                if held.o != flake.o || held.dt != flake.dt || held.m != flake.m {
+                    renamed.push((i, stored.retract(self.final_t).into_flake()));
+                }
+            }
+        }
+        for (i, retraction) in renamed {
+            self.folded[i] = retraction;
         }
         if keep.iter().all(|k| *k) {
             return Ok(());

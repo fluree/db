@@ -8,7 +8,8 @@ use crate::commit_data::{key_of, OwnChanges};
 use crate::error::{ApiError, Result};
 use fluree_db_core::LedgerId;
 use fluree_db_core::{
-    BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake, DEFAULT_GRAPH_ID,
+    BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake, GraphId, Sid,
+    DEFAULT_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
@@ -929,6 +930,29 @@ fn find_conflicting_keys(
         .collect()
 }
 
+/// The id `state` gives graph `g` (`None` is the default graph), or `None`
+/// for a graph `state` does not have.
+pub(crate) fn graph_id_in(state: &LedgerState, g: &Option<Sid>) -> Option<GraphId> {
+    match g {
+        None => Some(DEFAULT_GRAPH_ID),
+        Some(g_sid) => state
+            .snapshot
+            .decode_sid(g_sid)
+            .and_then(|iri| state.snapshot.graph_registry.graph_id_for_iri(&iri)),
+    }
+}
+
+/// The slot `(g, s, p)` names in `state`, or `None` for a graph `state` does
+/// not have, which holds nothing.
+pub(crate) fn slot_in(state: &LedgerState, g: &Option<Sid>, s: &Sid, p: &Sid) -> Option<Slot> {
+    Some(Slot {
+        g_id: graph_id_in(state, g)?,
+        g_sid: g.clone(),
+        s: s.clone(),
+        p: p.clone(),
+    })
+}
+
 /// The facts `state` currently holds for a conflict key's `(subject,
 /// predicate, graph)`, graph stamped.
 ///
@@ -941,22 +965,8 @@ pub(crate) async fn current_asserted_for_key(
     state: &LedgerState,
     key: &ConflictKey,
 ) -> Result<Vec<StoredFact>> {
-    let g_id = match &key.g {
-        None => DEFAULT_GRAPH_ID,
-        Some(g_sid) => match state
-            .snapshot
-            .decode_sid(g_sid)
-            .and_then(|iri| state.snapshot.graph_registry.graph_id_for_iri(&iri))
-        {
-            Some(g_id) => g_id,
-            None => return Ok(Vec::new()),
-        },
-    };
-    let slot = Slot {
-        g_id,
-        g_sid: key.g.clone(),
-        s: key.s.clone(),
-        p: key.p.clone(),
+    let Some(slot) = slot_in(state, &key.g, &key.s, &key.p) else {
+        return Ok(Vec::new());
     };
     Ok(CurrentFacts::new(state)
         .of_slots(std::slice::from_ref(&slot))

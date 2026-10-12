@@ -499,29 +499,50 @@ impl<'l> CurrentFacts<'l> {
         Ok(out)
     }
 
-    /// Whether `slot` holds the fact a retraction of `flake` names: a
-    /// current fact with its term and metadata, or, for a kind whose index
-    /// key can merge terms ([`IndexKeys`]), one with its key and list
-    /// position, which storage resolves as the same fact. The test a pushed
-    /// commit's retractions pass: written elsewhere, a retraction may carry
-    /// a term as written where the index keeps less of it.
+    /// Whether `slot` holds the fact a retraction of `flake` names; see
+    /// [`Self::named_by`]. The test a pushed commit's retractions pass:
+    /// written elsewhere, a retraction may carry a term as written where the
+    /// index keeps less of it.
     pub async fn holds(&self, slot: &Slot, flake: &Flake) -> Result<bool> {
+        Ok(self.named_by(slot, flake).await?.is_some())
+    }
+
+    /// The current fact of `slot` that `flake` names: the one with its term
+    /// and metadata, or, for a kind whose index key can merge terms
+    /// ([`IndexKeys`]), the one with its key and list position, which
+    /// storage resolves as the same fact.
+    pub async fn named_by(&self, slot: &Slot, flake: &Flake) -> Result<Option<StoredFact>> {
         let novelty = NoveltyPlan::for_slots(self.ledger, std::slice::from_ref(slot), self.to_t);
-        let facts = self.read_slot(slot, None, &novelty).await?;
-        if facts
+        let mut facts = self.read_slot(slot, None, &novelty).await?;
+        if let Some(n) = facts
             .iter()
-            .any(|f| f.flake.o == flake.o && f.flake.dt == flake.dt && f.flake.m == flake.m)
+            .position(|f| f.flake.o == flake.o && f.flake.dt == flake.dt && f.flake.m == flake.m)
         {
-            return Ok(true);
+            return Ok(Some(facts.swap_remove(n)));
         }
         let p_id = self.keys.p_id(&flake.p);
         let Some(key) = self.keys.key(slot.g_id, p_id, flake) else {
-            return Ok(false);
+            return Ok(None);
         };
         let at = list_index_of(flake);
-        Ok(facts.iter().any(|f| {
-            list_index_of(&f.flake) == at && self.keys.key(slot.g_id, p_id, &f.flake) == Some(key)
-        }))
+        Ok(facts
+            .iter()
+            .position(|f| {
+                list_index_of(&f.flake) == at
+                    && self.keys.key(slot.g_id, p_id, &f.flake) == Some(key)
+            })
+            .map(|n| facts.swap_remove(n)))
+    }
+
+    /// The index key storage merges `flake` under in graph `g_id`, for a kind
+    /// whose key can merge terms and that the index can key: ops with one
+    /// such key and list position are one fact to storage, whatever their
+    /// terms. `None` for any other fact, which storage tells by its term.
+    pub fn merge_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
+        if !flake.o.index_key_may_merge_terms() {
+            return None;
+        }
+        self.keys.key(g_id, self.keys.p_id(&flake.p), flake)
     }
 
     /// [`Self::of_slots`], except that a slot given `Some(values)` is read
