@@ -122,19 +122,10 @@ pub(crate) struct SequentialStager {
 }
 
 /// Fact identity for the sequential fold: `(g, s, p)` and the object as
-/// storage tells it apart (see [`FoldTerm`]).
-type SequentialFactKey = (Option<Sid>, Sid, Sid, FoldTerm);
-
-/// How storage tells two ops on one `(g, s, p)` apart. A kind whose index
-/// key can merge terms is one fact per key and list position, whatever its
-/// term: a delete that retracts the stored term and an insert that writes
-/// the same value with more detail are one fact, as they are to storage.
-/// Any other fact is its term.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum FoldTerm {
-    Term(FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>),
-    Key((u16, u64), Option<i32>),
-}
+/// storage tells it apart ([`fluree_db_transact::FactTerm`]). A delete that
+/// retracts the stored term and an insert that writes the same value with
+/// more detail than the index keeps are one fact, as they are to storage.
+type SequentialFactKey = (Option<Sid>, Sid, Sid, fluree_db_transact::FactTerm);
 
 impl SequentialStager {
     pub(crate) fn new(ledger: LedgerState) -> Self {
@@ -228,22 +219,16 @@ impl SequentialStager {
 
         let (mut state_i, flakes_i) = result.view.into_parts();
         let staged_count = flakes_i.len();
-        let base = fluree_db_transact::CurrentFacts::new(&self.original);
+        let ids = fluree_db_transact::FactIdentity::new(&self.original);
         for flake in &flakes_i {
             let mut merged = flake.clone();
             merged.t = self.final_t;
-            let merge_key = if merged.o.index_key_may_merge_terms() {
-                crate::rebase::graph_id_in(&self.original, &merged.g)
-                    .and_then(|g_id| base.merge_key(g_id, &merged))
-            } else {
-                None
-            };
-            let term = match merge_key {
-                Some(key) => FoldTerm::Key(key, merged.m.as_ref().and_then(|m| m.i)),
-                None => FoldTerm::Term(merged.o.clone(), merged.dt.clone(), merged.m.clone()),
-            };
-            let key: SequentialFactKey =
-                (merged.g.clone(), merged.s.clone(), merged.p.clone(), term);
+            let key: SequentialFactKey = (
+                merged.g.clone(),
+                merged.s.clone(),
+                merged.p.clone(),
+                ids.of_flake(&merged),
+            );
             match self.fold_index.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     self.folded[*entry.get()] = merged;
@@ -300,8 +285,12 @@ impl SequentialStager {
             if flake.op == self.first_ops[i] {
                 continue;
             }
-            let stored = match crate::rebase::slot_in(&self.original, &flake.g, &flake.s, &flake.p)
-            {
+            let stored = match fluree_db_transact::Slot::in_ledger(
+                &self.original,
+                &flake.g,
+                &flake.s,
+                &flake.p,
+            ) {
                 Some(slot) => base.named_by(&slot, flake).await?,
                 None => None,
             };

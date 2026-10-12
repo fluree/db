@@ -815,6 +815,17 @@ pub async fn stage_with_graph_delta(
         } else {
             FlakeAccumulator::mixed(64)
         };
+        // An operation that retracts and asserts tells its facts apart the
+        // way storage does: a DELETE of a stored value and an INSERT of the
+        // same value written with more detail than the index keeps are one
+        // fact, and cancel rather than commit both at one `t`.
+        if !pure_delete
+            && (!txn.delete_templates.is_empty()
+                || txn.sync_graph.is_some()
+                || txn.txn_type == TxnType::Upsert)
+        {
+            acc = acc.with_identity(crate::current_facts::FactIdentity::new(&ledger));
+        }
 
         let where_span = tracing::debug_span!(
             "where_exec",
@@ -2664,7 +2675,7 @@ async fn stream_where_into_accumulator(
     pure_delete: bool,
     fixed_graph_iris: &[String],
     reverse_graph: &mut HashMap<Sid, GraphId>,
-    acc: &mut FlakeAccumulator,
+    acc: &mut FlakeAccumulator<'_>,
     view_policy: Option<&PolicyContext>,
 ) -> Result<WhereStreamStats> {
     // Lower transaction WHERE clause to query patterns.

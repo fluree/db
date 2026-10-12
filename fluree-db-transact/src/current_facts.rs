@@ -47,8 +47,8 @@ use crate::error::{Result, TransactError};
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::{
-    range_with_overlay, Flake, FlakeValue, GraphId, NoOverlay, OverlayProvider, RangeMatch,
-    RangeOptions, RangeTest, Sid, Tracker,
+    range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, NoOverlay, OverlayProvider,
+    RangeMatch, RangeOptions, RangeTest, Sid, Tracker, DEFAULT_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
@@ -454,6 +454,101 @@ fn newer(a: &Flake, b: &Flake) -> bool {
     a.t > b.t || (a.t == b.t && !a.op && b.op)
 }
 
+/// How storage tells two facts of one `(graph, subject, predicate)` apart.
+///
+/// A value whose index key can merge terms ([`IndexKeys`]) and that the
+/// index can key is one fact per key and list position, whatever its term:
+/// storage merges every op by that key, in the index and in queries over
+/// novelty. Any other value is its term (value, datatype, and metadata:
+/// language tag and list position), as [`Flake`]'s equality has it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FactTerm {
+    /// The term of a value storage tells by term.
+    Term(FlakeValue, Sid, Option<FlakeMeta>),
+    /// The index key `(o_type, o_key)` and list position of a value storage
+    /// tells by key.
+    Key((u16, u64), Option<i32>),
+}
+
+/// An index key `(o_type, o_key)` and list position: how storage tells
+/// apart the facts of one `(graph, subject, predicate)` whose kind of value
+/// can merge terms ([`FactTerm::Key`]).
+pub type MergeKey = ((u16, u64), Option<i32>);
+
+/// The identity storage gives each fact of one ledger state ([`FactTerm`]).
+///
+/// One rule decides when a retraction and an assertion are the same fact:
+/// within one operation (the flake accumulator), across the operations of
+/// one request (the sequential fold), and against what the state stores
+/// ([`CurrentFacts::named_by`]). Storage resolves a retraction and an
+/// assertion of one fact at one `t` as the retraction, so wherever the two
+/// should cancel they must be told apart by this identity, not by term.
+pub struct FactIdentity<'l> {
+    ledger: &'l LedgerState,
+    keys: IndexKeys<'l>,
+}
+
+impl<'l> FactIdentity<'l> {
+    /// Fact identities in `ledger`: index keys from its persisted index (none
+    /// without one), graph ids from its registry.
+    pub fn new(ledger: &'l LedgerState) -> Self {
+        Self {
+            ledger,
+            keys: IndexKeys::new(ledger),
+        }
+    }
+
+    /// The id the state gives graph `g`; see [`graph_id_in`].
+    pub fn graph_id(&self, g: &Option<Sid>) -> Option<GraphId> {
+        graph_id_in(self.ledger, g)
+    }
+
+    /// `flake`'s index key and list position in graph `g_id`, when storage
+    /// tells it by key ([`FactTerm::Key`]).
+    pub fn key(&self, g_id: GraphId, flake: &Flake) -> Option<MergeKey> {
+        if !flake.o.index_key_may_merge_terms() {
+            return None;
+        }
+        self.key_under(g_id, self.keys.p_id(&flake.p), flake)
+    }
+
+    /// [`Self::key`] under `flake.p`'s persisted id `p_id`, for a caller
+    /// keying many facts of one predicate.
+    fn key_under(&self, g_id: GraphId, p_id: Option<u32>, flake: &Flake) -> Option<MergeKey> {
+        let key = self.keys.key(g_id, p_id, flake)?;
+        Some((key, list_index_of(flake)))
+    }
+
+    /// `flake`'s identity in graph `g_id`.
+    pub fn of(&self, g_id: GraphId, flake: &Flake) -> FactTerm {
+        match self.key(g_id, flake) {
+            Some((key, at)) => FactTerm::Key(key, at),
+            None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
+        }
+    }
+
+    /// `flake`'s identity in its own graph (`flake.g`). A graph the state
+    /// does not have holds nothing indexed, so its facts are told by term.
+    pub fn of_flake(&self, flake: &Flake) -> FactTerm {
+        match self.graph_id(&flake.g) {
+            Some(g_id) => self.of(g_id, flake),
+            None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
+        }
+    }
+}
+
+/// The id `ledger` gives graph `g` (`None` is the default graph), or `None`
+/// for a graph it does not have.
+pub fn graph_id_in(ledger: &LedgerState, g: &Option<Sid>) -> Option<GraphId> {
+    match g {
+        None => Some(DEFAULT_GRAPH_ID),
+        Some(g_sid) => ledger
+            .snapshot
+            .decode_sid(g_sid)
+            .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(&iri)),
+    }
+}
+
 /// A `(graph, subject, predicate)` slot to read.
 #[derive(Clone, Debug)]
 pub struct Slot {
@@ -465,6 +560,19 @@ pub struct Slot {
     pub s: Sid,
     /// Predicate.
     pub p: Sid,
+}
+
+impl Slot {
+    /// The slot `(g, s, p)` names in `ledger`, or `None` for a graph `ledger`
+    /// does not have, which holds nothing.
+    pub fn in_ledger(ledger: &LedgerState, g: &Option<Sid>, s: &Sid, p: &Sid) -> Option<Self> {
+        Some(Self {
+            g_id: graph_id_in(ledger, g)?,
+            g_sid: g.clone(),
+            s: s.clone(),
+            p: p.clone(),
+        })
+    }
 }
 
 /// Reads a ledger's current facts as of its current `t`.
@@ -507,42 +615,21 @@ impl<'l> CurrentFacts<'l> {
         Ok(self.named_by(slot, flake).await?.is_some())
     }
 
-    /// The current fact of `slot` that `flake` names: the one with its term
-    /// and metadata, or, for a kind whose index key can merge terms
-    /// ([`IndexKeys`]), the one with its key and list position, which
-    /// storage resolves as the same fact.
+    /// The current fact of `slot` that `flake` names: the one with
+    /// `flake`'s identity ([`FactIdentity`]), so a retraction that carries a
+    /// term as written where the index keeps less of it names the fact as
+    /// stored.
     pub async fn named_by(&self, slot: &Slot, flake: &Flake) -> Result<Option<StoredFact>> {
         let novelty = NoveltyPlan::for_slots(self.ledger, std::slice::from_ref(slot), self.to_t);
         let mut facts = self.read_slot(slot, None, &novelty).await?;
-        if let Some(n) = facts
-            .iter()
-            .position(|f| f.flake.o == flake.o && f.flake.dt == flake.dt && f.flake.m == flake.m)
-        {
-            return Ok(Some(facts.swap_remove(n)));
-        }
-        let p_id = self.keys.p_id(&flake.p);
-        let Some(key) = self.keys.key(slot.g_id, p_id, flake) else {
-            return Ok(None);
+        let ids = FactIdentity::new(self.ledger);
+        let n = match ids.key(slot.g_id, flake) {
+            Some(key) => facts
+                .iter()
+                .position(|f| ids.key(slot.g_id, &f.flake) == Some(key)),
+            None => facts.iter().position(|f| f.flake == *flake),
         };
-        let at = list_index_of(flake);
-        Ok(facts
-            .iter()
-            .position(|f| {
-                list_index_of(&f.flake) == at
-                    && self.keys.key(slot.g_id, p_id, &f.flake) == Some(key)
-            })
-            .map(|n| facts.swap_remove(n)))
-    }
-
-    /// The index key storage merges `flake` under in graph `g_id`, for a kind
-    /// whose key can merge terms and that the index can key: ops with one
-    /// such key and list position are one fact to storage, whatever their
-    /// terms. `None` for any other fact, which storage tells by its term.
-    pub fn merge_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
-        if !flake.o.index_key_may_merge_terms() {
-            return None;
-        }
-        self.keys.key(g_id, self.keys.p_id(&flake.p), flake)
+        Ok(n.map(|n| facts.swap_remove(n)))
     }
 
     /// [`Self::of_slots`], except that a slot given `Some(values)` is read
