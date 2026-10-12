@@ -39,9 +39,22 @@ use std::fmt;
 /// ([`Self::from_instant`]), because a commit writes six and the index keys
 /// microseconds: a value written and the value stored are then one value,
 /// before a reload and after one, in a write and in a query constant.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DateTime {
     instant: ChronoDateTime<Utc>,
+}
+
+/// The serialized form, `{ instant }`, read back through
+/// [`DateTime::from_instant`] like every other way in.
+impl<'de> Deserialize<'de> for DateTime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "DateTime")]
+        struct Form {
+            instant: ChronoDateTime<Utc>,
+        }
+        Form::deserialize(deserializer).map(|form| Self::from_instant(form.instant))
+    }
 }
 
 impl DateTime {
@@ -322,9 +335,22 @@ impl fmt::Display for Date {
 /// ever kept the wall clock (`micros_since_midnight`), so this is the reading
 /// both lanes agree on without re-encoding every stored time. See the module
 /// docs.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Time {
     time: NaiveTime,
+}
+
+/// The serialized form, `{ time }`, read back through [`Time::from_naive`]
+/// like every other way in.
+impl<'de> Deserialize<'de> for Time {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "Time")]
+        struct Form {
+            time: NaiveTime,
+        }
+        Form::deserialize(deserializer).map(|form| Self::from_naive(form.time))
+    }
 }
 
 impl Time {
@@ -3426,5 +3452,22 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(err.contains("overflow"), "unexpected error: {err}");
+    }
+
+    /// Every way into a `DateTime` or `Time` holds it to the microsecond,
+    /// deserialization included, and the serialized form reads back as
+    /// itself.
+    #[test]
+    fn a_deserialized_temporal_is_held_to_the_microsecond() {
+        let dt: DateTime =
+            serde_json::from_str(r#"{"instant":"2020-01-01T00:00:00.123456789Z"}"#).unwrap();
+        assert_eq!(dt, DateTime::parse("2020-01-01T00:00:00.123456Z").unwrap());
+        assert_eq!(dt.canonical(), "2020-01-01T00:00:00.123456Z");
+        let back: DateTime = serde_json::from_str(&serde_json::to_string(&dt).unwrap()).unwrap();
+        assert_eq!(back, dt);
+        let t: Time = serde_json::from_str(r#"{"time":"12:00:00.123456789"}"#).unwrap();
+        assert_eq!(t, Time::parse("12:00:00.123456").unwrap());
+        let back: Time = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
     }
 }
