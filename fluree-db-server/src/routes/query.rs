@@ -3834,9 +3834,8 @@ async fn execute_sparql_ledger(
         let ledger = match load_ledger_or_missing(state, ledger_id, &span).await {
             Ok(ledger) => ledger,
             Err(e) => {
-                // Non-not-found errors (real load failures) keep the LedgerLoad tag.
+                // Non-not-found errors (real load failures) were reported by the loader.
                 if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
-                    set_span_error_code(&span, "error:LedgerLoad");
                     return Err(e);
                 }
                 // As in execute_query: resolve the alias as a graph source; only a
@@ -4420,8 +4419,8 @@ pub(crate) async fn load_ledger_or_missing(
     // Get cached handle (loads if not cached)
     let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
         if !e.is_not_found() {
-            set_span_error_code(span, "error:NotFound");
-            tracing::error!(error = %e, "ledger not found");
+            set_span_error_code(span, "error:LedgerLoad");
+            tracing::error!(error = %e, "ledger load failed");
         }
         ServerError::Api(e)
     })?;

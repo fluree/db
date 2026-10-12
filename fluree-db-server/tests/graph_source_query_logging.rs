@@ -139,6 +139,17 @@ fn requests(name: &str) -> Vec<(&'static str, Request<Body>)> {
     ]
 }
 
+async fn server(storage: &std::path::Path) -> Arc<AppState> {
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(storage.to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"))
+}
+
 #[tokio::test]
 async fn a_graph_source_query_reports_no_missing_ledger_and_a_missing_name_still_does() {
     let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -147,14 +158,7 @@ async fn a_graph_source_query_reports_no_missing_ledger_and_a_missing_name_still
         .expect("fixtures dir");
     std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", &fixtures);
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = ServerConfig {
-        cors_enabled: false,
-        indexing_enabled: false,
-        storage_path: Some(tmp.path().to_path_buf()),
-        ..Default::default()
-    };
-    let telemetry = TelemetryConfig::with_server_config(&cfg);
-    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let state = server(tmp.path()).await;
 
     let failures = Failures::default();
     let _guard =
@@ -190,6 +194,69 @@ async fn a_graph_source_query_reports_no_missing_ledger_and_a_missing_name_still
         // Only the info route's span has an `error_code` field to carry it.
         assert_eq!(
             reported.iter().any(|f| f == "span: error:NotFound"),
+            route == "info",
+            "{route}: {reported:?}"
+        );
+    }
+}
+
+fn remove_commit_dirs(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir).expect("read_dir").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "commit") {
+                std::fs::remove_dir_all(&path).expect("remove commits");
+            } else {
+                remove_commit_dirs(&path);
+            }
+        }
+    }
+}
+
+/// A ledger that exists but cannot be loaded is a load failure, not a missing
+/// ledger, in its log line and its span code.
+#[tokio::test]
+async fn a_ledger_that_fails_to_load_is_not_reported_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = server(tmp.path()).await;
+    let ledger = state
+        .fluree
+        .create_ledger("broken:main")
+        .await
+        .expect("create");
+    state
+        .fluree
+        .insert(
+            ledger,
+            &json!({"@id": "http://example.org/a", "http://example.org/amount": 1}),
+        )
+        .await
+        .expect("insert");
+    drop(state);
+    remove_commit_dirs(&tmp.path().join("broken"));
+    // A fresh server, so the ledger is loaded rather than served from cache.
+    let state = server(tmp.path()).await;
+
+    let failures = Failures::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(failures.clone()));
+
+    for (route, request) in requests("broken:main") {
+        let (status, text) = send(&state, request).await;
+        assert!(status.is_server_error(), "{route}: {status} {text}");
+        let reported = failures.take();
+        assert!(
+            reported.iter().any(|f| f == "event: ledger load failed"),
+            "{route}: {reported:?}"
+        );
+        assert!(
+            !reported
+                .iter()
+                .any(|f| f.contains("not found") || f.contains("NotFound")),
+            "{route}: {reported:?}"
+        );
+        assert_eq!(
+            reported.iter().any(|f| f == "span: error:LedgerLoad"),
             route == "info",
             "{route}: {reported:?}"
         );
