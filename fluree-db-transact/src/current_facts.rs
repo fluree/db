@@ -2412,8 +2412,9 @@ mod tests {
 
     /// A retraction names a stored fact by its term and metadata: not an
     /// absent or retracted value, nor a stored value under another tag or
-    /// list position. (Without an index there are no keys to match by.) The
-    /// items name facts of one slot, which is read once for all of them.
+    /// list position. (Without an index there are no keys to match by.) Each
+    /// item is matched against its own slot, whatever the order of the
+    /// items: a value another slot holds is not named.
     #[tokio::test]
     async fn named_by_names_a_stored_fact_and_nothing_else() {
         let en = || Some(FlakeMeta::with_lang("en"));
@@ -2423,6 +2424,7 @@ mod tests {
                     flake("a", "p", "x", 1, true, None),
                     flake("a", "p", "y", 1, true, en()),
                     flake("a", "p", "z", 1, true, None),
+                    flake("b", "p", "q", 1, true, None),
                 ],
                 vec![flake("a", "p", "z", 2, false, None)],
             ],
@@ -2430,9 +2432,18 @@ mod tests {
         );
         let current = CurrentFacts::new(&ledger);
         let ap = slot(0, None, "a", "p");
+        let bp = slot(0, None, "b", "p");
         let retract = |o: &str, m: Option<FlakeMeta>| flake("a", "p", o, 3, false, m);
+        let retract_b = |o: &str| flake("b", "p", o, 3, false, None);
         let cases = [
             ("a stored value", &ap, retract("x", None), true),
+            ("a value of another slot", &bp, retract_b("q"), true),
+            (
+                "a value only another slot holds",
+                &bp,
+                retract_b("x"),
+                false,
+            ),
             ("a stored tagged value", &ap, retract("y", en()), true),
             ("a tagged value untagged", &ap, retract("y", None), false),
             (
