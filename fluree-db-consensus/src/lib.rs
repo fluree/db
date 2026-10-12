@@ -1010,6 +1010,15 @@ impl SubmissionError {
 #[async_trait]
 pub trait Committer: Send + Sync {
     /// Stage and commit a transaction.
+    /// The ledger's current instance, as the bits of its ULID
+    /// ([`LedgerState::instance_bits`](fluree_db_api::LedgerState::instance_bits)),
+    /// when this committer can tell cheaply; `None` when it cannot. An
+    /// idempotency cache uses it to tell a ledger from one dropped before it
+    /// under the same name, whose answers it must not give.
+    async fn ledger_instance(&self, _ledger_id: &str) -> Option<u128> {
+        None
+    }
+
     async fn transact(
         &self,
         request: TransactionRequest,

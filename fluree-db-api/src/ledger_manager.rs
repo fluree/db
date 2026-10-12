@@ -643,6 +643,12 @@ impl LedgerHandle {
         )
     }
 
+    /// The bits of the instance the cached state belongs to; see
+    /// [`LedgerState::instance_bits`].
+    pub async fn instance_bits(&self) -> u128 {
+        self.inner.state.read().await.instance_bits()
+    }
+
     /// Whether `record` belongs to another activation than the cached state;
     /// see [`other_activation`].
     pub async fn is_other_activation(&self, record: &NsRecord) -> bool {

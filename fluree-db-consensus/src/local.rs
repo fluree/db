@@ -84,6 +84,17 @@ impl LocalCommitter {
 
 #[async_trait]
 impl Committer for LocalCommitter {
+    /// From the ledger's cached state, which the operation loads anyway.
+    /// Without a ledger cache that would be a load per call, so it is not
+    /// answered.
+    async fn ledger_instance(&self, ledger_id: &str) -> Option<u128> {
+        if !self.fluree.is_caching_enabled() {
+            return None;
+        }
+        let handle = self.fluree.ledger_cached(ledger_id).await.ok()?;
+        Some(handle.instance_bits().await)
+    }
+
     async fn transact(
         &self,
         request: TransactionRequest,
