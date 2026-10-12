@@ -98,6 +98,16 @@ impl DateTime {
         }
     }
 
+    /// This value's order against the dateTime `lexical` writes, every digit
+    /// of it counted, where a constant parsed from it is held to the
+    /// microsecond; `None` when it is not a dateTime. For ordering a value
+    /// against a lexical form: every value is held to the microsecond, so
+    /// this is the order XSD gives the two.
+    pub fn cmp_lexical(&self, lexical: &str) -> Option<Ordering> {
+        let parsed = Self::parse(lexical).ok()?;
+        Some(against_every_digit(self.cmp(&parsed), lexical))
+    }
+
     /// From the index key encoding (`ObjKey::encode_datetime`).
     pub fn from_epoch_micros(micros: i64) -> Option<Self> {
         ChronoDateTime::from_timestamp_micros(micros).map(Self::from_instant)
@@ -187,14 +197,39 @@ impl fmt::Display for DateTime {
     }
 }
 
-/// Fractional-seconds suffix of a canonical lexical: empty when zero, else
-/// `.` and the digits with trailing zeros removed (the XSD canonical form).
 /// `nanos` (a sub-second count, a leap second's included) with the digits past
 /// the microsecond dropped: the precision Fluree stores a temporal value at.
 fn to_micros(nanos: u32) -> u32 {
     nanos - nanos % 1_000
 }
 
+/// Whether a `dateTime` or `time` lexical form has a non-zero digit past the
+/// microsecond, which its value drops ([`DateTime::from_instant`]): the
+/// lexical then lies strictly between its value and the next microsecond.
+/// The only `.` either form has is the one before the fractional seconds.
+pub fn digits_past_micros(lexical: &str) -> bool {
+    lexical.split_once('.').is_some_and(|(_, fraction)| {
+        fraction
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .skip(6)
+            .any(|digit| digit != b'0')
+    })
+}
+
+/// `ord`, a held value's order against the value `lexical` parses to, with
+/// the lexical's digits past the microsecond counted: a value equal to it at
+/// the microsecond is below a lexical that goes past it.
+fn against_every_digit(ord: Ordering, lexical: &str) -> Ordering {
+    if ord == Ordering::Equal && digits_past_micros(lexical) {
+        Ordering::Less
+    } else {
+        ord
+    }
+}
+
+/// Fractional-seconds suffix of a canonical lexical: empty when zero, else
+/// `.` and the digits with trailing zeros removed (the XSD canonical form).
 fn canonical_fraction(micros: u32) -> String {
     if micros == 0 {
         String::new()
@@ -385,6 +420,13 @@ impl Time {
         Self {
             time: time.with_nanosecond(to_micros(nanos)).unwrap_or(time),
         }
+    }
+
+    /// This value's order against the time `lexical` writes, every digit of
+    /// it counted; `None` when it is not a time. See [`DateTime::cmp_lexical`].
+    pub fn cmp_lexical(&self, lexical: &str) -> Option<Ordering> {
+        let parsed = Self::parse(lexical).ok()?;
+        Some(against_every_digit(self.cmp(&parsed), lexical))
     }
 
     /// From the index key encoding (`ObjKey::encode_time`).
@@ -1768,6 +1810,36 @@ impl Date {
         let formatted = Utc::now().format("%Y-%m-%d").to_string();
         Self::parse(&formatted).expect("UTC date parses")
     }
+}
+
+/// The order of a temporal value and a plain string read as a lexical form
+/// of its kind, either way round: a value held as a string (a temporal
+/// lexical the index keeps in its string dictionary) against a typed
+/// constant, or a typed value against a string constant. A dateTime or time
+/// is ordered against every digit of the lexical ([`DateTime::cmp_lexical`]).
+/// `None` when neither pairing applies or the string does not parse.
+pub fn cmp_with_lexical(
+    a: &crate::value::FlakeValue,
+    b: &crate::value::FlakeValue,
+) -> Option<Ordering> {
+    use crate::value::FlakeValue;
+    let (held, lexical, flipped) = match (a, b) {
+        (FlakeValue::String(s), held) => (held, s.as_str(), true),
+        (held, FlakeValue::String(s)) => (held, s.as_str(), false),
+        _ => return None,
+    };
+    let ord = match held {
+        FlakeValue::DateTime(v) => v.cmp_lexical(lexical)?,
+        FlakeValue::Time(v) => v.cmp_lexical(lexical)?,
+        FlakeValue::Date(v) => v.as_ref().cmp(&Date::parse(lexical).ok()?),
+        FlakeValue::GYear(v) => v.as_ref().cmp(&GYear::parse(lexical).ok()?),
+        FlakeValue::GYearMonth(v) => v.as_ref().cmp(&GYearMonth::parse(lexical).ok()?),
+        FlakeValue::GMonth(v) => v.as_ref().cmp(&GMonth::parse(lexical).ok()?),
+        FlakeValue::GDay(v) => v.as_ref().cmp(&GDay::parse(lexical).ok()?),
+        FlakeValue::GMonthDay(v) => v.as_ref().cmp(&GMonthDay::parse(lexical).ok()?),
+        _ => return None,
+    };
+    Some(if flipped { ord.reverse() } else { ord })
 }
 
 /// Fold a Cypher temporal constructor with a constant lexical argument into a
@@ -3469,5 +3541,40 @@ mod tests {
         assert_eq!(t, Time::parse("12:00:00.123456").unwrap());
         let back: Time = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    /// A lexical form with digits past the microsecond lies above the value
+    /// it parses to, and below the next microsecond; a held value is ordered
+    /// against all of it, either way round and before 1970 too.
+    #[test]
+    fn a_lexical_past_the_microsecond_orders_above_its_value() {
+        use crate::value::FlakeValue;
+        assert!(digits_past_micros("2020-01-01T00:00:00.1234569Z"));
+        assert!(digits_past_micros("12:00:00.0000001+05:00"));
+        assert!(digits_past_micros("2020-01-01T00:00:00.1234560000001Z"));
+        assert!(!digits_past_micros("2020-01-01T00:00:00.1234560Z"));
+        assert!(!digits_past_micros("2020-01-01T00:00:00.123456Z"));
+        assert!(!digits_past_micros("2020-01-01T00:00:00Z"));
+        let held = DateTime::parse("2020-01-01T00:00:00.123456Z").unwrap();
+        let cmp = |lexical: &str| held.cmp_lexical(lexical);
+        assert_eq!(cmp("2020-01-01T00:00:00.1234569Z"), Some(Ordering::Less));
+        assert_eq!(cmp("2020-01-01T00:00:00.123456Z"), Some(Ordering::Equal));
+        assert_eq!(cmp("2020-01-01T00:00:00.1234559Z"), Some(Ordering::Greater));
+        assert_eq!(cmp("not a dateTime"), None);
+        let old = DateTime::parse("1969-12-31T23:59:59.999999Z").unwrap();
+        assert_eq!(
+            old.cmp_lexical("1969-12-31T23:59:59.9999991Z"),
+            Some(Ordering::Less)
+        );
+        let t = Time::parse("12:00:00.123456").unwrap();
+        assert_eq!(t.cmp_lexical("12:00:00.1234561"), Some(Ordering::Less));
+        let value = FlakeValue::DateTime(Box::new(held));
+        let lexical = FlakeValue::String("2020-01-01T00:00:00.1234569Z".to_string());
+        assert_eq!(cmp_with_lexical(&value, &lexical), Some(Ordering::Less));
+        assert_eq!(cmp_with_lexical(&lexical, &value), Some(Ordering::Greater));
+        let year = FlakeValue::GYear(Box::new(GYear::parse("2020").unwrap()));
+        let later = FlakeValue::String("2021".to_string());
+        assert_eq!(cmp_with_lexical(&year, &later), Some(Ordering::Less));
+        assert_eq!(cmp_with_lexical(&later, &later), None);
     }
 }

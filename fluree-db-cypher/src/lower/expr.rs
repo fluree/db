@@ -77,9 +77,9 @@ pub fn lower_expr<E: IriEncoder>(
             let prop_var = resolve_property_accessor(ctx, target, key, aux)?;
             Ok(Expression::Var(prop_var))
         }
-        Expr::BinOp(op, l, r, _) => {
-            let l = lower_expr(ctx, l, aux)?;
-            let r = lower_expr(ctx, r, aux)?;
+        Expr::BinOp(op, left, right, _) => {
+            let l = lower_expr(ctx, left, aux)?;
+            let r = lower_expr(ctx, right, aux)?;
             let f = match op {
                 BinOp::Eq => Function::Eq,
                 BinOp::Ne => Function::Ne,
@@ -97,6 +97,10 @@ pub fn lower_expr<E: IriEncoder>(
                 BinOp::Or => Function::Or,
                 BinOp::Xor => Function::Xor,
             };
+            let f = f.against_digits_past_micros(
+                temporal_past_micros(left, &l),
+                temporal_past_micros(right, &r),
+            );
             Ok(Expression::binary(f, l, r))
         }
         Expr::UnaryOp(op, inner, _) => {
@@ -445,6 +449,33 @@ pub fn lower_expr<E: IriEncoder>(
             };
             Ok(Expression::call(func, args))
         }
+    }
+}
+
+/// Whether `ast`, lowered to `lowered`, is a `datetime`, `localdatetime`,
+/// `time` or `localtime` constructor whose constant argument goes past the
+/// microsecond, which the folded constant drops (see
+/// [`Function::against_digits_past_micros`]): a lexical form with digits past
+/// it, or a component map whose `nanosecond` is not a whole microsecond.
+fn temporal_past_micros(ast: &Expr, lowered: &Expression) -> bool {
+    if !matches!(
+        lowered,
+        Expression::Const(FlakeValue::DateTime(_) | FlakeValue::Time(_))
+    ) {
+        return false;
+    }
+    let Expr::Call(call) = ast else {
+        return false;
+    };
+    match call.args.as_slice() {
+        [Expr::Lit(Literal::String(lexical, _))] => {
+            fluree_db_core::temporal::digits_past_micros(lexical)
+        }
+        [Expr::Map(entries, _)] => entries.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("nanosecond")
+                && matches!(value, Expr::Lit(Literal::Integer(n, _)) if n % 1_000 != 0)
+        }),
+        _ => false,
     }
 }
 
