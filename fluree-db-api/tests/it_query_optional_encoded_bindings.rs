@@ -2047,6 +2047,179 @@ async fn geo_search_reads_one_graph() {
     failures.assert_none();
 }
 
+/// The count lanes the planner picks outside the fused fast paths, which gate
+/// at open through `fast_path_store`: the FIRST-header grouped count and
+/// bound-object count, and the per-predicate directory count. Each must answer
+/// over one graph, and decline at open over several, where it read the scope's
+/// `binary_g_id` member alone. Kinds: a and b `T` (default graph, g2), c `U`
+/// (g2), d `T` (g3); tags: a and b `x`, d `y`.
+#[tokio::test(flavor = "current_thread")]
+async fn count_lanes_read_one_graph() {
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:a ex:kind ex:T ; ex:tag "x" .
+        GRAPH <urn:g2> { ex:b ex:kind ex:T ; ex:tag "x" . ex:c ex:kind ex:U . }
+        GRAPH <urn:g3> { ex:d ex:kind ex:T ; ex:tag "y" . }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger("it/count-lanes-graphs:main", trig).await;
+    let object_count = |prologue: &str, ds: &str| {
+        format!("{prologue}{PREFIXES}SELECT (COUNT(?s) AS ?n) {ds} WHERE {{ ?s ex:kind ex:T }}")
+    };
+    let grouped_topk = |prologue: &str, ds: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?o (COUNT(?s) AS ?n) {ds} \
+             WHERE {{ ?s ex:kind ?o }} GROUP BY ?o ORDER BY DESC(?n) LIMIT 5"
+        )
+    };
+    let per_predicate = |prologue: &str, ds: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?p (COUNT(?s) AS ?n) {ds} \
+             WHERE {{ ?s ?p ?o }} GROUP BY ?p"
+        )
+    };
+    let from2 = "FROM <urn:g2> FROM <urn:g3>";
+    // (lane site, label, query, columns, answer, must the lane answer)
+    let cases: Vec<(&str, &str, String, &[&str], Rows, bool)> = vec![
+        (
+            "predicate_object_count",
+            "object count, the default graph alone",
+            object_count("", ""),
+            &["n"],
+            rows(&[&["1"]]),
+            true,
+        ),
+        (
+            "predicate_object_count",
+            "object count, FROM g2 alone",
+            object_count("", "FROM <urn:g2>"),
+            &["n"],
+            rows(&[&["1"]]),
+            true,
+        ),
+        (
+            "predicate_object_count",
+            "object count, union",
+            object_count(UNION_PRAGMA, ""),
+            &["n"],
+            rows(&[&["3"]]),
+            false,
+        ),
+        (
+            "predicate_object_count",
+            "object count, FROM g2 + g3",
+            object_count("", from2),
+            &["n"],
+            rows(&[&["2"]]),
+            false,
+        ),
+        (
+            "predicate_object_count",
+            "object count, FROM g3 + g2",
+            object_count("", "FROM <urn:g3> FROM <urn:g2>"),
+            &["n"],
+            rows(&[&["2"]]),
+            false,
+        ),
+        (
+            "group_by_object_count_topk",
+            "grouped top-k, the default graph alone",
+            grouped_topk("", ""),
+            &["o", "n"],
+            rows(&[&["T", "1"]]),
+            true,
+        ),
+        (
+            "group_by_object_count_topk",
+            "grouped top-k, FROM g2 alone",
+            grouped_topk("", "FROM <urn:g2>"),
+            &["o", "n"],
+            rows(&[&["T", "1"], &["U", "1"]]),
+            true,
+        ),
+        (
+            "group_by_object_count_topk",
+            "grouped top-k, union",
+            grouped_topk(UNION_PRAGMA, ""),
+            &["o", "n"],
+            rows(&[&["T", "3"], &["U", "1"]]),
+            false,
+        ),
+        (
+            "group_by_object_count_topk",
+            "grouped top-k, FROM g2 + g3",
+            grouped_topk("", from2),
+            &["o", "n"],
+            rows(&[&["T", "2"], &["U", "1"]]),
+            false,
+        ),
+        (
+            "COUNT by predicate (directory)",
+            "per-predicate count, the default graph alone",
+            per_predicate("", ""),
+            &["p", "n"],
+            rows(&[&["kind", "1"], &["tag", "1"]]),
+            true,
+        ),
+        (
+            "COUNT by predicate (directory)",
+            "per-predicate count, FROM g2 alone",
+            per_predicate("", "FROM <urn:g2>"),
+            &["p", "n"],
+            rows(&[&["kind", "2"], &["tag", "1"]]),
+            true,
+        ),
+        (
+            "COUNT by predicate (directory)",
+            "per-predicate count, union",
+            per_predicate(UNION_PRAGMA, ""),
+            &["p", "n"],
+            rows(&[&["kind", "4"], &["tag", "3"]]),
+            false,
+        ),
+        (
+            "COUNT by predicate (directory)",
+            "per-predicate count, FROM g2 + g3",
+            per_predicate("", from2),
+            &["p", "n"],
+            rows(&[&["kind", "3"], &["tag", "2"]]),
+            false,
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (site, label, query, vars, want, must_fire) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await;
+        match result {
+            Ok(json) => failures.eq(sparql_rows(&json, vars), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        // The kill switch keeps the planner from choosing these lanes at all,
+        // so under it only the answers are checked (the differential run).
+        if fluree_db_api::fast_paths_disabled() {
+            continue;
+        }
+        // The lane was reached either way. The FIRST-header lanes stamp
+        // `proceed` when planned and a decline when they fall back at open;
+        // the directory count stamps once, at open. Either way the lane
+        // answered when it was reached and stamped no decline.
+        let seen = stamps(&store, before, site);
+        let reached = !seen.is_empty();
+        let declined = seen.iter().any(|o| o == "fallback:gate_declined");
+        failures.eq(
+            (reached, declined),
+            (true, !must_fire),
+            &format!("{label}: `{site}` (reached, declined)"),
+        );
+    }
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //
