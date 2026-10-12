@@ -1005,7 +1005,7 @@ impl crate::Fluree {
         lifecycle::restore_dropped(store, &instance)
             .await
             .map_err(|e| match e {
-                NameServiceError::LedgerAlreadyExists(_) => ApiError::ledger_exists(&entry.name),
+                NameServiceError::LedgerAlreadyExists(detail) => ApiError::ledger_exists(detail),
                 NameServiceError::NotFound(_) => {
                     ApiError::NotFound(format!("Dropped ledger not found: {instance}"))
                 }

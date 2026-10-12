@@ -1112,7 +1112,21 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
         record.fence = binding.fence_of(&record.branch);
         record.frozen = record.retracted;
         record.retracted = false;
-        insert_fenced(store, &record).await?;
+        match insert_fenced(store, &record).await {
+            Ok(()) => {}
+            // A record from before name bindings holds the key, and is never
+            // deleted to make room: no attempt can finish this restore, and
+            // left half done it would hold the name with nothing able to
+            // drop, purge or finish it. It is undone instead.
+            Err(NameServiceError::LedgerAlreadyExists(held)) => {
+                undo_restore(store, &entry, version, binding_version, &records).await?;
+                return Err(NameServiceError::ledger_already_exists(format!(
+                    "{held}; the restore was undone, and the dropped ledger can be restored \
+                     once that record is dropped or bound"
+                )));
+            }
+            Err(e) => return Err(e),
+        }
         record.storage_root = Some(entry.root.clone());
         records.push(record);
     }
@@ -1128,6 +1142,34 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
     }
     cas_dropped(store, instance, Some(version), None).await?;
     Ok(Some(records))
+}
+
+/// Undo a restore that cannot finish: free the name, delete the records it
+/// reinstated, and return its entry, at `entry_version`, to `Dropped`.
+async fn undo_restore<S: LifecycleStore + ?Sized>(
+    store: &S,
+    entry: &DroppedLedger,
+    entry_version: u64,
+    binding_version: u64,
+    reinstated: &[NsRecord],
+) -> Result<()> {
+    match cas_binding(store, &entry.name, Some(binding_version), None).await? {
+        RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: None } => {}
+        RegistryCas::Conflict { .. } => return Err(contended(&entry.name)),
+    }
+    for record in reinstated {
+        if let Some(fence) = record.fence {
+            store.delete_record(&record.ledger_id, fence).await?;
+        }
+    }
+    let dropped = DroppedLedger {
+        state: DroppedState::Dropped,
+        ..entry.clone()
+    };
+    match cas_dropped(store, &entry.instance, Some(entry_version), Some(&dropped)).await? {
+        RegistryCas::Updated { .. } => Ok(()),
+        RegistryCas::Conflict { .. } => Err(contended(&entry.name)),
+    }
 }
 
 /// The live records a binding lists, with its root.

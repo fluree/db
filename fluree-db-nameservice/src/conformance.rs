@@ -258,6 +258,43 @@ pub async fn restore_into_a_taken_name_is_refused<S: LifecycleStore>(store: &S) 
     );
 }
 
+/// A restore that finds a record from before name bindings at one of its
+/// keys, as a process from an older release still writing would leave,
+/// cannot finish. It is undone, so it does not hold the name with nothing
+/// able to finish, drop or purge it: the name is free, the records it put
+/// back are gone, and the dropped ledger can be restored or purged.
+pub async fn a_restore_an_older_records_blocks_is_undone<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .insert_record(&NsRecord::new(id("mydb:dev")))
+        .await
+        .unwrap()
+        .is_none());
+
+    assert_exists(
+        lifecycle::restore_dropped(store, &dropped.instance)
+            .await
+            .unwrap_err(),
+    );
+    assert!(store.get_binding("mydb").await.unwrap().is_none());
+    assert!(
+        store.raw_record("mydb:main").await.unwrap().is_none(),
+        "the record the restore put back is gone"
+    );
+    let entry = store.get_dropped(&dropped.instance).await.unwrap().unwrap();
+    assert_eq!(entry.value.state, DroppedState::Dropped);
+    lifecycle::begin_purge(store, &dropped.instance)
+        .await
+        .expect("the dropped ledger can be purged");
+}
+
 /// A hard drop leaves a purging entry that restore refuses and
 /// `finish_purge` removes.
 pub async fn hard_drop_purges<S: LifecycleStore>(store: &S) {
@@ -1678,6 +1715,7 @@ where
     drop_frees_the_name(&make().await).await;
     restore_reinstates_under_fresh_fences(&make().await).await;
     restore_into_a_taken_name_is_refused(&make().await).await;
+    a_restore_an_older_records_blocks_is_undone(&make().await).await;
     hard_drop_purges(&make().await).await;
     soft_dropped_ledger_can_be_purged(&make().await).await;
     create_branch_lists_and_counts(&make().await).await;
@@ -1728,6 +1766,7 @@ macro_rules! lifecycle_conformance_tests {
             drop_frees_the_name,
             restore_reinstates_under_fresh_fences,
             restore_into_a_taken_name_is_refused,
+            a_restore_an_older_records_blocks_is_undone,
             hard_drop_purges,
             soft_dropped_ledger_can_be_purged,
             create_branch_lists_and_counts,
