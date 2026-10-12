@@ -799,7 +799,7 @@ impl PushError {
 ///
 /// Maps each unique graph Sid to a GraphId. Resolved graphs (known to the
 /// binary store) use the store's existing GraphId; unresolved graphs get
-/// fresh sequential IDs. Used by `stage_flakes` and `is_currently_asserted`.
+/// fresh sequential IDs. Used by `stage_flakes` and `retraction_slot`.
 struct GraphRoutingResult {
     /// All graph ID → Sid mappings (resolved + fabricated).
     graph_sids: HashMap<GraphId, Sid>,
@@ -1234,53 +1234,58 @@ async fn assert_retractions_exist(
     flakes: &[Flake],
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<(), PushError> {
-    let current = fluree_db_transact::CurrentFacts::new(state);
+    let mut at = Vec::new();
+    let mut items = Vec::new();
     for (idx, f) in flakes.iter().enumerate() {
         if f.op {
             continue;
         }
-
-        if !is_currently_asserted(&current, f, reverse_graph).await? {
-            return Err(PushError::Invalid(format!(
-                "retraction invariant violated at flake[{idx}]: retract targets non-existent assertion"
-            )));
-        }
+        at.push(idx);
+        items.push((retraction_slot(f, reverse_graph)?, f));
     }
-    Ok(())
+    if items.is_empty() {
+        return Ok(());
+    }
+    // Read through `CurrentFacts`, which stamps the graph on index rows (a
+    // range read returns them with `g: None` whatever graph they live in),
+    // reads each slot once, and names a fact by the identity storage gives
+    // it, so a retraction carrying a term the index keeps less of (a big
+    // integer's XSD subtype) names the stored fact.
+    let named = fluree_db_transact::CurrentFacts::new(state)
+        .named_by(&items)
+        .await
+        .map_err(|e| PushError::Internal(e.to_string()))?;
+    match at.iter().zip(&named).find(|(_, fact)| fact.is_none()) {
+        Some((idx, _)) => Err(PushError::Invalid(format!(
+            "retraction invariant violated at flake[{idx}]: retract targets non-existent assertion"
+        ))),
+        None => Ok(()),
+    }
 }
 
-/// Whether the fact `target` retracts is currently stored in its graph.
-///
-/// Read through [`fluree_db_transact::CurrentFacts`], which stamps the graph
-/// on index rows (a range read returns them with `g: None` whatever graph
-/// they live in) and also matches a retraction by index key where the index
-/// keeps less than the term (a big integer's XSD subtype).
-async fn is_currently_asserted(
-    current: &fluree_db_transact::CurrentFacts<'_>,
+/// The slot whose stored fact `target` retracts, in the graph the push's
+/// routing gives it.
+fn retraction_slot(
     target: &Flake,
     reverse_graph: &HashMap<Sid, GraphId>,
-) -> std::result::Result<bool, PushError> {
+) -> std::result::Result<fluree_db_transact::Slot, PushError> {
     // With per-graph novelty, ALL graphs (including overlay-only ones) have proper
     // GraphIds assigned by the cumulative routing.
     let g_id = match &target.g {
         None => 0,
         Some(g_sid) => *reverse_graph.get(g_sid).ok_or_else(|| {
             PushError::Internal(format!(
-                "is_currently_asserted: graph Sid {g_sid:?} not found in reverse_graph map \
+                "retraction_slot: graph Sid {g_sid:?} not found in reverse_graph map \
                  — derive_graph_routing should have included it",
             ))
         })?,
     };
-    let slot = fluree_db_transact::Slot {
+    Ok(fluree_db_transact::Slot {
         g_id,
         g_sid: target.g.clone(),
         s: target.s.clone(),
         p: target.p.clone(),
-    };
-    current
-        .holds(&slot, target)
-        .await
-        .map_err(|e| PushError::Internal(e.to_string()))
+    })
 }
 
 async fn write_required_blobs<S>(

@@ -278,27 +278,43 @@ impl SequentialStager {
     ///
     /// [`CurrentFacts::named_by`]: fluree_db_transact::CurrentFacts::named_by
     async fn drop_reversed_facts(&mut self) -> Result<()> {
-        let base = fluree_db_transact::CurrentFacts::new(&self.original);
+        let reversed: Vec<usize> = (0..self.folded.len())
+            .filter(|&i| self.folded[i].op != self.first_ops[i])
+            .collect();
+        if reversed.is_empty() {
+            return Ok(());
+        }
+        // A graph the base does not have holds nothing: no slot to ask.
+        let asked: Vec<(usize, fluree_db_transact::Slot)> = reversed
+            .iter()
+            .filter_map(|&i| {
+                let f = &self.folded[i];
+                fluree_db_transact::Slot::in_ledger(&self.original, &f.g, &f.s, &f.p)
+                    .map(|slot| (i, slot))
+            })
+            .collect();
+        let items: Vec<(fluree_db_transact::Slot, &fluree_db_core::Flake)> = asked
+            .iter()
+            .map(|(i, slot)| (slot.clone(), &self.folded[*i]))
+            .collect();
+        let named = fluree_db_transact::CurrentFacts::new(&self.original)
+            .named_by(&items)
+            .await?;
+        let mut stored: HashMap<usize, fluree_db_transact::StoredFact> = asked
+            .iter()
+            .zip(named)
+            .filter_map(|((i, _), fact)| fact.map(|fact| (*i, fact)))
+            .collect();
         let mut keep = vec![true; self.folded.len()];
         let mut renamed = Vec::new();
-        for (i, flake) in self.folded.iter().enumerate() {
-            if flake.op == self.first_ops[i] {
-                continue;
-            }
-            let stored = match fluree_db_transact::Slot::in_ledger(
-                &self.original,
-                &flake.g,
-                &flake.s,
-                &flake.p,
-            ) {
-                Some(slot) => base.named_by(&slot, flake).await?,
-                None => None,
-            };
-            keep[i] = flake.op != stored.is_some();
-            if let (true, false, Some(stored)) = (keep[i], flake.op, stored) {
-                let held = stored.flake();
-                if held.o != flake.o || held.dt != flake.dt || held.m != flake.m {
-                    renamed.push((i, stored.retract(self.final_t).into_flake()));
+        for i in reversed {
+            let flake = &self.folded[i];
+            let held = stored.remove(&i);
+            keep[i] = flake.op != held.is_some();
+            if let (true, false, Some(held)) = (keep[i], flake.op, held) {
+                let fact = held.flake();
+                if fact.o != flake.o || fact.dt != flake.dt || fact.m != flake.m {
+                    renamed.push((i, held.retract(self.final_t).into_flake()));
                 }
             }
         }

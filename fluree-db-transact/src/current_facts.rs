@@ -607,29 +607,56 @@ impl<'l> CurrentFacts<'l> {
         Ok(out)
     }
 
-    /// Whether `slot` holds the fact a retraction of `flake` names; see
-    /// [`Self::named_by`]. The test a pushed commit's retractions pass:
-    /// written elsewhere, a retraction may carry a term as written where the
-    /// index keeps less of it.
-    pub async fn holds(&self, slot: &Slot, flake: &Flake) -> Result<bool> {
-        Ok(self.named_by(slot, flake).await?.is_some())
-    }
-
-    /// The current fact of `slot` that `flake` names: the one with
-    /// `flake`'s identity ([`FactIdentity`]), so a retraction that carries a
-    /// term as written where the index keeps less of it names the fact as
-    /// stored.
-    pub async fn named_by(&self, slot: &Slot, flake: &Flake) -> Result<Option<StoredFact>> {
-        let novelty = NoveltyPlan::for_slots(self.ledger, std::slice::from_ref(slot), self.to_t);
-        let mut facts = self.read_slot(slot, None, &novelty).await?;
+    /// The current fact each `(slot, flake)` names, in order: the fact of
+    /// `slot` with `flake`'s identity ([`FactIdentity`]). So a retraction
+    /// written elsewhere, which may carry a term as written where the index
+    /// keeps less of it, names the fact as stored. Each distinct slot is read
+    /// once, and each item is matched by hash, so naming k facts of an
+    /// n-fact slot costs one read of the slot and O(k + n) matching.
+    pub async fn named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Option<StoredFact>>> {
+        let mut slot_index: HashMap<(GraphId, &Sid, &Sid), usize> = HashMap::new();
+        let mut slots: Vec<Slot> = Vec::new();
+        let item_slots: Vec<usize> = items
+            .iter()
+            .map(|(slot, _)| {
+                *slot_index
+                    .entry((slot.g_id, &slot.s, &slot.p))
+                    .or_insert_with(|| {
+                        slots.push(slot.clone());
+                        slots.len() - 1
+                    })
+            })
+            .collect();
+        let facts = self.of_slots(&slots).await?;
         let ids = FactIdentity::new(self.ledger);
-        let n = match ids.key(slot.g_id, flake) {
-            Some(key) => facts
-                .iter()
-                .position(|f| ids.key(slot.g_id, &f.flake) == Some(key)),
-            None => facts.iter().position(|f| f.flake == *flake),
-        };
-        Ok(n.map(|n| facts.swap_remove(n)))
+        let mut by_term: Vec<HashMap<&Flake, usize>> = Vec::with_capacity(slots.len());
+        let mut by_key: Vec<HashMap<MergeKey, usize>> = Vec::with_capacity(slots.len());
+        for (slot, slot_facts) in slots.iter().zip(&facts) {
+            let p_id = self.keys.p_id(&slot.p);
+            let mut terms = HashMap::with_capacity(slot_facts.len());
+            let mut keys = HashMap::new();
+            for (n, fact) in slot_facts.iter().enumerate() {
+                terms.insert(&fact.flake, n);
+                if fact.flake.o.index_key_may_merge_terms() {
+                    if let Some(key) = ids.key_under(slot.g_id, p_id, &fact.flake) {
+                        keys.insert(key, n);
+                    }
+                }
+            }
+            by_term.push(terms);
+            by_key.push(keys);
+        }
+        Ok(items
+            .iter()
+            .zip(item_slots)
+            .map(|((slot, flake), i)| {
+                let n = match ids.key(slot.g_id, flake) {
+                    Some(key) => by_key[i].get(&key),
+                    None => by_term[i].get(flake),
+                };
+                n.map(|&n| facts[i][n].clone())
+            })
+            .collect())
     }
 
     /// [`Self::of_slots`], except that a slot given `Some(values)` is read
@@ -2372,9 +2399,10 @@ mod tests {
 
     /// A retraction names a stored fact by its term and metadata: not an
     /// absent or retracted value, nor a stored value under another tag or
-    /// list position. (Without an index there are no keys to match by.)
+    /// list position. (Without an index there are no keys to match by.) The
+    /// items name facts of one slot, which is read once for all of them.
     #[tokio::test]
-    async fn holds_names_a_stored_fact_and_nothing_else() {
+    async fn named_by_names_a_stored_fact_and_nothing_else() {
         let en = || Some(FlakeMeta::with_lang("en"));
         let ledger = ledger(
             vec![
@@ -2403,8 +2431,16 @@ mod tests {
             ("a retracted value", &ap, retract("z", None), false),
             ("an absent value", &ap, retract("w", None), false),
         ];
-        for (what, slot, flake, held) in cases {
-            assert_eq!(current.holds(slot, &flake).await.unwrap(), held, "{what}");
+        let items: Vec<(Slot, &Flake)> = cases
+            .iter()
+            .map(|(_, slot, flake, _)| ((*slot).clone(), flake))
+            .collect();
+        let named = current.named_by(&items).await.unwrap();
+        for ((what, _, flake, held), fact) in cases.iter().zip(&named) {
+            assert_eq!(fact.is_some(), *held, "{what}");
+            if let Some(fact) = fact {
+                assert_eq!(fact.flake(), flake, "{what}: names the stored fact");
+            }
         }
     }
 }
