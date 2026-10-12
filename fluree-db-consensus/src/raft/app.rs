@@ -341,7 +341,19 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
     fn publish(&self, effects: Vec<Effect>) {
         // Phase one: every watermark, before any event reaches the bus.
         // See the module docs — this ordering is the point of the split.
-        if let Some(manager) = self.ledger_manager.get() {
+        // A live install replaces them: its heads are the whole truth.
+        let live_install = effects
+            .iter()
+            .any(|e| matches!(e, Effect::InvalidateInFlight));
+        if let (Some(manager), true) = (self.ledger_manager.get(), live_install) {
+            manager.reset_head_watermarks(effects.iter().filter_map(|effect| match effect {
+                Effect::HeadAdvance {
+                    ledger_id,
+                    commit_t,
+                } => Some((ledger_id.clone(), *commit_t)),
+                _ => None,
+            }));
+        } else if let Some(manager) = self.ledger_manager.get() {
             for effect in &effects {
                 match effect {
                     Effect::Event(NameServiceEvent::LedgerCommitPublished {
@@ -391,6 +403,15 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
                     }
                     if let Some(stash) = self.staged_receipts.as_ref() {
                         stash.clear_all();
+                    }
+                    // The install announces no drop or create, so a ledger
+                    // dropped or recreated in it is still cached as it was.
+                    if let (Some(manager), Ok(runtime)) = (
+                        self.ledger_manager.get(),
+                        tokio::runtime::Handle::try_current(),
+                    ) {
+                        let manager = Arc::clone(manager);
+                        runtime.spawn(async move { manager.reconcile_cached().await });
                     }
                 }
             }
@@ -1374,6 +1395,100 @@ mod tests {
             manager.head_watermark(&fluree_db_core::LedgerId::parse("test/db:main").unwrap()),
             Some(42)
         );
+    }
+
+    /// A snapshot that dropped and recreated a ledger puts it below the
+    /// watermark the dropped one left, and one it dropped has no head: the
+    /// install's heads replace the watermarks, never raise them.
+    #[tokio::test]
+    async fn a_live_install_replaces_head_watermarks() {
+        let source_storage =
+            storage_holding(&state_with_branch_head("test/db", "main", cid(8), 3)).await;
+        let mut source = StateMachineAdapter::open(source_storage, NameServiceObserver::new())
+            .await
+            .expect("adapter opens");
+        let snap = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let observer = NameServiceObserver::new();
+        let cell = observer.ledger_manager_cell();
+        let mut target = StateMachineAdapter::new(Arc::new(MemoryRaftStorage::new()), observer);
+        let manager = memory_ledger_manager();
+        cell.set(Arc::clone(&manager)).ok().expect("cell empty");
+        let id = |s: &str| fluree_db_core::LedgerId::parse(s).unwrap();
+        manager.note_head_advance(&id("test/db:main"), 42);
+        manager.note_head_advance(&id("gone/db:main"), 7);
+
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.head_watermark(&id("test/db:main")), Some(3));
+        assert_eq!(manager.head_watermark(&id("gone/db:main")), None);
+    }
+
+    /// An install announces no drop, so the ledger cache is reconciled
+    /// against the nameservice: a ledger dropped there is evicted.
+    #[tokio::test]
+    async fn a_live_install_evicts_a_cached_ledger_dropped_since() {
+        use fluree_db_api::{LedgerManagerConfig, NameServiceMode};
+        use fluree_db_core::{LedgerId, LedgerName, MemoryStorage, StorageBackend};
+        use fluree_db_nameservice::{lifecycle, memory::MemoryNameService};
+
+        let ns = Arc::new(MemoryNameService::new());
+        let manager = Arc::new(LedgerManager::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            NameServiceMode::ReadWrite(Arc::clone(&ns) as _),
+            LedgerManagerConfig::default(),
+        ));
+        let ledger_id = LedgerId::parse("cached/db:main").unwrap();
+        lifecycle::create_ledger(ns.as_ref(), &ledger_id)
+            .await
+            .unwrap();
+        manager.get_or_load(&ledger_id).await.expect("load");
+        lifecycle::drop_ledger(ns.as_ref(), &LedgerName::parse("cached/db").unwrap(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.cached_aliases().await,
+            std::slice::from_ref(&ledger_id)
+        );
+
+        let source_storage =
+            storage_holding(&state_with_branch_head("test/db", "main", cid(8), 3)).await;
+        let mut source = StateMachineAdapter::open(source_storage, NameServiceObserver::new())
+            .await
+            .expect("adapter opens");
+        let snap = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let observer = NameServiceObserver::new();
+        observer
+            .ledger_manager_cell()
+            .set(Arc::clone(&manager))
+            .ok()
+            .expect("cell empty");
+        let mut target = StateMachineAdapter::new(Arc::new(MemoryRaftStorage::new()), observer);
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        for _ in 0..200 {
+            if manager.cached_aliases().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the dropped ledger is still cached after the install");
     }
 
     #[tokio::test]

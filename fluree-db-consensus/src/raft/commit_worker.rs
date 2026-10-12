@@ -208,12 +208,13 @@ impl Worker {
     }
 
     /// The fence this branch's writes present, from the replicated state.
-    async fn branch_fence(&self) -> Option<fluree_db_nameservice::Fence> {
+    /// The branch's current fence, and whether its record is frozen.
+    async fn branch_fence(&self) -> Option<(fluree_db_nameservice::Fence, bool)> {
         let state = self.shared_state.read().await;
         state
             .fences
             .get(&self.ref_key)
-            .map(|f| fluree_db_nameservice::Fence::from_u64(f.fence))
+            .map(|f| (fluree_db_nameservice::Fence::from_u64(f.fence), f.frozen))
     }
 
     fn new(
@@ -371,6 +372,10 @@ impl Worker {
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
+        // A stage on a cached state presents that state's fence, so one
+        // built on another activation's state, cached from before a drop
+        // and recreate this node has not yet reconciled, is refused.
+        let staged_fence = install.as_ref().and_then(|i| i.new_state.fence());
 
         // Stash the typed receipt through `StashGuard` so an abort
         // mid-publish (ownership flap during the propose await)
@@ -390,7 +395,10 @@ impl Worker {
             self.ref_key.clone(),
             receipt,
         );
-        match self.publish_head_advance(commit_id.clone(), commit_t).await {
+        match self
+            .publish_head_advance(commit_id.clone(), commit_t, staged_fence)
+            .await
+        {
             Ok(()) => {
                 if let Some(install) = install {
                     self.finalize_after_publish(entry.queue_id, commit_t, install)
@@ -1158,13 +1166,20 @@ impl Worker {
         })
     }
 
+    /// Publish the head, presenting `staged_fence`, the fence of the state
+    /// the commit was staged on, or the branch's current fence for work
+    /// staged from the nameservice's records rather than a cached state.
     async fn publish_head_advance(
         &self,
         commit_id: ContentId,
         commit_t: i64,
+        staged_fence: Option<fluree_db_nameservice::Fence>,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
-        let fence = self.branch_fence().await;
+        let fence = match staged_fence {
+            Some(fence) => Some(fence),
+            None => self.branch_fence().await.map(|(fence, _)| fence),
+        };
         match self
             .publishing
             .commits
@@ -1201,6 +1216,19 @@ impl Worker {
             // head. The retry loop refreshes the local view and
             // re-stages the same entry.
             Err(NameServiceError::ApplyLagged(msg)) => Err(WorkerError::Lagged(msg)),
+            // Staged on another activation's state: the branch takes
+            // writes under a fence the cached state does not carry. The
+            // lagged path refreshes the cache, which reloads the current
+            // activation, and re-stages the entry. A branch frozen or gone
+            // since takes no write at all.
+            Err(NameServiceError::Fenced(msg)) => match self.branch_fence().await {
+                Some((live, false)) if Some(live) != fence => Err(WorkerError::Lagged(format!(
+                    "staged on another activation of the ledger: {msg}"
+                ))),
+                _ => Err(stage(PoisonReason::LedgerNotFound {
+                    ledger_id: full_ledger_id,
+                })),
+            },
             // Ambiguous outcome — the ApplyHead may have committed
             // with only the response lost. `Raft` is not a
             // rejection (see [`WorkerError::is_rejection`]), so the
@@ -1890,6 +1918,120 @@ mod tests {
         )
         .is_rejection());
         assert!(!WorkerError::Transient("backend blip".into()).is_rejection());
+    }
+
+    /// Admits a commit only under the branch's live fence, as the raft
+    /// publisher's precheck does, and records every fence presented.
+    #[derive(Debug, Default)]
+    struct FencedPublisher {
+        live: Option<fluree_db_nameservice::Fence>,
+        presented: std::sync::Mutex<Vec<Option<fluree_db_nameservice::Fence>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitPublisher for FencedPublisher {
+        async fn publish_commit_fenced(
+            &self,
+            ledger_id: &str,
+            fence: Option<fluree_db_nameservice::Fence>,
+            _commit_t: i64,
+            _commit_id: &ContentId,
+        ) -> fluree_db_nameservice::Result<()> {
+            self.presented.lock().unwrap().push(fence);
+            if fence.is_some() && fence == self.live {
+                Ok(())
+            } else {
+                Err(NameServiceError::fenced(ledger_id))
+            }
+        }
+
+        fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+            Some(ledger_id.to_string())
+        }
+    }
+
+    struct NoPoison;
+
+    #[async_trait::async_trait]
+    impl QueuePoisonPublisher for NoPoison {
+        async fn poison_queue_entry(
+            &self,
+            _ref_key: &RefKey,
+            _queue_id: u64,
+            _reason: PoisonReason,
+        ) -> Result<(), QueuePoisonError> {
+            Ok(())
+        }
+    }
+
+    /// A worker over `test/db:main` whose replicated fence is `live`,
+    /// `frozen` or not, publishing through a [`FencedPublisher`].
+    fn fenced_worker(live: u64, frozen: bool) -> (Worker, Arc<FencedPublisher>) {
+        let key = RefKey::new("test/db", "main");
+        let mut state = NameServiceState::default();
+        state.fences.insert(
+            key.clone(),
+            crate::raft::state_machine::FenceState {
+                fence: live,
+                frozen,
+                source_branch: None,
+                children: 0,
+            },
+        );
+        let publisher = Arc::new(FencedPublisher {
+            live: (!frozen).then(|| fluree_db_nameservice::Fence::from_u64(live)),
+            ..Default::default()
+        });
+        let worker = Worker::new(
+            key,
+            SharedState::view_of(Arc::new(RwLock::new(state))),
+            PublishingChannel {
+                commits: Arc::clone(&publisher) as _,
+                poison: Arc::new(NoPoison),
+                staged_receipts: Arc::new(StagedReceiptMap::default()),
+            },
+            StagingContext {
+                fluree: Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory()),
+                index_config: fluree_db_api::server_defaults::default_index_config(),
+            },
+        );
+        (worker, publisher)
+    }
+
+    /// A commit staged on a state cached from another activation of the
+    /// ledger presents that state's fence, is refused, and is re-staged
+    /// rather than published under the live fence.
+    #[tokio::test]
+    async fn a_stage_on_another_activations_state_is_refused_and_restaged() {
+        use fluree_db_nameservice::Fence;
+        let (worker, publisher) = fenced_worker(2, false);
+
+        let stale = worker
+            .publish_head_advance(cid(1), 5, Some(Fence::from_u64(1)))
+            .await;
+        assert!(matches!(stale, Err(WorkerError::Lagged(_))), "{stale:?}");
+        assert_eq!(
+            *publisher.presented.lock().unwrap(),
+            [Some(Fence::from_u64(1))]
+        );
+
+        // Work staged from the nameservice, with no cached state, presents
+        // the live fence.
+        worker.publish_head_advance(cid(1), 5, None).await.unwrap();
+    }
+
+    /// A branch frozen since takes no commit: the entry is poisoned, not
+    /// re-staged forever.
+    #[tokio::test]
+    async fn a_commit_to_a_frozen_branch_is_poisoned() {
+        let (worker, _) = fenced_worker(2, true);
+        let frozen = worker
+            .publish_head_advance(cid(1), 5, Some(fluree_db_nameservice::Fence::from_u64(2)))
+            .await;
+        assert!(
+            matches!(&frozen, Err(WorkerError::Stage(reason)) if matches!(**reason, PoisonReason::LedgerNotFound { .. })),
+            "{frozen:?}"
+        );
     }
 
     #[test]

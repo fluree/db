@@ -1383,6 +1383,34 @@ impl LedgerManager {
         }
     }
 
+    /// Replace every head watermark with `heads`. A snapshot install's
+    /// state is the whole truth: a ledger dropped in it has no head, and one
+    /// recreated under its name may sit below the watermark the dropped one
+    /// left, which [`Self::note_head_advance`] would keep.
+    pub fn reset_head_watermarks(&self, heads: impl IntoIterator<Item = (LedgerId, i64)>) {
+        let mut watermarks = self
+            .head_watermarks
+            .write()
+            .expect("head watermark lock never poisoned: no panics inside critical section");
+        *watermarks = heads.into_iter().collect();
+    }
+
+    /// Check every cached ledger against the nameservice as a notification
+    /// for it would: one dropped since is evicted, and one whose name now
+    /// holds another activation is reloaded.
+    pub async fn reconcile_cached(&self) {
+        let cached: Vec<LedgerId> = self.entries.read().await.keys().cloned().collect();
+        for ledger_id in cached {
+            let notify = NsNotify {
+                ledger_id: ledger_id.clone(),
+                record: None,
+            };
+            if let Err(e) = self.notify(notify).await {
+                tracing::warn!(%ledger_id, error = %e, "could not reconcile a cached ledger");
+            }
+        }
+    }
+
     /// The highest commit `t` reported for `ledger_id` via
     /// [`Self::note_head_advance`], or `None` if no head-advancing
     /// component has reported one (heads that only move through
