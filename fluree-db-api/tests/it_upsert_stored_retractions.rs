@@ -540,15 +540,13 @@ async fn upsert_over_an_annotated_lang_value_cascades_the_annotation() {
     }
 }
 
-/// U5: a big integer typed with an XSD subtype loses its declared datatype
-/// in the index (`NUM_BIG` stores no datatype), so after an index build an
-/// identical re-upsert stages a retraction of the decoded `xsd:integer`
-/// value that shares one storage key with the assertion of the declared
-/// one, and the retraction wins: the value is deleted. The retraction
-/// resolver reads what the index can tell it, which does not include the
-/// declared subtype; the fix belongs to the index encoding.
+/// An identical re-upsert keeps an indexed big integer typed with an XSD
+/// subtype. The index stores it with no datatype (`NUM_BIG`), so the upsert
+/// retracts the stored `xsd:integer` value and asserts the declared one: two
+/// terms under one storage key, which storage resolves at one `t` as the
+/// retraction. The operation tells facts apart the way storage does
+/// (`FactIdentity`), so the two are one fact and cancel.
 #[tokio::test]
-#[ignore = "U5: the index drops the declared subtype of NUM_BIG values (filing held, AJ-4)"]
 async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     let mut h = Harness::new("u5").await;
     let doc = jsonld(json!({
@@ -562,12 +560,10 @@ async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
 }
 
-/// The same class for temporals: storage keeps a `dateTime` to the
-/// microsecond, so a value written with more digits decodes differently from
-/// the term that is re-upserted, and the retraction of the decode and the
-/// assertion of the written term share one storage key.
+/// The same for a `dateTime` past the microsecond: storage keeps six
+/// fractional digits, so the stored decode and the re-upserted term differ
+/// and share one storage key, and cancel as one fact.
 #[tokio::test]
-#[ignore = "U5: storage keeps temporals to the microsecond (filing held, AJ-4)"]
 async fn an_identical_reupsert_keeps_a_sub_microsecond_datetime() {
     let mut h = Harness::new("u5-datetime").await;
     let doc = jsonld(json!({
