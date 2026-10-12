@@ -1004,9 +1004,28 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_ledger::CrossLedgerError;
+    use crate::wasm_compat::IndexerError as IE;
+    use fluree_db_connection::ConnectionError;
+    use fluree_db_core::LedgerIdParseError;
+    use fluree_db_core::QueryCancellationReason::Timeout;
+    #[cfg(feature = "credential")]
+    use fluree_db_credential::CredentialError as CE;
+    use fluree_db_cypher::LowerError as CypherLowerError;
+    #[cfg(feature = "iceberg")]
+    use fluree_db_iceberg::IcebergError as IbE;
+    use fluree_db_ledger::LedgerError as LE;
+    use fluree_db_nameservice::NameServiceError as NSE;
+    use fluree_db_novelty::NoveltyError;
+    use fluree_db_policy::PolicyError as PE;
+    use fluree_db_query::bm25;
+    use fluree_db_query::parse::ParseError;
     use fluree_db_query::QueryError as QE;
+    use fluree_db_sparql::{LowerError as SLE, SourceSpan};
+    use fluree_db_transact::lower_cypher_update::LowerCypherError;
     use fluree_db_transact::TransactError as TE;
-    use fluree_vocab::errors;
+    use fluree_graph_turtle::TurtleError;
+    use fluree_vocab::errors::*;
 
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
@@ -1016,69 +1035,48 @@ mod tests {
         + cfg!(feature = "credential") as usize
         + cfg!(feature = "iceberg") as usize;
 
+    fn conflict() -> ApiError {
+        ApiError::Transact(TE::CommitConflict {
+            expected_t: 1,
+            head_t: 2,
+        })
+    }
+
+    /// A fan-out window with one target deferred and `failed` failed.
+    fn partial(failed: usize) -> ApiError {
+        ApiError::MaterializePartial {
+            tally: TargetTally {
+                ok: 1,
+                deferred: 1,
+                failed,
+            },
+            detail: "x".into(),
+        }
+    }
+
     /// Every `ApiError` variant (several forms of the ones that split), with
-    /// the status and `@type` it must answer with.
+    /// the status and `@type` it must answer with, in status order.
     fn every_variant() -> Vec<(ApiError, u16, &'static str)> {
-        let tally = |deferred, failed| TargetTally {
-            ok: 1,
-            deferred,
-            failed,
-        };
+        // Every `serde_json` error that reaches `ApiError::Json` parses stored
+        // records, not the request.
+        let json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let span = SourceSpan::from(0..1);
         let rows = vec![
             (
-                ApiError::Connection(fluree_db_connection::ConnectionError::InvalidConfig(
-                    "x".into(),
-                )),
-                500,
-                errors::CONNECTION,
-            ),
-            (
-                ApiError::Parse(fluree_db_query::parse::ParseError::MissingField("select")),
+                ApiError::Parse(ParseError::MissingField("select")),
                 400,
-                errors::JSONLD_PARSE,
+                JSONLD_PARSE,
             ),
             (
-                ApiError::Parse(fluree_db_query::parse::ParseError::TypeCoercion("x".into())),
+                ApiError::Parse(ParseError::TypeCoercion("x".into())),
                 400,
-                errors::TYPE_COERCION,
+                TYPE_COERCION,
             ),
-            (
-                ApiError::Query(QE::InvalidQuery("x".into())),
-                400,
-                errors::INVALID_QUERY,
-            ),
-            (
-                ApiError::Query(QE::Cancelled {
-                    reason: fluree_db_core::QueryCancellationReason::Timeout,
-                }),
-                408,
-                errors::QUERY_CANCELLED,
-            ),
-            (
-                ApiError::Query(QE::MemoryBudgetExceeded {
-                    used_bytes: 2,
-                    budget_bytes: 1,
-                }),
-                507,
-                errors::INVALID_QUERY,
-            ),
-            (
-                ApiError::Query(QE::CatalogAccessDenied {
-                    table: "t".into(),
-                    message: "m".into(),
-                }),
-                403,
-                errors::CATALOG_ACCESS_DENIED,
-            ),
+            (ApiError::invalid_query("x"), 400, INVALID_QUERY),
             (
                 ApiError::Query(QE::r2rml_unsupported_pattern("x")),
                 400,
-                errors::R2RML_UNSUPPORTED_PATTERN,
-            ),
-            (
-                ApiError::Query(QE::Internal("x".into())),
-                500,
-                errors::INTERNAL,
+                R2RML_UNSUPPORTED_PATTERN,
             ),
             (
                 ApiError::Batch(fluree_db_query::BatchError::ColumnLengthMismatch {
@@ -1087,55 +1085,168 @@ mod tests {
                     column: 0,
                 }),
                 400,
-                errors::INVALID_QUERY,
+                INVALID_QUERY,
             ),
             (
-                ApiError::Ledger(fluree_db_ledger::LedgerError::not_found("db:main")),
-                404,
-                errors::LEDGER_NOT_FOUND,
-            ),
-            (
-                ApiError::Ledger(fluree_db_ledger::LedgerError::future_time("db:main", 9, 1)),
+                ApiError::Ledger(LE::future_time("db", 9, 1)),
                 400,
-                errors::BAD_REQUEST,
+                BAD_REQUEST,
             ),
             (
-                ApiError::Ledger(fluree_db_ledger::LedgerError::InvalidData("x".into())),
-                500,
-                errors::INTERNAL,
-            ),
-            (
-                ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(
-                    "a@b".into(),
-                )),
+                ApiError::NameService(NSE::InvalidId("a@b".into())),
                 400,
-                errors::BAD_REQUEST,
+                BAD_REQUEST,
             ),
             (
-                ApiError::NameService(fluree_db_nameservice::NameServiceError::Storage("x".into())),
-                500,
-                errors::NAMESERVICE,
+                ApiError::Transact(TE::InvalidTerm("x".into())),
+                400,
+                INVALID_TRANSACTION,
+            ),
+            (ApiError::sparql("x", vec![]), 400, SPARQL_PARSE),
+            (
+                ApiError::SparqlLower(SLE::AggregateWithoutAlias { span }),
+                400,
+                SPARQL_LOWER,
+            ),
+            (ApiError::cypher("x", vec![]), 400, CYPHER_PARSE),
+            (
+                ApiError::CypherLower(CypherLowerError::WriteOnQueryPath),
+                400,
+                CYPHER_LOWER,
             ),
             (
-                ApiError::Transact(TE::CommitConflict {
-                    expected_t: 1,
-                    head_t: 2,
+                ApiError::CypherUpdateLower(LowerCypherError::NotAnUpdate),
+                400,
+                CYPHER_LOWER,
+            ),
+            (
+                ApiError::Turtle(TurtleError::IriResolution("x".into())),
+                400,
+                TURTLE_PARSE,
+            ),
+            #[cfg(feature = "iceberg")]
+            (ApiError::Iceberg(IbE::Config("x".into())), 400, CONFIG),
+            (ApiError::config("x"), 400, CONFIG),
+            (
+                ApiError::Format(FormatError::InvalidBinding("x".into())),
+                400,
+                FORMAT,
+            ),
+            (ApiError::InvalidBranch("x".into()), 400, BAD_REQUEST),
+            (
+                ApiError::InvalidLedgerId(LedgerIdParseError::new("x")),
+                400,
+                BAD_REQUEST,
+            ),
+            (ApiError::IndexingDisabled, 400, INDEXING_DISABLED),
+            (ApiError::Indexer(IE::NoCommits), 400, BAD_REQUEST),
+            (
+                ApiError::Builder(BuilderErrors(vec![BuilderError::Missing {
+                    field: "input",
+                    hint: "h",
+                }])),
+                400,
+                MISSING_PARAMETER,
+            ),
+            // Signed requests: every verification failure is documented as 401.
+            #[cfg(feature = "credential")]
+            (
+                ApiError::Credential(CE::InvalidSignature("x".into())),
+                401,
+                INVALID_CREDENTIAL,
+            ),
+            (
+                ApiError::Query(QE::CatalogAccessDenied {
+                    table: "t".into(),
+                    message: "m".into(),
                 }),
-                409,
-                errors::COMMIT_CONFLICT,
+                403,
+                CATALOG_ACCESS_DENIED,
             ),
+            (
+                ApiError::Transact(TE::PolicyViolation(PE::modify_denied("no"))),
+                403,
+                ACCESS_DENIED,
+            ),
+            (
+                ApiError::StorageAccessDenied {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    region: None,
+                    message: "m".into(),
+                },
+                403,
+                STORAGE_ACCESS_DENIED,
+            ),
+            (
+                ApiError::CatalogCredentialsNotVended {
+                    catalog_uri: "c".into(),
+                },
+                403,
+                CATALOG_CREDENTIALS_NOT_VENDED,
+            ),
+            (
+                ApiError::Policy(PE::modify_denied("no")),
+                403,
+                ACCESS_DENIED,
+            ),
+            (ApiError::Ledger(LE::not_found("db")), 404, LEDGER_NOT_FOUND),
+            (ApiError::NotFound("db".into()), 404, LEDGER_NOT_FOUND),
+            (
+                ApiError::graph_source_not_found("gs"),
+                404,
+                GRAPH_SOURCE_NOT_FOUND,
+            ),
+            (ApiError::GraphNotFound("g".into()), 404, GRAPH_NOT_FOUND),
+            (ApiError::CommitNotFound("c".into()), 404, COMMIT_NOT_FOUND),
+            (ApiError::http(404, "x"), 404, NOT_FOUND),
+            (
+                ApiError::Indexer(IE::LedgerNotFound("db".into())),
+                404,
+                LEDGER_NOT_FOUND,
+            ),
+            (
+                ApiError::Query(QE::Cancelled { reason: Timeout }),
+                408,
+                QUERY_CANCELLED,
+            ),
+            (
+                ApiError::AwaitTNotReached {
+                    requested: 2,
+                    current: 1,
+                },
+                408,
+                READ_AFTER_WRITE_TIMEOUT,
+            ),
+            (conflict(), 409, COMMIT_CONFLICT),
             (
                 ApiError::Transact(TE::CommitIdMismatch {
                     expected: "a".into(),
                     found: "b".into(),
                 }),
                 409,
-                errors::COMMIT_CONFLICT,
+                COMMIT_CONFLICT,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::MergeOnReadDeletes("x".into())),
+                409,
+                MERGE_ON_READ_DELETES,
             ),
             (
-                ApiError::Transact(TE::NoveltyAtMax),
-                503,
-                errors::NOVELTY_AT_MAX,
+                ApiError::GraphSourceRetracted("x".into()),
+                409,
+                GRAPH_SOURCE_RETRACTED,
+            ),
+            (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
+            (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
+            (
+                ApiError::ReindexConflict {
+                    expected: 1,
+                    found: 2,
+                },
+                409,
+                REINDEX_CONFLICT,
             ),
             (
                 ApiError::Transact(TE::NoveltyWouldExceed {
@@ -1144,7 +1255,7 @@ mod tests {
                     max_bytes: 100,
                 }),
                 413,
-                errors::NOVELTY_DELTA_TOO_LARGE,
+                NOVELTY_DELTA_TOO_LARGE,
             ),
             (
                 ApiError::Transact(TE::DatatypeLimitExceeded {
@@ -1153,57 +1264,29 @@ mod tests {
                     max: 1,
                 }),
                 422,
-                errors::DATATYPE_LIMIT_EXCEEDED,
+                DATATYPE_LIMIT_EXCEEDED,
             ),
             (
-                ApiError::Transact(TE::PolicyViolation(
-                    fluree_db_policy::PolicyError::modify_denied("no"),
-                )),
-                403,
-                errors::ACCESS_DENIED,
-            ),
-            (
-                ApiError::Transact(TE::InvalidTerm("x".into())),
-                400,
-                errors::INVALID_TRANSACTION,
-            ),
-            (ApiError::sparql("x", vec![]), 400, errors::SPARQL_PARSE),
-            (
-                ApiError::SparqlLower(fluree_db_sparql::LowerError::AggregateWithoutAlias {
-                    span: fluree_db_sparql::SourceSpan { start: 0, end: 1 },
-                }),
-                400,
-                errors::SPARQL_LOWER,
-            ),
-            (ApiError::cypher("x", vec![]), 400, errors::CYPHER_PARSE),
-            (
-                ApiError::CypherLower(fluree_db_cypher::LowerError::WriteOnQueryPath),
-                400,
-                errors::CYPHER_LOWER,
-            ),
-            (
-                ApiError::CypherUpdateLower(
-                    fluree_db_transact::lower_cypher_update::LowerCypherError::NotAnUpdate,
-                ),
-                400,
-                errors::CYPHER_LOWER,
-            ),
-            (
-                ApiError::Turtle(fluree_graph_turtle::TurtleError::IriResolution("x".into())),
-                400,
-                errors::TURTLE_PARSE,
-            ),
-            (
-                ApiError::Bm25Builder(fluree_db_query::bm25::BuilderError::MissingId("x".into())),
+                ApiError::Connection(ConnectionError::InvalidConfig("x".into())),
                 500,
-                errors::BM25,
+                CONNECTION,
+            ),
+            (ApiError::Query(QE::Internal("x".into())), 500, INTERNAL),
+            (ApiError::Ledger(LE::InvalidData("x".into())), 500, INTERNAL),
+            (
+                ApiError::NameService(NSE::Storage("x".into())),
+                500,
+                NAMESERVICE,
             ),
             (
-                ApiError::Bm25Serialize(fluree_db_query::bm25::SerializeError::Io(
-                    std::io::Error::other("x"),
-                )),
+                ApiError::Bm25Builder(bm25::BuilderError::MissingId("x".into())),
                 500,
-                errors::BM25,
+                BM25,
+            ),
+            (
+                ApiError::Bm25Serialize(std::io::Error::other("x").into()),
+                500,
+                BM25,
             ),
             #[cfg(feature = "vector")]
             (
@@ -1214,50 +1297,20 @@ mod tests {
                     },
                 ),
                 500,
-                errors::INTERNAL,
+                INTERNAL,
             ),
             (
-                ApiError::Novelty(fluree_db_novelty::NoveltyError::Storage("x".into())),
+                ApiError::Novelty(NoveltyError::Storage("x".into())),
                 500,
-                errors::INTERNAL,
-            ),
-            // Signed requests: every verification failure is documented as 401.
-            #[cfg(feature = "credential")]
-            (
-                ApiError::Credential(fluree_db_credential::CredentialError::InvalidSignature(
-                    "x".into(),
-                )),
-                401,
-                errors::INVALID_CREDENTIAL,
-            ),
-            #[cfg(feature = "iceberg")]
-            (
-                ApiError::Iceberg(fluree_db_iceberg::IcebergError::MergeOnReadDeletes(
-                    "x".into(),
-                )),
-                409,
-                errors::MERGE_ON_READ_DELETES,
-            ),
-            #[cfg(feature = "iceberg")]
-            (
-                ApiError::Iceberg(fluree_db_iceberg::IcebergError::Config("x".into())),
-                400,
-                errors::CONFIG,
+                INTERNAL,
             ),
             (
                 ApiError::Core(fluree_db_core::Error::Storage("x".into())),
                 500,
-                errors::INTERNAL,
+                INTERNAL,
             ),
-            // Every `serde_json` error that reaches this variant parses
-            // stored records, not the request.
-            (
-                ApiError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
-                500,
-                errors::INTERNAL,
-            ),
-            (ApiError::config("x"), 400, errors::CONFIG),
-            (ApiError::ledger_config("x"), 500, errors::CONFIG),
+            (ApiError::Json(json), 500, INTERNAL),
+            (ApiError::ledger_config("x"), 500, CONFIG),
             (
                 ApiError::MaterializeMemoryBudget {
                     table: "t".into(),
@@ -1266,172 +1319,41 @@ mod tests {
                     distinct_subjects: 1,
                 },
                 500,
-                errors::INTERNAL,
+                INTERNAL,
             ),
-            (ApiError::OntologyImport("x".into()), 500, errors::INTERNAL),
+            (ApiError::OntologyImport("x".into()), 500, INTERNAL),
+            (ApiError::drop_error("x"), 500, INTERNAL),
+            (partial(1), 500, MATERIALIZE_PARTIAL),
+            (ApiError::internal("x"), 500, INTERNAL),
+            (ApiError::Policy(PE::invalid_query("x")), 500, INTERNAL),
+            (ApiError::Indexer(IE::Other("x".into())), 500, INDEXING),
             (
-                ApiError::Format(crate::format::FormatError::InvalidBinding("x".into())),
-                400,
-                errors::FORMAT,
+                ApiError::CrossLedger(CrossLedgerError::ModelLedgerMissing {
+                    ledger_id: "m".into(),
+                }),
+                502,
+                CROSS_LEDGER,
             ),
-            (ApiError::drop_error("x"), 500, errors::INTERNAL),
-            (
-                ApiError::GraphSourceRetracted("x".into()),
-                409,
-                errors::GRAPH_SOURCE_RETRACTED,
-            ),
-            (
-                ApiError::InvalidBranch("x".into()),
-                400,
-                errors::BAD_REQUEST,
-            ),
-            (
-                ApiError::InvalidLedgerId(fluree_db_core::LedgerIdParseError::new("x")),
-                400,
-                errors::BAD_REQUEST,
-            ),
-            (
-                ApiError::BranchConflict("x".into()),
-                409,
-                errors::COMMIT_CONFLICT,
-            ),
-            (
-                ApiError::NotFound("db:main".into()),
-                404,
-                errors::LEDGER_NOT_FOUND,
-            ),
-            (
-                ApiError::graph_source_not_found("gs:main"),
-                404,
-                errors::GRAPH_SOURCE_NOT_FOUND,
-            ),
-            (
-                ApiError::GraphNotFound("g".into()),
-                404,
-                errors::GRAPH_NOT_FOUND,
-            ),
-            (
-                ApiError::CommitNotFound("c".into()),
-                404,
-                errors::COMMIT_NOT_FOUND,
-            ),
-            (
-                ApiError::ledger_exists("db:main"),
-                409,
-                errors::LEDGER_EXISTS,
-            ),
+            (ApiError::Transact(TE::NoveltyAtMax), 503, NOVELTY_AT_MAX),
             (
                 ApiError::NoveltyDeferred { remaining: 1 },
                 503,
-                errors::NOVELTY_DEFERRED,
+                NOVELTY_DEFERRED,
             ),
+            (partial(0), 503, NOVELTY_DEFERRED),
             (
-                ApiError::MaterializePartial {
-                    tally: tally(1, 0),
-                    detail: "x".into(),
-                },
+                ApiError::commit_contention(16, conflict()),
                 503,
-                errors::NOVELTY_DEFERRED,
+                COMMIT_CONTENTION,
             ),
+            (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
             (
-                ApiError::MaterializePartial {
-                    tally: tally(1, 1),
-                    detail: "x".into(),
-                },
-                500,
-                errors::MATERIALIZE_PARTIAL,
-            ),
-            (ApiError::internal("x"), 500, errors::INTERNAL),
-            (
-                ApiError::StorageAccessDenied {
-                    bucket: "b".into(),
-                    key: "k".into(),
-                    region: None,
-                    message: "m".into(),
-                },
-                403,
-                errors::STORAGE_ACCESS_DENIED,
-            ),
-            (
-                ApiError::CatalogCredentialsNotVended {
-                    catalog_uri: "c".into(),
-                },
-                403,
-                errors::CATALOG_CREDENTIALS_NOT_VENDED,
-            ),
-            (ApiError::http(404, "x"), 404, errors::NOT_FOUND),
-            (ApiError::IndexTimeout(1), 504, errors::INDEX_TIMEOUT),
-            (ApiError::IndexingDisabled, 400, errors::INDEXING_DISABLED),
-            (
-                ApiError::AwaitTNotReached {
-                    requested: 2,
-                    current: 1,
-                },
-                408,
-                errors::READ_AFTER_WRITE_TIMEOUT,
-            ),
-            (
-                ApiError::commit_contention(
-                    16,
-                    ApiError::Transact(TE::CommitConflict {
-                        expected_t: 1,
-                        head_t: 2,
-                    }),
-                ),
-                503,
-                errors::COMMIT_CONTENTION,
-            ),
-            (
-                ApiError::ReindexConflict {
-                    expected: 1,
-                    found: 2,
-                },
-                409,
-                errors::REINDEX_CONFLICT,
-            ),
-            (
-                ApiError::Policy(fluree_db_policy::PolicyError::modify_denied("no")),
-                403,
-                errors::ACCESS_DENIED,
-            ),
-            (
-                ApiError::Policy(fluree_db_policy::PolicyError::InvalidQuery {
-                    message: "x".into(),
+                ApiError::Query(QE::MemoryBudgetExceeded {
+                    used_bytes: 2,
+                    budget_bytes: 1,
                 }),
-                500,
-                errors::INTERNAL,
-            ),
-            (
-                ApiError::Indexer(crate::wasm_compat::IndexerError::LedgerNotFound(
-                    "db:main".into(),
-                )),
-                404,
-                errors::LEDGER_NOT_FOUND,
-            ),
-            (
-                ApiError::Indexer(crate::wasm_compat::IndexerError::NoCommits),
-                400,
-                errors::BAD_REQUEST,
-            ),
-            (
-                ApiError::Indexer(crate::wasm_compat::IndexerError::Other("x".into())),
-                500,
-                errors::INDEXING,
-            ),
-            (
-                ApiError::Builder(BuilderErrors(vec![BuilderError::Missing {
-                    field: "input",
-                    hint: "h",
-                }])),
-                400,
-                errors::MISSING_PARAMETER,
-            ),
-            (
-                ApiError::CrossLedger(crate::cross_ledger::CrossLedgerError::ModelLedgerMissing {
-                    ledger_id: "m:main".into(),
-                }),
-                502,
-                errors::CROSS_LEDGER,
+                507,
+                INVALID_QUERY,
             ),
         ];
         for (e, ..) in &rows {
@@ -1514,9 +1436,8 @@ mod tests {
             // A client error must not read as a fault, in either form.
             for form in [&typed, &flattened] {
                 assert!(
-                    form.error_type() != errors::INTERNAL || status >= 500,
-                    "{status} answers {}: {form:?}",
-                    errors::INTERNAL
+                    form.error_type() != INTERNAL || status >= 500,
+                    "{status} answers {INTERNAL}: {form:?}"
                 );
             }
         }
