@@ -128,13 +128,11 @@ current value is retracted exactly as it is stored.
   document mints new blank nodes; the old ones stay (see
   [Stable blank-node ids](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids)
   for editing a stored blank node in place). For Turtle and TriG the
-  identity comes from the parsed statements, not their order: IRIs written
-  in full or as prefixed names, and strings in single or double quotes,
-  give the same identity. Other differences in how the statements are
-  written give a new one, and so new blank nodes: a number or boolean
-  written bare or as a typed literal (`1` vs `"1"^^xsd:integer`), a
-  language tag's case (`@en-US` vs `@en-us`), a repeated statement, or a
-  renamed blank-node label (`_:b` vs `_:c`). See
+  identity comes from the parsed statements as they are stored: their order
+  does not count, nor how a term is spelled (a prefixed or full IRI, `1` or
+  `"1"^^xsd:integer`, `true` or `"true"^^xsd:boolean`, a language tag in
+  any case), and a statement written twice counts once. Blank-node labels
+  do count: renaming `_:b` to `_:c` gives new nodes. See
   [How RDF text is read](turtle.md#how-rdf-text-is-read) for the details
   and a query that lists blank nodes nothing references.
 - **Named graphs.** The graph is part of the unit: an upsert into a named
