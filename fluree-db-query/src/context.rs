@@ -1260,7 +1260,11 @@ impl<'a> ExecutionContext<'a> {
     /// Whether this scope reads exactly one graph: no dataset, or a dataset
     /// whose active graph is one graph (a named graph, or a default graph of
     /// one). A default graph of several graphs, of one ledger or of several,
-    /// reads several.
+    /// reads several; `FROM NAMED` alone, a default graph of none, reads
+    /// none. Defined once, by [`ActiveGraph::reads_one_graph`], which the
+    /// planner's [`PlanningContext::one_graph`] answers too.
+    ///
+    /// [`PlanningContext::one_graph`]: crate::temporal_mode::PlanningContext::one_graph
     ///
     /// Every single-graph lane gates on this: the binary-index fast paths
     /// (through `fast_path_store` and `allow_cursor_fast_path`), the batched
@@ -1270,14 +1274,7 @@ impl<'a> ExecutionContext<'a> {
     /// `binary_g_id` to one member, so a lane that ran there would read that
     /// member alone.
     pub fn reads_exactly_one_graph(&self) -> bool {
-        if self.is_multi_ledger() {
-            return false;
-        }
-        match (&self.dataset, &self.active_graph) {
-            (None, _) => true,
-            (Some(ds), ActiveGraph::Default) => ds.default_graphs().len() == 1,
-            (Some(ds), ActiveGraph::Named(iri)) => ds.named_graph(iri).is_some(),
-        }
+        self.active_graph.reads_one_graph(self.dataset)
     }
 
     /// Whether this scope reads exactly one graph of a binary index: a store

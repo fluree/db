@@ -80,6 +80,18 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
+    /// Whether the query's default graph is exactly one graph
+    /// ([`ActiveGraph::reads_one_graph`]): no dataset, or a default graph of one
+    /// member. The planner's twin of
+    /// [`ExecutionContext::reads_exactly_one_graph`], from the same definition:
+    /// a plan choice that reads one graph's index (the geo index search, the
+    /// fused fast paths, the partitioned GROUP BY) is made only under it, so
+    /// the runtime never meets a scope it has to refuse. `false` for a default
+    /// graph of none (`FROM NAMED` alone) as well as of several.
+    ///
+    /// [`ActiveGraph::reads_one_graph`]: crate::dataset::ActiveGraph::reads_one_graph
+    /// [`ExecutionContext::reads_exactly_one_graph`]: crate::context::ExecutionContext::reads_exactly_one_graph
+    pub one_graph: bool,
     /// What an unmatched OPTIONAL binds its optional-only variables to — the
     /// surface language's null semantics. Folded in from `Query` at the plan
     /// root; defaults to SPARQL's `Unbound`.
@@ -99,6 +111,7 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            one_graph: true,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
         }
@@ -111,6 +124,7 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            one_graph: true,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
         }
@@ -136,6 +150,18 @@ impl PlanningContext {
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
         self.multi_default_graph = multi && self.mode.is_current();
         self
+    }
+
+    /// Plan for the query's default graph over `dataset` (`None`: the
+    /// ledger's own default graph): [`Self::multi_default_graph`] when it has
+    /// two or more members, and [`Self::one_graph`] by the one definition the
+    /// runtime uses. Every entry point that runs a query over a dataset plans
+    /// through this.
+    pub fn with_dataset_scope(self, dataset: Option<&crate::dataset::DataSet<'_>>) -> Self {
+        let mut planning =
+            self.with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2));
+        planning.one_graph = crate::dataset::ActiveGraph::Default.reads_one_graph(dataset);
+        planning
     }
 
     /// Set the surface language's OPTIONAL null semantics (see

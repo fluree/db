@@ -386,7 +386,7 @@ pub async fn execute_where_streaming<'a>(
     // blank minting. Single-graph datasets keep the flag off (byte-identical
     // planning).
     let planning = temporal_mode::PlanningContext::current()
-        .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2))
+        .with_dataset_scope(dataset)
         .with_unmatched_optional(unmatched_optional);
     let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)
         .map_err(|e| e.name_variables(vars))?;

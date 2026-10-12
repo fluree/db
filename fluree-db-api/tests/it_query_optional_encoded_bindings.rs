@@ -1762,6 +1762,13 @@ async fn partitioned_group_by_reads_one_graph() {
             rows(&[&["1", "3"], &["2", "4"]]),
             false,
         ),
+        (
+            "G9 FROM NAMED g2 alone: an empty default graph",
+            q("", "FROM NAMED <urn:g2>", "n", "COUNT(*)"),
+            vk,
+            rows(&[]),
+            false,
+        ),
     ];
     let mut failures = Failures::default();
     check_lane_cases(
@@ -1875,6 +1882,13 @@ async fn cyclic_lane_reads_one_graph() {
             tri("", "FROM <urn:g3> FROM <urn:g2>"),
             xyz,
             pqr,
+            false,
+        ),
+        (
+            "C6 FROM NAMED g2 alone: an empty default graph",
+            tri("", "FROM NAMED <urn:g2>"),
+            xyz,
+            rows(&[]),
             false,
         ),
     ];
@@ -2121,6 +2135,14 @@ async fn count_lanes_read_one_graph() {
             false,
         ),
         (
+            "predicate_object_count",
+            "object count, FROM NAMED g2 alone: an empty default graph",
+            object_count("", "FROM NAMED <urn:g2>"),
+            &["n"],
+            rows(&[&["0"]]),
+            false,
+        ),
+        (
             "group_by_object_count_topk",
             "grouped top-k, the default graph alone",
             grouped_topk("", ""),
@@ -2217,6 +2239,88 @@ async fn count_lanes_read_one_graph() {
             &format!("{label}: `{site}` (reached, declined)"),
         );
     }
+    failures.assert_none();
+}
+
+/// A `geof:distance` filter over a default graph of none (`FROM NAMED` alone):
+/// no rows, as over any empty default graph. The planner and the geo index
+/// search's own refusal share one definition of "reads one graph", so the
+/// rewrite is skipped here exactly as over several graphs. A `GRAPH` scope over
+/// the named graph is the control.
+#[tokio::test(flavor = "current_thread")]
+async fn geo_search_over_a_default_graph_of_none() {
+    let ledger_id = "it/geo-search-from-named:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        ex:paris ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+        GRAPH <urn:g2> { ex:london ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral . }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let near = |ds: &str, graph: bool| {
+        let pattern = "?place ex:location ?loc \
+                       BIND(geof:distance(?loc, \"POINT(2.3522 48.8566)\"^^geo:wktLiteral) AS ?d) \
+                       FILTER(?d <= 500000)";
+        let body = if graph {
+            format!("GRAPH <urn:g2> {{ {pattern} }}")
+        } else {
+            pattern.to_string()
+        };
+        format!(
+            "{PREFIXES}PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?place {ds} WHERE {{ {body} }}"
+        )
+    };
+    let place: &'static [&'static str] = &["place"];
+    let cases: Vec<LaneCase> = vec![
+        (
+            "one graph: the default graph alone",
+            near("", false),
+            place,
+            rows(&[&["paris"]]),
+            true,
+        ),
+        (
+            "FROM NAMED g2 alone: an empty default graph",
+            near("FROM NAMED <urn:g2>", false),
+            place,
+            rows(&[]),
+            false,
+        ),
+        (
+            "FROM NAMED g2 alone, GRAPH <g2>",
+            near("FROM NAMED <urn:g2>", true),
+            place,
+            rows(&[&["london"]]),
+            false,
+        ),
+    ];
+    let mut failures = Failures::default();
+    check_lane_cases(&fluree, &handle, "geo_search", cases, &mut failures).await;
+    let from_named = json!({
+        "@context": {"ex": EX},
+        "fromNamed": [{"@id": ledger_id, "graph": "urn:g2"}],
+        "select": ["?place"],
+        "where": [
+            {"@id": "?place", "ex:location": "?loc"},
+            ["bind", "?d", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
+            ["filter", "(<= ?d 500000)"]
+        ]
+    });
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "geo_search",
+        JsonLaneCase {
+            label: "JSON-LD fromNamed g2 alone",
+            query: from_named,
+            want: rows(&[]),
+            must_fire: false,
+        },
+        &mut failures,
+    )
+    .await;
     failures.assert_none();
 }
 

@@ -325,14 +325,18 @@ impl Operator for GeoSearchOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
-        // The planner rewrites to this operator only for a scope of one graph
-        // (`planning.multi_default_graph` skips the rewrite). It has no
-        // fallback to the patterns it replaced, so a scope of several graphs
-        // is refused rather than answered from one member's index.
+        // The planner rewrites to this operator only for a scope that reads
+        // exactly one graph (`planning.one_graph`, the same definition as this
+        // check). It has no fallback to the patterns it replaced, so any other
+        // scope is refused rather than answered from one graph's index.
         if !ctx.reads_exactly_one_graph() {
-            debug_assert!(false, "GeoSearch planned in a scope of several graphs");
+            debug_assert!(
+                false,
+                "GeoSearch planned in a scope that does not read exactly one graph"
+            );
             return Err(QueryError::Internal(
-                "GeoSearch reads one graph's index; the scope reads several".to_string(),
+                "GeoSearch reads one graph's index; the scope does not read exactly one graph"
+                    .to_string(),
             ));
         }
 

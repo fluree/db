@@ -2476,7 +2476,13 @@ fn build_operator_tree_inner(
     // (and some build count-only scans with a pruned emit mask), so they would
     // over-count a triple shared across members. Decline them and let the
     // general pipeline run over the deduplicating `DatasetOperator`.
-    let enable_fused_fast_paths = enable_fused_fast_paths && !planning.multi_default_graph;
+    //
+    // The fused paths also read one graph's index (`binary_g_id`'s), so they
+    // are planned only for a default graph of exactly one graph
+    // (`planning.one_graph`, which implies `!multi_default_graph`): their
+    // runtime gates check the same definition, and a default graph of none
+    // (`FROM NAMED` alone) has no index to read either.
+    let enable_fused_fast_paths = enable_fused_fast_paths && planning.one_graph;
 
     // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
     // generic pipeline's dedicated post-grouping bind stage. No fast path runs
@@ -3489,9 +3495,10 @@ pub(crate) fn apply_solution_modifiers(
     // A default graph of several graphs breaks the promise too: each member's
     // scan arrives sorted by the key, but `DatasetOperator` drains the members
     // one after another, so one key's rows come in one run per member. The
-    // operator also checks its scope at open
-    // (`ExecutionContext::reads_exactly_one_graph`).
-    let partitioned = partitioned && !planning.is_history() && !planning.multi_default_graph;
+    // operator also checks its scope at open, by the same definition
+    // (`planning.one_graph` here, `ExecutionContext::reads_exactly_one_graph`
+    // there).
+    let partitioned = partitioned && !planning.is_history() && planning.one_graph;
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
     // tail treats both variants uniformly. Cloning is cheap — both vectors are

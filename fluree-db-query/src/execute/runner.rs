@@ -442,11 +442,11 @@ pub async fn prepare_execution_with_config(
             // The operator reads the store its execution context takes from
             // the snapshot, which a caller need not have passed in here,
             // unless execution runs with none (a multi-ledger dataset). It
-            // reads `binary_g_id`'s index, so a default graph of several
-            // graphs keeps the patterns too, evaluated over every member.
-            // `GeoSearchOperator::open` refuses a scope that does not read
-            // exactly one graph, the runtime twin of this check.
-            let geo_index_covers = !planning.multi_default_graph
+            // reads `binary_g_id`'s index, so a default graph of none or of
+            // several keeps the patterns too, evaluated over every member.
+            // `planning.one_graph` and the refusal in `GeoSearchOperator::open`
+            // are one definition (`ActiveGraph::reads_one_graph`).
+            let geo_index_covers = planning.one_graph
                 && binary_scans
                 && binary_store
                     .cloned()
@@ -972,11 +972,7 @@ pub async fn execute<'a>(
     // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
     // the dataset paths do, so the members' scans deduplicate on full rows.
     let mut prepare_config = PrepareConfig::default();
-    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
-        config
-            .dataset
-            .is_some_and(|ds| ds.default_graphs().len() >= 2),
-    );
+    prepare_config.planning = prepare_config.planning.with_dataset_scope(config.dataset);
     let prepared = prepare_execution_with_config(db, query, &prepare_config)
         .await
         .map_err(|e| e.name_variables(vars))?;
