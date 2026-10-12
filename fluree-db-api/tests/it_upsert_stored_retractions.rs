@@ -780,6 +780,26 @@ async fn a_subtyped_big_integer_survives_its_delete_and_upsert() {
     .await;
 }
 
+/// An indexed value and a novelty term of its index key, in one slot, are
+/// one stored fact, so an upsert of the slot retracts one fact. The slot read
+/// folds novelty ops into the index rows by key; the index row alone would
+/// be named as a second fact.
+#[tokio::test]
+async fn an_upsert_over_an_indexed_value_and_a_novelty_term_of_its_key_retracts_one_fact() {
+    let dt = format!("{XSD}dateTime");
+    let mut h = Harness::new("one-key-two-terms").await;
+    h.insert(&typed("ex:s", "2020-01-01T00:00:00.123456Z", &dt))
+        .await;
+    h.reindex().await;
+    h.insert(&typed("ex:s", "2020-01-01T00:00:00.123456789Z", &dt))
+        .await;
+    let receipt = h.upsert(&typed("ex:s", "2021-06-01T00:00:00Z", &dt)).await;
+    assert_eq!(receipt.retract_count, 1);
+    let facts = h.facts(None, "s").await;
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(facts[0].contains("2021"), "{facts:?}");
+}
+
 /// A predicate the index does not have yet, matched by a WHERE that binds
 /// the predicate: the subject scan keys novelty under a runtime predicate
 /// id, so its row is the key's decode, and the resolver keys the stored

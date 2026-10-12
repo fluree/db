@@ -47,8 +47,8 @@ use crate::error::{Result, TransactError};
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::{
-    range_with_overlay, Flake, GraphId, NoOverlay, OverlayProvider, RangeMatch, RangeOptions,
-    RangeTest, Sid, Tracker,
+    range_with_overlay, Flake, FlakeValue, GraphId, NoOverlay, OverlayProvider, RangeMatch,
+    RangeOptions, RangeTest, Sid, Tracker,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_query::BinaryRangeProvider;
@@ -111,6 +111,40 @@ impl StoredFact {
             op: false,
             ..self.flake
         })
+    }
+
+    /// [`Self::retract`] for a DELETE intent that named this fact: when the
+    /// intent holds the stored value written alike, its value moves into the
+    /// retraction, which takes everything else from the fact; otherwise the
+    /// fact is copied.
+    fn retract_named(&self, intent: Flake, t: i64) -> Retraction {
+        let f = &self.flake;
+        if !written_alike(&f.o, &intent.o) {
+            return self.clone().retract(t);
+        }
+        Retraction(Flake {
+            g: f.g.clone(),
+            s: f.s.clone(),
+            p: f.p.clone(),
+            o: intent.o,
+            dt: f.dt.clone(),
+            t,
+            op: false,
+            m: f.m.clone(),
+        })
+    }
+}
+
+/// Whether two equal values are also written alike, so either stands for the
+/// other in a flake. For these kinds equality is identity; numbers compare
+/// across kind and scale, and temporals as instants, so those are copied.
+fn written_alike(a: &FlakeValue, b: &FlakeValue) -> bool {
+    match (a, b) {
+        (FlakeValue::String(x), FlakeValue::String(y)) => x == y,
+        (FlakeValue::Ref(x), FlakeValue::Ref(y)) => x == y,
+        (FlakeValue::Long(x), FlakeValue::Long(y)) => x == y,
+        (FlakeValue::Boolean(x), FlakeValue::Boolean(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -427,8 +461,10 @@ impl<'l> CurrentFacts<'l> {
         for slot in slots {
             let rm = RangeMatch::subject_predicate(slot.s.clone(), slot.p.clone());
             let mut flakes = self.base(slot.g_id, rm).await?;
+            let index_rows = flakes.len();
             novelty.collect_slot(self.ledger, slot, self.to_t, &mut flakes);
-            out.push(self.resolve(slot.g_id, flakes, slot.g_sid.as_ref()));
+            let index_only = flakes.len() == index_rows;
+            out.push(self.resolve(slot.g_id, flakes, slot.g_sid.as_ref(), index_only));
         }
         Ok(out)
     }
@@ -443,6 +479,7 @@ impl<'l> CurrentFacts<'l> {
         let mut flakes = self
             .base(g_id, RangeMatch::new().with_subject(s.clone()))
             .await?;
+        let index_rows = flakes.len();
         let lo = Flake::min_for_subject(s.clone());
         let hi = Flake::max_for_subject(s.clone());
         self.ledger.novelty.for_each_overlay_flake(
@@ -454,7 +491,8 @@ impl<'l> CurrentFacts<'l> {
             self.to_t,
             &mut |f| flakes.push(f.clone()),
         );
-        Ok(self.resolve(g_id, flakes, g_sid))
+        let index_only = flakes.len() == index_rows;
+        Ok(self.resolve(g_id, flakes, g_sid, index_only))
     }
 
     /// Every current fact of graph `g_id`, graph Sid stamped.
@@ -519,13 +557,29 @@ impl<'l> CurrentFacts<'l> {
     /// Resolve base rows plus novelty ops of graph `g_id` to the current
     /// facts, stamping the graph and the origin: ops that share an index key
     /// first ([`IndexKeys::merge`]), then by term.
-    fn resolve(&self, g_id: GraphId, flakes: Vec<Flake>, g_sid: Option<&Sid>) -> Vec<StoredFact> {
+    ///
+    /// Index rows alone (`index_only`, every one an assertion) are already
+    /// the index's current facts, one row each in SPOT order, as a range read
+    /// returns them ([`Self::whole_graph`] relies on the same): there is
+    /// nothing to fold.
+    fn resolve(
+        &self,
+        g_id: GraphId,
+        flakes: Vec<Flake>,
+        g_sid: Option<&Sid>,
+        index_only: bool,
+    ) -> Vec<StoredFact> {
         if flakes.is_empty() {
             return Vec::new();
         }
         let index_t = self.ledger.snapshot.t;
-        let flakes = self.keys.merge(g_id, flakes, index_t);
-        resolve_current_flakes(flakes, IndexType::Spot)
+        let flakes = if index_only && flakes.iter().all(|f| f.op) {
+            flakes
+        } else {
+            let flakes = self.keys.merge(g_id, flakes, index_t);
+            resolve_current_flakes(flakes, IndexType::Spot)
+        };
+        flakes
             .into_iter()
             .map(|flake| stored(flake, g_sid, index_t))
             .collect()
@@ -644,29 +698,46 @@ impl<'l> DeleteResolver<'l> {
         let mut read_index: HashMap<SlotKey, usize> = HashMap::new();
         let mut to_read: Vec<Slot> = Vec::new();
         let mut at: Vec<SlotAt> = Vec::with_capacity(pending.len());
+        // The previous intent's graph and place: a run of intents naming one
+        // slot (a delete of many values of one property) is placed without
+        // hashing its key again.
+        let mut previous: Option<(GraphId, &Flake, SlotAt)> = None;
         for intent in &pending {
             let f = &intent.flake;
-            let key: SlotKey = (graph_of(f)?, f.s.clone(), f.p.clone());
-            if !self.wide_index.is_empty() {
-                if let Some(&w) = self.wide_index.get(&key) {
-                    at.push(SlotAt::Wide(w));
+            let g_id = graph_of(f)?;
+            if let Some((prev_g, prev, place)) = previous {
+                if prev_g == g_id && prev.s == f.s && prev.p == f.p {
+                    at.push(place);
                     continue;
                 }
             }
-            let next = to_read.len();
-            match read_index.entry(key) {
-                Entry::Occupied(e) => at.push(SlotAt::Read(*e.get())),
-                Entry::Vacant(e) => {
-                    to_read.push(Slot {
-                        g_id: e.key().0,
-                        g_sid: f.g.clone(),
-                        s: f.s.clone(),
-                        p: f.p.clone(),
-                    });
-                    e.insert(next);
-                    at.push(SlotAt::Read(next));
+            let key: SlotKey = (g_id, f.s.clone(), f.p.clone());
+            let wide = if self.wide_index.is_empty() {
+                None
+            } else {
+                self.wide_index.get(&key).copied()
+            };
+            let place = match wide {
+                Some(w) => SlotAt::Wide(w),
+                None => {
+                    let next = to_read.len();
+                    match read_index.entry(key) {
+                        Entry::Occupied(e) => SlotAt::Read(*e.get()),
+                        Entry::Vacant(e) => {
+                            to_read.push(Slot {
+                                g_id,
+                                g_sid: f.g.clone(),
+                                s: f.s.clone(),
+                                p: f.p.clone(),
+                            });
+                            e.insert(next);
+                            SlotAt::Read(next)
+                        }
+                    }
                 }
-            }
+            };
+            at.push(place);
+            previous = Some((g_id, f, place));
         }
         stats.slot_reads = to_read.len();
         let read_facts = self.current.of_slots(&to_read).await?;
@@ -734,7 +805,7 @@ impl<'l> DeleteResolver<'l> {
                 }
             } else if let Some(n) = facts.named(&intent.flake, keys) {
                 stats.matched += 1;
-                out.push(facts.facts[n].clone().retract(t));
+                out.push(facts.facts[n].retract_named(intent.flake, t));
             } else {
                 stats.phantom_intents += 1;
                 if let Some(unmatched) = unmatched.as_deref_mut() {
@@ -748,6 +819,7 @@ impl<'l> DeleteResolver<'l> {
 
 /// Where an intent's slot is: a wide slot an earlier batch read, by its
 /// place in [`DeleteResolver`]'s wide slots, or a slot this batch reads.
+#[derive(Clone, Copy)]
 enum SlotAt {
     Wide(usize),
     Read(usize),
@@ -1076,7 +1148,8 @@ impl<K: Copy + Eq + Hash + Ord> Groups<K> {
             let mut pure = true;
             while i < keyed.len() && keyed[i].0 == k {
                 let n = keyed[i].2;
-                pure = pure && same(&facts[first].flake, &facts[n as usize].flake);
+                pure = pure
+                    && (n as usize == first || same(&facts[first].flake, &facts[n as usize].flake));
                 order.push(n);
                 i += 1;
             }
@@ -1430,6 +1503,80 @@ mod tests {
         assert_eq!(retraction.g, stored_flake.g);
         assert_eq!(retraction.m, stored_flake.m);
         assert_eq!(retraction.dt, stored_flake.dt);
+    }
+
+    /// A named intent's retraction is the stored fact's: from an intent
+    /// holding the value written alike only the value is taken (the stored
+    /// tag's case and list position stay), and a value written otherwise (a
+    /// decimal's scale) is copied from the fact.
+    #[tokio::test]
+    async fn retract_named_keeps_the_stored_identity() {
+        let g1 = sid("g1");
+        let reverse: HashMap<Sid, GraphId> = [(g1.clone(), 3)].into_iter().collect();
+        let decimal_dt = Sid::new(fluree_vocab::namespaces::XSD, "decimal");
+        let dec = |v: &str| FlakeValue::Decimal(Box::new(v.parse().expect("decimal")));
+        let tagged = in_graph(
+            flake(
+                "a",
+                "label",
+                "x",
+                1,
+                true,
+                FlakeMeta::from_parts(Some("en"), Some(4)),
+            ),
+            &g1,
+        );
+        let scaled = in_graph(
+            Flake::new(
+                sid("a"),
+                sid("amount"),
+                dec("1.00"),
+                decimal_dt.clone(),
+                1,
+                true,
+                None,
+            ),
+            &g1,
+        );
+        let ledger = ledger(vec![vec![tagged, scaled]], &reverse);
+        let facts = CurrentFacts::new(&ledger)
+            .of_slots(&[
+                slot(3, Some(&g1), "a", "label"),
+                slot(3, Some(&g1), "a", "amount"),
+            ])
+            .await
+            .unwrap();
+        let intents = [
+            flake(
+                "a",
+                "label",
+                "x",
+                9,
+                false,
+                FlakeMeta::from_parts(Some("EN"), None),
+            ),
+            Flake::new(
+                sid("a"),
+                sid("amount"),
+                dec("1.0"),
+                decimal_dt,
+                9,
+                false,
+                None,
+            ),
+        ];
+        for (fact, intent) in facts.iter().map(|slot| &slot[0]).zip(intents) {
+            let named = fact.retract_named(intent, 9).into_flake();
+            let copied = fact.clone().retract(9).into_flake();
+            // `Flake`'s equality ignores `g`, `t` and `op`, and a decimal's
+            // scale, so check them apart.
+            assert_eq!(named, copied);
+            assert_eq!(format!("{:?}", named.o), format!("{:?}", copied.o));
+            assert_eq!(
+                (named.t, named.op, &named.g, &named.m, &named.dt),
+                (copied.t, copied.op, &copied.g, &copied.m, &copied.dt)
+            );
+        }
     }
 
     // =========================================================================
