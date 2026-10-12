@@ -471,3 +471,84 @@ async fn a_where_scoped_to_one_graph_deletes_and_rewrites_its_big_integer() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// A DELETE naming a few plain values of a slot the index's statistics call
+/// wide reads just those values (`delete_point_read` proceeds). More values
+/// than the slot's width pays for, a tagged value, or a slot of a predicate
+/// with one value per subject read the slot (it falls back). All on one
+/// indexed ledger, each delete retracting what it names.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_reads_by_value_only_a_wide_slot_named_a_few_times() {
+    let (store, _guard) = span_capture::init_test_tracing();
+    let site = fluree_db_transact::DELETE_POINT_READ_SITE;
+    let outcomes = |from: usize| -> Vec<String> {
+        store.find_events("fast-path outcome")[from..]
+            .iter()
+            .filter(|e| e.fields.get("site").map(String::as_str) == Some(site))
+            .filter_map(|e| e.fields.get("outcome").cloned())
+            .collect()
+    };
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/delete-point-routing:main";
+    let mut tags: Vec<JsonValue> = (0..40).map(|i| json!(format!("t{i}"))).collect();
+    tags.push(json!({"@value": "t2", "@language": "en"}));
+    let mut graph = vec![json!({"@id": "ex:s", "ex:tag": tags})];
+    graph.extend((0..40).map(|i| json!({"@id": format!("ex:i{i}"), "ex:one": format!("v{i}")})));
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed");
+    support::rebuild_and_publish_index(&fluree, id).await;
+    let mut ledger = fluree.ledger(id).await.expect("reload");
+
+    let cases = [
+        (
+            "one value of the wide slot",
+            json!({"@id": "ex:s", "ex:tag": "t3"}),
+            1,
+            "proceed",
+        ),
+        (
+            "five values of the wide slot",
+            json!({"@id": "ex:s", "ex:tag": ["t4", "t5", "t6", "t7", "t8"]}),
+            5,
+            "fallback:gate_declined",
+        ),
+        (
+            "a tagged value",
+            json!({"@id": "ex:s", "ex:tag": {"@value": "t2", "@language": "en"}}),
+            1,
+            "fallback:gate_declined",
+        ),
+        (
+            "the value of a narrow slot",
+            json!({"@id": "ex:i0", "ex:one": "v0"}),
+            1,
+            "fallback:gate_declined",
+        ),
+        (
+            "another value of the wide slot",
+            json!({"@id": "ex:s", "ex:tag": "t9"}),
+            1,
+            "proceed",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (what, delete, retracted, outcome) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        let r = fluree
+            .update(ledger, &json!({"@context": ctx(), "delete": delete}))
+            .await
+            .expect("delete");
+        let stamps = outcomes(before);
+        if r.receipt.retract_count != retracted || stamps != [outcome] {
+            failures.push(format!(
+                "{what}: retracted {}, stamps {stamps:?}",
+                r.receipt.retract_count
+            ));
+        }
+        ledger = r.ledger;
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

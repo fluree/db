@@ -3084,6 +3084,7 @@ async fn stream_where_into_accumulator(
             matched = resolve_stats.matched,
             phantom_intents = resolve_stats.phantom_intents,
             slot_reads = resolve_stats.slot_reads,
+            point_reads = resolve_stats.point_reads,
             "delete intent resolution"
         );
     }

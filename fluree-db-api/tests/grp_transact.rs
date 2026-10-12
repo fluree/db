@@ -11,6 +11,8 @@ mod it_concurrent_update_reconcile;
 mod it_cypher_txn;
 #[path = "it_default_graph_name.rs"]
 mod it_default_graph_name;
+#[path = "it_delete_point_reads.rs"]
+mod it_delete_point_reads;
 #[path = "it_delete_stored_facts.rs"]
 mod it_delete_stored_facts;
 #[path = "it_enforce_unique_upsert_indexed.rs"]

@@ -51,6 +51,7 @@ use fluree_db_core::{
     RangeOptions, RangeTest, Sid, Tracker,
 };
 use fluree_db_ledger::LedgerState;
+use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::BinaryRangeProvider;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::collections::hash_map::Entry;
@@ -70,6 +71,20 @@ pub const NOVELTY_WALK_RATIO: usize = 16;
 /// scan costs less than building one, and a later batch that names the slot
 /// reads it again.
 const NARROW_SLOT: usize = 16;
+
+/// What reading one value of a slot from the index costs, in slot facts: a
+/// value read is a dictionary lookup of the value and a seek, a slot read
+/// the seek and a decode per fact. Measured over deletes naming 1 to 32
+/// values of slots of 1 to 20,000 values (the `slots_delete` probe,
+/// 2026-10-07): naming `m` values of a `k`-value slot, value reads cost
+/// less than the slot read whenever `m * 10 <= k`, and more at `k <= 4`
+/// for every `m`.
+const POINT_READ_FACTS: u64 = 10;
+
+/// The routing stamp of [`DeleteResolver`]'s value reads: `proceed` when a
+/// batch read some slot by the values its intents name, else
+/// `fallback:gate_declined`.
+pub const DELETE_POINT_READ_SITE: &str = "delete_point_read";
 
 /// Where a stored fact's surviving op was read from.
 ///
@@ -243,6 +258,8 @@ pub(crate) struct ResolveStats {
     pub(crate) phantom_intents: usize,
     /// `(graph, subject, predicate)` slots read.
     pub(crate) slot_reads: usize,
+    /// Slots read only for the values their intents name.
+    pub(crate) point_reads: usize,
 }
 
 impl ResolveStats {
@@ -252,6 +269,7 @@ impl ResolveStats {
         self.matched += other.matched;
         self.phantom_intents += other.phantom_intents;
         self.slot_reads += other.slot_reads;
+        self.point_reads += other.point_reads;
     }
 }
 
@@ -286,6 +304,23 @@ fn same_term(stored: &Flake, intent: &Flake) -> bool {
     stored.o == intent.o
         && dt_matches(&stored.dt, &intent.dt)
         && lang_matches(lang_of(stored), lang_of(intent))
+}
+
+/// Whether every stored fact a DELETE intent can name is found by reading
+/// the intent's value alone: an IRI or blank-node reference, or a plain
+/// `xsd:string` with no tag. The index keys either by one dictionary id
+/// (`IRI_REF`, which blank nodes share, or `XSD_STRING`), and one key is
+/// one term, so a range read bound to the value returns exactly the facts
+/// that hold it. Other kinds read their slot: a tagged or otherwise typed
+/// string has its own key type per tag or datatype, a bare number spans
+/// numeric types, and the kinds whose key can merge terms
+/// ([`IndexKeys`]) need the slot's keys.
+fn point_keyable(f: &Flake) -> bool {
+    match &f.o {
+        FlakeValue::Ref(_) => true,
+        FlakeValue::String(_) => lang_of(f).is_none() && f.dt == *crate::generate::DT_STRING,
+        _ => false,
+    }
 }
 
 /// A hash of a flake's term that agrees with [`same_term`]: `FlakeValue`'s
@@ -459,14 +494,54 @@ impl<'l> CurrentFacts<'l> {
         let novelty = NoveltyPlan::for_slots(self.ledger, slots, self.to_t);
         let mut out = Vec::with_capacity(slots.len());
         for slot in slots {
-            let rm = RangeMatch::subject_predicate(slot.s.clone(), slot.p.clone());
-            let mut flakes = self.base(slot.g_id, rm).await?;
-            let index_rows = flakes.len();
-            novelty.collect_slot(self.ledger, slot, self.to_t, &mut flakes);
-            let index_only = flakes.len() == index_rows;
-            out.push(self.resolve(slot.g_id, flakes, slot.g_sid.as_ref(), index_only));
+            out.push(self.read_slot(slot, None, &novelty).await?);
         }
         Ok(out)
+    }
+
+    /// [`Self::of_slots`], except that a slot given `Some(values)` is read
+    /// for those values alone: per value, the index rows of `(s, p, value)`
+    /// and the novelty ops in its bounds. Its answer is then the slot's
+    /// current facts that hold one of the values, under any datatype, tag
+    /// or list position, each value's in slot order.
+    async fn of_slots_or_values(
+        &self,
+        slots: &[Slot],
+        values: &[Option<Vec<FlakeValue>>],
+    ) -> Result<Vec<Vec<StoredFact>>> {
+        let novelty = NoveltyPlan::for_slots(self.ledger, slots, self.to_t);
+        let mut out = Vec::with_capacity(slots.len());
+        for (slot, values) in slots.iter().zip(values) {
+            match values {
+                None => out.push(self.read_slot(slot, None, &novelty).await?),
+                Some(values) => {
+                    let mut facts = Vec::new();
+                    for o in values {
+                        facts.extend(self.read_slot(slot, Some(o), &novelty).await?);
+                    }
+                    out.push(facts);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The current facts of one slot, or of its facts whose value is `o`.
+    async fn read_slot(
+        &self,
+        slot: &Slot,
+        o: Option<&FlakeValue>,
+        novelty: &NoveltyPlan,
+    ) -> Result<Vec<StoredFact>> {
+        let rm = RangeMatch {
+            o: o.cloned(),
+            ..RangeMatch::subject_predicate(slot.s.clone(), slot.p.clone())
+        };
+        let mut flakes = self.base(slot.g_id, rm).await?;
+        let index_rows = flakes.len();
+        novelty.collect_slot(self.ledger, slot, o, self.to_t, &mut flakes);
+        let index_only = flakes.len() == index_rows;
+        Ok(self.resolve(slot.g_id, flakes, slot.g_sid.as_ref(), index_only))
     }
 
     /// The current facts of one subject in graph `g_id`, in SPOT order.
@@ -637,6 +712,16 @@ type SlotKey = (GraphId, Sid, Sid);
 /// n values of one slot costs O(n) however the WHERE batches its rows. Such
 /// slots are held until staging ends; narrower ones are scanned and read
 /// again by a later batch that names them.
+///
+/// A slot that a batch's intents name a few times, every one of them not
+/// witnessed and [`point_keyable`], is read only for the values they name,
+/// so naming one value of a k-value slot costs a seek, not a read of k
+/// facts. "A few" is what the slot's expected width pays for
+/// ([`DeleteResolver::point_bound`]). Those facts are every stored fact the
+/// intents can name, in slot order, so matching gives the answer the slot
+/// would; they are not the slot, so they are dropped with the batch.
+/// Witnessed rows read their slot: the k-th identical row is counted
+/// against the slot's facts.
 pub(crate) struct DeleteResolver<'l> {
     current: CurrentFacts<'l>,
     list_free: Option<ListFree>,
@@ -649,6 +734,8 @@ pub(crate) struct DeleteResolver<'l> {
     taken: HashMap<(SlotKey, u32), usize>,
     /// [`NARROW_SLOT`], or another bound for tests.
     narrow_slot: usize,
+    /// A fixed [`Self::point_bound`] for tests (`Some(0)`: never).
+    point_bound_override: Option<usize>,
 }
 
 impl<'l> DeleteResolver<'l> {
@@ -662,7 +749,92 @@ impl<'l> DeleteResolver<'l> {
             wide_index: HashMap::new(),
             taken: HashMap::new(),
             narrow_slot: NARROW_SLOT,
+            point_bound_override: None,
         }
+    }
+
+    /// For each slot this batch reads (`at`'s `Read` places), the values
+    /// to read it for, or `None` to read the slot (see [`DeleteResolver`]).
+    fn point_values(
+        &self,
+        pending: &[RetractIntent],
+        at: &[SlotAt],
+        slots: &[Slot],
+    ) -> Vec<Option<Vec<FlakeValue>>> {
+        let mut named = vec![0usize; slots.len()];
+        let mut keyable = vec![true; slots.len()];
+        for (intent, place) in pending.iter().zip(at) {
+            if let SlotAt::Read(i) = *place {
+                named[i] += 1;
+                keyable[i] &= !intent.witnessed && point_keyable(&intent.flake);
+            }
+        }
+        // One bound per graph and predicate; slots of one predicate tend to
+        // come in runs, so the previous slot's is checked before hashing.
+        let mut bounds: HashMap<(GraphId, &Sid), usize> = HashMap::new();
+        let mut previous: Option<(GraphId, &Sid, usize)> = None;
+        let mut any = false;
+        let mut values: Vec<Option<Vec<FlakeValue>>> = slots
+            .iter()
+            .zip(named.iter().zip(&keyable))
+            .map(|(slot, (&named, &keyable))| {
+                if !keyable {
+                    return None;
+                }
+                let bound = match previous {
+                    Some((g_id, p, bound)) if g_id == slot.g_id && *p == slot.p => bound,
+                    _ => {
+                        let bound = *bounds
+                            .entry((slot.g_id, &slot.p))
+                            .or_insert_with(|| self.point_bound(slot.g_id, &slot.p));
+                        previous = Some((slot.g_id, &slot.p, bound));
+                        bound
+                    }
+                };
+                any |= named <= bound;
+                (named <= bound).then(Vec::new)
+            })
+            .collect();
+        if !any {
+            return values;
+        }
+        for (intent, place) in pending.iter().zip(at) {
+            if let SlotAt::Read(i) = *place {
+                if let Some(slot_values) = &mut values[i] {
+                    if !slot_values.contains(&intent.flake.o) {
+                        slot_values.push(intent.flake.o.clone());
+                    }
+                }
+            }
+        }
+        values
+    }
+
+    /// How many intents naming one slot of predicate `p` in graph `g_id`
+    /// are read by value rather than as the slot ([`POINT_READ_FACTS`]):
+    /// as many as the slot's expected width pays for, from the index's
+    /// statistics for `p` in the graph (current facts over distinct
+    /// subjects). With no index row of `p` possible, a value read is a
+    /// narrower seek into novelty than the slot's, and one intent takes it.
+    /// With an index but no statistics for `p`, the slot is read.
+    fn point_bound(&self, g_id: GraphId, p: &Sid) -> usize {
+        if let Some(bound) = self.point_bound_override {
+            return bound;
+        }
+        let Some(p_id) = self.current.keys.p_id(p) else {
+            return 1;
+        };
+        let width = self
+            .current
+            .ledger
+            .snapshot
+            .stats
+            .as_ref()
+            .and_then(|stats| stats.graphs.as_ref())
+            .and_then(|graphs| graphs.iter().find(|graph| graph.g_id == g_id))
+            .and_then(|graph| graph.properties.iter().find(|prop| prop.p_id == p_id))
+            .map_or(0, |prop| prop.count / prop.ndv_subjects.max(1));
+        usize::try_from(width / POINT_READ_FACTS).unwrap_or(usize::MAX)
     }
 
     /// Resolve one batch of DELETE intents (see [`DeleteResolver`]).
@@ -739,14 +911,27 @@ impl<'l> DeleteResolver<'l> {
             at.push(place);
             previous = Some((g_id, f, place));
         }
-        stats.slot_reads = to_read.len();
-        let read_facts = self.current.of_slots(&to_read).await?;
+        let values = self.point_values(&pending, &at, &to_read);
+        stats.point_reads = values.iter().filter(|v| v.is_some()).count();
+        stats.slot_reads = to_read.len() - stats.point_reads;
+        if !to_read.is_empty() {
+            stamp_fast_path(
+                DELETE_POINT_READ_SITE,
+                if stats.point_reads > 0 {
+                    FastPathOutcome::Proceed
+                } else {
+                    FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+                },
+            );
+        }
+        let read_facts = self.current.of_slots_or_values(&to_read, &values).await?;
         let mut read: Vec<ReadSlot> = Vec::with_capacity(to_read.len());
         let mut narrow: Vec<(SlotKey, SlotFacts)> = Vec::with_capacity(to_read.len());
-        for (slot, facts) in to_read.into_iter().zip(read_facts) {
+        for ((slot, facts), by_value) in to_read.into_iter().zip(read_facts).zip(&values) {
             let facts = SlotFacts::new(slot.g_id, slot.p.clone(), facts, self.narrow_slot);
             let key = (slot.g_id, slot.s, slot.p);
-            if facts.is_wide() {
+            // Facts read by value are not the slot: they stay with the batch.
+            if by_value.is_none() && facts.is_wide() {
                 let w = self.wide.len();
                 self.wide_index.insert(key.clone(), w);
                 self.wide.push((key, facts));
@@ -1230,8 +1415,16 @@ impl NoveltyPlan {
         plan
     }
 
-    /// Append the novelty ops of `slot` to `out`.
-    fn collect_slot(&self, ledger: &LedgerState, slot: &Slot, to_t: i64, out: &mut Vec<Flake>) {
+    /// Append the novelty ops of `slot` to `out`, or with `o` only those
+    /// whose value is `o`.
+    fn collect_slot(
+        &self,
+        ledger: &LedgerState,
+        slot: &Slot,
+        o: Option<&FlakeValue>,
+        to_t: i64,
+        out: &mut Vec<Flake>,
+    ) {
         if self.empty_graphs.contains(&slot.g_id) {
             return;
         }
@@ -1240,12 +1433,18 @@ impl NoveltyPlan {
                 .walked
                 .get(&(slot.g_id, slot.s.clone(), slot.p.clone()))
             {
-                out.extend(ops.iter().cloned());
+                out.extend(ops.iter().filter(|f| o.is_none_or(|o| f.o == *o)).cloned());
             }
             return;
         }
-        let lo = Flake::min_for_subject_predicate(slot.s.clone(), slot.p.clone());
-        let hi = Flake::max_for_subject_predicate(slot.s.clone(), slot.p.clone());
+        let mut lo = Flake::min_for_subject_predicate(slot.s.clone(), slot.p.clone());
+        let mut hi = Flake::max_for_subject_predicate(slot.s.clone(), slot.p.clone());
+        // SPOT orders a value's ops by datatype, `t`, op and meta after the
+        // value, so bounds that fix it hold every one of them.
+        if let Some(o) = o {
+            lo.o = o.clone();
+            hi.o = o.clone();
+        }
         ledger.novelty.for_each_overlay_flake(
             slot.g_id,
             IndexType::Spot,
@@ -1261,6 +1460,7 @@ impl NoveltyPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::flakes::DT_ID;
     use fluree_db_core::{FlakeMeta, FlakeValue, LedgerSnapshot};
     use fluree_db_novelty::Novelty;
 
@@ -1833,5 +2033,207 @@ mod tests {
             }
             assert_eq!(answers[0], answers[1], "{:?}", term_of(f));
         }
+    }
+
+    // =========================================================================
+    // Value reads
+    // =========================================================================
+
+    /// Every way a slot of strings and references can be stored in novelty:
+    /// a value with a tag and with another datatype beside the plain one, a
+    /// value at two list positions and plain, one retracted, one retracted
+    /// and asserted again, an IRI and a blank-node reference; and a value of
+    /// the same name in a named graph. With `filler`, novelty also holds
+    /// facts of another subject, enough that a slot is read by a seek into
+    /// novelty rather than one walk over it ([`NoveltyPlan`]).
+    fn value_read_ledger(g1: &Sid, filler: bool) -> LedgerState {
+        let reverse: HashMap<Sid, GraphId> = [(g1.clone(), 3)].into_iter().collect();
+        let typed = |o: &str, t: i64, op: bool| {
+            Flake::new(
+                sid("a"),
+                sid("p"),
+                FlakeValue::String(o.to_string()),
+                sid("myType"),
+                t,
+                op,
+                None,
+            )
+        };
+        let reference = |o: Sid, t: i64, op: bool| {
+            Flake::new(
+                sid("a"),
+                sid("p"),
+                FlakeValue::Ref(o),
+                DT_ID.clone(),
+                t,
+                op,
+                None,
+            )
+        };
+        let bnode = Sid::new(fluree_vocab::namespaces::BLANK_NODE, "fdb-b1");
+        ledger(
+            vec![
+                vec![
+                    flake("a", "p", "x", 1, true, None),
+                    flake("a", "p", "x", 1, true, Some(FlakeMeta::with_lang("en"))),
+                    typed("x", 1, true),
+                    flake("a", "p", "y", 1, true, Some(FlakeMeta::with_index(0))),
+                    flake("a", "p", "y", 1, true, Some(FlakeMeta::with_index(2))),
+                    flake("a", "p", "y", 1, true, None),
+                    flake("a", "p", "z", 1, true, None),
+                    flake("a", "p", "w", 1, true, None),
+                    reference(sid("r"), 1, true),
+                    reference(bnode.clone(), 1, true),
+                    in_graph(flake("a", "p", "x", 1, true, None), g1),
+                ],
+                vec![
+                    flake("a", "p", "z", 2, false, None),
+                    flake("a", "p", "w", 2, false, None),
+                ],
+                vec![flake("a", "p", "w", 3, true, None)],
+                (0..if filler { 200 } else { 0 })
+                    .map(|i| flake("b", "q", &format!("f{i}"), 4, true, None))
+                    .collect(),
+            ],
+            &reverse,
+        )
+    }
+
+    /// Intents naming the [`value_read_ledger`] slot, keyable and not.
+    fn value_read_intents(g1: &Sid) -> Vec<RetractIntent> {
+        let named = |o: FlakeValue, dt: Sid, m: Option<FlakeMeta>| {
+            RetractIntent::new(Flake::new(sid("a"), sid("p"), o, dt, 9, false, m), false)
+        };
+        let s = |o: &str| FlakeValue::String(o.to_string());
+        vec![
+            intent("p", "x", false, None),
+            intent("p", "x", false, Some(FlakeMeta::with_lang("EN"))),
+            named(s("x"), sid("myType"), None),
+            intent("p", "y", false, None),
+            intent("p", "y", false, Some(FlakeMeta::with_index(2))),
+            intent("p", "y", false, Some(FlakeMeta::with_index(1))),
+            intent("p", "z", false, None),
+            intent("p", "w", false, None),
+            intent("p", "absent", false, None),
+            named(FlakeValue::Ref(sid("r")), DT_ID.clone(), None),
+            named(
+                FlakeValue::Ref(Sid::new(fluree_vocab::namespaces::BLANK_NODE, "fdb-b1")),
+                DT_ID.clone(),
+                None,
+            ),
+            named(FlakeValue::Ref(sid("other")), DT_ID.clone(), None),
+            RetractIntent::new(in_graph(flake("a", "p", "x", 9, false, None), g1), false),
+        ]
+    }
+
+    /// Resolve `batches` with value reads bounded by `point_max` (`Some(0)`:
+    /// none; `None`: the resolver's own bound),
+    /// returning each retraction and unmatched intent in full (`Flake`'s
+    /// equality ignores `g` and `t`), and how many slots were read by value.
+    async fn resolve_reading_values(
+        ledger: &LedgerState,
+        batches: &[Vec<RetractIntent>],
+        point_max: Option<usize>,
+        narrow_slot: usize,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        let routing: HashMap<Sid, GraphId> = [(sid("g1"), 3)].into_iter().collect();
+        let mut resolver = DeleteResolver::new(ledger, ListFree::check(ledger));
+        resolver.point_bound_override = point_max;
+        resolver.narrow_slot = narrow_slot;
+        let (mut out, mut unmatched, mut point_reads) = (Vec::new(), Vec::new(), 0);
+        for batch in batches {
+            let graph_of = |f: &Flake| Ok(f.g.as_ref().map_or(0, |g| routing[g]));
+            let (retractions, stats) = resolver
+                .resolve(batch.clone(), graph_of, Some(&mut unmatched))
+                .await
+                .expect("resolve");
+            point_reads += stats.point_reads;
+            out.extend(retractions.iter().map(|r| format!("{:?}", r.flake())));
+        }
+        let unmatched = unmatched.iter().map(|f| format!("{f:?}")).collect();
+        (out, unmatched, point_reads)
+    }
+
+    /// Reading a slot for the values its intents name answers every intent
+    /// as reading the slot does, whatever the batches: one intent each, a
+    /// few, all at once (past the bound, so the slot is read), and with the
+    /// slot held as wide by an earlier batch.
+    #[tokio::test]
+    async fn value_reads_answer_as_slot_reads_do() {
+        let g1 = sid("g1");
+        for filler in [false, true] {
+            value_reads_answer_alike(&value_read_ledger(&g1, filler), &g1).await;
+        }
+    }
+
+    async fn value_reads_answer_alike(ledger: &LedgerState, g1: &Sid) {
+        let intents = value_read_intents(g1);
+        let mut groupings: Vec<(&str, Vec<Vec<RetractIntent>>)> = vec![
+            (
+                "one each",
+                intents.iter().map(|i| vec![i.clone()]).collect(),
+            ),
+            ("pairs", intents.chunks(2).map(<[_]>::to_vec).collect()),
+            ("all at once", vec![intents.clone()]),
+        ];
+        let mut wide_first = vec![intents.clone()];
+        wide_first.extend(intents.iter().map(|i| vec![i.clone()]));
+        groupings.push(("slot held as wide", wide_first));
+        for (what, batches) in groupings {
+            for narrow_slot in [NARROW_SLOT, 1] {
+                let scanned = resolve_reading_values(ledger, &batches, Some(0), narrow_slot).await;
+                let by_value =
+                    resolve_reading_values(ledger, &batches, Some(usize::MAX), narrow_slot).await;
+                let bounded = resolve_reading_values(ledger, &batches, None, narrow_slot).await;
+                assert_eq!(scanned.2, 0, "{what}");
+                assert_eq!(
+                    (&scanned.0, &scanned.1),
+                    (&by_value.0, &by_value.1),
+                    "{what}"
+                );
+                assert_eq!((&scanned.0, &scanned.1), (&bounded.0, &bounded.1), "{what}");
+                if what == "one each" || what == "pairs" {
+                    assert!(by_value.2 > 0, "{what}: some slot is read by value");
+                }
+            }
+        }
+    }
+
+    /// Facts read by value are not the slot: a later batch naming another
+    /// value of the slot still finds it, even when the values read were
+    /// more than a narrow slot holds.
+    #[tokio::test]
+    async fn facts_read_by_value_are_not_kept_as_the_slot() {
+        let g1 = sid("g1");
+        let ledger = value_read_ledger(&g1, false);
+        let batches = vec![
+            vec![intent("p", "y", false, None)],
+            vec![intent("p", "x", false, None)],
+        ];
+        let (out, unmatched, point_reads) =
+            resolve_reading_values(&ledger, &batches, Some(usize::MAX), 1).await;
+        assert_eq!(point_reads, 2);
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        assert_eq!(out.len(), 2, "{out:?}");
+    }
+
+    /// Witnessed rows read their slot even when one row names it: the k-th
+    /// identical row is counted against the slot's facts, and a batch that
+    /// read only the row's value would count against other indices than a
+    /// later batch that reads the slot.
+    #[tokio::test]
+    async fn witnessed_rows_read_their_slot_even_alone() {
+        let at_ = |o: &str, i: i32| flake("a", "p", o, 1, true, Some(FlakeMeta::with_index(i)));
+        let ledger = ledger(
+            vec![vec![at_("a", 0), at_("v", 1), at_("v", 2)]],
+            &HashMap::new(),
+        );
+        let batches = vec![
+            vec![intent("p", "v", true, None)],
+            vec![intent("p", "v", true, None), intent("p", "a", true, None)],
+        ];
+        let mut out = resolve_batches(&ledger, batches, NARROW_SLOT).await;
+        out.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+        assert_eq!(out, vec![at("a", 0), at("v", 1), at("v", 2)]);
     }
 }
