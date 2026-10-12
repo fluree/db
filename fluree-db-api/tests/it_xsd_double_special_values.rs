@@ -1495,6 +1495,86 @@ async fn values_a_previous_bulk_import_stored_as_text_read_as_before() {
     );
 }
 
+/// Export writes every special value, from novelty, from novelty over an
+/// index and from the index, as the datatype's lexical form: N-Triples
+/// `"INF"^^xsd:double`, and JSON-LD `{"@value": "INF", "@type": xsd:double}`.
+#[tokio::test]
+async fn export_writes_the_special_values() {
+    use fluree_db_api::export::ExportFormat;
+    let double = format!("^^<{XSD}double>");
+    let mut expected: Vec<String> = [
+        ("neg", "-1.5E0"),
+        ("zero", "0.0E0"),
+        ("pos", "2.5E0"),
+        ("ninf", "-INF"),
+        ("inf", "INF"),
+        ("nan", "NaN"),
+        ("nan2", "NaN"),
+    ]
+    .iter()
+    .map(|(s, v)| format!("<{EX}{s}> <{EX}v> \"{v}\"{double} ."))
+    .collect();
+    expected.sort_unstable();
+
+    let check = |fluree: Fluree, ledger_id: &'static str, lane: &'static str| {
+        let expected = expected.clone();
+        async move {
+            let mut nt = Vec::new();
+            fluree
+                .export(ledger_id)
+                .format(ExportFormat::NTriples)
+                .write_to(&mut nt)
+                .await
+                .expect("N-Triples export");
+            let nt = String::from_utf8(nt).unwrap();
+            let mut lines: Vec<&str> = nt
+                .lines()
+                .filter(|l| l.contains(&format!("<{EX}v>")))
+                .collect();
+            lines.sort_unstable();
+            assert_eq!(lines, expected, "{lane}: N-Triples");
+
+            let mut jsonld = Vec::new();
+            fluree
+                .export(ledger_id)
+                .format(ExportFormat::JsonLd)
+                .write_to(&mut jsonld)
+                .await
+                .expect("JSON-LD export");
+            let text = serde_json::from_slice::<Value>(&jsonld)
+                .expect("valid JSON-LD")
+                .to_string();
+            for special in ["\"INF\"", "\"-INF\""] {
+                assert!(
+                    text.contains(special),
+                    "{lane}: JSON-LD lacks {special}: {text}"
+                );
+            }
+            assert_eq!(
+                text.matches("\"NaN\"").count(),
+                2,
+                "{lane}: both NaNs: {text}"
+            );
+        }
+    };
+
+    let fluree = memory_fluree();
+    let novelty = "special-doubles:export-novelty";
+    fluree.create_ledger(novelty).await.expect("create");
+    write_finite(&fluree, novelty).await;
+    write_special(&fluree, novelty, false).await;
+    check(fluree.clone(), novelty, "novelty").await;
+
+    let indexed = "special-doubles:export-indexed";
+    fluree.create_ledger(indexed).await.expect("create");
+    write_finite(&fluree, indexed).await;
+    reindexed(&fluree, indexed).await;
+    write_special(&fluree, indexed, false).await;
+    check(fluree.clone(), indexed, "novelty over an index").await;
+    reindexed(&fluree, indexed).await;
+    check(fluree, indexed, "index").await;
+}
+
 /// An `xsd:float` literal keeps its double value when stored, so a numeral
 /// beyond the float range but within the double range is not `INF`; the
 /// cast to `xsd:float` gives `INF` for the same numeral.
