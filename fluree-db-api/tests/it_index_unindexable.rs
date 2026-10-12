@@ -35,11 +35,16 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     }
 }
 
-/// Index the fixture with the background indexer under `config`, and return
-/// the build's outcome with the ledger's index status after it.
+/// Index the fixture with the background indexer under `config`, then write
+/// with no room left in novelty. Returns the build's outcome, the ledger's
+/// index status after it, and the write's refusal.
 async fn index_the_fixture(
     config: IndexerConfig,
-) -> (IndexOutcome, fluree_db_api::IndexStatusResult) {
+) -> (
+    IndexOutcome,
+    fluree_db_api::IndexStatusResult,
+    fluree_db_api::ApiError,
+) {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/vector-lengths-4.2.3/storage");
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -67,7 +72,22 @@ async fn index_the_fixture(
                     .await
                     .expect("the build reports an outcome instead of retrying");
             let status = fluree.index_status(LEDGER).await.expect("status");
-            (outcome, status)
+            let full = fluree_db_api::IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 1,
+            };
+            let data =
+                serde_json::json!({"@id": "http://example.org/c", "http://example.org/name": "c"});
+            let ledger = fluree.ledger_cached(LEDGER).await.expect("handle");
+            let refused = fluree
+                .stage(&ledger)
+                .insert(&data)
+                .index_config(full)
+                .execute()
+                .await
+                .map(|_| ())
+                .expect_err("novelty is past its maximum");
+            (outcome, status, refused)
         })
         .await
 }
@@ -90,9 +110,24 @@ fn assert_halted(outcome: &IndexOutcome, status: &fluree_db_api::IndexStatusResu
 #[tokio::test(flavor = "current_thread")]
 async fn an_incremental_build_halts_without_falling_back() {
     let (spans, _guard) = span_capture::init_test_tracing();
-    let (outcome, status) = index_the_fixture(IndexerConfig::small()).await;
+    let (outcome, status, refused) = index_the_fixture(IndexerConfig::small()).await;
     assert_halted(&outcome, &status);
     assert!(spans.has_event(INCREMENTAL), "the incremental path ran");
+    // A write refused for want of room in novelty is logged with the halt.
+    assert!(
+        matches!(
+            refused,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::NoveltyAtMax)
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        spans.has_event(
+            "novelty at max: writes are refused because indexing of this ledger is halted on \
+             committed data it cannot index"
+        ),
+        "the refusal names the halt"
+    );
     assert!(
         !spans.has_event(REBUILD),
         "a build that fails on the data does not fall back to a full rebuild"
@@ -106,7 +141,7 @@ async fn a_full_rebuild_halts() {
         incremental_enabled: false,
         ..IndexerConfig::small()
     };
-    let (outcome, status) = index_the_fixture(config).await;
+    let (outcome, status, _) = index_the_fixture(config).await;
     assert_halted(&outcome, &status);
     assert!(spans.has_event(REBUILD), "the full rebuild path ran");
     assert!(!spans.has_event(INCREMENTAL));

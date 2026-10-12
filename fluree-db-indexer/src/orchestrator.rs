@@ -166,9 +166,15 @@ pub struct IndexStatusSnapshot {
     /// `last_error` says why. The same build would stop the same way, so no
     /// implicit trigger (a commit, a push, a published commit, a catch-up
     /// sweep) starts one. An explicit request
-    /// ([`IndexerHandle::trigger_explicit`]), a reindex that succeeds, a newer
-    /// index that any process publishes for the ledger, dropping the ledger
-    /// ([`IndexerHandle::cancel`]), or a restart clears it.
+    /// ([`IndexerHandle::trigger_explicit`]), a reindex that succeeds,
+    /// dropping the ledger through this worker ([`IndexerHandle::cancel`]),
+    /// or a restart clears it. So does a newer index that any process
+    /// publishes for the ledger, once the periodic re-sweep sees it: that
+    /// needs catch-up sweeps (`IndexerConfig::catchup_sweeps_enabled` and a
+    /// non-zero `catchup_interval`), which a worker whose sweeps another
+    /// worker in the process owns does not run. A drop by another process is
+    /// seen the same way, once the re-created ledger's index passes the
+    /// halted one.
     pub halted: bool,
 }
 
@@ -238,8 +244,8 @@ struct LedgerIndexState {
     next_retry_at: Option<tokio::time::Instant>,
     /// `Some(index_t)`: halted (see [`IndexStatusSnapshot::halted`]), with
     /// the nameservice `index_t` the failed build started from. A newer index
-    /// published by any process lifts the halt
-    /// ([`TriggerHandle::clear_superseded_halts`]).
+    /// published by any process lifts the halt when the catch-up re-sweep
+    /// sees it ([`TriggerHandle::clear_superseded_halts`]).
     halted: Option<i64>,
 }
 
@@ -1225,7 +1231,8 @@ impl TriggerHandle {
     /// Lift the halt of every ledger whose nameservice `index_t` has moved
     /// past the one its failed build started from: another process indexed
     /// it, so the content this worker could not index is no longer in its way.
-    /// The periodic re-sweep calls this with the records it lists.
+    /// The periodic re-sweep calls this with the records it lists, so a
+    /// worker that runs no catch-up sweeps does not.
     async fn clear_superseded_halts(&self, records: &[NsRecord]) {
         let mut states = self.states.lock().await;
         for record in records.iter().filter(|r| !r.retracted) {
@@ -2530,11 +2537,14 @@ impl BackgroundIndexerWorker {
             return;
         }
         if !error.is_retryable() {
-            warn!(
+            // The one signal an operator gets before novelty fills and writes
+            // are refused, so it is an error, not a warning.
+            error!(
                 ledger_id = %ledger_id,
                 partial_fuel = ?partial_fuel,
                 error = %error,
-                "Committed data cannot be indexed; ledger halted until an explicit index request"
+                "Committed data cannot be indexed; indexing of this ledger is halted until an \
+                 explicit index request, a reindex that succeeds, or a restart"
             );
             self.halt(ledger_id, &error.to_string()).await;
             return;
