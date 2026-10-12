@@ -2324,6 +2324,229 @@ async fn geo_search_over_a_default_graph_of_none() {
     failures.assert_none();
 }
 
+/// Cypher over a ledger whose default graph is the union of its graphs (the
+/// ledger's `f:unionDefaultGraph` setting). The count, the cycle and the
+/// grouped count reach the same single-graph lanes the SPARQL tests pin; over
+/// the union they must stand down and read every graph. A ledger holding the
+/// same facts in its default graph alone is the oracle, and shows each lane
+/// runs there.
+#[tokio::test(flavor = "current_thread")]
+async fn cypher_lanes_over_the_union_default_graph() {
+    let union_id = "it/cypher-lanes-union:main";
+    let facts = |dflt: &str, g2: &str, g3: &str| {
+        format!(
+            "@prefix ex: <http://example.org/> .\n\
+             @prefix f: <https://ns.flur.ee/db#> .\n\
+             {dflt}\n\
+             GRAPH <urn:g2> {{ {g2} }}\n\
+             GRAPH <urn:g3> {{ {g3} }}\n"
+        )
+    };
+    let d = "ex:p1 a ex:Person ; ex:knows ex:p2 ; ex:dept ex:Sales .";
+    let g2 = "ex:p2 a ex:Person ; ex:knows ex:p3 ; ex:dept ex:Ops . ex:p5 ex:dept ex:Sales .";
+    let g3 = "ex:p3 a ex:Person ; ex:knows ex:p1 ; ex:dept ex:Sales . ex:p4 a ex:Person .";
+    let config = format!(
+        "GRAPH <urn:fluree:{union_id}#config> {{ \
+         <urn:config:main> a f:LedgerConfig ; f:queryDefaults <urn:config:query> . \
+         <urn:config:query> f:unionDefaultGraph true . }}"
+    );
+    let (fluree, union) = indexed_trig_ledger(union_id, &(facts(d, g2, g3) + &config)).await;
+    // The oracle, on the same Fluree: every fact in the default graph.
+    let merged_id = "it/cypher-lanes-merged:main";
+    let merged_trig = format!("@prefix ex: <http://example.org/> .\n{d}\n{g2}\n{g3}\n");
+    fluree
+        .create_ledger(merged_id)
+        .await
+        .expect("create merged");
+    let merged = fluree.ledger_cached(merged_id).await.expect("cache merged");
+    fluree
+        .stage(&merged)
+        .upsert_turtle(&merged_trig)
+        .execute()
+        .await
+        .expect("seed merged");
+    rebuild_and_publish_index(&fluree, merged_id).await;
+    fluree.disconnect_ledger(merged_id).await;
+    let merged = fluree
+        .ledger_cached(merged_id)
+        .await
+        .expect("reload merged");
+
+    let person = "`http://example.org/Person`";
+    let knows = "`http://example.org/knows`";
+    let dept = "`http://example.org/dept`";
+    // (label, Cypher, the lane's routing site, the answer)
+    let cases: Vec<(&str, String, &str, Rows)> = vec![
+        (
+            "count of a label",
+            format!("MATCH (n:{person}) RETURN count(n) AS c"),
+            "whole-graph scalar aggregates",
+            rows(&[&["4"]]),
+        ),
+        (
+            "a triangle",
+            format!("MATCH (a)-[:{knows}]->(b)-[:{knows}]->(c)-[:{knows}]->(a) RETURN a, b, c"),
+            "cyclic_bgp",
+            rows(&[
+                &["p1", "p2", "p3"],
+                &["p2", "p3", "p1"],
+                &["p3", "p1", "p2"],
+            ]),
+        ),
+        (
+            "a count per related node",
+            format!("MATCH (n)-[:{dept}]->(d) RETURN d, count(n) AS c"),
+            "partitioned_group_by",
+            rows(&[&["Ops", "1"], &["Sales", "3"]]),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, cypher, site, want) in cases {
+        for (scope, handle, must_fire) in [("union", &union, false), ("merged", &merged, true)] {
+            let (store, _guard) = init_test_tracing();
+            let before = store.all_events().len();
+            let db = db(handle).await;
+            let label = format!("{scope}: {label}");
+            match fluree.query_cypher(&db, &cypher).await {
+                Ok(result) => match result.to_jsonld_async(db.as_graph_db_ref()).await {
+                    Ok(json) => failures.eq(jsonld_rows(&json), want.clone(), &label),
+                    Err(e) => failures.0.push(format!("{label}: format failed: {e}")),
+                },
+                Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+            }
+            // The kill switch keeps the whole-graph aggregates out of the plan;
+            // under it only the answers are checked.
+            if fluree_db_api::fast_paths_disabled() {
+                continue;
+            }
+            let fired = stamps(&store, before, site).iter().any(|o| o == "proceed");
+            failures.eq(fired, must_fire, &format!("{label}: `{site}` ran"));
+        }
+    }
+    failures.assert_none();
+}
+
+// ---------------------------------------------------------------------------
+// A default graph spanning two ledgers.
+//
+// Its members read each ledger's own index through the range scan (binding
+// provenance needs decoded terms), and ledgers code namespaces independently:
+// here `ex:` has a different namespace code in each, because ledger A meets
+// another namespace first.
+
+const LEDGER_A: &str = "it/two-ledgers-a:main";
+const LEDGER_B: &str = "it/two-ledgers-b:main";
+
+/// Ledgers A and B, both indexed. Labels: a and b "chat"@fr, c "chat"@en.
+/// Codes: a and b "A1"^^ex:Code, c "A1" (a plain string). Amounts: a and b
+/// 1.5, a2 and c 2.5, so each ledger's sorted run holds both values. Places:
+/// Paris in A, London in B.
+async fn two_ledgers() -> Fluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = |ledger_id: &'static str, ttl: &'static str| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+            fluree
+                .stage(&handle)
+                .upsert_turtle(ttl)
+                .execute()
+                .await
+                .expect("seed");
+            rebuild_and_publish_index(fluree, ledger_id).await;
+            fluree.disconnect_ledger(ledger_id).await;
+            let view = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("reload")
+                .snapshot()
+                .await;
+            assert!(view.binary_store.is_some(), "{ledger_id}: indexed");
+        }
+    };
+    seed(
+        LEDGER_A,
+        r#"
+        @prefix other: <http://other.example/> .
+        @prefix ex: <http://example.org/> .
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        other:x other:p "first" .
+        ex:a ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
+             ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+        ex:a2 ex:amount 2.5 .
+    "#,
+    )
+    .await;
+    seed(
+        LEDGER_B,
+        r#"
+        @prefix ex: <http://example.org/> .
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        ex:b ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
+             ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral .
+        ex:c ex:label "chat"@en ; ex:code "A1" ; ex:amount 2.5 .
+    "#,
+    )
+    .await;
+    fluree
+}
+
+/// A SPARQL query through the connection (so `FROM` can name ledgers), its
+/// rows as [`jsonld_rows`] gives them.
+async fn connection_sparql_rows(fluree: &Fluree, query: &str) -> Result<Rows, String> {
+    let result = fluree
+        .query_connection_sparql(query)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ledger = fluree.ledger(LEDGER_A).await.expect("ledger A");
+    let json = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(jsonld_rows(&json))
+}
+
+/// The partitioned GROUP BY and the geo index search over a default graph of
+/// two ledgers: both read one graph's index, so both stand down and every
+/// member answers.
+#[tokio::test(flavor = "current_thread")]
+async fn lanes_over_a_default_graph_of_two_ledgers() {
+    let fluree = two_ledgers().await;
+    let both = format!("FROM <{LEDGER_A}> FROM <{LEDGER_B}>");
+    let cases = [
+        (
+            "GROUP BY over one predicate",
+            format!(
+                "{PREFIXES}SELECT ?v (COUNT(*) AS ?k) {both} WHERE {{ ?s ex:amount ?v }} GROUP BY ?v"
+            ),
+            rows(&[&["1.5", "2"], &["2.5", "2"]]),
+        ),
+        (
+            "a geof:distance filter",
+            format!(
+                "{PREFIXES}PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+                 PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+                 SELECT ?s {both} WHERE {{ ?s ex:location ?loc \
+                 BIND(geof:distance(?loc, \"POINT(2.3522 48.8566)\"^^geo:wktLiteral) AS ?d) \
+                 FILTER(?d <= 500000) }}"
+            ),
+            rows(&[&["a"], &["b"]]),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, query, want) in cases {
+        match connection_sparql_rows(&fluree, &query).await {
+            Ok(got) => failures.eq(got, want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //
