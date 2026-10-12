@@ -1,6 +1,6 @@
 # Upsert
 
-Upsert operations **replace the values of the predicates you supply** for an entity (matched by `@id`). Repeating an upsert is idempotent, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
+Upsert operations **replace the values of the predicates you supply** for an entity (matched by `@id`). Repeating an upsert is idempotent (see [Idempotency](#idempotency) for one exception before a ledger's first index build).
 
 ## What is Upsert?
 
@@ -8,7 +8,7 @@ Upsert operations **replace the values of the predicates you supply** for an ent
 - If the entity exists: for each predicate present in your payload, retract existing values for that predicate and assert the new value(s)
 - If the entity doesn’t exist: create it with the supplied triples
 
-This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
+This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates (see [Idempotency](#idempotency) for one exception before a ledger's first index build).
 
 ## HTTP Endpoint
 
@@ -176,15 +176,20 @@ Result: nothing is committed. Each value's retraction and re-assertion cancel,
 so the transaction stages no flakes and the ledger stays at t=1. This holds
 for language-tagged values, lists, and the payload's blank nodes too.
 
-This makes upserts safe to retry, with one exception. A value stored with
-less detail than it was written is not re-upserted as a no-op: an integer too
-large for 64 bits written with an XSD subtype such as `xsd:nonNegativeInteger`
-(the index keeps no subtype), or a `dateTime` or `time` with digits past the
-microsecond (storage keeps six). Re-upserting such a value as written commits
-a retraction and an assertion of the same stored fact, and the value can be
-lost. Write these values at the precision they are stored with: `xsd:integer`
-for big integers, and at most six fractional digits for temporals. Graph sync
-behaves the same way.
+This makes upserts safe to retry, including for a value stored with less
+detail than it was written: an integer too large for 64 bits written with an
+XSD subtype such as `xsd:nonNegativeInteger` (the index keeps no subtype), or a
+`dateTime` or `time` with digits past the microsecond (storage keeps six). The
+upsert retracts such a value as stored and asserts it as written, and storage
+holds the two as one fact, so they cancel as an unchanged value does. Graph
+sync behaves the same way.
+
+One exception remains until a ledger's first index build. A `dateTime` or
+`time` written with digits past the microsecond is held as written only by the
+process that wrote it, and with six digits once the ledger is reloaded, as
+after a restart. Re-upserting it as written then commits a retraction and an
+assertion of it, and queries read it as gone until the ledger is next
+indexed. Writing temporals to at most six fractional digits avoids it.
 
 ## Comparison: Insert vs Update vs Upsert
 
@@ -233,7 +238,7 @@ POST /upsert?ledger=mydb:main
 **Behavior:**
 - Replaces values **for the predicates you supply** (per subject)
 - Leaves other predicates unchanged
-- Retry-safe/idempotent for the supplied predicates, except for values stored with less detail than they were written (see [Idempotency](#idempotency))
+- Retry-safe/idempotent for the supplied predicates (see [Idempotency](#idempotency) for one exception before a ledger's first index build)
 
 ## Use Cases
 

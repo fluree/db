@@ -22,7 +22,7 @@ Adding new data to the database:
 
 ### [Upsert](upsert.md)
 
-Transactions that replace values for supplied predicates, idempotent except for values stored with less detail than they were written:
+Transactions that replace values for supplied predicates, idempotent (with one exception before a ledger's first index build):
 - Upsert semantics
 - Use cases for upsert
 - Idempotent operations
