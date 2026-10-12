@@ -262,6 +262,12 @@ fn parse_located(
                             iri
                         }
                     };
+                    // `urn:default` names the default graph, which is no named
+                    // graph: a block by that name is refused on every lane, as
+                    // staging refuses any write graph by that name.
+                    if &*iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+                        return Err(TransactError::DefaultGraphNameAsGraph);
+                    }
                     if &*iri == TXN_META_GRAPH_IRI {
                         cap.sink.set_scope(Scope::TxnMeta);
                     } else {

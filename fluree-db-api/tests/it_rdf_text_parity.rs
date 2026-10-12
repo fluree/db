@@ -1116,3 +1116,92 @@ async fn refusals_inside_a_block_are_the_user_s_errors() {
         "{err:?}"
     );
 }
+
+// =============================================================================
+// `urn:default` on the RDF text lanes
+// =============================================================================
+
+/// `urn:default` names the default graph, so a write that names a graph by
+/// it is refused (`it_default_graph_name`). The RDF text lanes reach that
+/// refusal with block labels as written: a TriG insert, a sync payload, a
+/// sync target, and a Graph Store insert. Each is refused and leaves the
+/// ledger as it was.
+#[tokio::test]
+async fn a_refused_urn_default_block_leaves_the_ledger_as_it_was() {
+    const REFUSAL: &str = "<urn:default> names the default graph";
+    let fluree = memory();
+    let id = "it/rdf-urn-default:main";
+    let seed = fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, id),
+            "@prefix ex: <http://example.org/> .\nex:a ex:v \"default\" .\n",
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let block = "@prefix ex: <http://example.org/> .\n\
+                 GRAPH <urn:default> { ex:z ex:v \"zed\" . }\n";
+    let turtle = "@prefix ex: <http://example.org/> .\nex:z ex:v \"zed\" .\n";
+    let g = || GraphSel::Graph("http://example.org/g".to_string());
+    let attempts = [
+        (
+            "TriG insert",
+            fluree
+                .stage_owned(seed.clone())
+                .insert_turtle(block)
+                .execute()
+                .await,
+        ),
+        (
+            "sync payload block",
+            fluree
+                .stage_owned(seed.clone())
+                .sync_graph_payload(g(), GraphPayload::Rdf(block), false)
+                .execute()
+                .await,
+        ),
+        (
+            "sync target",
+            fluree
+                .stage_owned(seed.clone())
+                .sync_graph_payload(
+                    GraphSel::Graph("urn:default".to_string()),
+                    GraphPayload::Rdf(turtle),
+                    false,
+                )
+                .execute()
+                .await,
+        ),
+        (
+            "Graph Store insert block",
+            fluree
+                .stage_owned(seed.clone())
+                .insert_graph_payload(GraphSel::Default, GraphPayload::Rdf(block))
+                .execute()
+                .await,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (lane, result) in attempts {
+        match result {
+            Ok(r) => failures.push(format!("{lane}: committed at t={}", r.receipt.t)),
+            Err(e) if !e.to_string().contains(REFUSAL) => failures.push(format!("{lane}: {e}")),
+            Err(_) => {}
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    let now = fluree.ledger(id).await.expect("reload");
+    assert_eq!(now.t(), seed.t(), "nothing committed");
+    assert_eq!(
+        facts(&now, None).await,
+        facts(&seed, None).await,
+        "the default graph is as it was"
+    );
+    assert!(
+        now.snapshot
+            .graph_registry
+            .graph_id_for_iri("urn:default")
+            .is_none(),
+        "no graph is registered as urn:default"
+    );
+}
