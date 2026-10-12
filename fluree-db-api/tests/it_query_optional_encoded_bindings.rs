@@ -2547,6 +2547,80 @@ async fn lanes_over_a_default_graph_of_two_ledgers() {
     failures.assert_none();
 }
 
+/// A `geof:distance` filter over a dataset that spans ledgers through
+/// `FROM NAMED`: its default graph is one graph, ledger A, but a dataset
+/// spanning ledgers reads every graph through the range scan, with no binary
+/// index attached. The geo index search needs that index and has no fallback,
+/// so the planner keeps the patterns, at top level and inside `GRAPH <B>`.
+#[tokio::test(flavor = "current_thread")]
+async fn geo_filter_over_a_dataset_spanning_ledgers_through_from_named() {
+    let fluree = two_ledgers().await;
+    let ds = format!("FROM <{LEDGER_A}> FROM NAMED <{LEDGER_B}>");
+    let near = |graph: bool| {
+        let pattern = "?s ex:location ?loc \
+                       BIND(geof:distance(?loc, \"POINT(2.3522 48.8566)\"^^geo:wktLiteral) AS ?d) \
+                       FILTER(?d <= 500000)";
+        let body = if graph {
+            format!("GRAPH <{LEDGER_B}> {{ {pattern} }}")
+        } else {
+            pattern.to_string()
+        };
+        format!(
+            "{PREFIXES}PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?s {ds} WHERE {{ {body} }}"
+        )
+    };
+    let mut failures = Failures::default();
+    for (label, query, want) in [
+        ("top level: ledger A's place", near(false), rows(&[&["a"]])),
+        ("GRAPH <B>: ledger B's place", near(true), rows(&[&["b"]])),
+    ] {
+        match connection_sparql_rows(&fluree, &query).await {
+            Ok(got) => failures.eq(got, want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+    let jsonld = |graph: bool| {
+        let pattern = json!([
+            {"@id": "?s", "ex:location": "?loc"},
+            ["bind", "?d", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
+            ["filter", "(<= ?d 500000)"]
+        ]);
+        let where_ = if graph {
+            // ["graph", name, pattern1, pattern2, ...]
+            let mut clause = vec![json!("graph"), json!(LEDGER_B)];
+            clause.extend(pattern.as_array().expect("patterns").iter().cloned());
+            json!([clause])
+        } else {
+            pattern
+        };
+        json!({
+            "@context": {"ex": EX},
+            "from": LEDGER_A,
+            "fromNamed": [LEDGER_B],
+            "select": ["?s"],
+            "where": where_
+        })
+    };
+    for (label, query, want) in [
+        ("JSON-LD top level", jsonld(false), rows(&[&["a"]])),
+        ("JSON-LD graph B", jsonld(true), rows(&[&["b"]])),
+    ] {
+        match fluree.query_connection(&query).await {
+            Ok(result) => {
+                let ledger = fluree.ledger(LEDGER_A).await.expect("ledger A");
+                match result.to_jsonld_async(ledger.as_graph_db_ref(0)).await {
+                    Ok(json) => failures.eq(jsonld_rows(&json), want, label),
+                    Err(e) => failures.0.push(format!("{label}: format failed: {e}")),
+                }
+            }
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //

@@ -436,22 +436,23 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            // The GeoSearch operator reads one graph's binary index, so without
-            // one covering `to_t` (a ledger not yet indexed, a time before the
-            // index's base) the patterns stay as written and evaluate as such.
-            // The operator reads the store its execution context takes from
-            // the snapshot, which a caller need not have passed in here,
-            // unless execution runs with none (a multi-ledger dataset). It
-            // reads `binary_g_id`'s index, so a default graph of none or of
-            // several keeps the patterns too, evaluated over every member.
-            // `planning.one_graph` and the refusal in `GeoSearchOperator::open`
-            // are one definition (`ActiveGraph::reads_one_graph`).
-            let geo_index_covers = planning.one_graph
-                && binary_scans
-                && binary_store
-                    .cloned()
-                    .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
-                    .is_some_and(|store| db.t >= store.base_t());
+            // The GeoSearch operator reads one graph's binary index and has no
+            // fallback, so the patterns stay as written, evaluated as such,
+            // unless the scope reads exactly one graph through a binary index
+            // the operators will get (`planning.reads_one_graph_index`: one
+            // graph, a dataset that does not span ledgers, and a store with
+            // binary scans on; the definition the operator's refusal,
+            // `ExecutionContext::has_binary_store`, shares) and that index
+            // covers `to_t` (not a ledger yet to be indexed, nor a time before
+            // the index's base). The operator reads the store its execution
+            // context takes from the snapshot, which a caller need not have
+            // passed in here.
+            let geo_store = binary_store
+                .cloned()
+                .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot));
+            let geo_index_covers = planning
+                .reads_one_graph_index(binary_scans && geo_store.is_some())
+                && geo_store.is_some_and(|store| db.t >= store.base_t());
             let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
                 rewritten_patterns,
                 &|iri: &str| db.snapshot.encode_iri(iri),

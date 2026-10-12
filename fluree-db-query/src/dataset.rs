@@ -433,6 +433,25 @@ impl ActiveGraph {
         }
     }
 
+    /// Whether a scope with this active graph over `dataset` reads exactly one
+    /// graph through that graph's binary index: [`Self::reads_one_graph`], a
+    /// store attached (`has_store`), and a dataset that does not span ledgers.
+    /// A dataset spanning ledgers reads every graph, named ones included,
+    /// through the range scan: its bindings carry their ledger, which needs
+    /// decoded terms, so the query path attaches no store to it.
+    ///
+    /// The one definition behind [`ExecutionContext::has_binary_store`] at run
+    /// time and [`PlanningContext::reads_one_graph_index`] at plan time, for a
+    /// lane that has no fallback without the index (the geo index search).
+    ///
+    /// [`ExecutionContext::has_binary_store`]: crate::context::ExecutionContext::has_binary_store
+    /// [`PlanningContext::reads_one_graph_index`]: crate::temporal_mode::PlanningContext::reads_one_graph_index
+    pub fn reads_one_graph_index(&self, dataset: Option<&DataSet<'_>>, has_store: bool) -> bool {
+        has_store
+            && self.reads_one_graph(dataset)
+            && !dataset.is_some_and(DataSet::spans_multiple_ledgers)
+    }
+
     /// Create an active graph for a named graph
     pub fn named(iri: impl Into<Arc<str>>) -> Self {
         Self::Named(iri.into())

@@ -1277,11 +1277,14 @@ impl<'a> ExecutionContext<'a> {
         self.active_graph.reads_one_graph(self.dataset)
     }
 
-    /// Whether this scope reads exactly one graph of a binary index: a store
-    /// is attached and [`Self::reads_exactly_one_graph`]. Individual call
-    /// sites may layer additional conditions (e.g. `to_t >= base_t`).
+    /// Whether this scope reads exactly one graph through its binary index:
+    /// [`ActiveGraph::reads_one_graph_index`] (a store attached,
+    /// [`Self::reads_exactly_one_graph`], and a dataset that does not span
+    /// ledgers), which the planner answers too. Individual call sites may
+    /// layer additional conditions (e.g. `to_t >= base_t`).
     pub fn has_binary_store(&self) -> bool {
-        self.binary_store.is_some() && self.reads_exactly_one_graph()
+        self.active_graph
+            .reads_one_graph_index(self.dataset, self.binary_store.is_some())
     }
 
     /// Return a `BinaryGraphView` for the current graph, combining the binary store

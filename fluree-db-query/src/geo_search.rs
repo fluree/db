@@ -326,17 +326,17 @@ impl Operator for GeoSearchOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         // The planner rewrites to this operator only for a scope that reads
-        // exactly one graph (`planning.one_graph`, the same definition as this
+        // exactly one graph through its binary index
+        // (`planning.reads_one_graph_index`, the same definition as this
         // check). It has no fallback to the patterns it replaced, so any other
-        // scope is refused rather than answered from one graph's index.
-        if !ctx.reads_exactly_one_graph() {
+        // scope is refused rather than answered from another graph's index.
+        if !ctx.has_binary_store() {
             debug_assert!(
                 false,
-                "GeoSearch planned in a scope that does not read exactly one graph"
+                "GeoSearch planned in a scope that does not read one graph's binary index"
             );
             return Err(QueryError::Internal(
-                "GeoSearch reads one graph's index; the scope does not read exactly one graph"
-                    .to_string(),
+                "GeoSearch reads one graph's binary index; the scope does not".to_string(),
             ));
         }
 
