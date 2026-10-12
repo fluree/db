@@ -42,7 +42,7 @@ Fluree exposes two query styles over HTTP:
   - The ledger's own address, in any spelling (`mydb`, `mydb:main`, `urn:fluree:mydb:main`), names its default graph, and with a graph (`mydb:main#config`, `mydb:main#<graph IRI>`) that graph. A graph the ledger does not have is a 404 (`err:db/GraphNotFound`).
   - `GRAPH <iri> { ... }` and `GRAPH ?g { ... }` resolve the ledger's registered user named graphs **without** an explicit `FROM NAMED` (the reserved `#txn-meta` / `#config` graphs stay private). Supplying `FROM NAMED` still narrows resolution to exactly the graphs listed.
 
-A `from` object, or a `name:branch` string, that names a different ledger than the one in the URL is rejected with a "Ledger mismatch" error (see [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger)). A JSON-LD array `from`, or a `fromNamed`, may name other ledgers, as on `POST /query`; each is read under the caller's access rights.
+A `from` string or object, or a SPARQL `FROM`, that names a different ledger than the one in the URL, in any spelling, is rejected with a "Ledger mismatch" error (see [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger)). A JSON-LD array `from`, or a `fromNamed`, may name other ledgers, as on `POST /query`; each is read under the caller's access rights.
 
 ### The ledger's own address in a graph position
 
