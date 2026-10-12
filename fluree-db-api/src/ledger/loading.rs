@@ -162,11 +162,9 @@ impl Fluree {
         use fluree_db_novelty::Novelty;
         use tracing::info;
 
-        // 1. Parse (default branch applied) and apply the stricter rules for
-        //    new names, which existing ledgers are not held to.
+        // 1. Parse (default branch applied). Claiming the name applies the
+        //    stricter rules for new names.
         let ledger_id = LedgerId::parse(ledger_id)?;
-        fluree_db_core::validate_ledger_name(ledger_id.name())?;
-        fluree_db_core::validate_branch_name(ledger_id.branch())?;
         info!(ledger_id = %ledger_id, "Creating ledger");
 
         // 2. Claim the name under a fresh instance and register the root
@@ -685,10 +683,17 @@ async fn renewing_every<F: std::future::Future, R: Renewal>(
 
 /// Claim `ledger_id`'s name in `store` for a new ledger, not yet visible:
 /// the caller writes its data, then activates or abandons it.
+///
+/// Every new ledger is claimed here, so the stricter rules for new names,
+/// which existing ledgers are not held to, are applied here: a name or
+/// branch taking a reserved layout segment would put the ledger's files
+/// inside another's.
 pub(crate) async fn claim_name(
     store: &dyn crate::NameServicePublisher,
     ledger_id: &LedgerId,
 ) -> Result<PendingLedger> {
+    fluree_db_core::validate_ledger_name(ledger_id.name())?;
+    fluree_db_core::validate_branch_name(ledger_id.branch())?;
     match fluree_db_nameservice::lifecycle::begin_create(store, ledger_id).await {
         Ok(pending) => Ok(pending),
         Err(NameServiceError::LedgerAlreadyExists(a)) => Err(ApiError::ledger_exists(a)),

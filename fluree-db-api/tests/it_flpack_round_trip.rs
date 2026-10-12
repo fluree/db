@@ -1090,3 +1090,45 @@ async fn flpack_stream_structure_is_valid() {
         "last frame should be End"
     );
 }
+
+/// A restore creates a ledger, so it takes only the names a create does: a
+/// name or branch taking a reserved layout segment would put the restored
+/// ledger's files inside another's, or its record beside another's sidecar.
+#[tokio::test]
+async fn flpack_restore_refuses_names_a_create_refuses() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+    let src_ledger = "flpack-test/reserved-source:main";
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+    let src_state = src_fluree
+        .create_ledger(src_ledger)
+        .await
+        .expect("create source");
+    let insert = json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:a", "ex:v": 1});
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+    let pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    for reserved in ["a/main/index:main", "flpack-test/sidecar:main.index"] {
+        let err = dst_fluree
+            .restore_ledger(reserved, &mut std::io::Cursor::new(pack_bytes.clone()))
+            .await
+            .expect_err(reserved);
+        assert_eq!(err.status_code(), 400, "{reserved}: {err}");
+        let name = reserved.split_once(':').unwrap().0;
+        assert!(
+            dst_fluree
+                .publisher()
+                .unwrap()
+                .get_binding(name)
+                .await
+                .unwrap()
+                .is_none(),
+            "{reserved} claimed its name"
+        );
+    }
+}
