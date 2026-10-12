@@ -30,9 +30,7 @@ use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{
-    DatatypeDictId, GraphId, IndexType, ObjKind, ObjectBounds, Sid, BATCHED_JOIN_SIZE,
-};
+use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -424,7 +422,7 @@ pub(crate) enum Substitution {
     Bound,
     /// The slot stays a variable: the value constrains nothing (unbound or
     /// poisoned — callers screen poisoned rows first), or it is an encoded
-    /// value the context cannot decode (see [`CorrelationView`]). A caller
+    /// value the context cannot decode (no graph view). A caller
     /// must then correlate the slot by term equality on the scan's output.
     Free,
     /// No triple holds this value in this slot: a literal as a subject or
@@ -433,65 +431,13 @@ pub(crate) enum Substitution {
     Unmatchable,
 }
 
-/// What a correlated scan decodes a row's encoded values through.
-pub(crate) enum CorrelationView {
-    /// The active graph's view: every encoded value decodes.
-    Graph(BinaryGraphView),
-    /// The ledger's store, for a dataset of several of its graphs, where no
-    /// graph view exists while each graph's scan still binds encoded values.
-    /// What a ledger shares across its graphs decodes — subject, predicate
-    /// and string-dictionary ids, and inline literals; an arena-backed
-    /// literal handle (NUM_BIG, vector) names a value only within its own
-    /// graph and does not.
-    Ledger(BinaryGraphView),
-}
-
-impl CorrelationView {
-    /// `None` only without a store or across ledgers, where no scan binds an
-    /// encoded value.
-    pub(crate) fn of(ctx: &ExecutionContext<'_>) -> Option<Self> {
-        if let Some(gv) = ctx.graph_view() {
-            return Some(Self::Graph(gv));
-        }
-        if ctx.is_multi_ledger() {
-            return None;
-        }
-        let store = ctx.binary_store.as_ref()?;
-        Some(Self::Ledger(
-            store
-                .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
-                .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-                .with_tracker(ctx.tracker.clone()),
-        ))
-    }
-
-    fn view(&self) -> &BinaryGraphView {
-        match self {
-            Self::Graph(gv) | Self::Ledger(gv) => gv,
-        }
-    }
-
-    /// The view an encoded literal of `o_kind` decodes through, if any.
-    fn literal_view(&self, o_kind: u8) -> Option<&BinaryGraphView> {
-        match self {
-            Self::Graph(gv) => Some(gv),
-            Self::Ledger(_)
-                if o_kind == ObjKind::NUM_BIG.as_u8() || o_kind == ObjKind::VECTOR_ID.as_u8() =>
-            {
-                None
-            }
-            Self::Ledger(gv) => Some(gv),
-        }
-    }
-}
-
 /// Substitute one correlated left-row value into `pattern`'s `position`.
 ///
 /// The one place a row's value becomes a scan constant, for every correlated
 /// scan — the nested-loop join's right side and OPTIONAL's per-row lookup —
 /// so a value binds the same way whichever operator carries the correlation
 /// and whichever form the row holds it in. Encoded (late-materialized) ids
-/// decode through `view` (novelty-aware), into any position: an IRI that one
+/// decode through the graph view `gv` (novelty-aware), into any position: an IRI that one
 /// pattern reaches as a predicate (`EncodedPid`) is a subject or object to
 /// another, and the reverse. A value it cannot decode stays free
 /// ([`Substitution::Free`]) for the caller to correlate by term equality;
@@ -504,9 +450,8 @@ pub(crate) fn substitute_binding(
     pattern: &mut TriplePattern,
     position: PatternPosition,
     binding: &Binding,
-    view: Option<&CorrelationView>,
+    gv: Option<&BinaryGraphView>,
 ) -> Result<Substitution> {
-    let gv = view.map(CorrelationView::view);
     let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
         let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
             tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
@@ -583,7 +528,7 @@ pub(crate) fn substitute_binding(
                 // Must use decode_value_from_kind with the correct (o_kind, dt_id,
                 // lang_id) — dt_id is a DatatypeDictId, NOT an o_type. p_id is
                 // needed for NUM_BIG per-predicate arena lookup.
-                let Some(gv) = view.and_then(|v| v.literal_view(*o_kind)) else {
+                let Some(gv) = gv else {
                     return Ok(Substitution::Free);
                 };
                 let val = gv
@@ -1195,7 +1140,7 @@ impl NestedLoopJoinOperator {
         &self,
         left_batch: &Batch,
         left_row: usize,
-        view: Option<&CorrelationView>,
+        view: Option<&BinaryGraphView>,
     ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.right_pattern.clone();
         for instr in &self.bind_instructions {
@@ -1464,7 +1409,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Built once for the whole next_batch call (avoids repeated Arc::clone
         // + construction per row).
-        let cached_view = CorrelationView::of(ctx);
+        let cached_view = ctx.graph_view();
 
         // Process until we have output or exhaust input
         loop {

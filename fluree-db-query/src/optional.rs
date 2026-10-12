@@ -35,8 +35,8 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
     batched_subject_probe_binary, charge_probe_rows, for_each_object_probe_match,
-    substitute_binding, BindInstruction, CorrelationView, PatternPosition, SubjectProbeParams,
-    Substitution, UnifyInstruction,
+    substitute_binding, BindInstruction, PatternPosition, SubjectProbeParams, Substitution,
+    UnifyInstruction,
 };
 use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
 use crate::operator::flush::FlushSchedule;
@@ -602,9 +602,9 @@ impl PatternOptionalBuilder {
     /// triple can match the row — a correlated value that can never fill its
     /// slot (a literal as a subject or predicate, a list or map value).
     ///
-    /// A value the context cannot decode (an arena-backed literal while
-    /// several graphs are active) stays a variable, and `unify_check`
-    /// correlates it by term equality.
+    /// A value the context cannot decode (it has no graph view: several graphs
+    /// are active, whose member scans decode their rows) stays a variable, and
+    /// `unify_check` correlates it by term equality.
     fn substitute_pattern(
         &self,
         required_batch: &Batch,
@@ -614,7 +614,7 @@ impl PatternOptionalBuilder {
         let mut pattern = self.pattern.clone();
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
-        let mut view: Option<Option<CorrelationView>> = None;
+        let mut view: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
         let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             if object_to_unify && instr.position == PatternPosition::Object {
@@ -628,8 +628,7 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                view.get_or_insert_with(|| CorrelationView::of(ctx))
-                    .as_ref()
+                view.get_or_insert_with(|| ctx.graph_view()).as_ref()
             } else {
                 None
             };

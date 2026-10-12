@@ -352,34 +352,6 @@ impl Failures {
         }
     }
 
-    /// Every scan of the triple naming `marker` since `before` decoded its
-    /// arena-backed literals (`want`), or none did.
-    fn arena_decoding(
-        &mut self,
-        store: &SpanStore,
-        before: usize,
-        marker: &str,
-        want: bool,
-        label: &str,
-    ) {
-        let flags: Vec<String> = store.all_events()[before..]
-            .iter()
-            .filter(|e| e.message() == "BinaryScanOperator::open")
-            .filter(|e| {
-                e.fields
-                    .iter()
-                    .any(|(k, v)| k.ends_with("pattern") && v.contains(marker))
-            })
-            .filter_map(|e| e.fields.get("arena_literals_decoded").cloned())
-            .collect();
-        let want = want.to_string();
-        if flags.is_empty() || flags.iter().any(|f| *f != want) {
-            self.0.push(format!(
-                "{label}: scans of {marker} must have arena_literals_decoded={want}; saw {flags:?}"
-            ));
-        }
-    }
-
     /// The batched bound-object lane fired and never declined.
     fn object_probe_fired(&mut self, store: &SpanStore, before: usize, label: &str) {
         self.object_probe(store, before, Probe::Fires, label);
@@ -1422,11 +1394,11 @@ async fn optional_unify_matches_a_novelty_minted_object() {
 // ---------------------------------------------------------------------------
 // A dataset of several graphs of one ledger.
 //
-// With two default graphs no graph view exists, while each graph's scan
-// still binds encoded ids. A correlated value must still decode into its
-// slot (the ids a ledger shares across graphs decode without one), and a
-// slot that cannot take it must be correlated, never left free to match
-// every row.
+// With two default graphs no graph view exists, and the member scans bind
+// every value decoded (#2004). The answers must be the single-graph ones: a
+// correlated OPTIONAL bound into its lookup, a join correlated rather than
+// repeated, and arena-backed literals that share a handle across the two
+// graphs kept apart.
 // ---------------------------------------------------------------------------
 
 /// Chunks and concepts spread over two named graphs, and `xsd:decimal`
@@ -1509,9 +1481,9 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
             None,
         ),
         (
-            // Arena-backed literals (big numbers) are bound decoded by the
-            // member scans: their handles name a value only within one graph,
-            // and g1's 1.5 shares a handle with g2's 9.5.
+            // Arena-backed literals (big numbers): their handles name a value
+            // only within one graph, and g1's 1.5 shares a handle with g2's
+            // 9.5. The member scans bind every value decoded.
             "projection of an arena-backed literal",
             "SELECT ?x ?v FROM <urn:g1> FROM <urn:g2> WHERE { ?x ex:amount ?v }",
             &["x", "v"],
@@ -1588,13 +1560,9 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
         if let Some((marker, slot)) = bound {
             failures.bound_lookup(&store, before, marker, *slot, label);
         }
-        if label.contains("arena-backed") {
-            failures.arena_decoding(&store, before, "name: \"amount\"", true, label);
-        }
     }
 
-    // One graph: its scan keeps binding arena handles, decoded nowhere.
-    let before = store.all_events().len();
+    // One graph, as control.
     let query = format!("{PREFIXES} SELECT ?x ?v FROM <urn:g1> WHERE {{ ?x ex:amount ?v }}");
     let result = db(&handle)
         .await
@@ -1609,7 +1577,6 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
         rows(&[&["x1", "1.5"], &["x2", "9.5"]]),
         label,
     );
-    failures.arena_decoding(&store, before, "name: \"amount\"", false, label);
     failures.assert_none();
 }
 

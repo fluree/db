@@ -369,9 +369,8 @@ Other shapes look the triple up per driving row with every correlated value
 bound into the scan, whichever form the row carries it in: an encoded subject,
 predicate or literal is decoded into its slot, so no row scans the whole
 predicate. With several graphs of one ledger active there is no graph view, and
-values decode through a view of the ledger's store instead; only an
-arena-backed literal (a big number or a vector, whose handle names a value
-within one graph) stays free and is matched by term. When the row binds the
+the member scans bind every value decoded, so a row carries nothing to decode.
+When the row binds the
 subject, an encoded IRI, string or date object is left to the join check
 instead of decoded, because the subject seek is already narrow. A numeric
 object is still substituted: the substitution matches numerics by value across
@@ -393,8 +392,11 @@ assigns IDs in. The predicate-to-subject mapping is memoized per predicate per
 index, so a key over predicate bindings costs a load per row. Property-path
 endpoints decode an encoded IRI before traversal. What stays outside the rule:
 an IRI no dictionary holds keeps its decoded form, so its `Sid` and `Iri`
-forms still compare apart, and an arena-backed literal keyed with no graph
-view keys by its graph-scoped handle.
+forms still compare apart. An arena-backed literal (a big number or a vector,
+whose handle names a value within one graph) is never compared or keyed without
+a graph view to decode it: `same_term` refuses with an internal error and the
+key normalizers assert it in debug builds. Member scans of several graphs bind
+those literals decoded, so no query reaches either.
 
 **`CyclicBgpOperator`** handles small cyclic fixed-predicate BGPs (triangles and
 4-edge cycles over reference-valued joins) that would otherwise run as left-deep

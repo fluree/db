@@ -856,16 +856,6 @@ pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
     )
 }
 
-/// True if a stored object of `o_type` late-materializes as an arena handle
-/// ([`is_arena_encoded`]), decided before any binding is built.
-#[inline]
-pub(crate) fn is_arena_o_type(o_type: u16) -> bool {
-    matches!(
-        OType::from_u16(o_type).decode_kind(),
-        DecodeKind::NumBigArena | DecodeKind::VectorArena
-    )
-}
-
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
 pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
     matches!(
