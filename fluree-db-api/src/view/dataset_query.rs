@@ -5,7 +5,7 @@
 use crate::query::helpers::{
     build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
     parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset,
-    status_for_query_error, tracked_query_tracker, tracker_for_input_limits,
+    tracked_query_tracker, tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
@@ -439,7 +439,7 @@ impl Fluree {
             .execute_dataset_tracked(dataset, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
-                let status = status_for_query_error(&e);
+                let status = crate::error::query_error_status(&e);
                 crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
@@ -562,7 +562,7 @@ impl Fluree {
             )
             .await
             .map_err(|e| {
-                let status = status_for_query_error(&e);
+                let status = crate::error::query_error_status(&e);
                 crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 

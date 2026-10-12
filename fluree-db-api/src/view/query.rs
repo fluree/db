@@ -6,8 +6,7 @@
 use crate::query::helpers::{
     build_query_result, charge_query_floor, input_fuel_limit, limits_tracker, lower_sparql_ast,
     parse_and_validate_sparql, parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution,
-    sparql_ast_has_dataset, status_for_query_error, tracked_query_tracker,
-    tracker_for_input_limits,
+    sparql_ast_has_dataset, tracked_query_tracker, tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -1009,7 +1008,7 @@ impl Fluree {
             Box::pin(self.execute_view_tracked(db, &vars, &executable, &tracker, &options))
                 .await
                 .map_err(|e| {
-                    let status = query_error_to_status(&e);
+                    let status = crate::error::query_error_status(&e);
                     crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
                 })?;
 
@@ -1160,7 +1159,7 @@ impl Fluree {
             .execute_view_tracked_with_r2rml(db, &vars, &executable, &tracker, r2rml, &options)
             .await
             .map_err(|e| {
-                let status = query_error_to_status(&e);
+                let status = crate::error::query_error_status(&e);
                 crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
@@ -2019,11 +2018,6 @@ fn mark_graph_source_result(result: &mut QueryResult, db: &GraphDb) {
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
     ApiError::Query(err)
-}
-
-/// Map QueryError to HTTP-ish status code.
-fn query_error_to_status(err: &fluree_db_query::QueryError) -> u16 {
-    status_for_query_error(err)
 }
 
 /// Rejection for a dataset clause on a surface that does not support datasets
