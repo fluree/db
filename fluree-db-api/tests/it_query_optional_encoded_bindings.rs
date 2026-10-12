@@ -1697,12 +1697,12 @@ async fn check_lane_jsonld(
 #[tokio::test(flavor = "current_thread")]
 async fn partitioned_group_by_reads_one_graph() {
     let ledger_id = "it/partitioned-group-by:main";
-    let trig = r#"
+    let trig = r"
         @prefix ex: <http://example.org/> .
         ex:a1 ex:amount 1.5 ; ex:n 1 .
         GRAPH <urn:g2> { ex:b1 ex:amount 1.5 ; ex:n 1 . ex:b2 ex:amount 2.5 ; ex:n 2 . }
         GRAPH <urn:g3> { ex:c1 ex:amount 1.5 ; ex:n 1 . ex:c2 ex:amount 2.5 ; ex:n 2 . }
-    "#;
+    ";
     let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
     let q = |prologue: &str, ds: &str, pred: &str, agg: &str| {
         format!(
@@ -1833,12 +1833,12 @@ async fn partitioned_group_by_reads_one_graph() {
 /// `binary_g_id` is the default graph's), and nothing under `FROM g3 + g2`.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_lane_reads_one_graph() {
-    let trig = r#"
+    let trig = r"
         @prefix ex: <http://example.org/> .
         ex:a ex:knows ex:b .
         GRAPH <urn:g2> { ex:b ex:knows ex:c . ex:p ex:knows ex:q . ex:q ex:knows ex:r . ex:r ex:knows ex:p . }
         GRAPH <urn:g3> { ex:c ex:knows ex:a . }
-    "#;
+    ";
     let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-graphs:main", trig).await;
     let tri = |prologue: &str, ds: &str| {
         format!(
@@ -2061,6 +2061,17 @@ async fn geo_search_reads_one_graph() {
     failures.assert_none();
 }
 
+/// One count-lane case: the lane's routing site, a label, the query, its
+/// columns, the answer, and whether the lane must answer (`true`) or decline.
+type CountLaneCase = (
+    &'static str,
+    &'static str,
+    String,
+    &'static [&'static str],
+    Rows,
+    bool,
+);
+
 /// The count lanes the planner picks outside the fused fast paths, which gate
 /// at open through `fast_path_store`: the FIRST-header grouped count and
 /// bound-object count, and the per-predicate directory count. Each must answer
@@ -2092,8 +2103,7 @@ async fn count_lanes_read_one_graph() {
         )
     };
     let from2 = "FROM <urn:g2> FROM <urn:g3>";
-    // (lane site, label, query, columns, answer, must the lane answer)
-    let cases: Vec<(&str, &str, String, &[&str], Rows, bool)> = vec![
+    let cases: Vec<CountLaneCase> = vec![
         (
             "predicate_object_count",
             "object count, the default graph alone",
