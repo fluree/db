@@ -313,6 +313,11 @@ t=2: DELETE DATA { ex:alice schema:age 30 }
      Result: nothing is committed; the ledger stays at t=1
 ```
 
+The same holds in a named graph the ledger does not have: a DELETE that
+names one (`DELETE DATA { GRAPH <g> { … } }`, `WITH <g>`, a `GRAPH ?g` bound
+to it) retracts nothing there and does not create the graph. An INSERT into
+a new graph, a sync, or `CREATE GRAPH` creates it.
+
 A DELETE names RDF terms exactly. The datatype must match the stored one
 (`30` is `xsd:integer`, so it does not retract `"30"^^xsd:int`); a language
 tag matches case-insensitively (`"a"@EN` retracts a stored `"a"@en`). A

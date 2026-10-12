@@ -1461,6 +1461,84 @@ async fn transferring_viewable_facts_the_destination_holds_commits_nothing() {
 }
 
 // =============================================================================
+// A DELETE naming a graph the ledger does not have
+// =============================================================================
+
+/// A DELETE naming a graph the ledger does not have commits nothing and
+/// registers no graph: nothing is stored there to retract. An INSERT into a
+/// new graph, a `CREATE GRAPH`, and a DELETE beside an INSERT into the same
+/// new graph still register it, and the graph a transaction inserts into
+/// beside a DELETE-only new graph gets the id the commit gives it.
+#[tokio::test]
+async fn a_delete_naming_a_graph_the_ledger_lacks_commits_nothing() {
+    const NEW: &str = "http://example.org/new";
+    const ALSO_NEW: &str = "http://example.org/also-new";
+    let registered = |ledger: &LedgerState, iri: &str| {
+        ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .is_some()
+    };
+    for indexed in [false, true] {
+        for body in [
+            format!("DELETE DATA {{ GRAPH <{NEW}> {{ ex:alice ex:salary 100 }} }}"),
+            format!("DELETE {{ GRAPH <{NEW}> {{ ?s ex:salary ?o }} }} WHERE {{ ?s ex:salary ?o }}"),
+            format!("WITH <{NEW}> DELETE {{ ?s ex:salary ?o }} WHERE {{ ?s ex:salary ?o }}"),
+            format!(
+                "DELETE {{ GRAPH ?g {{ ?s ex:salary ?o }} }} \
+                 WHERE {{ ?s ex:salary ?o VALUES ?g {{ <{NEW}> }} }}"
+            ),
+        ] {
+            let (_d, fluree, ledger) = seeded("missing-graph", salary_seed(), indexed).await;
+            let t = ledger.t();
+            let r = sparql_update(&fluree, ledger, &body).await;
+            no_commit(&r, t, &format!("{body}, indexed={indexed}"));
+            assert!(
+                !registered(&r.ledger, NEW),
+                "{body}, indexed={indexed}: registered"
+            );
+        }
+        for body in [
+            format!("INSERT DATA {{ GRAPH <{NEW}> {{ ex:alice ex:salary 1 }} }}"),
+            format!("CREATE GRAPH <{NEW}>"),
+            format!(
+                "DELETE {{ GRAPH <{NEW}> {{ ?s ex:salary ?o }} }} \
+                 INSERT {{ GRAPH <{NEW}> {{ ?s ex:salary 1 }} }} WHERE {{ ?s ex:salary ?o }}"
+            ),
+        ] {
+            let (_d, fluree, ledger) = seeded("new-graph", salary_seed(), indexed).await;
+            let r = sparql_update(&fluree, ledger, &body).await;
+            assert!(
+                registered(&r.ledger, NEW),
+                "{body}, indexed={indexed}: not registered"
+            );
+        }
+
+        // `ALSO_NEW` sorts before `NEW`: leaving it out of the commit must not
+        // shift the id the inserted graph's flakes were routed to.
+        let (_d, fluree, ledger) = seeded("new-graph-beside", salary_seed(), indexed).await;
+        let r = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "DELETE {{ GRAPH <{ALSO_NEW}> {{ ?s ex:salary ?o }} }} \
+                 INSERT {{ GRAPH <{NEW}> {{ ?s ex:salary 1 }} }} WHERE {{ ?s ex:salary ?o }}"
+            ),
+        )
+        .await;
+        assert!(!registered(&r.ledger, ALSO_NEW), "indexed={indexed}");
+        let q = format!("SELECT ?o WHERE {{ GRAPH <{NEW}> {{ ex:alice ex:salary ?o }} }}");
+        let rows = support::query_sparql(&fluree, &r.ledger, &format!("PREFIX ex: <{EX}>\n{q}"))
+            .await
+            .expect("query")
+            .to_jsonld(&r.ledger.snapshot)
+            .expect("jsonld");
+        assert_eq!(rows, json!([[1]]), "indexed={indexed}");
+    }
+}
+
+// =============================================================================
 // A witness reads the graph its template writes
 // =============================================================================
 
