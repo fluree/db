@@ -2456,3 +2456,40 @@ async fn path_endpoint_bound_to_a_term_no_edge_touches() {
     }
     failures.assert_none();
 }
+
+/// Cypher `WITH a AS a` rebinds a variable to itself: the projection computes
+/// the node's decoded IRI while the scan bound it encoded, and the BIND that
+/// lowers it compares the two as one term. In every index state.
+#[tokio::test(flavor = "current_thread")]
+async fn cypher_with_a_variable_as_itself() {
+    let data = json!({
+        "@context": context(),
+        "@graph": [
+            {"@id": "alice", "@type": "Person", "name": "Alice"},
+            {"@id": "bob", "@type": "Person", "name": "Bob"}
+        ]
+    });
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) = ledger_with(state, "it/cypher-with-as-itself:main", &data).await;
+        let db = db(&handle).await;
+        for query in [
+            "MATCH (a:Person) WITH a AS a RETURN a.name",
+            "MATCH (a:Person) WITH a AS b RETURN b.name",
+        ] {
+            let result = fluree
+                .query_cypher(&db, query)
+                .await
+                .expect("cypher query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            failures.eq(
+                jsonld_rows(&result),
+                rows(&[&["Alice"], &["Bob"]]),
+                &format!("{state:?} / {query}"),
+            );
+        }
+    }
+    failures.assert_none();
+}
