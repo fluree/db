@@ -1619,7 +1619,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
