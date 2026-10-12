@@ -326,13 +326,15 @@ pub(super) fn bare_ledger_id(s: &str) -> String {
 /// avoids ever touching IRIs that appear inside comments or string literals.
 /// Replacements are applied right-to-left so earlier spans aren't shifted.
 ///
-/// When the SPARQL fails to parse, the original is returned unchanged — the
-/// downstream parser produces the user-facing parse error rather than this
-/// layer attempting an opaque rewrite.
+/// When the SPARQL has any parse error, even one the parser recovers from,
+/// the original is returned unchanged.
 pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> String {
     use fluree_db_sparql::ast::QueryBody;
 
     let parsed = fluree_db_sparql::parse_sparql(sparql);
+    if parsed.has_errors() {
+        return sparql.to_string();
+    }
     let Some(ast) = parsed.ast.as_ref() else {
         return sparql.to_string();
     };
@@ -552,6 +554,20 @@ mod tests {
         assert!(out.contains(r#""note: <ledgerA>""#), "got: {out}");
         // The FROM clause is rewritten.
         assert!(out.contains("FROM <ledgerA@t:42>"), "got: {out}");
+    }
+
+    /// Text with a parse error is returned as written, even when the parser
+    /// recovers its `FROM` clause and that ledger is in the snapshot.
+    #[test]
+    fn sparql_with_a_recovered_parse_error_is_returned_unchanged() {
+        let snap = snapshot(&[("ledgerA", 42)]);
+        let sparql = "SELECT ?x FROM <ledgerA> WHERE { ?x ?p ?o . ?x }";
+        let parsed = fluree_db_sparql::parse_sparql(sparql);
+        assert!(
+            parsed.has_errors() && parsed.ast.is_some(),
+            "the fixture must parse with an error and still yield an AST"
+        );
+        assert_eq!(apply_snapshot_to_sparql(sparql, &snap), sparql);
     }
 
     #[test]
