@@ -499,6 +499,31 @@ impl<'l> CurrentFacts<'l> {
         Ok(out)
     }
 
+    /// Whether `slot` holds the fact a retraction of `flake` names: a
+    /// current fact with its term and metadata, or, for a kind whose index
+    /// key can merge terms ([`IndexKeys`]), one with its key and list
+    /// position, which storage resolves as the same fact. The test a pushed
+    /// commit's retractions pass: written elsewhere, a retraction may carry
+    /// a term as written where the index keeps less of it.
+    pub async fn holds(&self, slot: &Slot, flake: &Flake) -> Result<bool> {
+        let novelty = NoveltyPlan::for_slots(self.ledger, std::slice::from_ref(slot), self.to_t);
+        let facts = self.read_slot(slot, None, &novelty).await?;
+        if facts
+            .iter()
+            .any(|f| f.flake.o == flake.o && f.flake.dt == flake.dt && f.flake.m == flake.m)
+        {
+            return Ok(true);
+        }
+        let p_id = self.keys.p_id(&flake.p);
+        let Some(key) = self.keys.key(slot.g_id, p_id, flake) else {
+            return Ok(false);
+        };
+        let at = list_index_of(flake);
+        Ok(facts.iter().any(|f| {
+            list_index_of(&f.flake) == at && self.keys.key(slot.g_id, p_id, &f.flake) == Some(key)
+        }))
+    }
+
     /// [`Self::of_slots`], except that a slot given `Some(values)` is read
     /// for those values alone: per value, the index rows of `(s, p, value)`
     /// and the novelty ops in its bounds. Its answer is then the slot's
@@ -2235,5 +2260,43 @@ mod tests {
         let mut out = resolve_batches(&ledger, batches, NARROW_SLOT).await;
         out.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
         assert_eq!(out, vec![at("a", 0), at("v", 1), at("v", 2)]);
+    }
+
+    /// A retraction names a stored fact by its term and metadata: not an
+    /// absent or retracted value, nor a stored value under another tag or
+    /// list position. (Without an index there are no keys to match by.)
+    #[tokio::test]
+    async fn holds_names_a_stored_fact_and_nothing_else() {
+        let en = || Some(FlakeMeta::with_lang("en"));
+        let ledger = ledger(
+            vec![
+                vec![
+                    flake("a", "p", "x", 1, true, None),
+                    flake("a", "p", "y", 1, true, en()),
+                    flake("a", "p", "z", 1, true, None),
+                ],
+                vec![flake("a", "p", "z", 2, false, None)],
+            ],
+            &HashMap::new(),
+        );
+        let current = CurrentFacts::new(&ledger);
+        let ap = slot(0, None, "a", "p");
+        let retract = |o: &str, m: Option<FlakeMeta>| flake("a", "p", o, 3, false, m);
+        let cases = [
+            ("a stored value", &ap, retract("x", None), true),
+            ("a stored tagged value", &ap, retract("y", en()), true),
+            ("a tagged value untagged", &ap, retract("y", None), false),
+            (
+                "a value at a list position it is not at",
+                &ap,
+                retract("x", Some(FlakeMeta::with_index(0))),
+                false,
+            ),
+            ("a retracted value", &ap, retract("z", None), false),
+            ("an absent value", &ap, retract("w", None), false),
+        ];
+        for (what, slot, flake, held) in cases {
+            assert_eq!(current.holds(slot, &flake).await.unwrap(), held, "{what}");
+        }
     }
 }
