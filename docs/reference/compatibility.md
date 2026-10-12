@@ -60,7 +60,7 @@ is dropped, but `LANG()` returns `en--ltr`, JSON-LD output carries that in
 
 ### JSON-LD 1.1
 
-**Status:** Fully compliant
+**Status:** Compliant, with the deviations listed below
 
 Fluree supports JSON-LD 1.1:
 - @context for namespace mappings
@@ -72,9 +72,14 @@ Fluree supports JSON-LD 1.1:
 - @language for language tags
 - Nested objects
 - Arrays
-
-Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored. Other `@`-keywords on a node object are refused.
 - @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
+
+Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
+
+Deviations from the JSON-LD 1.1 expansion algorithm:
+- Other `@`-keywords on a node object are refused, where the algorithm drops them.
+- A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
+- A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
@@ -352,7 +357,7 @@ Shapes no longer enable SHACL on their own. A ledger that holds shapes but has n
 
 Ledger info reports an affected ledger as `shapes present; SHACL enforcement not configured` (`configDiagnostics`; `fluree info` prints it), and the ledger logs the same as a warning once each time it loads. To keep enforcing, enable SHACL in the config. For a ledger that holds shapes and no config, that is one `INSERT DATA` writing a config with `f:shaclEnabled true`; a ledger that already has a config attaches the setting to its existing config subject: [Enabling SHACL](../ledger-config/writing-config.md#enabling-shacl).
 
-Inline shapes sent with a transaction (`opts.shapes`) are now governed by the SHACL group's `f:overrideControl` rather than by `f:shaclEnabled`: they apply without config, and under `f:OverrideAll` even where `f:shaclEnabled false`; under `f:OverrideNone` (or `f:IdentityRestricted` without a matching verified identity) the transaction is refused with a 400. They validate only themselves. They are not supported in a policy-scoped request (one with an identity or policy inputs, or on a ledger whose config sets policy defaults, ledger-wide or for a graph, other than an unrestricted `f:defaultAllow true`), which is refused with a 400; support is a follow-up. The same rule applies to inline uniqueness constraints (`opts.uniqueProperties`). See [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction). A transaction body's `opts.shapes` and `opts.uniqueProperties` are now read by the embedded API and by the CLI in local mode as well as by the server (they were ignored there), a malformed value is refused, and a build without SHACL support refuses inline shapes. Inline uniqueness constraints passed programmatically (`TxnOpts::unique_properties`) now apply to a plain Turtle insert as they did to TriG (a plain Turtle document ignored them).
+Inline shapes sent with a transaction (`opts.shapes`) are now governed by the SHACL group's `f:overrideControl` rather than by `f:shaclEnabled`: they apply without config, and under `f:OverrideAll` even where `f:shaclEnabled false`; under `f:OverrideNone` (or `f:IdentityRestricted` without a matching verified identity) the transaction is refused with a 400. They validate only themselves. They are not supported in a policy-scoped request (one with an identity or policy inputs, or on a ledger whose config sets policy defaults, ledger-wide or for a graph, other than an unrestricted `f:defaultAllow true`), which is refused with a 400; support is a follow-up. The same rule applies to inline uniqueness constraints (`opts.uniqueProperties`). See [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction). A transaction body's `opts.shapes` and `opts.uniqueProperties` are now read by the embedded API and by the CLI in local mode as well as by the server (they were ignored there), a malformed value is refused, and a build without SHACL support refuses inline shapes. Inline shapes, a requested validation mode and inline uniqueness constraints passed programmatically (`TxnOpts`) now apply to a plain Turtle insert as they did to TriG (a plain Turtle document ignored them).
 
 #### Branch operations are validated like transactions, fast-forwards included
 
@@ -378,7 +383,7 @@ A node nested under a node with an `@graph` selector is now written to that grap
 
 A term defined in a scoped (property- or type-scoped) `@context` whose `@id` is a compact IRI over a prefix only the outer context defines (`"a": {"@id": "ex:a", "@context": {"b": {"@id": "ex:b"}}}`) now expands to the full IRI. It used to stay compact, so the key was written as the string `ex:b`, an IRI with the scheme `ex`. Data already written that way stays as it is.
 
-Related JSON-LD changes: graph names must be absolute IRIs (relative ones are refused); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates; `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import refuses `@graph` scoping instead of folding it into the default graph; use `fluree insert`, or import TriG or N-Quads.
+Related JSON-LD changes: graph names must be absolute IRIs (relative ones are refused, and a graph name no longer expands through `@vocab`); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates; `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import refuses `@graph` scoping instead of folding it into the default graph; use `fluree insert`, or import TriG or N-Quads.
 
 #### Data written by an earlier release that reads differently
 
