@@ -1059,6 +1059,38 @@ where
     }
 }
 
+impl<S> StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
+    /// Run `write`, an index-file write presenting `fence`, once more when
+    /// its refusal was a stale caller's index file, which
+    /// [`ns_cas::repair_index_file`] replaces.
+    async fn with_index_repair<Fut>(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        write: impl Fn() -> Fut,
+    ) -> Result<()>
+    where
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let outcome = write().await;
+        if matches!(outcome, Err(NameServiceError::Fenced(_))) {
+            let (name, branch) = split_ledger_id(ledger_id)?;
+            let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+            let keys = RecordKeys {
+                main: &main,
+                index: &index,
+            };
+            if ns_cas::repair_index_file(&self.storage, keys, fence).await? {
+                return write().await;
+            }
+        }
+        outcome
+    }
+}
+
 #[async_trait]
 impl<S> IndexPublisher for StorageNameService<S>
 where
@@ -1071,35 +1103,38 @@ where
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let key = self.index_key(&ledger_name, &branch);
+        self.with_index_repair(ledger_id, fence, || async move {
+            let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+            let key = self.index_key(&ledger_name, &branch);
 
-        let cid_str = index_id.to_string();
+            let cid_str = index_id.to_string();
 
-        self.cas_update_fenced::<NsIndexFileV2, _, _>(
-            ledger_id,
-            &key,
-            move |current| index_admits(current, fence),
-            move |existing| {
-                // Only update if strictly newer
-                if let Some(ref file) = existing {
-                    if index_t <= file.index.t {
-                        return None;
+            self.cas_update_fenced::<NsIndexFileV2, _, _>(
+                ledger_id,
+                &key,
+                move |current| index_admits(current, fence),
+                move |existing| {
+                    // Only update if strictly newer
+                    if let Some(ref file) = existing {
+                        if index_t <= file.index.t {
+                            return None;
+                        }
                     }
-                }
 
-                Some(NsIndexFileV2 {
-                    context: ns_context(),
-                    index: IndexRef {
-                        cid: Some(cid_str.clone()),
-                        t: index_t,
-                    },
-                    fence,
-                    frozen: false,
-                    extra: Default::default(),
-                })
-            },
-        )
+                    Some(NsIndexFileV2 {
+                        context: ns_context(),
+                        index: IndexRef {
+                            cid: Some(cid_str.clone()),
+                            t: index_t,
+                        },
+                        fence,
+                        frozen: false,
+                        extra: Default::default(),
+                    })
+                },
+            )
+            .await
+        })
         .await
     }
 }
@@ -1116,41 +1151,44 @@ where
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let index_key = self.index_key(&ledger_name, &branch);
-        let cid_str = index_id.to_string();
+        self.with_index_repair(ledger_id, fence, || async move {
+            let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+            let index_key = self.index_key(&ledger_name, &branch);
+            let cid_str = index_id.to_string();
 
-        self.cas_update_fenced::<NsIndexFileV2, _, _>(
-            ledger_id,
-            &index_key,
-            move |current| index_admits(current, fence),
-            move |existing| {
-                let should_update = match &existing {
-                    Some(file) => index_t >= file.index.t, // Allow equal
-                    None => true,
-                };
+            self.cas_update_fenced::<NsIndexFileV2, _, _>(
+                ledger_id,
+                &index_key,
+                move |current| index_admits(current, fence),
+                move |existing| {
+                    let should_update = match &existing {
+                        Some(file) => index_t >= file.index.t, // Allow equal
+                        None => true,
+                    };
 
-                if should_update {
-                    Some(NsIndexFileV2 {
-                        context: ns_context(),
-                        index: IndexRef {
-                            cid: Some(cid_str.clone()),
-                            t: index_t,
-                        },
-                        fence,
-                        frozen: false,
-                        extra: Default::default(),
-                    })
-                } else {
-                    None
-                }
-            },
-        )
+                    if should_update {
+                        Some(NsIndexFileV2 {
+                            context: ns_context(),
+                            index: IndexRef {
+                                cid: Some(cid_str.clone()),
+                                t: index_t,
+                            },
+                            fence,
+                            frozen: false,
+                            extra: Default::default(),
+                        })
+                    } else {
+                        None
+                    }
+                },
+            )
+            .await
+
+            // Note: StorageNameService has no event_tx (no Publication support),
+            // so we don't emit NameServiceEvent here. This mirrors existing
+            // publish_index() behavior for StorageNameService.
+        })
         .await
-
-        // Note: StorageNameService has no event_tx (no Publication support),
-        // so we don't emit NameServiceEvent here. This mirrors existing
-        // publish_index() behavior for StorageNameService.
     }
 }
 
@@ -2561,6 +2599,35 @@ mod tests {
         for (key, json) in legacy {
             assert_eq!(ns.storage.read_bytes(&key).await.unwrap(), json.as_bytes());
         }
+    }
+
+    /// An index file a stale writer left under another fence does not keep
+    /// the record's own writer from publishing its index.
+    #[tokio::test]
+    async fn an_index_file_left_under_another_fence_is_repaired() {
+        let ns = make_storage_ns();
+        let record = crate::testing::create(&ns, "mydb:main").await.unwrap();
+        let stale = NsIndexFileV2 {
+            context: ns_context(),
+            index: IndexRef { cid: None, t: 0 },
+            fence: Some(Fence::generate()),
+            frozen: false,
+            extra: Default::default(),
+        };
+        ns.storage
+            .write_bytes(
+                "test/ns@v3/mydb/main.index.json",
+                &serde_json::to_vec(&stale).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let index = ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"index");
+        ns.publish_index_fenced("mydb:main", record.fence, 5, &index)
+            .await
+            .unwrap();
+        let after = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!((after.index_head_id, after.index_t), (Some(index), 5));
     }
 
     #[tokio::test]

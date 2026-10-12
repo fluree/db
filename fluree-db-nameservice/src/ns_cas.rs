@@ -208,16 +208,27 @@ where
 }
 
 /// Give the record at `keys` an index file under `fence` unless it has one:
-/// an empty one, replacing any an earlier incarnation left.
+/// an empty one, replacing any an earlier incarnation left. Returns whether
+/// it did.
 ///
-/// A caller paused since it saw the record may find it replaced by a later
-/// incarnation, whose index file it must not keep: the record is read again
-/// after the reset, and if it no longer carries `fence`, the file replaced is
-/// put back while the reset is still there.
-async fn reset_index_file<S>(storage: &S, keys: RecordKeys<'_>, fence: Option<Fence>) -> Result<()>
+/// Only the record's owner resets it: a caller paused since it saw the
+/// record may find it replaced by a later incarnation, whose index file it
+/// must not keep. The record is read before the reset, and again after it,
+/// since it can be replaced in between; then the file replaced is put back
+/// while the reset is still there. A crash in that window leaves the later
+/// incarnation's index file under the paused caller's fence, which
+/// [`repair_index_file`] undoes on the owner's next index write.
+async fn reset_index_file<S>(
+    storage: &S,
+    keys: RecordKeys<'_>,
+    fence: Option<Fence>,
+) -> Result<bool>
 where
     S: StorageCas + StorageRead + ?Sized,
 {
+    if read_record(storage, keys).await?.and_then(|r| r.fence) != fence {
+        return Ok(false);
+    }
     let index_bytes = serialize_json(&empty_index_file(fence, false))?;
     let replaced = Arc::new(parking_lot::Mutex::new(None));
     let (in_cas, reset_bytes) = (Arc::clone(&replaced), index_bytes.clone());
@@ -234,14 +245,14 @@ where
         })
         .await?;
     if !matches!(outcome, CasOutcome::Written) {
-        return Ok(());
+        return Ok(false);
     }
     let owner = read_record(storage, keys).await?.and_then(|r| r.fence);
     if owner == fence {
-        return Ok(());
+        return Ok(true);
     }
     let Some(previous) = replaced.lock().take() else {
-        return Ok(());
+        return Ok(false);
     };
     storage
         .compare_and_swap(keys.index, move |bytes| match bytes {
@@ -251,7 +262,36 @@ where
             _ => Ok(CasAction::<()>::Abort(())),
         })
         .await?;
-    Ok(())
+    Ok(false)
+}
+
+/// After an index write presenting `fence` was refused: when the record at
+/// `keys` carries `fence` and takes writes, its index file under another
+/// fence is a stale caller's, left by an interrupted [`reset_index_file`],
+/// and is replaced with an empty one under `fence`. Returns whether it was,
+/// and the write is worth repeating. Whatever index head the file held is
+/// lost; the next index build publishes one.
+pub(crate) async fn repair_index_file<S>(
+    storage: &S,
+    keys: RecordKeys<'_>,
+    fence: Option<Fence>,
+) -> Result<bool>
+where
+    S: StorageCas + StorageRead + ?Sized,
+{
+    match read_record(storage, keys).await? {
+        Some(record) if fence.is_some() && record.fence == fence && !record.frozen => {
+            let repaired = reset_index_file(storage, keys, fence).await?;
+            if repaired {
+                tracing::warn!(
+                    ledger_id = %record.ledger_id,
+                    "replaced an index file a stale writer left under another fence"
+                );
+            }
+            Ok(repaired)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Apply `change` to the main record if it carries `fence`. `change` may
@@ -373,6 +413,9 @@ where
             .compare_and_swap(keys.index, move |bytes| {
                 let mut file = match bytes.map(deserialize_json::<NsIndexFileV2>).transpose()? {
                     Some(file) if file.fence == Some(fence) => file,
+                    // A later incarnation's, if the record was replaced since
+                    // its freeze above: it keeps its own.
+                    Some(file) if file.fence.is_some() => return Ok(CasAction::Abort(())),
                     _ => empty_index_file(Some(fence), false),
                 };
                 file.frozen = true;
@@ -439,6 +482,48 @@ mod tests {
         serde_json::from_slice::<NsIndexFileV2>(&bytes)
             .unwrap()
             .fence
+    }
+
+    /// A freeze whose record was replaced after its main file was frozen
+    /// leaves the later incarnation's index file as it is.
+    #[tokio::test]
+    async fn a_freeze_leaves_a_later_incarnations_index_file_alone() {
+        let storage = MemoryStorage::new();
+        let record = record();
+        insert_record(&storage, KEYS, &record).await.unwrap();
+        let later = Fence::generate();
+        let theirs = serialize_json(&empty_index_file(Some(later), false)).unwrap();
+        storage.write_bytes(KEYS.index, &theirs).await.unwrap();
+
+        let fence = record.fence.unwrap();
+        assert_eq!(
+            freeze_record(&storage, KEYS, fence).await.unwrap(),
+            FenceOutcome::Applied
+        );
+        assert_eq!(storage.read_bytes(KEYS.index).await.unwrap(), theirs);
+    }
+
+    /// A reset by a caller the record no longer carries the fence of, one
+    /// paused since another incarnation took the key, touches nothing; the
+    /// owner's repair replaces an index file left under another fence.
+    #[tokio::test]
+    async fn only_the_owner_resets_or_repairs_the_index_file() {
+        let storage = MemoryStorage::new();
+        let record = record();
+        insert_record(&storage, KEYS, &record).await.unwrap();
+        let owned = storage.read_bytes(KEYS.index).await.unwrap();
+
+        let stale = Some(Fence::generate());
+        assert!(!reset_index_file(&storage, KEYS, stale).await.unwrap());
+        assert!(!repair_index_file(&storage, KEYS, stale).await.unwrap());
+        assert_eq!(storage.read_bytes(KEYS.index).await.unwrap(), owned);
+
+        let left = serialize_json(&empty_index_file(stale, false)).unwrap();
+        storage.write_bytes(KEYS.index, &left).await.unwrap();
+        assert!(repair_index_file(&storage, KEYS, record.fence)
+            .await
+            .unwrap());
+        assert_eq!(index_fence(&storage).await, record.fence);
     }
 
     /// An index file left under another fence, by a crash between the two

@@ -1150,6 +1150,34 @@ impl CommitPublisher for FileNameService {
     }
 }
 
+impl FileNameService {
+    /// Run `write`, an index-file write presenting `fence`, once more when
+    /// its refusal was a stale caller's index file, which
+    /// [`ns_cas::repair_index_file`] replaces.
+    async fn with_index_repair<Fut>(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        write: impl Fn() -> Fut,
+    ) -> Result<()>
+    where
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let outcome = write().await;
+        if matches!(outcome, Err(NameServiceError::Fenced(_))) {
+            let (main, index) = Self::record_keys(ledger_id)?;
+            let keys = RecordKeys {
+                main: &main,
+                index: &index,
+            };
+            if ns_cas::repair_index_file(&self.storage, keys, fence).await? {
+                return write().await;
+            }
+        }
+        outcome
+    }
+}
+
 #[async_trait]
 impl IndexPublisher for FileNameService {
     async fn publish_index_fenced(
@@ -1159,67 +1187,23 @@ impl IndexPublisher for FileNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let address = Self::index_address(&ledger_name, &branch);
-        let cid_str = index_id.to_string();
+        self.with_index_repair(ledger_id, fence, || async move {
+            let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+            let address = Self::index_address(&ledger_name, &branch);
+            let cid_str = index_id.to_string();
 
-        let outcome = self
-            .storage
-            .compare_and_swap(&address, move |bytes| {
-                let existing: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
-                if !index_admits(existing.as_ref(), fence) {
-                    return Ok(CasAction::Abort(Err(FenceRefused)));
-                }
-                if existing.as_ref().is_some_and(|e| index_t <= e.index.t) {
-                    return Ok(CasAction::Abort(Ok(())));
-                }
+            let outcome = self
+                .storage
+                .compare_and_swap(&address, move |bytes| {
+                    let existing: Option<NsIndexFileV2> =
+                        bytes.map(deserialize_json).transpose()?;
+                    if !index_admits(existing.as_ref(), fence) {
+                        return Ok(CasAction::Abort(Err(FenceRefused)));
+                    }
+                    if existing.as_ref().is_some_and(|e| index_t <= e.index.t) {
+                        return Ok(CasAction::Abort(Ok(())));
+                    }
 
-                let file = NsIndexFileV2 {
-                    context: ns_context(),
-                    index: IndexRef {
-                        cid: Some(cid_str.clone()),
-                        t: index_t,
-                    },
-                    fence,
-                    frozen: false,
-                    extra: Default::default(),
-                };
-                let new_bytes = serialize_json(&file)?;
-                Ok(CasAction::Write(new_bytes))
-            })
-            .await?;
-
-        match outcome {
-            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
-            _ => Ok(()),
-        }
-    }
-}
-
-#[async_trait]
-impl AdminPublisher for FileNameService {
-    async fn publish_index_allow_equal_fenced(
-        &self,
-        ledger_id: &str,
-        fence: Option<Fence>,
-        index_t: i64,
-        index_id: &ContentId,
-    ) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let address = Self::index_address(&ledger_name, &branch);
-        let cid_str = index_id.to_string();
-
-        let outcome = self
-            .storage
-            .compare_and_swap(&address, move |bytes| {
-                let existing: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
-                if !index_admits(existing.as_ref(), fence) {
-                    return Ok(CasAction::Abort(Err(FenceRefused)));
-                }
-                // Allow equal
-                let should_update = existing.as_ref().is_none_or(|e| index_t >= e.index.t);
-
-                if should_update {
                     let file = NsIndexFileV2 {
                         context: ns_context(),
                         index: IndexRef {
@@ -1232,16 +1216,68 @@ impl AdminPublisher for FileNameService {
                     };
                     let new_bytes = serialize_json(&file)?;
                     Ok(CasAction::Write(new_bytes))
-                } else {
-                    Ok(CasAction::Abort(Ok(())))
-                }
-            })
-            .await?;
+                })
+                .await?;
 
-        match outcome {
-            CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
-            _ => Ok(()),
-        }
+            match outcome {
+                CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+                _ => Ok(()),
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl AdminPublisher for FileNameService {
+    async fn publish_index_allow_equal_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        self.with_index_repair(ledger_id, fence, || async move {
+            let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+            let address = Self::index_address(&ledger_name, &branch);
+            let cid_str = index_id.to_string();
+
+            let outcome = self
+                .storage
+                .compare_and_swap(&address, move |bytes| {
+                    let existing: Option<NsIndexFileV2> =
+                        bytes.map(deserialize_json).transpose()?;
+                    if !index_admits(existing.as_ref(), fence) {
+                        return Ok(CasAction::Abort(Err(FenceRefused)));
+                    }
+                    // Allow equal
+                    let should_update = existing.as_ref().is_none_or(|e| index_t >= e.index.t);
+
+                    if should_update {
+                        let file = NsIndexFileV2 {
+                            context: ns_context(),
+                            index: IndexRef {
+                                cid: Some(cid_str.clone()),
+                                t: index_t,
+                            },
+                            fence,
+                            frozen: false,
+                            extra: Default::default(),
+                        };
+                        let new_bytes = serialize_json(&file)?;
+                        Ok(CasAction::Write(new_bytes))
+                    } else {
+                        Ok(CasAction::Abort(Ok(())))
+                    }
+                })
+                .await?;
+
+            match outcome {
+                CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+                _ => Ok(()),
+            }
+        })
+        .await
     }
 }
 
@@ -2376,6 +2412,33 @@ mod tests {
             std::fs::read(temp.path().join("ns@v2/plain/main.json")).unwrap(),
             RETIRED_FILE
         );
+    }
+
+    /// An index file a stale writer left under another fence does not keep
+    /// the record's own writer from publishing its index.
+    #[tokio::test]
+    async fn an_index_file_left_under_another_fence_is_repaired() {
+        let (temp, ns) = setup().await;
+        let record = crate::testing::create(&ns, "mydb:main").await.unwrap();
+        let stale = NsIndexFileV2 {
+            context: ns_context(),
+            index: IndexRef { cid: None, t: 0 },
+            fence: Some(Fence::generate()),
+            frozen: false,
+            extra: Default::default(),
+        };
+        std::fs::write(
+            temp.path().join("ns@v3/mydb/main.index.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let index = ContentId::new(ContentKind::IndexRoot, b"index");
+        ns.publish_index_fenced("mydb:main", record.fence, 5, &index)
+            .await
+            .unwrap();
+        let after = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!((after.index_head_id, after.index_t), (Some(index), 5));
     }
 
     #[tokio::test]
