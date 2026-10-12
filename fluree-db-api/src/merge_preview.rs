@@ -717,7 +717,7 @@ impl crate::Fluree {
                     .await?;
                 Some(ValidationSummary {
                     conforms: outcome.conforms(),
-                    report: outcome.report,
+                    report: outcome.report.map(|report| report.to_string()),
                 })
             } else {
                 None
@@ -890,8 +890,8 @@ async fn build_conflict_details(
                     current_asserted_for_key(source_state, &key),
                     current_asserted_for_key(target_state, &key),
                 )?;
-                let source_values = resolve_flake_list(&source_flakes, source_compactor)?;
-                let target_values = resolve_flake_list(&target_flakes, target_compactor)?;
+                let source_values = resolve_fact_list(&source_flakes, source_compactor)?;
+                let target_values = resolve_fact_list(&target_flakes, target_compactor)?;
 
                 Ok::<_, ApiError>(ConflictDetail {
                     key,
@@ -906,13 +906,13 @@ async fn build_conflict_details(
         .await
 }
 
-fn resolve_flake_list(
-    flakes: &[Flake],
+fn resolve_fact_list(
+    facts: &[fluree_db_transact::StoredFact],
     compactor: &IriCompactor,
 ) -> Result<Vec<crate::ResolvedFlake>> {
-    flakes
+    facts
         .iter()
-        .map(|flake| resolve_flake(compactor, flake))
+        .map(|fact| resolve_flake(compactor, fact.flake()))
         .collect()
 }
 

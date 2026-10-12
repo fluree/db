@@ -731,11 +731,13 @@ impl Fluree {
     ) -> Result<Option<GraphDb>> {
         let gs_id = address.id().clone();
 
+        // A drop leaves the record as a tombstone.
         let Some(record) = self
             .nameservice()
             .lookup_graph_source(&gs_id)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
+            .filter(|record| !record.retracted)
         else {
             return Ok(None);
         };

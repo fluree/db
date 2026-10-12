@@ -9,7 +9,7 @@
 //! `SUMMARY.md` TOC) orphans one.
 //!
 //! Assumes the full command surface: the gating features (`server`, `shacl`,
-//! `iceberg`, `aws`) are all DEFAULT features of this crate, so a plain
+//! `iceberg`, `sql`, `delta`, `graphql`, `aws`) are all DEFAULT features of this crate, so a plain
 //! `cargo test -p fluree-db-cli` sees every command — no `--all-features`
 //! needed (CI's `--all-features` is belt-and-suspenders, not load-bearing).
 //! Only a `--no-default-features` build would report the feature-gated pages

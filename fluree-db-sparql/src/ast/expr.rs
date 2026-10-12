@@ -474,6 +474,9 @@ pub enum FunctionName {
     CosineSimilarity,
     EuclideanDistance,
 
+    /// BM25 relevance of a full-text value to a query string (Fluree extension)
+    Fulltext,
+
     // SPARQL 1.2 triple-term functions (RDF-star). Accept-then-defer per
     // burn-down decision D-1: parsed and arity-validated here, but lowering
     // rejects them with `not_implemented` (no evaluable capability yet).
@@ -550,6 +553,7 @@ impl FunctionName {
             "EUCLIDEANDISTANCE" | "EUCLIDEAN_DISTANCE" | "EUCLIDIANDISTANCE" => {
                 Some(FunctionName::EuclideanDistance)
             }
+            "FULLTEXT" | "FULL_TEXT" => Some(FunctionName::Fulltext),
             // SPARQL 1.2 triple-term functions (case-insensitive, matching the
             // grammar's BuiltInCall keywords). `isTRIPLE` uppercases to
             // `ISTRIPLE`.

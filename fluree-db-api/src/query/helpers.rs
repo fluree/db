@@ -70,8 +70,9 @@ pub(crate) fn parse_sparql_to_ir(
     sparql: &str,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_sparql::ParamMap>,
 ) -> Result<(VarRegistry, Query)> {
-    let ast = parse_and_validate_sparql(sparql)?;
+    let ast = parse_and_validate_sparql(sparql, params)?;
     lower_sparql_ast(ast, snapshot, default_context, sparql)
 }
 
@@ -505,7 +506,21 @@ pub(crate) fn sparql_parse_count() -> usize {
     SPARQL_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
-pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
+/// Parse and validate `sparql`, then substitute `params` into it. Without
+/// parameters this is the parse alone.
+pub(crate) fn parse_and_validate_sparql(
+    sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
+) -> Result<fluree_db_sparql::SparqlAst> {
+    let mut ast = parse_and_validate_unparameterized(sparql)?;
+    if let Some(params) = params {
+        fluree_db_sparql::substitute_params(&mut ast, params)
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?;
+    }
+    Ok(ast)
+}
+
+fn parse_and_validate_unparameterized(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
     #[cfg(test)]
     SPARQL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
 
@@ -706,6 +721,7 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
         // specifically (a query too memory-heavy, not a slow one).
         fluree_db_query::QueryError::MemoryBudgetExceeded { .. } => 507,
         fluree_db_query::QueryError::InvalidQuery(_) => 400,
+        fluree_db_query::QueryError::UngroupedRead(_) => 400,
         fluree_db_query::QueryError::InvalidFilter(_) => 400,
         fluree_db_query::QueryError::InvalidExpression(_) => 400,
         _ => 500,
@@ -833,7 +849,7 @@ mod tests {
         reset_sparql_parse_count();
 
         let sparql = "SELECT * WHERE { ?s ?p ?o }";
-        let ast = parse_and_validate_sparql(sparql).expect("parse");
+        let ast = parse_and_validate_sparql(sparql, None).expect("parse");
         assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
 
         let snapshot = LedgerSnapshot::genesis("test:main");
@@ -852,7 +868,8 @@ mod tests {
     fn parse_sparql_to_ir_parses_once() {
         reset_sparql_parse_count();
         let snapshot = LedgerSnapshot::genesis("test:main");
-        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None).expect("lower");
+        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None, None)
+            .expect("lower");
         assert_eq!(sparql_parse_count(), 1);
     }
 

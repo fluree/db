@@ -226,7 +226,7 @@ async fn run_ledger_archive(
         ));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     match output {
         Some(path) => {
@@ -481,7 +481,7 @@ async fn run_local_rdf(
         ));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let format = parse_rdf_format(format_str)?;
 
     let mut builder = fluree.export(alias).format(format);

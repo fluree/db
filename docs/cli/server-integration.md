@@ -355,9 +355,14 @@ MATCH (n:Person {id: 7}) RETURN n
 
 Makes one named graph's contents exactly the payload, committing only the
 delta. Data-bearer auth (same bracket as `/insert` / `/upsert`), not admin.
-The CLI converts Turtle to JSON-LD client-side and sends it as
-`application/json`; TriG, which that conversion cannot carry, is sent as
-`application/trig`. A dry run answers with a delta report and
+The CLI sends RDF text as written: Turtle as `text/turtle`, TriG as
+`application/trig`, JSON-LD as `application/json`. A server from before
+`/sync` read RDF bodies refuses a Turtle body, with `415 Unsupported Media
+Type` or (v4.2.0 and v4.2.1) a `400` whose message ends `convert Turtle
+payloads client-side`; for that server the CLI converts the Turtle to
+JSON-LD client-side, sends it again, and prints a warning. Any other `400`
+is reported as is, and TriG is never
+converted. A dry run answers with a delta report and
 must commit nothing; a real run answers with the standard transact response.
 Designed so the CLI's source of desired contents (today RDF text; later
 R2RML-mapped Iceberg / CSV / spreadsheet data) is invisible to the server —
@@ -1524,7 +1529,7 @@ Content-Type: application/json
 | `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
-| body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI sends JSON-LD for JSON-LD and Turtle (converted client-side), so those work against servers that predate RDF bodies; it sends TriG as `application/trig`. Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
+| body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI sends Turtle as `text/turtle` and TriG as `application/trig`, converting Turtle to JSON-LD client-side only when a server that predates RDF bodies refuses it (a `415`, or v4.2.0 / v4.2.1's `400`). Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
 
 ### Auth
 
@@ -2380,12 +2385,15 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Graph source name (no colons) |
-| `mode` | string | No | `"rest"` (default) or `"direct"` |
+| `mode` | string | No | `"rest"` (default), `"direct"`, `"glue"` (AWS Glue Data Catalog), or `"s3tables"` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST mode | REST catalog URI |
-| `table` | string | No | Table identifier (`namespace.table`); required for REST mode if not specified in R2RML mapping |
-| `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`) |
-| `r2rml` | string | Yes | R2RML mapping source (storage address or path) |
-| `r2rml_type` | string | No | Mapping media type (e.g., `"text/turtle"`); inferred from extension |
+| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`); required for REST, Glue and S3 Tables modes if not specified in R2RML mapping |
+| `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`), or a `file://` URI / absolute local path under `FLUREE_ICEBERG_LOCAL_ROOTS` |
+| `region` | string | No | AWS region of the Glue / S3 Tables API (Glue and S3 Tables modes) |
+| `catalog_id` | string | No | Glue catalog id for cross-account access (Glue mode; default: the caller's account) |
+| `table_bucket_arn` | string | S3 Tables mode | S3 Tables table-bucket ARN (`arn:aws:s3tables:<region>:<account>:bucket/<name>`) |
+| `r2rml` | string | No | Inline R2RML mapping content (Turtle). Without it the source is a plain Iceberg source with no mapping |
+| `r2rml_type` | string | No | Mapping media type; default `"text/turtle"` (JSON-LD mappings are not supported yet) |
 | `branch` | string | No | Branch name (default: `"main"`) |
 | `auth_bearer` | string | No | Bearer token for REST catalog auth |
 | `oauth2_token_url` | string | No | OAuth2 token endpoint |
@@ -2399,9 +2407,14 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 
 **Validation rules:**
 - `name` must not be empty or contain `:`
-- `r2rml` is required (defines how table rows become RDF triples)
+- `r2rml`, when given, must parse and compile as an R2RML mapping (it defines how table rows become RDF triples); its table and column names are not checked against the tables here (see [Iceberg → Schema Mismatch](../graph-sources/iceberg.md#schema-mismatch))
+- `mode` must be one of `rest`, `direct`, `glue`, `s3tables` (any case)
 - REST mode requires `catalog_uri`; requires `table` unless specified in R2RML mapping's `rr:tableName`
-- Direct mode requires `table_location` (must start with `s3://` or `s3a://`)
+- Direct mode requires `table_location`: an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path, which is accepted only under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables))
+- Glue mode requires `table` unless specified in R2RML mapping's `rr:tableName`; `region` and `catalog_id` are optional
+- S3 Tables mode requires `table_bucket_arn` (a well-formed S3 Tables bucket ARN, any AWS partition) and `table` unless specified in R2RML mapping's `rr:tableName`; a `region` that contradicts the ARN's region is refused
+- `region` and `s3_region` must be AWS region codes (e.g. `us-east-1`) in Glue and S3 Tables modes
+- Glue and S3 Tables modes read with the server's ambient AWS credentials; vended credentials are turned off for them
 - OAuth2 fields must all be provided together (url + id + secret)
 
 **Example — REST catalog with R2RML:**
@@ -2412,7 +2425,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
   "mode": "rest",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "table": "sales.orders",
-  "r2rml": "mappings/orders.ttl",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "auth_bearer": "my-token",
   "warehouse": "my-warehouse"
 }
@@ -2425,7 +2438,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
   "name": "airlines",
   "mode": "rest",
   "catalog_uri": "https://polaris.example.com/api/catalog",
-  "r2rml": "mappings/airlines.ttl",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "auth_bearer": "my-token"
 }
 ```
@@ -2437,8 +2450,20 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
   "name": "execution-log",
   "mode": "direct",
   "table_location": "s3://bucket/warehouse/logs/execution_log",
-  "r2rml": "mappings/execution_log.ttl",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "s3_region": "us-east-1"
+}
+```
+
+**Example — AWS Glue Data Catalog:**
+
+```json
+{
+  "name": "warehouse-orders",
+  "mode": "glue",
+  "region": "us-east-1",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ..."
 }
 ```
 
@@ -2448,16 +2473,18 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 |-------|------|---------|-------------|
 | `graph_source_id` | string | Always | Created ID (e.g., `"warehouse-orders:main"`) |
 | `table_identifier` | string | Always | Table identifier or derived from location |
-| `catalog_uri` | string | Always | Catalog URI or S3 location |
-| `connection_tested` | boolean | Always | Whether catalog connection was verified (always `false` for direct mode) |
-| `mapping_source` | string | Always | R2RML mapping source |
-| `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
-| `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |
+| `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
+| `connection_tested` | boolean | Always | Whether catalog connection was verified (tested for REST mode only; always `false` for Direct, Glue and S3 Tables) |
+| `mapping_source` | string | With `r2rml` | Content address of the stored R2RML mapping |
+| `triples_map_count` | integer | With `r2rml` | Number of TriplesMap definitions found |
+| `mapping_validated` | boolean | With `r2rml` | Whether mapping was parsed and compiled successfully |
 
 **Error responses:**
-- `400 Bad Request` — validation failures (missing fields, invalid mode, bad table identifier)
+- `400 Bad Request` — validation failures (missing fields, invalid mode, bad table identifier, an `r2rml` that does not parse or compile)
 - `409 Conflict` — graph source with this name already exists (if your nameservice enforces uniqueness)
-- `500 Internal Server Error` — catalog connection failure, mapping load failure, nameservice write failure
+- `500 Internal Server Error` — nameservice write failure
+
+A REST catalog that cannot be reached does not fail the request: the source is created and the response carries `connection_tested: false`.
 
 ### Querying graph sources
 
@@ -2523,7 +2550,7 @@ WHERE {
 
 **How it works:** When the `iceberg` feature is compiled, `query_from()` and `graph().query()` automatically call `.with_r2rml()`, which constructs a `FlureeR2rmlProvider` that can resolve graph source names to R2RML mappings and route triple patterns through the Iceberg scan engine. The `NameService` trait requires `GraphSourceLookup` (read-only graph source discovery), so graph source resolution is always available at the nameservice layer.
 
-**Known limitation:** `FROM <ledger>, <graph-source>` with bare WHERE patterns (no GRAPH wrapper) — the graph source participates in the dataset but bare triple patterns only scan native indexes. Use explicit `GRAPH <gs:main> { ... }` for the graph source part in mixed-source queries.
+A graph source cannot share the default graph with a ledger: `FROM <ledger> FROM <graph-source>` is refused with an error naming the form that works. Name the graph source with `FROM NAMED <gs:main>` and read it inside `GRAPH <gs:main> { ... }`.
 
 ### Authentication
 

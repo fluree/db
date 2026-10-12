@@ -86,6 +86,8 @@ impl Fluree {
         options: QueryExecutionOptions,
         parsed_ast: Option<fluree_db_sparql::SparqlAst>,
     ) -> Result<QueryResult> {
+        options.sparql_params(&input)?;
+
         // Single-ledger fast path (only safe for JSON-LD or SPARQL without dataset clauses).
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
@@ -103,7 +105,9 @@ impl Fluree {
                         // clause, so this never delegates in that case.
                         let has_dataset = match &parsed_ast {
                             Some(ast) => sparql_ast_has_dataset(ast),
-                            None => sparql_ast_has_dataset(&parse_and_validate_sparql(sparql)?),
+                            None => {
+                                sparql_ast_has_dataset(&parse_and_validate_sparql(sparql, None)?)
+                            }
                         };
                         if !has_dataset {
                             return self.query_with_options(view, input, options).await;
@@ -160,6 +164,7 @@ impl Fluree {
                         sparql,
                         &primary.snapshot,
                         primary.default_context.as_ref(),
+                        options.sparql_params(&input)?,
                     )?,
                 }
             }
@@ -207,6 +212,7 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let input = q.into();
+        options.sparql_params(&input)?;
 
         // Single-ledger fast path (only safe for JSON-LD or SPARQL without dataset clauses).
         if dataset.is_single_ledger() {
@@ -225,7 +231,7 @@ impl Fluree {
                             .await;
                     }
                     QueryInput::Sparql(sparql) => {
-                        let ast = parse_and_validate_sparql(sparql)?;
+                        let ast = parse_and_validate_sparql(sparql, None)?;
                         let has_dataset = match &ast.body {
                             fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.is_some(),
                             fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.is_some(),
@@ -268,9 +274,12 @@ impl Fluree {
                 primary.default_context.as_ref(),
                 None,
             )?,
-            QueryInput::Sparql(sparql) => {
-                parse_sparql_to_ir(sparql, &primary.snapshot, primary.default_context.as_ref())?
-            }
+            QueryInput::Sparql(sparql) => parse_sparql_to_ir(
+                sparql,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                options.sparql_params(&input)?,
+            )?,
         };
 
         // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
@@ -357,6 +366,9 @@ impl Fluree {
     {
         // Tracker: caller-provided options if given, else per-input defaults.
         let tracker = tracked_query_tracker(&input, &tracking_override, parsed_ast.as_ref());
+        let params = options.sparql_params(&input).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)
@@ -397,6 +409,7 @@ impl Fluree {
                         sparql,
                         &primary.snapshot,
                         primary.default_context.as_ref(),
+                        params,
                     ),
                 };
                 lowered.map_err(|e| {
@@ -484,6 +497,9 @@ impl Fluree {
         let input = q.into();
 
         let tracker = tracked_query_tracker(&input, &tracking_override, None);
+        let params = options.sparql_params(&input).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)
@@ -509,12 +525,15 @@ impl Fluree {
             .map_err(|e| {
                 crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
             })?,
-            QueryInput::Sparql(sparql) => {
-                parse_sparql_to_ir(sparql, &primary.snapshot, primary.default_context.as_ref())
-                    .map_err(|e| {
-                        crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-                    })?
-            }
+            QueryInput::Sparql(sparql) => parse_sparql_to_ir(
+                sparql,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                params,
+            )
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+            })?,
         };
 
         // Auto-wrap for graph source context, then refuse whatever the wrap
@@ -733,21 +752,6 @@ impl Fluree {
 
         reject_reasoning_in_history_mode(history_mode, executable).map_err(ApiError::query)?;
 
-        let mut prepare_config = if history_mode {
-            PrepareConfig::history(primary.binary_store.as_ref())
-        } else {
-            PrepareConfig::current(primary.binary_store.as_ref())
-        };
-        // A `>= 2`-member default union is an RDF merge (a set), not a bag
-        // (SPARQL §13.2); tell the planner so it forces full triple identity and
-        // the `DatasetOperator` deduplicates across members.
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
-        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
-            .await
-            .map_err(query_error_to_api_error)?;
-
         // Binary scans rely on a ledger-specific binary index store. For datasets that span
         // multiple ledgers, using only the primary view's store will silently drop results.
         //
@@ -762,6 +766,24 @@ impl Fluree {
                 .named
                 .values()
                 .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+
+        let mut prepare_config = if history_mode {
+            PrepareConfig::history(primary.binary_store.as_ref())
+        } else {
+            PrepareConfig::current(primary.binary_store.as_ref())
+        };
+        // A `>= 2`-member default union is an RDF merge (a set), not a bag
+        // (SPARQL §13.2); tell the planner so it forces full triple identity and
+        // the `DatasetOperator` deduplicates across members.
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
+        if !is_single_ledger_dataset {
+            prepare_config = prepare_config.without_binary_scans();
+        }
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
 
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
         // for queries that don't actually call `fulltext(...)`. Spatial
@@ -918,6 +940,18 @@ impl Fluree {
         reject_reasoning_in_history_mode(history_mode, executable)
             .map_err(fluree_db_query::QueryError::InvalidQuery)?;
 
+        // See `execute_dataset_into_with_r2rml`: a multi-ledger dataset runs
+        // without binary scans.
+        let primary_ledger_id: &str = primary.ledger_id.as_ref();
+        let is_single_ledger_dataset = dataset
+            .default
+            .iter()
+            .all(|v| v.ledger_id.as_ref() == primary_ledger_id)
+            && dataset
+                .named
+                .values()
+                .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+
         let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
@@ -928,17 +962,12 @@ impl Fluree {
         prepare_config.planning = prepare_config
             .planning
             .with_multi_default_graph(runtime_dataset.default_graphs().len() >= 2);
-        let prepared = prepare_execution_with_config(db, executable, &prepare_config).await?;
-
-        let primary_ledger_id: &str = primary.ledger_id.as_ref();
-        let is_single_ledger_dataset = dataset
-            .default
-            .iter()
-            .all(|v| v.ledger_id.as_ref() == primary_ledger_id)
-            && dataset
-                .named
-                .values()
-                .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+        if !is_single_ledger_dataset {
+            prepare_config = prepare_config.without_binary_scans();
+        }
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(|e| e.name_variables(vars))?;
 
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
         // for queries that don't actually call `fulltext(...)`. Spatial

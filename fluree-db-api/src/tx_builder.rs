@@ -33,8 +33,8 @@ use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
 use fluree_db_transact::GraphSel;
 use fluree_db_transact::{
-    lower_sparql_update_request, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
-    RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
+    lower_sparql_update_request, CommitOpts, NamespaceRegistry, TransactError, Txn, TxnOpts,
+    TxnType,
 };
 use rustc_hash::FxHashSet;
 use std::collections::HashMap;
@@ -94,6 +94,7 @@ impl GraphPayload<'_> {
 /// last operation's delta carries the whole request's allocations.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
 ) -> Result<Vec<Txn>> {
@@ -105,7 +106,7 @@ pub(crate) fn parse_and_lower_sparql_update(
             format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
         ));
     }
-    let ast = parsed
+    let mut ast = parsed
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
 
@@ -130,6 +131,10 @@ pub(crate) fn parse_and_lower_sparql_update(
             .map(|d| d.message.clone())
             .unwrap_or_else(|| "SPARQL UPDATE validation error".to_string());
         return Err(ApiError::sparql(message, errors));
+    }
+    if let Some(params) = params {
+        fluree_db_sparql::substitute_params(&mut ast, params)
+            .map_err(|e| ApiError::http(400, e.to_string()))?;
     }
 
     let mut ns = NamespaceRegistry::from_db(snapshot);
@@ -156,7 +161,7 @@ pub(crate) fn parse_and_lower_sparql_update(
 /// `commit_with_handle` would consume the already-built `stage_result`.
 /// The consensus layer's retry, which preserves the request body across
 /// attempts, handles that case instead.
-fn is_retryable_commit_conflict(e: &ApiError) -> bool {
+pub(crate) fn is_retryable_commit_conflict(e: &ApiError) -> bool {
     matches!(
         e,
         ApiError::Transact(
@@ -405,14 +410,6 @@ impl GraphOp<'_> {
     }
 }
 
-/// Result of parsing a transaction operation to JSON.
-/// For Turtle inputs with TriG GRAPH blocks, also includes raw txn-meta and named graphs.
-pub(crate) struct ParsedOperation {
-    pub json: JsonValue,
-    pub trig_meta: Option<RawTrigMeta>,
-    pub named_graphs: Vec<NamedGraphBlock>,
-}
-
 impl TransactOperation<'_> {
     /// Get the `TxnType` for this operation.
     pub(crate) fn txn_type(&self) -> TxnType {
@@ -426,51 +423,25 @@ impl TransactOperation<'_> {
         }
     }
 
-    /// Parse the operation to JSON, extracting TriG txn-meta and named graphs from Turtle inputs.
-    ///
-    /// For Turtle inputs with `GRAPH <...> { ... }` blocks, this extracts:
-    /// - Metadata from txn-meta graph
-    /// - Named graph blocks for user-defined graphs
-    ///
-    /// The metadata can be resolved to `TxnMetaEntry` using `resolve_trig_meta()` once a
-    /// `NamespaceRegistry` is available. Named graphs are converted to
-    /// `TripleTemplate`s with appropriate graph_id during staging.
-    pub(crate) fn to_json_with_trig_meta(&self) -> Result<ParsedOperation> {
+    /// The operation's JSON-LD body. RDF text and graph operations are
+    /// staged by their own lanes and never read as JSON-LD.
+    pub(crate) fn to_json(&self) -> Result<JsonValue> {
         match self {
-            TransactOperation::InsertJson(j) => Ok(ParsedOperation {
-                json: (*j).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
-            TransactOperation::UpsertJson(j) => Ok(ParsedOperation {
-                json: (*j).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
-            TransactOperation::UpdateJson(j) => Ok(ParsedOperation {
-                json: (*j).clone(),
-                trig_meta: None,
-                named_graphs: Vec::new(),
-            }),
+            TransactOperation::InsertJson(j)
+            | TransactOperation::UpsertJson(j)
+            | TransactOperation::UpdateJson(j) => Ok((*j).clone()),
             // Every staging path dispatches graph ops first; parsing one as a
             // plain insert would drop its graph scope (and a sync's
             // retraction wave).
             TransactOperation::Graph(_) => Err(ApiError::internal(
                 "graph operations must be staged through stage_graph_op_tracked",
             )),
-            TransactOperation::InsertTurtle(ttl) | TransactOperation::UpsertTurtle(ttl) => {
-                // Phase 1: Extract TriG GRAPH block (if present)
-                let phase1 = parse_trig_phase1(ttl)?;
-
-                // Parse cleaned Turtle to JSON
-                let json = fluree_graph_turtle::parse_to_json(&phase1.turtle)?;
-
-                Ok(ParsedOperation {
-                    json,
-                    trig_meta: phase1.raw_meta,
-                    named_graphs: phase1.named_graphs,
-                })
-            }
+            // RDF text is parsed once, into templates, by the staging path
+            // (`stage_turtle_insert_with_opts`, `stage_rdf_text_tracked`);
+            // reading it here would re-encode it as JSON-LD.
+            TransactOperation::InsertTurtle(_) | TransactOperation::UpsertTurtle(_) => Err(
+                ApiError::internal("RDF text must be staged through its own lane, not as JSON-LD"),
+            ),
         }
     }
 }
@@ -493,6 +464,8 @@ pub(crate) struct TransactCore<'a> {
     /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
     /// `execute()` so its namespace allocation shares the staging registry.
     pub(crate) pending_sparql: Option<&'a str>,
+    /// Parameters substituted into `pending_sparql`.
+    pub(crate) sparql_params: Option<&'a fluree_db_sparql::ParamMap>,
     /// A multi-clause Cypher write staged clause-by-clause under the write
     /// lock by the sequential driver (see [`crate::cypher_seq`]).
     pub(crate) pre_built_cypher_seq: Option<crate::cypher_seq::CypherSeqInput>,
@@ -525,6 +498,7 @@ impl<'a> TransactCore<'a> {
             pre_built_txn: None,
             pre_built_txn_followup: None,
             pending_sparql: None,
+            sparql_params: None,
             pre_built_cypher_seq: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -605,7 +579,11 @@ impl<'a> TransactCore<'a> {
         self.txn_opts = opts;
     }
 
-    pub(crate) fn set_sparql_update(&mut self, sparql: &'a str) {
+    pub(crate) fn set_sparql_update(
+        &mut self,
+        sparql: &'a str,
+        params: Option<&'a fluree_db_sparql::ParamMap>,
+    ) {
         if self.operation.is_some() || self.pre_built_txn.is_some() || self.pending_sparql.is_some()
         {
             self.errors.push(BuilderError::Conflict {
@@ -614,6 +592,7 @@ impl<'a> TransactCore<'a> {
             });
         } else {
             self.pending_sparql = Some(sparql);
+            self.sparql_params = params;
         }
     }
 
@@ -1062,7 +1041,18 @@ impl<'a> RefTransactBuilder<'a> {
     /// namespace-conflict retry that pre-lowering against an unlocked
     /// snapshot would require.
     pub fn sparql_update(mut self, sparql: &'a str) -> Self {
-        self.core.set_sparql_update(sparql);
+        self.core.set_sparql_update(sparql, None);
+        self
+    }
+
+    /// [`Self::sparql_update`] with variables bound to values; see
+    /// [`fluree_db_sparql::substitute_params`].
+    pub fn sparql_update_with_params(
+        mut self,
+        sparql: &'a str,
+        params: &'a fluree_db_sparql::ParamMap,
+    ) -> Self {
+        self.core.set_sparql_update(sparql, Some(params));
         self
     }
 
@@ -1177,37 +1167,42 @@ fn remap_sid(sid: &mut Sid, remap: &HashMap<u16, u16>) {
     }
 }
 
-enum OpPlan<'a> {
+pub(crate) enum OpPlan<'a> {
     InsertTurtle(&'a str),
+    /// RDF text staged as templates (an upsert), parsed against whichever
+    /// state it is staged on: parsing allocates namespace codes relative to
+    /// that state's table.
+    Rdf {
+        txn_type: TxnType,
+        text: &'a str,
+    },
     /// A SPARQL UPDATE request, parsed and lowered against whichever state
     /// it is staged on — lowering allocates namespace codes relative to
     /// that state's table.
-    Sparql(&'a str),
+    Sparql(&'a str, Option<&'a fluree_db_sparql::ParamMap>),
     JsonLike {
         txn_type: TxnType,
         txn_json: JsonValue,
-        trig_meta: Option<RawTrigMeta>,
-        named_graphs: Vec<NamedGraphBlock>,
     },
     /// A write scoped to one graph (see [`GraphOp`]).
     Graph(GraphOp<'a>),
 }
 
 impl<'a> OpPlan<'a> {
-    /// Pre-parse a [`TransactOperation`] into an [`OpPlan`], extracting TriG
-    /// metadata and named graphs for Turtle inputs.
-    fn from_op(op: TransactOperation<'a>) -> Result<Self> {
+    /// Pre-parse a [`TransactOperation`] into an [`OpPlan`].
+    pub(crate) fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
+            TransactOperation::UpsertTurtle(text) => Ok(OpPlan::Rdf {
+                txn_type: TxnType::Upsert,
+                text,
+            }),
             TransactOperation::Graph(op) => Ok(OpPlan::Graph(op)),
             _ => {
                 let txn_type = op.txn_type();
-                let parsed = op.to_json_with_trig_meta()?;
                 Ok(OpPlan::JsonLike {
                     txn_type,
-                    txn_json: parsed.json,
-                    trig_meta: parsed.trig_meta,
-                    named_graphs: parsed.named_graphs,
+                    txn_json: op.to_json()?,
                 })
             }
         }
@@ -1431,8 +1426,12 @@ impl Fluree {
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let txns =
-                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
+            let txns = parse_and_lower_sparql_update(
+                sparql,
+                core.sparql_params,
+                &ledger_state.snapshot,
+                core.txn_opts,
+            )?;
             // A single-op request reports its own type; a multi-op (or
             // empty no-op) request is reported as a generic update.
             let txn_type = match txns.as_slice() {
@@ -1476,6 +1475,28 @@ impl Fluree {
             return Ok((stage_result, TxnType::Insert, commit_opts, None));
         }
 
+        // RDF text upsert: parsed once into templates.
+        if let TransactOperation::UpsertTurtle(text) = op {
+            let commit_opts = self.maybe_spawn_txn_upload(
+                core.commit_opts,
+                &ledger_id,
+                serde_json::Value::String(text.to_string()),
+                store_raw_txn,
+            );
+            let stage_result = self
+                .stage_rdf_text_tracked(
+                    ledger_state,
+                    TxnType::Upsert,
+                    text,
+                    core.txn_opts,
+                    Some(index_config),
+                    tracker_ref,
+                    core.policy.as_ref(),
+                )
+                .await?;
+            return Ok((stage_result, TxnType::Upsert, commit_opts, None));
+        }
+
         // Graph ops: dedicated staging (graph scope, sync retraction wave).
         // Must be dispatched before the JSON-like fallthrough, which would
         // otherwise stage the payload as a plain default-graph insert.
@@ -1499,12 +1520,9 @@ impl Fluree {
             return Ok((stage_result, op.txn_type(), commit_opts, None));
         }
 
-        // JSON-like operation: parse, extracting TriG metadata + named graphs.
+        // JSON-LD operation.
         let txn_type = op.txn_type();
-        let parsed = op.to_json_with_trig_meta()?;
-        let txn_json = parsed.json;
-        let trig_meta = parsed.trig_meta;
-        let named_graphs = parsed.named_graphs;
+        let txn_json = op.to_json()?;
 
         let commit_opts = self.maybe_spawn_txn_upload(
             core.commit_opts,
@@ -1513,14 +1531,12 @@ impl Fluree {
             store_raw_txn,
         );
         let stage_result = self
-            .stage_transaction_with_named_graphs_tracked(
+            .stage_transaction_tracked(
                 ledger_state,
                 txn_type,
                 &txn_json,
                 core.txn_opts,
                 Some(index_config),
-                trig_meta.as_ref(),
-                &named_graphs,
                 tracker_ref,
                 core.policy.as_ref(),
             )
@@ -1531,7 +1547,8 @@ impl Fluree {
 
     /// Stage a pre-parsed [`OpPlan`] against a given [`LedgerState`] — one
     /// iteration of the optimistic-path retry loop.
-    async fn stage_plan(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_plan(
         &self,
         op_plan: &OpPlan<'_>,
         ledger_state: LedgerState,
@@ -1539,12 +1556,18 @@ impl Fluree {
         commit_opts_base: &CommitOpts,
         tracker_ref: Option<&Tracker>,
         index_config: &IndexConfig,
+        policy: Option<&PolicyContext>,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         let ledger_id = ledger_state.ledger_id().to_string();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
         match op_plan {
-            OpPlan::Sparql(sparql) => {
-                let txns = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, txn_opts)?;
+            OpPlan::Sparql(sparql, params) => {
+                let txns = parse_and_lower_sparql_update(
+                    sparql,
+                    *params,
+                    &ledger_state.snapshot,
+                    txn_opts,
+                )?;
                 // A single-op request reports its own type; a multi-op (or
                 // empty no-op) request is reported as a generic update.
                 let txn_type = match txns.as_slice() {
@@ -1556,7 +1579,7 @@ impl Fluree {
                         ledger_state,
                         txns,
                         Some(index_config),
-                        None,
+                        policy,
                         tracker_ref,
                     )
                     .await?;
@@ -1576,17 +1599,32 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, TxnType::Insert, commit_opts))
             }
-            OpPlan::JsonLike {
-                txn_type,
-                txn_json,
-                trig_meta,
-                named_graphs,
-            } => {
+            OpPlan::Rdf { txn_type, text } => {
+                let commit_opts = self.maybe_spawn_txn_upload(
+                    commit_opts_base.clone(),
+                    &ledger_id,
+                    serde_json::Value::String((*text).to_string()),
+                    store_raw_txn,
+                );
+                let stage_result = self
+                    .stage_rdf_text_tracked(
+                        ledger_state,
+                        *txn_type,
+                        text,
+                        txn_opts,
+                        Some(index_config),
+                        tracker_ref,
+                        None,
+                    )
+                    .await?;
+                Ok((stage_result, *txn_type, commit_opts))
+            }
+            OpPlan::JsonLike { txn_type, txn_json } => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
                     &ledger_id,
@@ -1594,16 +1632,14 @@ impl Fluree {
                     store_raw_txn,
                 );
                 let stage_result = self
-                    .stage_transaction_with_named_graphs_tracked(
+                    .stage_transaction_tracked(
                         ledger_state,
                         *txn_type,
                         txn_json,
                         txn_opts,
                         Some(index_config),
-                        trig_meta.as_ref(),
-                        named_graphs,
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
@@ -1622,7 +1658,7 @@ impl Fluree {
                         txn_opts,
                         Some(index_config),
                         tracker_ref,
-                        None,
+                        policy,
                     )
                     .await?;
                 Ok((stage_result, op.txn_type(), commit_opts))
@@ -1676,7 +1712,7 @@ impl Fluree {
     /// Short-circuits a no-op stage ([`StageResult::is_noop`]) without
     /// touching the cache or triggering indexing.
     #[allow(clippy::too_many_arguments)]
-    async fn commit_and_finalize(
+    pub(crate) async fn commit_and_finalize(
         &self,
         write_guard: LedgerWriteGuard,
         stage_result: StageResult,
@@ -1885,7 +1921,7 @@ impl Fluree {
     /// On a pass the flakes are restamped to the new `t` and layered over a
     /// clone of the locked state; on a fail the stage is dropped and `None`
     /// says to stage again under the lock.
-    fn rebase_stage(
+    pub(crate) fn rebase_stage(
         guard: &LedgerWriteGuard,
         stage: StageResult,
         base_t: i64,
@@ -2332,7 +2368,7 @@ impl Fluree {
         // commit itself. Later attempts take the lock first and stage under
         // it; they are for commit conflicts that `refresh` heals.
         let op_plan = match core.pending_sparql.take() {
-            Some(sparql) => OpPlan::Sparql(sparql),
+            Some(sparql) => OpPlan::Sparql(sparql, core.sparql_params),
             None => OpPlan::from_op(core.operation.take().unwrap())?, // safe: validate checks
         };
         let txn_opts = core.txn_opts;
@@ -2358,6 +2394,7 @@ impl Fluree {
                         &commit_opts_base,
                         tracker_ref,
                         &index_config,
+                        None,
                     )
                     .await?;
                 let stage_us = stage_started.elapsed().as_micros() as u64;
@@ -2397,6 +2434,7 @@ impl Fluree {
                             &commit_opts_base,
                             tracker_ref,
                             &index_config,
+                            None,
                         )
                         .await?;
                     (write_guard, stage_result, txn_type, commit_opts)
@@ -2411,6 +2449,7 @@ impl Fluree {
                         &commit_opts_base,
                         tracker_ref,
                         &index_config,
+                        None,
                     )
                     .await?;
                 (write_guard, stage_result, txn_type, commit_opts)

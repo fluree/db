@@ -13,6 +13,7 @@
 // plain `allow` is the only annotation correct across every binary.
 #![allow(dead_code)]
 
+pub mod hooked_storage;
 pub mod recording_ns;
 pub mod span_capture;
 

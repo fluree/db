@@ -46,7 +46,7 @@ impl Fluree {
         let identity = jws_result.did;
 
         // Parse SPARQL to extract dataset spec
-        let ast = parse_and_validate_sparql(sparql)?;
+        let ast = parse_and_validate_sparql(sparql, None)?;
 
         // The dataset clause, with its IRIs expanded against the prologue.
         let spec = DatasetSpec::from_sparql_ast(&ast)

@@ -226,42 +226,38 @@ impl DataSetDb {
     /// `t` (per-view), and policy enforcement is carried via `GraphRef::policy_enforcer`.
     pub(crate) fn as_runtime_dataset(&self) -> fluree_db_query::DataSet<'_> {
         let mut ds = fluree_db_query::DataSet::new();
+        // A history range's views are loaded at the ledger head; its `to`
+        // bounds what the scans may read.
+        let graph_t = |view: &GraphDb| match self.history_range {
+            Some((_, to_t)) => view.t.min(to_t),
+            None => view.t,
+        };
 
-        for view in &self.default {
+        fn graph_ref(view: &GraphDb, t: i64) -> fluree_db_query::GraphRef<'_> {
             let mut graph = fluree_db_query::GraphRef::new(
                 view.snapshot.as_ref(),
                 view.graph_id,
                 view.overlay.as_ref(),
-                view.t,
-                Arc::clone(&view.ledger_id),
-            );
-            graph.policy_enforcer = view.policy_enforcer().cloned();
-            graph.kind = view.member_kind();
-            ds = ds.with_default_graph(graph);
-        }
-
-        fn graph_ref(view: &GraphDb) -> fluree_db_query::GraphRef<'_> {
-            let mut graph = fluree_db_query::GraphRef::new(
-                view.snapshot.as_ref(),
-                view.graph_id,
-                view.overlay.as_ref(),
-                view.t,
+                t,
                 Arc::clone(&view.ledger_id),
             );
             graph.policy_enforcer = view.policy_enforcer().cloned();
             graph.kind = view.member_kind();
             graph
         }
+        for view in &self.default {
+            ds = ds.with_default_graph(graph_ref(view, graph_t(view)));
+        }
         for iri in &self.named_order {
             let view = self
                 .named
                 .get(iri)
                 .expect("named_order key must exist in named map");
-            ds = ds.with_named_graph(Arc::clone(iri), graph_ref(view));
+            ds = ds.with_named_graph(Arc::clone(iri), graph_ref(view, graph_t(view)));
         }
         for (alias, member) in &self.named_aliases {
             if let Some(view) = self.named.get(member) {
-                ds = ds.with_named_graph_alias(Arc::clone(alias), graph_ref(view));
+                ds = ds.with_named_graph_alias(Arc::clone(alias), graph_ref(view, graph_t(view)));
             }
         }
 

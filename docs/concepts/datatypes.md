@@ -406,10 +406,16 @@ Numeric types (long, double, bigint, decimal) are mutually comparable via automa
 
 A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
 built-in datatype but is not one of its values. JSON-LD transactions and
-SPARQL UPDATE reject it, naming the datatype in the error. Turtle
+SPARQL UPDATE refuse to insert it, naming the datatype in the error. Turtle
 transactions and bulk import keep it, as RDF allows: the literal is stored with
 its text and its datatype and reads back exactly as written, but it is not a
 date or a number, so it never equals one.
+
+A delete names such a literal as it is stored, so `DELETE DATA` or a JSON-LD
+`delete` with the same text and datatype removes it, and one that matches
+nothing stored commits nothing. A constant in a WHERE clause or a query is
+still refused, so `DELETE WHERE` and `SELECT` reach a stored one only through
+a variable (`FILTER(STR(?o) = "2024-02-30")`).
 
 ### Type Casting in Queries
 

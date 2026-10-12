@@ -123,7 +123,9 @@ let report = fluree
 assert!(report.committed || (report.asserted == 0 && report.retracted == 0));
 ```
 
-`SyncGraphOpts { dry_run, allow_empty }` mirror the query parameters;
+`SyncGraphOpts { dry_run, allow_empty }` mirror the query parameters, and
+`message` (Rust API only) is recorded as the commit's `f:message`. When the
+sync committed, the report's `commit_id` names the new commit.
 `sync_named_graph_with` additionally takes explicit `TxnOpts` and a
 `PolicyContext`, and `sync_named_graph_rdf_with` is the same call for
 Turtle / N-Triples / TriG text. `sync_graph_with(ledger, &GraphSel, GraphPayload, …)`

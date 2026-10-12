@@ -255,7 +255,7 @@ fn create_config(
 
 #[cfg(feature = "delta")]
 async fn run_delta_map_local(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = crate::context::build_fluree(dirs)?;
+    let fluree = crate::context::build_fluree(dirs).await?;
     let config = fluree_db_api::DeltaCreateConfig {
         branch: args.branch.clone(),
         model: args.model.clone(),
@@ -364,7 +364,7 @@ impl Ask<'_> {
 
     #[cfg(feature = "delta")]
     async fn local(&self, dirs: &FlureeDir) -> CliResult<Value> {
-        let fluree = crate::context::build_fluree(dirs)?;
+        let fluree = crate::context::build_fluree(dirs).await?;
         let unity = match self.unity() {
             Some(unity) => unity_config(unity)?,
             None => None,

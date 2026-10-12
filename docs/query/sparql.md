@@ -99,6 +99,8 @@ ASK {
 }
 ```
 
+ASK is `true` when a solution remains after its solution modifiers and a trailing `VALUES` clause: `GROUP BY` / `HAVING` count the groups that pass, `OFFSET 1` needs a second solution, and `LIMIT 0` is always `false`. `ORDER BY` cannot change the answer.
+
 ### DESCRIBE Queries
 
 Return RDF description of resources:
@@ -376,6 +378,26 @@ WHERE {
 }
 ```
 
+### Parameters
+
+When Fluree is embedded (the Rust API and the Python package), a query or
+update can take parameters: values bound to variables by name. A parameter
+replaces its variable — written `?name` or `$name`, which SPARQL treats as the
+same variable — everywhere in the request before it is planned, so
+`SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
+exactly as `SELECT ?person WHERE { ?person ex:name "Alice" }`. Unlike a
+`VALUES` block, the value is visible inside every `FILTER`, `OPTIONAL` and
+subquery.
+
+- A projected parameter (`SELECT $name ?age`) is still a column, holding the
+  value; `SELECT *` does not list it.
+- A parameter that the request never mentions is an error, since a misspelt
+  variable would otherwise be unbound and match everything. So is a parameter
+  the request assigns itself (`BIND`, `VALUES`, `AS`), and one used inside a
+  remote `SERVICE`, whose body is sent to the endpoint as written.
+- `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
+  `INSERT { ... } WHERE { ... }`.
+
 ## Aggregation
 
 ### GROUP BY
@@ -404,6 +426,16 @@ GROUP BY (SUBSTR(?name, 1, 1) AS ?initial)
 
 The expression is evaluated per row and bound to the alias variable before grouping. Any SPARQL expression is supported, including function calls, arithmetic, and type casts.
 
+**SELECT expressions in a grouped query** are evaluated once per group, after aggregation, in SELECT order (SPARQL 1.1 §18.2.4.4); the ones `HAVING` reads run before it, the rest after it. They may read GROUP BY keys, aggregate results and earlier SELECT aliases:
+
+```sparql
+SELECT (IF(?area = "Net", "network", "other") AS ?segment) (COUNT(?e) AS ?n)
+WHERE { ?e ex:area ?area }
+GROUP BY ?area
+```
+
+returns one row per `?area`. A query groups when it has a `GROUP BY` or an aggregate anywhere in SELECT, HAVING or ORDER BY; `SELECT *` of such a query projects its GROUP BY keys (none, without a `GROUP BY`). An aggregate cannot read an alias of the same SELECT clause (it is bound after aggregation): aggregate the expression itself, e.g. `COUNT(IF(…))`.
+
 ### HAVING
 
 Filter grouped results:
@@ -416,6 +448,8 @@ WHERE {
 GROUP BY ?category
 HAVING (COUNT(?product) > 10)
 ```
+
+`HAVING` can read the SELECT clause's aliases: an aggregate's alias, such as `?count` above, and an expression's alias (`(COUNT(?product) + 1 AS ?n) … HAVING (?n > 10)`), whose expression is evaluated once, before `HAVING`. SPARQL 1.1 evaluates SELECT expressions after `HAVING`, which leaves such an alias unbound there; reading it is a Fluree extension that many engines share (see [compatibility](../reference/compatibility.md)). In `HAVING` and `ORDER BY`, a variable that is neither a GROUP BY key nor inside an aggregate means `SAMPLE(?v)`, an arbitrary value from the group (§18.2.4.1). On a query that does not group, `HAVING` filters the solutions (§18.2.4.2).
 
 ### Aggregation Functions
 
@@ -759,6 +793,33 @@ Per W3C SPARQL 1.1 §17.5, XSD constructor functions cast values between datatyp
 - `ISBLANK(?x)` - Is blank node
 - `ISLITERAL(?x)` - Is literal
 - `ISNUMERIC(?x)` - Is numeric
+
+### Search and Similarity Functions
+
+Fluree extensions that score values for ranking, used in `BIND`:
+
+- `fulltext(?text, "query")` - BM25 relevance of a full-text value to a query string; `0` when no query term occurs. Also written `f:fulltext(...)`. See [Inline Fulltext Search](../indexing-and-search/fulltext.md).
+- `dotProduct(?v1, ?v2)` - Dot product of two vectors
+- `cosineSimilarity(?v1, ?v2)` - Cosine similarity of two vectors
+- `euclideanDistance(?v1, ?v2)` - Euclidean (L2) distance between two vectors
+
+Vectors are `f:embeddingVector` literals (`"[0.1, 0.2]"^^f:embeddingVector`); see [Vector Search](../indexing-and-search/vector-search.md). Names are case-insensitive and accept underscores (`cosine_similarity`).
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f:  <https://ns.flur.ee/db#>
+
+SELECT ?doc ?text ?similar WHERE {
+  VALUES ?q { "[0.88, 0.12, 0.08]"^^f:embeddingVector }
+  ?doc ex:body ?body ;
+       ex:embedding ?vec .
+  BIND(fulltext(?body, "graph databases") AS ?text)
+  BIND(cosineSimilarity(?vec, ?q) AS ?similar)
+  FILTER(?text > 0 || ?similar > 0.8)
+}
+ORDER BY DESC(0.6 * ?text + 0.4 * ?similar)
+LIMIT 10
+```
 
 ## Subqueries
 

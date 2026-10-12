@@ -36,6 +36,7 @@
 pub mod ast;
 pub mod diag;
 pub mod lex;
+pub mod params;
 pub mod parse;
 pub mod protocol;
 pub mod span;
@@ -47,6 +48,7 @@ pub mod lower;
 // Re-exports
 pub use ast::{MetaPragma, Pragmas, Prologue, QueryBody, SparqlAst, UpdateOperation};
 pub use diag::{DiagCode, Diagnostic, ParseOutput, Severity};
+pub use params::{substitute_params, ParamError, ParamMap};
 pub use parse::{parse_sparql, pragma_names, request_pragmas};
 pub use span::SourceSpan;
 pub use validate::{validate, Capabilities};

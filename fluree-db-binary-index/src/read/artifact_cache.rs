@@ -5,5 +5,6 @@
 //! data files. This module re-exports it for existing call sites.
 
 pub use fluree_db_core::disk_cache::{
-    best_effort_cache_bytes_to_path, fetch_cached_bytes, fetch_cached_bytes_cid, DiskArtifactCache,
+    fetch_cached_bytes, fetch_cached_bytes_cid, needs_disk_copy, seed_disk_cache, uses_disk_cache,
+    DiskArtifactCache,
 };

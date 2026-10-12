@@ -41,6 +41,13 @@ while it sits on that base. Two ways this repo lands stacks, with different cons
   carried is silently lost. Move those keywords into the surviving parent's body, or close the
   issues by hand with a citation to the commit that did the work.
 
+## PRs into `next`
+
+`next` is not the default branch, so `Fixes #N` in a PR based on `next` does nothing — not when
+that PR merges, and not later when `next` merges into `main`. Keep the keyword in the PR body for
+the record, and carry every such `Fixes #N` into the body of the `next` → `main` PR so the issues
+close when the major lands.
+
 ## Why
 
 A 2026-08 audit of the full open backlog found eight issues that were already fixed but still

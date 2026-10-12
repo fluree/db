@@ -2483,12 +2483,60 @@ async fn unique_basic_enforcement() {
         .unwrap_err();
     assert!(
         matches!(
-            err,
+            &err,
             fluree_db_api::ApiError::Transact(
-                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
-            )
+                fluree_db_transact::TransactError::UniqueConstraintViolation { value, .. }
+            ) if value == "alice@example.com"
         ),
         "duplicate email should trigger unique constraint violation: {err:?}"
+    );
+}
+
+/// Test: a duplicate reference is reported as the IRI it points to.
+#[tokio::test]
+async fn unique_ref_value_reports_its_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/unique-ref:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#"
+                },
+                "@graph": [
+                    {"@id": "ex:badge", "f:enforceUnique": true},
+                    {"@id": "ex:alice", "ex:badge": {"@id": "ex:badge-7"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let ledger = write_unique_config(&fluree, result.ledger, ledger_id)
+        .await
+        .ledger;
+
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob",
+                "ex:badge": {"@id": "ex:badge-7"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { value, .. }
+            ) if value == "http://example.org/badge-7"
+        ),
+        "{err:?}"
     );
 }
 

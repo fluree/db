@@ -1580,9 +1580,13 @@ fn parse_value_object(
             }
         }
         JsonValue::Bool(b) => UnresolvedTerm::boolean(*b),
+        JsonValue::Array(items) => UnresolvedTerm::Literal(super::values::parse_vector_literal(
+            items,
+            explicit_dt.as_deref(),
+        )?),
         _ => {
             return Err(ParseError::InvalidWhere(
-                "@value must be string/number/bool".to_string(),
+                "@value must be a string, number, bool, or array (vector)".to_string(),
             ))
         }
     };

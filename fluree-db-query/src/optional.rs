@@ -443,11 +443,12 @@ impl PatternOptionalBuilder {
                             // Leave as variable
                         }
                         Binding::Grouped(_) => {
-                            debug_assert!(
-                                false,
-                                "Grouped binding in optional pattern substitution"
-                            );
-                            // Leave as variable
+                            // A per-group list never leaves a grouping stage (the
+                            // plan-time `Grouping::first_ungrouped_read` check);
+                            // leaving the slot a variable would match anything.
+                            return Err(QueryError::Internal(
+                                "grouped (list-valued) binding reached an OPTIONAL".to_string(),
+                            ));
                         }
                         Binding::Path { .. }
                         | Binding::Rel(_)

@@ -509,6 +509,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
+        ctx.ill_typed_as_stored = true;
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -886,6 +887,9 @@ struct TemplateParseCtx<'a> {
     default_graph: Option<Arc<str>>,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
+    /// Delete templates keep an ill-typed literal's lexical form as stored
+    /// (see [`coerce_value_with_datatype`]) instead of refusing it.
+    ill_typed_as_stored: bool,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -910,6 +914,7 @@ impl<'a> TemplateParseCtx<'a> {
             default_graph,
             from_named_aliases,
             blank_counter: 0,
+            ill_typed_as_stored: false,
         }
     }
 
@@ -1317,7 +1322,8 @@ fn parse_values_cell(
                 }
 
                 let expanded_type = expand_datatype_iri(type_val, context, strict)?;
-                let parsed = coerce_value_with_datatype(value_val, &expanded_type, ns_registry)?;
+                let parsed =
+                    coerce_value_with_datatype(value_val, &expanded_type, ns_registry, false)?;
                 return Ok(parsed.term);
             }
 
@@ -1410,7 +1416,9 @@ fn parse_expanded_object_with_ctx(
         })
         .transpose()?;
     // A node with no `@graph` of its own takes the default: the update's
-    // template default (top-level `graph`) or an enclosing wrapper's graph.
+    // template default (top-level `graph`), an enclosing wrapper's graph, or
+    // the graph of the node it is nested in.
+    let own_graph = node_graph.clone();
     let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
     let place = |t: TripleTemplate| match &node_graph {
         Some(graph) => t.in_graph(Arc::clone(graph)),
@@ -1427,7 +1435,26 @@ fn parse_expanded_object_with_ctx(
         TemplateTerm::BlankNode(format!("_:b{n}"))
     };
 
-    // Parse each predicate-object pair
+    // Nodes nested in this one belong to its graph, as an embedded node object
+    // does in JSON-LD.
+    let outer = own_graph.map(|graph| ctx.default_graph.replace(graph));
+    let parsed = parse_node_properties(obj, &subject, &place, ctx, &mut templates);
+    if let Some(default_graph) = outer {
+        ctx.default_graph = default_graph;
+    }
+    parsed?;
+
+    Ok((subject, templates))
+}
+
+/// The triples for each predicate-object pair of a node object.
+fn parse_node_properties(
+    obj: &serde_json::Map<String, Value>,
+    subject: &TemplateTerm,
+    place: &dyn Fn(TripleTemplate) -> TripleTemplate,
+    ctx: &mut TemplateParseCtx<'_>,
+    templates: &mut Vec<TripleTemplate>,
+) -> Result<()> {
     for (key, value) in obj {
         // Skip JSON-LD keywords except @type which becomes rdf:type
         if key == "@id" || key == "@context" || key == "@graph" {
@@ -1481,7 +1508,7 @@ fn parse_expanded_object_with_ctx(
             TemplateTerm::Sid(ctx.ns_registry.sid_for_iri(key))
         };
 
-        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, &mut templates)?;
+        let parsed_values = parse_expanded_objects_with_ctx(value, ctx, templates)?;
 
         for parsed_value in parsed_values {
             let mut template = place(TripleTemplate::new(
@@ -1498,8 +1525,7 @@ fn parse_expanded_object_with_ctx(
             templates.push(template);
         }
     }
-
-    Ok((subject, templates))
+    Ok(())
 }
 
 fn resolve_graph_selector_str_for_templates(
@@ -1676,6 +1702,7 @@ fn parse_expanded_value_with_ctx(
                     ctx.ns_registry,
                     ctx.object_var_parsing,
                     ctx.strict_compact_iri,
+                    ctx.ill_typed_as_stored,
                 );
             }
 
@@ -1814,6 +1841,7 @@ fn parse_literal_value_with_meta(
     ns_registry: &mut NamespaceRegistry,
     object_var_parsing: bool,
     strict: bool,
+    ill_typed_as_stored: bool,
 ) -> Result<ParsedValue> {
     // Check for @type first - always route through typed coercion when present
     if let Some(type_val) = obj.get("@type") {
@@ -1851,7 +1879,12 @@ fn parse_literal_value_with_meta(
             };
 
             // Route all @value types through typed coercion
-            return coerce_value_with_datatype(val, resolved_type, ns_registry);
+            return coerce_value_with_datatype(
+                val,
+                resolved_type,
+                ns_registry,
+                ill_typed_as_stored,
+            );
         }
     }
 
@@ -1915,16 +1948,30 @@ fn parse_literal_value_with_meta(
 /// - Boolean @value + xsd:string → ERROR
 /// - Numeric @value + xsd:boolean → ERROR
 /// - Integer subtypes enforce range bounds (e.g., xsd:byte must be -128 to 127)
+///
+/// With `ill_typed_as_stored` (delete templates), a string `@value` the
+/// datatype does not accept is kept as a string with the declared datatype,
+/// the form a Turtle write stores an ill-typed literal in: a DELETE names
+/// what is stored, and a term that is not stored retracts nothing.
 fn coerce_value_with_datatype(
     val: &Value,
     type_iri: &str,
     ns_registry: &mut NamespaceRegistry,
+    ill_typed_as_stored: bool,
 ) -> Result<ParsedValue> {
     let datatype_sid = ns_registry.sid_for_iri(type_iri);
 
     // Delegate to core coercion module
-    let flake_value = fluree_db_core::coerce::coerce_json_value(val, type_iri)
-        .map_err(|e| TransactError::Parse(e.message))?;
+    let flake_value = match (
+        fluree_db_core::coerce::coerce_json_value(val, type_iri),
+        val,
+    ) {
+        (Ok(value), _) => value,
+        (Err(_), Value::String(lexical)) if ill_typed_as_stored => {
+            FlakeValue::String(lexical.clone())
+        }
+        (Err(e), _) => return Err(TransactError::Parse(e.message)),
+    };
 
     Ok(ParsedValue::new(TemplateTerm::Value(flake_value))
         .with_dtc(DatatypeConstraint::Explicit(datatype_sid)))

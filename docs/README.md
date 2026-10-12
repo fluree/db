@@ -15,7 +15,7 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 - **Storage your way.** Local filesystem for development, S3 + DynamoDB for production, and (experimentally, from the Rust API) IPFS for content-addressed distribution. The same ledger format works across all of them.
 - **Search built in.** BM25 full-text indexing and HNSW vector search live alongside SPARQL — no separate search service to operate.
 - **Reasoning.** OWL/RDFS inference and Datalog rules run inside the query engine, so derived facts are queryable without a materialization step.
-- **Embeddable.** The same engine that powers the server runs as a Rust library, generic over storage and nameservice. Use it directly in your application or run it standalone over HTTP.
+- **Embeddable.** The same engine that powers the server runs as a Rust library, generic over storage and nameservice, and in-process from Python. Use it directly in your application or run it standalone over HTTP.
 
 ## Start here
 
@@ -26,6 +26,7 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 - **End-to-end walkthrough** → [Tutorial: search, time travel, branching, policies](getting-started/tutorial-end-to-end.md)
 - **Coming from SQL?** → [Fluree for SQL developers](getting-started/fluree-for-sql-developers.md)
 - **Embedding in Rust?** → [Using Fluree as a Rust library](getting-started/rust-api.md)
+- **Using Python?** → [Using Fluree from Python](getting-started/python.md)
 
 ## Explore the docs
 

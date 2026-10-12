@@ -124,6 +124,10 @@ impl<'a> QueryCore<'a> {
         self.execution = options;
     }
 
+    pub(crate) fn set_params(&mut self, params: fluree_db_sparql::ParamMap) {
+        self.execution = std::mem::take(&mut self.execution).with_params(params);
+    }
+
     #[cfg(feature = "iceberg")]
     pub(crate) fn set_r2rml(&mut self) {
         self.graph_sources = GraphSourceMode::R2rml;
@@ -231,6 +235,12 @@ impl<'a> ViewQueryBuilder<'a> {
     /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
@@ -506,6 +516,12 @@ impl<'a> DatasetQueryBuilder<'a> {
     /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
         self
     }
 
@@ -876,6 +892,12 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
@@ -1162,7 +1184,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1265,7 +1287,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
                 if let Some(alias) = spec
                     .default_graphs
@@ -1336,7 +1358,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
             let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1438,7 +1460,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
                 let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
                 if let Some(alias) = spec
                     .default_graphs
