@@ -53,6 +53,7 @@ use fluree_db_core::{
 use fluree_db_ledger::LedgerState;
 use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::BinaryRangeProvider;
+use num_bigint::BigInt;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -465,24 +466,38 @@ fn newer(a: &Flake, b: &Flake) -> bool {
 
 /// How storage tells two facts of one `(graph, subject, predicate)` apart.
 ///
-/// A value whose index key can merge terms ([`IndexKeys`]) and that the
-/// index can key is one fact per key and list position, whatever its term:
-/// storage merges every op by that key, in the index and in queries over
-/// novelty. Any other value is its term (value, datatype, and metadata:
-/// language tag and list position), as [`Flake`]'s equality has it.
+/// A value whose index key can merge terms ([`IndexKeys`]) is one fact per
+/// key and list position, whatever its term, when it has a key
+/// ([`FactKey`]): storage merges every op by that key, in the index and in
+/// queries over novelty. Any other value is its term (value, datatype, and
+/// metadata: language tag and list position), as [`Flake`]'s equality has
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FactTerm {
     /// The term of a value storage tells by term.
     Term(FlakeValue, Sid, Option<FlakeMeta>),
-    /// The index key `(o_type, o_key)` and list position of a value storage
-    /// tells by key.
-    Key((u16, u64), Option<i32>),
+    /// The key and list position of a value storage tells by key.
+    Key(FactKey, Option<i32>),
 }
 
-/// An index key `(o_type, o_key)` and list position: how storage tells
-/// apart the facts of one `(graph, subject, predicate)` whose kind of value
-/// can merge terms ([`FactTerm::Key`]).
-pub type MergeKey = ((u16, u64), Option<i32>);
+/// The key storage merges the ops of a value by, for the kinds of value
+/// whose key two terms can share ([`IndexKeys`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FactKey {
+    /// An integer too large for 64 bits, by value. The index keys one by its
+    /// `(graph, predicate)` arena's handle for the value, whatever XSD
+    /// subtype it was written with, so the value is its key before the arena
+    /// holds it as well as after: a value first written since the last index
+    /// build is merged by value at the next.
+    BigInt(Box<BigInt>),
+    /// A persisted index key `(o_type, o_key)`.
+    Index((u16, u64)),
+}
+
+/// A [`FactKey`] and list position: how storage tells apart the facts of one
+/// `(graph, subject, predicate)` whose kind of value can merge terms
+/// ([`FactTerm::Key`]).
+pub type MergeKey = (FactKey, Option<i32>);
 
 /// The identity storage gives each fact of one ledger state ([`FactTerm`]).
 ///
@@ -512,35 +527,38 @@ impl<'l> FactIdentity<'l> {
         graph_id_in(self.ledger, g)
     }
 
-    /// `flake`'s index key and list position in graph `g_id`, when storage
+    /// `flake`'s key and list position in graph `g_id` (`None` for a graph
+    /// the state does not have, which holds nothing indexed), when storage
     /// tells it by key ([`FactTerm::Key`]).
-    pub fn key(&self, g_id: GraphId, flake: &Flake) -> Option<MergeKey> {
+    pub fn key(&self, g_id: Option<GraphId>, flake: &Flake) -> Option<MergeKey> {
+        self.key_under(g_id, || self.keys.p_id(&flake.p), flake)
+    }
+
+    /// [`Self::key`], with `flake.p`'s persisted id from `p_id`, asked only
+    /// for an index key: a caller keying many facts of one predicate looks
+    /// it up once.
+    fn key_under(
+        &self,
+        g_id: Option<GraphId>,
+        p_id: impl FnOnce() -> Option<u32>,
+        flake: &Flake,
+    ) -> Option<MergeKey> {
         if !flake.o.index_key_may_merge_terms() {
             return None;
         }
-        self.key_under(g_id, self.keys.p_id(&flake.p), flake)
-    }
-
-    /// [`Self::key`] under `flake.p`'s persisted id `p_id`, for a caller
-    /// keying many facts of one predicate.
-    fn key_under(&self, g_id: GraphId, p_id: Option<u32>, flake: &Flake) -> Option<MergeKey> {
-        let key = self.keys.key(g_id, p_id, flake)?;
+        let key = match &flake.o {
+            FlakeValue::BigInt(v) if i64::try_from(v.as_ref()).is_err() => {
+                FactKey::BigInt(v.clone())
+            }
+            _ => FactKey::Index(self.keys.key(g_id?, p_id(), flake)?),
+        };
         Some((key, list_index_of(flake)))
     }
 
-    /// `flake`'s identity in graph `g_id`.
-    pub fn of(&self, g_id: GraphId, flake: &Flake) -> FactTerm {
-        match self.key(g_id, flake) {
-            Some((key, at)) => FactTerm::Key(key, at),
-            None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
-        }
-    }
-
-    /// `flake`'s identity in its own graph (`flake.g`). A graph the state
-    /// does not have holds nothing indexed, so its facts are told by term.
+    /// `flake`'s identity in its own graph (`flake.g`).
     pub fn of_flake(&self, flake: &Flake) -> FactTerm {
-        match self.graph_id(&flake.g) {
-            Some(g_id) => self.of(g_id, flake),
+        match self.key(self.graph_id(&flake.g), flake) {
+            Some((key, at)) => FactTerm::Key(key, at),
             None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
         }
     }
@@ -641,13 +659,14 @@ impl<'l> CurrentFacts<'l> {
         let mut by_term: Vec<HashMap<&Flake, usize>> = Vec::with_capacity(slots.len());
         let mut by_key: Vec<HashMap<MergeKey, usize>> = Vec::with_capacity(slots.len());
         for (slot, slot_facts) in slots.iter().zip(&facts) {
-            let p_id = self.keys.p_id(&slot.p);
+            let mut slot_p_id = None;
             let mut terms = HashMap::with_capacity(slot_facts.len());
             let mut keys = HashMap::new();
             for (n, fact) in slot_facts.iter().enumerate() {
                 terms.insert(&fact.flake, n);
                 if fact.flake.o.index_key_may_merge_terms() {
-                    if let Some(key) = ids.key_under(slot.g_id, p_id, &fact.flake) {
+                    let p_id = || *slot_p_id.get_or_insert_with(|| self.keys.p_id(&slot.p));
+                    if let Some(key) = ids.key_under(Some(slot.g_id), p_id, &fact.flake) {
                         keys.insert(key, n);
                     }
                 }
@@ -655,14 +674,17 @@ impl<'l> CurrentFacts<'l> {
             by_term.push(terms);
             by_key.push(keys);
         }
+        // By term first: two terms of one key can both be current while
+        // novelty holds them, and an item naming one of them exactly names
+        // that one.
         Ok(items
             .iter()
             .zip(item_slots)
             .map(|((slot, flake), i)| {
-                let n = match ids.key(slot.g_id, flake) {
-                    Some(key) => by_key[i].get(&key),
-                    None => by_term[i].get(flake),
-                };
+                let n = by_term[i].get(flake).or_else(|| {
+                    let key = ids.key(Some(slot.g_id), flake)?;
+                    by_key[i].get(&key)
+                });
                 n.map(|&n| facts[i][n].clone())
             })
             .collect())
@@ -2465,6 +2487,63 @@ mod tests {
             assert_eq!(fact.is_some(), *held, "{what}");
             if let Some(fact) = fact {
                 assert_eq!(fact.flake(), flake, "{what}: names the stored fact");
+            }
+        }
+    }
+
+    /// `named_by` names an integer too large for 64 bits by value with no
+    /// index yet, as the first build will key it, and by term first: of two
+    /// terms of one value that novelty holds side by side, an item naming one
+    /// of them exactly names that one.
+    #[tokio::test]
+    async fn named_by_names_a_big_integer_by_value_its_own_term_first() {
+        let big = |n: i64, dt: &str, t: i64, m: Option<FlakeMeta>| {
+            let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+            Flake::new(
+                sid("a"),
+                sid("p"),
+                FlakeValue::BigInt(Box::new(v + n)),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                t,
+                t < 3,
+                m,
+            )
+        };
+        let ledger = ledger(
+            vec![
+                vec![big(0, "nonNegativeInteger", 1, None)],
+                vec![big(0, "positiveInteger", 2, None)],
+            ],
+            &HashMap::new(),
+        );
+        let current = CurrentFacts::new(&ledger);
+        let cases = [
+            (
+                "one stored term",
+                big(0, "nonNegativeInteger", 3, None),
+                Some("nonNegativeInteger"),
+            ),
+            (
+                "the other",
+                big(0, "positiveInteger", 3, None),
+                Some("positiveInteger"),
+            ),
+            ("a third subtype", big(0, "integer", 3, None), Some("")),
+            ("another value", big(1, "nonNegativeInteger", 3, None), None),
+            (
+                "a list position",
+                big(0, "nonNegativeInteger", 3, Some(FlakeMeta::with_index(0))),
+                None,
+            ),
+        ];
+        let ap = slot(0, None, "a", "p");
+        let items: Vec<(Slot, &Flake)> = cases.iter().map(|(_, f, _)| (ap.clone(), f)).collect();
+        let named = current.named_by(&items).await.unwrap();
+        for ((what, _, want), fact) in cases.iter().zip(&named) {
+            let got = fact.as_ref().map(|f| f.flake().dt.name.to_string());
+            match want {
+                Some("") => assert!(got.is_some(), "{what}: {got:?}"),
+                want => assert_eq!(got.as_deref(), *want, "{what}"),
             }
         }
     }

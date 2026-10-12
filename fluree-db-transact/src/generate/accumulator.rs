@@ -76,11 +76,11 @@ enum AccInner {
 struct MixedGraph {
     /// The graph's id in the ledger, which index keys are computed in;
     /// `None` without an identity or for a graph the ledger does not have
-    /// (whose facts are told apart by term).
+    /// (which holds nothing indexed).
     g_id: Option<GraphId>,
     /// Facts told apart by term.
     by_term: FxHashMap<Flake, FlakeBucket>,
-    /// Facts told apart by index key: `(s, p, key, list position)`.
+    /// Facts told apart by key: `(s, p, (key, list position))`.
     by_key: FxHashMap<(Sid, Sid, MergeKey), FlakeBucket>,
 }
 
@@ -318,8 +318,8 @@ fn push_into_mixed(
     graph: &mut MixedGraph,
     flake: Flake,
 ) {
-    if let (Some(ids), Some(g_id)) = (identity, graph.g_id) {
-        if let Some(key) = ids.key(g_id, &flake) {
+    if let Some(ids) = identity {
+        if let Some(key) = ids.key(graph.g_id, &flake) {
             let bucket = graph
                 .by_key
                 .entry((flake.s.clone(), flake.p.clone(), key))

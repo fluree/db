@@ -335,9 +335,12 @@ was present.
 Once a fact is indexed, a DELETE is matched against what the index stores,
 which is less than was written for an integer too large for 64 bits: the index
 keeps no XSD subtype. A DELETE naming the same big integer under another
-integer datatype retracts such a fact. A DELETE and an INSERT of such a value
-in one transaction name one stored fact and cancel, so `DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as
-for any value that is present.
+integer datatype retracts such a fact. Storage holds such an integer as one
+fact per value, indexed yet or not, so when a transaction retracts one and
+inserts the same value, the two cancel whatever subtype the insert names:
+`DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as for any value
+that is present, and neither does a write that retracts it and inserts it
+under another subtype.
 
 ### No Cascading by Default
 

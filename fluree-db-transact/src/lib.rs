@@ -66,7 +66,7 @@ pub use commit::{
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use current_facts::{
-    graph_id_in, CurrentFacts, FactIdentity, FactTerm, MergeKey, Origin, Retraction, Slot,
+    graph_id_in, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey, Origin, Retraction, Slot,
     StoredFact, DELETE_POINT_READ_SITE,
 };
 pub use error::{ReportResult, Result, ShaclViolations, TransactError};

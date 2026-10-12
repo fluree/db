@@ -1832,3 +1832,136 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The values of `ex:s`'s `pred`, read cold from the ledger at `path`.
+async fn values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
+    let fluree = FlureeBuilder::file(path.to_string())
+        .build()
+        .expect("reload");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let q = format!("PREFIX ex: <{EX}>\nSELECT ?o WHERE {{ ex:s {pred} ?o }}");
+    let json = support::query_sparql(&fluree, &ledger, &q)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("json");
+    let mut values: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["o"]["value"].as_str().unwrap_or("?").to_string())
+        .collect();
+    values.sort();
+    values
+}
+
+/// An integer too large for 64 bits is one stored fact per value, whatever
+/// XSD subtype it is written with: the index keys it by value. So a write
+/// that retracts it under one subtype and asserts it under another commits
+/// nothing and keeps it, whether the index holds it, holds the value for
+/// another subject only, has not seen it since its last build, or does not
+/// exist yet; and it is still there after the next index build. In one
+/// operation (SPARQL and JSON-LD) and across two of one request.
+#[tokio::test]
+async fn changing_a_big_integers_subtype_keeps_it() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    const BIG: &str = "123456789012345678901234567890";
+    let nonneg = format!("\"{BIG}\"^^xsd:nonNegativeInteger");
+    let posint = format!("\"{BIG}\"^^xsd:positiveInteger");
+    // (case, indexed seed, novelty seed after the index build; no build
+    // without an indexed seed)
+    let cases = [
+        (
+            "the index holds it",
+            format!("ex:s ex:p {nonneg} ; ex:k \"keep\" ."),
+            String::new(),
+        ),
+        (
+            "written since the last index build, which holds the value for another subject",
+            format!("ex:t ex:p {nonneg} . ex:s ex:k \"keep\" ."),
+            format!("ex:s ex:p {nonneg} ."),
+        ),
+        (
+            "written since the last index build, which never saw the value",
+            "ex:t ex:p 1 . ex:s ex:k \"keep\" .".to_string(),
+            format!("ex:s ex:p {nonneg} ."),
+        ),
+        (
+            "never indexed",
+            String::new(),
+            format!("ex:s ex:p {nonneg} ; ex:k \"keep\" ."),
+        ),
+    ];
+    let jv = |dt: &str| json!({"@value": BIG, "@type": format!("xsd:{dt}")});
+    let lanes = [
+        "DELETE { x } INSERT { y } WHERE {}",
+        "JSON-LD delete and insert",
+        "DELETE DATA { x } ; INSERT DATA { y }",
+    ];
+    let mut failures = Vec::new();
+    for (case, indexed, novelty) in &cases {
+        for lane in lanes {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let id = "it/big-subtype:main";
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                fluree.create_ledger(id).await.expect("create");
+                for (seed, index) in [(indexed, true), (novelty, false)] {
+                    if seed.is_empty() {
+                        continue;
+                    }
+                    fluree
+                        .graph(id)
+                        .transact()
+                        .sparql_update(&format!("{PFX}INSERT DATA {{ {seed} }}"))
+                        .commit()
+                        .await
+                        .expect("seed");
+                    if index {
+                        support::rebuild_and_publish_index(&fluree, id).await;
+                    }
+                }
+            }
+            let flakes = {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let graph = fluree.graph(id);
+                let tx = graph.transact();
+                let update = match lane {
+                    "DELETE { x } INSERT { y } WHERE {}" => format!(
+                        "{PFX}DELETE {{ ex:s ex:p {nonneg} }} INSERT {{ ex:s ex:p {posint} }} \
+                         WHERE {{}}"
+                    ),
+                    _ => format!(
+                        "{PFX}DELETE DATA {{ ex:s ex:p {nonneg} }} ;\n\
+                         INSERT DATA {{ ex:s ex:p {posint} }}"
+                    ),
+                };
+                let delins = json!({
+                    "@context": ctx(),
+                    "delete": {"@id": "ex:s", "ex:p": jv("nonNegativeInteger")},
+                    "insert": {"@id": "ex:s", "ex:p": jv("positiveInteger")}
+                });
+                let tx = match lane {
+                    "JSON-LD delete and insert" => tx.update(&delins),
+                    _ => tx.sparql_update(&update),
+                };
+                tx.commit().await.expect("write").receipt.flake_count
+            };
+            let after = values_of(&path, id, "ex:p").await;
+            {
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                support::rebuild_and_publish_index(&fluree, id).await;
+            }
+            let reindexed = values_of(&path, id, "ex:p").await;
+            if flakes != 0 || after != [BIG] || reindexed != [BIG] {
+                failures.push(format!(
+                    "{case}, {lane}: flakes {flakes}, values {after:?}, after reindex \
+                     {reindexed:?}; expected no commit and [{BIG}]"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
