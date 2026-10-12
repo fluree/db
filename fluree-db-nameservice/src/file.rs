@@ -193,16 +193,23 @@ impl FileNameService {
 
         let legacy = base.join(LEGACY_NS_VERSION);
         let relatives = walk_files(&legacy)?;
+        let mut files = Vec::with_capacity(relatives.len());
         for relative in &relatives {
             let bytes = tokio::fs::read(legacy.join(relative))
                 .await
                 .map_err(|e| NameServiceError::storage(format!("reading {relative}: {e}")))?;
             // Retired by an interrupted attempt, which copied it first.
-            if bytes == RETIRED_FILE {
-                continue;
+            if bytes != RETIRED_FILE {
+                files.push((relative.clone(), bytes));
             }
+        }
+        let refused = crate::migration::unmigratable_files(&files);
+        if !refused.is_empty() {
+            return Err(crate::migration::unmigratable_store(&refused));
+        }
+        for (relative, bytes) in &files {
             self.storage
-                .insert(&format!("fluree:file://{NS_VERSION}/{relative}"), &bytes)
+                .insert(&format!("fluree:file://{NS_VERSION}/{relative}"), bytes)
                 .await
                 .map_err(|e| NameServiceError::storage(format!("copying {relative}: {e}")))?;
         }
@@ -2328,13 +2335,12 @@ mod tests {
         assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
     }
 
-    /// Ids an older release could store but the current grammar rejects
-    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
-    /// them, and a name whose path can alias another ledger's is skipped.
+    /// A store holding ids an older release accepted but bindings cannot
+    /// carry (`@`, `#`) is refused before anything is written, so it still
+    /// works with that release; the refusal names every such ledger. A
+    /// name whose path can alias another ledger's is skipped, as everywhere.
     #[tokio::test]
-    #[ignore = "a 4.2 store holding an `@`/`#` id fails the ns@v3 migration: \
-                bindings and storage roots parse names with the strict grammar"]
-    async fn legacy_ids_do_not_fail_the_listing() {
+    async fn a_store_holding_ids_bindings_cannot_carry_is_left_as_it_was() {
         let temp = TempDir::new().unwrap();
         for (name, branch) in [
             ("plain", "main"),
@@ -2345,25 +2351,31 @@ mod tests {
             record.commit_t = 1;
             write_legacy_record(temp.path(), &record);
         }
-        // A stored name whose path can alias another ledger's.
         write_legacy_record(temp.path(), &legacy_record("unsafeQ:main", 1, false));
         let path = temp.path().join("ns@v2/unsafeQ/main.json");
         let json = std::fs::read_to_string(&path)
             .unwrap()
             .replace("unsafeQ", "/unsafe");
         std::fs::write(&path, json).unwrap();
+        let legacy_before = walk_files(&temp.path().join("ns@v2")).unwrap();
 
         let ns = FileNameService::new(temp.path());
-        ns.migrate().await.unwrap().expect("migrated");
-        let mut all: Vec<String> = ns
-            .all_records()
-            .await
+        let err = ns.migrate().await.unwrap_err().to_string();
+        for id in ["rep@2026:main", "mydb:feature#1"] {
+            assert!(err.contains(id), "{err}");
+        }
+        assert!(!err.contains("plain") && !err.contains("unsafe"), "{err}");
+        assert!(walk_files(&temp.path().join(NS_VERSION))
             .unwrap()
-            .into_iter()
-            .map(|r| r.ledger_id.to_string())
-            .collect();
-        all.sort();
-        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
+            .is_empty());
+        assert_eq!(
+            walk_files(&temp.path().join("ns@v2")).unwrap(),
+            legacy_before
+        );
+        assert_ne!(
+            std::fs::read(temp.path().join("ns@v2/plain/main.json")).unwrap(),
+            RETIRED_FILE
+        );
     }
 
     #[tokio::test]

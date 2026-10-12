@@ -666,6 +666,7 @@ where
         }
 
         let (legacy_root, relatives) = self.legacy_files().await?;
+        let mut files = Vec::with_capacity(relatives.len());
         for relative in &relatives {
             let key = format!("{legacy_root}{relative}");
             let bytes = match self.storage.read_bytes(&key).await {
@@ -676,13 +677,21 @@ where
                 }
             };
             // Retired by an interrupted attempt, which copied it first.
-            if bytes == RETIRED_FILE {
-                continue;
+            if bytes != RETIRED_FILE {
+                files.push((relative.clone(), bytes));
             }
+        }
+        let refused = crate::migration::unmigratable_files(&files);
+        if !refused.is_empty() {
+            return Err(crate::migration::unmigratable_store(&refused));
+        }
+        for (relative, bytes) in &files {
             self.storage
-                .insert(&self.ns_root_key(relative), &bytes)
+                .insert(&self.ns_root_key(relative), bytes)
                 .await
-                .map_err(|e| NameServiceError::storage(format!("copying {key}: {e}")))?;
+                .map_err(|e| {
+                    NameServiceError::storage(format!("copying {legacy_root}{relative}: {e}"))
+                })?;
         }
 
         let report = crate::lifecycle::migrate_legacy(self).await?;
@@ -2513,19 +2522,19 @@ mod tests {
         assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
     }
 
-    /// Ids an older release could store but the current grammar rejects
-    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
-    /// them, and a name whose path can alias another ledger's is skipped.
+    /// A store holding ids an older release accepted but bindings cannot
+    /// carry (`@`, `#`) is refused before anything is written, so it still
+    /// works with that release; the refusal names every such ledger. A
+    /// name whose path can alias another ledger's is skipped, as everywhere.
     #[tokio::test]
-    #[ignore = "a 4.2 store holding an `@`/`#` id fails the ns@v3 migration: \
-                bindings and storage roots parse names with the strict grammar"]
-    async fn legacy_ids_do_not_fail_the_listing() {
+    async fn a_store_holding_ids_bindings_cannot_carry_is_left_as_it_was() {
         let ns = make_storage_ns();
         let ids = [
             ("plain", "main"),
             ("rep@2026", "main"),
             ("mydb", "feature#1"),
         ];
+        let mut legacy = Vec::new();
         for (name, branch) in ids.into_iter().chain([("unsafeQ", "main")]) {
             let mut record = NsRecord::new(LedgerId::from_persisted_parts(name, branch).unwrap());
             record.commit_t = 1;
@@ -2533,22 +2542,25 @@ mod tests {
                 .unwrap()
                 // A stored name whose path can alias another ledger's.
                 .replace("unsafeQ", "/unsafe");
-            ns.storage
-                .write_bytes(&format!("test/ns@v2/{name}/{branch}.json"), json.as_bytes())
-                .await
-                .unwrap();
+            let key = format!("test/ns@v2/{name}/{branch}.json");
+            ns.storage.write_bytes(&key, json.as_bytes()).await.unwrap();
+            legacy.push((key, json));
         }
 
-        ns.migrate().await.unwrap().expect("migrated");
-        let mut all: Vec<String> = ns
-            .all_records()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.ledger_id.to_string())
-            .collect();
-        all.sort();
-        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
+        let err = ns.migrate().await.unwrap_err().to_string();
+        for id in ["rep@2026:main", "mydb:feature#1"] {
+            assert!(err.contains(id), "{err}");
+        }
+        assert!(!err.contains("plain") && !err.contains("unsafe"), "{err}");
+        assert!(
+            StorageList::list_prefix(&ns.storage, &format!("test/{NS_VERSION}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for (key, json) in legacy {
+            assert_eq!(ns.storage.read_bytes(&key).await.unwrap(), json.as_bytes());
+        }
     }
 
     #[tokio::test]

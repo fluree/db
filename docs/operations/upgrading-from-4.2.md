@@ -116,7 +116,15 @@ dropped list, and is logged only when there was something to do.
    - Raft: copy each node's `--raft-storage-path`.
 3. **Check your scripts** for `fluree drop` (now soft; add `--hard --force` to
    delete) and for creating separate ledgers as branches of one name.
-4. **Query peers.** A peer in shared storage mode opens its server's store, and
+4. **Check ledger names for `@` and `#`.** Older releases let a ledger
+   or branch name contain them; this release reserves both. A file, object
+   or DynamoDB store holding such a ledger is refused at the first start,
+   with an error naming each one, before anything is written: the store
+   still works with the release that wrote it. Move each to a valid name
+   with that release, drop the old one, then upgrade. On Raft, the first
+   upgraded leader binds every other ledger and logs an error naming the
+   ones it left unbound, which no request can reach.
+5. **Query peers.** A peer in shared storage mode opens its server's store, and
    upgrades it if it starts first, so it is one of the processes above. A peer
    in proxy storage mode keeps no store of its own: it can be upgraded before
    its server, but not after. A 4.2 peer works out a ledger's files from its

@@ -87,6 +87,36 @@ impl FormatMarker {
     }
 }
 
+/// The error a migration refuses a store with when it holds ledgers whose
+/// ids it cannot bind ([`migratable`](crate::lifecycle::migratable)),
+/// before it has written anything: the store still works with the release
+/// that wrote it.
+pub fn unmigratable_store(ids: &[String]) -> NameServiceError {
+    NameServiceError::storage(format!(
+        "cannot upgrade the nameservice: {} ledger(s) have ids this release does not accept \
+         ('@' and '#' are reserved): {}. Nothing was changed. With the release that created \
+         them, move each to a valid name and drop it, then start this release again",
+        ids.len(),
+        ids.join(", ")
+    ))
+}
+
+/// Of the files under [`LEGACY_NS_VERSION`], as `(relative path, bytes)`,
+/// the ledger records whose ids the migration cannot bind.
+pub(crate) fn unmigratable_files(files: &[(String, Vec<u8>)]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(_, bytes)| crate::ns_format::is_ledger_main_record(bytes))
+        .filter_map(|(relative, bytes)| {
+            let main: crate::ns_format::NsFileV2 = serde_json::from_slice(bytes).ok()?;
+            // An id even the persisted grammar refuses is skipped everywhere.
+            let id =
+                crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, relative)?;
+            (!crate::lifecycle::migratable(&main.ledger.id, &main.branch)).then(|| id.to_string())
+        })
+        .collect()
+}
+
 /// Refuse a store a newer binary has moved to a format this one does not
 /// understand.
 pub fn check_format_version(version: u32) -> Result<()> {

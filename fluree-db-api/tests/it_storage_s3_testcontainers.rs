@@ -778,6 +778,66 @@ async fn dynamodb_lifecycle_conformance() {
     .await;
 }
 
+/// A table holding a ledger whose id an older release accepted but bindings
+/// cannot carry (`@`, `#`) is refused before the in-place migration writes
+/// anything: the refusal names it, and the table still works with the
+/// release that wrote it.
+#[tokio::test]
+async fn dynamodb_refuses_ids_bindings_cannot_carry_before_writing() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use fluree_db_nameservice::BranchRecordStore;
+    use fluree_db_storage_aws::dynamodb::schema::{
+        ATTR_BRANCH, ATTR_KIND, ATTR_NAME, ATTR_PK, ATTR_RETRACTED, ATTR_SK, KIND_LEDGER,
+        PK_FORMAT, SK_META,
+    };
+
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+    let table = "upgrade-unmigratable-ids";
+    ensure_dynamodb_table(&sdk_config, table).await;
+    let ns = DynamoDbNameService::from_client(client.clone(), table.into());
+
+    let plain = fluree_db_nameservice::NsRecord::new(
+        fluree_db_core::LedgerId::parse("plain:main").unwrap(),
+    );
+    assert!(ns.insert_record(&plain).await.expect("insert").is_none());
+    client
+        .put_item()
+        .table_name(table)
+        .item(ATTR_PK, AttributeValue::S("rep@2026:main".into()))
+        .item(ATTR_SK, AttributeValue::S(SK_META.into()))
+        .item(ATTR_KIND, AttributeValue::S(KIND_LEDGER.into()))
+        .item(ATTR_NAME, AttributeValue::S("rep@2026".into()))
+        .item(ATTR_BRANCH, AttributeValue::S("main".into()))
+        .item(ATTR_RETRACTED, AttributeValue::Bool(false))
+        .send()
+        .await
+        .expect("put a 4.2 record");
+
+    let err = ns.migrate().await.expect_err("refused").to_string();
+    assert!(
+        err.contains("rep@2026:main") && !err.contains("plain"),
+        "{err}"
+    );
+    let format = client
+        .get_item()
+        .table_name(table)
+        .key(ATTR_PK, AttributeValue::S(PK_FORMAT.into()))
+        .key(ATTR_SK, AttributeValue::S(SK_META.into()))
+        .consistent_read(true)
+        .send()
+        .await
+        .expect("get format item");
+    assert!(format.item.is_none(), "no format marker is written");
+    let record = ns
+        .raw_record("plain:main")
+        .await
+        .expect("read")
+        .expect("record");
+    assert!(record.fence.is_none(), "nothing was bound: {record:?}");
+}
+
 /// A table a newer binary has marked with a newer format is refused at
 /// startup, and a binding in a state this binary does not know is refused
 /// rather than read as a free name.

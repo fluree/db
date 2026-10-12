@@ -1109,12 +1109,34 @@ pub struct MigrationReport {
     pub bound: Vec<String>,
     /// Names whose soft-dropped ledgers moved to the dropped-ledger registry.
     pub dropped: Vec<String>,
+    /// Ledgers left unbound, as stored, because their ids are not
+    /// [`migratable`]. Nothing can resolve them.
+    pub quarantined: Vec<String>,
 }
 
 impl MigrationReport {
     pub fn is_empty(&self) -> bool {
-        self.bound.is_empty() && self.dropped.is_empty()
+        self.bound.is_empty() && self.dropped.is_empty() && self.quarantined.is_empty()
     }
+}
+
+/// Whether the migration can bind a ledger an older release stored as
+/// `name:branch`. Releases before the ledger-id grammar accepted `@` and
+/// `#`, which bindings, storage roots and every request refuse.
+pub fn migratable(name: &str, branch: &str) -> bool {
+    LedgerId::from_parts(name, branch).is_ok()
+}
+
+/// The ledgers in `store` from before name bindings that the migration
+/// cannot bind ([`migratable`]), as stored.
+pub async fn unmigratable_ids<S: LifecycleStore + ?Sized>(store: &S) -> Result<Vec<String>> {
+    Ok(store
+        .all_raw_records()
+        .await?
+        .into_iter()
+        .filter(|r| r.fence.is_none() && !migratable(&r.name, &r.branch))
+        .map(|r| r.ledger_id.to_string())
+        .collect())
 }
 
 /// The instance id the migration gives a ledger created before name
@@ -1169,14 +1191,22 @@ pub async fn migrate_legacy<S: LifecycleStore + ?Sized>(store: &S) -> Result<Mig
     // fenced but may not have listed yet.
     let mut by_name: std::collections::BTreeMap<String, Vec<NsRecord>> =
         std::collections::BTreeMap::new();
+    let mut report = MigrationReport::default();
     for record in store.all_raw_records().await? {
         let legacy = legacy_fence(record.ledger_id.as_ref());
-        if record.fence.is_none_or(|f| f == legacy) {
-            by_name.entry(record.name.clone()).or_default().push(record);
+        if !record.fence.is_none_or(|f| f == legacy) {
+            continue;
         }
+        // Skipped, not fatal: one such ledger must not keep every other
+        // from being bound. The file and object-store migrations refuse the
+        // store before writing anything instead.
+        if !migratable(&record.name, &record.branch) {
+            report.quarantined.push(record.ledger_id.to_string());
+            continue;
+        }
+        by_name.entry(record.name.clone()).or_default().push(record);
     }
 
-    let mut report = MigrationReport::default();
     for (name, records) in by_name {
         let ledger_name = LedgerName::parse(&name)?;
         let bound = store.get_binding(&name).await?;
@@ -1303,4 +1333,41 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryNameService;
+
+    /// A ledger the migration cannot bind is skipped and reported, and every
+    /// other is bound, including those after it in name order.
+    #[tokio::test]
+    async fn migration_skips_ledgers_it_cannot_bind() {
+        let store = MemoryNameService::new();
+        for (name, branch) in [
+            ("alpha", "main"),
+            ("mydb", "feature#1"),
+            ("mydb", "main"),
+            ("rep@2026", "main"),
+            ("zeta", "main"),
+        ] {
+            let id = LedgerId::from_persisted_parts(name, branch).unwrap();
+            assert!(store
+                .insert_record(&NsRecord::new(id))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let mut refused = unmigratable_ids(&store).await.unwrap();
+        refused.sort();
+        assert_eq!(refused, ["mydb:feature#1", "rep@2026:main"]);
+
+        let mut report = migrate_legacy(&store).await.unwrap();
+        report.quarantined.sort();
+        assert_eq!(report.bound, ["alpha", "mydb", "zeta"]);
+        assert_eq!(report.quarantined, refused);
+        let mydb = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(mydb.listing("main").is_some() && mydb.listing("feature#1").is_none());
+    }
 }

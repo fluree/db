@@ -455,6 +455,14 @@ impl DynamoDbNameService {
             }
         }
 
+        // Migrates in place: refuse before the first write, so the table
+        // still works with the release that wrote it.
+        let refused = fluree_db_nameservice::lifecycle::unmigratable_ids(self).await?;
+        if !refused.is_empty() {
+            return Err(fluree_db_nameservice::migration::unmigratable_store(
+                &refused,
+            ));
+        }
         let report = fluree_db_nameservice::lifecycle::migrate_legacy(self).await?;
         self.client
             .put_item()

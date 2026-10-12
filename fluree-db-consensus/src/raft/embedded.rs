@@ -340,11 +340,21 @@ pub async fn release_one(fluree: &Fluree, ledger_id: &str, cid: &ContentId) {
 async fn migrate_nameservice(nameservice: Arc<crate::raft::nameservice::RaftNameService>) {
     match fluree_db_nameservice::lifecycle::migrate_legacy(nameservice.as_ref()).await {
         Ok(report) if report.is_empty() => {}
-        Ok(report) => tracing::info!(
-            bound = report.bound.len(),
-            dropped = report.dropped.len(),
-            "bound the ledgers created before name bindings"
-        ),
+        Ok(report) => {
+            tracing::info!(
+                bound = report.bound.len(),
+                dropped = report.dropped.len(),
+                "bound the ledgers created before name bindings"
+            );
+            if !report.quarantined.is_empty() {
+                tracing::error!(
+                    ledgers = ?report.quarantined,
+                    "left unbound, and unreachable, ledgers whose ids this release does not \
+                     accept ('@' and '#' are reserved); move each to a valid name with the \
+                     release that created it"
+                );
+            }
+        }
         Err(e) => {
             tracing::warn!(error = %e, "could not bind the ledgers created before name bindings");
         }
