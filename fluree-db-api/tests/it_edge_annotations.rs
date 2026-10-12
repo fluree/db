@@ -1813,8 +1813,11 @@ fn is_link_key(p: &str) -> bool {
 async fn variable_predicate_scan_returns_the_link() {
     let fluree = FlureeBuilder::memory().build_memory();
     for (ledger_id, graph) in [
-        ("it/edge-annotations:link-default-graph", None),
-        ("it/edge-annotations:link-named-graph", Some("ex:hr-graph")),
+        ("it/edge-annotations-link-default-graph:main", None),
+        (
+            "it/edge-annotations-link-named-graph:main",
+            Some("ex:hr-graph"),
+        ),
     ] {
         let ledger0 = genesis_ledger(&fluree, ledger_id).await;
         let mut txn = json!({
@@ -6501,7 +6504,7 @@ async fn base_edge_retraction_leaves_sibling_reifiers_the_delete_never_named() {
 #[tokio::test]
 async fn variable_predicate_scan_hides_legacy_bundles() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:legacy-bundle-scan";
+    let ledger_id = "it/edge-annotations-legacy-bundle-scan:main";
     let ledger =
         support::commit_legacy_bundle(&fluree, genesis_ledger(&fluree, ledger_id).await).await;
 
@@ -6574,7 +6577,7 @@ async fn variable_predicate_scan_hides_legacy_bundles() {
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
     check(fluree.ledger(ledger_id).await.expect("load"), "indexed", 3).await;
 
-    let ledger_id = "it/edge-annotations:legacy-bundle-over-index";
+    let ledger_id = "it/edge-annotations-legacy-bundle-over-index:main";
     let plain = fluree
         .insert(
             genesis_ledger(&fluree, ledger_id).await,

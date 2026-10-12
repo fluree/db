@@ -695,7 +695,8 @@ async fn link_lowering_keeps_object_types_through_accessors_and_novelty() {
 #[tokio::test]
 async fn rdf_reifies_with_an_ordinary_object_is_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "it/triple-term-links:reifies-firewall").await;
+    let ledger0 =
+        support::genesis_ledger(&fluree, "it/triple-term-links-reifies-firewall:main").await;
     let bad = "@prefix ex: <http://example.org/> .\n\
                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
                ex:r rdf:reifies ex:x ; ex:source ex:hr .\n";
@@ -706,11 +707,11 @@ async fn rdf_reifies_with_an_ordinary_object_is_refused() {
     assert!(format!("{err}").contains("reifies"), "{err}");
 
     fluree
-        .create_ledger("it/triple-term-links:reifies-firewall-sparql")
+        .create_ledger("it/triple-term-links-reifies-firewall-sparql:main")
         .await
         .expect("create ledger");
     let handle = fluree
-        .ledger_cached("it/triple-term-links:reifies-firewall-sparql")
+        .ledger_cached("it/triple-term-links-reifies-firewall-sparql:main")
         .await
         .expect("ledger handle");
     let err = fluree
@@ -738,7 +739,7 @@ async fn rdf_reifies_with_an_ordinary_object_is_refused() {
         .expect_err("a predicate variable bound to rdf:reifies must be refused too");
     assert!(format!("{err}").contains("reifies"), "{err}");
     let ledger = fluree
-        .ledger("it/triple-term-links:reifies-firewall-sparql")
+        .ledger("it/triple-term-links-reifies-firewall-sparql:main")
         .await
         .expect("reload");
     let err = fluree
@@ -3089,20 +3090,23 @@ async fn every_write_path_takes_triple_term_values() {
     let fresh = |id: &'static str| support::genesis_ledger(&fluree, id);
 
     let ledger = fluree
-        .insert(fresh("it/tt-values:jsonld").await, &term_values_jsonld())
+        .insert(
+            fresh("it/tt-values-jsonld:main").await,
+            &term_values_jsonld(),
+        )
         .await
         .expect("JSON-LD insert")
         .ledger;
     assert_term_values(&fluree, &ledger, "JSON-LD insert", 1).await;
 
     let ledger = fluree
-        .upsert_turtle(fresh("it/tt-values:upsert").await, TERM_VALUES)
+        .upsert_turtle(fresh("it/tt-values-upsert:main").await, TERM_VALUES)
         .await
         .expect("Turtle upsert")
         .ledger;
     assert_term_values(&fluree, &ledger, "Turtle upsert", 1).await;
 
-    let ledger_id = "it/tt-values:sparql";
+    let ledger_id = "it/tt-values-sparql:main";
     fluree.create_ledger(ledger_id).await.expect("create");
     let update = |body: &str| {
         let body = format!("PREFIX ex: <http://example.org/>\n{body}");
@@ -3147,7 +3151,7 @@ async fn every_write_path_takes_triple_term_values() {
 
     let ledger = fluree
         .update(
-            fluree.ledger("it/tt-values:jsonld").await.expect("load"),
+            fluree.ledger("it/tt-values-jsonld:main").await.expect("load"),
             &json!({
                 "@context": {"ex": "http://example.org/"},
                 "delete": {"@id": "ex:doc", "ex:mentions": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}}
@@ -3162,18 +3166,21 @@ async fn every_write_path_takes_triple_term_values() {
         "a JSON-LD delete removes the value"
     );
 
-    let (imported, ledger) =
-        import(&[("values.ttl", TERM_VALUES)], "it/tt-values:import-ttl").await;
+    let (imported, ledger) = import(
+        &[("values.ttl", TERM_VALUES)],
+        "it/tt-values-import-ttl:main",
+    )
+    .await;
     assert_term_values(&imported, &ledger, "Turtle import", 1).await;
     let (imported, ledger) = import(
         &[("values.jsonld", &term_values_jsonld().to_string())],
-        "it/tt-values:import-jsonld",
+        "it/tt-values-import-jsonld:main",
     )
     .await;
     assert_term_values(&imported, &ledger, "JSON-LD import", 1).await;
 
     // Graph sync stores them, and a re-sync of the same text finds no delta.
-    let ledger_id = "it/tt-values:sync";
+    let ledger_id = "it/tt-values-sync:main";
     fluree.create_ledger(ledger_id).await.expect("create");
     let sync = || {
         fluree.sync_named_graph_rdf_with(
@@ -3209,14 +3216,14 @@ async fn every_write_path_takes_triple_term_values() {
                   <http://example.org/doc> <http://example.org/mentions> \
                   <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>> \
                   <http://example.org/g> .\n";
-    let (imported, ledger) = import(&[("values.nq", nquads)], "it/tt-values:import-nq").await;
+    let (imported, ledger) = import(&[("values.nq", nquads)], "it/tt-values-import-nq:main").await;
     assert_term_values(&imported, &ledger, "N-Quads import", 1).await;
     let trig = format!("{TERM_VALUES}ex:g {{ ex:doc ex:mentions <<( ex:s ex:p ex:o )>> . }}\n");
     let (imported, imported_ledger) =
-        import(&[("values.trig", &trig)], "it/tt-values:import-trig").await;
+        import(&[("values.trig", &trig)], "it/tt-values-import-trig:main").await;
     assert_term_values(&imported, &imported_ledger, "TriG import", 1).await;
     let inserted = fluree
-        .insert_turtle(fresh("it/tt-values:trig-insert").await, &trig)
+        .insert_turtle(fresh("it/tt-values-trig-insert:main").await, &trig)
         .await
         .expect("TriG insert")
         .ledger;
@@ -3480,7 +3487,10 @@ async fn every_write_path_takes_nested_triple_terms() {
         ]
     });
     let ledger = fluree
-        .insert(fresh_ledger("it/tt-nested:jsonld").await, &nested_jsonld)
+        .insert(
+            fresh_ledger("it/tt-nested-jsonld:main").await,
+            &nested_jsonld,
+        )
         .await
         .expect("JSON-LD insert")
         .ledger;
@@ -3514,13 +3524,13 @@ async fn every_write_path_takes_nested_triple_terms() {
     assert_eq!(mentions(ledger).await, 0, "a JSON-LD delete removes it");
 
     let ledger = fluree
-        .upsert_turtle(fresh_ledger("it/tt-nested:upsert").await, NESTED)
+        .upsert_turtle(fresh_ledger("it/tt-nested-upsert:main").await, NESTED)
         .await
         .expect("Turtle upsert")
         .ledger;
     assert_nested(&fluree, &ledger, "Turtle upsert", 1).await;
 
-    let ledger_id = "it/tt-nested:sparql";
+    let ledger_id = "it/tt-nested-sparql:main";
     fluree.create_ledger(ledger_id).await.expect("create");
     let update = |body: &str| {
         let body = format!("PREFIX ex: <http://example.org/>\n{body}");
@@ -3569,13 +3579,13 @@ async fn every_write_path_takes_nested_triple_terms() {
         "{NESTED}ex:g {{ ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> . }}\n"
     );
     let inserted = fluree
-        .insert_turtle(fresh_ledger("it/tt-nested:trig").await, &trig)
+        .insert_turtle(fresh_ledger("it/tt-nested-trig:main").await, &trig)
         .await
         .expect("TriG insert")
         .ledger;
     assert_nested(&fluree, &inserted, "TriG insert", 1).await;
     let (imported, imported_ledger) =
-        import(&[("nested.trig", &trig)], "it/tt-nested:import-trig").await;
+        import(&[("nested.trig", &trig)], "it/tt-nested-import-trig:main").await;
     assert_nested(&imported, &imported_ledger, "TriG import", 1).await;
     for (fluree, ledger, label) in [
         (&fluree, &inserted, "TriG insert"),

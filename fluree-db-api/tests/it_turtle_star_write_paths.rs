@@ -409,8 +409,8 @@ async fn one_named_reifier_on_two_edges_names_both_on_every_turtle_path() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     for (path, ledger_id) in [
-        ("insert", "it/turtle-star-reuse:insert"),
-        ("upsert", "it/turtle-star-reuse:upsert"),
+        ("insert", "it/turtle-star-reuse-insert:main"),
+        ("upsert", "it/turtle-star-reuse-upsert:main"),
     ] {
         let ledger = genesis_ledger(&fluree, ledger_id).await;
         let committed = match path {

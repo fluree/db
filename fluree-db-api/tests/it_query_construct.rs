@@ -1649,7 +1649,7 @@ mod annotations_and_graphs {
         }
 
         let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
-        let source = upsert(&fluree, "it/construct:trig-source", SEED).await;
+        let source = upsert(&fluree, "it/construct-trig-source:main", SEED).await;
         let result = sparql(&fluree, &source, COPY).await;
         let trig = render(&result, &source, FormatterConfig::trig());
         let nq = render(&result, &source, FormatterConfig::nquads());
@@ -1663,7 +1663,7 @@ mod annotations_and_graphs {
             assert!(nq.lines().any(|l| l == line), "missing {line}\n{nq}");
         }
 
-        let copy = upsert(&fluree, "it/construct:trig-copy", &trig).await;
+        let copy = upsert(&fluree, "it/construct-trig-copy:main", &trig).await;
         let copied = render(
             &sparql(&fluree, &copy, COPY).await,
             &copy,
