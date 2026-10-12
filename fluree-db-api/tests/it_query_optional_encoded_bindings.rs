@@ -1581,6 +1581,473 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
 }
 
 // ---------------------------------------------------------------------------
+// Lanes that read one graph.
+//
+// A default graph of several graphs of one ledger sets `binary_g_id` to one
+// member. The lanes that read a single graph's index (the binary-index fast
+// paths, the probe and cyclic lanes, the EXISTS semijoin cache, the
+// partitioned GROUP BY, the geo index search) would read that member alone
+// there. They gate on `ExecutionContext::reads_exactly_one_graph` (the geo
+// rewrite and the partition hint on its planning twin,
+// `multi_default_graph`) and stand down for the generic plan. Each test
+// pairs scopes of one graph, where the lane must run, with the union default
+// graph and `FROM` several graphs, where it must not, all against
+// hand-derived answers.
+
+/// A TriG ledger, indexed, with no novelty.
+async fn indexed_trig_ledger(ledger_id: &str, trig: &str) -> (Fluree, LedgerHandle) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("seed TriG");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
+    let view = handle.snapshot().await;
+    assert!(view.binary_store.is_some(), "indexed");
+    assert!(view.novelty.is_empty(), "no novelty");
+    (fluree, handle)
+}
+
+/// A JSON-LD query through the connection, so `from` can name graphs.
+async fn connection_jsonld(fluree: &Fluree, ledger_id: &str, query: &JsonValue) -> JsonValue {
+    let result = fluree
+        .query_connection(query)
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+}
+
+const UNION_PRAGMA: &str = "# PRAGMA union-default-graph: true\n";
+
+/// One case of a single-graph lane: the query, its columns, the answer, and
+/// whether the lane must run (`true`) or stand down (`false`).
+type LaneCase = (&'static str, String, &'static [&'static str], Rows, bool);
+
+/// Run SPARQL lane cases, checking each answer and the lane's routing stamp.
+async fn check_lane_cases(
+    fluree: &Fluree,
+    handle: &LedgerHandle,
+    site: &str,
+    cases: Vec<LaneCase>,
+    failures: &mut Failures,
+) {
+    for (label, query, vars, want, must_fire) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = db(handle)
+            .await
+            .query(fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await;
+        match result {
+            Ok(json) => failures.eq(sparql_rows(&json, vars), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        let fired = stamps(&store, before, site).iter().any(|o| o == "proceed");
+        failures.eq(fired, must_fire, &format!("{label}: `{site}` ran"));
+    }
+}
+
+/// One JSON-LD lane case, run through the connection (`from` may name graphs).
+struct JsonLaneCase<'a> {
+    label: &'a str,
+    query: JsonValue,
+    want: Rows,
+    must_fire: bool,
+}
+
+/// Run one JSON-LD lane case, checking its answer and the lane's stamp.
+async fn check_lane_jsonld(
+    fluree: &Fluree,
+    ledger_id: &str,
+    site: &str,
+    case: JsonLaneCase<'_>,
+    failures: &mut Failures,
+) {
+    let (store, _guard) = init_test_tracing();
+    let before = store.all_events().len();
+    let result = connection_jsonld(fluree, ledger_id, &case.query).await;
+    failures.eq(jsonld_rows(&result), case.want, case.label);
+    let fired = stamps(&store, before, site).iter().any(|o| o == "proceed");
+    failures.eq(
+        fired,
+        case.must_fire,
+        &format!("{}: `{site}` ran", case.label),
+    );
+}
+
+/// GROUP BY over one bound-predicate pattern (the partitioned lane, which
+/// aggregates key runs instead of hashing). A default graph of several graphs
+/// drains its members one after another, each sorted by the key, so one key
+/// arrives in one run per member and the lane split its groups (on main too).
+#[tokio::test(flavor = "current_thread")]
+async fn partitioned_group_by_reads_one_graph() {
+    let ledger_id = "it/partitioned-group-by:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:a1 ex:amount 1.5 ; ex:n 1 .
+        GRAPH <urn:g2> { ex:b1 ex:amount 1.5 ; ex:n 1 . ex:b2 ex:amount 2.5 ; ex:n 2 . }
+        GRAPH <urn:g3> { ex:c1 ex:amount 1.5 ; ex:n 1 . ex:c2 ex:amount 2.5 ; ex:n 2 . }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let q = |prologue: &str, ds: &str, pred: &str, agg: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?v ({agg} AS ?k) {ds} \
+             WHERE {{ ?s ex:{pred} ?v }} GROUP BY ?v"
+        )
+    };
+    let from2 = "FROM <urn:g2> FROM <urn:g3>";
+    let vk: &'static [&'static str] = &["v", "k"];
+    let cases: Vec<LaneCase> = vec![
+        (
+            "one graph: the default graph alone",
+            q("", "", "n", "COUNT(*)"),
+            vk,
+            rows(&[&["1", "1"]]),
+            true,
+        ),
+        (
+            "one graph: FROM g2 alone",
+            q("", "FROM <urn:g2>", "amount", "COUNT(*)"),
+            vk,
+            rows(&[&["1.5", "1"], &["2.5", "1"]]),
+            true,
+        ),
+        (
+            "G1 union, decimal key",
+            q(UNION_PRAGMA, "", "amount", "COUNT(*)"),
+            vk,
+            rows(&[&["1.5", "3"], &["2.5", "2"]]),
+            false,
+        ),
+        (
+            "G2 union, integer key",
+            q(UNION_PRAGMA, "", "n", "COUNT(*)"),
+            vk,
+            rows(&[&["1", "3"], &["2", "2"]]),
+            false,
+        ),
+        (
+            "G3 FROM g2 + g3, decimal key",
+            q("", from2, "amount", "COUNT(*)"),
+            vk,
+            rows(&[&["1.5", "2"], &["2.5", "2"]]),
+            false,
+        ),
+        (
+            "G4 FROM g2 + g3, integer key",
+            q("", from2, "n", "COUNT(*)"),
+            vk,
+            rows(&[&["1", "2"], &["2", "2"]]),
+            false,
+        ),
+        (
+            "G6 union, SUM per key",
+            q(UNION_PRAGMA, "", "n", "SUM(?v)"),
+            vk,
+            rows(&[&["1", "3"], &["2", "4"]]),
+            false,
+        ),
+    ];
+    let mut failures = Failures::default();
+    check_lane_cases(
+        &fluree,
+        &handle,
+        "partitioned_group_by",
+        cases,
+        &mut failures,
+    )
+    .await;
+    let group_by = |from: JsonValue, opts: Option<JsonValue>| {
+        let mut q = json!({
+            "@context": {"ex": EX},
+            "from": from,
+            "select": ["?v", "(as (count ?s) ?k)"],
+            "where": [{"@id": "?s", "ex:n": "?v"}],
+            "groupBy": ["?v"]
+        });
+        if let Some(opts) = opts {
+            q["opts"] = opts;
+        }
+        q
+    };
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "partitioned_group_by",
+        JsonLaneCase {
+            label: "G7 JSON-LD groupBy, union",
+            query: group_by(json!(ledger_id), Some(json!({"unionDefaultGraph": true}))),
+            want: rows(&[&["1", "3"], &["2", "2"]]),
+            must_fire: false,
+        },
+        &mut failures,
+    )
+    .await;
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "partitioned_group_by",
+        JsonLaneCase {
+            label: "G8 JSON-LD groupBy, FROM g2 + g3",
+            query: group_by(
+                json!([
+                    {"@id": ledger_id, "graph": "urn:g2"},
+                    {"@id": ledger_id, "graph": "urn:g3"}
+                ]),
+                None,
+            ),
+            want: rows(&[&["1", "2"], &["2", "2"]]),
+            must_fire: false,
+        },
+        &mut failures,
+    )
+    .await;
+    failures.assert_none();
+}
+
+/// A cyclic BGP (the cyclic-join lane, gated by `allow_cursor_fast_path`).
+/// Cycle a→b→c→a spans all three graphs; cycle p→q→r→p lies inside g2. The
+/// lane read `binary_g_id`'s graph alone: nothing over the union (whose
+/// `binary_g_id` is the default graph's), and nothing under `FROM g3 + g2`.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_lane_reads_one_graph() {
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:a ex:knows ex:b .
+        GRAPH <urn:g2> { ex:b ex:knows ex:c . ex:p ex:knows ex:q . ex:q ex:knows ex:r . ex:r ex:knows ex:p . }
+        GRAPH <urn:g3> { ex:c ex:knows ex:a . }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-graphs:main", trig).await;
+    let tri = |prologue: &str, ds: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        )
+    };
+    let xyz: &'static [&'static str] = &["x", "y", "z"];
+    let pqr = rows(&[&["p", "q", "r"], &["q", "r", "p"], &["r", "p", "q"]]);
+    let cases: Vec<LaneCase> = vec![
+        (
+            "one graph: FROM g2 alone",
+            tri("", "FROM <urn:g2>"),
+            xyz,
+            pqr.clone(),
+            true,
+        ),
+        (
+            "C1 union: one cycle across graphs, one inside g2",
+            tri(UNION_PRAGMA, ""),
+            xyz,
+            rows(&[
+                &["a", "b", "c"],
+                &["b", "c", "a"],
+                &["c", "a", "b"],
+                &["p", "q", "r"],
+                &["q", "r", "p"],
+                &["r", "p", "q"],
+            ]),
+            false,
+        ),
+        (
+            "C2 FROM g2 + g3",
+            tri("", "FROM <urn:g2> FROM <urn:g3>"),
+            xyz,
+            pqr.clone(),
+            false,
+        ),
+        (
+            "C4 FROM g3 + g2",
+            tri("", "FROM <urn:g3> FROM <urn:g2>"),
+            xyz,
+            pqr,
+            false,
+        ),
+    ];
+    let mut failures = Failures::default();
+    check_lane_cases(&fluree, &handle, "cyclic_bgp", cases, &mut failures).await;
+    failures.assert_none();
+}
+
+/// EXISTS inside an expression (the semijoin cache, admitted by
+/// `fast_path_store`, built from `binary_g_id`'s graph). Labels: x1 in the
+/// default graph, y1 in g2.
+#[tokio::test(flavor = "current_thread")]
+async fn exists_semijoin_cache_reads_one_graph() {
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        ex:x1 ex:amount 1.5 ; ex:label "x one" .
+        ex:x2 ex:amount 9.5 .
+        GRAPH <urn:g2> { ex:y1 ex:amount 7.5 ; ex:label "y one" . ex:y2 ex:amount 1.5 . }
+        GRAPH <urn:g3> { ex:z1 ex:amount 9.5 . }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger("it/exists-cache-graphs:main", trig).await;
+    let filter = |prologue: &str, ds: &str, not: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?x {ds} WHERE {{ ?x ex:amount ?v \
+             FILTER({not}EXISTS {{ ?x ex:label ?l }} && ?v > 0) }}"
+        )
+    };
+    let x: &'static [&'static str] = &["x"];
+    let cases: Vec<LaneCase> = vec![
+        (
+            "one graph: FROM g2 alone",
+            filter("", "FROM <urn:g2>", ""),
+            x,
+            rows(&[&["y1"]]),
+            true,
+        ),
+        (
+            "E1 union, FILTER(EXISTS && ...)",
+            filter(UNION_PRAGMA, "", ""),
+            x,
+            rows(&[&["x1"], &["y1"]]),
+            false,
+        ),
+        (
+            "E3 union, FILTER(!EXISTS && ...)",
+            filter(UNION_PRAGMA, "", "!"),
+            x,
+            rows(&[&["x2"], &["y2"], &["z1"]]),
+            false,
+        ),
+        (
+            "E4 FROM g3 + g2",
+            filter("", "FROM <urn:g3> FROM <urn:g2>", ""),
+            x,
+            rows(&[&["y1"]]),
+            false,
+        ),
+        (
+            "E2 union, BIND(EXISTS)",
+            format!(
+                "{UNION_PRAGMA}{PREFIXES}SELECT ?x ?b WHERE {{ ?x ex:amount ?v \
+                 BIND(EXISTS {{ ?x ex:label ?l }} AS ?b) }}"
+            ),
+            &["x", "b"],
+            rows(&[
+                &["x1", "true"],
+                &["x2", "false"],
+                &["y1", "true"],
+                &["y2", "false"],
+                &["z1", "false"],
+            ]),
+            false,
+        ),
+    ];
+    let mut failures = Failures::default();
+    check_lane_cases(&fluree, &handle, "exists_semijoin", cases, &mut failures).await;
+    failures.assert_none();
+}
+
+/// A `geof:distance` filter, which the planner rewrites into the geo index
+/// search when the scope reads one graph. Paris is in the default graph,
+/// London in g2, Brussels and Berlin in g3; London and Brussels lie within
+/// 500 km of Paris, Berlin does not.
+#[tokio::test(flavor = "current_thread")]
+async fn geo_search_reads_one_graph() {
+    let ledger_id = "it/geo-search-graphs:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        ex:paris ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+        GRAPH <urn:g2> { ex:london ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral . }
+        GRAPH <urn:g3> {
+            ex:brussels ex:location "POINT(4.3517 50.8503)"^^geo:wktLiteral .
+            ex:berlin ex:location "POINT(13.4050 52.5200)"^^geo:wktLiteral .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let nearby = |from: Option<JsonValue>, opts: Option<JsonValue>| {
+        let mut q = json!({
+            "@context": {
+                "ex": EX,
+                "geo": "http://www.opengis.net/ont/geosparql#",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?place"],
+            "where": [
+                {"@id": "?place", "ex:location": "?loc"},
+                ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
+                ["filter", "(<= ?dist 500000)"]
+            ]
+        });
+        if let Some(from) = from {
+            q["from"] = from;
+        }
+        if let Some(opts) = opts {
+            q["opts"] = opts;
+        }
+        q
+    };
+    let mut failures = Failures::default();
+    {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let r = jsonld(&fluree, &handle, &nearby(None, None)).await;
+        failures.eq(
+            jsonld_rows(&r),
+            rows(&[&["paris"]]),
+            "one graph: the default graph alone",
+        );
+        let fired = stamps(&store, before, "geo_search")
+            .iter()
+            .any(|o| o == "proceed");
+        failures.eq(fired, true, "one graph: `geo_search` ran");
+    }
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "geo_search",
+        JsonLaneCase {
+            label: "union",
+            query: nearby(
+                Some(json!(ledger_id)),
+                Some(json!({"unionDefaultGraph": true})),
+            ),
+            want: rows(&[&["brussels"], &["london"], &["paris"]]),
+            must_fire: false,
+        },
+        &mut failures,
+    )
+    .await;
+    check_lane_jsonld(
+        &fluree,
+        ledger_id,
+        "geo_search",
+        JsonLaneCase {
+            label: "FROM g2 + g3",
+            query: nearby(
+                Some(json!([
+                    {"@id": ledger_id, "graph": "urn:g2"},
+                    {"@id": ledger_id, "graph": "urn:g3"}
+                ])),
+                None,
+            ),
+            want: rows(&[&["brussels"], &["london"]]),
+            must_fire: false,
+        },
+        &mut failures,
+    )
+    .await;
+    failures.assert_none();
+}
+
+// ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //
 // A GRAPH scope's scans bind big numbers and vectors as handles into its own

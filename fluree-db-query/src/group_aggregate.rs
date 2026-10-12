@@ -700,6 +700,11 @@ struct GroupState {
     agg_states: Vec<AggState>,
 }
 
+/// Routing stamp of the partitioned GROUP BY lane ([`GroupAggregateOperator`]
+/// aggregating key runs instead of hashing), recorded at open when the plan
+/// promised partitioned input.
+pub(crate) const PARTITIONED_GROUP_BY_SITE: &str = "partitioned_group_by";
+
 /// Streaming GROUP BY + Aggregate operator
 ///
 /// Memory usage: O(groups) instead of O(rows)
@@ -717,8 +722,14 @@ pub struct GroupAggregateOperator {
     /// Accumulated groups: composite_key -> group_state
     groups: hashbrown::HashMap<CompositeGroupKey, GroupState, FxBuildHasher>,
     /// If true, input is already partitioned by the GROUP BY key(s), so we can
-    /// aggregate per-run without hashing each row into a map.
+    /// aggregate per-run without hashing each row into a map. Set at open:
+    /// the plan's hint ([`Self::partition_hint`]), held only when the scope
+    /// reads exactly one graph.
     partitioned: bool,
+    /// The plan's promise that the input arrives grouped by the key. A
+    /// default graph of several graphs drains its members one after another,
+    /// one sorted run per member, so the promise holds only for one graph.
+    partition_hint: bool,
     /// Accumulated groups in partitioned mode (in input order).
     partitioned_groups: Vec<GroupState>,
     /// Iterator for emitting results.
@@ -808,6 +819,7 @@ impl GroupAggregateOperator {
             agg_specs,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             partitioned,
+            partition_hint: partitioned,
             partitioned_groups: Vec::new(),
             emit_iter: None,
             graph_view,
@@ -924,6 +936,19 @@ impl Operator for GroupAggregateOperator {
         self.groups.clear();
         self.partitioned_groups.clear();
         self.emit_iter = None;
+        if self.partition_hint {
+            self.partitioned = ctx.reads_exactly_one_graph();
+            crate::fast_path_outcome::stamp_fast_path(
+                PARTITIONED_GROUP_BY_SITE,
+                if self.partitioned {
+                    crate::fast_path_outcome::FastPathOutcome::Proceed
+                } else {
+                    crate::fast_path_outcome::FastPathOutcome::Fallback(
+                        crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                    )
+                },
+            );
+        }
         // If the execution context has a binary store, use it to materialize
         // encoded bindings for correct MIN/MAX comparison semantics.
         if self.graph_view.is_none() {

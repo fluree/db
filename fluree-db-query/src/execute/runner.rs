@@ -436,13 +436,18 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            // The GeoSearch operator reads the binary index, so without one
-            // covering `to_t` (a ledger not yet indexed, a time before the
+            // The GeoSearch operator reads one graph's binary index, so without
+            // one covering `to_t` (a ledger not yet indexed, a time before the
             // index's base) the patterns stay as written and evaluate as such.
             // The operator reads the store its execution context takes from
             // the snapshot, which a caller need not have passed in here,
-            // unless execution runs with none (a multi-ledger dataset).
-            let geo_index_covers = binary_scans
+            // unless execution runs with none (a multi-ledger dataset). It
+            // reads `binary_g_id`'s index, so a default graph of several
+            // graphs keeps the patterns too, evaluated over every member
+            // (`ExecutionContext::reads_exactly_one_graph` is the runtime twin
+            // of this planning-time check).
+            let geo_index_covers = !planning.multi_default_graph
+                && binary_scans
                 && binary_store
                     .cloned()
                     .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))

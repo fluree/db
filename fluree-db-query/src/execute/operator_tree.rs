@@ -3485,7 +3485,13 @@ pub(crate) fn apply_solution_modifiers(
     // (e.g. `GROUP BY ?s COUNT(*)` splitting every subject into per-source
     // groups of 1). Demote here, next to the consumer, so no caller can
     // reintroduce the unsound combination.
-    let partitioned = partitioned && !planning.is_history();
+    //
+    // A default graph of several graphs breaks the promise too: each member's
+    // scan arrives sorted by the key, but `DatasetOperator` drains the members
+    // one after another, so one key's rows come in one run per member. The
+    // operator also checks its scope at open
+    // (`ExecutionContext::reads_exactly_one_graph`).
+    let partitioned = partitioned && !planning.is_history() && !planning.multi_default_graph;
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
     // tail treats both variants uniformly. Cloning is cheap — both vectors are

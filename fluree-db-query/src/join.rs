@@ -1379,15 +1379,12 @@ impl Operator for NestedLoopJoinOperator {
                 // caller that sets this flag — fall back to the per-row path,
                 // which merges the overlay and honours eager decoding.
                 && !ctx.eager_materialization
-                && match ctx.active_graphs() {
-                    // Object-batched path currently emits `Binding::EncodedSid` for the new
-                    // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
-                    // requirements.
-                    ActiveGraphs::Single => true,
-                    ActiveGraphs::Many(graphs) => {
-                        (self.batched_eligible || self.batched_exists_eligible) && graphs.len() == 1
-                    }
-                };
+                // The batched lanes read one graph's leaves (`binary_g_id`'s).
+                && ctx.reads_exactly_one_graph()
+                // Object-batched path currently emits `Binding::EncodedSid` for the new
+                // subject var. Keep it to a scope with no dataset, to avoid dataset-mode
+                // IriMatch requirements.
+                && (ctx.dataset.is_none() || self.batched_eligible || self.batched_exists_eligible);
 
         if !self.logged_runtime_mode {
             let (active_graph_mode, active_graph_count) = match ctx.active_graphs() {
