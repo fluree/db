@@ -2208,6 +2208,9 @@ async fn count_lanes_read_one_graph() {
         ),
     ];
     let mut failures = Failures::default();
+    // Other tests in this binary turn the process-wide kill switch on; the
+    // read side keeps it off for these queries unless the environment set it.
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
     for (site, label, query, vars, want, must_fire) in cases {
         let (store, _guard) = init_test_tracing();
         let before = store.all_events().len();
@@ -2401,6 +2404,9 @@ async fn cypher_lanes_over_the_union_default_graph() {
         ),
     ];
     let mut failures = Failures::default();
+    // Other tests in this binary turn the process-wide kill switch on; the
+    // read side keeps it off for these queries unless the environment set it.
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
     for (label, cypher, site, want) in cases {
         for (scope, handle, must_fire) in [("union", &union, false), ("merged", &merged, true)] {
             let (store, _guard) = init_test_tracing();
