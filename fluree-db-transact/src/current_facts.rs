@@ -74,12 +74,20 @@ const NARROW_SLOT: usize = 16;
 
 /// What reading one value of a slot from the index costs, in slot facts: a
 /// value read is a dictionary lookup of the value and a seek, a slot read
-/// the seek and a decode per fact. Measured over deletes naming 1 to 32
-/// values of slots of 1 to 20,000 values (the `slots_delete` probe,
-/// 2026-10-07): naming `m` values of a `k`-value slot, value reads cost
-/// less than the slot read whenever `m * 10 <= k`, and more at `k <= 4`
-/// for every `m`.
-const POINT_READ_FACTS: u64 = 10;
+/// the seek and a decode per fact. Measured 2026-10-08 over deletes naming
+/// `m` values of one slot of `k` values; where the values lie decides it:
+/// - close together (each read forced, `m` up to `k / 2`, `k` = 1,000 to
+///   100,000): value reads cost as much as the slot read at `m` = `k / 12.2`
+///   to `k / 13.5`, in instructions and in wall time alike;
+/// - spread over the whole slot (every seventh value, `k` = 20,000 and
+///   40,000, wall time): at `m` = `k / 19` to `k / 21`.
+///
+/// 16 sits between the two. At the bound, value reads cost 6 to 7% less
+/// than the slot read when the values lie together and 5 to 7% more when
+/// they are spread; 20 would make the spread case even and cost up to 12%
+/// on the other. At `k <= 4` the slot read costs less for every `m`
+/// (2026-10-07).
+const POINT_READ_FACTS: u64 = 16;
 
 /// The routing stamp of [`DeleteResolver`]'s value reads: `proceed` when a
 /// batch read some slot by the values its intents name, else
@@ -978,7 +986,10 @@ impl<'l> DeleteResolver<'l> {
     /// statistics for `p` in the graph (current facts over distinct
     /// subjects). With no index row of `p` possible, a value read is a
     /// narrower seek into novelty than the slot's, and one intent takes it.
-    /// With an index but no statistics for `p`, the slot is read.
+    /// With an index but no statistics for `p`, the slot is read. The width
+    /// is the predicate's average over its subjects, so one wide subject
+    /// among narrow ones reads its slot and the reverse reads by value: the
+    /// choice costs time when it is wrong, never results.
     fn point_bound(&self, g_id: GraphId, p: &Sid) -> usize {
         if let Some(bound) = self.point_bound_override {
             return bound;
