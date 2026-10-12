@@ -840,13 +840,20 @@ async fn hard_drop_of_nested_name_keeps_the_parent_named_ledgers_dicts() {
     assert!(db.t > 0);
 }
 
-/// A legacy ledger whose name nests inside another ledger's storage
-/// (`a/main/index/child` lives under `a:main`'s `index/` directory) must
-/// survive a hard drop of `a` — its branches and its `@shared/` dictionaries.
-/// New names can no longer take a reserved layout segment, so the fixture is
-/// built the way such a ledger would already exist: without `create_ledger`.
-#[tokio::test]
-async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
+/// Two legacy ledgers from before name bindings, both rooted at their
+/// names: `a`, and `a/main/index/child`, whose files therefore sit inside
+/// `a:main`'s `index/` directory. With `child_dropped`, the child is
+/// soft-dropped: its records move to the dropped-ledger registry, and its
+/// files stay where they are. Returns the child's files and its instance
+/// when dropped.
+async fn nested_legacy_ledgers(
+    child_dropped: bool,
+) -> (
+    tempfile::TempDir,
+    fluree_db_api::Fluree,
+    Vec<String>,
+    Option<String>,
+) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
     let fluree = FlureeBuilder::file(&path).build().expect("build");
@@ -854,15 +861,15 @@ async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [{"@id": "ex:seed", "ex:val": "a string for the dicts"}]
     });
-    let parent = fluree.create_ledger("a").await.expect("create a");
-    fluree.insert(parent, &txn).await.expect("insert a");
-    let child_id = "a/main/index/child:main";
-    fluree_db_nameservice::testing::create_at_name_root(fluree.publisher().unwrap(), child_id)
-        .await
-        .expect("a ledger from before name bindings");
-    let child = fluree.ledger(child_id).await.expect("load child");
-    fluree.insert(child, &txn).await.expect("insert child");
-    for id in ["a", "a/main/index/child"] {
+    // New names can no longer take a reserved layout segment, and new
+    // ledgers get roots of their own, so both are built the way such
+    // ledgers would already exist: without `create_ledger`.
+    for id in ["a:main", "a/main/index/child:main"] {
+        fluree_db_nameservice::testing::create_at_name_root(fluree.publisher().unwrap(), id)
+            .await
+            .expect("a ledger from before name bindings");
+        let ledger = fluree.ledger(id).await.expect("load");
+        fluree.insert(ledger, &txn).await.expect("insert");
         fluree
             .reindex(id, fluree_db_api::ReindexOptions::default())
             .await
@@ -870,26 +877,77 @@ async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
     }
 
     let admin = fluree.admin_storage().expect("managed backend");
-    let child_root = "fluree:file://a/main/index/child/";
-    let before = admin.list_prefix(child_root).await.expect("list");
-    assert!(
-        before.iter().any(|f| f.contains("/@shared/dicts/"))
-            && before.iter().any(|f| f.contains("/main/commit/")),
-        "fixture: child must have commits and shared dicts: {before:?}"
-    );
-
-    fluree
-        .drop_ledger("a", DropMode::Hard)
+    let child = admin
+        .list_prefix("fluree:file://a/main/index/child/")
         .await
-        .expect("drop a");
-
-    let after = admin.list_prefix(child_root).await.expect("list");
-    assert_eq!(
-        after, before,
-        "dropping `a` deleted the nested ledger's files"
+        .expect("list");
+    assert!(
+        child.iter().any(|f| f.contains("/@shared/dicts/"))
+            && child.iter().any(|f| f.contains("/main/commit/")),
+        "fixture: child must have commits and shared dicts: {child:?}"
     );
-    fluree.disconnect_ledger(child_id).await;
-    assert!(fluree.db(child_id).await.expect("child still loads").t > 0);
+    let instance = if child_dropped {
+        let report = fluree
+            .drop_ledger("a/main/index/child", DropMode::Soft)
+            .await
+            .expect("soft-drop child");
+        Some(report.instance.expect("instance").to_string())
+    } else {
+        None
+    };
+    (tmp, fluree, child, instance)
+}
+
+async fn files_of_child(fluree: &fluree_db_api::Fluree) -> Vec<String> {
+    fluree
+        .admin_storage()
+        .expect("managed backend")
+        .list_prefix("fluree:file://a/main/index/child/")
+        .await
+        .expect("list")
+}
+
+/// A hard drop of `a` keeps a nested legacy ledger's files, its branches'
+/// and its `@shared/` dictionaries, whether that ledger is live or
+/// soft-dropped and waiting in the registry.
+#[tokio::test]
+async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
+    for child_dropped in [false, true] {
+        let (_tmp, fluree, before, instance) = nested_legacy_ledgers(child_dropped).await;
+        fluree
+            .drop_ledger("a", DropMode::Hard)
+            .await
+            .expect("drop a");
+        assert_eq!(
+            files_of_child(&fluree).await,
+            before,
+            "dropping `a` deleted the nested ledger's files (dropped: {child_dropped})"
+        );
+        if let Some(instance) = instance {
+            fluree
+                .restore_dropped(&instance)
+                .await
+                .expect("restore child");
+        }
+        let child_id = "a/main/index/child:main";
+        fluree.disconnect_ledger(child_id).await;
+        assert!(fluree.db(child_id).await.expect("child loads").t > 0);
+    }
+}
+
+/// An index sweep of `a` plans none of a nested legacy ledger's files as
+/// orphans, live or soft-dropped.
+#[tokio::test]
+async fn index_sweep_keeps_a_nested_legacy_ledgers_files() {
+    for child_dropped in [false, true] {
+        let (_tmp, fluree, before, _) = nested_legacy_ledgers(child_dropped).await;
+        fluree.sweep_index_storage("a").await.expect("sweep a");
+        assert_eq!(
+            files_of_child(&fluree).await,
+            before,
+            "sweeping `a` deleted the nested ledger's files (dropped: {child_dropped})"
+        );
+    }
 }
 
 async fn files_under(tier: &fluree_db_core::MemoryStorage, root: &str) -> Vec<String> {

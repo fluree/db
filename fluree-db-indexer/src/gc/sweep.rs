@@ -448,14 +448,17 @@ pub fn nested_prefixes(method: &str, nested: &[StorageNamespace]) -> Vec<String>
     prefixes
 }
 
-/// The branches whose storage can nest under `root`: every recorded branch
-/// (retracted included) of a ledger whose root extends `root/`.
-pub fn nested_namespaces(records: &[NsRecord], root: &StorageRoot) -> Vec<StorageNamespace> {
+/// Of `namespaces`, the branches of every ledger that keeps storage, those
+/// that can nest under `root`: the ones whose root extends `root/`.
+pub fn nested_namespaces(
+    namespaces: &[StorageNamespace],
+    root: &StorageRoot,
+) -> Vec<StorageNamespace> {
     let prefix = format!("{root}/");
-    let mut nested: Vec<StorageNamespace> = records
+    let mut nested: Vec<StorageNamespace> = namespaces
         .iter()
-        .map(NsRecord::storage_namespace)
         .filter(|namespace| namespace.root().as_str().starts_with(&prefix))
+        .cloned()
         .collect();
     nested.sort_by(|a, b| a.branch_prefix().cmp(b.branch_prefix()));
     nested.dedup();
@@ -620,11 +623,11 @@ mod tests {
             );
         }
 
-        let records = [
-            fluree_db_nameservice::NsRecord::new(MAIN),
-            fluree_db_nameservice::NsRecord::new(&child),
+        let namespaces = [
+            StorageNamespace::parse_legacy(MAIN).unwrap(),
+            StorageNamespace::legacy(&child),
         ];
-        let nested = nested_namespaces(&records, &root(NAME));
+        let nested = nested_namespaces(&namespaces, &root(NAME));
         assert_eq!(
             nested,
             [StorageNamespace::parse_legacy("mydb/main/index/child:main").unwrap()]
@@ -656,11 +659,11 @@ mod tests {
             .unwrap();
         assert!(unaware.orphans.contains(&orphan), "fixture has no orphan");
 
-        let records = [
-            fluree_db_nameservice::NsRecord::new(MAIN),
-            fluree_db_nameservice::NsRecord::new("mydb/main:trunk"),
+        let namespaces = [
+            StorageNamespace::parse_legacy(MAIN).unwrap(),
+            StorageNamespace::parse_legacy("mydb/main:trunk").unwrap(),
         ];
-        let nested = nested_namespaces(&records, &root(NAME));
+        let nested = nested_namespaces(&namespaces, &root(NAME));
         assert_eq!(
             nested,
             [StorageNamespace::parse_legacy("mydb/main:trunk").unwrap()]

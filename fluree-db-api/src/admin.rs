@@ -1057,6 +1057,37 @@ impl crate::Fluree {
     ///
     /// Lists the whole store. Run it against the nameservice that owns the
     /// storage: a peer's local copy may not know every ledger.
+    /// Where every ledger that keeps storage keeps it: each branch a binding
+    /// lists, in any state, and each branch of a dropped ledger the registry
+    /// keeps. Records alone miss a ledger that is dropped, or being created,
+    /// dropped or restored, whose files another ledger's drop or sweep must
+    /// still leave alone when they nest under its root.
+    pub(crate) async fn storage_namespaces(&self) -> Result<Vec<StorageNamespace>> {
+        let store = self.publisher()?;
+        let mut namespaces = Vec::new();
+        for (_, binding) in store.list_bindings().await? {
+            let root = &binding.value.root;
+            namespaces.extend(
+                binding
+                    .value
+                    .branches
+                    .iter()
+                    .map(|b| root.namespace(&b.branch)),
+            );
+        }
+        for entry in store.list_dropped().await? {
+            let root = &entry.value.root;
+            namespaces.extend(
+                entry
+                    .value
+                    .branches
+                    .iter()
+                    .map(|r| root.namespace(&r.branch)),
+            );
+        }
+        Ok(namespaces)
+    }
+
     pub async fn sweep_orphan_instances(&self, dry_run: bool) -> Result<OrphanSweepReport> {
         let storage = self.sweepable_storage()?;
         let store = self.publisher()?;
@@ -1869,10 +1900,10 @@ impl crate::Fluree {
         // `a:main`'s `index/`). Without the listing that says which, refuse
         // to delete rather than guess: leftovers are recoverable, deleting
         // another ledger's data is not.
-        let foreign: Vec<String> = match self.nameservice().all_records().await {
-            Ok(records) => nested_prefixes(
+        let foreign: Vec<String> = match self.storage_namespaces().await {
+            Ok(namespaces) => nested_prefixes(
                 storage_method,
-                &nested_namespaces(&records, namespace.root()),
+                &nested_namespaces(&namespaces, namespace.root()),
             ),
             Err(e) => {
                 warnings.push(format!(
@@ -2857,8 +2888,8 @@ impl crate::Fluree {
     /// branches, so omitting one would reclaim dicts it still reads.
     ///
     /// Also returns the ledger's storage root, and the branches of the other
-    /// ledgers whose storage nests under it (see [`nested_namespaces`]), from
-    /// the same listing.
+    /// ledgers whose storage nests under it (see [`nested_namespaces`]), in
+    /// any state, including dropped ones kept in the registry.
     async fn hold_ledger_for_maintenance(
         &self,
         ledger_name: &LedgerName,
@@ -2880,7 +2911,7 @@ impl crate::Fluree {
                 "Ledger not found: {ledger_name}"
             )));
         };
-        let nested = nested_namespaces(&all, &root);
+        let nested = nested_namespaces(&self.storage_namespaces().await?, &root);
 
         // Holds are per-branch, so a ledger-wide sweep must hold them all.
         // Guards release on drop, so an early return frees whatever was taken.

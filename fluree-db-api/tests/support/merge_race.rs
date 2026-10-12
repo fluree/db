@@ -38,9 +38,17 @@ impl PausingNameService {
         }
     }
 
-    /// Make every `all_records` call fail from now on.
+    /// Make every listing of records, bindings or dropped ledgers fail from
+    /// now on.
     pub(super) fn fail_listings(&self) {
         self.failing_listings.store(true, Ordering::SeqCst);
+    }
+
+    fn listing(&self) -> Result<()> {
+        if self.failing_listings.load(Ordering::SeqCst) {
+            return Err(NameServiceError::storage("injected listing failure"));
+        }
+        Ok(())
     }
 }
 
@@ -90,9 +98,7 @@ impl NameServiceLookup for PausingNameService {
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
-        if self.failing_listings.load(Ordering::SeqCst) {
-            return Err(NameServiceError::storage("injected listing failure"));
-        }
+        self.listing()?;
         self.inner.all_records().await
     }
 
@@ -295,6 +301,7 @@ impl fluree_db_nameservice::LedgerRegistry for PausingNameService {
             fluree_db_nameservice::Versioned<fluree_db_nameservice::NameBinding>,
         )>,
     > {
+        self.listing()?;
         self.inner.list_bindings().await
     }
 
@@ -318,6 +325,7 @@ impl fluree_db_nameservice::LedgerRegistry for PausingNameService {
     async fn list_dropped(
         &self,
     ) -> Result<Vec<fluree_db_nameservice::Versioned<fluree_db_nameservice::DroppedLedger>>> {
+        self.listing()?;
         self.inner.list_dropped().await
     }
 }
