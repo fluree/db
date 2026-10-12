@@ -152,7 +152,9 @@ pub fn eval_xsd_float<R: RowAccess>(
 }
 
 fn cast_to_float(v: ComparableValue) -> Option<ComparableValue> {
-    let v = unwrap_typed_literal(v);
+    // A numeric typed literal held as text reads as arithmetic reads it,
+    // including the `inf`/`-inf` text of earlier imports.
+    let v = unwrap_typed_literal(v.coerce_numeric_operand());
     let f: f32 = match v {
         ComparableValue::Bool(b) => {
             if b {
@@ -262,12 +264,14 @@ pub fn eval_cypher_to_float<R: RowAccess>(
     Ok(cast_to_double(v, |s| s.parse::<f64>().ok()))
 }
 
-/// A value as a double; `parse` reads a string.
+/// A value as a double; `parse` reads a string. A numeric typed literal held
+/// as text reads as arithmetic reads it, including the `inf`/`-inf` text of
+/// earlier imports.
 fn cast_to_double(
     v: ComparableValue,
     parse: impl Fn(&str) -> Option<f64>,
 ) -> Option<ComparableValue> {
-    let v = unwrap_typed_literal(v);
+    let v = unwrap_typed_literal(v.coerce_numeric_operand());
     let d: f64 = match v {
         ComparableValue::Bool(b) => {
             if b {

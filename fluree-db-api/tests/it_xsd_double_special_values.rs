@@ -1387,7 +1387,7 @@ async fn inf_text_reads_as_infinity_in_arithmetic_and_aggregates() {
 /// an index, written by v4.2.3's bulk import from `source.ttl` beside it. It
 /// reads as before: the values come back as stored, and SUM, AVG, arithmetic
 /// and comparisons take the text as the number it stands for. The expected
-/// answers are v4.2.3's own on this index.
+/// answers are v4.2.3's own on this index, except where marked.
 #[tokio::test]
 async fn values_a_previous_bulk_import_stored_as_text_read_as_before() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1444,6 +1444,126 @@ async fn values_a_previous_bulk_import_stored_as_text_read_as_before() {
             &["b", "a", "ninf", "nan", "inf"],
         ),
         (r#"SELECT ?s WHERE { ?s ex:v "INF"^^xsd:double }"#, &[]),
+        // NaN text reads as NaN in arithmetic, and so in SUM, where v4.2.3
+        // left the sum unbound (the one answer here that is not v4.2.3's).
+        ("SELECT ((?v + 1) AS ?x) WHERE { ex:nan ex:v ?v }", &["NaN"]),
+        (
+            "SELECT (SUM(?v) AS ?x) WHERE { ?s ex:v ?v FILTER(?s = ex:nan || ?s = ex:a) }",
+            &["NaN"],
+        ),
+        // Casts read the text as arithmetic does.
+        (
+            "SELECT (xsd:double(?v) AS ?x) WHERE { ex:inf ex:v ?v }",
+            &["INF"],
+        ),
+        (
+            "SELECT (xsd:double(?v) AS ?x) WHERE { ex:nan ex:v ?v }",
+            &["NaN"],
+        ),
+        (
+            "SELECT (xsd:float(?v) AS ?x) WHERE { ex:finf ex:f ?v }",
+            &["INF"],
+        ),
+        // A comparison inside a larger expression reads the text as INF; a
+        // filter that is one comparison, alone or over a UNION or OPTIONAL,
+        // keeps it text.
+        (
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 1 || ?v < -100) } ORDER BY ?s",
+            &["a", "inf", "ninf"],
+        ),
+        (
+            "SELECT ?s WHERE { { ?s ex:v ?v } UNION { ?s ex:f ?v } FILTER(?v > 1) } ORDER BY ?s",
+            &["a"],
+        ),
+        (
+            "SELECT ?s WHERE { ?s ex:v ?v OPTIONAL { ?s ex:none ?z } FILTER(?v > 1) } ORDER BY ?s",
+            &["a"],
+        ),
+    ] {
+        let got = sparql_tokens(&fluree, &ledger, query).await;
+        if got != expected {
+            failures.push(format!(
+                "SPARQL: {query}\n  expected {expected:?}\n  got      {got:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// An `xsd:float` literal keeps its double value when stored, so a numeral
+/// beyond the float range but within the double range is not `INF`; the
+/// cast to `xsd:float` gives `INF` for the same numeral.
+#[tokio::test]
+async fn a_float_beyond_its_range_is_stored_at_double_precision() {
+    let fluree = memory_fluree();
+    let ledger_id = "special-doubles:float-range";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert_turtle(&format!(
+            "@prefix ex: <{EX}> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+             ex:f ex:v \"3.4e39\"^^xsd:float .\n"
+        ))
+        .commit()
+        .await
+        .expect("insert");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_eq!(
+        sparql_tokens(
+            &fluree,
+            &ledger,
+            "SELECT (?v > 3.3e39 AS ?x) WHERE { ex:f ex:v ?v }"
+        )
+        .await,
+        ["true"],
+        "the stored value is finite"
+    );
+    assert_eq!(
+        sparql_tokens(
+            &fluree,
+            &ledger,
+            r#"SELECT (xsd:float("3.4e39") AS ?x) WHERE { }"#
+        )
+        .await,
+        ["INF"]
+    );
+}
+
+/// A full reindex of an index that v4.2.3's bulk import built stores the
+/// special values as numbers: they read back as `INF`, `-INF` and `NaN`
+/// everywhere, `isNumeric` included.
+#[tokio::test]
+async fn a_reindex_stores_the_text_of_a_previous_bulk_import_as_numbers() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/bulk-import-4.2.3/storage");
+    let db = tempfile::TempDir::new().expect("tmp");
+    copy_dir(&fixture, db.path());
+    let fluree = FlureeBuilder::file(db.path().to_string_lossy().to_string())
+        .build()
+        .expect("file-backed Fluree");
+    let ledger = reindexed(&fluree, "ex:main").await;
+    let mut failures = Vec::new();
+    for (query, expected) in [
+        (
+            "SELECT ?v WHERE { ?s ex:v ?v } ORDER BY ?s",
+            &["1.5", "-2.5", "INF", "NaN", "-INF"][..],
+        ),
+        (
+            "SELECT (isNumeric(?v) AS ?n) WHERE { ?s ex:v ?v } ORDER BY ?s",
+            &["true", "true", "true", "true", "true"],
+        ),
+        (
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 1) } ORDER BY ?s",
+            &["a", "inf"],
+        ),
+        ("SELECT ?s WHERE { ?s ex:f ?v FILTER(?v > 1) }", &["finf"]),
+        ("SELECT (MAX(?v) AS ?x) WHERE { ?s ex:v ?v }", &["NaN"]),
     ] {
         let got = sparql_tokens(&fluree, &ledger, query).await;
         if got != expected {
