@@ -2332,3 +2332,127 @@ async fn object_lane_answers_the_rows_of_a_mixed_window_it_can_key() {
     }
     failures.assert_none();
 }
+
+// ---------------------------------------------------------------------------
+// Path endpoints bound to terms no edge touches
+// ---------------------------------------------------------------------------
+
+/// Ages (literals), an `ex:next` chain n1 → n2 → n3, and m1 starting it.
+fn path_endpoint_fixture() -> JsonValue {
+    json!({
+        "@context": context(),
+        "@graph": [
+            {"@id": "ex:a1", "ex:age": 30},
+            {"@id": "ex:a2", "ex:age": 31},
+            {"@id": "ex:n1", "ex:next": {"@id": "ex:n2"}},
+            {"@id": "ex:n2", "ex:next": {"@id": "ex:n3"}},
+            {"@id": "ex:m1", "ex:start": {"@id": "ex:n1"}}
+        ]
+    })
+}
+
+/// A path endpoint a row binds to a literal is a term no edge touches: only a
+/// zero-length match (`*`, `?`) reaches it, pairing it with itself when a
+/// triple holds it (the W3C `values_and_path` rule). It used to be taken for
+/// an unbound endpoint, pairing every row with the whole closure of the path.
+/// An IRI the ledger has never seen is a node no edge touches (the control).
+#[tokio::test(flavor = "current_thread")]
+async fn path_endpoint_bound_to_a_term_no_edge_touches() {
+    let cases: &[SurfaceCase] = &[
+        (
+            "a literal start, one or more steps",
+            "SELECT ?s ?n WHERE { ?s ex:age ?a . ?a ex:next+ ?n }",
+            &["s", "n"],
+            &[],
+        ),
+        (
+            "a literal start, zero or more steps",
+            "SELECT ?s ?n WHERE { ?s ex:age ?a . ?a ex:next* ?n }",
+            &["s", "n"],
+            &[&["a1", "30"], &["a2", "31"]],
+        ),
+        (
+            "a literal end, one or more steps",
+            "SELECT ?s ?m WHERE { ?s ex:age ?a . ?m ex:next+ ?a }",
+            &["s", "m"],
+            &[],
+        ),
+        (
+            "a literal end, zero or one step",
+            "SELECT ?s ?m WHERE { ?s ex:age ?a . ?m ex:next? ?a }",
+            &["s", "m"],
+            &[&["a1", "30"], &["a2", "31"]],
+        ),
+        (
+            "an IRI the ledger has never seen, one or more steps (control: a node)",
+            "SELECT ?n WHERE { VALUES ?x { <http://elsewhere.example/z> } ?x ex:next+ ?n }",
+            &["n"],
+            &[],
+        ),
+        (
+            "a literal no triple holds, zero or more steps",
+            "SELECT ?n WHERE { VALUES ?x { 99 } ?x ex:next* ?n }",
+            &["n"],
+            &[],
+        ),
+        (
+            "a node start (control)",
+            "SELECT ?m ?n WHERE { ?m ex:start ?x . ?x ex:next+ ?n }",
+            &["m", "n"],
+            &[&["m1", "n2"], &["m1", "n3"]],
+        ),
+    ];
+    let mut path_context = context();
+    path_context["nextPlus"] = json!({"@path": "ex:next+"});
+    path_context["nextStar"] = json!({"@path": "ex:next*"});
+    let jsonld_cases = [
+        (
+            "JSON-LD: a literal start, one or more steps",
+            json!({
+                "@context": path_context.clone(),
+                "select": ["?s", "?n"],
+                "where": [{"@id": "?s", "ex:age": "?a"}, {"@id": "?a", "nextPlus": "?n"}]
+            }),
+            rows(&[]),
+        ),
+        (
+            "JSON-LD: a literal start, zero or more steps",
+            json!({
+                "@context": path_context,
+                "select": ["?s", "?n"],
+                "where": [{"@id": "?s", "ex:age": "?a"}, {"@id": "?a", "nextStar": "?n"}]
+            }),
+            rows(&[&["a1", "30"], &["a2", "31"]]),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) = ledger_with(
+            state,
+            "it/path-term-endpoints:main",
+            &path_endpoint_fixture(),
+        )
+        .await;
+        for (label, body, vars, expected) in cases {
+            let label = format!("{state:?} / {label}");
+            match db(&handle)
+                .await
+                .query(&fluree)
+                .sparql(&format!("{PREFIXES}{body}"))
+                .execute_formatted()
+                .await
+            {
+                Ok(json) => failures.eq(sparql_rows(&json, vars), rows(expected), &label),
+                Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+            }
+        }
+        for (label, query, expected) in &jsonld_cases {
+            failures.eq(
+                jsonld_rows(&jsonld(&fluree, &handle, query).await),
+                expected.clone(),
+                &format!("{state:?} / {label}"),
+            );
+        }
+    }
+    failures.assert_none();
+}

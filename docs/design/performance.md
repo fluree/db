@@ -390,7 +390,9 @@ node follows the same rule. A decoded term resolves through the persisted
 dictionary first and the novelty dictionary second, the order every lane
 assigns IDs in. The predicate-to-subject mapping is memoized per predicate per
 index, so a key over predicate bindings costs a load per row. Property-path
-endpoints decode an encoded IRI before traversal. What stays outside the rule:
+endpoints decode an encoded IRI before traversal. An endpoint bound to a
+literal is reached only by a zero-length match, and one that cannot be decoded
+is an error. What stays outside the rule:
 an IRI no dictionary holds keeps its decoded form, so its `Sid` and `Iri`
 forms still compare apart. An arena-backed literal (a big number or a vector,
 whose handle names a value within one graph) is never compared or keyed without
