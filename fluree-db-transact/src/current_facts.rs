@@ -958,10 +958,12 @@ impl<'l> DeleteResolver<'l> {
         if !any {
             return values;
         }
+        // Each slot's distinct values, in the order its intents name them.
+        let mut seen: HashSet<(usize, &FlakeValue)> = HashSet::new();
         for (intent, place) in pending.iter().zip(at) {
             if let SlotAt::Read(i) = *place {
                 if let Some(slot_values) = &mut values[i] {
-                    if !slot_values.contains(&intent.flake.o) {
+                    if seen.insert((i, &intent.flake.o)) {
                         slot_values.push(intent.flake.o.clone());
                     }
                 }
