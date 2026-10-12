@@ -607,24 +607,52 @@ impl BranchRecordStore for DynamoDbNameService {
 
     /// Inserts every item of the record in one transaction, each conditional
     /// on its key being absent. Items a partly deleted record left without
-    /// its meta item are garbage and are cleared first.
+    /// its meta item are garbage and are cleared first, each only while it
+    /// still carries the fence it was read with, so an insert racing this
+    /// one never loses an item it wrote. A meta item no ledger record reads
+    /// from, a graph source's or one whose id no longer parses, holds the
+    /// key: the insert is refused rather than clearing it.
     async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
         let pk = Self::normalize(&record.ledger_id)?;
         for _ in 0..3 {
             if let Some(existing) = self.raw_record(&pk).await? {
                 return Ok(Some(existing));
             }
-            for item in self.record_items(&pk).await? {
-                if let Some(sk) = Self::sk_of(&item) {
-                    self.client
-                        .delete_item()
-                        .table_name(&self.table_name)
-                        .key(ATTR_PK, AttributeValue::S(pk.clone()))
-                        .key(ATTR_SK, AttributeValue::S(sk.to_string()))
-                        .send()
-                        .await
-                        .map_err(|e| storage_err("DeleteItem", e))?;
+            let items = self.record_items(&pk).await?;
+            if items.iter().any(|item| Self::sk_of(item) == Some(SK_META)) {
+                if let Some(existing) = self.raw_record(&pk).await? {
+                    return Ok(Some(existing));
                 }
+                return Err(NameServiceError::ledger_already_exists(format!(
+                    "{pk} (the key holds something other than a ledger record)"
+                )));
+            }
+            let mut cleared = true;
+            for item in &items {
+                let Some(sk) = Self::sk_of(item) else {
+                    continue;
+                };
+                let delete = self
+                    .client
+                    .delete_item()
+                    .table_name(&self.table_name)
+                    .key(ATTR_PK, AttributeValue::S(pk.clone()))
+                    .key(ATTR_SK, AttributeValue::S(sk.to_string()))
+                    .expression_attribute_names("#fence", ATTR_FENCE);
+                let delete = match item.get(ATTR_FENCE) {
+                    Some(fence) => delete
+                        .condition_expression("#fence = :fence")
+                        .expression_attribute_values(":fence", fence.clone()),
+                    None => delete.condition_expression("attribute_not_exists(#fence)"),
+                };
+                match delete.send().await {
+                    Ok(_) => {}
+                    Err(e) if condition_failed(&e) => cleared = false,
+                    Err(e) => return Err(storage_err("DeleteItem", e)),
+                }
+            }
+            if !cleared {
+                continue;
             }
 
             let transaction = self.record_items_for(&pk, record).into_iter().fold(

@@ -110,6 +110,10 @@ async fn read_record<S: StorageRead + ?Sized>(
     let Some(bytes) = read_bytes(storage, keys.main).await? else {
         return Ok(None);
     };
+    // A graph source shares the key space: its file is not a ledger record.
+    if !crate::ns_format::is_ledger_main_record(&bytes) {
+        return Ok(None);
+    }
     let main: NsFileV2 = serde_json::from_slice(&bytes)?;
     let Some(ledger_id) =
         crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, keys.main)
@@ -164,6 +168,9 @@ where
             let main_bytes = serialize_json(&NsFileV2::for_record(record))?;
             let outcome = storage
                 .compare_and_swap(keys.main, move |bytes| {
+                    if bytes.is_some_and(|b| !crate::ns_format::is_ledger_main_record(b)) {
+                        return Ok(CasAction::Abort(()));
+                    }
                     let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
                     match current {
                         Some(file) if !file.is_deleted() => Ok(CasAction::Abort(())),
@@ -176,7 +183,18 @@ where
                     reset_index_file(storage, keys, record.fence).await?;
                     return Ok(None);
                 }
-                CasOutcome::Aborted(()) => read_record(storage, keys).await?,
+                // Held by a live record, or by something no ledger record
+                // reads from: a graph source, or a record whose id no longer
+                // parses. Neither is replaced.
+                CasOutcome::Aborted(()) => match read_record(storage, keys).await? {
+                    Some(existing) => Some(existing),
+                    None => {
+                        return Err(NameServiceError::ledger_already_exists(format!(
+                            "{} (the key holds something other than a ledger record)",
+                            record.ledger_id
+                        )))
+                    }
+                },
             }
         }
         existing => existing,
@@ -250,7 +268,8 @@ where
 {
     let outcome = storage
         .compare_and_swap(main_key, move |bytes| {
-            let Some(data) = bytes else {
+            // A graph source's file at the key is no ledger record.
+            let Some(data) = bytes.filter(|b| crate::ns_format::is_ledger_main_record(b)) else {
                 return Ok(CasAction::Abort(FenceOutcome::Missing));
             };
             let mut file: NsFileV2 = deserialize_json(data)?;
@@ -313,7 +332,8 @@ where
 
     let outcome = storage
         .compare_and_swap(keys.main, move |bytes| {
-            let Some(data) = bytes else {
+            // A graph source's file at the key is no ledger record.
+            let Some(data) = bytes.filter(|b| crate::ns_format::is_ledger_main_record(b)) else {
                 return Ok(CasAction::Abort(FenceOutcome::Missing));
             };
             let mut file: NsFileV2 = deserialize_json(data)?;

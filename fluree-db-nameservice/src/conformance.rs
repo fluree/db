@@ -370,6 +370,39 @@ pub async fn garbage_record_does_not_block_create<S: LifecycleStore>(store: &S) 
     );
 }
 
+/// A graph source shares the `name:branch` key space with ledger records.
+/// A create under its key never replaces or damages it, and does not leave
+/// the name held: the create is refused, or, on a backend that keeps the two
+/// apart, succeeds beside it.
+pub async fn a_graph_source_keeps_its_key<S: crate::NameServicePublisher>(store: &S) {
+    use crate::GraphSourceType;
+    let index = fluree_db_core::ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"gs");
+    store
+        .publish_graph_source("search", "main", GraphSourceType::Bm25, "{}", &[])
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &index, 5)
+        .await
+        .unwrap();
+
+    let created = lifecycle::create_ledger(store, &id("search")).await;
+    let binding = store.get_binding("search").await.unwrap();
+    match created {
+        Ok(_) => assert!(binding.is_some_and(|b| b.value.is_active())),
+        Err(e) => {
+            assert_exists(e);
+            assert!(binding.is_none(), "a refused create left {binding:?}");
+        }
+    }
+    let source = store
+        .lookup_graph_source("search:main")
+        .await
+        .unwrap()
+        .expect("the graph source is kept");
+    assert_eq!((source.index_id, source.index_t), (Some(index), 5));
+}
+
 /// A record with no fence predates fencing: it is never deleted to make
 /// room.
 pub async fn unfenced_record_is_never_deleted<S: LifecycleStore>(store: &S) {
@@ -1680,6 +1713,7 @@ where
     a_create_under_way_is_not_dropped(&make().await).await;
     a_dropped_branch_reads_as_absent(&make().await).await;
     unknown_binding_fields_survive_rewrites(&make().await).await;
+    a_graph_source_keeps_its_key(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1729,6 +1763,7 @@ macro_rules! lifecycle_conformance_tests {
             a_create_under_way_is_not_dropped,
             a_dropped_branch_reads_as_absent,
             unknown_binding_fields_survive_rewrites,
+            a_graph_source_keeps_its_key,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {
