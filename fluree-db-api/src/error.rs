@@ -531,9 +531,6 @@ impl ApiError {
         }
     }
 
-    /// Check if this error represents a "not found" condition.
-    ///
-    /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
     /// A write refused because the writer loaded the ledger before it was
     /// dropped, restored or replaced. Retrying on the same state cannot
     /// succeed; the writer must reload the ledger.
@@ -558,6 +555,9 @@ impl ApiError {
         )
     }
 
+    /// Check if this error represents a "not found" condition.
+    ///
+    /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
     pub fn is_not_found(&self) -> bool {
         matches!(
             self,
