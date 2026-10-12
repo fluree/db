@@ -1666,10 +1666,16 @@ pub(crate) struct ShaclRequest<'a> {
 #[cfg(feature = "shacl")]
 impl<'a> ShaclRequest<'a> {
     fn take(txn: &mut Txn, policy: Option<&'a crate::PolicyContext>) -> Self {
+        Self::take_opts(&mut txn.opts, policy)
+    }
+
+    /// [`Self::take`] from the options alone, for a lane that stages without
+    /// a [`Txn`] (plain Turtle).
+    fn take_opts(opts: &mut TxnOpts, policy: Option<&'a crate::PolicyContext>) -> Self {
         Self {
-            inline_shapes: txn.opts.shapes.take(),
-            requested_validation_mode: txn.opts.validation_mode,
-            request_identity: txn.opts.server_identity.clone(),
+            inline_shapes: opts.shapes.take(),
+            requested_validation_mode: opts.validation_mode,
+            request_identity: opts.server_identity.clone(),
             policy,
         }
     }
@@ -4029,13 +4035,24 @@ impl crate::Fluree {
         &self,
         ledger: LedgerState,
         turtle: &str,
-        txn_opts: TxnOpts,
+        #[cfg_attr(not(feature = "shacl"), allow(unused_mut))] mut txn_opts: TxnOpts,
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
         policy: Option<&crate::PolicyContext>,
         request: Option<&RequestGovernance>,
     ) -> Result<StageResult> {
         use fluree_db_transact::{generate_txn_id, stage_flakes, FlakeSink};
+
+        // Without SHACL support inline shapes cannot be applied, and a caller
+        // that sends them expects its data checked: refuse rather than commit
+        // unchecked, as the other lanes do.
+        #[cfg(not(feature = "shacl"))]
+        if txn_opts.shapes.is_some() {
+            return Err(fluree_db_transact::TransactError::UnsupportedFeature(
+                "inline SHACL shapes (opts.shapes) need a build with SHACL support".to_string(),
+            )
+            .into());
+        }
 
         let span = tracing::debug_span!(
             "stage_turtle_insert",
@@ -4100,11 +4117,11 @@ impl crate::Fluree {
         // (`check_staged_write`): SHACL, uniqueness and the staged-config
         // guard, under one config read. Plain Turtle has no named-graph
         // metadata (that's TriG), so there is no graph delta: every flake
-        // `FlakeSink` produces is in the default graph. Turtle carries no
-        // request surface in its text (inline shapes, validation mode,
-        // JSON-LD context), so it runs the configured posture, plus the
-        // caller's inline uniqueness constraints as TriG does, and violations
-        // name full IRIs.
+        // `FlakeSink` produces is in the default graph. The text carries no
+        // request settings and no JSON-LD context, so the configured posture
+        // applies with the caller's programmatic options (inline shapes, a
+        // requested validation mode, inline uniqueness constraints), as for
+        // TriG, and violations name full IRIs.
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
             .with_data_state(view.base().clone());
         check_staged_write(
@@ -4112,6 +4129,8 @@ impl crate::Fluree {
             &mut ns_registry,
             &rustc_hash::FxHashMap::default(),
             WriteChecks {
+                #[cfg(feature = "shacl")]
+                shacl_request: ShaclRequest::take_opts(&mut txn_opts, policy),
                 unique_properties: txn_opts.unique_properties.as_deref(),
                 tracker,
                 policy,
@@ -4735,7 +4754,6 @@ mod tests {
             "{err:?}"
         );
     }
-
 
     /// A config read failure refuses the transaction instead of admitting it
     /// unchecked. The ledger enforces uniqueness on `ex:email`; a write with a

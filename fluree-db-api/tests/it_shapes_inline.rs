@@ -488,11 +488,21 @@ async fn inline_shapes_are_refused_when_any_written_graph_refuses() {
 }
 
 /// Where inline shapes are permitted, a requested warn mode applies to them:
-/// the violation is logged and the write commits.
+/// the violation is logged and the write commits. The same write is refused
+/// in the default (reject) mode, so the shapes did run.
 #[tokio::test]
 async fn inline_shapes_honor_a_requested_warn_mode() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = genesis_ledger(&fluree, "test/inline-shapes/warn:main");
+    let err = insert_inline(
+        &fluree,
+        ledger.clone(),
+        &person("ex:alice", None),
+        inline_opts(),
+    )
+    .await
+    .expect_err("reject mode refuses the violation");
+    assert_shacl_violation(&err, "reject mode");
     let opts = TxnOpts {
         validation_mode: Some(fluree_db_core::ledger_config::ValidationMode::Warn),
         ..inline_opts()
@@ -500,6 +510,46 @@ async fn inline_shapes_honor_a_requested_warn_mode() {
     insert_inline(&fluree, ledger, &person("ex:alice", None), opts)
         .await
         .expect("warn mode logs the violation and commits");
+}
+
+/// Inline shapes and a requested mode sent with a Turtle insert apply
+/// whether or not the document has a `GRAPH` block (plain Turtle and TriG
+/// take different parse paths).
+#[tokio::test]
+async fn inline_shapes_apply_to_turtle_with_and_without_graph_blocks() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, turtle) in [
+        "@prefix ex: <http://example.org/ns/> . ex:alice a ex:Person .",
+        "@prefix ex: <http://example.org/ns/> .
+         GRAPH ex:other { ex:carol ex:p 1 }
+         ex:alice a ex:Person .",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("test/inline-shapes/turtle-{i}:main");
+        fluree.create_ledger(&ledger_id).await.expect("create");
+        let err = fluree
+            .graph(&ledger_id)
+            .transact()
+            .insert_turtle(turtle)
+            .txn_opts(inline_opts())
+            .commit()
+            .await
+            .expect_err("the inline shape requires ex:name");
+        assert_shacl_violation(&err, &format!("case {i}"));
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .insert_turtle(turtle)
+            .txn_opts(TxnOpts {
+                validation_mode: Some(fluree_db_core::ledger_config::ValidationMode::Warn),
+                ..inline_opts()
+            })
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("case {i}: warn mode commits: {e}"));
+    }
 }
 
 /// Inline shapes validate only themselves: they never switch on the ledger's
