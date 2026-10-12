@@ -339,6 +339,9 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
     assert!(response.errors.contains_key("bad"));
 }
 
+/// SPARQL with a parse error the parser recovers from, naming `mq:users`.
+const RECOVERED: &str = "SELECT ?n FROM <mq:users> WHERE { ?u <http://schema.org/name> ?n . ?u }";
+
 #[tokio::test]
 async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in_process_api() {
     // A sub-query that does not parse is reported under its alias, in either
@@ -362,6 +365,10 @@ async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in
             "bad_jsonld": {
                 "language": "jsonld",
                 "query": { "from": "mq:users", "select": 42, "where": { "@id": "?u" } }
+            },
+            "bad_recovered": {
+                "language": "sparql",
+                "query": RECOVERED
             }
         }
     }))
@@ -376,13 +383,24 @@ async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in
 
     assert_eq!(response.status, MultiQueryStatus::Partial);
     assert!(response.results.contains_key("good"));
-    for alias in ["bad_sparql", "bad_jsonld"] {
+    for alias in ["bad_sparql", "bad_jsonld", "bad_recovered"] {
         assert!(
             response.errors.contains_key(alias),
             "{alias}: {:?}",
             response.errors
         );
     }
+    // A parse error the parser recovers from is reported for the text as
+    // written, though the sibling puts its `FROM` ledger in the snapshot.
+    let parsed = fluree_db_sparql::parse_sparql(RECOVERED);
+    assert!(
+        parsed.has_errors() && parsed.ast.is_some(),
+        "the fixture must parse with an error and still yield an AST"
+    );
+    let first = parsed.errors().next().expect("an error").message.clone();
+    let reported = response.errors["bad_recovered"].to_string();
+    assert!(reported.contains(&first), "{first:?} not in {reported}");
+    assert!(response.snapshot.ledgers.contains_key("mq:users"));
     // The SPARQL sub-query that does not parse reads nothing, so its `FROM`
     // is not in the snapshot.
     assert!(
@@ -1020,23 +1038,25 @@ fn layered_envelope(
     serde_json::from_value(envelope).expect("envelope deserialises")
 }
 
-/// A ledger the envelope's or the alias's `opts` adds to a sibling's dataset
-/// is one the sibling reads: validation counts it against the bound, the
-/// snapshot pins it and lists it, as for a ledger the body names.
+/// A ledger a sibling's `fromNamed` adds, in its body or in the envelope's or
+/// the alias's `opts`, is one the sibling reads: validation counts it against
+/// the bound, and the snapshot pins it and lists it, as for its `from`.
 #[tokio::test]
-async fn multi_query_a_ledger_named_in_outer_opts_is_counted_and_pinned() {
+async fn multi_query_a_from_named_ledger_is_counted_and_pinned_in_every_layer() {
     let fluree = Arc::new(FlureeBuilder::memory().build_memory());
     seed_hist_and_other(&fluree).await;
     let named = json!({ "fromNamed": { "h": { "@id": "mq:hist" } } });
+    let none = serde_json::Value::Null;
     let mut failures = Vec::new();
-    for (layer, envelope_opts, alias_opts) in [
-        ("envelope", named.clone(), serde_json::Value::Null),
-        ("alias", serde_json::Value::Null, named.clone()),
+    for (layer, envelope_opts, alias_opts, body_extra) in [
+        ("body", none.clone(), none.clone(), named.clone()),
+        ("envelope", named.clone(), none.clone(), json!({})),
+        ("alias", none.clone(), named.clone(), json!({})),
     ] {
         let envelope = layered_envelope(
             envelope_opts.clone(),
             alias_opts.clone(),
-            json!({}),
+            body_extra.clone(),
             serde_json::Value::Null,
         );
         let ledgers = fluree_db_api::query::multi::validate_envelope_ledgers(
@@ -1068,7 +1088,7 @@ async fn multi_query_a_ledger_named_in_outer_opts_is_counted_and_pinned() {
         let envelope = layered_envelope(
             envelope_opts.clone(),
             alias_opts.clone(),
-            json!({}),
+            body_extra.clone(),
             json!(1),
         );
         match fluree.multi_query().envelope(envelope).execute().await {
@@ -1082,7 +1102,7 @@ async fn multi_query_a_ledger_named_in_outer_opts_is_counted_and_pinned() {
         let envelope = layered_envelope(
             envelope_opts,
             alias_opts,
-            json!({}),
+            body_extra,
             serde_json::Value::Null,
         );
         match fluree.multi_query().envelope(envelope).execute().await {

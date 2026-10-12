@@ -1719,6 +1719,20 @@ mod tests {
         assert_eq!(members[0].ledger, "ledgerA:main");
     }
 
+    /// Text with a parse error the parser recovers from has no members
+    /// either: validation reads it as strictly as the query runs.
+    #[test]
+    fn a_sparql_subquery_with_a_recovered_parse_error_has_no_members() {
+        let text = "SELECT ?x FROM <ledgerA> WHERE { ?x ?p ?o . ?x }";
+        let parsed = fluree_db_sparql::parse_sparql(text);
+        assert!(
+            parsed.has_errors() && parsed.ast.is_some(),
+            "the fixture must parse with an error and still yield an AST"
+        );
+        let members = validate_sparql_subquery("a", &sparql(text), None, false).unwrap();
+        assert_eq!(members, Vec::new());
+    }
+
     #[test]
     fn a_sparql_dataset_clause_that_cannot_be_read_is_an_error() {
         let text = "SELECT ?x FROM <ledgerA@foo> WHERE { ?x ?p ?o }";
