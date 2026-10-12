@@ -1581,6 +1581,290 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
 }
 
 // ---------------------------------------------------------------------------
+// A default graph spanning two ledgers.
+//
+// Its members read each ledger's own index through the range scan (binding
+// provenance needs decoded terms), and ledgers code namespaces independently:
+// here `ex:` has a different namespace code in each, because ledger A meets
+// another namespace first.
+
+const LEDGER_A: &str = "it/two-ledgers-a:main";
+const LEDGER_B: &str = "it/two-ledgers-b:main";
+
+/// Ledgers A and B, both indexed. Labels: a and b "chat"@fr, c "chat"@en.
+/// Codes: a and b "A1"^^ex:Code, c "A1" (a plain string). Amounts: a and b
+/// 1.5, a2 and c 2.5, so each ledger's sorted run holds both values. Places:
+/// Paris in A, London in B.
+async fn two_ledgers() -> Fluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = |ledger_id: &'static str, ttl: &'static str| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+            fluree
+                .stage(&handle)
+                .upsert_turtle(ttl)
+                .execute()
+                .await
+                .expect("seed");
+            rebuild_and_publish_index(fluree, ledger_id).await;
+            fluree.disconnect_ledger(ledger_id).await;
+            let view = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("reload")
+                .snapshot()
+                .await;
+            assert!(view.binary_store.is_some(), "{ledger_id}: indexed");
+        }
+    };
+    seed(
+        LEDGER_A,
+        r#"
+        @prefix other: <http://other.example/> .
+        @prefix ex: <http://example.org/> .
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        other:x other:p "first" .
+        ex:a ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
+             ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+        ex:a2 ex:amount 2.5 .
+    "#,
+    )
+    .await;
+    seed(
+        LEDGER_B,
+        r#"
+        @prefix ex: <http://example.org/> .
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        ex:b ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
+             ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral .
+        ex:c ex:label "chat"@en ; ex:code "A1" ; ex:amount 2.5 .
+    "#,
+    )
+    .await;
+    fluree
+}
+
+/// A SPARQL query through the connection (so `FROM` can name ledgers), its
+/// rows as [`jsonld_rows`] gives them.
+async fn connection_sparql_rows(fluree: &Fluree, query: &str) -> Result<Rows, String> {
+    let result = fluree
+        .query_connection_sparql(query)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ledger = fluree.ledger(LEDGER_A).await.expect("ledger A");
+    let json = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(jsonld_rows(&json))
+}
+
+/// A JSON-LD query through the connection, so `from` can name ledgers.
+async fn connection_jsonld(fluree: &Fluree, ledger_id: &str, query: &JsonValue) -> JsonValue {
+    let result = fluree
+        .query_connection(query)
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+}
+
+/// A bound string's datatype is part of the term: a language-tagged literal or
+/// one of a custom datatype matches only its own kind. Over a default graph of
+/// two ledgers (whose members read through the range scan) a bound one matched
+/// nothing, constant, VALUES or joined, because the range read every bound
+/// string as `xsd:string`; and a custom datatype is coded in each ledger's own
+/// namespace space. Each ledger alone is the control, and plain strings,
+/// integers and expression equality are too.
+#[tokio::test(flavor = "current_thread")]
+async fn typed_string_literals_over_a_default_graph_of_two_ledgers() {
+    let fluree = two_ledgers().await;
+    let both = format!("FROM <{LEDGER_A}> FROM <{LEDGER_B}>");
+    let only_b = format!("FROM <{LEDGER_B}>");
+    let q = |ds: &str, select: &str, body: &str| {
+        format!("{PREFIXES}SELECT {select} {ds} WHERE {{ {body} }}")
+    };
+    let cases = [
+        (
+            "a language-tagged constant",
+            q(&both, "?s", "?s ex:label \"chat\"@fr"),
+            rows(&[&["a"], &["b"]]),
+        ),
+        (
+            "another tag",
+            q(&both, "?s", "?s ex:label \"chat\"@en"),
+            rows(&[&["c"]]),
+        ),
+        (
+            "VALUES of a language-tagged literal",
+            q(&both, "?s", "VALUES ?l { \"chat\"@fr } ?s ex:label ?l"),
+            rows(&[&["a"], &["b"]]),
+        ),
+        (
+            "a join on a language-tagged literal",
+            q(
+                &both,
+                "?x ?y",
+                "?x ex:label ?l . ?y ex:label ?l FILTER(?x != ?y)",
+            ),
+            rows(&[&["a", "b"], &["b", "a"]]),
+        ),
+        (
+            "a custom-datatype constant",
+            q(&both, "?s", "?s ex:code \"A1\"^^ex:Code"),
+            rows(&[&["a"], &["b"]]),
+        ),
+        (
+            "VALUES of a custom-datatype literal",
+            q(&both, "?s", "VALUES ?c { \"A1\"^^ex:Code } ?s ex:code ?c"),
+            rows(&[&["a"], &["b"]]),
+        ),
+        (
+            "a join on a custom-datatype literal",
+            q(
+                &both,
+                "?x ?y",
+                "?x ex:code ?c . ?y ex:code ?c FILTER(?x != ?y)",
+            ),
+            rows(&[&["a", "b"], &["b", "a"]]),
+        ),
+        (
+            "control: a plain string",
+            q(&both, "?s", "?s ex:code \"A1\""),
+            rows(&[&["c"]]),
+        ),
+        (
+            "control: a decimal join",
+            q(
+                &both,
+                "?x ?y",
+                "?x ex:amount ?v . ?y ex:amount ?v FILTER(?x != ?y)",
+            ),
+            rows(&[&["a", "b"], &["a2", "c"], &["b", "a"], &["c", "a2"]]),
+        ),
+        (
+            "control: expression equality",
+            q(
+                &both,
+                "?x ?y",
+                "?x ex:label ?a . ?y ex:label ?b FILTER(?a = ?b && ?x != ?y)",
+            ),
+            rows(&[&["a", "b"], &["b", "a"]]),
+        ),
+        (
+            "control: ledger B alone",
+            q(&only_b, "?s", "?s ex:label \"chat\"@fr"),
+            rows(&[&["b"]]),
+        ),
+        (
+            "control: ledger B alone, custom datatype",
+            q(&only_b, "?s", "?s ex:code \"A1\"^^ex:Code"),
+            rows(&[&["b"]]),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, query, want) in cases {
+        match connection_sparql_rows(&fluree, &query).await {
+            Ok(got) => failures.eq(got, want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+    // JSON-LD twins: a language-tagged and a custom-datatype constant.
+    for (label, object, want) in [
+        (
+            "JSON-LD language-tagged constant",
+            json!({"@value": "chat", "@language": "fr"}),
+            rows(&[&["a"], &["b"]]),
+        ),
+        (
+            "JSON-LD custom-datatype constant",
+            json!({"@value": "A1", "@type": "ex:Code"}),
+            rows(&[&["a"], &["b"]]),
+        ),
+    ] {
+        let query = json!({
+            "@context": {"ex": EX},
+            "from": [LEDGER_A, LEDGER_B],
+            "select": ["?s"],
+            "where": [{"@id": "?s", "ex:label": object.clone()}]
+        });
+        let query = if label.contains("custom") {
+            let mut q = query;
+            q["where"] = json!([{"@id": "?s", "ex:code": object}]);
+            q
+        } else {
+            query
+        };
+        let json = connection_jsonld(&fluree, LEDGER_A, &query).await;
+        failures.eq(jsonld_rows(&json), want, label);
+    }
+    failures.assert_none();
+}
+
+/// The same range scan serves one ledger under a view policy that covers the
+/// scanned predicate (the binary scan has no per-flake policy filter). A
+/// language-tagged and a custom-datatype constant must match there too.
+#[tokio::test(flavor = "current_thread")]
+async fn typed_string_literals_under_a_view_policy() {
+    let fluree = two_ledgers().await;
+    let policy = json!([{
+        "@id": "http://example.org/viewLabelsAndCodes",
+        "f:action": "f:view",
+        "f:onProperty": [{"@id": "http://example.org/label"}, {"@id": "http://example.org/code"}],
+        "f:allow": true
+    }]);
+    let view = fluree
+        .db_with_policy(
+            LEDGER_B,
+            &fluree_db_api::GovernanceOptions {
+                policy: Some(policy),
+                default_allow: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("db_with_policy");
+    assert!(!view.is_root(), "an enforcing view");
+    let mut failures = Failures::default();
+    for (label, body, want) in [
+        (
+            "a language-tagged constant",
+            "?s ex:label \"chat\"@fr",
+            rows(&[&["b"]]),
+        ),
+        ("another tag", "?s ex:label \"chat\"@en", rows(&[&["c"]])),
+        (
+            "a custom-datatype constant",
+            "?s ex:code \"A1\"^^ex:Code",
+            rows(&[&["b"]]),
+        ),
+        (
+            "control: a plain string",
+            "?s ex:code \"A1\"",
+            rows(&[&["c"]]),
+        ),
+    ] {
+        let query = format!("{PREFIXES}SELECT ?s WHERE {{ {body} }}");
+        match fluree.query(&view, query.as_str()).await {
+            Ok(result) => match result.to_jsonld(&view.snapshot) {
+                Ok(json) => failures.eq(jsonld_rows(&json), want, label),
+                Err(e) => failures.0.push(format!("{label}: format failed: {e}")),
+            },
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+    }
+    failures.assert_none();
+}
+
+// ---------------------------------------------------------------------------
 // Arena-backed literals crossing a GRAPH scope.
 //
 // A GRAPH scope's scans bind big numbers and vectors as handles into its own
