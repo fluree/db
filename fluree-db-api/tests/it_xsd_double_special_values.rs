@@ -1509,9 +1509,13 @@ async fn non_xsd_spellings_are_not_doubles() {
     // A query constant with the spelling is refused like any ill-typed one.
     let ledger = fluree.ledger(ledger_id).await.expect("load");
     let query = format!("{PREFIXES}SELECT ?s WHERE {{ ?s ex:v \"inf\"^^xsd:double }}");
-    assert!(support::query_sparql(&fluree, &ledger, &query)
+    let err = support::query_sparql(&fluree, &ledger, &query)
         .await
-        .is_err());
+        .expect_err("a query constant with the spelling");
+    assert!(
+        err.to_string().contains("Invalid xsd:double literal 'inf'"),
+        "{err}"
+    );
 
     // The XSD spellings, and an overflowing numeral, are numbers.
     for (lexical, token) in [

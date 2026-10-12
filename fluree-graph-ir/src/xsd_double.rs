@@ -10,8 +10,9 @@
 //! Every RDF-lexical serialization site (SPARQL Results JSON/XML, CSV/TSV,
 //! RDF/XML, N-Triples/N-Quads export, `LiteralValue::lexical()`) must route
 //! through these helpers so Fluree emits one consistent, spec-aligned form.
-//! JSON-LD (and other JSON-native typed output) is deliberately excluded:
-//! there a double is a native JSON number, never a lexical string.
+//! JSON-LD (and other JSON-native typed output) writes a finite double as a
+//! native JSON number; JSON has no number for the special values, so there
+//! they are the strings `"INF"`, `"-INF"` and `"NaN"`.
 //!
 //! The reverse direction, lexical form to value, is [`parse_xsd_double`] and
 //! [`parse_xsd_float`]: the one definition of which spellings are `xsd:double`

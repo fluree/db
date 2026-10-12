@@ -791,6 +791,11 @@ fn parse_string_to_integer(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
 /// Only the XSD lexical space is accepted ([`fluree_graph_ir::parse_xsd_double`]):
 /// numerals plus `INF`, `+INF`, `-INF` and `NaN`. Other spellings such as `inf`,
 /// `Infinity` or `nan` are not lexical forms of either datatype.
+/// What an `xsd:double` or `xsd:float` lexical form looks like, for errors
+/// that refuse one.
+pub const XSD_DOUBLE_LEXICAL_HINT: &str =
+    "expected a numeral such as 1.5 or 1.5E3, or INF, +INF, -INF or NaN";
+
 fn parse_string_to_double(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
     fluree_graph_ir::parse_xsd_double(s)
         .map(FlakeValue::Double)
@@ -800,11 +805,7 @@ fn parse_string_to_double(s: &str, datatype_iri: &str) -> CoercionResult<FlakeVa
             } else {
                 "xsd:double"
             };
-            CoercionError::parse_failed(
-                s,
-                target,
-                Some("expected a numeral such as 1.5 or 1.5E3, or INF, +INF, -INF or NaN"),
-            )
+            CoercionError::parse_failed(s, target, Some(XSD_DOUBLE_LEXICAL_HINT))
         })
 }
 

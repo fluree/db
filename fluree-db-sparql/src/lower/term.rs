@@ -330,8 +330,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             // The write surfaces' parser, so a query literal accepts exactly
             // the XSD lexical forms a transaction does.
             xsd::DOUBLE | xsd::FLOAT => {
-                fluree_db_core::coerce::coerce_string_value(value, dt_iri.as_str())
-                    .map_err(|_| LowerError::invalid_decimal(value, datatype.span))
+                fluree_db_core::coerce::coerce_string_value(value, dt_iri.as_str()).map_err(|_| {
+                    let name = if dt_iri.as_str() == xsd::DOUBLE {
+                        "xsd:double"
+                    } else {
+                        "xsd:float"
+                    };
+                    LowerError::invalid_literal(
+                        value,
+                        name,
+                        fluree_db_core::coerce::XSD_DOUBLE_LEXICAL_HINT,
+                        datatype.span,
+                    )
+                })
             }
             xsd::BOOLEAN => {
                 let b = value == "true" || value == "1";
