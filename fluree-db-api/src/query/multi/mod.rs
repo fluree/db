@@ -288,8 +288,8 @@ pub enum MultiQueryValidationError {
     JsonLdBodyNotObject { alias: String },
     #[error("sub-query '{alias}': SPARQL query body must be a string")]
     SparqlBodyNotString { alias: String },
-    /// The SPARQL text does not parse, or its dataset clause cannot be read.
-    /// `message` is that error.
+    /// The SPARQL text's dataset clause cannot be read. `message` is that
+    /// error.
     #[error("sub-query '{alias}': {message}")]
     SparqlUnreadable { alias: String, message: String },
     #[error(
@@ -543,8 +543,8 @@ fn validate_jsonld_subquery(
 }
 
 /// The members of a SPARQL sub-query's dataset, read from its
-/// [`sparql_subquery_text`]. Text that does not parse cleanly, or whose dataset
-/// clause cannot be read, is an error.
+/// [`sparql_subquery_text`]. Text that does not parse cleanly reads nothing,
+/// so it has none; a dataset clause that cannot be read is an error.
 fn validate_sparql_subquery(
     alias: &str,
     sq: &MultiQuerySubquery,
@@ -563,7 +563,9 @@ fn validate_sparql_subquery(
     };
 
     let text = sparql_subquery_text(body, envelope_context);
-    let ast = crate::query::helpers::parse_sparql_strict(&text).map_err(unreadable)?;
+    let Ok(ast) = crate::query::helpers::parse_sparql_strict(&text) else {
+        return Ok(Vec::new());
+    };
 
     // Fluree's history-range extension (`FROM <a> TO <b>`) reads a range of
     // times rather than one snapshot.
@@ -1493,20 +1495,27 @@ mod tests {
         assert!(distinct.contains("ledgerC:dev"));
     }
 
-    /// A SPARQL sub-query that does not parse is refused with the parser's
-    /// error.
+    /// A SPARQL sub-query that does not parse reads nothing: it has no
+    /// members, and its siblings' ledgers are counted as usual.
     #[test]
-    fn rejects_sparql_subquery_that_does_not_parse() {
+    fn a_sparql_subquery_that_does_not_parse_has_no_members() {
         for text in [
             "not a SPARQL query",
             "SELECT ?x FROM <ledgerA> WHERE { this is not valid SPARQL }",
         ] {
-            let req = envelope_with(&[("a", sparql(text))], None);
-            let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-            let message = err.to_string();
-            assert!(
-                message.contains("'a'") && message.contains("SPARQL"),
-                "{text}: {message}"
+            let req = envelope_with(
+                &[
+                    ("a", sparql(text)),
+                    ("b", sparql("SELECT ?x FROM <ledgerB> WHERE { ?x ?p ?o }")),
+                ],
+                None,
+            );
+            let ledgers = validate_envelope_ledgers(&req, &MultiQueryBounds::DEFAULT).unwrap();
+            assert_eq!(ledgers.sparql["a"], Vec::new(), "{text}");
+            assert_eq!(
+                ledgers.distinct.into_iter().collect::<Vec<_>>(),
+                vec!["ledgerB:main".to_string()],
+                "{text}"
             );
         }
     }
@@ -1712,9 +1721,9 @@ mod tests {
     }
 
     #[test]
-    fn sparql_subquery_that_does_not_parse_is_an_error() {
-        let err =
-            validate_sparql_subquery("a", &sparql("not a SPARQL query"), None, false).unwrap_err();
+    fn a_sparql_dataset_clause_that_cannot_be_read_is_an_error() {
+        let text = "SELECT ?x FROM <ledgerA@foo> WHERE { ?x ?p ?o }";
+        let err = validate_sparql_subquery("a", &sparql(text), None, false).unwrap_err();
         assert!(
             matches!(err, MultiQueryValidationError::SparqlUnreadable { .. }),
             "got: {err:?}"

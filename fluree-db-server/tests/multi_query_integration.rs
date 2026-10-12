@@ -319,8 +319,8 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
     // 'bad' parses, so envelope-level checks pass and snapshot resolution
     // succeeds against mq:partial, but its WHERE uses a prefix it never
     // declares: the query fails when it runs, and dispatch reports that as
-    // the alias's error. (A sub-query that does not parse is refused with the
-    // envelope; see `multi_query_sparql_sibling_that_does_not_parse_is_refused`.)
+    // the alias's error. (A sub-query that does not parse is reported the same
+    // way; see `multi_query_sub_queries_that_do_not_parse_are_reported_per_alias`.)
     let envelope = json!({
         "queries": {
             "good": {
@@ -444,10 +444,10 @@ async fn multi_query_sub_query_min_t_covers_every_ledger_it_reads() {
     );
 }
 
-/// A SPARQL sub-query that does not parse refuses the whole envelope with the
-/// parser's error.
+/// A sub-query that does not parse is reported under its alias, in either
+/// language, and its siblings still run.
 #[tokio::test]
-async fn multi_query_sparql_sibling_that_does_not_parse_is_refused() {
+async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
     create_ledger(&app, "mq:pf").await;
@@ -464,19 +464,23 @@ async fn multi_query_sparql_sibling_that_does_not_parse_is_refused() {
                     "where": { "@id": "?s", "ex:name": "?name" }
                 }
             },
-            "bad": {
+            "bad_sparql": {
                 "language": "sparql",
                 "query": "SELECT ?x FROM <mq:pf> WHERE { this is not valid SPARQL }"
+            },
+            "bad_jsonld": {
+                "language": "jsonld",
+                "query": { "from": "mq:pf", "select": 42, "where": { "@id": "?s" } }
             }
         }
     });
     let (status, body) = post_envelope(&app, &envelope).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got body: {body}");
-    let message = body.to_string();
-    assert!(
-        message.contains("'bad'") && message.contains("SPARQL"),
-        "the error names the sub-query and the parse failure, got: {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    assert_eq!(body["status"], "partial", "got body: {body}");
+    assert!(body["results"].get("good").is_some(), "got body: {body}");
+    for alias in ["bad_sparql", "bad_jsonld"] {
+        assert!(body["errors"].get(alias).is_some(), "{alias}: {body}");
+    }
 }
 
 // =============================================================================

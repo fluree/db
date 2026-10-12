@@ -23,9 +23,7 @@ use std::sync::Arc;
 
 use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::query::multi::MultiQueryError;
-use fluree_db_api::query::multi::{
-    MultiQueryBounds, MultiQueryRequest, MultiQueryStatus, MultiQueryValidationError,
-};
+use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
 use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
 
@@ -340,9 +338,9 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
 }
 
 #[tokio::test]
-async fn multi_query_sparql_sub_query_that_does_not_parse_is_refused_via_in_process_api() {
-    // A SPARQL sub-query that does not parse refuses the whole envelope with
-    // the parser's error.
+async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in_process_api() {
+    // A sub-query that does not parse is reported under its alias, in either
+    // language, and its siblings still run.
     let fluree = Arc::new(FlureeBuilder::memory().build_memory());
     ignore_ledgers(seed_two_ledgers(&fluree).await);
 
@@ -355,27 +353,40 @@ async fn multi_query_sparql_sub_query_that_does_not_parse_is_refused_via_in_proc
                            "select": ["?n"],
                            "where": { "@id": "?u", "schema:name": "?n" } }
             },
-            "bad": {
+            "bad_sparql": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq:users> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq:orders> WHERE { this is not valid SPARQL }"
+            },
+            "bad_jsonld": {
+                "language": "jsonld",
+                "query": { "from": "mq:users", "select": 42, "where": { "@id": "?u" } }
             }
         }
     }))
     .expect("envelope deserialises");
 
-    let err = fluree
+    let response = fluree
         .multi_query()
         .envelope(envelope)
         .execute()
         .await
-        .expect_err("a sub-query that does not parse refuses the envelope");
+        .expect("an envelope with sub-queries that do not parse still runs");
+
+    assert_eq!(response.status, MultiQueryStatus::Partial);
+    assert!(response.results.contains_key("good"));
+    for alias in ["bad_sparql", "bad_jsonld"] {
+        assert!(
+            response.errors.contains_key(alias),
+            "{alias}: {:?}",
+            response.errors
+        );
+    }
+    // The SPARQL sub-query that does not parse reads nothing, so its `FROM`
+    // is not in the snapshot.
     assert!(
-        matches!(
-            err,
-            MultiQueryError::Validation(MultiQueryValidationError::SparqlUnreadable { ref alias, .. })
-                if alias == "bad"
-        ),
-        "got: {err:?}"
+        !response.snapshot.ledgers.contains_key("mq:orders"),
+        "{:?}",
+        response.snapshot.ledgers
     );
 }
 
