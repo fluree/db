@@ -1767,6 +1767,14 @@ fn insert_branch_record(
     if is_registered(state, &key) {
         return Response::BranchRecordExists;
     }
+    if !restoring(state, &key.ledger_name) {
+        // A ledger new to the key: a retry it receives must not be
+        // answered with an earlier ledger's receipt under the name.
+        let ledger_id = key.ledger_id();
+        state
+            .idempotency
+            .retain(|cached, _| cached.ledger_id != ledger_id);
+    }
     state
         .ledgers
         .entry(key.ledger_name.clone())
@@ -1819,6 +1827,23 @@ fn insert_branch_record(
         }
     }
     Response::BranchRecordInserted
+}
+
+/// Whether `name`'s binding is a restore of a dropped ledger: the ledger
+/// its idempotency answers were recorded for, which keeps them.
+fn restoring(state: &NameServiceState, name: &str) -> bool {
+    let instance = state
+        .bindings
+        .get(name)
+        .and_then(|b| b.json.as_deref())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|binding| binding.get("instance")?.as_str().map(str::to_string));
+    instance.is_some_and(|instance| {
+        state
+            .dropped
+            .get(&instance)
+            .is_some_and(|entry| entry.json.is_some())
+    })
 }
 
 fn freeze_branch(
@@ -4011,6 +4036,79 @@ mod tests {
                 ledger_id: "missing:main".into()
             }
         );
+    }
+
+    /// A ledger created under a name a dropped ledger held does not answer a
+    /// retry with the dropped one's receipt; a restore of the dropped ledger
+    /// is the same ledger, and keeps it.
+    #[test]
+    fn a_new_ledger_under_a_name_forgets_the_dropped_ones_idempotency() {
+        let cached = IdempotencyCacheKey::new(
+            "mydb:main",
+            IdempotencyKey::new("k1").expect("test key fits cap"),
+        );
+        let receipt = ApplyOutcome::Applied(ApplyRecord {
+            request_cid: cid(7),
+            body_cid: cid(7),
+            body_kind: BodyKind::JsonLdInsert,
+            recorded_at_millis: 2_000,
+            head: cid(2),
+            t: 5,
+            recorded_index: 3,
+            tally: None,
+            flake_count: 0,
+        });
+        let dropped = "01JB8ZK4X5Y6Z7A8B9C0D1E2F3";
+        let insert = |state: &mut NameServiceState, instance: &str| {
+            state.bindings.insert(
+                "mydb".into(),
+                VersionedJson {
+                    version: 1,
+                    json: Some(format!(r#"{{"instance":"{instance}"}}"#)),
+                },
+            );
+            apply(
+                state,
+                Command::InsertBranchRecord(FencedBranchRecord {
+                    key: RefKey::new("mydb", "main"),
+                    fence: Some(7),
+                    frozen: false,
+                    retracted: false,
+                    head: None,
+                    index: None,
+                    source_branch: None,
+                    branches: 0,
+                    applied_at_millis: 0,
+                }),
+                9,
+            )
+        };
+        let with_entries = || {
+            let mut state = NameServiceState::new();
+            state.idempotency.insert(cached.clone(), receipt.clone());
+            state.dropped.insert(
+                dropped.into(),
+                VersionedJson {
+                    version: 2,
+                    json: Some("{}".into()),
+                },
+            );
+            state
+        };
+
+        let mut created = with_entries();
+        assert_eq!(
+            insert(&mut created, "01JB8ZK4X5Y6Z7A8B9C0D1E2F4"),
+            Response::BranchRecordInserted
+        );
+        assert!(created.idempotency.is_empty());
+
+        let mut restored = with_entries();
+        assert_eq!(
+            insert(&mut restored, dropped),
+            Response::BranchRecordInserted
+        );
+        assert!(restored.idempotency.contains_key(&cached));
     }
 
     #[test]
