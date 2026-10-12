@@ -855,6 +855,85 @@ async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
     assert_eq!(orphans[0][0], g, "{orphans:?}");
 }
 
+/// Earlier versions upserted Turtle by converting it to JSON-LD, whose
+/// blank nodes were scoped by the converted document; RDF text is now
+/// scoped by its parsed statements. So the first upsert of a document from
+/// text over one upserted the earlier way mints its blank nodes again,
+/// leaving the earlier ones unreferenced, and the same upsert after that
+/// commits nothing. The documented query lists the earlier nodes, whose ids
+/// share one scope the current ones do not, and each deletes by its id.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // the conversion the RDF lane replaced
+async fn a_document_upserted_through_json_ld_re_mints_its_blank_nodes_once_from_text() {
+    let fluree = memory();
+    let id = "it/rdf-upsert-identity:main";
+    let doc = "@prefix ex: <http://example.org/> .\n\
+               ex:w ex:owner _:o1 ; ex:spec [ ex:unit \"mm\" ] .\n\
+               _:o1 ex:name \"Owner\" .\n";
+    let converted = fluree_graph_turtle::parse_to_json(doc).expect("convert");
+    let earlier = fluree
+        .upsert(genesis_ledger(&fluree, id), &converted)
+        .await
+        .expect("upsert through JSON-LD");
+    let first = fluree
+        .upsert_turtle(earlier.ledger, doc)
+        .await
+        .expect("upsert from text");
+    assert!(
+        first.receipt.t > earlier.receipt.t,
+        "the first upsert from text mints the blank nodes again"
+    );
+    let again = fluree
+        .upsert_turtle(first.ledger, doc)
+        .await
+        .expect("the same upsert again");
+    assert_eq!(again.receipt.t, first.receipt.t, "then it commits nothing");
+
+    // `_:fdb-upsert<scope>-<solution>-<label>`; an anonymous node's label
+    // starts with `-`.
+    let scope = |b: &str| b.split('-').nth(1).map(str::to_string);
+    let orphans = select(&fluree, &again.ledger, ORPHANS_DEFAULT).await;
+    let current = select(
+        &fluree,
+        &again.ledger,
+        "SELECT ?b WHERE { <http://example.org/w> ?p ?b FILTER(isBlank(?b)) }",
+    )
+    .await;
+    assert_eq!(
+        (orphans.len(), current.len()),
+        (2, 2),
+        "{orphans:?} {current:?}"
+    );
+    let orphan_scopes: Vec<_> = orphans.iter().map(|r| scope(&r[0])).collect();
+    let current_scope = scope(&current[0][0]);
+    assert!(
+        orphan_scopes
+            .iter()
+            .all(|s| *s == orphan_scopes[0] && *s != current_scope),
+        "{orphans:?} {current:?}"
+    );
+
+    let mut ledger = again.ledger;
+    for orphan in &orphans {
+        let b = &orphan[0];
+        let txn = json!({"where": {"@id": b, "?p": "?o"}, "delete": {"@id": b, "?p": "?o"}});
+        ledger = fluree.update(ledger, &txn).await.expect("delete").ledger;
+    }
+    assert!(select(&fluree, &ledger, ORPHANS_DEFAULT).await.is_empty());
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            "SELECT ?unit ?name WHERE { <http://example.org/w> <http://example.org/spec> ?s ; \
+             <http://example.org/owner> ?o . ?s <http://example.org/unit> ?unit . \
+             ?o <http://example.org/name> ?name }",
+        )
+        .await,
+        vec![row(&["mm", "Owner"])],
+        "the current nodes are intact"
+    );
+}
+
 /// A blank-node label names one node across a TriG document, so a node
 /// described in one graph can be referenced from another graph, or from the
 /// default graph. The documented queries do not list it; a check within the
