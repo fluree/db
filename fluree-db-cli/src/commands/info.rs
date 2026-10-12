@@ -142,8 +142,22 @@ pub async fn run(
                     Some(id) => println!("Index ID:       {id}"),
                     None => println!("Index ID:       (none)"),
                 }
-                match fluree.ledger_info(&ledger_id).execute().await {
-                    Ok(info) => print_config_diagnostics(&info),
+                // Only the config diagnostics, not the full ledger-info stats:
+                // the ledger is loaded, and its config graph read.
+                let diagnostics = match fluree.ledger(&ledger_id).await {
+                    Ok(ledger) => fluree_db_api::config_resolver::diagnose(
+                        &ledger.snapshot,
+                        ledger.novelty.as_ref(),
+                        ledger.t(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                match diagnostics {
+                    Ok(diagnostics) => print_config_diagnostics(
+                        &serde_json::json!({ "configDiagnostics": diagnostics }),
+                    ),
                     Err(e) => eprintln!("warning: config diagnostics unavailable: {e}"),
                 }
             } else if let Some(gs) = fluree.nameservice().lookup_graph_source(&ledger_id).await? {

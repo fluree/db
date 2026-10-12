@@ -129,6 +129,22 @@ pub fn format_data_model_markdown(alias: &str, info: &JsonValue) -> String {
         }
     }
 
+    // Degenerate config state (ledger info's `configDiagnostics`), such as
+    // shapes no config enforces: worth knowing before writing or querying.
+    if let Some(diagnostics) = info
+        .get("configDiagnostics")
+        .and_then(|v| v.as_array())
+        .filter(|d| !d.is_empty())
+    {
+        lines.push("## Config Diagnostics".to_string());
+        for diagnostic in diagnostics {
+            if let Some(message) = diagnostic.get("message").and_then(|m| m.as_str()) {
+                lines.push(format!("- {message}"));
+            }
+        }
+        lines.push(String::new());
+    }
+
     lines.join("\n")
 }
 
@@ -361,6 +377,27 @@ mod tests {
         // Native (non-virtual) info has no `source` block, so no coarse-estimate
         // note is emitted — native markdown stays byte-identical.
         assert!(!markdown.contains("COARSE ESTIMATES"));
+    }
+
+    #[test]
+    fn test_format_data_model_config_diagnostics() {
+        let info = json!({
+            "stats": {"flakes": 1},
+            "configDiagnostics": [{
+                "code": "shacl-not-configured",
+                "message": "shapes present; SHACL enforcement not configured"
+            }]
+        });
+        let markdown = format_data_model_markdown("test:main", &info);
+        assert!(markdown.contains("## Config Diagnostics"), "{markdown}");
+        assert!(
+            markdown.contains("- shapes present; SHACL enforcement not configured"),
+            "{markdown}"
+        );
+        assert!(
+            !format_data_model_markdown("test:main", &json!({"stats": {"flakes": 1}}))
+                .contains("## Config Diagnostics")
+        );
     }
 
     #[test]
