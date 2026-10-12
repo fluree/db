@@ -572,10 +572,20 @@ async fn shapes_without_enforcement(
     unenforced_shapes(snapshot, overlay, to_t, config.as_ref()).await
 }
 
+/// The SHACL target predicates: a subject with one is a shape the compiler
+/// enforces where SHACL is on, typed `sh:NodeShape` or not.
+const SHAPE_TARGETS: [&str; 4] = [
+    fluree_vocab::shacl::TARGET_CLASS,
+    fluree_vocab::shacl::TARGET_NODE,
+    fluree_vocab::shacl::TARGET_SUBJECTS_OF,
+    fluree_vocab::shacl::TARGET_OBJECTS_OF,
+];
+
 /// Whether the ledger may hold a SHACL shape, decided in memory, without
 /// reading the index: its index stats count instances of `sh:NodeShape` or
-/// `sh:PropertyShape`, or its novelty asserts one in the default graph. An
-/// index without class stats counts as holding none. A gate for checks that
+/// `sh:PropertyShape` or uses of a target predicate (an untyped shape), or
+/// its novelty asserts one of those in the default graph. An index without
+/// class or property stats counts as holding none. A gate for checks that
 /// would otherwise read the ledger.
 #[cfg(feature = "shacl")]
 pub(crate) fn may_hold_shapes(
@@ -590,19 +600,49 @@ pub(crate) fn may_hold_shapes(
     .iter()
     .filter_map(|iri| snapshot.encode_iri_strict(iri))
     .collect();
-    if shape_types.is_empty() {
+    let targets: Vec<Sid> = SHAPE_TARGETS
+        .iter()
+        .filter_map(|iri| snapshot.encode_iri_strict(iri))
+        .collect();
+    if shape_types.is_empty() && targets.is_empty() {
         return false;
     }
-    let indexed = snapshot
-        .stats
-        .as_ref()
+    let stats = snapshot.stats.as_ref();
+    let indexed = stats
         .and_then(|stats| stats.classes.as_ref())
         .is_some_and(|classes| {
             classes
                 .iter()
                 .any(|class| class.count > 0 && shape_types.contains(&class.class_sid))
-        });
+        })
+        || stats
+            .and_then(|stats| stats.properties.as_ref())
+            .is_some_and(|properties| {
+                properties.iter().any(|property| {
+                    property.count > 0
+                        && targets.iter().any(|target| {
+                            target.namespace_code == property.sid.0
+                                && *target.name == *property.sid.1
+                        })
+                })
+            });
     if indexed {
+        return true;
+    }
+    let targeted = targets.into_iter().any(|target| {
+        let mut asserted = false;
+        novelty.for_each_overlay_flake(
+            fluree_db_core::DEFAULT_GRAPH_ID,
+            fluree_db_core::IndexType::Psot,
+            Some(&fluree_db_core::Flake::min_for_predicate(target.clone())),
+            Some(&fluree_db_core::Flake::max_for_predicate(target)),
+            false,
+            to_t,
+            &mut |flake| asserted |= flake.op,
+        );
+        asserted
+    });
+    if targeted {
         return true;
     }
     let Some(rdf_type) = snapshot.encode_iri_strict(RDF_TYPE_IRI) else {
@@ -652,6 +692,16 @@ pub(crate) async fn unenforced_shapes(
     if enabled {
         return Ok(None);
     }
+    // SHACL switched off on purpose (`f:shaclEnabled false`, ledger-wide or
+    // for a graph) is the ledger's posture, not a gap to report.
+    let switched_off = config.is_some_and(|c| {
+        std::iter::once(c.shacl.as_ref())
+            .chain(c.graph_overrides.iter().map(|graph| graph.shacl.as_ref()))
+            .any(|shacl| shacl.is_some_and(|shacl| shacl.enabled == Some(false)))
+    });
+    if switched_off {
+        return Ok(None);
+    }
     // The configured shapes graph when it is a local one, else the default
     // graph (a cross-ledger source is not examined here).
     let source = config
@@ -671,6 +721,13 @@ pub(crate) async fn unenforced_shapes(
     let (Some(g_id), Some(rdf_type)) = (g_id, try_encode(snapshot, RDF_TYPE_IRI)) else {
         return Ok(None);
     };
+    let diagnostic = || ConfigDiagnostic {
+        code: ConfigDiagnosticCode::ShaclNotConfigured,
+        message: "shapes present; SHACL enforcement not configured (shapes are enforced \
+                  only where the ledger config sets f:shaclEnabled true)"
+            .to_string(),
+        subjects: Vec::new(),
+    };
     for shape_type in [
         fluree_vocab::shacl::NODE_SHAPE,
         fluree_vocab::shacl::PROPERTY_SHAPE,
@@ -681,13 +738,30 @@ pub(crate) async fn unenforced_shapes(
         let shapes =
             find_instances_of_type(snapshot, overlay, to_t, g_id, &rdf_type, &type_sid).await?;
         if !shapes.is_empty() {
-            return Ok(Some(ConfigDiagnostic {
-                code: ConfigDiagnosticCode::ShaclNotConfigured,
-                message: "shapes present; SHACL enforcement not configured (shapes are \
-                          enforced only where the ledger config sets f:shaclEnabled true)"
-                    .to_string(),
-                subjects: Vec::new(),
-            }));
+            return Ok(Some(diagnostic()));
+        }
+    }
+    // An untyped shape: a subject with a target predicate.
+    for target in SHAPE_TARGETS {
+        let Some(target) = snapshot.encode_iri(target) else {
+            continue;
+        };
+        let used = fluree_db_core::range_with_overlay(
+            snapshot,
+            g_id,
+            overlay,
+            fluree_db_core::IndexType::Psot,
+            fluree_db_core::RangeTest::Eq,
+            fluree_db_core::RangeMatch::predicate(target),
+            fluree_db_core::RangeOptions {
+                to_t: Some(to_t),
+                flake_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if !used.is_empty() {
+            return Ok(Some(diagnostic()));
         }
     }
     Ok(None)

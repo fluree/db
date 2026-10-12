@@ -23,6 +23,12 @@ const SHAPE: &str =
     ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
       sh:property [ sh:path ex:name ; sh:minCount 1 ] .";
 
+/// An untyped shape: a target predicate and no `sh:NodeShape` type.
+const UNTYPED_SHAPE: &str =
+    "@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://example.org/> .
+    ex:PersonShape sh:targetClass ex:Person ;
+      sh:property [ sh:path ex:name ; sh:minCount 1 ] .";
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_ledger_with_unenforced_shapes_warns_once_per_load() {
     let (spans, _guard) = span_capture::init_test_tracing();
@@ -76,6 +82,27 @@ async fn a_ledger_with_unenforced_shapes_warns_once_per_load() {
             ),
         )
         .await;
+        seed("it/untyped-unenforced", UNTYPED_SHAPE.to_string()).await;
+        seed("it/untyped-unenforced-indexed", UNTYPED_SHAPE.to_string()).await;
+        fluree
+            .reindex(
+                "it/untyped-unenforced-indexed:main",
+                fluree_db_api::ReindexOptions::default(),
+            )
+            .await
+            .expect("reindex");
+        seed(
+            "it/shapes-switched-off",
+            format!(
+                "{SHAPE}
+                 @prefix f: <https://ns.flur.ee/db#> .
+                 GRAPH <urn:fluree:it/shapes-switched-off:main#config> {{
+                   <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+                   <urn:config:shacl> f:shaclEnabled false .
+                 }}"
+            ),
+        )
+        .await;
         seed(
             "it/no-shapes",
             "@prefix ex: <http://example.org/> . ex:alice ex:name \"Alice\" .".to_string(),
@@ -113,8 +140,28 @@ async fn a_ledger_with_unenforced_shapes_warns_once_per_load() {
     );
     assert_eq!(warnings() - before, 2, "warned for the indexed ledger too");
 
-    for ledger in ["it/shapes-enforced:main", "it/no-shapes:main"] {
+    // An untyped shape warns as a typed one does, in novelty and indexed.
+    fluree
+        .ledger_cached("it/untyped-unenforced:main")
+        .await
+        .expect("load");
+    assert_eq!(warnings() - before, 3, "warned for the untyped shape");
+    fluree
+        .ledger_cached("it/untyped-unenforced-indexed:main")
+        .await
+        .expect("load");
+    assert_eq!(
+        warnings() - before,
+        4,
+        "warned for the indexed untyped shape"
+    );
+
+    for ledger in [
+        "it/shapes-enforced:main",
+        "it/shapes-switched-off:main",
+        "it/no-shapes:main",
+    ] {
         fluree.ledger_cached(ledger).await.expect("load");
-        assert_eq!(warnings() - before, 2, "{ledger} has nothing to warn about");
+        assert_eq!(warnings() - before, 4, "{ledger} has nothing to warn about");
     }
 }

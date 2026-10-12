@@ -203,6 +203,43 @@ async fn diagnostics_report_shapes_without_enforcement() {
         .await
         .unwrap();
     assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+
+    // An untyped shape (a target predicate and no `sh:NodeShape` type) is a
+    // shape the compiler enforces where SHACL is on, so it is reported too.
+    let ledger_id = "it/config-diagnostics-untyped-shape:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@id": "ex:PersonShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": {"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["shacl-not-configured"]
+    );
+
+    // SHACL switched off in the config is the ledger's posture, not a gap.
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:it:cfg:ledger",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"f:shaclEnabled": false}
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
 }
 
 /// SHACL enabled for one graph only is configured: the shapes are enforced
