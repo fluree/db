@@ -574,24 +574,31 @@ fn count_numeric_compare_in_leaf_slice(
 ///
 /// Every comparison with NaN is false (XPath F&O 3.1 §4.3.2): a NaN threshold
 /// selects nothing, and a double interval stops at `+INF`'s key, below NaN's.
-type KeyInterval = Option<(u64, u64)>;
+pub(crate) type KeyInterval = Option<(u64, u64)>;
 
-fn threshold_key_interval(
+pub(crate) fn threshold_key_interval(
     otype: OType,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
 ) -> Option<KeyInterval> {
-    let (key, max) = match (otype, threshold) {
-        (OType::XSD_INTEGER, FlakeValue::Long(n)) => (ObjKey::encode_i64(*n).as_u64(), u64::MAX),
-        (OType::XSD_DOUBLE, FlakeValue::Long(n)) => (
-            ObjKey::encode_f64(*n as f64).as_u64(),
-            ObjKey::F64_COMPARABLE_MAX.as_u64(),
-        ),
+    let (compare, key, max) = match (otype, threshold) {
+        (OType::XSD_INTEGER, FlakeValue::Long(n)) => {
+            (compare, ObjKey::encode_i64(*n).as_u64(), u64::MAX)
+        }
+        (OType::XSD_DOUBLE, FlakeValue::Long(n)) => {
+            let (compare, d) = long_threshold_as_double(compare, *n);
+            (
+                compare,
+                ObjKey::encode_f64(d).as_u64(),
+                ObjKey::F64_COMPARABLE_MAX.as_u64(),
+            )
+        }
         (OType::XSD_DOUBLE, FlakeValue::Double(d)) => {
             if d.is_nan() {
                 return Some(None);
             }
             (
+                compare,
                 ObjKey::encode_f64(*d).as_u64(),
                 ObjKey::F64_COMPARABLE_MAX.as_u64(),
             )
@@ -605,6 +612,33 @@ fn threshold_key_interval(
         NumericCompareOp::Le => Some((0, key)),
     };
     Some(interval.filter(|(lo, hi)| lo <= hi))
+}
+
+/// `?v compare n`, for a double `?v`, as a comparison with a double: `n`
+/// itself when it is one, else the double `n` rounds to, with the comparison
+/// adjusted to its side of `n`. No double lies strictly between `n` and that
+/// neighbour, so the comparison selects exactly the doubles the exact one
+/// does (Fluree compares numbers exactly).
+fn long_threshold_as_double(compare: NumericCompareOp, n: i64) -> (NumericCompareOp, f64) {
+    use std::cmp::Ordering;
+    use NumericCompareOp::{Ge, Gt, Le, Lt};
+    let d = n as f64;
+    // Every double at or beyond 2^53 is an integer, and `d` is at most 2^63,
+    // so this comparison is exact.
+    let compare = match (d as i128).cmp(&i128::from(n)) {
+        Ordering::Equal => compare,
+        // `d` is above `n`: `> n` and `>= n` are `>= d`; `< n` and `<= n` are `< d`.
+        Ordering::Greater => match compare {
+            Gt | Ge => Ge,
+            Lt | Le => Lt,
+        },
+        // `d` is below `n`: `> n` and `>= n` are `> d`; `< n` and `<= n` are `<= d`.
+        Ordering::Less => match compare {
+            Gt | Ge => Gt,
+            Lt | Le => Le,
+        },
+    };
+    (compare, d)
 }
 
 fn leaflet_fully_matches(first: u64, last: u64, interval: KeyInterval) -> bool {
@@ -2171,6 +2205,63 @@ mod tests {
     use super::*;
     use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
     use fluree_db_core::IndexStats;
+
+    /// An integer threshold selects exactly the doubles the generic lane's
+    /// exact comparison does, around and beyond 2^53 where an `i64` has no
+    /// double of its own.
+    #[test]
+    fn a_long_threshold_selects_doubles_exactly() {
+        use std::cmp::Ordering;
+        // `v` against `n`, exactly.
+        fn exact(v: f64, n: i64) -> Ordering {
+            let floor = v.floor();
+            match (floor as i128).cmp(&i128::from(n)) {
+                Ordering::Equal if v > floor => Ordering::Greater,
+                other => other,
+            }
+        }
+        let p53 = 1_i64 << 53;
+        for n in [
+            0,
+            7,
+            p53 - 1,
+            p53,
+            p53 + 1,
+            p53 + 3,
+            -(p53 + 1),
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let d = n as f64;
+            let near = [
+                d,
+                d.next_up(),
+                d.next_down(),
+                d.next_up().next_up(),
+                d.next_down().next_down(),
+            ];
+            for op in [
+                NumericCompareOp::Gt,
+                NumericCompareOp::Ge,
+                NumericCompareOp::Lt,
+                NumericCompareOp::Le,
+            ] {
+                let interval = threshold_key_interval(OType::XSD_DOUBLE, op, &FlakeValue::Long(n))
+                    .expect("an integer threshold is comparable with doubles");
+                for v in near {
+                    let key = ObjKey::encode_f64(v).as_u64();
+                    let selected = interval.is_some_and(|(lo, hi)| lo <= key && key <= hi);
+                    let expected = match op {
+                        NumericCompareOp::Gt => exact(v, n) == Ordering::Greater,
+                        NumericCompareOp::Ge => exact(v, n) != Ordering::Less,
+                        NumericCompareOp::Lt => exact(v, n) == Ordering::Less,
+                        NumericCompareOp::Le => exact(v, n) != Ordering::Greater,
+                    };
+                    assert_eq!(selected, expected, "{v:e} {op:?} {n}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn numbig_signed_keys_preserve_boundaries() {

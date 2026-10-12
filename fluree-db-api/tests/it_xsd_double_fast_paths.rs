@@ -40,6 +40,14 @@ fn turtle(values: &[(&str, &str)]) -> String {
         ttl.push_str(&format!(
             "ex:{s} ex:v \"{v}\"^^xsd:double ; ex:n 1 ; ex:kind ex:K ; ex:label \"{s}\" .\n"
         ));
+        // 2^53 and 2^53 + 4. Above 2^53 doubles are 2 apart: 2^53 + 1 rounds
+        // down to 2^53 and 2^53 + 3 rounds up to 2^53 + 4.
+        if *s == "pos" {
+            ttl.push_str("ex:pos ex:big \"9007199254740992\"^^xsd:double .\n");
+        }
+        if *s == "zero" {
+            ttl.push_str("ex:zero ex:big \"9007199254740996\"^^xsd:double .\n");
+        }
     }
     ttl
 }
@@ -96,6 +104,9 @@ struct Case {
     expected: &'static [&'static str],
     /// The fast path that must serve it on the indexed ledger.
     site: &'static str,
+    /// Whether that fast path also serves it with the special values in
+    /// novelty over the index; when it does not, the general pipeline does.
+    overlay_fires: bool,
 }
 
 fn count_where(filter: &str) -> Value {
@@ -126,6 +137,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["2"],
             site: COUNT_COMPARE,
+            overlay_fires: true,
         },
         Case {
             name: "COUNT of < 0",
@@ -134,6 +146,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["2"],
             site: COUNT_COMPARE,
+            overlay_fires: true,
         },
         Case {
             name: "COUNT of >= -INF: every number but NaN",
@@ -142,6 +155,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["5"],
             site: COUNT_COMPARE,
+            overlay_fires: true,
         },
         Case {
             name: "COUNT of <= INF: every number but NaN",
@@ -150,6 +164,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["5"],
             site: COUNT_COMPARE,
+            overlay_fires: true,
         },
         Case {
             name: "COUNT of > INF",
@@ -158,6 +173,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["0"],
             site: COUNT_COMPARE,
+            overlay_fires: true,
         },
         Case {
             name: "COUNT of < NaN: no comparison holds for NaN",
@@ -166,6 +182,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["0"],
             site: COUNT_COMPARE,
+            overlay_fires: true,
         },
         Case {
             name: "MIN",
@@ -174,6 +191,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["-INF"],
             site: MIN_MAX,
+            overlay_fires: false,
         },
         Case {
             name: "MAX: NaN, which ORDER BY places after INF",
@@ -182,6 +200,7 @@ fn cases() -> Vec<Case> {
             var: "out",
             expected: &["NaN"],
             site: MIN_MAX,
+            overlay_fires: false,
         },
         Case {
             name: "top-k labels of > 0",
@@ -192,6 +211,7 @@ fn cases() -> Vec<Case> {
             var: "label",
             expected: &["inf", "pos"],
             site: TOP_K,
+            overlay_fires: false,
         },
         Case {
             name: "top-k labels of > -INF: NaN is not above it",
@@ -201,6 +221,7 @@ fn cases() -> Vec<Case> {
             var: "label",
             expected: &["inf", "neg", "pos", "zero"],
             site: TOP_K,
+            overlay_fires: false,
         },
         Case {
             name: "top-k labels of > NaN",
@@ -210,6 +231,7 @@ fn cases() -> Vec<Case> {
             var: "label",
             expected: &[],
             site: TOP_K,
+            overlay_fires: false,
         },
         Case {
             name: "top-k labels of integers > NaN",
@@ -219,6 +241,7 @@ fn cases() -> Vec<Case> {
             var: "label",
             expected: &[],
             site: TOP_K,
+            overlay_fires: false,
         },
         Case {
             name: "top-k labels of integers > -INF",
@@ -228,6 +251,53 @@ fn cases() -> Vec<Case> {
             var: "label",
             expected: &["inf", "nan", "nan2", "neg", "ninf", "pos", "zero"],
             site: TOP_K,
+            overlay_fires: false,
+        },
+        Case {
+            name: "COUNT of >= 2^53 + 1, which rounds down to 2^53",
+            sparql:
+                "SELECT (COUNT(?s) AS ?out) WHERE { ?s ex:big ?v FILTER(?v >= 9007199254740993) }",
+            jsonld: json!({
+                "select": ["(as (count ?s) ?out)"],
+                "where": [{"@id": "?s", "ex:big": "?v"}, ["filter", "(>= ?v 9007199254740993)"]]
+            }),
+            var: "out",
+            expected: &["1"],
+            site: COUNT_COMPARE,
+            overlay_fires: true,
+        },
+        Case {
+            name: "COUNT of > 2^53 + 3, which rounds up to 2^53 + 4",
+            sparql:
+                "SELECT (COUNT(?s) AS ?out) WHERE { ?s ex:big ?v FILTER(?v > 9007199254740995) }",
+            jsonld: json!({
+                "select": ["(as (count ?s) ?out)"],
+                "where": [{"@id": "?s", "ex:big": "?v"}, ["filter", "(> ?v 9007199254740995)"]]
+            }),
+            var: "out",
+            expected: &["1"],
+            site: COUNT_COMPARE,
+            overlay_fires: true,
+        },
+        Case {
+            name: "top-k labels of > 2^53 + 3, which rounds up to 2^53 + 4",
+            sparql: r"SELECT DISTINCT ?s ?label WHERE { ?s ex:kind ex:K . ?s ex:big ?v
+                       . ?s ex:label ?label FILTER(?v > 9007199254740995) } ORDER BY ?label LIMIT 10",
+            jsonld: top_k_where("ex:big", "(> ?v 9007199254740995)"),
+            var: "label",
+            expected: &["zero"],
+            site: TOP_K,
+            overlay_fires: false,
+        },
+        Case {
+            name: "top-k labels of > 2^53 - 1",
+            sparql: r"SELECT DISTINCT ?s ?label WHERE { ?s ex:kind ex:K . ?s ex:big ?v
+                       . ?s ex:label ?label FILTER(?v > 9007199254740991) } ORDER BY ?label LIMIT 10",
+            jsonld: top_k_where("ex:big", "(> ?v 9007199254740991)"),
+            var: "label",
+            expected: &["pos", "zero"],
+            site: TOP_K,
+            overlay_fires: false,
         },
     ]
 }
@@ -353,6 +423,14 @@ async fn fast_paths_over_special_doubles_match_the_general_pipeline() {
                 if !disabled && lane == "indexed" && fired != 2 {
                     failures.push(format!(
                         "{lane}: {}: `{}` must serve both surfaces; it served {fired} \
+                         [proceeded: {proceeded:?}]",
+                        case.name, case.site
+                    ));
+                }
+                let overlay_fired = usize::from(case.overlay_fires) * 2;
+                if !disabled && lane != "indexed" && fired != overlay_fired {
+                    failures.push(format!(
+                        "{lane}: {}: `{}` served {fired} surface(s), expected {overlay_fired} \
                          [proceeded: {proceeded:?}]",
                         case.name, case.site
                     ));

@@ -349,9 +349,14 @@ fn filter_subjects_by_numeric_gt(
     // saturating cast above would otherwise drop i64::MIN.
     let all_integers = thr_d < i64::MIN as f64;
     let thr_i_key = fluree_db_core::value_id::ObjKey::encode_i64(thr_i).as_u64();
-    let thr_d_key = fluree_db_core::value_id::ObjKey::encode_f64(thr_d).as_u64();
-    // NaN's key is the only one above +INF's, and NaN is never greater.
-    let max_d_key = fluree_db_core::value_id::ObjKey::F64_COMPARABLE_MAX.as_u64();
+    // The double keys above the threshold, compared exactly (an integer
+    // threshold beyond 2^53 included), and never NaN's.
+    let double_keys = crate::fast_count::threshold_key_interval(
+        OType::XSD_DOUBLE,
+        crate::fast_count::NumericCompareOp::Gt,
+        threshold,
+    )
+    .flatten();
 
     let mut keep: FxHashSet<u64> = FxHashSet::default();
     for_each_subject_row_psot(
@@ -366,7 +371,7 @@ fn filter_subjects_by_numeric_gt(
                 OType::XSD_INTEGER => all_integers || batch.o_key.get(i) > thr_i_key,
                 OType::XSD_DOUBLE => {
                     let k = batch.o_key.get(i);
-                    k > thr_d_key && k <= max_d_key
+                    double_keys.is_some_and(|(lo, hi)| lo <= k && k <= hi)
                 }
                 _ => false,
             };
