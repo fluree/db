@@ -939,7 +939,7 @@ impl crate::Fluree {
         if !purged_root {
             for mut record in branches {
                 record.storage_root = Some(entry.root.clone());
-                let (count, warnings) = self.drop_artifacts(&record.ledger_id, &record).await;
+                let (count, warnings) = self.drop_artifacts(&record.ledger_id, &record, None).await;
                 report.artifacts_deleted += count;
                 report.branch_reports.push(BranchDropReport {
                     ledger_id: record.ledger_id.to_string(),
@@ -1713,7 +1713,31 @@ impl crate::Fluree {
         // Branch path: only the per-branch artifacts. The rest of
         // `@shared/dicts/` stays — sibling/parent branches reference it — and
         // is wiped by `drop_ledger` once every branch is gone.
-        let (count, warnings) = self.drop_artifacts(ledger_id, record).await;
+        //
+        // Renewed while it runs, so housekeeping does not take a slow drop
+        // for a stopped one and resume it alongside.
+        let name = ledger_id.ledger_name();
+        let deleting =
+            self.drop_artifacts(ledger_id, record, record.fence.map(|fence| (&name, fence)));
+        let (count, warnings) = match (self.publisher(), record.fence) {
+            (Ok(store), Some(fence)) => crate::ledger::while_dropping_branch(
+                store,
+                &name,
+                ledger_id.branch(),
+                fence,
+                deleting,
+            )
+            .await
+            .unwrap_or_else(|| {
+                (
+                    0,
+                    vec![format!(
+                        "Stopped deleting '{ledger_id}': its drop was finished elsewhere"
+                    )],
+                )
+            }),
+            _ => deleting.await,
+        };
         report.artifacts_deleted += count;
         let complete = warnings.is_empty();
         report.warnings.extend(warnings);
@@ -1875,10 +1899,17 @@ impl crate::Fluree {
     ///   and deletes each individually.
     ///
     /// Returns `(count_deleted, warnings)`.
+    ///
+    /// `branch_drop`, the ledger name and fence of a branch drop deleting the
+    /// branch's own folder, makes it confirm before each subprefix that the
+    /// drop is still its own ([`lifecycle::branch_drop_under_way`]): one
+    /// finished elsewhere may have let the branch be created again in the
+    /// same folder, whose files are not this drop's to delete.
     pub(crate) async fn drop_artifacts(
         &self,
         ledger_id: &LedgerId,
         record: &fluree_db_nameservice::NsRecord,
+        branch_drop: Option<(&LedgerName, fluree_db_nameservice::Fence)>,
     ) -> (usize, Vec<String>) {
         let mut warnings = Vec::new();
         let namespace = record.storage_namespace();
@@ -1933,6 +1964,31 @@ impl crate::Fluree {
         let mut listing_errors: Vec<String> = Vec::new();
 
         for sub in &subprefixes {
+            if let Some((name, fence)) = branch_drop {
+                let under_way = match self.publisher() {
+                    Ok(store) => {
+                        lifecycle::branch_drop_under_way(store, name, ledger_id.branch(), fence)
+                            .await
+                            .map_err(ApiError::from)
+                    }
+                    Err(e) => Err(e),
+                };
+                match under_way {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warnings.push(format!(
+                            "Stopped deleting '{ledger_id}': its drop was finished elsewhere"
+                        ));
+                        return (total, warnings);
+                    }
+                    Err(e) => {
+                        warnings.push(format!(
+                            "Stopped deleting '{ledger_id}': could not confirm its drop is under way: {e}"
+                        ));
+                        return (total, warnings);
+                    }
+                }
+            }
             match storage.list_prefix(sub).await {
                 Ok(files) => {
                     any_listed = true;

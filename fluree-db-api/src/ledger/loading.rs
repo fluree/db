@@ -562,19 +562,95 @@ pub(crate) async fn while_claimed<F: std::future::Future>(
     pending: &mut PendingLedger,
     work: F,
 ) -> Option<F::Output> {
-    renewing_every(CLAIM_RENEW_INTERVAL, store, pending, work).await
+    renewing_every(CLAIM_RENEW_INTERVAL, ClaimRenewal { store, pending }, work).await
 }
 
-async fn renewing_every<F: std::future::Future>(
-    interval: std::time::Duration,
+/// Run `work`, a drop of `name`'s `branch` under `fence` deleting the
+/// branch's storage, while renewing the drop every [`CLAIM_RENEW_INTERVAL`],
+/// so housekeeping does not take it for stopped and resume it alongside.
+/// `None` when the drop was finished elsewhere: `work` is dropped
+/// unfinished, since the branch's folder may hold a branch created since.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn while_dropping_branch<F: std::future::Future>(
     store: &dyn crate::NameServicePublisher,
-    pending: &mut PendingLedger,
+    name: &fluree_db_core::LedgerName,
+    branch: &str,
+    fence: fluree_db_nameservice::Fence,
     work: F,
 ) -> Option<F::Output> {
-    // No timer runs in a browser, and nothing there rolls creates back.
+    let renewal = BranchDropRenewal {
+        store,
+        name,
+        branch,
+        fence,
+    };
+    renewing_every(CLAIM_RENEW_INTERVAL, renewal, work).await
+}
+
+/// What [`renewing_every`] renews. Nothing renews in a browser.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+trait Renewal {
+    /// Renew; `false` when the operation is no longer this caller's.
+    fn renew(
+        &mut self,
+    ) -> impl std::future::Future<Output = fluree_db_nameservice::Result<bool>> + Send;
+    /// The operation, for logging.
+    fn describe(&self) -> String;
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct ClaimRenewal<'a> {
+    store: &'a dyn crate::NameServicePublisher,
+    pending: &'a mut PendingLedger,
+}
+
+impl Renewal for ClaimRenewal<'_> {
+    fn renew(
+        &mut self,
+    ) -> impl std::future::Future<Output = fluree_db_nameservice::Result<bool>> + Send {
+        fluree_db_nameservice::lifecycle::renew_claim(self.store, self.pending)
+    }
+
+    fn describe(&self) -> String {
+        format!("the create of {}", self.pending.record.ledger_id)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct BranchDropRenewal<'a> {
+    store: &'a dyn crate::NameServicePublisher,
+    name: &'a fluree_db_core::LedgerName,
+    branch: &'a str,
+    fence: fluree_db_nameservice::Fence,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Renewal for BranchDropRenewal<'_> {
+    fn renew(
+        &mut self,
+    ) -> impl std::future::Future<Output = fluree_db_nameservice::Result<bool>> + Send {
+        fluree_db_nameservice::lifecycle::renew_branch_drop(
+            self.store,
+            self.name,
+            self.branch,
+            self.fence,
+        )
+    }
+
+    fn describe(&self) -> String {
+        format!("the drop of {}:{}", self.name, self.branch)
+    }
+}
+
+async fn renewing_every<F: std::future::Future, R: Renewal>(
+    interval: std::time::Duration,
+    mut renewal: R,
+    work: F,
+) -> Option<F::Output> {
+    // No timer runs in a browser, and nothing there resumes or rolls back.
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (interval, store, pending);
+        let _ = (interval, &mut renewal);
         Some(work.await)
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -586,19 +662,19 @@ async fn renewing_every<F: std::future::Future>(
             tokio::select! {
                 out = &mut work => return Some(out),
                 _ = renew.tick() => {
-                    match fluree_db_nameservice::lifecycle::renew_claim(store, pending).await {
+                    match renewal.renew().await {
                         Ok(true) => {}
                         Ok(false) => {
                             tracing::warn!(
-                                ledger = %pending.record.ledger_id,
-                                "a create's claim on the name was rolled back; stopping it"
+                                operation = %renewal.describe(),
+                                "finished or rolled back elsewhere; stopping it"
                             );
                             return None;
                         }
                         Err(e) => tracing::warn!(
-                            ledger = %pending.record.ledger_id,
+                            operation = %renewal.describe(),
                             error = %e,
-                            "could not renew a create's claim on the name; retrying"
+                            "could not renew; retrying"
                         ),
                     }
                 }
@@ -624,7 +700,7 @@ pub(crate) async fn claim_name(
 mod tests {
     use super::*;
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{lifecycle, LedgerRegistry};
+    use fluree_db_nameservice::{lifecycle, BranchRecordStore, LedgerRegistry};
     use std::time::Duration;
 
     async fn claimed(store: &MemoryNameService) -> PendingLedger {
@@ -646,7 +722,11 @@ mod tests {
         let before = version(&store).await;
 
         let work = tokio::time::sleep(Duration::from_millis(200));
-        let out = renewing_every(Duration::from_millis(20), &store, &mut pending, work).await;
+        let renewal = ClaimRenewal {
+            store: &store,
+            pending: &mut pending,
+        };
+        let out = renewing_every(Duration::from_millis(20), renewal, work).await;
         assert!(out.is_some());
         assert!(version(&store).await > before, "renewed");
         lifecycle::activate(&store, &pending)
@@ -665,10 +745,87 @@ mod tests {
             .unwrap()
             .expect("rolled back");
 
+        let renewal = ClaimRenewal {
+            store: &store,
+            pending: &mut pending,
+        };
         let out = renewing_every(
             Duration::from_millis(20),
-            &store,
-            &mut pending,
+            renewal,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(out.is_none());
+    }
+
+    /// A branch of `slow` dropped as far as deleting its storage: the
+    /// branch's fence.
+    async fn dropping_branch(store: &MemoryNameService) -> fluree_db_nameservice::Fence {
+        let name = fluree_db_core::LedgerName::parse("slow").unwrap();
+        lifecycle::create_ledger(store, &LedgerId::parse("slow:main").unwrap())
+            .await
+            .unwrap();
+        let dev = lifecycle::create_branch(store, &name, "dev", "main", None)
+            .await
+            .unwrap();
+        lifecycle::begin_drop_branch(store, &name, "dev")
+            .await
+            .unwrap();
+        dev.fence.unwrap()
+    }
+
+    /// A slow branch drop moves the binding while it deletes, so
+    /// housekeeping does not take it for stopped and resume it alongside.
+    #[tokio::test]
+    async fn a_branch_drop_is_renewed_while_it_deletes() {
+        let store = MemoryNameService::new();
+        let name = fluree_db_core::LedgerName::parse("slow").unwrap();
+        let fence = dropping_branch(&store).await;
+        let before = version(&store).await;
+
+        let renewal = BranchDropRenewal {
+            store: &store,
+            name: &name,
+            branch: "dev",
+            fence,
+        };
+        let work = tokio::time::sleep(Duration::from_millis(200));
+        assert!(renewing_every(Duration::from_millis(20), renewal, work)
+            .await
+            .is_some());
+        assert!(version(&store).await > before, "renewed");
+    }
+
+    /// A branch drop that another run finished stops deleting: the branch
+    /// may be listed again, under another fence, in the same folder.
+    #[tokio::test]
+    async fn a_branch_drop_finished_elsewhere_stops_the_work() {
+        let store = MemoryNameService::new();
+        let name = fluree_db_core::LedgerName::parse("slow").unwrap();
+        let fence = dropping_branch(&store).await;
+        let record = store
+            .raw_record("slow:dev")
+            .await
+            .unwrap()
+            .expect("frozen record");
+        lifecycle::finish_drop_branch(&store, &name, &record)
+            .await
+            .unwrap();
+        assert!(
+            !lifecycle::branch_drop_under_way(&store, &name, "dev", fence)
+                .await
+                .unwrap()
+        );
+
+        let renewal = BranchDropRenewal {
+            store: &store,
+            name: &name,
+            branch: "dev",
+            fence,
+        };
+        let out = renewing_every(
+            Duration::from_millis(20),
+            renewal,
             std::future::pending::<()>(),
         )
         .await;

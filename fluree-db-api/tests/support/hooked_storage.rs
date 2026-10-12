@@ -24,6 +24,9 @@ pub trait StorageHooks: Debug + Send + Sync + 'static {
 
     /// Runs after every successful write, with the address written.
     fn after_write(&self, _address: &str) {}
+
+    /// Runs before every listing of `prefix`.
+    async fn before_list(&self, _prefix: &str) {}
 }
 
 /// `MemoryStorage` that runs `H` around the operations it forwards.
@@ -92,6 +95,7 @@ impl<H: StorageHooks> StorageRead for HookedStorage<H> {
     }
 
     async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+        self.hooks.before_list(prefix).await;
         self.inner.list_prefix(prefix).await
     }
 
@@ -112,6 +116,7 @@ impl<H: StorageHooks> StorageRead for HookedStorage<H> {
         &self,
         prefix: &str,
     ) -> fluree_db_core::Result<Vec<RemoteObject>> {
+        self.hooks.before_list(prefix).await;
         self.inner.list_prefix_with_metadata(prefix).await
     }
 }

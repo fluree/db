@@ -1151,3 +1151,103 @@ async fn drop_branch_keeps_its_files_when_ledgers_cannot_be_listed() {
         "dropping again deletes the files"
     );
 }
+
+/// Pauses the first listing of a prefix ending in `suffix`, once armed,
+/// until resumed.
+#[derive(Debug)]
+struct PauseListing {
+    suffix: &'static str,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl crate::support::hooked_storage::StorageHooks for PauseListing {
+    async fn before_list(&self, prefix: &str) {
+        use std::sync::atomic::Ordering;
+        if prefix.ends_with(self.suffix) && self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+    }
+}
+
+/// A branch drop finished by another run while this one was still deleting
+/// leaves alone what the folder holds since: dropping the branch again
+/// finishes it, as housekeeping resuming a slow drop would, and the branch
+/// created again under its name reuses the folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_branch_drop_finished_elsewhere_spares_the_branch_created_since() {
+    use crate::support::hooked_storage::HookedStorage;
+    use fluree_db_api::{NameServiceMode, ReindexOptions};
+    use fluree_db_core::StorageRead;
+    use std::sync::Arc;
+
+    let storage = HookedStorage::new(PauseListing {
+        suffix: "/dev/txn/",
+        armed: false.into(),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let fluree = Arc::new(FlureeBuilder::memory().build_with(
+        storage.clone(),
+        NameServiceMode::ReadWrite(Arc::new(
+            fluree_db_nameservice::memory::MemoryNameService::new(),
+        )),
+    ));
+    let main = fluree.create_ledger("pause").await.expect("create");
+    let txn = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:v": 1});
+    fluree.insert(main, &txn).await.expect("insert");
+    fluree
+        .reindex("pause", ReindexOptions::default())
+        .await
+        .expect("reindex");
+    fluree
+        .create_branch("pause", "dev", None, None)
+        .await
+        .expect("create dev");
+    let namespace = fluree.storage_namespace("pause:dev").await.unwrap();
+    let dev_index = format!("fluree:memory://{}/index/", namespace.branch_prefix());
+
+    storage
+        .hooks()
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = tokio::spawn({
+        let fluree = Arc::clone(&fluree);
+        async move { fluree.drop_branch("pause", "dev").await }
+    });
+    storage.hooks().entered.notified().await;
+
+    fluree
+        .drop_branch("pause", "dev")
+        .await
+        .expect("the second run finishes the drop");
+    fluree
+        .create_branch("pause", "dev", None, None)
+        .await
+        .expect("dev again");
+    let recreated = storage.list_prefix(&dev_index).await.unwrap();
+    assert!(
+        !recreated.is_empty(),
+        "fixture: the new dev must have an index in the folder"
+    );
+
+    storage.hooks().resume.notify_one();
+    let report = first.await.unwrap().expect("first run");
+    assert_eq!(
+        storage.list_prefix(&dev_index).await.unwrap(),
+        recreated,
+        "the first run deleted the new dev's index"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("finished elsewhere")),
+        "{report:?}"
+    );
+    fluree.disconnect_ledger("pause:dev").await;
+    assert!(fluree.db("pause:dev").await.expect("dev loads").t > 0);
+}

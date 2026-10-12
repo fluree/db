@@ -662,6 +662,57 @@ async fn drop_branch_from<S: LifecycleStore + ?Sized>(
     Ok(Some(BranchDrop::Purge(Box::new(record))))
 }
 
+/// Renew a drop of `branch` under `fence` while it deletes the branch's
+/// storage, so the maintenance scan does not take it for stopped: the
+/// binding is written back unchanged, which moves its version. Returns
+/// `false` when the drop is no longer this one's to finish: a drop finished
+/// elsewhere unlisted the branch, and it may be listed again under another
+/// fence.
+pub async fn renew_branch_drop<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+    fence: Fence,
+) -> Result<bool> {
+    for _ in 0..MAX_ATTEMPTS {
+        let Some(Versioned { value, version }) = store.get_binding(name).await? else {
+            return Ok(false);
+        };
+        if !dropping_under(&value, branch, fence) {
+            return Ok(false);
+        }
+        if let RegistryCas::Updated { .. } =
+            store.cas_binding(name, Some(version), Some(&value)).await?
+        {
+            return Ok(true);
+        }
+    }
+    // Other writers kept moving the binding, which is all a renewal is for.
+    Ok(true)
+}
+
+/// Whether a drop of `branch` under `fence` is still the one under way: the
+/// binding lists the branch as dropped under that fence. A drop that finds
+/// it is not was finished elsewhere, and must delete nothing more: the
+/// branch's folder may already hold a branch created under its name since.
+pub async fn branch_drop_under_way<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    branch: &str,
+    fence: Fence,
+) -> Result<bool> {
+    Ok(store
+        .get_binding(name)
+        .await?
+        .is_some_and(|b| dropping_under(&b.value, branch, fence)))
+}
+
+fn dropping_under(binding: &NameBinding, branch: &str, fence: Fence) -> bool {
+    binding
+        .listing(branch)
+        .is_some_and(|l| l.dropped && l.fence == fence)
+}
+
 /// Forget a dropped branch once its storage is gone: take it out of the
 /// binding, then delete its record.
 ///
