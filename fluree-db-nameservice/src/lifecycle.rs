@@ -47,6 +47,55 @@ fn name_taken(name: &str, binding: Option<&NameBinding>) -> NameServiceError {
     }
 }
 
+/// [`LedgerRegistry::cas_binding`], reporting a write that landed as one. A
+/// write can take effect while its caller is told it failed: the response
+/// is lost and the write retried, and the retry finds the item already at
+/// the version it would have written, holding its own value, and reports a
+/// conflict. Versions never repeat for a key, so that value is this write,
+/// or another writer's identical one, which leaves the same state.
+async fn cas_binding<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &str,
+    expected: Option<u64>,
+    new: Option<&NameBinding>,
+) -> Result<RegistryCas<NameBinding>> {
+    let outcome = store.cas_binding(name, expected, new).await?;
+    Ok(settled(expected, new, outcome))
+}
+
+/// [`cas_binding`] for the dropped-ledger registry.
+async fn cas_dropped<S: LifecycleStore + ?Sized>(
+    store: &S,
+    instance: &InstanceId,
+    expected: Option<u64>,
+    new: Option<&DroppedLedger>,
+) -> Result<RegistryCas<DroppedLedger>> {
+    let outcome = store.cas_dropped(instance, expected, new).await?;
+    Ok(settled(expected, new, outcome))
+}
+
+/// `outcome`, with a conflict holding exactly `new` at the version a write
+/// expecting `expected` would have taken counted as that write.
+fn settled<T: PartialEq>(
+    expected: Option<u64>,
+    new: Option<&T>,
+    outcome: RegistryCas<T>,
+) -> RegistryCas<T> {
+    match (outcome, new) {
+        (
+            RegistryCas::Conflict {
+                actual: Some(actual),
+            },
+            Some(new),
+        ) if actual.value == *new && expected.is_none_or(|v| actual.version == v + 1) => {
+            RegistryCas::Updated {
+                version: Some(actual.version),
+            }
+        }
+        (outcome, _) => outcome,
+    }
+}
+
 /// Insert `record` for a binding the caller holds. A record already at the
 /// key with another fence is garbage while the caller's binding still lists
 /// the caller's fence, since that binding names the only fence the key can
@@ -119,7 +168,7 @@ pub async fn begin_create<S: LifecycleStore + ?Sized>(
         branches: vec![BranchFence::new(id.branch(), fence)],
     };
 
-    let version = match store.cas_binding(&name, None, Some(&binding)).await? {
+    let version = match cas_binding(store, &name, None, Some(&binding)).await? {
         RegistryCas::Updated { version: Some(v) } => v,
         RegistryCas::Updated { version: None } => {
             return Err(NameServiceError::storage(
@@ -154,6 +203,10 @@ pub async fn begin_create<S: LifecycleStore + ?Sized>(
 }
 
 /// Make a pending ledger visible.
+///
+/// A write reported failed may have landed: before an error is reported,
+/// the binding is read again, and the ledger counts as activated if it holds
+/// this create's binding, active.
 pub async fn activate<S: LifecycleStore + ?Sized>(
     store: &S,
     pending: &PendingLedger,
@@ -163,12 +216,15 @@ pub async fn activate<S: LifecycleStore + ?Sized>(
         state: BindingState::Active,
         ..pending.binding.clone()
     };
-    match store
-        .cas_binding(name, Some(pending.version), Some(&active))
-        .await?
-    {
-        RegistryCas::Updated { .. } => Ok(()),
-        RegistryCas::Conflict { .. } => Err(create_rolled_back(name)),
+    match cas_binding(store, name, Some(pending.version), Some(&active)).await {
+        Ok(RegistryCas::Updated { .. }) => Ok(()),
+        Ok(RegistryCas::Conflict { .. }) => Err(create_rolled_back(name)),
+        // The write may have landed with its response lost: a caller that
+        // rolls back on an error would delete a live ledger.
+        Err(e) => match store.get_binding(name).await {
+            Ok(Some(current)) if current.value == active => Ok(()),
+            _ => Err(e),
+        },
     }
 }
 
@@ -179,23 +235,28 @@ pub fn create_rolled_back(name: &str) -> NameServiceError {
     ))
 }
 
-/// Undo a pending ledger: delete its record, then its claim on the name.
-/// Storage is not touched; the caller deletes what it wrote.
+/// Undo a pending ledger: release its claim on the name, then delete its
+/// records. Storage is not touched; the caller deletes what it wrote, and
+/// only once this succeeds.
+///
+/// A claim that has moved on is not this create's to undo: the create may
+/// have been activated after all, its write reported failed, and its
+/// records and data are then a live ledger's. Nothing is deleted.
 pub async fn abandon<S: LifecycleStore + ?Sized>(store: &S, pending: &PendingLedger) -> Result<()> {
+    match cas_binding(store, &pending.record.name, Some(pending.version), None).await? {
+        RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: None } => {}
+        RegistryCas::Conflict { .. } => {
+            return Err(NameServiceError::conflict(format!(
+                "the name binding for '{}' changed while rolling back its create",
+                pending.record.name
+            )))
+        }
+    }
     for b in &pending.binding.branches {
         let id = LedgerId::from_parts(&pending.record.name, &b.branch)?;
         store.delete_record(&id, b.fence).await?;
     }
-    match store
-        .cas_binding(&pending.record.name, Some(pending.version), None)
-        .await?
-    {
-        RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: None } => Ok(()),
-        RegistryCas::Conflict { .. } => Err(NameServiceError::conflict(format!(
-            "the name binding for '{}' changed while rolling back its create",
-            pending.record.name
-        ))),
-    }
+    Ok(())
 }
 
 /// Renew a pending create's claim on its name, so the maintenance scan does
@@ -206,13 +267,13 @@ pub async fn renew_claim<S: LifecycleStore + ?Sized>(
     store: &S,
     pending: &mut PendingLedger,
 ) -> Result<bool> {
-    match store
-        .cas_binding(
-            &pending.record.name,
-            Some(pending.version),
-            Some(&pending.binding),
-        )
-        .await?
+    match cas_binding(
+        store,
+        &pending.record.name,
+        Some(pending.version),
+        Some(&pending.binding),
+    )
+    .await?
     {
         RegistryCas::Updated { version: Some(v) } => {
             pending.version = v;
@@ -242,7 +303,7 @@ pub async fn rollback_create<S: LifecycleStore + ?Sized>(
     if current.version != version || current.value.state != BindingState::Creating {
         return Ok(None);
     }
-    if let RegistryCas::Conflict { .. } = store.cas_binding(name, Some(version), None).await? {
+    if let RegistryCas::Conflict { .. } = cas_binding(store, name, Some(version), None).await? {
         return Ok(None);
     }
     for b in &current.value.branches {
@@ -333,7 +394,7 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
         next.branches.retain(|b| b.branch != new_branch);
         next.branches.push(listing.clone());
         if let RegistryCas::Updated { .. } =
-            store.cas_binding(name, Some(version), Some(&next)).await?
+            cas_binding(store, name, Some(version), Some(&next)).await?
         {
             listed = Some((listing.fence, source, binding.root));
             break;
@@ -392,7 +453,7 @@ async fn confirm_branch<S: LifecycleStore + ?Sized>(
             }
         }
         if let RegistryCas::Updated { .. } =
-            store.cas_binding(name, Some(version), Some(&next)).await?
+            cas_binding(store, name, Some(version), Some(&next)).await?
         {
             return Ok(());
         }
@@ -430,7 +491,7 @@ pub async fn rollback_branch_create<S: LifecycleStore + ?Sized>(
             let mut next = value;
             next.branches.retain(|b| b.branch != branch);
             if let RegistryCas::Conflict { .. } =
-                store.cas_binding(name, Some(version), Some(&next)).await?
+                cas_binding(store, name, Some(version), Some(&next)).await?
             {
                 continue;
             }
@@ -504,7 +565,8 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
             dropped: record.retracted,
             ..BranchFence::for_record(record, branch_fence)
         });
-        if let RegistryCas::Updated { .. } = store.cas_binding(&name, expected, Some(&next)).await?
+        if let RegistryCas::Updated { .. } =
+            cas_binding(store, &name, expected, Some(&next)).await?
         {
             fence = Some(branch_fence);
             break;
@@ -547,7 +609,7 @@ pub async fn unmirror_record<S: LifecycleStore + ?Sized>(
         let mut next = value;
         next.branches.retain(|b| b.branch != branch);
         let new = (!next.branches.is_empty()).then_some(&next);
-        if let RegistryCas::Updated { .. } = store.cas_binding(&name, Some(version), new).await? {
+        if let RegistryCas::Updated { .. } = cas_binding(store, &name, Some(version), new).await? {
             store.delete_record(ledger_id.as_ref(), fence).await?;
             return Ok(());
         }
@@ -637,7 +699,7 @@ async fn drop_branch_from<S: LifecycleStore + ?Sized>(
             b.dropped |= b.branch == branch;
         }
         if let RegistryCas::Updated { .. } =
-            store.cas_binding(name, Some(version), Some(&next)).await?
+            cas_binding(store, name, Some(version), Some(&next)).await?
         {
             marked = Some((next, listing.fence, false));
             break;
@@ -682,7 +744,7 @@ pub async fn renew_branch_drop<S: LifecycleStore + ?Sized>(
             return Ok(false);
         }
         if let RegistryCas::Updated { .. } =
-            store.cas_binding(name, Some(version), Some(&value)).await?
+            cas_binding(store, name, Some(version), Some(&value)).await?
         {
             return Ok(true);
         }
@@ -741,7 +803,7 @@ pub async fn finish_drop_branch<S: LifecycleStore + ?Sized>(
         let mut next = binding;
         next.branches.retain(|b| b.branch != record.branch);
         if let RegistryCas::Updated { .. } =
-            store.cas_binding(name, Some(version), Some(&next)).await?
+            cas_binding(store, name, Some(version), Some(&next)).await?
         {
             unlisted = Some(next);
             break;
@@ -848,9 +910,8 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
                         state: BindingState::Dropping { hard },
                         ..value
                     };
-                    if let RegistryCas::Updated { version: Some(v) } = store
-                        .cas_binding(name, Some(version), Some(&dropping))
-                        .await?
+                    if let RegistryCas::Updated { version: Some(v) } =
+                        cas_binding(store, name, Some(version), Some(&dropping)).await?
                     {
                         claimed = Some((dropping, v));
                         break;
@@ -905,10 +966,7 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     };
     let mut expected = None;
     let entry = loop {
-        match store
-            .cas_dropped(&binding.instance, expected, Some(&entry))
-            .await?
-        {
+        match cas_dropped(store, &binding.instance, expected, Some(&entry)).await? {
             RegistryCas::Updated { .. } => break entry,
             RegistryCas::Conflict {
                 actual: Some(existing),
@@ -931,7 +989,7 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     }
 
     // 5. Free the name.
-    match store.cas_binding(name, Some(version), None).await? {
+    match cas_binding(store, name, Some(version), None).await? {
         RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: None } => {}
         RegistryCas::Conflict { .. } => return Err(contended(name)),
     }
@@ -997,10 +1055,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
                 },
                 ..entry.clone()
             };
-            match store
-                .cas_dropped(instance, Some(version), Some(&restoring))
-                .await?
-            {
+            match cas_dropped(store, instance, Some(version), Some(&restoring)).await? {
                 RegistryCas::Updated { version: Some(v) } => (fences, v),
                 _ => return Err(contended(&entry.name)),
             }
@@ -1022,7 +1077,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
         state: BindingState::Restoring,
         branches: fences.clone(),
     };
-    let binding_version = match store.cas_binding(&entry.name, None, Some(&binding)).await? {
+    let binding_version = match cas_binding(store, &entry.name, None, Some(&binding)).await? {
         RegistryCas::Updated { version: Some(v) } => v,
         RegistryCas::Conflict {
             actual: Some(existing),
@@ -1031,7 +1086,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
             BindingState::Restoring => existing.version,
             // An interrupted attempt already made it visible.
             BindingState::Active => {
-                store.cas_dropped(instance, Some(version), None).await?;
+                cas_dropped(store, instance, Some(version), None).await?;
                 return restored_records(store, &entry.name, &existing.value)
                     .await
                     .map(Some);
@@ -1045,9 +1100,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
                 state: DroppedState::Dropped,
                 ..entry.clone()
             };
-            store
-                .cas_dropped(instance, Some(version), Some(&dropped))
-                .await?;
+            cas_dropped(store, instance, Some(version), Some(&dropped)).await?;
             return Err(NameServiceError::ledger_already_exists(entry.name.clone()));
         }
     };
@@ -1069,14 +1122,11 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
         state: BindingState::Active,
         ..binding
     };
-    match store
-        .cas_binding(&entry.name, Some(binding_version), Some(&active))
-        .await?
-    {
+    match cas_binding(store, &entry.name, Some(binding_version), Some(&active)).await? {
         RegistryCas::Updated { .. } => {}
         RegistryCas::Conflict { .. } => return Err(contended(&entry.name)),
     }
-    store.cas_dropped(instance, Some(version), None).await?;
+    cas_dropped(store, instance, Some(version), None).await?;
     Ok(Some(records))
 }
 
@@ -1125,10 +1175,7 @@ pub async fn begin_purge<S: LifecycleStore + ?Sized>(
                 state: DroppedState::Purging,
                 ..entry
             };
-            match store
-                .cas_dropped(instance, Some(version), Some(&purging))
-                .await?
-            {
+            match cas_dropped(store, instance, Some(version), Some(&purging)).await? {
                 RegistryCas::Updated { .. } => Ok(purging),
                 RegistryCas::Conflict { .. } => Err(contended(&purging.name)),
             }
@@ -1149,7 +1196,7 @@ pub async fn finish_purge<S: LifecycleStore + ?Sized>(
             "dropped ledger {instance} is not being purged"
         )));
     }
-    store.cas_dropped(instance, Some(version), None).await?;
+    cas_dropped(store, instance, Some(version), None).await?;
     Ok(())
 }
 
@@ -1318,7 +1365,7 @@ async fn bind_legacy<S: LifecycleStore + ?Sized>(
         state: BindingState::Active,
         branches,
     };
-    match store.cas_binding(name, None, Some(&binding)).await? {
+    match cas_binding(store, name, None, Some(&binding)).await? {
         RegistryCas::Updated { .. } => Ok(()),
         // An earlier attempt bound it, perhaps without a branch it had not
         // yet fenced then.
@@ -1334,10 +1381,7 @@ async fn bind_legacy<S: LifecycleStore + ?Sized>(
             if merged == existing.value {
                 return Ok(());
             }
-            match store
-                .cas_binding(name, Some(existing.version), Some(&merged))
-                .await?
-            {
+            match cas_binding(store, name, Some(existing.version), Some(&merged)).await? {
                 RegistryCas::Updated { .. } => Ok(()),
                 RegistryCas::Conflict { .. } => Err(contended(name)),
             }
@@ -1372,7 +1416,7 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
             })
             .collect(),
     };
-    match store.cas_dropped(&instance, None, Some(&entry)).await? {
+    match cas_dropped(store, &instance, None, Some(&entry)).await? {
         RegistryCas::Updated { .. } | RegistryCas::Conflict { actual: Some(_) } => {}
         RegistryCas::Conflict { actual: None } => return Err(contended(name)),
     }
@@ -1389,7 +1433,147 @@ async fn register_legacy_drop<S: LifecycleStore + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binding::{DroppedLedger, FenceOutcome, LedgerRegistry};
     use crate::memory::MemoryNameService;
+    use async_trait::async_trait;
+
+    /// Applies every write, but reports an error for the binding writes that
+    /// make a ledger active, as a store whose response was lost would.
+    #[derive(Debug)]
+    struct LostActivation(MemoryNameService);
+
+    #[async_trait]
+    impl LedgerRegistry for LostActivation {
+        async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
+            self.0.get_binding(name).await
+        }
+
+        async fn cas_binding(
+            &self,
+            name: &str,
+            expected: Option<u64>,
+            new: Option<&NameBinding>,
+        ) -> Result<RegistryCas<NameBinding>> {
+            let outcome = self.0.cas_binding(name, expected, new).await?;
+            if new.is_some_and(NameBinding::is_active) {
+                return Err(NameServiceError::storage("the response was lost"));
+            }
+            Ok(outcome)
+        }
+
+        async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
+            self.0.list_bindings().await
+        }
+
+        async fn get_dropped(
+            &self,
+            instance: &InstanceId,
+        ) -> Result<Option<Versioned<DroppedLedger>>> {
+            self.0.get_dropped(instance).await
+        }
+
+        async fn cas_dropped(
+            &self,
+            instance: &InstanceId,
+            expected: Option<u64>,
+            new: Option<&DroppedLedger>,
+        ) -> Result<RegistryCas<DroppedLedger>> {
+            self.0.cas_dropped(instance, expected, new).await
+        }
+
+        async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
+            self.0.list_dropped().await
+        }
+    }
+
+    #[async_trait]
+    impl BranchRecordStore for LostActivation {
+        async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+            self.0.raw_record(ledger_id).await
+        }
+
+        async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
+            self.0.all_raw_records().await
+        }
+
+        async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
+            self.0.insert_record(record).await
+        }
+
+        async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+            self.0.adopt_record(ledger_id, fence).await
+        }
+
+        async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+            self.0.freeze_record(ledger_id, fence).await
+        }
+
+        async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+            self.0.delete_record(ledger_id, fence).await
+        }
+    }
+
+    /// A write retried after it landed finds its own value at the version it
+    /// took, and counts as written rather than as a conflict.
+    #[tokio::test]
+    async fn a_write_that_already_landed_counts_as_written() {
+        let store = MemoryNameService::new();
+        let pending = begin_create(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        let active = NameBinding {
+            state: BindingState::Active,
+            ..pending.binding.clone()
+        };
+        let expected = Some(pending.version);
+        store
+            .cas_binding("mydb", expected, Some(&active))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cas_binding(&store, "mydb", expected, Some(&active)).await.unwrap(),
+            RegistryCas::Updated { version: Some(v) } if Some(v) == expected.map(|v| v + 1)
+        ));
+
+        let other = NameBinding {
+            root_branch: "other".into(),
+            ..active
+        };
+        assert!(matches!(
+            cas_binding(&store, "mydb", expected, Some(&other))
+                .await
+                .unwrap(),
+            RegistryCas::Conflict { .. }
+        ));
+    }
+
+    /// An activation that landed with its response lost is an activation:
+    /// a caller that rolled back on its error would delete a live ledger.
+    /// And a rollback of a create its claim has moved on from, as after
+    /// such an activation, deletes nothing.
+    #[tokio::test]
+    async fn an_activation_reported_failed_is_kept_when_it_landed() {
+        let store = LostActivation(MemoryNameService::new());
+        let pending = begin_create(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        activate(&store, &pending)
+            .await
+            .expect("the activation landed");
+
+        assert!(abandon(&store, &pending).await.is_err());
+        assert!(store
+            .get_binding("mydb")
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .is_active());
+        assert_eq!(
+            store.raw_record("mydb:main").await.unwrap().unwrap().fence,
+            pending.record.fence
+        );
+    }
 
     /// A ledger the migration cannot bind is skipped and reported, and every
     /// other is bound, including those after it in name order.

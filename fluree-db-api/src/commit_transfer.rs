@@ -2104,15 +2104,17 @@ impl Fluree {
                 .map_err(ApiError::from),
             Err(e) => Err(e),
         };
-        if let Err(e) = abandoned {
+        // A claim that could not be released may hold a live ledger: its
+        // data stays.
+        if let Err(e) = &abandoned {
             error!(
                 ledger = %pending.record.ledger_id,
                 error = %e,
-                "failed to release a failed restore's claim on the name"
+                "failed to release a failed restore's claim on the name; its data is kept"
             );
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(storage) = self.admin_storage() {
+        if let (Ok(()), Some(storage)) = (&abandoned, self.admin_storage()) {
             let mut report = crate::admin::DropReport::default();
             crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report).await;
             for warning in &report.warnings {

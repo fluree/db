@@ -3777,14 +3777,20 @@ where
         };
         if let (Err(_), Some(pending)) = (&pipeline_result, &pending) {
             // Release the claim, then delete what the import wrote: nothing
-            // references the instance once the claim is gone.
-            if let Err(e) = fluree_db_nameservice::lifecycle::abandon(nameservice, pending).await {
-                tracing::warn!(alias = %normalized_alias, error = %e, "failed to release a failed import's claim on the name");
-            }
-            let mut report = crate::admin::DropReport::default();
-            crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report).await;
-            for warning in &report.warnings {
-                tracing::warn!(alias = %normalized_alias, %warning, "a failed import's data left behind");
+            // references the instance once the claim is gone. A claim that
+            // could not be released may hold a live ledger: its data stays.
+            match fluree_db_nameservice::lifecycle::abandon(nameservice, pending).await {
+                Ok(()) => {
+                    let mut report = crate::admin::DropReport::default();
+                    crate::admin::purge_instance_root(storage, &pending.root, &[], &mut report)
+                        .await;
+                    for warning in &report.warnings {
+                        tracing::warn!(alias = %normalized_alias, %warning, "a failed import's data left behind");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(alias = %normalized_alias, error = %e, "failed to release a failed import's claim on the name; its data is kept");
+                }
             }
         }
 
