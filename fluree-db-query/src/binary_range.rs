@@ -336,7 +336,7 @@ impl BinaryRangeProvider {
     /// value).
     pub fn persisted_object_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
         let p_id = self.persisted_p_id(&flake.p)?;
-        self.persisted_object_key_in(g_id, p_id, flake)
+        self.persisted_object_key_in(g_id, Some(p_id), flake)
     }
 
     /// The persisted id of predicate `p`: `None` when no persisted row has it.
@@ -346,11 +346,13 @@ impl BinaryRangeProvider {
 
     /// [`Self::persisted_object_key`] for a flake whose predicate has the
     /// persisted id `p_id`, so a caller keying many objects of one predicate
-    /// resolves it once.
+    /// resolves it once. With no persisted predicate (`None`) only a big
+    /// number has no key: the others' keys do not depend on the predicate,
+    /// and queries over novelty key them under a runtime predicate id.
     pub fn persisted_object_key_in(
         &self,
         g_id: GraphId,
-        p_id: u32,
+        p_id: Option<u32>,
         flake: &Flake,
     ) -> Option<(u16, u64)> {
         let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
@@ -360,17 +362,10 @@ impl BinaryRangeProvider {
             lang,
             &self.store,
             None,
-            Some((g_id, p_id)),
+            p_id.map(|p_id| (g_id, p_id)),
         )
         .ok()
         .map(|(o_type, o_key)| (o_type.as_u16(), o_key))
-    }
-
-    /// Whether two different terms whose values are of `value`'s kind can
-    /// share a persisted key, so that storage, which merges ops by key, holds
-    /// them as one fact. See `binary_scan::key_may_merge_terms`.
-    pub fn key_may_merge_terms(value: &FlakeValue) -> bool {
-        crate::binary_scan::key_may_merge_terms(value)
     }
 }
 

@@ -724,30 +724,88 @@ async fn an_upsert_after_reverting_an_indexed_subtyped_big_integer_writes_it() {
     // assertion on the commit's revert metadata, a separate issue.
 }
 
-/// The same between two novelty ops. Storage keeps a `dateTime` to the
-/// microsecond, so a WHERE row decodes a nanosecond term stored in novelty
-/// to the microsecond, and the retraction the witnessed lane stages for it,
-/// as decoded, shares the term's index key while differing from it as a
-/// term. Reads merge the two by key and the resolver now agrees, so the
-/// upsert asserts the value again; but novelty's set-semantics dedup
-/// tracks facts by term, still holds the nanosecond term as asserted, and
-/// drops the assertion, so the value reads as gone.
-#[tokio::test]
-#[ignore = "novelty dedups a re-assertion by term after a retraction by key (follow-up)"]
-async fn an_upsert_after_a_delete_where_of_a_sub_microsecond_datetime_writes_it() {
-    let xsd_datetime = "http://www.w3.org/2001/XMLSchema#dateTime";
-    let at = |id: &str, v: &str| {
-        jsonld(json!({"@id": id, "ex:d": {"@value": v, "@type": xsd_datetime}}))
-    };
-    let doc = at("ex:s", "2020-01-01T00:00:00.123456789Z");
-    let mut h = Harness::new("key-datetime").await;
-    // Index the predicate, then write the value in novelty on top.
-    h.insert(&at("ex:other", "2020-01-01T00:00:00Z")).await;
+/// A value in novelty whose index key keeps less than its term: queries over
+/// novelty read it through the key, so the row a `DELETE WHERE` matches is
+/// the key's decode, not the stored term. Retracted as decoded, the row
+/// shares the term's key and storage drops the value, while novelty's
+/// set-semantics dedup, which compares terms, still held the stored term as
+/// asserted and dropped its re-assertion: the value read as gone. Such rows
+/// now read their slot and retract the stored term.
+///
+/// `seed` is indexed first, so the predicate (and for a big integer, the
+/// value's key) is in the index; `doc` is written in novelty on top, deleted
+/// through its WHERE row, and upserted again.
+async fn a_lossy_value_survives_its_delete_and_upsert(name: &str, seed: Payload, doc: Payload) {
+    a_lossy_value_survives(name, seed, doc, delete_where("ex:v")).await;
+}
+
+async fn a_lossy_value_survives(name: &str, seed: Payload, doc: Payload, delete: JsonValue) {
+    let mut h = Harness::new(name).await;
+    h.insert(&seed).await;
     h.reindex().await;
     h.insert(&doc).await;
-    h.update(&delete_where("ex:d")).await;
-    h.upsert_writes_it_again(&doc, "sub-microsecond DELETE WHERE")
-        .await;
+    h.update(&delete).await;
+    h.upsert_writes_it_again(&doc, name).await;
+}
+
+fn typed(id: &str, value: &str, dt: &str) -> Payload {
+    jsonld(json!({"@id": id, "ex:v": {"@value": value, "@type": dt}}))
+}
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+#[tokio::test]
+async fn a_sub_microsecond_datetime_survives_its_delete_and_upsert() {
+    let dt = format!("{XSD}dateTime");
+    a_lossy_value_survives_its_delete_and_upsert(
+        "lossy-datetime",
+        typed("ex:other", "2020-01-01T00:00:00Z", &dt),
+        typed("ex:s", "2020-01-01T00:00:00.123456789Z", &dt),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_sub_microsecond_time_survives_its_delete_and_upsert() {
+    let dt = format!("{XSD}time");
+    a_lossy_value_survives_its_delete_and_upsert(
+        "lossy-time",
+        typed("ex:other", "12:00:00", &dt),
+        typed("ex:s", "12:00:00.123456789", &dt),
+    )
+    .await;
+}
+
+/// The value is in the index already, under another subject, so a query
+/// keys the novelty term by it and reads it back as `xsd:integer`.
+#[tokio::test]
+async fn a_subtyped_big_integer_survives_its_delete_and_upsert() {
+    a_lossy_value_survives_its_delete_and_upsert(
+        "lossy-big-integer",
+        typed("ex:other", BIG, XSD_INTEGER),
+        typed("ex:s", BIG, XSD_NON_NEGATIVE),
+    )
+    .await;
+}
+
+/// A predicate the index does not have yet, matched by a WHERE that binds
+/// the predicate: the subject scan keys novelty under a runtime predicate
+/// id, so its row is the key's decode, and the resolver keys the stored
+/// term the same way.
+#[tokio::test]
+async fn a_sub_microsecond_datetime_of_a_new_predicate_survives_its_delete_and_upsert() {
+    let dt = format!("{XSD}dateTime");
+    a_lossy_value_survives(
+        "lossy-datetime-new-predicate",
+        jsonld(json!({"@id": "ex:other", "ex:u": "u"})),
+        typed("ex:s", "2020-01-01T00:00:00.123456789Z", &dt),
+        json!({
+            "@context": ctx(),
+            "where": {"@id": "ex:s", "?p": "?o"},
+            "delete": {"@id": "ex:s", "?p": "?o"}
+        }),
+    )
+    .await;
 }
 
 // =============================================================================

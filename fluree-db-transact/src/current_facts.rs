@@ -168,12 +168,29 @@ impl RetractIntent {
 /// persisted index recorded none (`Some(false)` is an exact observation by
 /// the indexer; `None`, a legacy root or a bulk import, proves nothing) and
 /// novelty holds none. Only [`ListFree::check`] makes one.
-pub(crate) struct ListFree(());
+pub(crate) struct ListFree {
+    /// Novelty holds a term whose index key keeps less than the term
+    /// ([`FlakeValue::index_key_loses_detail`](fluree_db_core::FlakeValue::index_key_loses_detail)):
+    /// a WHERE row of such a kind may be its decode rather than the stored
+    /// term.
+    lossy_terms: bool,
+}
 
 impl ListFree {
     pub(crate) fn check(ledger: &LedgerState) -> Option<ListFree> {
-        (ledger.snapshot.has_list_meta == Some(false) && !ledger.novelty.has_list_meta)
-            .then_some(ListFree(()))
+        (ledger.snapshot.has_list_meta == Some(false) && !ledger.novelty.has_list_meta).then(|| {
+            ListFree {
+                lossy_terms: ledger.novelty.has_lossy_index_terms,
+            }
+        })
+    }
+
+    /// Whether witnessed `row` is the stored fact it decodes, so it can be
+    /// retracted as decoded with no read: no list position can be stored,
+    /// and the row is not of a kind whose decode can differ from a stored
+    /// term novelty holds.
+    fn row_is_stored(&self, row: &Flake) -> bool {
+        !(self.lossy_terms && row.o.index_key_may_merge_terms())
     }
 }
 
@@ -182,8 +199,9 @@ impl ListFree {
 pub(crate) struct ResolveStats {
     /// Witnessed rows retracted as decoded, with no read.
     pub(crate) witnessed: usize,
-    /// Witnessed rows on a list-bearing ledger, matched to the stored fact
-    /// they decode.
+    /// Witnessed rows that read their slot, matched to the stored fact they
+    /// decode: on a list-bearing ledger, or of a kind whose decode may differ
+    /// from a term novelty holds.
     pub(crate) enriched: usize,
     /// Intents matched to a stored fact.
     pub(crate) matched: usize,
@@ -268,11 +286,12 @@ type IndexKey = (u16, u64);
 /// and from the term a query row carries for it, and an op on one term can
 /// retract a fact stored as another.
 ///
-/// Only the kinds [`BinaryRangeProvider::key_may_merge_terms`] names can do
-/// that; for every other kind one term is one key. Keys are computed for
-/// those kinds alone, so a slot of strings, IRIs or integers never pays for
-/// one. With no index there are no keys, and storage resolves novelty by
-/// term too.
+/// Only the kinds
+/// [`FlakeValue::index_key_may_merge_terms`](fluree_db_core::FlakeValue::index_key_may_merge_terms)
+/// names can do that; for every other kind one term is one key. Keys are
+/// computed for those kinds alone, so a slot of strings, IRIs or integers
+/// never pays for one. With no index there are no keys, and storage
+/// resolves novelty by term too.
 struct IndexKeys<'l> {
     provider: Option<&'l BinaryRangeProvider>,
 }
@@ -294,14 +313,14 @@ impl<'l> IndexKeys<'l> {
     }
 
     /// `f`'s index key in graph `g_id` under predicate `p_id` (`f.p`'s
-    /// persisted id), when its kind of value can share one with another term
-    /// and the index can key it. A value no persisted dictionary holds has
-    /// none: storage resolves it by term as well.
+    /// persisted id, if any), when its kind of value can share one with
+    /// another term and the index can key it. A value no persisted dictionary
+    /// holds has none: storage resolves it by term as well.
     fn key(&self, g_id: GraphId, p_id: Option<u32>, f: &Flake) -> Option<IndexKey> {
-        if !BinaryRangeProvider::key_may_merge_terms(&f.o) {
+        if !f.o.index_key_may_merge_terms() {
             return None;
         }
-        self.provider?.persisted_object_key_in(g_id, p_id?, f)
+        self.provider?.persisted_object_key_in(g_id, p_id, f)
     }
 
     /// Merge the ops of one read that share an index key, the way storage
@@ -315,7 +334,7 @@ impl<'l> IndexKeys<'l> {
         if self.provider.is_none()
             || !flakes
                 .iter()
-                .any(|f| f.t > index_t && BinaryRangeProvider::key_may_merge_terms(&f.o))
+                .any(|f| f.t > index_t && f.o.index_key_may_merge_terms())
         {
             return flakes;
         }
@@ -324,7 +343,7 @@ impl<'l> IndexKeys<'l> {
             let mut winner: HashMap<(&Sid, IndexKey, Option<i32>), usize> = HashMap::new();
             let mut dropped = vec![false; flakes.len()];
             for (n, f) in flakes.iter().enumerate() {
-                if !BinaryRangeProvider::key_may_merge_terms(&f.o) {
+                if !f.o.index_key_may_merge_terms() {
                     continue;
                 }
                 let p_id = *p_ids.entry(&f.p).or_insert_with(|| self.p_id(&f.p));
@@ -534,7 +553,10 @@ type SlotKey = (GraphId, Sid, Sid);
 /// at a time.
 ///
 /// - A witnessed row on a list-free ledger ([`ListFree`]) is retracted as
-///   decoded, with no read: the WHERE just matched that stored fact.
+///   decoded, with no read: the WHERE just matched that stored fact. Unless
+///   novelty holds a term its index key keeps less of, and the row is of a
+///   kind that can be such a term's decode: then the row reads its slot as
+///   on a list-bearing ledger, and names the stored term.
 /// - A witnessed row on a list-bearing ledger reads its slot for what a
 ///   WHERE binding does not carry, the list position. It is matched to the
 ///   stored facts its decode can be: those with the same index key when its
@@ -601,7 +623,12 @@ impl<'l> DeleteResolver<'l> {
         let mut out = Vec::with_capacity(intents.len());
         let mut pending = Vec::new();
         for intent in intents {
-            if intent.witnessed && self.list_free.is_some() {
+            if intent.witnessed
+                && self
+                    .list_free
+                    .as_ref()
+                    .is_some_and(|proof| proof.row_is_stored(&intent.flake))
+            {
                 stats.witnessed += 1;
                 out.push(Retraction(intent.flake));
             } else {
@@ -810,7 +837,7 @@ impl SlotFacts {
     /// `f`'s index key, when its kind of value can share one (see
     /// [`IndexKeys::key`]).
     fn key_of(&mut self, keys: &IndexKeys, f: &Flake) -> Option<IndexKey> {
-        if !BinaryRangeProvider::key_may_merge_terms(&f.o) {
+        if !f.o.index_key_may_merge_terms() {
             return None;
         }
         let p_id = self.p_id(keys);
