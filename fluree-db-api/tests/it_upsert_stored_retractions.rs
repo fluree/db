@@ -712,16 +712,8 @@ async fn an_upsert_after_reverting_an_indexed_subtyped_big_integer_writes_it() {
         .await
         .expect("revert");
     h.ledger = Some(h.fluree.ledger(&h.id).await.expect("reload"));
-    assert!(h.facts(None, "s").await.is_empty(), "the revert removed it");
-    let t = h.ledger().t();
-    let receipt = h.upsert(&big(XSD_NON_NEGATIVE)).await;
-    assert!(
-        receipt.t > t && receipt.assert_count == 1,
-        "the upsert writes the value again: {receipt:?}"
-    );
-    assert_eq!(h.facts(None, "s").await.len(), 1);
-    // No index build after it: one over a revert commit trips a debug
-    // assertion on the commit's revert metadata, a separate issue.
+    h.upsert_writes_it_again(&big(XSD_NON_NEGATIVE), "revert")
+        .await;
 }
 
 /// A value in novelty whose index key keeps less than its term: queries over

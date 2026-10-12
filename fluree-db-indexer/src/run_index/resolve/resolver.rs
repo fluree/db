@@ -48,14 +48,22 @@ fn checked_dt_id(dt_id: u32) -> Result<u16, String> {
         })
 }
 
-/// System-injected txn-meta predicates that legitimately live in a reserved
-/// namespace: `build_commit` strips any user-supplied claim for these and
-/// injects the system-controlled value (`f:identity` for provenance,
-/// `db:receivedAt` for the dual-stamp audit axis). They must flow through
-/// the resolver like ordinary entries so they stay queryable post-index.
+/// Txn-meta predicates that legitimately live in a reserved namespace:
+/// - injected by `build_commit`, which strips any user-supplied claim for
+///   them: `f:identity` (provenance) and `db:receivedAt` (the dual-stamp
+///   audit axis);
+/// - written by revert: `f:reverts`, one per reverted commit;
+/// - the user claims `extract_txn_meta` admits in that namespace:
+///   `f:message` and `f:author`.
+///
+/// They must flow through the resolver like ordinary entries so they stay
+/// queryable post-index.
 fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
     entry.predicate_ns == FLUREE_DB
-        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
+        && matches!(
+            entry.predicate_name.as_str(),
+            db::IDENTITY | db::RECEIVED_AT | db::REVERTS | db::MESSAGE | db::AUTHOR
+        )
 }
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
