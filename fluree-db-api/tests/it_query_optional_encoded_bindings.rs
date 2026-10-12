@@ -1597,7 +1597,9 @@ const LEDGER_B: &str = "it/two-ledgers-b:main";
 /// Paris in A, London in B.
 async fn two_ledgers() -> Fluree {
     let fluree = FlureeBuilder::memory().build_memory();
-    let seed = |ledger_id: &'static str, ttl: &'static str| {
+    // Each chunk is its own transaction, so namespace codes are allocated in
+    // this order.
+    let seed = |ledger_id: &'static str, chunks: &'static [&'static str]| {
         let fluree = &fluree;
         async move {
             fluree
@@ -1605,12 +1607,14 @@ async fn two_ledgers() -> Fluree {
                 .await
                 .expect("create ledger");
             let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
-            fluree
-                .stage(&handle)
-                .upsert_turtle(ttl)
-                .execute()
-                .await
-                .expect("seed");
+            for ttl in chunks {
+                fluree
+                    .stage(&handle)
+                    .upsert_turtle(ttl)
+                    .execute()
+                    .await
+                    .expect("seed");
+            }
             rebuild_and_publish_index(fluree, ledger_id).await;
             fluree.disconnect_ledger(ledger_id).await;
             let view = fluree
@@ -1620,43 +1624,55 @@ async fn two_ledgers() -> Fluree {
                 .snapshot()
                 .await;
             assert!(view.binary_store.is_some(), "{ledger_id}: indexed");
+            view.snapshot
+                .encode_iri("http://example.org/Code")
+                .expect("ex:Code encodes")
+                .namespace_code
         }
     };
-    seed(
+    let ex_in_a = seed(
         LEDGER_A,
-        r#"
-        @prefix other: <http://other.example/> .
-        @prefix ex: <http://example.org/> .
-        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
-        other:x other:p "first" .
-        ex:a ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
-             ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
-        ex:a2 ex:amount 2.5 .
-    "#,
+        &[
+            r#"@prefix other: <http://other.example/> . other:x other:p "first" ."#,
+            r#"
+            @prefix ex: <http://example.org/> .
+            @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+            ex:a ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
+                 ex:location "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+            ex:a2 ex:amount 2.5 .
+        "#,
+        ],
     )
     .await;
-    seed(
+    let ex_in_b = seed(
         LEDGER_B,
-        r#"
-        @prefix ex: <http://example.org/> .
-        @prefix geo: <http://www.opengis.net/ont/geosparql#> .
-        ex:b ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
-             ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral .
-        ex:c ex:label "chat"@en ; ex:code "A1" ; ex:amount 2.5 .
-    "#,
+        &[r#"
+            @prefix ex: <http://example.org/> .
+            @prefix geo: <http://www.opengis.net/ont/geosparql#> .
+            ex:b ex:label "chat"@fr ; ex:code "A1"^^ex:Code ; ex:amount 1.5 ;
+                 ex:location "POINT(-0.1276 51.5072)"^^geo:wktLiteral .
+            ex:c ex:label "chat"@en ; ex:code "A1" ; ex:amount 2.5 .
+        "#],
     )
     .await;
+    assert_ne!(ex_in_a, ex_in_b, "the ledgers code `ex:` differently");
     fluree
 }
 
 /// A SPARQL query through the connection (so `FROM` can name ledgers), its
-/// rows as [`jsonld_rows`] gives them.
+/// rows as [`jsonld_rows`] gives them. Formatted through ledger A, the primary
+/// of a `FROM <A> FROM <B>` query, or through B when A is not named.
 async fn connection_sparql_rows(fluree: &Fluree, query: &str) -> Result<Rows, String> {
     let result = fluree
         .query_connection_sparql(query)
         .await
         .map_err(|e| e.to_string())?;
-    let ledger = fluree.ledger(LEDGER_A).await.expect("ledger A");
+    let primary = if query.contains(&format!("<{LEDGER_A}>")) {
+        LEDGER_A
+    } else {
+        LEDGER_B
+    };
+    let ledger = fluree.ledger(primary).await.expect("ledger");
     let json = result
         .to_jsonld_async(ledger.as_graph_db_ref(0))
         .await
