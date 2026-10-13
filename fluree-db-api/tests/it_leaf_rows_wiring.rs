@@ -21,7 +21,7 @@ fn subjects(range: std::ops::Range<u32>) -> String {
 
 /// `(label, leaf count)` for every order of every graph in the root.
 async fn leaf_counts(fluree: &Fluree, ledger_id: &str, root: &ContentId) -> Vec<(String, usize)> {
-    let cs = fluree.content_store(ledger_id);
+    let cs = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
     let root = IndexRoot::decode(&cs.get(root).await.unwrap()).unwrap();
     let mut counts: Vec<(String, usize)> = root
         .default_graph_orders
