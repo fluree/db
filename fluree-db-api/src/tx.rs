@@ -933,7 +933,8 @@ pub(crate) async fn resolve_cross_ledger_schema_for_tx(
 /// Identity of the shape source a compiled-SHACL cache entry was built from.
 ///
 /// `CrossLedger` carries the wire origin — model ledger, graph, and the `t`
-/// the wire was materialized at. M's head advancing produces a new
+/// the wire was materialized at — and the model ledger's instance, since a
+/// model recreated under its name starts again at the same `t`. M's head advancing produces a new
 /// `resolved_t` (one cheap nameservice lookup per transaction detects this),
 /// which misses here and forces a recompile; an unchanged head reuses the
 /// already-translated, already-parsed shapes (including pre-parsed sh:sparql
@@ -944,6 +945,7 @@ enum CachedShapeSource {
     Local(Vec<GraphId>),
     CrossLedger {
         model_ledger_id: String,
+        model_instance: u128,
         graph_iri: String,
         resolved_t: i64,
     },
@@ -1195,6 +1197,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             {
                 let source = CachedShapeSource::CrossLedger {
                     model_ledger_id: wire.origin.model_ledger_id.clone(),
+                    model_instance: wire.model_instance,
                     graph_iri: wire.origin.graph_iri.clone(),
                     resolved_t: wire.origin.resolved_t,
                 };

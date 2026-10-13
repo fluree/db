@@ -319,6 +319,12 @@ impl SchemaArtifactWire {
 pub struct ShapesArtifactWire {
     /// Provenance for diagnostics and cache key derivation.
     pub origin: WireOrigin,
+    /// The model ledger's instance
+    /// ([`LedgerState::instance_bits`]),
+    /// 0 for one stored at its name. A model dropped and created again
+    /// under its name starts again at the same `t`, so `origin` alone does
+    /// not tell the two apart.
+    pub model_instance: u128,
     /// SHACL whitelist triples + rdf:list internals in the order
     /// the materializer read them from M.
     pub triples: Vec<WireTriple>,
