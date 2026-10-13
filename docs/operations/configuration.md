@@ -1016,6 +1016,7 @@ fluree server run \
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
 | `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
+| `FLUREE_REMOTE_LEAF_FETCH`              | How index leaves are read from remote storage (S3, HTTP). `whole` fetches a leaf in one request on first access, shared by concurrent readers and kept in the disk cache; `ranged` reads the header and directory, then byte ranges per leaflet, until the leaf is reopened or scanned | `whole` |
 | `FLUREE_ICEBERG_LOCAL_ROOTS`            | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem. Unset disables local-filesystem tables entirely | Unset (local tables disabled) |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |

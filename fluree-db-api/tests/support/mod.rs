@@ -350,6 +350,39 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("publish index");
 }
 
+/// Build the index incrementally over the published one and publish it, with
+/// no fallback to a full rebuild: the build fails if the incremental path
+/// does. For tests whose incremental lane must not quietly become a rebuild.
+#[cfg(feature = "native")]
+pub async fn build_incrementally_and_publish_index(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    assert!(
+        record.index_head_id.is_some(),
+        "an incremental build needs a published index"
+    );
+    let result = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.content_store(ledger_id),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("incremental index build should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
 // =============================================================================
 // Indexing helpers (native tests)
 // =============================================================================
