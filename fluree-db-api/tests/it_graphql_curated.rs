@@ -50,7 +50,7 @@ async fn error_of(fluree: &MemoryFluree, db: &GraphDb, query: &str) -> String {
 /// A ledger with three classes, shapes for each, and whatever curation is passed.
 async fn seeded(ledger_id: &str, curation: Option<JsonValue>) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree
         .insert(
             ledger,
@@ -225,7 +225,7 @@ async fn graphql_name_and_plural_name_rename_the_surface() {
 #[tokio::test]
 async fn an_abstract_class_becomes_a_queryable_interface() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "gql-cur-interface");
+    let ledger = genesis_ledger(&fluree, "gql-cur-interface").await;
     let ledger = fluree
         .insert(
             ledger,

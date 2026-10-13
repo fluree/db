@@ -431,7 +431,7 @@ async fn graph_payload_lanes_store_iris_the_json_ld_round_trip_refused() {
             "it/rdf-graph-iri-{}:main",
             lane.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
         );
-        let builder = fluree.stage_owned(genesis_ledger(&fluree, &id));
+        let builder = fluree.stage_owned(genesis_ledger(&fluree, &id).await);
         let builder = if lane.starts_with("sync") {
             builder.sync_graph_payload(graph, GraphPayload::Rdf(body), false)
         } else {
@@ -459,7 +459,7 @@ async fn a_synced_collection_keeps_its_order() {
     let g = "http://example.org/g";
     let body = "@prefix ex: <http://example.org/> .\nex:s ex:items ( \"b\" \"a\" \"b\" ) .\n";
     let result = fluree
-        .stage_owned(genesis_ledger(&fluree, "it/rdf-sync-list:main"))
+        .stage_owned(genesis_ledger(&fluree, "it/rdf-sync-list:main").await)
         .sync_graph_payload(
             GraphSel::Graph(g.to_string()),
             GraphPayload::Rdf(body),
@@ -497,7 +497,7 @@ async fn a_graph_synced_through_json_ld_resyncs_from_the_same_text_as_a_no_op() 
     let nodes = fluree_graph_turtle::parse_to_json(doc).expect("convert");
     let converted = json!({ "@graph": nodes });
     let first = fluree
-        .stage_owned(genesis_ledger(&fluree, id))
+        .stage_owned(genesis_ledger(&fluree, id).await)
         .sync_graph_payload(
             GraphSel::Graph(g.to_string()),
             GraphPayload::JsonLd(&converted),
@@ -563,7 +563,7 @@ async fn upsert_and_sync_store_what_insert_stores() {
     let fluree = memory();
     let inserted = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/rdf-parity-insert:main"),
+            genesis_ledger(&fluree, "it/rdf-parity-insert:main").await,
             PARITY_DOC,
         )
         .await
@@ -571,14 +571,14 @@ async fn upsert_and_sync_store_what_insert_stores() {
         .ledger;
     let upserted = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/rdf-parity-upsert:main"),
+            genesis_ledger(&fluree, "it/rdf-parity-upsert:main").await,
             PARITY_DOC,
         )
         .await
         .expect("upsert")
         .ledger;
     let synced = fluree
-        .stage_owned(genesis_ledger(&fluree, "it/rdf-parity-sync:main"))
+        .stage_owned(genesis_ledger(&fluree, "it/rdf-parity-sync:main").await)
         .sync_graph_payload(GraphSel::Default, GraphPayload::Rdf(PARITY_DOC), false)
         .execute()
         .await
@@ -603,7 +603,7 @@ async fn a_turtle_list_upsert_replaces_the_list_in_order() {
     let fluree = memory();
     let ledger = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/rdf-list-upsert:main"),
+            genesis_ledger(&fluree, "it/rdf-list-upsert:main").await,
             "@prefix ex: <http://example.org/> .\nex:s ex:items ( \"a\" \"b\" ) .\n",
         )
         .await
@@ -647,7 +647,7 @@ async fn the_config_recipe_upserts_as_written() {
          }}\n"
     );
     let result = fluree
-        .upsert_turtle(genesis_ledger(&fluree, id), &recipe)
+        .upsert_turtle(genesis_ledger(&fluree, id).await, &recipe)
         .await
         .expect("the recipe upserts");
     let stored = facts(&result.ledger, Some(&config)).await;
@@ -677,7 +677,8 @@ async fn a_ledger_id_in_a_graph_block_is_stored_as_written() {
     for (i, (g, lanes)) in cases.into_iter().enumerate() {
         let block = format!("GRAPH <{g}> {{ {statement} }}\n");
         for &lane in lanes {
-            let ledger = genesis_ledger(&fluree, &format!("it/rdf-ledger-id-{lane}-{i}:main"));
+            let ledger =
+                genesis_ledger(&fluree, &format!("it/rdf-ledger-id-{lane}-{i}:main")).await;
             let result = match lane {
                 "upsert" => fluree.upsert_turtle(ledger, &block).await.map(|r| r.ledger),
                 "insert" => fluree.insert_turtle(ledger, &block).await.map(|r| r.ledger),
@@ -705,7 +706,7 @@ async fn a_ledger_id_in_a_graph_block_is_stored_as_written() {
 
     let err = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/rdf-ledger-id-default:main"),
+            genesis_ledger(&fluree, "it/rdf-ledger-id-default:main").await,
             statement,
         )
         .await
@@ -718,7 +719,7 @@ async fn a_ledger_id_in_a_graph_block_is_stored_as_written() {
 
     let based = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/rdf-ledger-id-based:main"),
+            genesis_ledger(&fluree, "it/rdf-ledger-id-based:main").await,
             &format!("@base <http://b.org/> .\nGRAPH <cfg/local> {{ {statement} }}\n"),
         )
         .await
@@ -756,7 +757,7 @@ async fn upserting_the_same_document_again_commits_nothing() {
     let fluree = memory();
     let first = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/rdf-idempotent:main"),
+            genesis_ledger(&fluree, "it/rdf-idempotent:main").await,
             IDEMPOTENT_DOC,
         )
         .await
@@ -820,7 +821,7 @@ async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
     let fluree = memory();
     let v1 = "@prefix ex: <http://example.org/> .\nex:A ex:part [ ex:k \"v1\" ] .\n";
     let first = fluree
-        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans:main"), v1)
+        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans:main").await, v1)
         .await
         .expect("v1");
     let v2 = v1.replace("\"v1\"", "\"v2\"");
@@ -842,7 +843,10 @@ async fn the_documented_query_lists_the_blank_nodes_an_edit_left_behind() {
         "@prefix ex: <http://example.org/> .\nGRAPH <{g}> {{ ex:A ex:part [ ex:k \"v1\" ] . }}\n"
     );
     let first = fluree
-        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans-graph:main"), &v1)
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-orphans-graph:main").await,
+            &v1,
+        )
         .await
         .expect("v1 in a graph");
     let v2 = v1.replace("\"v1\"", "\"v2\"");
@@ -867,7 +871,10 @@ async fn the_documented_query_counts_references_from_other_graphs() {
                GRAPH <http://example.org/g1> { _:n ex:k \"described in g1\" . }\n\
                GRAPH <http://example.org/g2> { ex:A ex:part _:n , _:d . }\n";
     let r = fluree
-        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-orphans-across:main"), doc)
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-orphans-across:main").await,
+            doc,
+        )
         .await
         .expect("upsert");
     let default_orphans = select(&fluree, &r.ledger, ORPHANS_DEFAULT).await;
@@ -975,7 +982,7 @@ async fn the_raw_transaction_of_a_turtle_upsert_is_its_text() {
     let doc = "@prefix ex: <http://example.org/> .\nex:s ex:p ( 1 2 ) .\n";
     let result = fluree
         .upsert_turtle_with_opts(
-            genesis_ledger(&fluree, id),
+            genesis_ledger(&fluree, id).await,
             doc,
             TxnOpts::default().store_raw_txn(true),
             CommitOpts::default(),
@@ -983,7 +990,7 @@ async fn the_raw_transaction_of_a_turtle_upsert_is_its_text() {
         )
         .await
         .expect("upsert");
-    let store = fluree.content_store(id);
+    let store = fluree.content_store(&fluree.storage_namespace(id).await.unwrap());
     let commit = fluree_db_core::commit::codec::read_commit(
         &store
             .get(&result.receipt.commit_id)
@@ -1010,7 +1017,7 @@ async fn a_malformed_document_fails_as_a_turtle_parse_error() {
                GRAPH <http://example.org/g1> { ex:a ex:p 1 . }\n\
                GRAPH <http://example.org/g2> { ex:b ex:p ; }\n";
     let err = fluree
-        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-errors:main"), doc)
+        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-errors:main").await, doc)
         .await
         .map(|_| ())
         .expect_err("malformed");
@@ -1033,7 +1040,10 @@ async fn a_malformed_document_fails_as_a_turtle_parse_error() {
 
     let nested = "GRAPH <http://example.org/g> { GRAPH <http://example.org/h> { } }";
     let err = fluree
-        .upsert_turtle(genesis_ledger(&fluree, "it/rdf-errors-2:main"), nested)
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/rdf-errors-2:main").await,
+            nested,
+        )
         .await
         .map(|_| ())
         .expect_err("nested");
@@ -1062,7 +1072,7 @@ async fn rdf_text_writes_naming_urn_default_as_a_graph_are_refused() {
             "it/rdf-urn-default-{}:main",
             lane.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
         );
-        let builder = fluree.stage_owned(genesis_ledger(&fluree, &id));
+        let builder = fluree.stage_owned(genesis_ledger(&fluree, &id).await);
         let builder = match lane {
             "TriG insert" => builder.insert_turtle(body),
             "graph insert, TriG block" => {
@@ -1089,7 +1099,7 @@ async fn refusals_inside_a_block_are_the_user_s_errors() {
     let undefined = "GRAPH <http://example.org/g1> { nope:a <http://example.org/p> 1 . }";
     let err = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/rdf-block-errors:main"),
+            genesis_ledger(&fluree, "it/rdf-block-errors:main").await,
             undefined,
         )
         .await
@@ -1104,7 +1114,7 @@ async fn refusals_inside_a_block_are_the_user_s_errors() {
                     <https://ns.flur.ee/db#reifiesSubject> <http://example.org/evil> . }";
     let err = fluree
         .upsert_turtle(
-            genesis_ledger(&fluree, "it/rdf-block-errors-2:main"),
+            genesis_ledger(&fluree, "it/rdf-block-errors-2:main").await,
             reserved,
         )
         .await

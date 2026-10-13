@@ -36,7 +36,11 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admin;
 pub mod authorization;
+#[cfg(not(target_arch = "wasm32"))]
+mod housekeeping;
 pub use authorization::PolicyAuthorization;
+#[cfg(not(target_arch = "wasm32"))]
+pub use housekeeping::{HousekeepingOptions, ABANDONED_CREATE_AFTER};
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
@@ -134,9 +138,14 @@ pub use admin::{
     DropNamedGraphReport,
     DropReport,
     DropStatus,
+    DroppedData,
+    DroppedLedgerInfo,
+    DroppedLedgerState,
     GraphSourceDropReport,
     // Index maintenance
     IndexStatusResult,
+    OrphanInstance,
+    OrphanSweepReport,
     ReindexOptions,
     ReindexResult,
     SyncGraphOpts,
@@ -158,7 +167,6 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
-pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::VerifiedIdentity;
 pub use fluree_db_core::{
@@ -168,6 +176,7 @@ pub use fluree_db_core::{
 pub use fluree_db_core::{
     CommitId, ContentId, LedgerId, LedgerIdParseError, LedgerName, LedgerRef,
 };
+pub use fluree_db_core::{StorageNamespace, StorageRoot};
 pub use format::{
     sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
     QueryOutput,
@@ -179,8 +188,8 @@ pub use graph_commit_builder::{
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};
 pub use graph_snapshot::GraphSnapshot;
 pub use graph_source::{
-    Bm25CreateConfig, Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck, Bm25SyncResult,
-    FlureeIndexProvider, SnapshotSelection,
+    index_is_suspended, Bm25CreateConfig, Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck,
+    Bm25SyncResult, FlureeIndexProvider, SnapshotSelection,
 };
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 #[cfg(not(target_arch = "wasm32"))]
@@ -343,7 +352,7 @@ pub use fluree_db_ledger::{
 };
 pub use fluree_db_nameservice::{
     BranchLifecycle, ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue,
-    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService, LedgerLifecycle,
+    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService,
     NameServiceLookup, NsRecord, Publisher,
 };
 pub use fluree_db_novelty::Novelty;
@@ -611,15 +620,6 @@ impl NameServiceMode {
         }
     }
 
-    /// Get the ledger-admin surface ([`LedgerLifecycle`] — init,
-    /// retract, purge). `None` for [`Self::ReadOnly`].
-    pub fn ledger_admin(&self) -> Option<&dyn LedgerLifecycle> {
-        match self {
-            Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::ReadOnly(_) => None,
-        }
-    }
-
     /// Get the branch-admin surface ([`BranchLifecycle`] —
     /// create_branch, drop_branch, reset_head). `None` for
     /// [`Self::ReadOnly`].
@@ -730,7 +730,7 @@ impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
 // NOTE: `NameServiceMode` deliberately does NOT implement any of the
 // write traits (`GraphSourcePublisher`, `AdminPublisher`,
 // `ConfigPublisher`, `StatusPublisher`, `RefPublisher`,
-// `LedgerLifecycle`, `CommitPublisher`, `IndexPublisher`). The
+// `CommitPublisher`, `IndexPublisher`). The
 // `ReadOnly` variant has no writer to call, so any such impl would
 // have to fake the contract by returning an error on every call —
 // a runtime check for what is a compile-time guarantee, and a
@@ -927,16 +927,31 @@ where
         }
     }
 
+    /// A prefix naming commit or txn blobs lists the commit tier. Any other
+    /// prefix (a ledger's root, the whole store) can match blobs on both, so
+    /// both are listed, each keeping only the addresses it serves.
     async fn list_prefix(
         &self,
         prefix: &str,
     ) -> std::result::Result<Vec<String>, fluree_db_core::Error> {
-        // Route based on prefix - commit/txn prefixes go to commit storage
         if Self::route_to_commit(prefix) {
-            self.commit.list_prefix(prefix).await
-        } else {
-            self.index.list_prefix(prefix).await
+            return self.commit.list_prefix(prefix).await;
         }
+        let mut listed: Vec<String> = self
+            .commit
+            .list_prefix(prefix)
+            .await?
+            .into_iter()
+            .filter(|address| Self::route_to_commit(address))
+            .collect();
+        listed.extend(
+            self.index
+                .list_prefix(prefix)
+                .await?
+                .into_iter()
+                .filter(|address| !Self::route_to_commit(address)),
+        );
+        Ok(listed)
     }
 }
 
@@ -989,7 +1004,7 @@ where
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
@@ -997,12 +1012,12 @@ where
         match kind {
             ContentKind::Commit | ContentKind::Txn => {
                 self.commit
-                    .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                    .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
                     .await
             }
             _ => {
                 self.index
-                    .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                    .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
                     .await
             }
         }
@@ -1011,17 +1026,17 @@ where
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
         // Commit blobs + txn blobs go to commit storage.
         match kind {
             ContentKind::Commit | ContentKind::Txn => {
                 self.commit
-                    .content_write_bytes(kind, ledger_id, bytes)
+                    .content_write_bytes(kind, namespace, bytes)
                     .await
             }
-            _ => self.index.content_write_bytes(kind, ledger_id, bytes).await,
+            _ => self.index.content_write_bytes(kind, namespace, bytes).await,
         }
     }
 }
@@ -1207,23 +1222,23 @@ impl ContentAddressedWrite for AddressIdentifierResolverStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
         self.default
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await
     }
 
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> std::result::Result<ContentWriteResult, fluree_db_core::Error> {
         self.default
-            .content_write_bytes(kind, ledger_id, bytes)
+            .content_write_bytes(kind, namespace, bytes)
             .await
     }
 }
@@ -1665,7 +1680,19 @@ pub fn spawn_local_cache_event_listener(
                 }) => {
                     reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
-                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
+                // A branch shown again, or under a new ledger: a cached state
+                // of an earlier one is reloaded.
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerCreated {
+                    ledger_id, ..
+                }) => {
+                    if let Ok(id) = LedgerId::parse(&ledger_id) {
+                        ledger_manager.forget_root(&id);
+                    }
+                    reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted {
+                    ledger_id, ..
+                }) => {
                     ledger_manager.disconnect(&ledger_id).await;
                     tracing::debug!(
                         alias = %ledger_id,
@@ -1689,6 +1716,7 @@ pub fn spawn_local_cache_event_listener(
                     // this could re-trigger Lagged. Not observed in
                     // practice; revisit with a bound or a provably-behind
                     // scope only if it proves to arise.
+                    ledger_manager.forget_roots();
                     let aliases = ledger_manager.cached_aliases().await;
                     tracing::warn!(
                         skipped,
@@ -2503,7 +2531,10 @@ impl FlureeBuilder {
     pub fn build(mut self) -> Result<Fluree> {
         let storage = self.open_file_storage()?;
         storage.recover_wal()?;
-        Ok(self.build_file(storage))
+        // A store from before name bindings moves to the current format.
+        let nameservice = FileNameService::with_storage(storage.clone());
+        nameservice.migrate_blocking()?;
+        Ok(self.build_file(storage, nameservice))
     }
 
     /// Build a file-backed Fluree instance, recovering the storage root's WAL
@@ -2514,7 +2545,9 @@ impl FlureeBuilder {
     pub async fn build_async(mut self) -> Result<Fluree> {
         let storage = self.open_file_storage()?;
         storage.recover_wal_async().await?;
-        Ok(self.build_file(storage))
+        let nameservice = FileNameService::with_storage(storage.clone());
+        Box::pin(nameservice.migrate()).await?;
+        Ok(self.build_file(storage, nameservice))
     }
 
     /// Takes the builder's storage path and opens its file storage.
@@ -2533,10 +2566,10 @@ impl FlureeBuilder {
         Ok(storage)
     }
 
-    /// Assembles a file-backed instance over `storage`, whose WAL is already recovered.
+    /// Assembles a file-backed instance over `storage`, whose WAL is already
+    /// recovered, and its `nameservice`, already in the current format.
     #[cfg(feature = "native")]
-    fn build_file(self, storage: FileStorage) -> Fluree {
-        let nameservice = FileNameService::with_storage(storage.clone());
+    fn build_file(self, storage: FileStorage, nameservice: FileNameService) -> Fluree {
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
@@ -2855,6 +2888,7 @@ impl FlureeBuilder {
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
+        Box::pin(nameservice.migrate()).await?;
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
@@ -2936,6 +2970,7 @@ impl FlureeBuilder {
             .ensure_table()
             .await
             .map_err(|e| ApiError::config(format!("Failed to ensure DynamoDB table: {e}")))?;
+        Box::pin(dynamo_ns.migrate()).await?;
 
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -3358,6 +3393,7 @@ impl FlureeBuilder {
                 Some(ns) => (ns, tx::IndexingMode::Disabled),
                 None => {
                     let ns = FileNameService::with_storage(ns_storage);
+                    ns.migrate_blocking()?;
                     let notifying =
                         fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
                     let indexing_mode =
@@ -3503,10 +3539,10 @@ pub struct Fluree {
     leaflet_cache: std::sync::Arc<fluree_db_binary_index::LeafletCache>,
     /// Per-instance cache for resolved cross-ledger governance
     /// artifacts (`f:policySource` from a model ledger, etc.). Keyed
-    /// on `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)`
+    /// on `(ArtifactKind, model_ledger_id, graph_iri, model head)`
     /// so a single entry is reusable across every data ledger on
     /// this instance that references the same model graph at the
-    /// same model `t`.
+    /// same model head commit.
     governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,
@@ -3712,15 +3748,6 @@ impl Fluree {
             .ok_or_else(|| ApiError::internal("write operations require a read-write nameservice"))
     }
 
-    /// Get the ledger-admin write surface ([`LedgerLifecycle`] —
-    /// init, retract, purge). Available from both `ReadWrite` and
-    /// `Replicated` nameservices; errors only from `ReadOnly` proxies.
-    pub fn ledger_admin(&self) -> Result<&dyn LedgerLifecycle> {
-        self.nameservice_mode
-            .ledger_admin()
-            .ok_or_else(|| ApiError::internal("ledger admin requires a writable nameservice"))
-    }
-
     /// Get the branch-admin write surface ([`BranchLifecycle`] —
     /// create_branch, drop_branch, reset_head). Available from both
     /// `ReadWrite` and `Replicated` nameservices.
@@ -3758,9 +3785,31 @@ impl Fluree {
         &self.backend
     }
 
-    /// Get a content store scoped to the given namespace/ledger ID.
-    pub fn content_store(&self, namespace_id: &str) -> Arc<dyn ContentStore> {
-        self.backend.content_store(namespace_id)
+    /// Get a content store scoped to one branch's storage namespace.
+    ///
+    /// Take the namespace from the branch's nameservice record
+    /// ([`NsRecord::storage_namespace`](fluree_db_nameservice::NsRecord::storage_namespace))
+    /// or loaded state ([`LedgerState::storage_namespace`]); a ledger id alone
+    /// does not say where its artifacts live.
+    pub fn content_store(&self, namespace: &StorageNamespace) -> Arc<dyn ContentStore> {
+        self.backend.content_store(namespace)
+    }
+
+    /// Where `ledger_id`'s artifacts live, from its nameservice record.
+    pub async fn storage_namespace(&self, ledger_id: &str) -> Result<StorageNamespace> {
+        Ok(self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?
+            .storage_namespace())
+    }
+
+    /// Get a content store for a graph source's artifacts, which always live
+    /// under its own id.
+    pub fn graph_source_store(&self, graph_source_id: &str) -> Result<Arc<dyn ContentStore>> {
+        let namespace = StorageNamespace::parse_graph_source(graph_source_id)?;
+        Ok(self.backend.content_store(&namespace))
     }
 
     /// Get a content store for `ledger_id` that walks branch ancestry on
@@ -3786,8 +3835,7 @@ impl Fluree {
     }
 
     /// Resolve a content store from an `Option<NsRecord>`, falling back
-    /// to the flat namespace store keyed by `fallback_id` when no record
-    /// is present.
+    /// to the flat store for `fallback` when no record is present.
     ///
     /// This collapses the recurring `match record { Some(...) => ..., None
     /// => ... }` pattern at every site that wants a branch-aware store
@@ -3795,13 +3843,13 @@ impl Fluree {
     pub(crate) async fn content_store_for_record_or_id(
         &self,
         record: Option<&fluree_db_nameservice::NsRecord>,
-        fallback_id: &str,
+        fallback: &StorageNamespace,
     ) -> Result<Arc<dyn ContentStore>> {
         Ok(fluree_db_nameservice::content_store_for_record_or_id(
             &self.backend,
             self.nameservice_mode.reader(),
             record,
-            fallback_id,
+            fallback,
         )
         .await?)
     }
@@ -4840,12 +4888,14 @@ impl Fluree {
     ///
     /// # Returns
     ///
-    /// - `Ok(None)` - Nameservice lookup returned no record (ledger doesn't exist)
+    /// - `Ok(None)` - Nameservice lookup returned no record (ledger doesn't
+    ///   exist); a cached state of it is removed
     /// - `Ok(Some(NotifyResult::NotLoaded))` - Record exists but ledger not cached
     /// - `Ok(Some(NotifyResult::Current))` - Ledger is already up to date
     /// - `Ok(Some(NotifyResult::IndexUpdated))` - Index was refreshed incrementally
     /// - `Ok(Some(NotifyResult::CommitsApplied { count }))` - Commits applied incrementally
-    /// - `Ok(Some(NotifyResult::Reloaded))` - Full reload was performed
+    /// - `Ok(Some(NotifyResult::Reloaded))` - Full reload was performed, as
+    ///   when the record belongs to a ledger created under the name since
     ///
     /// # Use Cases
     ///
@@ -4908,22 +4958,16 @@ impl Fluree {
 
         let ledger_id = LedgerId::parse(ledger_id)?;
 
-        // Fast path: if min_t is set, check current cached t before hitting NS
-        if let Some(min_t) = opts.min_t {
-            if let Some(current_t) = mgr.current_t(&ledger_id).await {
-                if current_t >= min_t {
-                    return Ok(Some(RefreshResult {
-                        t: current_t,
-                        action: NotifyResult::Current,
-                    }));
-                }
-            }
-        }
-
-        // Step B: Lookup nameservice record
+        // Step B: Lookup nameservice record. Always, even when the cached `t`
+        // already meets `min_t`: a ledger created under the name since starts
+        // again at `t` 1, so only the record tells the two apart.
         let ns_record = match self.nameservice().lookup(&ledger_id).await? {
             Some(record) => record,
-            None => return Ok(None), // Ledger doesn't exist in nameservice
+            // Gone, or never there: a cached state of it must not outlive it.
+            None => {
+                mgr.disconnect(&ledger_id).await;
+                return Ok(None);
+            }
         };
         // Step C: Use NsRecord.ledger_id as the cache key
         let canonical_alias = ns_record.ledger_id.clone();
@@ -5262,13 +5306,24 @@ impl Fluree {
             .lookup(ledger_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+        self.push_default_context(&record, context).await
+    }
+
+    /// [`Self::set_default_context`] for the branch `record` describes,
+    /// which need not be visible yet.
+    pub(crate) async fn push_default_context(
+        &self,
+        record: &NsRecord,
+        context: &serde_json::Value,
+    ) -> Result<SetContextResult> {
         let canonical_id = &record.ledger_id;
+        let namespace = record.storage_namespace();
 
         // Serialize and write context blob to CAS
         let context_bytes = serde_json::to_vec(context)
             .map_err(|e| ApiError::internal(format!("failed to serialize context: {e}")))?;
 
-        let cs = self.content_store(canonical_id);
+        let cs = self.content_store(&namespace);
         let new_cid = cs
             .put(ContentKind::LedgerConfig, &context_bytes)
             .await
@@ -5296,7 +5351,12 @@ impl Fluree {
 
             match self
                 .publisher()?
-                .push_config(canonical_id, current_config.as_ref(), &new_config)
+                .push_config_fenced(
+                    canonical_id,
+                    record.fence,
+                    current_config.as_ref(),
+                    &new_config,
+                )
                 .await?
             {
                 ConfigCasResult::Updated => {
@@ -5309,7 +5369,7 @@ impl Fluree {
                     // GC old blob if CID changed.
                     if let Some(old) = old_cid {
                         if old != new_cid {
-                            let cs = self.content_store(canonical_id);
+                            let cs = self.content_store(&namespace);
                             if let Err(e) = cs.release(&old).await {
                                 tracing::debug!(
                                     %e,
@@ -5337,7 +5397,7 @@ impl Fluree {
         }
 
         // All retries exhausted — best-effort GC the orphan blob we wrote.
-        let cs = self.content_store(canonical_id);
+        let cs = self.content_store(&namespace);
         if let Err(e) = cs.release(&new_cid).await {
             tracing::debug!(
                 %e,
@@ -5370,6 +5430,7 @@ pub fn fluree_memory() -> Fluree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_nameservice::testing::CurrentFence;
 
     #[tokio::test]
     async fn test_fluree_builder_memory() {
@@ -5692,9 +5753,11 @@ mod tests {
         let cid = ContentId::new(ContentKind::Commit, b"commit-1");
 
         // Publish a record to nameservice directly (without caching the ledger)
-        fluree
-            .publisher()
-            .unwrap()
+        let publisher = fluree.publisher().unwrap();
+        fluree_db_nameservice::testing::create(publisher, "mydb:main")
+            .await
+            .unwrap();
+        publisher
             .publish_commit("mydb:main", 5, &cid)
             .await
             .unwrap();
@@ -5730,9 +5793,11 @@ mod tests {
         let cid = ContentId::new(ContentKind::Commit, b"commit-1");
 
         // Publish with canonical alias
-        fluree
-            .publisher()
-            .unwrap()
+        let publisher = fluree.publisher().unwrap();
+        fluree_db_nameservice::testing::create(publisher, "mydb:main")
+            .await
+            .unwrap();
+        publisher
             .publish_commit("mydb:main", 5, &cid)
             .await
             .unwrap();

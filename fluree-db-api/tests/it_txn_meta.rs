@@ -54,7 +54,7 @@ async fn test_jsonld_txn_meta_basic() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Envelope-form with top-level metadata
             let tx = json!({
@@ -141,7 +141,7 @@ async fn test_jsonld_single_object_no_meta() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Single-object form - all properties are DATA, not metadata
             let tx = json!({
@@ -220,7 +220,7 @@ async fn test_jsonld_txn_meta_all_value_types() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let tx = json!({
                 "@context": {
@@ -347,7 +347,7 @@ async fn test_jsonld_txn_meta_reject_nested_object() {
         .build_memory();
     let ledger_id = "it/txn-meta-nested:main";
 
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -376,7 +376,7 @@ async fn test_jsonld_txn_meta_reject_null() {
         .build_memory();
     let ledger_id = "it/txn-meta-null:main";
 
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let tx = json!({
         "@context": {"ex": "http://example.org/"},
@@ -417,7 +417,7 @@ async fn test_txn_meta_queryable_after_indexing() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Use same pattern as working test
             let tx = json!({
@@ -496,7 +496,7 @@ async fn test_trig_txn_meta_basic() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // TriG format with GRAPH block for txn-meta
             let turtle = r#"
@@ -584,7 +584,7 @@ async fn test_trig_no_graph_passthrough() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Plain Turtle without GRAPH block
             let turtle = r#"
@@ -646,7 +646,7 @@ async fn test_txn_meta_multiple_commits() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // First commit: metadata with "batch-1"
             let tx1 = json!({
@@ -752,7 +752,7 @@ async fn test_txn_meta_time_travel_syntax() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Commit with metadata
             let tx = json!({
@@ -834,7 +834,7 @@ async fn test_sparql_graph_pattern_txn_meta() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Commit with metadata
             let tx = json!({
@@ -930,7 +930,7 @@ async fn test_txn_meta_time_travel_filtering() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // First commit with batch-1
             let tx1 = json!({
@@ -1064,7 +1064,7 @@ async fn test_commit_stats_available_in_novelty_before_indexing() {
         .build_memory();
     let ledger_id = "it/txn-meta-stats-novelty:main";
 
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Insert data (no indexing triggered)
     let tx = json!({
@@ -1161,7 +1161,7 @@ async fn test_commit_stats_survive_indexing() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // First commit
             let tx1 = json!({
@@ -1242,7 +1242,7 @@ async fn test_insert_with_txn_meta_preserves_graph_data() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Envelope-form: @graph items + top-level txn metadata
             let tx = json!({
@@ -1348,7 +1348,7 @@ async fn test_upsert_with_txn_meta_preserves_graph_data() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // First insert some data
             let tx1 = json!({
@@ -1425,7 +1425,7 @@ async fn test_insert_with_id_and_graph_and_txn_meta() {
     local
         .run_until(async move {
             // ── Part 1: @id + @graph + txn-meta (named graph form) ──────────
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let tx_with_id = json!({
                 "@context": {
@@ -1482,7 +1482,7 @@ async fn test_insert_with_id_and_graph_and_txn_meta() {
             // Same data but without @id: the envelope heuristic kicks in and
             // @graph data IS inserted into the default graph.
             let ledger2_id = "it/txn-meta-no-id-graph:main";
-            let ledger2 = genesis_ledger(&fluree, ledger2_id);
+            let ledger2 = genesis_ledger(&fluree, ledger2_id).await;
 
             let tx_no_id = json!({
                 "@context": {
@@ -1565,7 +1565,7 @@ async fn test_txn_meta_full_iri_in_from() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Insert with envelope-form metadata
             let tx = json!({
@@ -1647,7 +1647,7 @@ async fn test_commit_opts_identity_and_user_claims_in_txn_meta() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/txn-meta-commit-opts:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // f:message and f:author flow through the transaction body as ordinary
     // user txn-meta. Only identity is system-set.
@@ -1752,7 +1752,7 @@ async fn test_user_supplied_f_message_and_f_author_accepted() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/txn-meta-user-claims:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let data = json!({
         "@context": {
@@ -1821,7 +1821,7 @@ async fn test_user_supplied_f_message_and_f_author_accepted() {
 async fn test_user_supplied_f_identity_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/txn-meta-reject-identity:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let data = json!({
         "@context": {
@@ -1852,7 +1852,7 @@ async fn test_txn_meta_sidecar_on_update() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/txn-meta-sidecar-update:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed a row to update.
     let seed = json!({
@@ -1933,7 +1933,7 @@ async fn test_txn_meta_sidecar_on_update() {
 async fn test_txn_meta_sidecar_rejects_f_identity() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/txn-meta-sidecar-reject-id:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let data = json!({
         "@context": {

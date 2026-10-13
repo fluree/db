@@ -1,7 +1,7 @@
 //! Integration tests for `Fluree::refresh()` with `min_t` support.
 //!
 //! Verifies:
-//! - Fast path: `min_t <= cached_t` returns immediately without hitting NS
+//! - `min_t <= cached_t` returns `Current` once the nameservice confirms the cached ledger
 //! - `AwaitTNotReached` error when `min_t` exceeds the ledger's `t`
 //! - `LedgerManager::current_t()` returns correct values
 
@@ -49,7 +49,7 @@ async fn refresh_min_t_satisfied_returns_immediately() {
     let ledger_id = "it/refresh-fast:main";
 
     // Create ledger and insert data so t >= 1
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let t = ledger1.t();
     assert!(t >= 1);
@@ -60,7 +60,7 @@ async fn refresh_min_t_satisfied_returns_immediately() {
         .await
         .expect("ledger_cached");
 
-    // Refresh with min_t already satisfied — should return Current without NS lookup
+    // Refresh with min_t already satisfied — Current
     let result = fluree
         .refresh(ledger_id, RefreshOpts { min_t: Some(t) })
         .await
@@ -82,7 +82,7 @@ async fn refresh_min_t_below_cached_t_returns_immediately() {
     let ledger_id = "it/refresh-below:main";
 
     // Create ledger and insert two items
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let ledger2 = insert_data(&fluree, ledger1, "item2").await;
     let t = ledger2.t();
@@ -116,7 +116,7 @@ async fn refresh_min_t_not_reached_returns_error() {
     let ledger_id = "it/refresh-not-reached:main";
 
     // Create ledger with one commit
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let t = ledger1.t();
 
@@ -169,7 +169,7 @@ async fn current_t_returns_correct_value_after_load() {
         .expect("ledger_manager should be present");
 
     // Create and commit data
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = insert_data(&fluree, ledger0, "item1").await;
     let expected_t = ledger1.t();
 
@@ -188,4 +188,105 @@ async fn current_t_returns_correct_value_after_load() {
         Some(expected_t),
         "current_t should match the loaded ledger's t"
     );
+}
+
+/// Another process drops the ledger and creates a new one under its name,
+/// at a lower t. Refreshing loads the new ledger rather than keep serving
+/// the old; once the name is dropped again, reconciling removes it.
+#[tokio::test]
+async fn refresh_follows_a_ledger_created_under_the_name_elsewhere() {
+    use fluree_db_api::ledger_manager::NsNotify;
+    use fluree_db_api::{DropMode, LedgerId};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let open = || {
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("build")
+    };
+    // Two handles on one store: neither hears the other's events.
+    let (here, elsewhere) = (open(), open());
+    let id = "it/refresh-replaced:main";
+    let key = LedgerId::parse(id).unwrap();
+    let tx = |label: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": format!("ex:{label}"), "ex:name": label});
+
+    let mut ledger = here.create_ledger(id).await.unwrap();
+    for label in ["a1", "a2", "a3"] {
+        ledger = here.insert(ledger, &tx(label)).await.unwrap().ledger;
+    }
+    here.ledger_cached(id).await.unwrap();
+    let mgr = here.ledger_manager().expect("caching");
+    assert_eq!(mgr.current_t(&key).await, Some(3));
+
+    elsewhere
+        .drop_ledger("it/refresh-replaced", DropMode::Hard)
+        .await
+        .unwrap();
+    let ledger = elsewhere.create_ledger(id).await.unwrap();
+    elsewhere.insert(ledger, &tx("b1")).await.unwrap();
+
+    let refreshed = here
+        .refresh(id, RefreshOpts::default())
+        .await
+        .unwrap()
+        .expect("the name resolves");
+    assert_eq!(refreshed.action, NotifyResult::Reloaded);
+    assert_eq!(mgr.current_t(&key).await, Some(1), "the new ledger");
+
+    elsewhere
+        .drop_ledger("it/refresh-replaced", DropMode::Soft)
+        .await
+        .unwrap();
+    let result = mgr
+        .notify(NsNotify {
+            ledger_id: key.clone(),
+            record: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, NotifyResult::Evicted);
+    assert_eq!(mgr.current_t(&key).await, None, "no longer cached");
+}
+
+/// The same, with a `min_t` the dropped ledger's cached state already meets:
+/// the cached `t` says nothing about which ledger the name now holds.
+#[tokio::test]
+async fn refresh_with_min_t_follows_a_ledger_created_under_the_name_elsewhere() {
+    use fluree_db_api::{DropMode, LedgerId};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let open = || {
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("build")
+    };
+    let (here, elsewhere) = (open(), open());
+    let id = "it/refresh-min-t-replaced:main";
+    let key = LedgerId::parse(id).unwrap();
+    let tx = |label: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": format!("ex:{label}"), "ex:name": label});
+
+    let mut ledger = here.create_ledger(id).await.unwrap();
+    for label in ["a1", "a2", "a3"] {
+        ledger = here.insert(ledger, &tx(label)).await.unwrap().ledger;
+    }
+    here.ledger_cached(id).await.unwrap();
+    let mgr = here.ledger_manager().expect("caching");
+
+    elsewhere
+        .drop_ledger("it/refresh-min-t-replaced", DropMode::Soft)
+        .await
+        .unwrap();
+    let ledger = elsewhere.create_ledger(id).await.unwrap();
+    elsewhere.insert(ledger, &tx("b1")).await.unwrap();
+
+    let refreshed = here
+        .refresh(id, RefreshOpts { min_t: Some(1) })
+        .await
+        .unwrap()
+        .expect("the name resolves");
+    assert_eq!(refreshed.action, NotifyResult::Reloaded);
+    assert_eq!(refreshed.t, 1);
+    assert_eq!(mgr.current_t(&key).await, Some(1), "the new ledger");
 }

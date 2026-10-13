@@ -21,7 +21,7 @@ fn context() -> JsonValue {
 /// Alice knows Bob and Bob knows Alice, so `knows` is a cycle the schema
 /// exposes and a document can descend without limit.
 async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger,

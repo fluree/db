@@ -8,6 +8,7 @@ use fluree_db_core::ContentStore;
 use fluree_db_core::LedgerId;
 use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId, ContentId};
 use fluree_db_ledger::DecodedIndexRoot;
+use fluree_db_nameservice::lifecycle::PendingLedger;
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 use fluree_db_query::QueryError;
 
@@ -136,7 +137,8 @@ impl Fluree {
     ///
     /// This operation:
     /// 1. Normalizes the ledger ID (ensures branch suffix like `:main`)
-    /// 2. Registers the ledger in the nameservice (fails if already exists)
+    /// 2. Claims the name under a fresh instance, with its own storage root
+    ///    (fails if the name is held)
     /// 3. Creates a genesis database with t=0 (no transactions yet)
     /// 4. Returns the new LedgerState ready for transactions
     ///
@@ -146,9 +148,9 @@ impl Fluree {
     ///
     /// # Errors
     ///
-    /// Returns `ApiError::LedgerExists` (HTTP 409) if:
-    /// - The ledger already exists
-    /// - The ledger was previously dropped (retracted) - must use hard drop to reuse address
+    /// Returns `ApiError::LedgerExists` (HTTP 409) if the name holds a ledger,
+    /// on any branch, or a drop of it is still in progress. A dropped name is
+    /// free at once.
     ///
     /// # Example
     ///
@@ -160,34 +162,34 @@ impl Fluree {
         use fluree_db_novelty::Novelty;
         use tracing::info;
 
-        // 1. Parse (default branch applied) and apply the stricter rules for
-        //    new names, which existing ledgers are not held to.
+        // 1. Parse (default branch applied). Claiming the name applies the
+        //    stricter rules for new names.
         let ledger_id = LedgerId::parse(ledger_id)?;
-        fluree_db_core::validate_ledger_name(ledger_id.name())?;
-        fluree_db_core::validate_branch_name(ledger_id.branch())?;
         info!(ledger_id = %ledger_id, "Creating ledger");
 
-        // 2. Register in nameservice via the ledger-admin surface
-        //    (fails if already exists). Works for both ReadWrite and
-        //    Replicated nameservices; the latter goes through Raft.
-        match self.ledger_admin()?.init(&ledger_id).await {
-            Ok(()) => {}
-            Err(NameServiceError::LedgerAlreadyExists(a)) => {
-                return Err(ApiError::ledger_exists(a));
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
+        // 2. Claim the name under a fresh instance and register the root
+        //    branch (fails if the name is held). Works for every read-write
+        //    nameservice; the replicated one goes through Raft.
+        let pending = self.claim_name(&ledger_id).await?;
+        fluree_db_nameservice::lifecycle::activate(self.publisher()?, &pending).await?;
+        let record = pending.record;
 
         // 3. Create genesis LedgerSnapshot with empty state at t=0
         let db = fluree_db_core::LedgerSnapshot::genesis(&ledger_id);
 
-        // 4. Create LedgerState with empty Novelty (t=0)
-        let ledger = LedgerState::new(db, Novelty::new(0));
+        // 4. Create LedgerState with empty Novelty (t=0), carrying the new
+        //    record: its fence and storage root.
+        let mut ledger = LedgerState::new(db, Novelty::new(0));
+        ledger.ns_record = Some(record);
 
         info!(ledger_id = %ledger_id, "Ledger created successfully");
         Ok(ledger)
+    }
+
+    /// Claim `ledger_id`'s name for a new ledger, not yet visible: the caller
+    /// writes its data, then activates or abandons it.
+    pub(crate) async fn claim_name(&self, ledger_id: &LedgerId) -> Result<PendingLedger> {
+        claim_name(self.publisher()?, ledger_id).await
     }
 
     /// Create a new branch for a ledger.
@@ -283,13 +285,21 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        self.branch_admin()?
-            .create_branch(ledger_name, new_branch, source, at_commit)
-            .await
-            .map_err(|e| match e {
-                NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
-                other => other.into(),
-            })?;
+        // The binding lists the branch with its own fence.
+        let name = fluree_db_core::LedgerName::parse(ledger_name)?;
+        let new_fence = fluree_db_nameservice::lifecycle::create_branch(
+            self.publisher()?,
+            &name,
+            new_branch,
+            source,
+            at_commit,
+        )
+        .await
+        .map(|record| record.fence)
+        .map_err(|e| match e {
+            NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
+            other => other.into(),
+        })?;
 
         // Historical branches replay from genesis — skip the index copy.
         // The source's current index reflects HEAD, which is too fresh.
@@ -298,7 +308,11 @@ impl Fluree {
                 // Copy the source's index files into the new branch's
                 // namespace so it owns its own copy, safe from GC on source.
                 if let Err(e) = self
-                    .copy_index_to_branch(&source_id, &new_id, index_cid)
+                    .copy_index_to_branch(
+                        &source_id,
+                        &source_record.storage_root().namespace(new_branch),
+                        index_cid,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -307,7 +321,7 @@ impl Fluree {
                     );
                 } else {
                     self.index_publisher()?
-                        .publish_index(&new_id, source_record.index_t, index_cid)
+                        .publish_index_fenced(&new_id, new_fence, source_record.index_t, index_cid)
                         .await?;
                 }
             }
@@ -336,7 +350,7 @@ impl Fluree {
     pub(crate) async fn copy_index_to_branch(
         &self,
         source_id: &str,
-        target_id: &str,
+        target: &fluree_db_core::StorageNamespace,
         index_cid: &fluree_db_core::ContentId,
     ) -> Result<()> {
         use fluree_db_binary_index::collect_root_cas_ids_expanded;
@@ -422,7 +436,7 @@ impl Fluree {
                 // durability instead of the instance's: page-cache now, one
                 // batched flush below before the pointer is published.
                 storage
-                    .content_write_bytes_with_hash(kind, target_id, &hex, &bytes)
+                    .content_write_bytes_with_hash(kind, target, &hex, &bytes)
                     .await
                     .map(|_| ())
                     .map_err(ApiError::from)
@@ -433,12 +447,12 @@ impl Fluree {
         .await?;
         storage.sync().await.map_err(|e| {
             ApiError::internal(format!(
-                "failed to flush index artifacts copied to {target_id}: {e}"
+                "failed to flush index artifacts copied to {target}: {e}"
             ))
         })?;
 
         tracing::info!(
-            source = %source_id, target = %target_id,
+            source = %source_id, target = %target,
             count = artifact_count,
             "copied index artifacts to branch namespace"
         );
@@ -528,5 +542,298 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
              A commit that arrived through a merge cannot be branched at: branch \
              at the merge commit instead, or at a commit on the branch that made it"
         )))
+    }
+}
+
+/// How often a create that writes its data before activating renews its
+/// claim on the name: well inside the time lifecycle housekeeping waits for
+/// a claim to move before it rolls the create back.
+pub(crate) const CLAIM_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `work`, a create writing its data, while renewing `pending`'s claim
+/// on the name every [`CLAIM_RENEW_INTERVAL`]. `None` when the claim was
+/// lost, housekeeping having rolled the create back: `work` is dropped
+/// unfinished. A renewal that fails for another reason is retried at the
+/// next interval.
+pub(crate) async fn while_claimed<F: std::future::Future>(
+    store: &dyn crate::NameServicePublisher,
+    pending: &mut PendingLedger,
+    work: F,
+) -> Option<F::Output> {
+    renewing_every(CLAIM_RENEW_INTERVAL, ClaimRenewal { store, pending }, work).await
+}
+
+/// Run `work`, a drop of `name`'s `branch` under `fence` deleting the
+/// branch's storage, while renewing the drop every [`CLAIM_RENEW_INTERVAL`],
+/// so housekeeping does not take it for stopped and resume it alongside.
+/// `None` when the drop was finished elsewhere: `work` is dropped
+/// unfinished, since the branch's folder may hold a branch created since.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn while_dropping_branch<F: std::future::Future>(
+    store: &dyn crate::NameServicePublisher,
+    name: &fluree_db_core::LedgerName,
+    branch: &str,
+    fence: fluree_db_nameservice::Fence,
+    work: F,
+) -> Option<F::Output> {
+    let renewal = BranchDropRenewal {
+        store,
+        name,
+        branch,
+        fence,
+    };
+    renewing_every(CLAIM_RENEW_INTERVAL, renewal, work).await
+}
+
+/// What [`renewing_every`] renews. Nothing renews in a browser.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+trait Renewal {
+    /// Renew; `false` when the operation is no longer this caller's.
+    fn renew(
+        &mut self,
+    ) -> impl std::future::Future<Output = fluree_db_nameservice::Result<bool>> + Send;
+    /// The operation, for logging.
+    fn describe(&self) -> String;
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct ClaimRenewal<'a> {
+    store: &'a dyn crate::NameServicePublisher,
+    pending: &'a mut PendingLedger,
+}
+
+impl Renewal for ClaimRenewal<'_> {
+    fn renew(
+        &mut self,
+    ) -> impl std::future::Future<Output = fluree_db_nameservice::Result<bool>> + Send {
+        fluree_db_nameservice::lifecycle::renew_claim(self.store, self.pending)
+    }
+
+    fn describe(&self) -> String {
+        format!("the create of {}", self.pending.record.ledger_id)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct BranchDropRenewal<'a> {
+    store: &'a dyn crate::NameServicePublisher,
+    name: &'a fluree_db_core::LedgerName,
+    branch: &'a str,
+    fence: fluree_db_nameservice::Fence,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Renewal for BranchDropRenewal<'_> {
+    fn renew(
+        &mut self,
+    ) -> impl std::future::Future<Output = fluree_db_nameservice::Result<bool>> + Send {
+        fluree_db_nameservice::lifecycle::renew_branch_drop(
+            self.store,
+            self.name,
+            self.branch,
+            self.fence,
+        )
+    }
+
+    fn describe(&self) -> String {
+        format!("the drop of {}:{}", self.name, self.branch)
+    }
+}
+
+async fn renewing_every<F: std::future::Future, R: Renewal>(
+    interval: std::time::Duration,
+    mut renewal: R,
+    work: F,
+) -> Option<F::Output> {
+    // No timer runs in a browser, and nothing there resumes or rolls back.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (interval, &mut renewal);
+        Some(work.await)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut work = std::pin::pin!(work);
+        let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                out = &mut work => return Some(out),
+                _ = renew.tick() => {
+                    match renewal.renew().await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                operation = %renewal.describe(),
+                                "finished or rolled back elsewhere; stopping it"
+                            );
+                            return None;
+                        }
+                        Err(e) => tracing::warn!(
+                            operation = %renewal.describe(),
+                            error = %e,
+                            "could not renew; retrying"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Claim `ledger_id`'s name in `store` for a new ledger, not yet visible:
+/// the caller writes its data, then activates or abandons it.
+///
+/// Every new ledger is claimed here, so the stricter rules for new names,
+/// which existing ledgers are not held to, are applied here: a name or
+/// branch taking a reserved layout segment would put the ledger's files
+/// inside another's.
+pub(crate) async fn claim_name(
+    store: &dyn crate::NameServicePublisher,
+    ledger_id: &LedgerId,
+) -> Result<PendingLedger> {
+    fluree_db_core::validate_ledger_name(ledger_id.name())?;
+    fluree_db_core::validate_branch_name(ledger_id.branch())?;
+    match fluree_db_nameservice::lifecycle::begin_create(store, ledger_id).await {
+        Ok(pending) => Ok(pending),
+        Err(NameServiceError::LedgerAlreadyExists(a)) => Err(ApiError::ledger_exists(a)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::{lifecycle, BranchRecordStore, LedgerRegistry};
+    use std::time::Duration;
+
+    async fn claimed(store: &MemoryNameService) -> PendingLedger {
+        lifecycle::begin_create(store, &LedgerId::parse("slow:main").unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn version(store: &MemoryNameService) -> Option<u64> {
+        store.get_binding("slow").await.unwrap().map(|v| v.version)
+    }
+
+    /// The claim moves while the work runs, and the create can activate
+    /// afterwards.
+    #[tokio::test]
+    async fn the_claim_is_renewed_while_the_work_runs() {
+        let store = MemoryNameService::new();
+        let mut pending = claimed(&store).await;
+        let before = version(&store).await;
+
+        let work = tokio::time::sleep(Duration::from_millis(200));
+        let renewal = ClaimRenewal {
+            store: &store,
+            pending: &mut pending,
+        };
+        let out = renewing_every(Duration::from_millis(20), renewal, work).await;
+        assert!(out.is_some());
+        assert!(version(&store).await > before, "renewed");
+        lifecycle::activate(&store, &pending)
+            .await
+            .expect("activates");
+    }
+
+    /// A claim rolled back under a running create stops the work.
+    #[tokio::test]
+    async fn a_lost_claim_stops_the_work() {
+        let store = MemoryNameService::new();
+        let mut pending = claimed(&store).await;
+        let seen = version(&store).await.unwrap();
+        lifecycle::rollback_create(&store, "slow", seen)
+            .await
+            .unwrap()
+            .expect("rolled back");
+
+        let renewal = ClaimRenewal {
+            store: &store,
+            pending: &mut pending,
+        };
+        let out = renewing_every(
+            Duration::from_millis(20),
+            renewal,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(out.is_none());
+    }
+
+    /// A branch of `slow` dropped as far as deleting its storage: the
+    /// branch's fence.
+    async fn dropping_branch(store: &MemoryNameService) -> fluree_db_nameservice::Fence {
+        let name = fluree_db_core::LedgerName::parse("slow").unwrap();
+        lifecycle::create_ledger(store, &LedgerId::parse("slow:main").unwrap())
+            .await
+            .unwrap();
+        let dev = lifecycle::create_branch(store, &name, "dev", "main", None)
+            .await
+            .unwrap();
+        lifecycle::begin_drop_branch(store, &name, "dev")
+            .await
+            .unwrap();
+        dev.fence.unwrap()
+    }
+
+    /// A slow branch drop moves the binding while it deletes, so
+    /// housekeeping does not take it for stopped and resume it alongside.
+    #[tokio::test]
+    async fn a_branch_drop_is_renewed_while_it_deletes() {
+        let store = MemoryNameService::new();
+        let name = fluree_db_core::LedgerName::parse("slow").unwrap();
+        let fence = dropping_branch(&store).await;
+        let before = version(&store).await;
+
+        let renewal = BranchDropRenewal {
+            store: &store,
+            name: &name,
+            branch: "dev",
+            fence,
+        };
+        let work = tokio::time::sleep(Duration::from_millis(200));
+        assert!(renewing_every(Duration::from_millis(20), renewal, work)
+            .await
+            .is_some());
+        assert!(version(&store).await > before, "renewed");
+    }
+
+    /// A branch drop that another run finished stops deleting: the branch
+    /// may be listed again, under another fence, in the same folder.
+    #[tokio::test]
+    async fn a_branch_drop_finished_elsewhere_stops_the_work() {
+        let store = MemoryNameService::new();
+        let name = fluree_db_core::LedgerName::parse("slow").unwrap();
+        let fence = dropping_branch(&store).await;
+        let record = store
+            .raw_record("slow:dev")
+            .await
+            .unwrap()
+            .expect("frozen record");
+        lifecycle::finish_drop_branch(&store, &name, &record)
+            .await
+            .unwrap();
+        assert!(
+            !lifecycle::branch_drop_under_way(&store, &name, "dev", fence)
+                .await
+                .unwrap()
+        );
+
+        let renewal = BranchDropRenewal {
+            store: &store,
+            name: &name,
+            branch: "dev",
+            fence,
+        };
+        let out = renewing_every(
+            Duration::from_millis(20),
+            renewal,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(out.is_none());
     }
 }

@@ -39,7 +39,7 @@ const KNOWS: &str = ":START_ID(Person),:END_ID(Person),:TYPE,creationDate:long\n
 #[tokio::test]
 async fn csv_import_round_trips_to_cypher_and_sparql() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/csv:round-trip");
+    let ledger0 = genesis_ledger(&fluree, "it/csv-round-trip:main").await;
     let doc = csv_files_to_jsonld(&[PERSONS, KNOWS], &opts()).expect("csv → jsonld");
     let l = fluree
         .insert(ledger0, &doc)
@@ -113,7 +113,7 @@ async fn csv_import_plain_policy_yields_pure_rdf_edges() {
     // Under EdgePolicy::Plain the knows edge is a plain triple — visible to
     // Cypher set-semantics and SPARQL as an ordinary triple, with no annotation.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/csv:plain");
+    let ledger0 = genesis_ledger(&fluree, "it/csv-plain:main").await;
     let doc = csv_files_to_jsonld(
         &[PERSONS, KNOWS],
         &CsvImportOptions {
@@ -166,7 +166,7 @@ async fn cypher_json_emits_native_scalars_not_rdf_value_objects() {
     // `birthday:date` is a bare ISO string and a `creationDate:long` a bare
     // number, NOT JSON-LD `{"@value":…,"@type":…}` value-objects.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/csv:cypher-json");
+    let ledger0 = genesis_ledger(&fluree, "it/csv-cypher-json:main").await;
     let persons = "id:ID(Person),name:string,birthday:date,:LABEL\n10,Alice,1990-11-23,Person\n";
     let doc = csv_files_to_jsonld(&[persons], &opts()).expect("csv");
     let l = fluree.insert(ledger0, &doc).await.expect("insert").ledger;
@@ -209,7 +209,7 @@ async fn cypher_json_emits_native_scalars_not_rdf_value_objects() {
 
     // A long renders as a bare number in cypher-json.
     let l2 = {
-        let ledger0 = genesis_ledger(&fluree, "it/csv:cypher-json-long");
+        let ledger0 = genesis_ledger(&fluree, "it/csv-cypher-json-long:main").await;
         let doc = csv_files_to_jsonld(&[PERSONS, KNOWS], &opts()).expect("csv");
         fluree.insert(ledger0, &doc).await.expect("insert").ledger
     };
@@ -240,7 +240,7 @@ async fn cypher_json_unaliased_projection_keeps_columns_and_values() {
     // explicit projections emit verbatim, and the column reads as Neo4j does
     // (the projected expression's surface text).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/csv:cypher-json-unaliased");
+    let ledger0 = genesis_ledger(&fluree, "it/csv-cypher-json-unaliased:main").await;
     let persons = "id:ID(Person),name:string,birthday:date,:LABEL\n10,Alice,1990-11-23,Person\n";
     let doc = csv_files_to_jsonld(&[persons], &opts()).expect("csv");
     let l = fluree.insert(ledger0, &doc).await.expect("insert").ledger;

@@ -23,11 +23,11 @@ use crate::fast_path_common::{
     collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
     collect_subjects_with_object_in_set, count_rows_for_predicate_psot,
     cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
-    intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
-    projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
-    CursorSubjectCountStream, FastPathOperator, GroupStream, InnerMergeHeads, ObjectFilterMode,
-    PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek,
-    PsotSubjectWeightedSumIter, SharedOverlayOps,
+    driver_subject_boundaries, intersect_many_sorted, leaf_entries_for_predicate,
+    normalize_pred_sid, projection_sid_otype_okey, slice_overlay_ops_by_subject,
+    sum_post_object_counts_filtered, CursorSubjectCountStream, FastPathOperator, GroupStream,
+    InnerMergeHeads, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
+    PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -962,41 +962,6 @@ fn merge_optional_count_range(
         }
     }
     Ok(total)
-}
-
-/// Ascending candidate subject boundaries for partitioning a predicate's scan.
-///
-/// When the predicate has at least `k` leaves, returns each leaf's first subject
-/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
-/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
-/// returns each matching leaflet's first subject, giving finer boundaries for a
-/// predicate that fits in one/few leaves but many leaflets. The returned values
-/// are non-decreasing (leaves and leaflets are subject-sorted).
-fn driver_subject_boundaries(
-    store: &BinaryIndexStore,
-    g_id: fluree_db_core::GraphId,
-    p_id: u32,
-    k: usize,
-) -> Result<Vec<u64>> {
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
-    if leaves.len() >= k {
-        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
-    }
-    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-    let mut bounds: Vec<u64> = Vec::new();
-    for leaf in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                continue;
-            }
-            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
-            bounds.push(first.s_id.as_u64());
-        }
-    }
-    Ok(bounds)
 }
 
 /// Parallel partitioned variant of the inner-star count merge.
@@ -2756,27 +2721,13 @@ fn execute_chain(
                         crate::fast_path_common::projection_sid_okey()
                     };
 
-                    let batch = if let Some(cache) = self.store.leaflet_cache() {
-                        use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
-                        let idx_u32: u32 = idx.try_into().map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?;
-                        load_columns_cached_via_handle(
-                            handle.as_ref(),
-                            cache,
-                            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                                leaf_id: handle.leaf_id(),
-                                leaflet_idx: idx_u32,
-                                order: RunSortOrder::Psot,
-                                decode_set: fluree_db_binary_index::ColumnSet::ALL,
-                            },
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    } else {
-                        handle
-                            .load_columns(idx, &projection, RunSortOrder::Psot)
-                            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    };
+                    let batch = crate::fast_path_common::load_leaflet_projection(
+                        self.store,
+                        handle.as_ref(),
+                        idx,
+                        &projection,
+                        RunSortOrder::Psot,
+                    )?;
 
                     self.row = 0;
                     self.batch = Some(batch);
@@ -3351,10 +3302,10 @@ fn execute_chain_overlay(chain: &ChainFold, ec: &ExecCtx<'_, '_>) -> Result<Opti
 fn predicate_objects_all_iri(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<bool> {
     let iri_ref = OType::IRI_REF.as_u16();
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }

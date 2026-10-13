@@ -89,6 +89,9 @@ struct NoveltyDocEntry {
 struct NoveltyCacheKey {
     /// Hash of the ledger ID — discriminates across ledgers sharing the process.
     ledger_id_hash: u64,
+    /// The binary store's process-unique id. A ledger dropped and created
+    /// again under its name restarts its epoch and `t`, but not its store.
+    store_id: u64,
     epoch: u64,
     to_t: i64,
     g_id: fluree_db_core::GraphId,
@@ -102,6 +105,7 @@ struct NoveltyCacheKey {
 impl PartialEq for NoveltyCacheKey {
     fn eq(&self, other: &Self) -> bool {
         self.ledger_id_hash == other.ledger_id_hash
+            && self.store_id == other.store_id
             && self.epoch == other.epoch
             && self.to_t == other.to_t
             && self.g_id == other.g_id
@@ -115,6 +119,7 @@ impl Eq for NoveltyCacheKey {}
 impl Hash for NoveltyCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.ledger_id_hash.hash(state);
+        self.store_id.hash(state);
         self.epoch.hash(state);
         self.to_t.hash(state);
         self.g_id.hash(state);
@@ -349,6 +354,7 @@ fn get_or_build_delta(
 
     let key = NoveltyCacheKey {
         ledger_id_hash,
+        store_id: binary_store.store_id(),
         epoch,
         to_t: ctx.to_t,
         g_id,

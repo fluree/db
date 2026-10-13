@@ -121,6 +121,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let v1_admin_protected_writes = Router::new()
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
+        // Dropped ledgers stay in a registry until restored or purged.
+        .route("/dropped/restore", post(ledger::restore_dropped))
+        .route("/dropped/purge", post(ledger::purge_dropped))
+        // Deletes instance folders nothing references: storage-wide.
+        .route("/dropped/sweep", post(ledger::sweep_orphans))
         .route("/reindex", post(ledger::reindex))
         // Reclaims index artifacts no index chain references. Deletes storage
         // and holds the ledger against indexing, so it is admin-gated and
@@ -208,7 +213,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Held encryption key ids and the rotation record; the record is
         // storage-resident, so any node answers.
         .route("/encryption", get(encryption::encryption))
-        .route("/encryption/rotate/status", get(encryption::rotate_status));
+        .route("/encryption/rotate/status", get(encryption::rotate_status))
+        // The dropped-ledger registry, restorable or purgeable by instance.
+        .route("/dropped", get(ledger::list_dropped));
 
     // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
     // connection carries a secret in the body) but they mutate nothing and

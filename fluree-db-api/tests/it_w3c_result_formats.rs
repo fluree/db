@@ -41,7 +41,7 @@ async fn seeded_view(ledger_id: &str) -> (fluree_db_api::Fluree, fluree_db_api::
         reindex_min_bytes: 0,
         reindex_max_bytes: 10_000_000,
     };
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     fluree
         .insert_with_opts(
             ledger,

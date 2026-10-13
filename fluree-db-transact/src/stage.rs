@@ -3375,11 +3375,16 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // First: insert ex:alice with name="Alice"
         let txn1 = Txn::insert().with_insert(TripleTemplate::new(
@@ -3475,11 +3480,16 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // Commit 1: Insert schema:alice with schema:name="Alice"
         // Do NOT rely on pre-registered SCHEMA_ORG codes — this build intentionally keeps
@@ -3582,11 +3592,16 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // Commit 1: Insert schema:alice with name="Alice" and age=30
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
@@ -3802,11 +3817,16 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let nameservice = MemoryNameService::new();
+
+        let ledger = crate::test_support::created(&nameservice, ledger).await;
         let config = IndexConfig {
             reindex_min_bytes: 100_000,
             reindex_max_bytes: 1_000_000_000,
         };
-        let cs = content_store_for(storage.clone(), "test:main");
+        let cs = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy("test:main").unwrap(),
+        );
 
         // Insert data: alice has age 30, bob has age 25
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);

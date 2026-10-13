@@ -32,7 +32,7 @@ async fn seed(fluree: &Fluree, n: usize, features: usize) {
 }
 
 async fn seed_with_offers(fluree: &Fluree, n: usize, features: usize, offers: usize) {
-    let ledger = genesis_ledger(fluree, "q4:main");
+    let ledger = genesis_ledger(fluree, "q4:main").await;
     let mut graph = Vec::new();
     for i in 0..n {
         graph.push(json!({"@id": format!("ex:p{i}"), "@type": "ex:Type", "ex:feature": [

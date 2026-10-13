@@ -182,7 +182,7 @@ async fn fluree_insert_turtle_accepts_trig() {
     let fluree = memory();
     let id = "it/trig-insert-direct:main";
     let result = fluree
-        .insert_turtle(genesis_ledger(&fluree, id), TRIG)
+        .insert_turtle(genesis_ledger(&fluree, id).await, TRIG)
         .await
         .expect("Fluree::insert_turtle with TriG");
     assert_trig_landed(
@@ -199,7 +199,7 @@ async fn owned_builder_execute_accepts_trig() {
     let fluree = memory();
     let id = "it/trig-insert-owned:main";
     let result = fluree
-        .stage_owned(genesis_ledger(&fluree, id))
+        .stage_owned(genesis_ledger(&fluree, id).await)
         .insert_turtle(TRIG)
         .execute()
         .await
@@ -217,7 +217,7 @@ async fn owned_builder_execute_accepts_trig() {
 async fn owned_builder_stage_accepts_trig() {
     let fluree = memory();
     let staged = fluree
-        .stage_owned(genesis_ledger(&fluree, "it/trig-insert-owned-stage:main"))
+        .stage_owned(genesis_ledger(&fluree, "it/trig-insert-owned-stage:main").await)
         .insert_turtle(TRIG)
         .stage()
         .await
@@ -301,7 +301,7 @@ async fn trig_with_only_graph_blocks_is_accepted() {
                 GRAPH <http://example.org/g1> { ex:alice ex:knows ex:bob . }\n";
     let result = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/trig-insert-blocks-only:main"),
+            genesis_ledger(&fluree, "it/trig-insert-blocks-only:main").await,
             trig,
         )
         .await
@@ -324,7 +324,7 @@ async fn trig_insert_takes_default_blocks_and_escaped_local_names() {
                 <http://example.org/g1> { ex:alice ex:knows ex:b\\-ob . }\n";
     let result = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/trig-insert-default-block:main"),
+            genesis_ledger(&fluree, "it/trig-insert-default-block:main").await,
             trig,
         )
         .await
@@ -361,7 +361,7 @@ async fn trig_insert_adds_where_upsert_replaces() {
         let fluree = &fluree;
         async move {
             fluree
-                .insert_turtle(genesis_ledger(fluree, id), first)
+                .insert_turtle(genesis_ledger(fluree, id).await, first)
                 .await
                 .expect("seed")
                 .ledger
@@ -402,7 +402,10 @@ async fn trig_insert_shares_a_blank_node_across_graphs() {
                 _:x ex:name \"X\" .\n\
                 GRAPH <http://example.org/g1> { _:x ex:knows ex:bob . }\n";
     let result = fluree
-        .insert_turtle(genesis_ledger(&fluree, "it/trig-insert-bnode:main"), trig)
+        .insert_turtle(
+            genesis_ledger(&fluree, "it/trig-insert-bnode:main").await,
+            trig,
+        )
         .await
         .expect("insert");
     let db = GraphDb::from_ledger_state(&result.ledger);
@@ -430,7 +433,10 @@ async fn trig_insert_annotation_lands_in_its_graph() {
                   ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n\
                 }\n";
     let result = fluree
-        .insert_turtle(genesis_ledger(&fluree, "it/trig-insert-star:main"), trig)
+        .insert_turtle(
+            genesis_ledger(&fluree, "it/trig-insert-star:main").await,
+            trig,
+        )
         .await
         .expect("insert");
     let db = GraphDb::from_ledger_state(&result.ledger);
@@ -474,14 +480,17 @@ ex:alice ex:knows ex:carol {| ex:since 2020 |} .
     let fluree = memory();
     let plain = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/trig-parity-turtle:main"),
+            genesis_ledger(&fluree, "it/trig-parity-turtle:main").await,
             default_graph,
         )
         .await
         .expect("plain Turtle")
         .ledger;
     let via_trig = fluree
-        .insert_turtle(genesis_ledger(&fluree, "it/trig-parity-trig:main"), &trig)
+        .insert_turtle(
+            genesis_ledger(&fluree, "it/trig-parity-trig:main").await,
+            &trig,
+        )
         .await
         .expect("TriG")
         .ledger;
@@ -541,7 +550,7 @@ async fn plain_turtle_stays_on_the_streaming_parser() {
     // interest to "never". Hit the callsite once, then rebuild the cache.
     let ledger = fluree
         .insert_turtle(
-            genesis_ledger(&fluree, "it/trig-routing:main"),
+            genesis_ledger(&fluree, "it/trig-routing:main").await,
             "<http://example.org/warm> <http://example.org/up> 1 .",
         )
         .await
@@ -578,7 +587,7 @@ async fn plain_turtle_stays_on_the_streaming_parser() {
 #[tokio::test]
 async fn parse_errors_name_the_real_problem() {
     let fluree = memory();
-    let ledger = genesis_ledger(&fluree, "it/trig-errors:main");
+    let ledger = genesis_ledger(&fluree, "it/trig-errors:main").await;
 
     // Contains `{` and "graph", so the TriG reader looks, finds no block, and
     // defers to the Turtle error.
@@ -864,7 +873,8 @@ async fn a_redefined_prefix_or_base_applies_only_after_it() {
     let mut failures = Vec::new();
     for (i, (case, doc, expected)) in cases.iter().enumerate() {
         for lane in ["upsert", "insert"] {
-            let ledger = genesis_ledger(&fluree, &format!("it/trig-directives-{i}-{lane}:main"));
+            let ledger =
+                genesis_ledger(&fluree, &format!("it/trig-directives-{i}-{lane}:main")).await;
             let result = if lane == "upsert" {
                 fluree
                     .stage_owned(ledger)

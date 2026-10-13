@@ -322,6 +322,12 @@ pub enum ApiError {
     #[error("Branch conflict: {0}")]
     BranchConflict(String),
 
+    /// A graph source indexed a ledger that has since been dropped and its
+    /// name reused. It indexes nothing from the new ledger until it is
+    /// recreated over it.
+    #[error("Graph source suspended: {0}")]
+    GraphSourceSuspended(String),
+
     /// Not found errors
     #[error("Not found: {0}")]
     NotFound(String),
@@ -525,6 +531,30 @@ impl ApiError {
         }
     }
 
+    /// A write refused because the writer loaded the ledger before it was
+    /// dropped, restored or replaced. Retrying on the same state cannot
+    /// succeed; the writer must reload the ledger.
+    pub fn is_fenced(&self) -> bool {
+        use fluree_db_nameservice::NameServiceError::Fenced;
+        matches!(
+            self,
+            ApiError::NameService(Fenced(_))
+                | ApiError::Transact(fluree_db_transact::TransactError::Nameservice(Fenced(_)))
+        )
+    }
+
+    /// A lifecycle operation refused because another holds the name or the
+    /// dropped ledger, or took it from this one: a create, drop, restore or
+    /// purge under way. Retrying once that finishes may succeed.
+    pub fn is_lifecycle_conflict(&self) -> bool {
+        use fluree_db_nameservice::NameServiceError::Conflict;
+        matches!(
+            self,
+            ApiError::NameService(Conflict(_))
+                | ApiError::Transact(fluree_db_transact::TransactError::Nameservice(Conflict(_)))
+        )
+    }
+
     /// Check if this error represents a "not found" condition.
     ///
     /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
@@ -638,8 +668,15 @@ impl ApiError {
             },
             ApiError::InvalidBranch(_) => 400,
             ApiError::InvalidLedgerId(_) => 400,
-            ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
+            ApiError::NameService(
+                fluree_db_nameservice::NameServiceError::InvalidId(_)
+                | fluree_db_nameservice::NameServiceError::TooLarge(_),
+            ) => 400,
+            e if e.is_fenced() => 409,
+            e if e.is_lifecycle_conflict() => 409,
             ApiError::BranchConflict(_) => 409,
+            ApiError::GraphSourceSuspended(_)
+            | ApiError::Query(fluree_db_query::QueryError::GraphSourceSuspended(_)) => 409,
             ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
             ApiError::CommitNotFound(_) => 404,
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
@@ -763,6 +800,17 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A create, drop, restore or purge another one got to first is a
+    /// retryable conflict, not a server fault.
+    #[test]
+    fn lifecycle_conflicts_are_409() {
+        let e = ApiError::from(fluree_db_nameservice::NameServiceError::conflict(
+            "'mydb' is being restored",
+        ));
+        assert!(e.is_lifecycle_conflict());
+        assert_eq!(e.status_code(), 409);
+    }
 
     #[test]
     fn storage_permission_errors_are_403() {

@@ -454,7 +454,7 @@ async fn optional_mode_allows_anonymous_but_rejects_bad_tokens() {
 async fn scoped_token_gates_ledgers_and_writes() {
     let (_tmp, state, addr) = auth_server(DataAuthMode::Required).await;
     seed_ledger(&state, LEDGER).await;
-    seed_ledger(&state, "boltauth:other").await;
+    seed_ledger(&state, "boltauth-other:main").await;
 
     // Read-only scope on LEDGER only.
     let token = scoped_token(&[LEDGER], &[], now_secs() + 3600);
@@ -469,9 +469,12 @@ async fn scoped_token_gates_ledgers_and_writes() {
     // Out-of-scope ledger: DatabaseNotFound (existence-hiding, like the
     // HTTP routes' 404).
     let mut c = BoltClient::ready_54(addr, auth_map("bearer", None, Some(&token))).await;
-    c.run("MATCH (n:Person) RETURN count(n) AS c", "boltauth:other")
-        .await
-        .assert_failure_code("Neo.ClientError.Database.DatabaseNotFound");
+    c.run(
+        "MATCH (n:Person) RETURN count(n) AS c",
+        "boltauth-other:main",
+    )
+    .await
+    .assert_failure_code("Neo.ClientError.Database.DatabaseNotFound");
 
     // No write scope: writes to the readable ledger are refused too.
     let mut c = BoltClient::ready_54(addr, auth_map("bearer", None, Some(&token))).await;
@@ -541,13 +544,13 @@ async fn logoff_drops_identity_and_requires_reauth() {
 async fn explicit_transactions_enforce_scopes_per_statement() {
     let (_tmp, state, addr) = auth_server(DataAuthMode::Required).await;
     seed_ledger(&state, LEDGER).await;
-    seed_ledger(&state, "boltauth:other").await;
+    seed_ledger(&state, "boltauth-other:main").await;
 
     // BEGIN on an out-of-scope ledger is refused (existence-hiding).
     let token = scoped_token(&[LEDGER], &[], now_secs() + 3600);
     let mut c = BoltClient::ready_54(addr, auth_map("bearer", None, Some(&token))).await;
     let mut extra = MapValue::new();
-    extra.insert("db", "boltauth:other");
+    extra.insert("db", "boltauth-other:main");
     c.send(msg::BEGIN, vec![Value::Map(extra)]).await;
     c.recv()
         .await
@@ -575,7 +578,7 @@ async fn identity_derived_policy_filters_bolt_reads() {
     // Cypher — different graphs. Policy comes from the identity's
     // in-ledger f:policyClass binding; no policy knobs on the transport.
     let (_tmp, state, addr) = auth_server(DataAuthMode::Optional).await;
-    let ledger = "boltauth:policy";
+    let ledger = "boltauth-policy:main";
     http_insert(
         &state,
         "/v1/fluree/create",
@@ -679,7 +682,7 @@ async fn delegated_bolt_sessions_enforce_grants_scopes_and_reauthentication() {
         ..Default::default()
     })
     .await;
-    let ledger = "boltauth:delegation";
+    let ledger = "boltauth-delegation:main";
     seed_ledger(&state, ledger).await;
     http_insert(
         &state,

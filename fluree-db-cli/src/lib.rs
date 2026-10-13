@@ -193,11 +193,17 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Drop {
             name,
+            hard,
             force,
             remote,
         } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::drop::run(&name, force, &fluree_dir, remote.as_deref(), direct).await
+            commands::drop::run(&name, hard, force, &fluree_dir, remote.as_deref(), direct).await
+        }
+
+        Commands::Dropped { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::dropped::run(action, &fluree_dir, direct).await
         }
 
         Commands::Graph { action } => {

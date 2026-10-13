@@ -139,7 +139,7 @@ async fn build_twice_and_query<S: Storage + Clone + 'static>(storage: S) -> Buil
     fluree.set_indexing_mode(IndexingMode::Background(handle));
 
     let ledger_id = "it/disk-cache:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let mut root_id = None;
     for round in 0..2 {
         ledger = fluree
@@ -185,7 +185,13 @@ async fn remote_storage_builds_seed_the_disk_cache() {
 
     let root_bytes = built
         .fluree
-        .content_store(built.ledger_id)
+        .content_store(
+            &built
+                .fluree
+                .storage_namespace(built.ledger_id)
+                .await
+                .unwrap(),
+        )
         .get(&built.root_id)
         .await
         .expect("root bytes");

@@ -121,9 +121,8 @@ where
 mod tests {
     use super::*;
     use fluree_db_core::{ContentId, ContentKind};
-    use fluree_db_nameservice::{
-        memory::MemoryNameService, CommitPublisher, GraphSourcePublisher, GraphSourceType,
-    };
+    use fluree_db_nameservice::testing::CurrentFence;
+    use fluree_db_nameservice::{memory::MemoryNameService, GraphSourcePublisher, GraphSourceType};
 
     async fn setup_ns_with_records() -> MemoryNameService {
         let ns = MemoryNameService::new();
@@ -132,6 +131,11 @@ mod tests {
         let cid1 = ContentId::new(ContentKind::Commit, b"commit-1");
         let cid2 = ContentId::new(ContentKind::Commit, b"commit-2");
         let cid3 = ContentId::new(ContentKind::Commit, b"commit-3");
+        for id in ["db1:main", "db1:dev", "db2:main"] {
+            fluree_db_nameservice::testing::create(&ns, id)
+                .await
+                .unwrap();
+        }
         ns.publish_commit("db1:main", 10, &cid1).await.unwrap();
         ns.publish_commit("db1:dev", 5, &cid2).await.unwrap();
         ns.publish_commit("db2:main", 20, &cid3).await.unwrap();

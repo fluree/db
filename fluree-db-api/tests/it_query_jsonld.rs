@@ -33,7 +33,7 @@ async fn assert_query_bind_error(
 #[tokio::test]
 async fn jsonld_bind_str_double_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/str-double-canonical");
+    let ledger0 = genesis_ledger(&fluree, "query/str-double-canonical").await;
     let insert = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -72,7 +72,7 @@ async fn jsonld_bind_str_double_canonical_form() {
 #[tokio::test]
 async fn jsonld_bind_str_float_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/str-float-canonical");
+    let ledger0 = genesis_ledger(&fluree, "query/str-float-canonical").await;
     let insert = json!({
         "@context": {
             "ex": "http://example.org/ns/",
@@ -474,7 +474,7 @@ async fn jsonld_optional_basic_left_join() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -516,7 +516,7 @@ async fn jsonld_optional_with_passthrough() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-passthrough:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -561,7 +561,7 @@ async fn jsonld_optional_sandwiched() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-sandwiched:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -607,7 +607,7 @@ async fn jsonld_optional_two_separate() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-two-separate:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -656,7 +656,7 @@ async fn jsonld_optional_conjunctive_inner() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-conjunctive:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -707,7 +707,7 @@ async fn jsonld_optional_multiple_clauses_left_join() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-left-join:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
     let insert = json!({
         "@context": ctx,
@@ -757,7 +757,7 @@ async fn jsonld_nested_optionals() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/nested-optionals:main";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.com/"},
         "@graph": [
@@ -826,7 +826,7 @@ async fn jsonld_union_basic_passthrough() {
     // Mirrors `fluree.snapshot.query.union-query-test/union-queries` (basic combine emails into one var)
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/union:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -880,7 +880,7 @@ async fn jsonld_optional_with_filter() {
     // OPTIONAL with FILTER - only include optional bindings where filter passes
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-filter:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -933,7 +933,7 @@ async fn jsonld_optional_with_filter_multivalue_skosxl() {
     // NO inner solution is compatible).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-filter-multivalue:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let ctx = json!({
         "skos":   "http://www.w3.org/2004/02/skos/core#",
@@ -997,7 +997,7 @@ async fn jsonld_two_independent_optionals() {
     // separate OPTIONAL { } blocks). Each OPTIONAL can independently null-extend.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-two-independent:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -1046,7 +1046,7 @@ async fn jsonld_optional_with_bind() {
     // OPTIONAL with BIND - compute a value within the optional block
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-bind:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -1099,7 +1099,7 @@ async fn jsonld_optional_with_subquery() {
     // OPTIONAL containing a subquery - uses ["query", {...}] syntax
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "query/optional-subquery:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -1158,7 +1158,7 @@ async fn jsonld_optional_with_subquery() {
 #[tokio::test]
 async fn query_jsonld_works_for_values_only_query() {
     let fluree: MemoryFluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/main");
+    let ledger = genesis_ledger(&fluree, "test/main").await;
 
     // No WHERE, only VALUES (supported)
     let q = json!({
@@ -1178,7 +1178,7 @@ async fn query_format_async_works_for_non_crawl_queries() {
     use fluree_db_api::format::FormatterConfig;
 
     let fluree: MemoryFluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "test/main");
+    let ledger = genesis_ledger(&fluree, "test/main").await;
 
     let q = json!({
         "@context": context_ex_schema(),
@@ -1208,7 +1208,7 @@ async fn query_format_async_works_for_non_crawl_queries() {
 // - DISTINCT
 
 async fn seed_people_grouping(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     // Seed dataset: people-strings
@@ -1613,7 +1613,7 @@ async fn select_distinct_with_limit_offset() {
 /// Seed dataset with multi-byte strings, datetime, and decimal values for
 /// built-in function tests (JSON-LD path).
 async fn seed_builtin_fn_jsonld(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = json!({
         "ex": "http://example.org/ns/",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -1910,7 +1910,7 @@ async fn jsonld_lcase_preserves_language_tag() {
 #[tokio::test]
 async fn jsonld_bind_arithmetic_in_select() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/bind-arith:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/bind-arith:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -1960,7 +1960,7 @@ async fn jsonld_bind_arithmetic_in_select() {
 #[tokio::test]
 async fn jsonld_integer_division_yields_decimal() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/int-div:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/int-div:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -1995,7 +1995,7 @@ async fn jsonld_integer_division_yields_decimal() {
 #[tokio::test]
 async fn jsonld_float_divided_by_integer_promotes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/float-div-int:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/float-div-int:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2035,7 +2035,7 @@ async fn jsonld_float_divided_by_integer_promotes() {
 #[tokio::test]
 async fn jsonld_bind_chained() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/bind-chain:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/bind-chain:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2078,7 +2078,7 @@ async fn jsonld_bind_chained() {
 #[tokio::test]
 async fn jsonld_bind_with_filter() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/bind-filter:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/bind-filter:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2128,7 +2128,7 @@ async fn jsonld_bind_with_filter() {
 #[tokio::test]
 async fn jsonld_bind_in_union() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/bind-union:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/bind-union:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2184,7 +2184,7 @@ async fn jsonld_bind_in_union() {
 #[tokio::test]
 async fn jsonld_bind_wildcard_select() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/bind-wild:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/bind-wild:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2227,7 +2227,7 @@ async fn jsonld_bind_wildcard_select() {
 #[tokio::test]
 async fn jsonld_values_constraining_where() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/values-where:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/values-where:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2268,7 +2268,7 @@ async fn jsonld_values_constraining_where() {
 #[tokio::test]
 async fn jsonld_values_with_undef() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/values-undef:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/values-undef:main").await;
     let ctx = context_ex_schema();
 
     let insert = json!({
@@ -2316,7 +2316,7 @@ async fn jsonld_values_with_undef() {
 #[tokio::test]
 async fn jsonld_values_optional_poisoned_filled_by_values() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "parity/values-poisoned:main");
+    let ledger0 = genesis_ledger(&fluree, "parity/values-poisoned:main").await;
     let ctx = context_ex_schema();
 
     // ex:s1 has both ex:p and ex:q; ex:s2 has only ex:p (no ex:q)

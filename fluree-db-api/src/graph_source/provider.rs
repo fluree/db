@@ -66,6 +66,15 @@ impl<'a> FlureeIndexProvider<'a> {
     }
 }
 
+/// `e`, raised doing `what`: a suspended index keeps its type, which the
+/// server answers with 409; anything else is internal.
+fn query_error(what: &str, e: crate::ApiError) -> QueryError {
+    match e {
+        crate::ApiError::GraphSourceSuspended(message) => QueryError::GraphSourceSuspended(message),
+        e => QueryError::Internal(format!("{what}: {e}")),
+    }
+}
+
 impl std::fmt::Debug for FlureeIndexProvider<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlureeIndexProvider")
@@ -97,11 +106,11 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
         sync: bool,
         timeout_ms: Option<u64>,
     ) -> QueryResult<Arc<Bm25Index>> {
-        self.lookup_live(graph_source_id).await?;
+        let record = self.checked_record(graph_source_id).await?;
         // Load BM25 manifest from CAS
         let manifest = self
             .fluree
-            .load_or_create_bm25_manifest(graph_source_id)
+            .bm25_manifest_of(graph_source_id, record.as_ref())
             .await
             .map_err(|e| QueryError::Internal(format!("Manifest load error: {e}")))?;
 
@@ -117,7 +126,10 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
 
         // If we have a suitable snapshot, load and return it
         if let Some(entry) = selection {
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             let bytes = cs
                 .get(&entry.snapshot_id)
                 .await
@@ -147,7 +159,7 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
             self.fluree
                 .sync_bm25_index(graph_source_id)
                 .await
-                .map_err(|e| QueryError::Internal(format!("Sync error: {e}")))?;
+                .map_err(|e| query_error("Sync error", e))?;
 
             // Re-load manifest after sync
             let manifest = self
@@ -159,7 +171,10 @@ impl Bm25IndexProvider for FlureeIndexProvider<'_> {
             let selection = manifest.select_snapshot(effective_as_of_t);
 
             if let Some(entry) = selection {
-                let cs = self.fluree.content_store(graph_source_id);
+                let cs = self
+                    .fluree
+                    .graph_source_store(graph_source_id)
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
                 let bytes = cs
                     .get(&entry.snapshot_id)
                     .await
@@ -234,8 +249,9 @@ impl Bm25SearchProvider for FlureeIndexProvider<'_> {
         sync: bool,
         timeout_ms: Option<u64>,
     ) -> QueryResult<Bm25SearchResult> {
-        // Look up graph source record to get deployment configuration
-        let deployment_config = self.get_deployment_config(graph_source_id).await?;
+        // The graph source's record, for its deployment and its manifest.
+        let record = self.checked_record(graph_source_id).await?;
+        let deployment_config = Self::deployment_of(record.as_ref())?;
 
         match deployment_config.mode {
             DeploymentMode::Embedded if self.fluree.should_use_chunked_format() => {
@@ -244,7 +260,13 @@ impl Bm25SearchProvider for FlureeIndexProvider<'_> {
                     "Using selective chunked search mode"
                 );
                 self.search_bm25_selective(
-                    graph_source_id, query_text, limit, as_of_t, sync, timeout_ms,
+                    graph_source_id,
+                    record.as_ref(),
+                    query_text,
+                    limit,
+                    as_of_t,
+                    sync,
+                    timeout_ms,
                 )
                 .await
             }
@@ -278,6 +300,25 @@ impl Bm25SearchProvider for FlureeIndexProvider<'_> {
 }
 
 impl FlureeIndexProvider<'_> {
+    /// The graph source's record for a search, unless it was dropped, refused
+    /// while it is a suspended index ([`crate::Fluree::check_index_query`]).
+    /// A search reads it once and hands it on, for its deployment, its index
+    /// and its manifest; after a sync, which moves it, [`Self::lookup_live`]
+    /// reads it afresh.
+    async fn checked_record(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<fluree_db_nameservice::GraphSourceRecord>> {
+        let record = self.lookup_live(graph_source_id).await?;
+        if let Some(record) = &record {
+            self.fluree
+                .check_index_query(record)
+                .await
+                .map_err(|e| query_error("Graph source check", e))?;
+        }
+        Ok(record)
+    }
+
     /// The graph source's record, unless it was dropped: a drop leaves the
     /// record as a tombstone, which no query may resolve.
     async fn lookup_live(
@@ -296,23 +337,16 @@ impl FlureeIndexProvider<'_> {
         }
     }
 
-    /// Get deployment configuration for a graph source.
-    ///
-    /// Looks up the graph source record from nameservice and parses the deployment
-    /// configuration from its JSON config. Defaults to embedded mode if
-    /// no deployment config is specified.
-    async fn get_deployment_config(
-        &self,
-        graph_source_id: &str,
+    /// The deployment configuration in a graph source's `record`. Defaults to
+    /// embedded mode when there is no record, or it names none: a search of a
+    /// missing graph source fails later, with a more specific error.
+    fn deployment_of(
+        record: Option<&fluree_db_nameservice::GraphSourceRecord>,
     ) -> QueryResult<SearchDeploymentConfig> {
-        let Some(record) = self.lookup_live(graph_source_id).await? else {
-            // Graph source not found - return default embedded mode
-            // The actual search will fail later with a more specific error
-            return Ok(SearchDeploymentConfig::default());
-        };
-
-        // Try to parse deployment config from the graph source's JSON config
-        parse_deployment_from_gs_config(&record.config)
+        match record {
+            Some(record) => parse_deployment_from_gs_config(&record.config),
+            None => Ok(SearchDeploymentConfig::default()),
+        }
     }
 }
 
@@ -322,9 +356,11 @@ impl FlureeIndexProvider<'_> {
     /// Handles the full lifecycle (manifest, snapshot selection, sync, selective
     /// leaflet loading, scoring) — same contract as `EmbeddedBm25SearchProvider`
     /// but fetches only the posting leaflets needed for the query terms.
+    #[allow(clippy::too_many_arguments)]
     async fn search_bm25_selective(
         &self,
         graph_source_id: &str,
+        record: Option<&fluree_db_nameservice::GraphSourceRecord>,
         query_text: &str,
         limit: usize,
         as_of_t: Option<i64>,
@@ -334,7 +370,7 @@ impl FlureeIndexProvider<'_> {
         // Load manifest
         let manifest = self
             .fluree
-            .load_or_create_bm25_manifest(graph_source_id)
+            .bm25_manifest_of(graph_source_id, record)
             .await
             .map_err(|e| QueryError::Internal(format!("Manifest load error: {e}")))?;
 
@@ -343,7 +379,10 @@ impl FlureeIndexProvider<'_> {
 
         // Load snapshot bytes
         let snapshot_bytes = if let Some(entry) = selection {
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             cs.get(&entry.snapshot_id)
                 .await
                 .map_err(|e| QueryError::Internal(format!("Storage error: {e}")))?
@@ -352,7 +391,7 @@ impl FlureeIndexProvider<'_> {
             self.fluree
                 .sync_bm25_index(graph_source_id)
                 .await
-                .map_err(|e| QueryError::Internal(format!("Sync error: {e}")))?;
+                .map_err(|e| query_error("Sync error", e))?;
 
             let manifest = self
                 .fluree
@@ -366,7 +405,10 @@ impl FlureeIndexProvider<'_> {
                 ))
             })?;
 
-            let cs = self.fluree.content_store(graph_source_id);
+            let cs = self
+                .fluree
+                .graph_source_store(graph_source_id)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
             cs.get(&entry.snapshot_id)
                 .await
                 .map_err(|e| QueryError::Internal(format!("Storage error: {e}")))?
@@ -441,13 +483,15 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
         graph_source_id: &str,
         params: VectorSearchParams<'_>,
     ) -> QueryResult<Vec<VectorSearchHit>> {
-        // Look up graph source record to get deployment configuration
-        let deployment_config = self.get_deployment_config(graph_source_id).await?;
+        // The graph source's record, for its deployment and its index.
+        let record = self.checked_record(graph_source_id).await?;
+        let deployment_config = Self::deployment_of(record.as_ref())?;
 
         match deployment_config.mode {
             DeploymentMode::Embedded => {
                 debug!(graph_source_id = %graph_source_id, "Using embedded vector search mode");
-                self.search_vector_embedded(graph_source_id, &params).await
+                self.search_vector_embedded(graph_source_id, record, &params)
+                    .await
             }
             #[cfg(feature = "search-remote-client")]
             DeploymentMode::Remote => {
@@ -472,27 +516,18 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
 
     /// Check if a vector index collection exists for the given graph source alias.
     async fn collection_exists(&self, graph_source_id: &str) -> QueryResult<bool> {
-        let record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
-
-        Ok(record.is_some() && record.map(|r| !r.retracted).unwrap_or(false))
+        match self.lookup_live(graph_source_id).await {
+            Ok(record) => Ok(record.is_some()),
+            Err(QueryError::InvalidQuery(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The expanded embedding property IRI this graph source indexes, read from
     /// the published graph-source record config. Used to enforce view policy on
     /// vector search hits.
     async fn embedding_property(&self, graph_source_id: &str) -> QueryResult<Option<String>> {
-        let Some(record) = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
-        else {
+        let Some(record) = self.lookup_live(graph_source_id).await? else {
             return Ok(None);
         };
         let config: serde_json::Value = serde_json::from_str(&record.config)
@@ -526,6 +561,7 @@ impl FlureeIndexProvider<'_> {
     async fn search_vector_embedded(
         &self,
         graph_source_id: &str,
+        record: Option<fluree_db_nameservice::GraphSourceRecord>,
         params: &VectorSearchParams<'_>,
     ) -> QueryResult<Vec<VectorSearchHit>> {
         use fluree_db_query::vector::usearch::deserialize;
@@ -533,10 +569,7 @@ impl FlureeIndexProvider<'_> {
         let _ = params.timeout_ms; // Reserved for future use
 
         // Load head snapshot via nameservice head pointer
-        let record = self
-            .lookup_live(graph_source_id)
-            .await?
-            .ok_or_else(|| graph_source_not_found(graph_source_id))?;
+        let record = record.ok_or_else(|| graph_source_not_found(graph_source_id))?;
 
         // Vector indexes are head-only. A single-ledger view always names its
         // `t`, so `as_of_t` alone is not time travel: only a request for a
@@ -562,7 +595,7 @@ impl FlureeIndexProvider<'_> {
                     self.fluree
                         .sync_vector_index(graph_source_id)
                         .await
-                        .map_err(|e| QueryError::Internal(format!("Sync error: {e}")))?;
+                        .map_err(|e| query_error("Sync error", e))?;
 
                     // Re-lookup after sync
                     let record = self.lookup_live(graph_source_id).await?.ok_or_else(|| {
@@ -585,7 +618,10 @@ impl FlureeIndexProvider<'_> {
         };
 
         // Load and deserialize via content store
-        let cs = self.fluree.content_store(graph_source_id);
+        let cs = self
+            .fluree
+            .graph_source_store(graph_source_id)
+            .map_err(|e| QueryError::Internal(e.to_string()))?;
         let bytes = cs
             .get(&index_id)
             .await

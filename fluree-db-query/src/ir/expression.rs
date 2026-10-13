@@ -1117,6 +1117,8 @@ pub enum Function {
     XsdDateTime,
     XsdDate,
     XsdTime,
+    /// Cypher `toFloat(x)`: `xsd:double(x)` with Cypher's string spellings.
+    CypherToFloat,
 
     // =========================================================================
     // Path functions (Cypher shortestPath result values)

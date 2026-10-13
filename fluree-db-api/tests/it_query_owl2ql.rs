@@ -13,7 +13,7 @@ use serde_json::json;
 #[tokio::test]
 async fn owl2ql_equivalent_property_expands_across_properties() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/owl2ql:equivalent-property");
+    let ledger0 = genesis_ledger(&fluree, "query/owl2ql:equivalent-property").await;
 
     // Define p2 owl:equivalentProperty p1
     let schema = json!({
@@ -51,7 +51,7 @@ async fn owl2ql_equivalent_property_expands_across_properties() {
 #[tokio::test]
 async fn noncanonical_reasoning_string_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/owl2ql:reject-alias");
+    let ledger0 = genesis_ledger(&fluree, "query/owl2ql:reject-alias").await;
 
     let data = json!({"@context":{"ex":"http://example.org/"},"@id":"ex:s","ex:p1":"v"});
     let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;

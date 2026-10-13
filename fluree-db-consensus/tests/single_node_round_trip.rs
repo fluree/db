@@ -30,10 +30,12 @@ use fluree_db_consensus::raft::state_machine::{
 use fluree_db_consensus::raft::state_machine_adapter::{NameServiceObserver, StateMachineAdapter};
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
+use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_nameservice::lifecycle::{self, BranchDrop};
+use fluree_db_nameservice::testing::CurrentFence;
 use fluree_db_nameservice::{
-    BranchLifecycle, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, IndexPublisher,
-    LedgerEventBus, LedgerLifecycle, NameServiceError, NameServiceEvent, NameServiceLookup,
-    NsRecordSnapshot, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    ConfigCasResult, ConfigLookup, ConfigValue, LedgerEventBus, NameServiceError, NameServiceEvent,
+    NameServiceLookup, NsRecordSnapshot, StatusCasResult, StatusLookup, StatusValue,
     SubscriptionScope,
 };
 
@@ -76,6 +78,14 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>> {
         panic!("single-node Raft should never invoke vote");
     }
+}
+
+fn drain(sub: &mut fluree_db_nameservice::Subscription) -> Vec<NameServiceEvent> {
+    std::iter::from_fn(|| sub.receiver.try_recv().ok()).collect()
+}
+
+fn lid(s: &str) -> LedgerId {
+    LedgerId::parse(s).unwrap()
 }
 
 fn cid(seed: u8) -> ContentId {
@@ -142,7 +152,7 @@ async fn single_node_raft_index_publisher_round_trip() {
     };
     let config = Arc::new(config.validate().unwrap());
 
-    let raft = Raft::new(1, config, StubFactory, log, sm).await.unwrap();
+    let raft = Arc::new(Raft::new(1, config, StubFactory, log, sm).await.unwrap());
 
     let mut members = BTreeMap::new();
     members.insert(1u64, ClusterNode::default());
@@ -153,15 +163,12 @@ async fn single_node_raft_index_publisher_round_trip() {
         .await
         .unwrap();
 
-    // Bootstrap the ledger + a commit so the index publish has
-    // something to attach to.
-    raft.client_write(SmCommand::CreateLedger(NewLedger {
-        ledger_id: "test/db".into(),
-        branch: "main".into(),
-        created_at_millis: 1_000,
-    }))
-    .await
-    .unwrap();
+    // Create the ledger and a commit so the index publish has something
+    // to attach to.
+    let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft));
+    lifecycle::create_ledger(&ns, &LedgerId::parse("test/db:main").unwrap())
+        .await
+        .expect("create");
 
     // Drive the queue path end-to-end: enqueue a fake transaction
     // envelope, then apply its head. Equivalent setup to the
@@ -197,8 +204,7 @@ async fn single_node_raft_index_publisher_round_trip() {
     .unwrap();
 
     // Publish through the combined RaftNameService.
-    let raft_arc = Arc::new(raft);
-    let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft_arc));
+    let raft_arc = raft;
     ns.publish_index("test/db:main", 10, &cid(42))
         .await
         .expect("publish_index ok");
@@ -348,110 +354,10 @@ async fn single_node_apply_emits_commit_event_on_bus() {
 }
 
 #[tokio::test]
-async fn single_node_ledger_lifecycle_round_trip() {
-    // init → retract → purge → init (alias reusable) — driven
-    // entirely through the LedgerLifecycle trait surface on
-    // RaftNameService, so the test exercises the same path
-    // production HTTP routes will.
-
-    let storage = Arc::new(MemoryRaftStorage::new());
-    let bus = Arc::new(LedgerEventBus::new(16));
-    let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(
-        Arc::clone(&storage),
-        NameServiceObserver::new().with_event_bus(Arc::clone(&bus)),
-    );
-    let shared_state = sm.shared_state();
-
-    let config = Config {
-        cluster_name: "single-node-lifecycle".into(),
-        election_timeout_min: 150,
-        election_timeout_max: 300,
-        heartbeat_interval: 50,
-        ..Config::default()
-    };
-    let config = Arc::new(config.validate().unwrap());
-    let raft = Arc::new(Raft::new(1, config, StubFactory, log, sm).await.unwrap());
-
-    let mut members = BTreeMap::new();
-    members.insert(1u64, ClusterNode::default());
-    raft.initialize(members).await.unwrap();
-
-    raft.wait(Some(Duration::from_secs(5)))
-        .state(ServerState::Leader, "leader after self-election")
-        .await
-        .unwrap();
-
-    let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft));
-    let mut sub = bus.subscribe(SubscriptionScope::All);
-
-    // init registers the branch unborn.
-    ns.init("test/db:main").await.expect("init ok");
-    let record = ns.lookup("test/db:main").await.unwrap().expect("record");
-    assert_eq!(record.ledger_id, "test/db:main");
-    assert_eq!(record.commit_head_id, None);
-    assert!(!record.retracted);
-
-    // Duplicate init returns the typed LedgerAlreadyExists error.
-    match ns.init("test/db:main").await {
-        Err(NameServiceError::LedgerAlreadyExists(id)) => {
-            assert_eq!(id, "test/db:main");
-        }
-        other => panic!("expected LedgerAlreadyExists, got {other:?}"),
-    }
-
-    // retract flips the record to retracted; lookup keeps returning
-    // it (with the flag) until purge clears it.
-    ns.retract("test/db:main").await.expect("retract ok");
-    let record = ns.lookup("test/db:main").await.unwrap().expect("record");
-    assert!(record.retracted);
-
-    // The first event on the bus is the retract.
-    match sub.receiver.try_recv().expect("event present") {
-        NameServiceEvent::LedgerRetracted { ledger_id } => {
-            assert_eq!(ledger_id, "test/db:main");
-        }
-        other => panic!("expected LedgerRetracted, got {other:?}"),
-    }
-
-    // Idempotent retract is Ok and emits nothing.
-    ns.retract("test/db:main")
-        .await
-        .expect("retract idempotent");
-    assert!(sub.receiver.try_recv().is_err());
-
-    // Init still refuses while the record is retracted.
-    match ns.init("test/db:main").await {
-        Err(NameServiceError::LedgerAlreadyExists(_)) => {}
-        other => panic!("expected LedgerAlreadyExists, got {other:?}"),
-    }
-
-    // purge clears the alias. Emits LedgerRetracted again since the
-    // branch transitioned from "present" to "absent".
-    ns.purge("test/db:main").await.expect("purge ok");
-    assert!(ns.lookup("test/db:main").await.unwrap().is_none());
-    match sub.receiver.try_recv().expect("event present") {
-        NameServiceEvent::LedgerRetracted { ledger_id } => {
-            assert_eq!(ledger_id, "test/db:main");
-        }
-        other => panic!("expected LedgerRetracted, got {other:?}"),
-    }
-
-    // Idempotent purge of an already-purged branch is Ok and silent.
-    ns.purge("test/db:main").await.expect("purge idempotent");
-    assert!(sub.receiver.try_recv().is_err());
-
-    // The alias is reusable now.
-    ns.init("test/db:main").await.expect("init after purge");
-
-    raft.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn single_node_branch_lifecycle_round_trip() {
-    // init main → seed head → create_branch feature → reset_head on
-    // main → drop_branch feature — driven entirely through the
-    // BranchLifecycle trait surface on RaftNameService.
+    // create main → seed head → create branch feature → reset_head on
+    // main → drop feature — driven through the lifecycle protocols on
+    // RaftNameService.
 
     let storage = Arc::new(MemoryRaftStorage::new());
     let bus = Arc::new(LedgerEventBus::new(16));
@@ -485,7 +391,9 @@ async fn single_node_branch_lifecycle_round_trip() {
 
     // Set up: init main and seed it with a head so create_branch
     // has something to fork from. Drive the queue path end-to-end.
-    ns.init("test/db:main").await.expect("init main");
+    lifecycle::create_ledger(&ns, &LedgerId::parse("test/db:main").unwrap())
+        .await
+        .expect("create main");
     let enqueue_resp = raft
         .client_write(SmCommand::EnqueueCommand(QueueSubmission {
             ledger_id: "test/db".into(),
@@ -514,11 +422,23 @@ async fn single_node_branch_lifecycle_round_trip() {
     }))
     .await
     .unwrap();
-    // Drain seed commit event.
-    let _ = sub.receiver.try_recv().expect("seed commit event");
+    // Activating main announces it, naming its ledger.
+    let instance = ns
+        .lookup("test/db:main")
+        .await
+        .unwrap()
+        .and_then(|r| r.instance())
+        .expect("main resolves with its instance");
+    let created = |ledger_id: &str| NameServiceEvent::LedgerCreated {
+        ledger_id: lid(ledger_id),
+        instance: instance.clone(),
+    };
+    let events = drain(&mut sub);
+    assert!(events.contains(&created("test/db:main")), "{events:?}");
 
     // Fork feature from main.
-    ns.create_branch("test/db", "feature", "main", None)
+    let name = LedgerName::parse("test/db").unwrap();
+    lifecycle::create_branch(&ns, &name, "feature", "main", None)
         .await
         .expect("create_branch");
     let feature = ns
@@ -533,20 +453,22 @@ async fn single_node_branch_lifecycle_round_trip() {
     assert_eq!(main.branches, 1);
 
     // create_branch fires a LedgerCommitPublished against the new
-    // branch so the indexer picks it up.
-    match sub.receiver.try_recv().expect("create-branch event") {
-        NameServiceEvent::LedgerCommitPublished { ledger_id, .. } => {
-            assert_eq!(ledger_id, "test/db:feature");
-        }
-        other => panic!("expected LedgerCommitPublished, got {other:?}"),
-    }
+    // branch so the indexer picks it up, and announces it.
+    let events = drain(&mut sub);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            NameServiceEvent::LedgerCommitPublished { ledger_id, .. }
+                if *ledger_id == lid("test/db:feature")
+        )),
+        "{events:?}"
+    );
+    assert!(events.contains(&created("test/db:feature")), "{events:?}");
 
-    // Trying to drop main while it has a child returns a storage
-    // error.
-    assert!(matches!(
-        ns.drop_branch("test/db:main").await,
-        Err(NameServiceError::Storage(_))
-    ));
+    // The root branch cannot be dropped on its own.
+    assert!(lifecycle::begin_drop_branch(&ns, &name, "main")
+        .await
+        .is_err());
 
     // reset_head rewrites main's head non-monotonically. Forwards
     // through the same client_write path.
@@ -565,23 +487,57 @@ async fn single_node_branch_lifecycle_round_trip() {
     assert_eq!(main.commit_head_id, Some(cid(0)));
     assert_eq!(main.commit_t, 0);
 
-    // Drop feature; parent_branches comes back as 0.
-    let parent = ns.drop_branch("test/db:feature").await.expect("drop");
-    assert_eq!(parent, Some(0));
+    // Drop feature: a leaf, so its record goes, and main is left without
+    // children.
+    let BranchDrop::Purge(record) = lifecycle::begin_drop_branch(&ns, &name, "feature")
+        .await
+        .expect("drop")
+    else {
+        panic!("a leaf branch drop purges");
+    };
+    let parent = lifecycle::finish_drop_branch(&ns, &name, &record)
+        .await
+        .expect("finish drop");
+    assert!(parent.is_none(), "main is not dropped, so nothing cascades");
     assert!(ns.lookup("test/db:feature").await.unwrap().is_none());
+    assert_eq!(
+        ns.lookup("test/db:main").await.unwrap().unwrap().branches,
+        0
+    );
 
-    match sub.receiver.try_recv().expect("drop-branch event") {
-        NameServiceEvent::LedgerRetracted { ledger_id } => {
-            assert_eq!(ledger_id, "test/db:feature");
-        }
-        other => panic!("expected LedgerRetracted, got {other:?}"),
-    }
+    let events = drain(&mut sub);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            NameServiceEvent::LedgerRetracted { ledger_id, .. }
+                if *ledger_id == lid("test/db:feature")
+        )),
+        "{events:?}"
+    );
 
-    // drop_branch on a missing branch surfaces NotFound.
+    // Dropping a missing branch surfaces NotFound.
     assert!(matches!(
-        ns.drop_branch("test/db:ghost").await,
+        lifecycle::begin_drop_branch(&ns, &name, "ghost").await,
         Err(NameServiceError::NotFound(_))
     ));
+
+    // A ledger drop names the ledger in its retraction; a restore announces
+    // it again.
+    drain(&mut sub);
+    lifecycle::drop_ledger(&ns, &name, false)
+        .await
+        .expect("drop ledger");
+    let events = drain(&mut sub);
+    let retracted = NameServiceEvent::LedgerRetracted {
+        ledger_id: lid("test/db:main"),
+        instance: Some(instance.clone()),
+    };
+    assert!(events.contains(&retracted), "{events:?}");
+    lifecycle::restore_dropped(&ns, &instance)
+        .await
+        .expect("restore");
+    let events = drain(&mut sub);
+    assert!(events.contains(&created("test/db:main")), "{events:?}");
 
     raft.shutdown().await.unwrap();
 }
@@ -627,7 +583,9 @@ async fn single_node_status_config_round_trip_normalizes_ledger_id() {
         .unwrap();
 
     let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft));
-    ns.init("test/db:main").await.expect("init ok");
+    lifecycle::create_ledger(&ns, &LedgerId::parse("test/db:main").unwrap())
+        .await
+        .expect("create");
 
     // Push under the bare name; read under the full form.
     let pushed_status = StatusValue::new(2, Default::default());

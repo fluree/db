@@ -115,7 +115,7 @@ Twin ledger 'dw-gs-twin:main' built and verified: 35238778 flakes, index t=42.
 `--output pack`:
 
 ```
-Twin packed to dw-gs-twin_main.flpack (35238778 flakes). The source twin ledger 'dw-gs-twin:main' stays registered locally; drop it with `fluree drop dw-gs-twin --force` when no longer needed.
+Twin packed to dw-gs-twin_main.flpack (35238778 flakes). The source twin ledger 'dw-gs-twin:main' stays registered locally; drop it with `fluree drop dw-gs-twin --hard --force` when no longer needed.
 ```
 
 ## See Also

@@ -13,8 +13,7 @@
 //! WHERE patterns.
 
 use crate::support;
-use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{FlureeBuilder, LedgerState};
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -28,8 +27,10 @@ fn ctx() -> JsonValue {
 /// anonymous blank node and return the fluree handle + ledger.
 async fn seed_restriction(ledger_id: &str) -> (fluree_db_api::Fluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .update(
@@ -210,8 +211,10 @@ async fn jsonld_delete_insert_edits_blank_node_in_place() {
 #[tokio::test]
 async fn jsonld_plain_blank_label_still_mints_fresh() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let db0 = LedgerSnapshot::genesis("it/stable-bnode:fresh-mint");
-    let mut ledger = LedgerState::new(db0, Novelty::new(0));
+    let mut ledger = fluree
+        .create_ledger("it/stable-bnode:fresh-mint")
+        .await
+        .expect("create ledger");
 
     for tag in ["one", "two"] {
         ledger = fluree

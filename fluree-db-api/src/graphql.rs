@@ -841,6 +841,9 @@ type ShapeCache =
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeCacheKey {
     ledger_id: fluree_db_core::LedgerId,
+    /// A ledger dropped and created again under its name starts its `t` and
+    /// epochs over, so only the instance tells the two apart.
+    instance: u128,
     index_t: i64,
     shacl_epoch: u64,
     /// The compiled shapes bake in subclass expansion, so a hierarchy change
@@ -861,6 +864,7 @@ fn shape_cache_key(db: &GraphDb) -> Option<ShapeCacheKey> {
     let novelty = db.novelty_for_stats()?;
     Some(ShapeCacheKey {
         ledger_id: db.snapshot.ledger_id.clone(),
+        instance: db.instance_bits,
         index_t: db.snapshot.t,
         shacl_epoch: novelty.shacl_epoch,
         schema_epoch: novelty.schema_epoch,

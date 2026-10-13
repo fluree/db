@@ -53,7 +53,8 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`use`](use.md) | Set the active ledger |
 | [`list`](list.md) | List all ledgers |
 | [`info`](info.md) | Show detailed information about a ledger |
-| [`drop`](drop.md) | Drop (delete) a ledger |
+| [`drop`](drop.md) | Drop a ledger, keeping its data restorable (`--hard` deletes it) |
+| [`dropped`](dropped.md) | List, restore or purge dropped ledgers |
 | [`graph`](graph.md) | Manage named graphs within a ledger (list, drop) |
 | [`branch`](branch.md) | Branches: create, list, drop, rebase, merge, diff, revert |
 | [`insert`](insert.md) | Insert data into a ledger |

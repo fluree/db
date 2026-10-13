@@ -18,7 +18,7 @@ use serde_json::json;
 /// 3 Person, 2 Company, 5 Country, 2 Maker (France + Japan have a maker).
 /// This is the exact dataset from the azure-chat repro.
 async fn seed_setop(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [

@@ -745,14 +745,13 @@ fn ctx_ex_schema() -> serde_json::Value {
 
 #[tokio::test]
 async fn insert_data_then_query_names() {
-    use fluree_db_api::{LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-insert:basic";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let inserted = fluree
         .insert(
@@ -788,14 +787,15 @@ async fn insert_data_then_query_names() {
 
 #[tokio::test]
 async fn insert_invalid_type_literal_errors() {
-    use fluree_db_api::{ApiError, LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
+    use fluree_db_api::ApiError;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-insert:invalid-type";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let txn = json!({
         "@context": {
@@ -834,14 +834,13 @@ async fn insert_invalid_type_literal_errors() {
 
 #[tokio::test]
 async fn retract_property_removes_only_that_property() {
-    use fluree_db_api::{LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-retraction:prop";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let seeded = fluree
         .insert(
@@ -898,14 +897,13 @@ async fn retract_property_removes_only_that_property() {
 
 #[tokio::test]
 async fn retracting_ordered_lists_removes_list_values() {
-    use fluree_db_api::{LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-retraction:list";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     let ctx = json!({
         "ex": "http://example.org/ns/",

@@ -392,7 +392,14 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
 
     // Serialize to canonical bytes and store in CAS.
     let canonical_bytes = config.to_bytes();
-    let content_store = fluree.content_store(&ledger_id);
+    let namespace = fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .ok_or_else(|| CliError::NotFound(format!("ledger '{ledger_id}' not found")))?
+        .storage_namespace();
+    let content_store = fluree.content_store(&namespace);
     let cid = content_store
         .put(ContentKind::LedgerConfig, &canonical_bytes)
         .await
@@ -416,10 +423,16 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
             extra: existing_payload.extra,
         }),
     );
+    let fence = fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to look up ledger: {e}")))?
+        .and_then(|record| record.fence);
     match fluree
         .publisher()
         .map_err(|e| CliError::Config(e.to_string()))?
-        .push_config(&ledger_id, current.as_ref(), &new_config)
+        .push_config_fenced(&ledger_id, fence, current.as_ref(), &new_config)
         .await
         .map_err(|e| CliError::Config(format!("failed to set config: {e}")))?
     {

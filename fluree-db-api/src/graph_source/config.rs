@@ -1279,6 +1279,7 @@ impl IcebergCreateConfig {
             delete: self.delete_convention.clone(),
             order_by: self.order_by.clone(),
             model: self.model.clone(),
+            model_instance: None,
             default_allow: self.default_allow,
         }
     }

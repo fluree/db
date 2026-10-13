@@ -17,7 +17,7 @@ async fn seed_two_commits(
     fluree: &MemoryFluree,
     ledger_id: &str,
 ) -> (fluree_db_api::LedgerState, i64, i64) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let tx1 = json!({
         "@context": {"ex": "http://example.org/"},
@@ -160,7 +160,7 @@ async fn commit_t_resolves_indexed_commit_from_txn_meta_post_lookup() {
 /// Seed a ledger with users, identity, and policy rules for SSN restriction.
 /// Returns the ledger state after setup (t=1) with policies loaded.
 async fn seed_ledger_with_policy(fluree: &MemoryFluree, ledger_id: &str) -> (LedgerState, i64) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // Insert users + identity + policies in one transaction
     let setup = json!({

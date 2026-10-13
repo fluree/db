@@ -260,6 +260,11 @@ with two adjustments, because D has nowhere to hold identity records:
 matters for `f:query` rules — and those cannot run against a virtual source
 anyway. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
 
+The source records which ledger its model was when it was registered. If
+that ledger is dropped and another created under its name, queries against
+the source fail with `409` (`err:db/GraphSourceSuspended`) instead of
+applying the new ledger's policies.
+
 One merge subtlety: an identity counts as a request policy input,
 so under the default `f:overrideControl` (`f:OverrideAll`) the
 request's options take precedence and the config's
@@ -492,7 +497,7 @@ Specifics:
   its namespace; a constraint over vocabulary D has never seen
   anywhere is silently inert (no rows, never an error).
 - **Steady-state cost is one nameservice lookup.** The wire is
-  cached per `(model, graph, resolved_t)` and the *compiled*
+  cached per `(model, graph, head)` and the *compiled*
   shapes (including parsed `sh:sparql` queries) are reused
   across transactions while M's head and D's shape-affecting
   epochs are unchanged. A commit on M invalidates both on the
@@ -658,11 +663,14 @@ clients can branch on the specific failure.
 ## Behavior on model ledger updates
 
 There is no explicit invalidation channel. The cache key includes
-the model ledger's `resolved_t` (its commit head at the time of
-capture), so new commits to M produce new cache keys
+the model ledger's head at the time of capture, its `t` and head
+commit id, and its instance, so new commits to M, and a new ledger
+created under M's name after a drop, produce new cache keys
 automatically. The next request after M advances captures the
 new head; older entries age out under the cache's LRU/TinyLFU
-policy.
+policy. This holds across servers sharing the storage and
+nameservice: one whose ledger cache still holds a dropped M enforces
+the M created after it.
 
 Within a single request, every cross-ledger reference to the
 same M reuses one `resolved_t` value. Policy and any future
@@ -673,6 +681,14 @@ If M is dropped while D references it, the next request against
 D that needs governance from M fails closed with
 `ModelLedgerMissing`. D isn't proactively notified — the
 failure surface is the next request.
+
+`f:ledger` names a ledger, not one incarnation of it. If another
+ledger is later created under M's name, its artifacts govern D
+from the next request, so creating a ledger under a model
+ledger's name is as privileged as writing to the model ledger.
+A [virtual graph source](#virtual-graph-sources-iceberg--sql) is
+the exception: it records the model ledger it was registered
+with.
 
 ## Related
 

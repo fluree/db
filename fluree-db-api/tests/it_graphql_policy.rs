@@ -20,7 +20,7 @@ fn context() -> JsonValue {
 /// Two classes and a sensitive property, so a policy has something to remove in
 /// each dimension.
 async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> LedgerState {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger,
@@ -198,7 +198,7 @@ async fn a_denied_class_cannot_be_queried() {
 #[tokio::test]
 async fn a_per_subject_policy_filters_the_returned_data() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "gql-policy-per-subject:main");
+    let ledger = genesis_ledger(&fluree, "gql-policy-per-subject:main").await;
     let ledger = fluree
         .insert(
             ledger,

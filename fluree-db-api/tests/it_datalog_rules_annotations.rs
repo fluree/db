@@ -16,7 +16,7 @@ use serde_json::json;
 /// Four claims over three edges: alice→bob (0.8 from A, 0.9 from B),
 /// bob→carol (0.5 from A), carol→dave (0.95 from B).
 async fn claims_ledger(fluree: &MemoryFluree, name: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, name);
+    let ledger0 = genesis_ledger(fluree, name).await;
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -245,7 +245,7 @@ async fn jsonld_rule_expands_bare_context_mapped_keys_and_types() {
     // their prefixed spellings. The old rule parser encoded them literally and
     // silently matched nothing.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "rules/annotations/bare-terms");
+    let ledger0 = genesis_ledger(&fluree, "rules/annotations/bare-terms").await;
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -760,7 +760,7 @@ async fn fact_budget_bounds_a_single_round() {
     // closure is 780 facts. A cap of 50 must stop INSIDE the round that
     // crosses it, not after the round has derived everything.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "rules/budget");
+    let ledger0 = genesis_ledger(&fluree, "rules/budget").await;
     let nodes: Vec<serde_json::Value> = (0..40)
         .map(|i| json!({"@id": format!("ex:n{i}"), "ex:knows": {"@id": format!("ex:n{}", i + 1)}}))
         .collect();
@@ -905,7 +905,7 @@ async fn unquoted_atoms_are_iris_only_where_terms_are_compared() {
     // bound by `bind` is a literal, as it was before 4.2, not a ref.
     let written = fluree
         .insert(
-            genesis_ledger(&fluree, "rules/atom-positions-bind"),
+            genesis_ledger(&fluree, "rules/atom-positions-bind").await,
             &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:seed": 1}),
         )
         .await

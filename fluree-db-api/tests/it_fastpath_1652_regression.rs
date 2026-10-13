@@ -109,8 +109,9 @@ fn star_turtle() -> String {
 /// Chain ledger: `?a ex:sigPub ?b . ?b rdf:type ?c` with a `rdfs:subClassOf`
 /// tail on `?c` (classes c-0/c-1 have 2/1 superclasses, the rest none), plus a
 /// mixed-object `ex:kind` second hop and literal objects sprinkled into
-/// `sigPub` itself. Indexed with 3-row leaflets so object groups of the POST
-/// walk straddle leaflet boundaries — the shape that lost rows.
+/// `sigPub` itself, and an all-IRI `ex:cites` (a → b) to head an OPTIONAL
+/// chain. Indexed with 3-row leaflets so object groups of the POST walk
+/// straddle leaflet boundaries — the shape that lost rows.
 fn chain_turtle() -> String {
     let mut buf = String::from(
         "@prefix ex: <http://example.org/ns/> .\n\
@@ -141,6 +142,9 @@ fn chain_turtle() -> String {
             buf.push_str(&format!(", \"lit-{i}\" "));
         }
         buf.push_str(" .\n");
+    }
+    for i in 0..N_A {
+        buf.push_str(&format!("ex:a-{i:04} ex:cites ex:b-{:04} .\n", i % N_B));
     }
     buf
 }
@@ -413,6 +417,17 @@ fn cases() -> Vec<Case> {
             sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c .\n\
                      MINUS { ?c rdfs:subClassOf ?d . } }",
             expected: &["[52]"],
+            routing: MustFire(PLAN_SITE),
+        },
+        // OPTIONAL chain head through the mixed-object hop: `ex:kind`'s mixed
+        // leaflets must decode `o_type` so its literals weigh 0. Only b-0000
+        // reaches a class with superclasses (c-0, two), and a-0/a-25 cite it.
+        Case {
+            name: "chain-head COUNT(*) OPTIONAL through mixed-object hop",
+            ledger: Chain,
+            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:cites ?b .\n\
+                     OPTIONAL { ?b ex:kind ?c . ?c rdfs:subClassOf ?d . } }",
+            expected: &["[42]"],
             routing: MustFire(PLAN_SITE),
         },
         // ---- Case 3: composite (s,o) join ---------------------------------

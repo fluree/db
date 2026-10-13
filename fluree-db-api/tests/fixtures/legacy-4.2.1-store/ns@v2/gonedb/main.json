@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "@id": "gonedb:main",
+  "@type": [
+    "f:LedgerSource"
+  ],
+  "f:ledger": {
+    "@id": "gonedb"
+  },
+  "f:branch": "main",
+  "f:commitCid": "bagaybqabciqefpgptzegcdx4mg7qvh65e52mo74mi6xenfdyxuri3jf6gcrczgq",
+  "f:t": 1,
+  "f:status": "retracted",
+  "f:statusV": 2,
+  "f:configV": 0
+}

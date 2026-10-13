@@ -161,6 +161,8 @@ fluree-test-support = { path = "../fluree-test-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+# The lifecycle conformance suite, run here against DynamoDB on LocalStack.
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false, features = ["conformance"] }
 wiremock = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native
@@ -379,6 +381,18 @@ path = "tests/it_fastpath_1863_regression.rs"
 [[test]]
 name = "it_geo_search_routing"
 path = "tests/it_geo_search_routing.rs"
+required-features = ["native"]
+
+# Own binary: toggles the fast-path kill switch and asserts routing.
+# Own binary: asserts which index build path ran through span capture.
+[[test]]
+name = "it_index_unindexable"
+path = "tests/it_index_unindexable.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_xsd_double_fast_paths"
+path = "tests/it_xsd_double_fast_paths.rs"
 required-features = ["native"]
 
 # Own binary: toggles the process-global fast-path kill switch.
@@ -784,6 +798,10 @@ required-features = ["native"]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Test hooks: halting a ledger, and building incrementally without fallback.
+fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 moka = { workspace = true }

@@ -929,6 +929,19 @@ pub enum SubmissionError {
     #[error("{message}")]
     CommitNotFound { message: String },
 
+    /// The ledger was dropped, restored or replaced since the writer loaded
+    /// it (HTTP 409, `err:db/Fenced`). Typed because an `Execution` 409
+    /// reads as a commit conflict, which is safe to retry; this is not until
+    /// the writer reloads. `message` names the ledger.
+    #[error("{message}")]
+    Fenced { message: String },
+
+    /// A create, drop, restore or purge of the ledger is under way (HTTP 409,
+    /// `err:db/LifecycleConflict`). Typed for the same reason as
+    /// [`Self::Fenced`].
+    #[error("{message}")]
+    LifecycleConflict { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -969,6 +982,8 @@ impl SubmissionError {
             Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
             // Decided before commit construction, like the novelty refusals.
             Self::DatatypeLimitExceeded { .. } | Self::CommitNotFound { .. } => true,
+            // Refused at publication: the commit never landed.
+            Self::Fenced { .. } | Self::LifecycleConflict { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }
@@ -995,6 +1010,15 @@ impl SubmissionError {
 #[async_trait]
 pub trait Committer: Send + Sync {
     /// Stage and commit a transaction.
+    /// The ledger's current instance, as the bits of its ULID
+    /// ([`LedgerState::instance_bits`](fluree_db_api::LedgerState::instance_bits)),
+    /// when this committer can tell cheaply; `None` when it cannot. An
+    /// idempotency cache uses it to tell a ledger from one dropped before it
+    /// under the same name, whose answers it must not give.
+    async fn ledger_instance(&self, _ledger_id: &str) -> Option<u128> {
+        None
+    }
+
     async fn transact(
         &self,
         request: TransactionRequest,

@@ -37,7 +37,7 @@ async fn seed_divergent_ledgers(fluree: &MemoryFluree) {
     // Authors — entity prefix `author`.
     fluree
         .insert(
-            genesis_ledger(fluree, "test/authors:main"),
+            genesis_ledger(fluree, "test/authors:main").await,
             &json!({
                 "@context": {
                     "author": "http://author.example/",
@@ -56,7 +56,7 @@ async fn seed_divergent_ledgers(fluree: &MemoryFluree) {
     // Books — entity prefix `book`; author ref points into `author` namespace.
     fluree
         .insert(
-            genesis_ledger(fluree, "test/books:main"),
+            genesis_ledger(fluree, "test/books:main").await,
             &json!({
                 "@context": {
                     "book": "http://book.example/",
@@ -84,7 +84,7 @@ async fn seed_divergent_ledgers(fluree: &MemoryFluree) {
     // dict has no `http://author.example/` entry (or a colliding code).
     fluree
         .insert(
-            genesis_ledger(fluree, "test/movies:main"),
+            genesis_ledger(fluree, "test/movies:main").await,
             &json!({
                 "@context": {
                     "movie": "http://movie.example/",
@@ -256,7 +256,7 @@ async fn flat_select_cross_graph_iri_decode() {
 async fn seed_divergent_predicate_ledgers(fluree: &MemoryFluree) {
     fluree
         .insert(
-            genesis_ledger(fluree, "test/catalog:main"),
+            genesis_ledger(fluree, "test/catalog:main").await,
             &json!({
                 "@context": {
                     "schema": "http://schema.org/",
@@ -274,7 +274,7 @@ async fn seed_divergent_predicate_ledgers(fluree: &MemoryFluree) {
 
     fluree
         .insert(
-            genesis_ledger(fluree, "test/people:main"),
+            genesis_ledger(fluree, "test/people:main").await,
             &json!({
                 "@context": {
                     "schema": "http://schema.org/",
@@ -424,7 +424,7 @@ async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
 
     fluree
         .insert(
-            genesis_ledger(&fluree, "catalog:main"),
+            genesis_ledger(&fluree, "catalog:main").await,
             &json!({
                 "@context": {"@vocab": "http://example.org/catalog/"},
                 "@graph": [
@@ -438,7 +438,7 @@ async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
 
     fluree
         .insert(
-            genesis_ledger(&fluree, "lists:main"),
+            genesis_ledger(&fluree, "lists:main").await,
             &json!({
                 "@context": {"@vocab": "http://example.org/lists/"},
                 "@graph": [
@@ -502,7 +502,7 @@ async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
 async fn seed_divergent_predicate_ref_ledgers(fluree: &MemoryFluree) {
     fluree
         .insert(
-            genesis_ledger(fluree, "test/catalog:main"),
+            genesis_ledger(fluree, "test/catalog:main").await,
             &json!({
                 "@context": {
                     "schema": "http://schema.org/",
@@ -521,7 +521,7 @@ async fn seed_divergent_predicate_ref_ledgers(fluree: &MemoryFluree) {
 
     fluree
         .insert(
-            genesis_ledger(fluree, "test/people:main"),
+            genesis_ledger(fluree, "test/people:main").await,
             &json!({
                 "@context": {
                     "schema": "http://schema.org/",
@@ -700,7 +700,7 @@ async fn cross_graph_wildcard_refinement_divergent_ns() {
     // first; `sys.example` only via the cross-ledger ref → a higher code here.
     fluree
         .insert(
-            genesis_ledger(&fluree, "test/wr-app:main"),
+            genesis_ledger(&fluree, "test/wr-app:main").await,
             &json!({
                 "@context": {"app": "http://app.example/", "s": "http://sys.example/",
                              "id": "@id", "type": "@type"},
@@ -715,7 +715,7 @@ async fn cross_graph_wildcard_refinement_divergent_ns() {
     // `sys.example` registers first here → a lower code (divergent from app's).
     fluree
         .insert(
-            genesis_ledger(&fluree, "test/wr-sys:main"),
+            genesis_ledger(&fluree, "test/wr-sys:main").await,
             &json!({
                 "@context": {"s": "http://sys.example/", "id": "@id"},
                 "@graph": [
@@ -850,7 +850,7 @@ async fn cross_graph_root_projection_divergent_predicate() {
 async fn seed_split_subject_ledgers(fluree: &MemoryFluree) {
     fluree
         .insert(
-            genesis_ledger(fluree, "test/split-a:main"),
+            genesis_ledger(fluree, "test/split-a:main").await,
             &json!({
                 "@context": {
                     "skos": "http://www.w3.org/2004/02/skos/core#",
@@ -869,7 +869,7 @@ async fn seed_split_subject_ledgers(fluree: &MemoryFluree) {
 
     fluree
         .insert(
-            genesis_ledger(fluree, "test/split-b:main"),
+            genesis_ledger(fluree, "test/split-b:main").await,
             &json!({
                 "@context": {
                     "skos": "http://www.w3.org/2004/02/skos/core#",
