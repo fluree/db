@@ -2242,6 +2242,180 @@ async fn bind_onto_a_bound_variable_compares_terms_across_forms() {
     failures.assert_none();
 }
 
+/// Values a BIND computes for a variable that a pattern of the same group also
+/// binds: numbers of two datatypes (the double 7.0 and the integer 7 are
+/// different terms), a string, a subject IRI, and keys for an IRI built from a
+/// joined value.
+fn bind_target_fixture() -> JsonValue {
+    let xsd = |t: &str| format!("http://www.w3.org/2001/XMLSchema#{t}");
+    json!({
+        "@context": context(),
+        "@graph": [
+            {"@id": "ex:t1", "ex:w": {"@value": "7.0E0", "@type": xsd("double")}},
+            {"@id": "ex:t2", "ex:w": {"@value": "3", "@type": xsd("integer")}},
+            {"@id": "ex:t3", "ex:w": {"@value": "2.5E0", "@type": xsd("double")}},
+            {"@id": "ex:t4", "ex:w": "seven"},
+            {"@id": "ex:t5", "ex:w": {"@value": "7", "@type": xsd("integer")}},
+            {"@id": "ex:alice", "ex:name": "Alice"},
+            {"@id": "ex:a", "ex:num": {"@value": "3", "@type": xsd("integer")}},
+            {"@id": "ex:b", "ex:num": {"@value": "4", "@type": xsd("integer")}},
+            {"@id": "ex:v3", "ex:val": "three"}
+        ]
+    })
+}
+
+/// A BIND followed by a pattern that binds the same variable joins on the
+/// computed term, in every index state. The planner runs the pattern first and
+/// applies the BIND as a check that the row's value is the computed one, so the
+/// scan's encoded value meets the expression's decoded one there. A number
+/// matches its own datatype only: `7` does not match the double `7.0`. The
+/// cases that fail without the fix all reach the join's inline check, the
+/// JSON-LD BIND after a MINUS included; none reaches the BIND operator's own
+/// check, and the BIND after a UNION passes with either check reverted.
+#[tokio::test(flavor = "current_thread")]
+async fn bind_then_a_pattern_on_its_target_joins_on_the_term() {
+    let sparql_cases: [(&str, &str, &[&str], Rows); 7] = [
+        (
+            "a double",
+            "SELECT ?t WHERE { BIND(7.0e0 AS ?x) ?t ex:w ?x }",
+            &["t"],
+            rows(&[&["t1"]]),
+        ),
+        (
+            "another double",
+            "SELECT ?t WHERE { BIND(2.5e0 AS ?x) ?t ex:w ?x }",
+            &["t"],
+            rows(&[&["t3"]]),
+        ),
+        (
+            "an integer",
+            "SELECT ?t WHERE { BIND(3 AS ?x) ?t ex:w ?x }",
+            &["t"],
+            rows(&[&["t2"]]),
+        ),
+        (
+            "an integer equal in value to a stored double",
+            "SELECT ?t WHERE { BIND(7 AS ?x) ?t ex:w ?x }",
+            &["t"],
+            rows(&[&["t5"]]),
+        ),
+        (
+            "a string",
+            "SELECT ?t WHERE { BIND(\"seven\" AS ?x) ?t ex:w ?x }",
+            &["t"],
+            rows(&[&["t4"]]),
+        ),
+        (
+            "a subject IRI",
+            "SELECT ?n WHERE { BIND(ex:alice AS ?s) ?s ex:name ?n }",
+            &["n"],
+            rows(&[&["Alice"]]),
+        ),
+        (
+            "an IRI built from a joined value",
+            "SELECT ?s ?t ?v WHERE { ?s ex:num ?num \
+             BIND(IRI(CONCAT(\"http://example.org/v\", STR(?num))) AS ?t) ?t ex:val ?v }",
+            &["s", "t", "v"],
+            rows(&[&["a", "v3", "three"]]),
+        ),
+    ];
+    let bind_first = |target: &str, expr: &str, pattern: JsonValue, select: &[&str]| {
+        json!({
+            "@context": context(),
+            "select": select,
+            "where": [["bind", target, expr], pattern]
+        })
+    };
+    let w = || json!({"@id": "?t", "ex:w": "?x"});
+    let jsonld_cases: Vec<(&str, JsonValue, Rows)> = vec![
+        (
+            "a double",
+            bind_first("?x", "7.0e0", w(), &["?t"]),
+            rows(&[&["t1"]]),
+        ),
+        (
+            "an integer",
+            bind_first("?x", "3", w(), &["?t"]),
+            rows(&[&["t2"]]),
+        ),
+        (
+            "a subject IRI",
+            bind_first(
+                "?s",
+                "(iri \"http://example.org/alice\")",
+                json!({"@id": "?s", "ex:name": "?n"}),
+                &["?n"],
+            ),
+            rows(&[&["Alice"]]),
+        ),
+        (
+            "an IRI built from a joined value",
+            json!({
+                "@context": context(),
+                "select": ["?s", "?t", "?v"],
+                "where": [
+                    {"@id": "?s", "ex:num": "?num"},
+                    ["bind", "?t", "(iri (concat \"http://example.org/v\" (str ?num)))"],
+                    {"@id": "?t", "ex:val": "?v"}
+                ]
+            }),
+            rows(&[&["a", "v3", "three"]]),
+        ),
+        // JSON-LD also binds an already-bound variable after a UNION or a
+        // MINUS. (SPARQL refuses a BIND onto a variable already in scope.)
+        // The value is one no stored value of another datatype equals: a
+        // plan that looks the computed value up in the pattern instead would
+        // match numbers by value, as the join does.
+        (
+            "a double, BIND after a UNION",
+            json!({
+                "@context": context(),
+                "select": ["?t"],
+                "where": [
+                    ["union", [{"@id": "?t", "ex:w": "?x"}], [{"@id": "?t", "ex:name": "?x"}]],
+                    ["bind", "?x", "2.5e0"]
+                ]
+            }),
+            rows(&[&["t3"]]),
+        ),
+        (
+            "a double, BIND after a MINUS",
+            json!({
+                "@context": context(),
+                "select": ["?t"],
+                "where": [
+                    {"@id": "?t", "ex:w": "?x"},
+                    ["minus", {"@id": "?t", "ex:name": "?n"}],
+                    ["bind", "?x", "2.5e0"]
+                ]
+            }),
+            rows(&[&["t3"]]),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for state in STATES {
+        let (fluree, handle) =
+            ledger_with(state, "it/bind-then-pattern:main", &bind_target_fixture()).await;
+        for (label, body, vars, want) in &sparql_cases {
+            let result = sparql(&fluree, &handle, body).await;
+            failures.eq(
+                sparql_rows(&result, vars),
+                want.clone(),
+                &format!("{state:?} / SPARQL BIND then a pattern: {label}"),
+            );
+        }
+        for (label, query, want) in &jsonld_cases {
+            let result = jsonld(&fluree, &handle, query).await;
+            failures.eq(
+                jsonld_rows(&result),
+                want.clone(),
+                &format!("{state:?} / JSON-LD bind then a pattern: {label}"),
+            );
+        }
+    }
+    failures.assert_none();
+}
+
 // ---------------------------------------------------------------------------
 // A batched lane over a window it can key only in part
 // ---------------------------------------------------------------------------
