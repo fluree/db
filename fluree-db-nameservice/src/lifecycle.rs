@@ -587,6 +587,11 @@ pub async fn mirror_record<S: LifecycleStore + ?Sized>(
 /// with its last branch, then delete the record. The copy owns no data, so
 /// nothing else is deleted.
 ///
+/// A branch with children is kept, dropped and frozen, as the owner keeps
+/// it: their history reaches into its data, which they find through its
+/// record. The owner announces the drop again when it deletes the branch
+/// after its last child, and then the copy goes.
+///
 /// Given the `instance` the branch belonged to, a copy of another ledger
 /// under the name is left alone: the drop is older than that ledger.
 pub async fn unmirror_record<S: LifecycleStore + ?Sized>(
@@ -606,6 +611,22 @@ pub async fn unmirror_record<S: LifecycleStore + ?Sized>(
         let Some(fence) = value.fence_of(branch) else {
             return Ok(());
         };
+        if value.children_of(branch).next().is_some() {
+            if !value.listing(branch).is_some_and(|l| l.dropped) {
+                let mut next = value;
+                for b in &mut next.branches {
+                    b.dropped |= b.branch == branch;
+                }
+                if !matches!(
+                    cas_binding(store, &name, Some(version), Some(&next)).await?,
+                    RegistryCas::Updated { .. }
+                ) {
+                    continue;
+                }
+            }
+            store.freeze_record(ledger_id.as_ref(), fence).await?;
+            return Ok(());
+        }
         let mut next = value;
         next.branches.retain(|b| b.branch != branch);
         let new = (!next.branches.is_empty()).then_some(&next);

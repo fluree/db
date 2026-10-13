@@ -583,7 +583,24 @@ where
         ledger_id: &str,
         fence: crate::Fence,
     ) -> Result<crate::FenceOutcome> {
-        self.inner.freeze_record(ledger_id, fence).await
+        let outcome = self.inner.freeze_record(ledger_id, fence).await?;
+        if outcome == crate::FenceOutcome::Applied {
+            // A branch drop freezes the branch first, and one with children
+            // deletes nothing until its last child goes, so the drop is
+            // announced here. A ledger drop announces as it deletes.
+            let id = LedgerId::parse(ledger_id)?;
+            if let Some(binding) = self
+                .listing_binding(&id, Some(fence))
+                .await
+                .filter(|b| b.is_active() && b.listing(id.branch()).is_some_and(|l| l.dropped))
+            {
+                self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+                    ledger_id: id,
+                    instance: Some(binding.instance),
+                });
+            }
+        }
+        Ok(outcome)
     }
 
     async fn delete_record(
@@ -675,5 +692,34 @@ mod tests {
         let next = again.instance().unwrap();
         assert_ne!(next, instance);
         assert_eq!(drain(&mut sub), vec![created("mydb:main", &next)]);
+    }
+
+    /// A branch drop deferred for its children announces the drop, though
+    /// it deletes nothing yet.
+    #[tokio::test]
+    async fn a_deferred_branch_drop_is_announced() {
+        let bus = Arc::new(LedgerEventBus::new(64));
+        let ns = NotifyingNameService::new(MemoryNameService::new(), Arc::clone(&bus));
+        let name = LedgerName::parse("mydb").unwrap();
+        let main = lifecycle::create_ledger(&ns, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        let instance = main.instance().unwrap();
+        lifecycle::create_branch(&ns, &name, "dev", "main", None)
+            .await
+            .unwrap();
+        lifecycle::create_branch(&ns, &name, "feature", "dev", None)
+            .await
+            .unwrap();
+        let mut sub = bus.subscribe(SubscriptionScope::all());
+
+        let begun = lifecycle::begin_drop_branch(&ns, &name, "dev")
+            .await
+            .unwrap();
+        assert!(matches!(
+            begun,
+            lifecycle::BranchDrop::Deferred { already: false }
+        ));
+        assert_eq!(drain(&mut sub), vec![retracted("mydb:dev", &instance)]);
     }
 }

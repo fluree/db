@@ -912,7 +912,9 @@ pub enum NameServiceEvent {
     /// A branch's authoritative state went away: fired for a ledger drop,
     /// a branch drop, and purge alike. Consumers use it uniformly to evict
     /// per-branch state, so the distinction between those transitions
-    /// isn't conveyed.
+    /// isn't conveyed. A branch drop fires it when it freezes the branch,
+    /// and again when it deletes the record, which a branch with children
+    /// defers until the last of them is dropped.
     ///
     /// `instance` names the ledger the branch belonged to, so a consumer
     /// holding a later ledger under the same name can tell the event is

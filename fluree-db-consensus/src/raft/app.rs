@@ -610,6 +610,21 @@ fn event_for(
                     .map(|b| b.instance),
             })
         }
+        // A branch drop freezes the branch first, and one with children
+        // deletes nothing until its last child goes, so the drop is
+        // announced here. A ledger drop announces as it deletes.
+        (Command::FreezeBranch { key, fence, .. }, Response::BranchFrozen { ledger_id, .. }) => {
+            let binding = state_binding(state, &key.ledger_name)?;
+            let listing = binding.listing(&key.branch)?;
+            if !(binding.is_active() && listing.dropped && listing.fence == Fence::from_u64(*fence))
+            {
+                return None;
+            }
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: parsed_event_ledger_id(ledger_id)?,
+                instance: Some(binding.instance),
+            })
+        }
         (Command::CreateBranch(_), Response::BranchCreated { ledger_id, head, t }) => {
             Some(NameServiceEvent::LedgerCommitPublished {
                 ledger_id: parsed_event_ledger_id(ledger_id)?,
@@ -1764,6 +1779,67 @@ mod tests {
             waiters.len(),
             0,
             "a resolved waiter must leave nothing behind"
+        );
+    }
+
+    /// Freezing a branch its binding lists as dropped announces the drop: a
+    /// branch with children deletes nothing else until its last child goes.
+    /// A ledger drop's freezes, under a dropping binding, do not; it
+    /// announces as it deletes.
+    #[test]
+    fn freezing_a_dropped_branch_announces_it() {
+        use fluree_db_nameservice::{BindingState, BranchFence};
+        let fence = Fence::from_u64(7);
+        let instance = fluree_db_nameservice::lifecycle::legacy_instance("test/db");
+        let state_with = |state: BindingState, dropped: bool| {
+            let binding = NameBinding {
+                extra: Default::default(),
+                instance: instance.clone(),
+                root: fluree_db_core::StorageRoot::legacy(
+                    &fluree_db_core::LedgerName::parse("test/db").unwrap(),
+                ),
+                root_branch: "main".into(),
+                state,
+                branches: vec![BranchFence {
+                    dropped,
+                    ..BranchFence::new("dev", fence)
+                }],
+            };
+            let mut ns = NameServiceState::default();
+            ns.bindings.insert(
+                "test/db".into(),
+                state_machine::VersionedJson {
+                    version: 1,
+                    json: Some(serde_json::to_string(&binding).unwrap()),
+                },
+            );
+            ns
+        };
+        let freeze = Command::FreezeBranch {
+            key: RefKey::new("test/db", "dev"),
+            fence: fence.as_u64(),
+            applied_at_millis: 0,
+        };
+        let frozen = Response::BranchFrozen {
+            ledger_id: "test/db:dev".into(),
+            released_envelopes: Vec::new(),
+        };
+
+        assert_eq!(
+            event_for(&freeze, &frozen, &state_with(BindingState::Active, true)),
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: fluree_db_core::LedgerId::parse("test/db:dev").unwrap(),
+                instance: Some(instance.clone()),
+            })
+        );
+        let dropping = BindingState::Dropping { hard: false };
+        assert_eq!(
+            event_for(&freeze, &frozen, &state_with(dropping, true)),
+            None
+        );
+        assert_eq!(
+            event_for(&freeze, &frozen, &state_with(BindingState::Active, false)),
+            None
         );
     }
 

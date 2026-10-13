@@ -964,6 +964,54 @@ pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameSer
     assert_eq!(copy.instance(), Some(lifecycle::legacy_instance("old")));
 }
 
+/// A copy of a branch whose drop the owner deferred for its children stays,
+/// dropped and frozen, while the copied children need it to reach their
+/// history; the drop announced again after the last child goes removes it.
+pub async fn an_unmirrored_branch_with_children_is_kept<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    let origin = crate::memory::MemoryNameService::new();
+    let main = lifecycle::create_ledger(&origin, &id("mydb"))
+        .await
+        .unwrap();
+    let dev = lifecycle::create_branch(&origin, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    let feature = lifecycle::create_branch(&origin, &name("mydb"), "feature", "dev", None)
+        .await
+        .unwrap();
+    for record in [&main, &dev, &feature] {
+        lifecycle::mirror_record(store, record).await.unwrap();
+    }
+    let instance = main.instance();
+
+    lifecycle::unmirror_record(store, &id("mydb:dev"), instance.as_ref())
+        .await
+        .unwrap();
+    let kept = store.lookup("mydb:dev").await.unwrap().expect("kept");
+    assert!(kept.retracted, "reads as dropped");
+    let copy = store.raw_record("mydb:dev").await.unwrap().unwrap();
+    assert!(copy.frozen, "takes no writes");
+    // Announced again, as a deferred drop resumed is, it stays.
+    lifecycle::unmirror_record(store, &id("mydb:dev"), instance.as_ref())
+        .await
+        .unwrap();
+    assert!(store.lookup("mydb:dev").await.unwrap().is_some());
+    assert!(store.lookup("mydb:feature").await.unwrap().is_some());
+
+    lifecycle::unmirror_record(store, &id("mydb:feature"), instance.as_ref())
+        .await
+        .unwrap();
+    lifecycle::unmirror_record(store, &id("mydb:dev"), None)
+        .await
+        .unwrap();
+    assert!(store.lookup("mydb:dev").await.unwrap().is_none());
+    assert!(store.raw_record("mydb:dev").await.unwrap().is_none());
+    assert!(store.lookup("mydb:main").await.unwrap().is_some());
+}
+
 /// A copy's index head reads the same through `lookup` and `get_ref`, and a
 /// compare-and-swap from what `get_ref` read succeeds. A mirror (or a
 /// restore) carries the head in the record itself, beside no index of its
@@ -1810,6 +1858,7 @@ where
     unknown_binding_fields_survive_rewrites(&make().await).await;
     a_graph_source_keeps_its_key(&make().await).await;
     a_mirrored_index_head_reads_and_swaps_as_one(&make().await).await;
+    an_unmirrored_branch_with_children_is_kept(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1862,6 +1911,7 @@ macro_rules! lifecycle_conformance_tests {
             unknown_binding_fields_survive_rewrites,
             a_graph_source_keeps_its_key,
             a_mirrored_index_head_reads_and_swaps_as_one,
+            an_unmirrored_branch_with_children_is_kept,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {
