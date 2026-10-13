@@ -300,11 +300,11 @@ async fn multi_query_validation_error_surfaces_as_typed_variant() {
 
 #[tokio::test]
 async fn multi_query_partial_failure_per_alias_via_in_process_api() {
-    // Two aliases — one good JSON-LD, one syntactically-broken SPARQL.
-    // Validation passes (the multi-query validator defers SPARQL
-    // grammar to the downstream parser); the dispatcher's per-alias
-    // error path lands the broken SPARQL in `response.errors` while the
-    // good alias produces results. Status is "partial."
+    // Two aliases — one good JSON-LD, one SPARQL that parses but fails when
+    // it runs (its WHERE uses a prefix it never declares). Validation
+    // passes; the dispatcher's per-alias error path lands the failing
+    // SPARQL in `response.errors` while the good alias produces results.
+    // Status is "partial."
     let fluree = Arc::new(FlureeBuilder::memory().build_memory());
     ignore_ledgers(seed_two_ledgers(&fluree).await);
 
@@ -319,7 +319,7 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq-users:main> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq-users:main> WHERE { ?x undeclared:p ?y }"
             }
         }
     }))
@@ -330,11 +330,64 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
         .envelope(envelope)
         .execute()
         .await
-        .expect("envelope executes even with one broken sub-query");
+        .expect("envelope executes even with one failing sub-query");
 
     assert_eq!(response.status, MultiQueryStatus::Partial);
     assert!(response.results.contains_key("good"));
     assert!(response.errors.contains_key("bad"));
+}
+
+#[tokio::test]
+async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in_process_api() {
+    // A sub-query that does not parse is reported under its alias, in either
+    // language, and its siblings still run.
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "queries": {
+            "good": {
+                "language": "jsonld",
+                "query": { "@context": { "schema": "http://schema.org/" },
+                           "from": "mq-users:main",
+                           "select": ["?n"],
+                           "where": { "@id": "?u", "schema:name": "?n" } }
+            },
+            "bad_sparql": {
+                "language": "sparql",
+                "query": "SELECT ?x FROM <mq-orders:main> WHERE { this is not valid SPARQL }"
+            },
+            "bad_jsonld": {
+                "language": "jsonld",
+                "query": { "from": "mq-users:main", "select": 42, "where": { "@id": "?u" } }
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+
+    let response = fluree
+        .multi_query()
+        .envelope(envelope)
+        .execute()
+        .await
+        .expect("an envelope with sub-queries that do not parse still runs");
+
+    assert_eq!(response.status, MultiQueryStatus::Partial);
+    assert!(response.results.contains_key("good"));
+    for alias in ["bad_sparql", "bad_jsonld"] {
+        assert!(
+            response.errors.contains_key(alias),
+            "{alias}: {:?}",
+            response.errors
+        );
+    }
+    // The SPARQL sub-query that does not parse reads nothing, so its `FROM`
+    // is not in the snapshot.
+    assert!(
+        !response.snapshot.ledgers.contains_key("mq-orders:main"),
+        "{:?}",
+        response.snapshot.ledgers
+    );
 }
 
 // =============================================================================

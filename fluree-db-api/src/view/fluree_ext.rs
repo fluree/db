@@ -6,12 +6,15 @@ use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 use crate::view::{GraphDb, ReasoningModePrecedence};
-use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, Result, TimeSpec};
+use crate::{
+    config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, LedgerView, Result,
+    TimeSpec,
+};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
-    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI,
-    TXN_META_GRAPH_ID,
+    ContentId, ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
+    DEFAULT_GRAPH_IRI, TXN_META_GRAPH_ID,
 };
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
@@ -32,6 +35,17 @@ enum GraphRef {
     Config,
     /// User-defined named graph by exact IRI
     Named(String),
+}
+
+/// A view of a cached handle's head, with its binary store attached.
+fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
+    let binary_store = snap.binary_store.clone();
+    let ledger = snap.to_ledger_state();
+    let view = GraphDb::from_ledger_state(&ledger);
+    match binary_store {
+        Some(store) => view.with_binary_store(store),
+        None => view,
+    }
 }
 
 impl Fluree {
@@ -345,16 +359,32 @@ impl Fluree {
         let handle = self.ledger_cached(ledger_id).await?;
         let snap = handle.snapshot().await;
         if target_t == snap.t {
-            let binary_store = snap.binary_store.clone();
-            let ledger = snap.to_ledger_state();
-            let view = GraphDb::from_ledger_state(&ledger);
-            return Ok(match binary_store {
-                Some(store) => view.with_binary_store(store),
-                None => view,
-            });
+            return Ok(graph_db_from_cached_head(snap));
         }
 
         self.load_graph_db_historical(ledger_id, target_t).await
+    }
+
+    /// Load a ledger at `t`, where its head commit is `commit_id`.
+    ///
+    /// Unlike [`Self::load_graph_db_at_t`], the cached handle serves it only
+    /// when its head is that commit. `t` alone does not name the history: an
+    /// instance sharing this one's storage can drop the ledger and create it
+    /// again, and a handle cached here before the drop sits at the same `t`
+    /// until it is reloaded. The historical loader reads the nameservice.
+    pub(crate) async fn load_graph_db_at_commit(
+        &self,
+        ledger_id: &str,
+        t: i64,
+        commit_id: Option<&ContentId>,
+    ) -> Result<GraphDb> {
+        let handle = self.ledger_cached(ledger_id).await?;
+        let snap = handle.snapshot().await;
+        if t == snap.t && commit_id == snap.head_commit_id.as_ref() {
+            return Ok(graph_db_from_cached_head(snap));
+        }
+
+        self.load_graph_db_historical(ledger_id, t).await
     }
 
     /// Open a ledger at a past `t` through the historical loader: no ledger
@@ -881,17 +911,17 @@ impl Fluree {
             let source = source.expect("checked above");
             // Seed from any prior governance-context capture stored
             // on the view (e.g., an earlier `wrap_policy` in the
-            // same logical request). The merged resolved_ts is
+            // same logical request). The merged resolved_heads is
             // written back below so the subsequent `query` call's
-            // own ResolveCtx observes the same per-ledger head-t.
+            // own ResolveCtx observes the same per-ledger head.
             //
             // `ledger_id_owned` keeps the id alive past the
             // eventual `view` move at the end of this branch.
             let ledger_id_owned = view.snapshot.ledger_id.clone();
-            let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+            let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_heads(
                 &ledger_id_owned,
                 self,
-                (**view.cross_ledger_resolved_ts()).clone(),
+                (**view.cross_ledger_resolved_heads()).clone(),
             );
             // The class-filter chain, identity contract (bind-only, never a
             // rule selector), and PolicyRules dispatch all live in the shared
@@ -961,7 +991,7 @@ impl Fluree {
             // logical request sees the same M version policy did.
             let view = view
                 .with_policy(Arc::new(policy_ctx))
-                .with_cross_ledger_resolved_ts(Arc::new(ctx.resolved_ts));
+                .with_cross_ledger_resolved_heads(Arc::new(ctx.resolved_heads));
             return Ok(view);
         }
 
@@ -986,10 +1016,10 @@ impl Fluree {
         {
             Some(reasoning) => {
                 let ledger_id_owned = view.snapshot.ledger_id.clone();
-                let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+                let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_heads(
                     &ledger_id_owned,
                     self,
-                    (**view.cross_ledger_resolved_ts()).clone(),
+                    (**view.cross_ledger_resolved_heads()).clone(),
                 );
                 crate::cross_ledger::resolve_schema_closure_bundle(
                     reasoning,

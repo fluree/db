@@ -616,6 +616,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::XsdDateTime
             | Function::XsdDate
             | Function::XsdTime
+            | Function::CypherToFloat
             | Function::Year
             | Function::Month
             | Function::Day

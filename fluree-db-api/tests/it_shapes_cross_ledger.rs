@@ -12,8 +12,8 @@
 
 #![cfg(all(feature = "native", feature = "shacl"))]
 
-use crate::support::genesis_ledger;
-use fluree_db_api::{DropMode, FlureeBuilder};
+use crate::support::{genesis_ledger, instances_sharing_storage};
+use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 fn config_graph_iri(ledger_id: &str) -> String {
@@ -106,6 +106,96 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
         ),
         "expected ShaclViolation from M's cross-ledger shape, got: {err:?}"
     );
+}
+
+/// A model ledger's shape with `INF` and `-INF` bounds reaches the data
+/// ledger in the datatype's own lexical form, and is enforced there.
+#[tokio::test]
+async fn cross_ledger_shape_with_infinite_values_is_enforced() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/model-inf:main";
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, model_id).await)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:ReadingShape
+                    rdf:type        sh:NodeShape ;
+                    sh:targetClass  ex:Reading ;
+                    sh:property     ex:rshape_score , ex:rshape_level .
+                ex:rshape_score
+                    sh:path         ex:score ;
+                    sh:maxInclusive "INF"^^xsd:double ;
+                    sh:minExclusive "-INF"^^xsd:double .
+                ex:rshape_level
+                    sh:path ex:level ;
+                    sh:in   ( "-INF"^^xsd:double "1.5"^^xsd:double ) .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M shapes");
+
+    let data_id = "test/cross-ledger-shapes/data-inf:main";
+    let config_iri = config_graph_iri(data_id);
+    let data = fluree
+        .stage_owned(genesis_ledger(&fluree, data_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger SHACL config")
+        .ledger;
+
+    let reading = |id: &str, score: &str, level: &str| {
+        json!({
+            "@context": {
+                "ex": "http://example.org/ns/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "@id": id,
+            "@type": "ex:Reading",
+            "ex:score": {"@value": score, "@type": "xsd:double"},
+            "ex:level": {"@value": level, "@type": "xsd:double"}
+        })
+    };
+    let data = fluree
+        .insert(data, &reading("ex:r1", "INF", "-INF"))
+        .await
+        .expect("INF is within [.., INF] and -INF is in the list")
+        .ledger;
+    let err = fluree
+        .insert(data.clone(), &reading("ex:r2", "1.0", "2.5"))
+        .await
+        .expect_err("2.5 is not in the list");
+    assert_shacl_violation(err, "sh:in with -INF");
+    let err = fluree
+        .insert(data, &reading("ex:r3", "-INF", "1.5"))
+        .await
+        .expect_err("-INF is not above -INF");
+    assert_shacl_violation(err, "sh:minExclusive -INF");
 }
 
 #[tokio::test]
@@ -426,11 +516,21 @@ async fn seed_cross_ledger_person_shape(
         .execute()
         .await
         .expect("seed M shapes");
+    seed_shapes_source_config(fluree, data_id, model_id, extra_shacl_config).await
+}
 
-    let data = genesis_ledger(fluree, data_id).await;
+/// Data ledger D's `#config`: SHACL on, with `f:shapesSource` pointing at
+/// model ledger M's shapes graph. Returns D's post-config `LedgerState`.
+async fn seed_shapes_source_config(
+    fluree: &fluree_db_api::Fluree,
+    data_id: &str,
+    model_id: &str,
+    extra_shacl_config: &str,
+) -> fluree_db_api::LedgerState {
+    let shapes_graph_iri = "http://example.org/governance/shapes";
     let config_iri = config_graph_iri(data_id);
     let r = fluree
-        .stage_owned(data)
+        .stage_owned(genesis_ledger(fluree, data_id).await)
         .upsert_turtle(&format!(
             r"
             @prefix f:   <https://ns.flur.ee/db#> .
@@ -808,34 +908,18 @@ async fn model_head_advance_recompiles_shapes() {
         .expect("deactivated shape must no longer reject");
 }
 
-const RECREATE_SHAPES: &str = r"
-    @prefix sh:   <http://www.w3.org/ns/shacl#> .
-    @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-    @prefix ex:   <http://example.org/ns/> .
-    GRAPH <http://example.org/governance/shapes> {
-        ex:PersonShape rdf:type sh:NodeShape ;
-                       sh:targetClass ex:Person ;
-                       sh:property ex:pshape_name ;
-                       sh:deactivated DEACTIVATED .
-        ex:pshape_name sh:path ex:name ; sh:minCount 1 .
-    }
-";
+/// A model ledger dropped and created again under its name restarts at the
+/// same `t`. D's compiled shapes are cached by the wire's origin, so a
+/// recreated M with other shapes must still recompile.
+#[tokio::test]
+async fn recreated_model_ledger_shapes_replace_the_cached_compile() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/recreate-model:main";
+    let data_id = "test/cross-ledger-shapes/recreate-data:main";
+    let data = seed_cross_ledger_person_shape(&fluree, model_id, data_id, "").await;
 
-/// Seed `model_id` with the Person shape, active or deactivated.
-async fn seed_recreated_model(fluree: &fluree_db_api::Fluree, model_id: &str, deactivated: bool) {
-    let model = genesis_ledger(fluree, model_id).await;
-    fluree
-        .stage_owned(model)
-        .upsert_turtle(&RECREATE_SHAPES.replace("DEACTIVATED", &deactivated.to_string()))
-        .execute()
-        .await
-        .expect("seed the new M");
-}
-
-/// Seed M and D with the Person shape, then make a conforming write: with no
-/// namespace delta left behind, D's next write compiles and caches M's shapes.
-async fn cached_person_shape(fluree: &fluree_db_api::Fluree, model_id: &str, data_id: &str) {
-    let data = seed_cross_ledger_person_shape(fluree, model_id, data_id, "").await;
+    // Conforming write first: an empty namespace delta afterwards makes the
+    // next transactions eligible for the compile cache.
     fluree
         .insert(
             data,
@@ -848,95 +932,205 @@ async fn cached_person_shape(fluree: &fluree_db_api::Fluree, model_id: &str, dat
         )
         .await
         .expect("conforming Person must pass");
-}
-
-/// Write a Person with no name to `data_id`.
-async fn nameless_person(
-    fluree: &fluree_db_api::Fluree,
-    data_id: &str,
-    person: &str,
-) -> fluree_db_api::Result<fluree_db_api::TransactResultRef> {
-    fluree
-        .graph(data_id)
-        .transact()
-        .insert(&json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "@id": person,
-            "@type": "ex:Person"
-        }))
-        .commit()
-        .await
-}
-
-/// A model ledger dropped and created again under its name starts again at
-/// the same `t`. D's compiled shapes are cached by the shape source, so the
-/// new M, with its shape deactivated, must recompile rather than keep the
-/// dropped M's shape enforced.
-#[tokio::test]
-async fn recreated_model_ledger_shapes_replace_the_cached_compile() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let model_id = "test/cross-ledger-shapes/recreate-model:main";
-    let data_id = "test/cross-ledger-shapes/recreate-data:main";
-    cached_person_shape(&fluree, model_id, data_id).await;
-    let err = nameless_person(&fluree, data_id, "ex:bob")
+    let nameless_bob = || async {
+        fluree
+            .graph(data_id)
+            .transact()
+            .insert(&json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:bob",
+                "@type": "ex:Person"
+            }))
+            .commit()
+            .await
+    };
+    let err = nameless_bob()
         .await
         .expect_err("M requires a name: compiled and cached");
-    assert_shacl_violation(err, "the dropped M");
+    assert!(
+        err.to_string().contains("SHACL") || format!("{err:?}").contains("ShaclViolation"),
+        "expected ShaclViolation, got: {err:?}"
+    );
 
+    // The new M, at the dropped M's t, deactivates the shape.
     fluree
-        .drop_ledger("test/cross-ledger-shapes/recreate-model", DropMode::Soft)
+        .drop_ledger(
+            "test/cross-ledger-shapes/recreate-model",
+            fluree_db_api::DropMode::Hard,
+        )
         .await
         .expect("drop M");
-    seed_recreated_model(&fluree, model_id, true).await;
+    seed_person_name_shape(&fluree, model_id, false).await;
 
-    nameless_person(&fluree, data_id, "ex:bob")
+    nameless_bob()
         .await
         .expect("the new M's deactivated shape must no longer reject");
 }
 
-/// The fail-open direction: D cached a lax M's shapes, and the strict M
-/// created under its name at the same `t` must be enforced.
-#[tokio::test]
-async fn recreated_model_ledger_shapes_are_enforced_over_a_cached_lax_compile() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let model_id = "test/cross-ledger-shapes/recreate-lax-model:main";
-    let data_id = "test/cross-ledger-shapes/recreate-lax-data:main";
-    cached_person_shape(&fluree, model_id, data_id).await;
-    // M at t 2 deactivates the shape; D compiles and caches the lax shapes.
-    let model = fluree.ledger(model_id).await.expect("M");
+/// Commit model ledger M: a Person shape requiring a name, active or not.
+async fn seed_person_name_shape(fluree: &fluree_db_api::Fluree, model_id: &str, active: bool) {
+    let deactivated = !active;
     fluree
-        .stage_owned(model)
-        .upsert_turtle(&RECREATE_SHAPES.replace("DEACTIVATED", "true"))
+        .stage_owned(genesis_ledger(fluree, model_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+            GRAPH <http://example.org/governance/shapes> {{
+                ex:PersonShape rdf:type sh:NodeShape ;
+                               sh:targetClass ex:Person ;
+                               sh:property ex:pshape_name ;
+                               sh:deactivated {deactivated} .
+                ex:pshape_name sh:path ex:name ; sh:minCount 1 .
+            }}
+        "
+        ))
         .execute()
         .await
-        .expect("deactivate");
-    nameless_person(&fluree, data_id, "ex:bob")
+        .expect("seed M");
+}
+
+/// The reverse: a recreated M that rejects what the dropped one let through.
+/// The compiled shapes cached from the dropped M must not keep passing it.
+#[tokio::test]
+async fn recreated_model_ledger_shapes_reject_what_the_cached_compile_passed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/recreate-strict-model:main";
+    let data_id = "test/cross-ledger-shapes/recreate-strict-data:main";
+    seed_person_name_shape(&fluree, model_id, false).await;
+    let data = seed_shapes_source_config(&fluree, data_id, model_id, "").await;
+
+    // Conforming write first: an empty namespace delta afterwards makes the
+    // next transactions eligible for the compile cache.
+    fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:name": "Alice"
+            }),
+        )
         .await
-        .expect("the lax M lets a nameless Person in");
+        .expect("conforming Person must pass");
+    let nameless = |person: &'static str| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(data_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"ex": "http://example.org/ns/"},
+                    "@id": person,
+                    "@type": "ex:Person"
+                }))
+                .commit()
+                .await
+        }
+    };
+    nameless("ex:bob")
+        .await
+        .expect("M's shape is deactivated: compiled and cached");
 
     fluree
         .drop_ledger(
-            "test/cross-ledger-shapes/recreate-lax-model",
-            DropMode::Soft,
+            "test/cross-ledger-shapes/recreate-strict-model",
+            fluree_db_api::DropMode::Hard,
         )
         .await
         .expect("drop M");
-    // The new M reaches the dropped M's t 2 with the shape active.
-    let model = genesis_ledger(&fluree, model_id).await;
-    let pad = json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:pad", "ex:v": 1});
-    let model = fluree.insert(model, &pad).await.expect("pad M").ledger;
+    seed_person_name_shape(&fluree, model_id, true).await;
+
+    let err = nameless("ex:carol")
+        .await
+        .expect_err("the new M, at the dropped M's t, requires a name");
+    assert!(
+        err.to_string().contains("SHACL") || format!("{err:?}").contains("ShaclViolation"),
+        "expected ShaclViolation, got: {err:?}"
+    );
+}
+
+const US_STATE_SHAPES_GRAPH: &str = "http://example.org/governance/shapes";
+
+/// Commit model ledger `model`: a shape whose `ex:homeState` must be an
+/// `ex:USState`, and the vocabulary of `states`, in one graph.
+async fn seed_us_state_model(fluree: &fluree_db_api::Fluree, model: &str, states: &[&str]) {
+    let members: String = states
+        .iter()
+        .map(|state| format!("ex:{state} rdf:type ex:USState .\n"))
+        .collect();
     fluree
-        .stage_owned(model)
-        .upsert_turtle(&RECREATE_SHAPES.replace("DEACTIVATED", "false"))
+        .stage_owned(genesis_ledger(fluree, &format!("{model}:main")).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{US_STATE_SHAPES_GRAPH}> {{
+                ex:PersonShape rdf:type sh:NodeShape ;
+                               sh:targetClass ex:Person ;
+                               sh:property ex:pshape_state .
+                ex:pshape_state sh:path ex:homeState ; sh:class ex:USState .
+                {members}
+            }}
+        "
+        ))
         .execute()
         .await
-        .expect("seed the strict M");
-    assert_eq!(fluree.ledger(model_id).await.unwrap().t(), 2);
+        .expect("seed M");
+}
 
-    let err = nameless_person(&fluree, data_id, "ex:carol")
+/// `sh:class` membership is read from M itself, not from the shapes wire.
+/// With M recreated by another instance sharing the storage and nameservice,
+/// nothing clears this instance's cached handle of the dropped M, which sits
+/// at the `t` the new M reaches. Membership still comes from the new M.
+#[tokio::test]
+async fn sh_class_membership_follows_a_model_recreated_by_another_instance() {
+    let (writer, reader) = instances_sharing_storage();
+    let model = "test/cross-ledger-shapes/recreate-vocab-model";
+    let data_id = "test/cross-ledger-shapes/recreate-vocab-data:main";
+    seed_us_state_model(&writer, model, &["illinois", "iowa"]).await;
+    seed_shapes_source_config(&writer, data_id, &format!("{model}:main"), "").await;
+
+    let from_illinois = |person: &'static str| {
+        let reader = &reader;
+        async move {
+            reader
+                .graph(data_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"ex": "http://example.org/ns/"},
+                    "@id": person,
+                    "@type": "ex:Person",
+                    "ex:homeState": {"@id": "ex:illinois"}
+                }))
+                .commit()
+                .await
+        }
+    };
+    from_illinois("ex:alice")
         .await
-        .expect_err("the strict M rejects a nameless Person");
-    assert_shacl_violation(err, "the new M");
+        .expect("M lists Illinois, and the reader caches M");
+
+    writer
+        .drop_ledger(model, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop M");
+    seed_us_state_model(&writer, model, &["iowa"]).await;
+
+    let err = from_illinois("ex:bob")
+        .await
+        .expect_err("the new M does not list Illinois");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "expected ShaclViolation, got: {err:?}"
+    );
 }
 
 /// A `f:shapesSource` whose `f:ledger` names the data ledger itself is a

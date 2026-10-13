@@ -351,29 +351,36 @@ fn filter_subjects_by_numeric_gt(
     to_t: i64,
     threshold: &FlakeValue,
 ) -> Result<Option<Vec<u64>>> {
-    use fluree_db_core::value_id::ObjKey;
     // This lane derives its row-comparison keys from a Long/Double threshold.
     // Any other threshold type (e.g. an xsd:decimal constant, now that the
     // detector can extract them) must DECLINE to the fallback — returning an
     // empty set would silently undercount instead of evaluating the filter.
     let (thr_i, thr_d) = match threshold {
         FlakeValue::Long(n) => (*n, *n as f64),
+        // Nothing is greater than NaN (XPath F&O 3.1 §4.3.2).
+        FlakeValue::Double(d) if d.is_nan() => return Ok(Some(Vec::new())),
         FlakeValue::Double(d) => (*d as i64, *d),
         _ => return Ok(None),
     };
-    let thr_i_key = ObjKey::encode_i64(thr_i).as_u64();
-    let thr_d_key = ObjKey::encode_f64(thr_d)
-        .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-        .as_u64();
-    // Decimal threshold key, for comparing inline-decimal rows. Only an integer
-    // threshold maps cleanly onto the decimal key space (10 == 10.00); a double
-    // threshold against decimal rows isn't compared here (decimal rows decline).
-    let thr_dec_key: Option<u64> = match threshold {
-        FlakeValue::Long(n) => {
-            ObjKey::encode_decimal(&bigdecimal::BigDecimal::from(*n)).map(ObjKey::as_u64)
-        }
-        _ => None,
-    };
+    // A threshold below every i64 (e.g. -INF) keeps every integer; the
+    // saturating cast above would otherwise drop i64::MIN.
+    let all_integers = thr_d < i64::MIN as f64;
+    let thr_i_key = fluree_db_core::value_id::ObjKey::encode_i64(thr_i).as_u64();
+    // The double keys above the threshold, compared exactly (an integer
+    // threshold beyond 2^53 included), and never NaN's.
+    let double_keys = crate::fast_count::threshold_key_interval(
+        OType::XSD_DOUBLE,
+        crate::fast_count::NumericCompareOp::Gt,
+        threshold,
+    )
+    .flatten();
+    // Inline decimal rows compare in their own key order; a threshold with no
+    // decimal key (a double) declines them.
+    let decimal_keys = crate::fast_count::threshold_key_interval(
+        OType::XSD_DECIMAL_INLINE,
+        crate::fast_count::NumericCompareOp::Gt,
+        threshold,
+    );
 
     let mut keep: FxHashSet<u64> = FxHashSet::default();
     let mut saw_uncomparable_numeric = false;
@@ -386,12 +393,16 @@ fn filter_subjects_by_numeric_gt(
         |s_id, batch, i| {
             let ot = OType::from_u16(batch.o_type.get_or(i, 0));
             let over_threshold = match ot {
-                OType::XSD_INTEGER => batch.o_key.get(i) > thr_i_key,
-                OType::XSD_DOUBLE => batch.o_key.get(i) > thr_d_key,
-                // Inline decimals are order-preserving: compare keys when the
-                // threshold encodes to a decimal key, else decline.
-                OType::XSD_DECIMAL_INLINE => match thr_dec_key {
-                    Some(k) => batch.o_key.get(i) > k,
+                OType::XSD_INTEGER => all_integers || batch.o_key.get(i) > thr_i_key,
+                OType::XSD_DOUBLE => {
+                    let k = batch.o_key.get(i);
+                    double_keys.is_some_and(|(lo, hi)| lo <= k && k <= hi)
+                }
+                OType::XSD_DECIMAL_INLINE => match decimal_keys {
+                    Some(interval) => {
+                        let k = batch.o_key.get(i);
+                        interval.is_some_and(|(lo, hi)| lo <= k && k <= hi)
+                    }
                     None => {
                         saw_uncomparable_numeric = true;
                         false
