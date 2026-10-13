@@ -338,20 +338,101 @@ mod tests {
         let prefixes = PrefixMap::from_map(BTreeMap::from([("ex".into(), EX.into())]));
         for format in [RdfFormat::TriG, RdfFormat::NQuads] {
             let text = serialize(&dataset, format, &prefixes).unwrap();
-            let mut again = parse(&text, format, None).unwrap();
-            again.canonicalize();
-            assert_eq!(
-                again.default.triples(),
-                dataset.default.triples(),
-                "{format}"
-            );
-            assert_eq!(again.default.reifications(), dataset.default.reifications());
-            assert_eq!(again.named.len(), 1, "{format}");
-            assert_eq!(
-                again.named[&ex("g")].triples(),
-                dataset.named[&ex("g")].triples()
-            );
+            let again = parse(&text, format, None).unwrap();
+            // TriG writes the collection as `( … )`, whose nodes read back
+            // under fresh labels: the same dataset, up to blank-node labels.
+            assert!(isomorphic(&again, &dataset), "{format}:\n{text}");
         }
+    }
+
+    /// Every statement of `dataset` with its graph, a reification as
+    /// `r rdf:reifies <<( s p o )>>`.
+    fn statements(dataset: &Dataset) -> Vec<(Option<Term>, [Term; 3])> {
+        let reifies = Term::iri(fluree_vocab::rdf::REIFIES);
+        let mut out = Vec::new();
+        for (name, graph) in dataset.graphs() {
+            for t in graph.iter() {
+                let triple = [t.subject(), t.predicate(), t.object()].map(Term::clone);
+                out.push((name.cloned(), triple));
+            }
+            for r in graph.reifications() {
+                let t = &r.triple;
+                let parts = [t.subject(), t.predicate(), t.object()].map(Term::clone);
+                let reified = Term::TripleTerm(std::sync::Arc::new(parts));
+                out.push((name.cloned(), [r.reifier.clone(), reifies.clone(), reified]));
+            }
+        }
+        out
+    }
+
+    fn rename(term: &Term, to: &std::collections::HashMap<&Term, &Term>) -> Term {
+        match term {
+            Term::BlankNode(_) => to.get(term).map_or_else(|| term.clone(), |t| (*t).clone()),
+            Term::TripleTerm(parts) => Term::TripleTerm(std::sync::Arc::new(
+                parts.as_ref().clone().map(|p| rename(&p, to)),
+            )),
+            _ => term.clone(),
+        }
+    }
+
+    fn blank_nodes(statements: &[(Option<Term>, [Term; 3])]) -> Vec<Term> {
+        fn walk(term: &Term, out: &mut std::collections::BTreeSet<Term>) {
+            match term {
+                Term::BlankNode(_) => {
+                    out.insert(term.clone());
+                }
+                Term::TripleTerm(parts) => parts.iter().for_each(|p| walk(p, out)),
+                _ => {}
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        for (name, triple) in statements {
+            name.iter()
+                .chain(triple.iter())
+                .for_each(|t| walk(t, &mut out));
+        }
+        out.into_iter().collect()
+    }
+
+    fn permutations(items: &[Term]) -> Vec<Vec<Term>> {
+        if items.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let first = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, first.clone());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Whether `a` and `b` hold the same statements up to a renaming of their
+    /// blank nodes. It tries every renaming, so it suits small datasets only.
+    fn isomorphic(a: &Dataset, b: &Dataset) -> bool {
+        let (from, mut to) = (statements(a), statements(b));
+        to.sort();
+        let (blanks_a, blanks_b) = (blank_nodes(&from), blank_nodes(&to));
+        if from.len() != to.len() || blanks_a.len() != blanks_b.len() {
+            return false;
+        }
+        permutations(&blanks_b).iter().any(|image| {
+            let map = blanks_a.iter().zip(image).collect();
+            let mut renamed: Vec<_> = from
+                .iter()
+                .map(|(name, triple)| {
+                    (
+                        name.as_ref().map(|n| rename(n, &map)),
+                        triple.clone().map(|t| rename(&t, &map)),
+                    )
+                })
+                .collect();
+            renamed.sort();
+            renamed == to
+        })
     }
 
     /// The JSON-LD writer's output reads back as the dataset it wrote.
