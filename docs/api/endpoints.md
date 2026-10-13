@@ -1400,9 +1400,13 @@ POST /query/{ledger}
   - `FROM <default>` / `FROM <txn-meta>` / `FROM <graph IRI>` selects the default graph for triple patterns outside `GRAPH {}`.
   - `FROM NAMED <graph IRI>` makes that named graph available via `GRAPH <graph IRI> { ... }`.
 
-**Ledger mismatch protection:**
+**Other ledgers:**
 
-If the body includes a ledger reference that targets a different ledger than `{ledger}`, the server returns `400 Bad Request` with a "Ledger mismatch" error.
+- A `from` object (`{"@id": …}`, or `{"id": …}`) must name `{ledger}`, in any spelling of its id. One that names another ledger is a `400 Bad Request` "Ledger mismatch" error.
+- A `from` string names a graph of `{ledger}` when it is a graph keyword, an IRI (`urn:…`, `scheme://…`), or a bare name with no `:`, `@` or `#`. Any other `from` string is a ledger address: it must name `{ledger}` as the path spells it, or it is a "Ledger mismatch".
+- A SPARQL `FROM` / `FROM NAMED` written as `name:branch` that names another ledger is a "Ledger mismatch".
+- A JSON-LD array `from`, or a `fromNamed`, may name other ledgers. It is the multi-ledger (union) form, the same as on `POST /query`, and each ledger it names is read under the caller's access rights.
+- `/stream/query/{ledger}` and `/explain/{ledger}` read `from` and `fromNamed` the same way.
 
 **Time pin in the path:**
 
