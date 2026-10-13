@@ -425,8 +425,9 @@ impl CompareOp {
                     }
                 },
                 _ => match cmp_values(&prev, &curr) {
-                    Some(ord) => self.satisfies(ord),
-                    None => {
+                    ValueOrder::Ordered(ord) => self.satisfies(ord),
+                    ValueOrder::Unordered => false,
+                    ValueOrder::Incomparable => {
                         return Err(ComparisonError::TypeMismatch {
                             operator: self.symbol(),
                             left_type: prev.type_name(),
@@ -447,11 +448,23 @@ impl CompareOp {
     }
 }
 
-/// Compare two values and return their ordering.
-///
-/// Returns `None` for type mismatches (incomparable types).
+/// How two values relate under the SPARQL comparison operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueOrder {
+    /// Comparable, with this ordering.
+    Ordered(Ordering),
+    /// Two numbers, at least one of them NaN. XPath's numeric comparisons
+    /// return false whenever an operand is NaN (F&O 3.1 §4.3), so `=`, `<`,
+    /// `>`, `<=` and `>=` are all false and `!=` is true (SPARQL 1.1 §17.3).
+    /// A false comparison, not a type error.
+    Unordered,
+    /// Not comparable: a type error.
+    Incomparable,
+}
+
+/// Compare two values for the ordering operators (`<`, `<=`, `>`, `>=`).
 /// Delegates to FlakeValue's comparison methods for numeric and temporal types.
-fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Ordering> {
+fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> ValueOrder {
     cmp_values_inner(left, right, true)
 }
 
@@ -463,7 +476,7 @@ fn cmp_values_inner(
     left: &ComparableValue,
     right: &ComparableValue,
     temporal_string_coerce: bool,
-) -> Option<Ordering> {
+) -> ValueOrder {
     // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float, whose
     // value is stored string-backed) into their primitive numeric variant so the
     // numeric comparison below applies — mirroring arithmetic's operand coercion.
@@ -482,33 +495,39 @@ fn cmp_values_inner(
     let left_fv: FlakeValue = left.into();
     let right_fv: FlakeValue = right.into();
 
-    // Try numeric comparison first (handles all numeric cross-type comparisons)
-    if let Some(ordering) = left_fv.numeric_cmp(&right_fv) {
-        return Some(ordering);
+    // Numeric comparison first (handles all numeric cross-type comparisons).
+    if left_fv.is_numeric() && right_fv.is_numeric() {
+        let is_nan = |v: &FlakeValue| matches!(v, FlakeValue::Double(d) if d.is_nan());
+        return match left_fv.numeric_cmp(&right_fv) {
+            Some(ordering) => ValueOrder::Ordered(ordering),
+            None if is_nan(&left_fv) || is_nan(&right_fv) => ValueOrder::Unordered,
+            None => ValueOrder::Incomparable,
+        };
     }
 
     // Try temporal comparison (same-type temporal only)
     if let Some(ordering) = left_fv.temporal_cmp(&right_fv) {
-        return Some(ordering);
+        return ValueOrder::Ordered(ordering);
     }
 
     // Cross-type coercion: when one side is a temporal type and the other is a
     // string, try to parse the string as that temporal type (ordering only).
     if temporal_string_coerce {
         if let Some(ordering) = try_coerce_temporal_string_cmp(&left_fv, &right_fv) {
-            return Some(ordering);
+            return ValueOrder::Ordered(ordering);
         }
     }
 
     // Fall back to same-type comparisons for non-numeric, non-temporal types
-    match (left, right) {
-        (ComparableValue::String(a), ComparableValue::String(b)) => Some(a.cmp(b)),
-        (ComparableValue::Bool(a), ComparableValue::Bool(b)) => Some(a.cmp(b)),
-        (ComparableValue::Sid(a), ComparableValue::Sid(b)) => Some(a.cmp(b)),
-        (ComparableValue::Iri(a), ComparableValue::Iri(b)) => Some(a.cmp(b)),
+    let ordering = match (left, right) {
+        (ComparableValue::String(a), ComparableValue::String(b)) => a.cmp(b),
+        (ComparableValue::Bool(a), ComparableValue::Bool(b)) => a.cmp(b),
+        (ComparableValue::Sid(a), ComparableValue::Sid(b)) => a.cmp(b),
+        (ComparableValue::Iri(a), ComparableValue::Iri(b)) => a.cmp(b),
         // Type mismatch
-        _ => None,
-    }
+        _ => return ValueOrder::Incomparable,
+    };
+    ValueOrder::Ordered(ordering)
 }
 
 /// Outcome of RDFterm-equal (`=` / `!=`).
@@ -623,30 +642,17 @@ pub(crate) fn rdf_term_equal_in(
 /// operator mapping. Returns a three-valued outcome so an incomparable pair is
 /// a type error (excluding the row) rather than silently `false`/`true`.
 pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
-    // XPath op:numeric-equal (F&O §4.2.3): NaN is not equal to anything,
-    // including itself — `NaN = NaN` is false and `NaN != NaN` is true. The
-    // numeric fast path below bottoms out in `numeric_cmp`'s bit-level total
-    // order (wanted for ORDER BY stability), which reports two identical-bit
-    // NaNs as Equal, so the equality entry point must catch NaN first. Scoped
-    // to numeric-vs-numeric so NaN vs an unrecognized-datatype literal still
-    // reaches the TypeError arm below. (A NaN hidden in a string-backed
-    // `TypedLiteral` — `STRDT("NaN", xsd:double)` — still takes the coercing
-    // fast path; accepted corner.)
-    let is_nan = |v: &ComparableValue| {
-        matches!(v, ComparableValue::Double(d) if d.is_nan())
-            || matches!(v, ComparableValue::Float(f) if f.is_nan())
-    };
-    if (is_nan(a) || is_nan(b)) && eq_kind(a) == EqKind::Numeric && eq_kind(b) == EqKind::Numeric {
-        return EqOutcome::Ne;
-    }
     // Value-comparable fast path: numeric promotion, string, boolean, temporal.
     // No plain-string↔temporal coercion (equality, not ordering).
-    if let Some(ord) = cmp_values_inner(a, b, false) {
-        return if ord == Ordering::Equal {
-            EqOutcome::Eq
-        } else {
-            EqOutcome::Ne
-        };
+    match cmp_values_inner(a, b, false) {
+        ValueOrder::Ordered(Ordering::Equal) => return EqOutcome::Eq,
+        ValueOrder::Ordered(_) => return EqOutcome::Ne,
+        // XPath op:numeric-equal (F&O 3.1 §4.3.1): NaN equals nothing, itself
+        // included, so `NaN = NaN` is false and `NaN != NaN` is true. Also
+        // for a NaN carried by a string-backed literal (`xsd:float`, `STRDT`),
+        // which `cmp_values_inner` coerces to a number first.
+        ValueOrder::Unordered => return EqOutcome::Ne,
+        ValueOrder::Incomparable => {}
     }
     // Same term (reflexivity): equal even for ill-typed / unrecognized literals.
     if a == b {
@@ -793,30 +799,28 @@ mod tests {
     fn test_cmp_longs() {
         let a = ComparableValue::Long(10);
         let b = ComparableValue::Long(20);
-        assert_eq!(cmp_values(&a, &b), Some(Ordering::Less));
-        assert_eq!(cmp_values(&b, &a), Some(Ordering::Greater));
-        assert_eq!(cmp_values(&a, &a), Some(Ordering::Equal));
+        assert_eq!(cmp_values(&a, &b), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&b, &a), ValueOrder::Ordered(Ordering::Greater));
+        assert_eq!(cmp_values(&a, &a), ValueOrder::Ordered(Ordering::Equal));
     }
 
     #[test]
     fn test_cmp_strings() {
         let a = ComparableValue::String(Arc::from("alpha"));
         let b = ComparableValue::String(Arc::from("beta"));
-        assert_eq!(cmp_values(&a, &b), Some(Ordering::Less));
-        assert_eq!(cmp_values(&a, &a), Some(Ordering::Equal));
+        assert_eq!(cmp_values(&a, &b), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&a, &a), ValueOrder::Ordered(Ordering::Equal));
     }
 
     #[test]
     fn test_type_mismatch() {
         let long = ComparableValue::Long(10);
         let string = ComparableValue::String(Arc::from("10"));
-        // Type mismatch returns None
-        assert_eq!(cmp_values(&long, &string), None);
+        assert_eq!(cmp_values(&long, &string), ValueOrder::Incomparable);
     }
 
     // XPath op:numeric-equal: NaN is never equal, including to itself; `!=`
-    // is therefore true. numeric_cmp's bit-level total order (kept for ORDER
-    // BY) would otherwise report identical-bit NaNs as Equal.
+    // is therefore true.
     #[test]
     fn test_rdf_term_equal_nan_is_never_equal() {
         let d_nan = ComparableValue::Double(f64::NAN);
@@ -833,14 +837,36 @@ mod tests {
         );
     }
 
-    // The NaN carve-out is equality-only: the ORDER BY total order still
-    // places identical-bit NaNs as Equal (stability), and NaN vs a
-    // non-numeric operand keeps its existing outcome (recognized pair → Ne
-    // via the kind table; unrecognized-datatype literal stays a TypeError).
+    // A NaN among two numbers is unordered (every `<`, `>`, `<=`, `>=` is
+    // false, not a type error, F&O 3.1 §4.3.2), and +/-INF order around every
+    // other number. NaN vs a non-numeric operand keeps its outcome:
+    // a recognized pair is Ne via the kind table, and an
+    // unrecognized-datatype literal stays a TypeError.
     #[test]
-    fn test_nan_scope_is_equality_only() {
+    fn test_nan_is_unordered_among_numbers() {
         let d_nan = ComparableValue::Double(f64::NAN);
-        assert_eq!(cmp_values(&d_nan, &d_nan), Some(Ordering::Equal));
+        let one = ComparableValue::Long(1);
+        let inf = ComparableValue::Double(f64::INFINITY);
+        let ninf = ComparableValue::Double(f64::NEG_INFINITY);
+        assert_eq!(cmp_values(&d_nan, &d_nan), ValueOrder::Unordered);
+        assert_eq!(cmp_values(&d_nan, &one), ValueOrder::Unordered);
+        assert_eq!(cmp_values(&inf, &d_nan), ValueOrder::Unordered);
+        assert_eq!(
+            cmp_values(&inf, &one),
+            ValueOrder::Ordered(Ordering::Greater)
+        );
+        assert_eq!(cmp_values(&ninf, &one), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&inf, &inf), ValueOrder::Ordered(Ordering::Equal));
+        assert_eq!(cmp_values(&ninf, &inf), ValueOrder::Ordered(Ordering::Less));
+        // A NaN carried by a string-backed float literal is a NaN too.
+        let float_nan = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("NaN".to_string()),
+            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                Arc::from(fluree_vocab::xsd::FLOAT),
+            )),
+        };
+        assert_eq!(cmp_values(&float_nan, &one), ValueOrder::Unordered);
+        assert_eq!(rdf_term_equal(&float_nan, &float_nan), EqOutcome::Ne);
         let s = ComparableValue::String(Arc::from("NaN"));
         assert_eq!(rdf_term_equal(&d_nan, &s), EqOutcome::Ne);
         let foreign = ComparableValue::TypedLiteral {

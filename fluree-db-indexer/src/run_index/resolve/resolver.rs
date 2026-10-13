@@ -569,8 +569,7 @@ impl CommitResolver {
                     ));
                 }
                 // Always encode as NUM_F64 to avoid NUM_INT + dt DOUBLE edge cases
-                let key = ObjKey::encode_f64(*n)
-                    .map_err(|e| ResolverError::Resolve(format!("txn_meta double: {e}")))?;
+                let key = ObjKey::encode_f64(*n);
                 Ok((ObjKind::NUM_F64, key, DatatypeDictId::DOUBLE.as_u16(), 0))
             }
             TxnMetaValue::Boolean(b) => Ok((
@@ -876,8 +875,8 @@ impl CommitResolver {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
                 // The decode path uses the property's datatype to select
                 // DecodeKind, and F64→I64 mismatch corrupts values. (fluree/db-r#142)
-                let key = ObjKey::encode_f64(*v)
-                    .map_err(|e| format!("f64 encode for p_id={p_id}: {e}"))?;
+                // Every double, ±INF and NaN included, has an index key.
+                let key = ObjKey::encode_f64(*v);
                 Ok((ObjKind::NUM_F64, key))
             }
             RawObject::Str(s) => {
@@ -1410,13 +1409,18 @@ impl SharedResolverState {
         self.apply_namespace_delta(&commit_ops.envelope.namespace_delta);
 
         let t = u32::try_from(commit_ops.t).map_err(|_| {
-            ResolverError::Resolve(format!("commit t={} does not fit in u32", commit_ops.t))
+            ResolverError::Unindexable(format!("commit t={} does not fit in u32", commit_ops.t))
         })?;
         let mut asserts = 0u32;
         let mut retracts = 0u32;
 
+        // A failure to resolve an op's content is a property of the commit.
+        // `for_each_op` can only return a codec error, so the failure is noted
+        // here to tell it apart from a failure to decode the op itself.
+        let mut unindexable: Option<String> = None;
+
         // Resolve user-data ops into chunk-local records.
-        commit_ops.for_each_op(|raw_op: RawOp<'_>| {
+        let walked = commit_ops.for_each_op(|raw_op: RawOp<'_>| {
             // Schema extraction (rebuild only): capture class/property hierarchy
             // directly from commit ops before dict remap.
             if let Some(ref mut schema) = self.schema_hook {
@@ -1442,8 +1446,13 @@ impl SharedResolverState {
 
             // Skip vector retractions with no matching assertion: a no-op
             // shouldn't drive any side-effect (stats / spatial / fulltext).
-            let Some(record) = self.resolve_op_chunk(&raw_op, t, chunk)? else {
-                return Ok(());
+            let record = match self.resolve_op_chunk(&raw_op, t, chunk) {
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    unindexable = Some(e.to_string());
+                    return Err(e);
+                }
             };
 
             // Feed raw op to spatial hook (needs raw WKT string + resolved IDs).
@@ -1486,17 +1495,29 @@ impl SharedResolverState {
                 retracts += 1;
             }
             Ok(())
-        })?;
+        });
+        if let Err(e) = walked {
+            return Err(match unindexable {
+                Some(msg) => ResolverError::Unindexable(msg),
+                None => e.into(),
+            });
+        }
 
-        // Emit txn-meta records into the same chunk.
-        let meta_count = self.emit_txn_meta_chunk(
-            commit_hash_hex,
-            &commit_ops.envelope,
-            commit_size,
-            asserts,
-            retracts,
-            chunk,
-        )?;
+        // Emit txn-meta records into the same chunk. Its failures are about
+        // the envelope's content too.
+        let meta_count = self
+            .emit_txn_meta_chunk(
+                commit_hash_hex,
+                &commit_ops.envelope,
+                commit_size,
+                asserts,
+                retracts,
+                chunk,
+            )
+            .map_err(|e| match e {
+                ResolverError::Resolve(msg) => ResolverError::Unindexable(msg),
+                other => other,
+            })?;
 
         Ok(ResolvedCommit {
             total_records: asserts + retracts + meta_count,
@@ -1689,8 +1710,8 @@ impl SharedResolverState {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
                 // The decode path uses the property's datatype to select
                 // DecodeKind, and F64→I64 mismatch corrupts values. (fluree/db-r#142)
-                let key = ObjKey::encode_f64(*v)
-                    .map_err(|e| format!("f64 encode for p_id={p_id}: {e}"))?;
+                // Every double, ±INF and NaN included, has an index key.
+                let key = ObjKey::encode_f64(*v);
                 Ok((ObjKind::NUM_F64, key))
             }
             RawObject::Str(s) => {
@@ -2066,8 +2087,7 @@ impl SharedResolverState {
                         "txn_meta does not support non-finite double values".into(),
                     ));
                 }
-                let key = ObjKey::encode_f64(*n)
-                    .map_err(|e| ResolverError::Resolve(format!("txn_meta double: {e}")))?;
+                let key = ObjKey::encode_f64(*n);
                 Ok((ObjKind::NUM_F64, key, DatatypeDictId::DOUBLE.as_u16(), 0))
             }
             TxnMetaValue::Boolean(b) => Ok((
@@ -2164,6 +2184,10 @@ pub enum ResolverError {
     Codec(CommitCodecError),
     Io(io::Error),
     Resolve(String),
+    /// A decoded commit's content has no index representation. Raised only
+    /// by [`SharedResolverState::resolve_commit_into_chunk`]; resolving the
+    /// same commit again fails the same way.
+    Unindexable(String),
 }
 
 impl From<CommitCodecError> for ResolverError {
@@ -2184,6 +2208,7 @@ impl std::fmt::Display for ResolverError {
             Self::Codec(e) => write!(f, "commit-codec: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
             Self::Resolve(msg) => write!(f, "resolve: {msg}"),
+            Self::Unindexable(msg) => write!(f, "resolve: {msg}"),
         }
     }
 }
@@ -2878,5 +2903,46 @@ mod tests {
             Some(0),
             "txn-meta graph must be first entry (dict id=0, g_id=0+1=1)"
         );
+    }
+
+    #[test]
+    fn content_the_index_cannot_hold_is_unindexable() {
+        let flake = |dt: &str| {
+            Flake::new(
+                Sid::new(101, "x"),
+                Sid::new(101, "n"),
+                FlakeValue::String("a".to_string()),
+                Sid::new(101, dt),
+                1,
+                true,
+                None,
+            )
+        };
+        let shared_with_full_datatype_dict = || {
+            let mut shared = SharedResolverState::new_for_ledger("test:main");
+            shared
+                .ns_prefixes
+                .insert(101, "http://example.org/".to_string());
+            while shared.datatypes.len() <= u32::from(DatatypeDictId::MAX) {
+                let iri = format!("http://example.org/dt{}", shared.datatypes.len());
+                shared.datatypes.get_or_insert(&iri);
+            }
+            shared
+        };
+
+        // A commit that needs one more datatype than the dictionary can number.
+        let mut chunk = RebuildChunk::new();
+        let err = shared_with_full_datatype_dict()
+            .resolve_commit_into_chunk(&build_test_blob(&[flake("fresh")], 1), "abc", &mut chunk)
+            .unwrap_err();
+        assert!(matches!(err, ResolverError::Unindexable(_)), "{err}");
+
+        // Bytes that do not decode are not: another read may succeed.
+        let blob = build_test_blob(&[flake("fresh")], 1);
+        let mut chunk = RebuildChunk::new();
+        let err = shared_with_full_datatype_dict()
+            .resolve_commit_into_chunk(&blob[..blob.len() / 2], "abc", &mut chunk)
+            .unwrap_err();
+        assert!(matches!(err, ResolverError::Codec(_)), "{err}");
     }
 }
