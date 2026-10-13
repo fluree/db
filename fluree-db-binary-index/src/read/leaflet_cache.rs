@@ -281,16 +281,13 @@ struct CachedV3Batch {
 }
 
 impl CachedV3Batch {
-    fn serve(
-        &self,
-        want: super::column_types::ColumnSet,
-    ) -> Option<super::column_types::ColumnBatch> {
+    /// `want`'s columns, which this entry must cover.
+    fn into_served(self, want: super::column_types::ColumnSet) -> super::column_types::ColumnBatch {
+        debug_assert!(self.columns.covers(want));
         if self.columns == want {
-            Some(self.batch.clone())
-        } else if self.columns.covers(want) {
-            Some(self.batch.project_to(want))
+            self.batch
         } else {
-            None
+            self.batch.project_to(want)
         }
     }
 
@@ -942,8 +939,9 @@ impl LeafletCache {
     /// Get a cached V3 column batch covering `key.columns` (read-only, no
     /// insertion).
     pub fn get_v3_batch(&self, key: &V3BatchCacheKey) -> Option<super::column_types::ColumnBatch> {
-        self.get_v3_entry(&key.into())?
-            .serve(super::column_types::ColumnSet(key.columns))
+        let want = super::column_types::ColumnSet(key.columns);
+        let entry = self.get_v3_entry(&key.into())?;
+        entry.columns.covers(want).then(|| entry.into_served(want))
     }
 
     /// Get or decode a V3 column batch with single-flight and error propagation.
@@ -989,8 +987,8 @@ impl LeafletCache {
                 }
             }
         };
-        if let Some(batch) = entry.serve(want) {
-            return Ok(batch);
+        if entry.columns.covers(want) {
+            return Ok(entry.into_served(want));
         }
         // Only an entry another caller decoded can fall short of `want`.
         let decode = decode_fn
@@ -999,9 +997,7 @@ impl LeafletCache {
         let missing = want.difference(entry.columns);
         let decoded = decode(missing)?;
         let widened = entry.widen(&decoded, missing);
-        let batch = widened
-            .serve(want)
-            .expect("widened entry covers the request");
+        let batch = widened.batch.project_to(want);
         self.store_widened(slot, widened);
         Ok(batch)
     }
