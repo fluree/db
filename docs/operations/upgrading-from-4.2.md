@@ -176,6 +176,9 @@ binding:
 - it can commit to a branch whose drop is in progress, since it does not check
   fences.
 
+Running the upgrade again binds the ledgers and lists the branches it created;
+see [A ledger a 4.2 process created on DynamoDB](#a-ledger-a-42-process-created-on-dynamodb).
+
 **Raft.** Raft clusters are upgraded one node at a time (see
 [Rolling upgrades](raft-clusters.md#rolling-upgrades)). The upgrade runs on the
 first leader elected on this release, through commands a 4.2 node cannot read,
@@ -277,6 +280,34 @@ stopping every process first still spares their users failed requests.
 - Watch for a warning that files under `ns@v2/` changed after the migration:
   a process on the old release is still running, and has created a ledger
   this release does not see.
+
+### A ledger a 4.2 process created on DynamoDB
+
+On DynamoDB a 4.2 process still running after the upgrade can create a
+ledger, which this release does not see: it is not listed, cannot be queried,
+and creating the name again fails because it already exists. To find such
+ledgers, scan the table for ledger `meta` items without a `fence`:
+
+```bash
+aws dynamodb scan --table-name <table> \
+  --filter-expression "#sk = :meta AND #kind = :ledger AND attribute_not_exists(#fence)" \
+  --expression-attribute-names '{"#sk":"sk","#kind":"kind","#fence":"fence","#pk":"pk"}' \
+  --expression-attribute-values '{":meta":{"S":"meta"},":ledger":{"S":"ledger"}}' \
+  --projection-expression "#pk"
+```
+
+To bring them in, stop every 4.2 process, delete the `@format` item, and start
+one process on this release:
+
+```bash
+aws dynamodb delete-item --table-name <table> \
+  --key '{"pk":{"S":"@format"},"sk":{"S":"meta"}}'
+```
+
+The upgrade runs again. It binds each ledger it finds unbound, and lists a
+branch a 4.2 process added to an upgraded ledger; ledgers and branches this
+release created, and those already upgraded, are left as they are. Its log
+line names what it bound.
 
 ## Rolling back
 

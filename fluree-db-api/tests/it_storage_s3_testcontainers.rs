@@ -838,6 +838,66 @@ async fn dynamodb_refuses_ids_bindings_cannot_carry_before_writing() {
     assert!(record.fence.is_none(), "nothing was bound: {record:?}");
 }
 
+/// A ledger a 4.2 process created after the upgrade: unbound, so unseen,
+/// and found by a scan for ledger `meta` items without a `fence`. Deleting
+/// the `@format` item runs the upgrade again at the next start, which binds
+/// it, as the upgrade guide describes.
+#[tokio::test]
+async fn dynamodb_rerun_upgrade_binds_a_late_ledger() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use fluree_db_nameservice::{BranchRecordStore, NameServiceLookup, NsRecord};
+    use fluree_db_storage_aws::dynamodb::schema::{ATTR_PK, ATTR_SK, PK_FORMAT, SK_META};
+
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+    let table = "upgrade-late-ledger";
+    ensure_dynamodb_table(&sdk_config, table).await;
+    let ns = DynamoDbNameService::from_client(client.clone(), table.into());
+    ns.migrate().await.expect("upgrade");
+
+    let late = fluree_db_core::LedgerId::parse("late:main").unwrap();
+    assert!(ns
+        .insert_record(&NsRecord::new(late.clone()))
+        .await
+        .expect("4.2 create")
+        .is_none());
+    assert!(ns.migrate().await.expect("current").is_none());
+    assert!(ns.lookup("late:main").await.unwrap().is_none(), "unbound");
+
+    let unfenced = client
+        .scan()
+        .table_name(table)
+        .filter_expression("#sk = :meta AND #kind = :ledger AND attribute_not_exists(#fence)")
+        .expression_attribute_names("#sk", "sk")
+        .expression_attribute_names("#kind", "kind")
+        .expression_attribute_names("#fence", "fence")
+        .expression_attribute_values(":meta", AttributeValue::S(SK_META.to_string()))
+        .expression_attribute_values(":ledger", AttributeValue::S("ledger".to_string()))
+        .send()
+        .await
+        .expect("scan");
+    let found: Vec<_> = unfenced
+        .items()
+        .iter()
+        .filter_map(|item| item.get(ATTR_PK)?.as_s().ok().cloned())
+        .collect();
+    assert_eq!(found, vec!["late:main".to_string()]);
+
+    client
+        .delete_item()
+        .table_name(table)
+        .key(ATTR_PK, AttributeValue::S(PK_FORMAT.to_string()))
+        .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
+        .send()
+        .await
+        .expect("delete format item");
+    let report = ns.migrate().await.expect("rerun").expect("ran");
+    assert_eq!(report.bound, vec!["late".to_string()]);
+    assert!(ns.lookup("late:main").await.unwrap().is_some());
+    assert!(ns.migrate().await.expect("current again").is_none());
+}
+
 /// A table a newer binary has marked with a newer format is refused at
 /// startup, and a binding in a state this binary does not know is refused
 /// rather than read as a free name.

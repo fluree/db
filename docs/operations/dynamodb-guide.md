@@ -607,6 +607,9 @@ The upgrade writes in place, so take a backup first, and upgrade every process
 that writes the table together, or deny the old ones write access with IAM. See
 [Upgrading from 4.2 and earlier](upgrading-from-4.2.md), including
 [deployments that cannot stop at once](upgrading-from-4.2.md#deployments-that-cannot-stop-at-once).
+A ledger a 4.2 process created after the upgrade is brought in by running the
+upgrade again; see
+[A ledger a 4.2 process created on DynamoDB](upgrading-from-4.2.md#a-ledger-a-42-process-created-on-dynamodb).
 
 ## Production Considerations
 

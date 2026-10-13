@@ -1480,6 +1480,56 @@ pub async fn migration_registers_soft_dropped_ledgers<S: LifecycleStore>(store: 
 
 /// A migration interrupted after fencing some of a ledger's records, before
 /// binding it, lists them all when it resumes.
+/// The upgrade run again on a store in use, as after a 4.2 process created
+/// records past it: a ledger it created is bound and seen, a branch it added
+/// to a migrated ledger is listed beside the branches created since, and
+/// nothing else changes.
+pub async fn a_rerun_migration_binds_late_legacy_records<S: crate::NameServicePublisher>(
+    store: &S,
+) {
+    assert!(store
+        .insert_record(&legacy_record("mydb:main", None, false))
+        .await
+        .unwrap()
+        .is_none());
+    lifecycle::migrate_legacy(store).await.unwrap();
+    let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_ledger(store, &id("fresh")).await.unwrap();
+    let fresh = store.get_binding("fresh").await.unwrap().unwrap();
+
+    for record in [
+        legacy_record("late:main", None, false),
+        legacy_record("mydb:hotfix", Some("main"), false),
+    ] {
+        assert!(store.insert_record(&record).await.unwrap().is_none());
+    }
+    assert!(
+        store.lookup("late:main").await.unwrap().is_none(),
+        "unbound"
+    );
+    assert_exists(
+        lifecycle::create_ledger(store, &id("late"))
+            .await
+            .unwrap_err(),
+    );
+
+    let report = lifecycle::migrate_legacy(store).await.unwrap();
+    assert_eq!(report.bound, vec!["late".to_string(), "mydb".to_string()]);
+    assert!(report.dropped.is_empty());
+
+    let late = store.get_binding("late").await.unwrap().unwrap().value;
+    assert_eq!(late.instance, lifecycle::legacy_instance("late"));
+    let record = store.lookup("late:main").await.unwrap().expect("bound");
+    assert_eq!(record.fence, late.fence_of("main"));
+    let mydb = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert_eq!(mydb.fence_of("dev"), dev.fence);
+    assert!(mydb.fence_of("hotfix").is_some());
+    assert!(store.lookup("mydb:hotfix").await.unwrap().is_some());
+    assert_eq!(store.get_binding("fresh").await.unwrap(), Some(fresh));
+}
+
 pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store: &S) {
     for record in [
         legacy_record("mydb:main", None, false),
@@ -1859,6 +1909,7 @@ where
     a_graph_source_keeps_its_key(&make().await).await;
     a_mirrored_index_head_reads_and_swaps_as_one(&make().await).await;
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
+    a_rerun_migration_binds_late_legacy_records(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1912,6 +1963,7 @@ macro_rules! lifecycle_conformance_tests {
             a_graph_source_keeps_its_key,
             a_mirrored_index_head_reads_and_swaps_as_one,
             an_unmirrored_branch_with_children_is_kept,
+            a_rerun_migration_binds_late_legacy_records,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {
