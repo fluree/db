@@ -108,6 +108,96 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
     );
 }
 
+/// A model ledger's shape with `INF` and `-INF` bounds reaches the data
+/// ledger in the datatype's own lexical form, and is enforced there.
+#[tokio::test]
+async fn cross_ledger_shape_with_infinite_values_is_enforced() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/model-inf:main";
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, model_id))
+        .upsert_turtle(&format!(
+            r#"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:ReadingShape
+                    rdf:type        sh:NodeShape ;
+                    sh:targetClass  ex:Reading ;
+                    sh:property     ex:rshape_score , ex:rshape_level .
+                ex:rshape_score
+                    sh:path         ex:score ;
+                    sh:maxInclusive "INF"^^xsd:double ;
+                    sh:minExclusive "-INF"^^xsd:double .
+                ex:rshape_level
+                    sh:path ex:level ;
+                    sh:in   ( "-INF"^^xsd:double "1.5"^^xsd:double ) .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M shapes");
+
+    let data_id = "test/cross-ledger-shapes/data-inf:main";
+    let config_iri = config_graph_iri(data_id);
+    let data = fluree
+        .stage_owned(genesis_ledger(&fluree, data_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger SHACL config")
+        .ledger;
+
+    let reading = |id: &str, score: &str, level: &str| {
+        json!({
+            "@context": {
+                "ex": "http://example.org/ns/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "@id": id,
+            "@type": "ex:Reading",
+            "ex:score": {"@value": score, "@type": "xsd:double"},
+            "ex:level": {"@value": level, "@type": "xsd:double"}
+        })
+    };
+    let data = fluree
+        .insert(data, &reading("ex:r1", "INF", "-INF"))
+        .await
+        .expect("INF is within [.., INF] and -INF is in the list")
+        .ledger;
+    let err = fluree
+        .insert(data.clone(), &reading("ex:r2", "1.0", "2.5"))
+        .await
+        .expect_err("2.5 is not in the list");
+    assert_shacl_violation(err, "sh:in with -INF");
+    let err = fluree
+        .insert(data, &reading("ex:r3", "-INF", "1.5"))
+        .await
+        .expect_err("-INF is not above -INF");
+    assert_shacl_violation(err, "sh:minExclusive -INF");
+}
+
 #[tokio::test]
 async fn data_ledger_tx_passes_when_cross_ledger_shape_satisfied() {
     let fluree = FlureeBuilder::memory().build_memory();

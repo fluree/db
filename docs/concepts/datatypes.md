@@ -72,6 +72,57 @@ Supported numeric types:
 - **xsd:double**: 64-bit floating point
 - **xsd:float**: 32-bit floating point
 
+#### Special Values: INF, -INF and NaN
+
+`xsd:double` and `xsd:float` include three special values, written `INF` (or
+`+INF`), `-INF` and `NaN`. A numeral too large for `xsd:double`, such as
+`"1e400"^^xsd:double`, is `INF` or `-INF`, as XSD 1.1 specifies. Other
+spellings such as `inf`, `Infinity` or `nan` are not values of these datatypes
+(see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
+
+`xsd:float` values are stored at double precision, so a numeral beyond the
+float range but within the double range, such as `"3.4e39"^^xsd:float`, keeps
+its value when written. The cast `xsd:float("3.4e39")` gives `INF`, so the two
+differ for such numerals.
+
+One exception keeps existing indexes reading as before. Bulk import in earlier
+versions stored `INF`, `-INF` and `NaN` in the index as the text `inf`, `-inf`
+and `NaN`. Under `xsd:double` or `xsd:float`:
+
+- Arithmetic, `SUM`, `AVG`, casts to `xsd:double` and `xsd:float`, and a
+  comparison inside a larger expression, such as `FILTER(?v > 1 || ?v < -1)`
+  or `BIND(?v > 1 AS ?b)`, read `inf` and `-inf` as `INF` and `-INF`, and
+  `NaN` as NaN.
+- To `isNumeric`, `ORDER BY`, `MIN`/`MAX`, and a `FILTER` that is a single
+  comparison, such as `FILTER(?v > 1)`, the text stays text.
+- One answer differs from earlier versions: `SUM` and `AVG` over `NaN` text
+  are `NaN`, as SPARQL specifies, where they were unbound.
+- The text `inf` cannot be told apart from a literal `"inf"^^xsd:double`
+  written today, which is not a value, so arithmetic and these aggregates read
+  that literal as `INF` too. `Infinity` and other spellings stay text.
+
+A full reindex of an index that bulk import built stores those values as
+numbers.
+
+Queries treat the special values as SPARQL specifies:
+
+- `INF` is greater, and `-INF` less, than every other number. Fluree compares
+  numbers exactly, so an integer or decimal beyond the double range is still
+  below `INF`. That is a choice: XPath would convert `10^400` to a double,
+  making it equal to `INF`.
+- No comparison holds for `NaN`: `=`, `<`, `>`, `<=` and `>=` are false and
+  `!=` is true, even between two NaNs. So `FILTER(?v = ?v)` drops NaN values.
+- A `NaN` literal in a pattern, as in `?s ex:v "NaN"^^xsd:double`, matches
+  stored NaN values, because patterns match terms.
+- `SUM` and `AVG` are `NaN` when a member is `NaN`, and `INF + -INF` is `NaN`.
+- `DISTINCT` and `GROUP BY` treat every NaN as one value.
+- `ORDER BY` places `NaN` after `INF` in ascending order. SPARQL leaves that
+  position to the implementation. `MIN` and `MAX` follow `ORDER BY`, so `MAX`
+  is `NaN` when a NaN is present.
+
+JSON-LD query results carry them as the strings `"INF"`, `"-INF"` and
+`"NaN"`, since JSON numbers cannot express them.
+
 ### Boolean Type
 
 ```json

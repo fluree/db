@@ -2563,6 +2563,22 @@ impl crate::Fluree {
             return;
         }
         if let IndexingMode::Background(handle) = &self.indexing_mode {
+            // A halted ledger starts no build on its own: say why writes are
+            // refused, where an operator sees the refusals. (No background
+            // indexer exists on wasm32.)
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Some(status) = handle.status(ledger_id).await.filter(|s| s.halted) {
+                    tracing::error!(
+                        ledger_id = %ledger_id,
+                        base_t,
+                        error = status.last_error.as_deref().unwrap_or_default(),
+                        "novelty at max: writes are refused because indexing of this ledger \
+                         is halted on committed data it cannot index"
+                    );
+                    return;
+                }
+            }
             if handle.trigger_if_idle(ledger_id, base_t).await {
                 tracing::info!(
                     ledger_id = %ledger_id,
