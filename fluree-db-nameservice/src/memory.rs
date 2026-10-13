@@ -31,7 +31,8 @@ pub struct MemoryNameService {
     records: Arc<RwLock<HashMap<LedgerId, NsRecord>>>,
     /// Graph source records keyed by canonical address (e.g., "my-search:main")
     graph_source_records: Arc<RwLock<HashMap<LedgerId, GraphSourceRecord>>>,
-    /// Status values keyed by canonical address (v2 extension)
+    /// Status values keyed by canonical address (v2 extension). Like
+    /// `config_values`, taken only after `records` when both are held.
     status_values: Arc<RwLock<HashMap<LedgerId, StatusValue>>>,
     /// Config values keyed by canonical address (v2 extension)
     config_values: Arc<RwLock<HashMap<LedgerId, ConfigValue>>>,
@@ -668,16 +669,15 @@ impl GraphSourceLookup for MemoryNameService {
 impl StatusLookup for MemoryNameService {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
         let key = LedgerId::parse(ledger_id)?;
-        let status_values = self.status_values.read();
+        let status = self.status_values.read().get(&key).cloned();
 
         // If status exists, return it
-        if let Some(status) = status_values.get(&key).cloned() {
+        if let Some(status) = status {
             return Ok(Some(status));
         }
 
         // If the ledger record exists but no status, return initial status (v=1)
-        let records = self.records.read();
-        if records.contains_key(&key) {
+        if self.records.read().contains_key(&key) {
             return Ok(Some(StatusValue::initial()));
         }
 
@@ -696,21 +696,20 @@ impl StatusPublisher for MemoryNameService {
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
         let key = LedgerId::parse(ledger_id)?;
+        // Records before status, as `delete_record` takes them, held until
+        // the write so a drop cannot land between the check and the write.
+        let records = self.records.read();
+        let mut status_values = self.status_values.write();
+        check_fence(&records, &key, fence)?;
 
         // Get current status (or initial if record exists but no status)
-        let current = {
-            let status_values = self.status_values.read();
-            let records = self.records.read();
-            check_fence(&records, &key, fence)?;
-
-            if let Some(status) = status_values.get(&key).cloned() {
-                Some(status)
-            } else if records.contains_key(&key) {
-                // Record exists but no status → treat as initial
-                Some(StatusValue::initial())
-            } else {
-                None
-            }
+        let current = if let Some(status) = status_values.get(&key).cloned() {
+            Some(status)
+        } else if records.contains_key(&key) {
+            // Record exists but no status → treat as initial
+            Some(StatusValue::initial())
+        } else {
+            None
         };
 
         if let Some(conflict) = check_cas_expectation(
@@ -730,7 +729,7 @@ impl StatusPublisher for MemoryNameService {
         }
 
         // Apply the update
-        self.status_values.write().insert(key, new.clone());
+        status_values.insert(key, new.clone());
 
         Ok(StatusCasResult::Updated)
     }
@@ -740,16 +739,15 @@ impl StatusPublisher for MemoryNameService {
 impl ConfigLookup for MemoryNameService {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let key = LedgerId::parse(ledger_id)?;
-        let config_values = self.config_values.read();
+        let config = self.config_values.read().get(&key).cloned();
 
         // If config exists, return it
-        if let Some(config) = config_values.get(&key).cloned() {
+        if let Some(config) = config {
             return Ok(Some(config));
         }
 
         // If the ledger record exists but no config, return unborn config (v=0)
-        let records = self.records.read();
-        if records.contains_key(&key) {
+        if self.records.read().contains_key(&key) {
             return Ok(Some(ConfigValue::unborn()));
         }
 
@@ -768,21 +766,20 @@ impl ConfigPublisher for MemoryNameService {
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
         let key = LedgerId::parse(ledger_id)?;
+        // Records before config, as `delete_record` takes them, held until
+        // the write so the record updated is the one whose fence was checked.
+        let mut records = self.records.write();
+        let mut config_values = self.config_values.write();
+        check_fence(&records, &key, fence)?;
 
         // Get current config (or unborn if record exists but no config)
-        let current = {
-            let config_values = self.config_values.read();
-            let records = self.records.read();
-            check_fence(&records, &key, fence)?;
-
-            if let Some(config) = config_values.get(&key).cloned() {
-                Some(config)
-            } else if records.contains_key(&key) {
-                // Record exists but no config → treat as unborn
-                Some(ConfigValue::unborn())
-            } else {
-                None
-            }
+        let current = if let Some(config) = config_values.get(&key).cloned() {
+            Some(config)
+        } else if records.contains_key(&key) {
+            // Record exists but no config → treat as unborn
+            Some(ConfigValue::unborn())
+        } else {
+            None
         };
 
         if let Some(conflict) = check_cas_expectation(
@@ -802,12 +799,12 @@ impl ConfigPublisher for MemoryNameService {
         }
 
         // Apply the update to config_values
-        self.config_values.write().insert(key.clone(), new.clone());
+        config_values.insert(key.clone(), new.clone());
 
         // Sync default_context and config_id to NsRecord
         let new_default_context = new.payload.as_ref().and_then(|p| p.default_context.clone());
         let new_config_id = new.payload.as_ref().and_then(|p| p.config_id.clone());
-        if let Some(record) = self.records.write().get_mut(&key) {
+        if let Some(record) = records.get_mut(&key) {
             record.default_context = new_default_context;
             record.config_id = new_config_id;
         }
@@ -869,6 +866,56 @@ mod tests {
         assert_eq!(heads.index.t, 1);
         let record = ns.lookup("mydb:main").await.unwrap().unwrap();
         assert_eq!(heads, crate::LedgerHeads::from_record(&record));
+    }
+
+    /// A drop racing status and config reads and pushes does not deadlock:
+    /// every path takes `records` before the status or config map.
+    #[test]
+    fn drops_racing_status_and_config_do_not_deadlock() {
+        const ID: &str = "race:main";
+        const ITERATIONS: i64 = 20_000;
+        let ns = Arc::new(MemoryNameService::new());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for role in 0..4 {
+            let ns = Arc::clone(&ns);
+            let done = done_tx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    for v in 1..=ITERATIONS {
+                        match role {
+                            0 => {
+                                let fence = Fence::generate();
+                                let mut record = NsRecord::new(LedgerId::parse(ID).unwrap());
+                                record.fence = Some(fence);
+                                ns.records.write().insert(record.ledger_id.clone(), record);
+                                ns.delete_record(ID, fence).await.unwrap();
+                            }
+                            1 => {
+                                ns.get_status(ID).await.unwrap();
+                                ns.get_config(ID).await.unwrap();
+                            }
+                            2 => {
+                                let new = StatusValue::new(v, StatusPayload::new("ready"));
+                                let _ = ns.push_status_fenced(ID, None, None, &new).await;
+                            }
+                            _ => {
+                                let new = ConfigValue::new(v, None);
+                                let _ = ns.push_config_fenced(ID, None, None, &new).await;
+                            }
+                        }
+                    }
+                });
+                done.send(()).unwrap();
+            });
+        }
+        for _ in 0..4 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("a nameservice call deadlocked");
+        }
     }
 
     #[tokio::test]
