@@ -69,7 +69,9 @@ pub use build::incremental_branch::{
     update_branch, update_branch_streaming, BranchUpdateConfig, BranchUpdateMeta,
     BranchUpdateResult,
 };
-pub use build::incremental_leaf::{update_leaf, LeafUpdateInput, LeafUpdateOutput, NewLeafBlob};
+pub use build::incremental_leaf::{
+    update_leaf, LeafUpdateInput, LeafUpdateOutput, LeafletOrigin, NewLeafBlob,
+};
 pub use build::incremental_resolve::{IncrementalNovelty, IncrementalResolveConfig};
 pub use build::incremental_root::IncrementalRootBuilder;
 pub use build::index_build::{
