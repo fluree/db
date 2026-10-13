@@ -349,7 +349,7 @@ fn parse_node_value(
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, strict);
+                return parse_value_object(map, entry, context, idx, strict);
             }
 
             // Check for @container: @language
@@ -411,6 +411,7 @@ fn parse_value_object(
     map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    idx: &[JsonValue],
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
     let val = map.get("@value").or_else(|| map.get("value")).unwrap();
@@ -462,6 +463,18 @@ fn parse_value_object(
         } else if let Some(l) = lang {
             obj.insert("@language".to_string(), json!(l));
         }
+    }
+
+    // `{"@value": …, "@annotation": {…}}`: the annotation describes a
+    // reifier of the triple this value completes, and expands as a node does.
+    if let Some(annotation) = map.get("@annotation") {
+        let mut key_idx = idx.to_vec();
+        key_idx.push(json!("@annotation"));
+        let expanded = match expand_node_internal(annotation, context, &key_idx, strict)? {
+            JsonValue::Array(nodes) => nodes,
+            node => vec![node],
+        };
+        obj.insert("@annotation".to_string(), JsonValue::Array(expanded));
     }
 
     Ok(vec![JsonValue::Object(obj)])

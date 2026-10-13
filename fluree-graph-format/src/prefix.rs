@@ -35,6 +35,18 @@ impl PrefixMap {
         PrefixMap { entries }
     }
 
+    /// The prefixes as a JSON-LD `@context`: `{"ex": "http://example.org/"}`.
+    pub fn to_context(&self) -> JsonValue {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort();
+        JsonValue::Object(
+            entries
+                .into_iter()
+                .map(|(prefix, ns)| (prefix.clone(), JsonValue::String(ns.clone())))
+                .collect(),
+        )
+    }
+
     /// Split `iri` into `(prefix, local)` for the longest namespace it starts
     /// with whose remainder is a valid local name. No allocation.
     pub fn prefixed_name<'a>(&'a self, iri: &'a str) -> Option<(&'a str, &'a str)> {

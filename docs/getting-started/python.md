@@ -47,7 +47,8 @@ with fluree.connect("./data") as conn:          # or fluree.connect(":memory:")
 ```
 
 `conn.ledger("people")` opens an existing ledger. Results come back as Python
-values: `int`, `Decimal`, `datetime`, `str`, and `fluree.IRI` for IRIs. A
+values: `int`, `Decimal`, `datetime`, `str`, `fluree.IRI` for IRIs, and
+`fluree.Triple` for RDF 1.2 triple terms. A
 result converts to a DataFrame with `to_pandas()` or `to_polars()`.
 
 ## Reading this book from Python
@@ -69,6 +70,7 @@ transaction body goes to `insert()`, `upsert()` or `update()`:
 | [Full-text](../indexing-and-search/fulltext.md) and [vector](../indexing-and-search/vector-search.md) search | `ledger.set_full_text(...)`, `fluree.Vector`, and the query functions |
 | [Graph sources](../graph-sources/overview.md): Iceberg, Delta, SQL | `conn.map_iceberg(...)`, `conn.map_delta(...)`, `conn.map_sql(...)` |
 | Export, and [archives](../operations/pack-archive-restore.md) | `ledger.export(...)`, `ledger.archive(path)`, `conn.restore(path, name)` |
+| [RDF documents](../reference/rdf-documents.md) (Turtle, TriG, N-Triples, N-Quads, JSON-LD) with no ledger | `fluree.parse(...)` and `fluree.serialize(...)`, as `fluree.Quad`s |
 | [Connection configuration](../reference/connection-config-jsonld.md) (S3, DynamoDB, encryption) | `fluree.connect(config={...})` |
 
 A few things differ from the server:

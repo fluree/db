@@ -3,6 +3,8 @@
 from os import PathLike
 from typing import Any
 
+from fluree._terms import IRI, BlankNode
+
 __version__: str
 
 Term = tuple[Any, ...]
@@ -193,6 +195,10 @@ class Transaction:
     def rollback(self) -> None: ...
 
 def sparql_form(sparql: str) -> str | None: ...
+def parse_rdf(
+    text: str, format: str, base: str | None = None
+) -> list[tuple[IRI | BlankNode, IRI, IRI | BlankNode | Term, IRI | BlankNode | None]]: ...
+def serialize_rdf(quads: list[Any], format: str, prefixes: dict[str, str] | None = None) -> str: ...
 def set_log_level(level: int) -> None: ...
 
 class Canceller:

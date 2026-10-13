@@ -745,6 +745,37 @@ async fn import_single_jsonld_file_then_query() {
     assert_eq!(names, vec!["Carol", "Dave"]);
 }
 
+/// A node with `@graph` names a graph, which bulk import does not hold. The
+/// import is refused, rather than storing the node and losing the graph.
+#[tokio::test]
+async fn import_refuses_a_jsonld_node_naming_a_graph() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    std::fs::write(
+        data_dir.path().join("named.jsonld"),
+        r#"{
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:g",
+            "ex:label": "G",
+            "@graph": [{"@id": "ex:x", "ex:p": "in-g"}]
+        }"#,
+    )
+    .unwrap();
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let err = fluree
+        .create("test/import-jsonld-named-graph:main")
+        .import(data_dir.path())
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("a node naming a graph must not import as if it had none");
+    assert!(err.to_string().contains("@graph"), "{err}");
+}
+
 /// Regression: serial Turtle path (threads=0) must produce queryable results.
 #[tokio::test]
 async fn import_serial_turtle_then_query() {
