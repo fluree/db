@@ -156,6 +156,87 @@ impl DynamoDbNameService {
         Ok(response.item().cloned())
     }
 
+    /// The items at `sk` under each of `pks`, read consistently with
+    /// `BatchGetItem` (100 keys a call), keyed by partition key. Keys a call
+    /// leaves unprocessed, as one whose response passes 16 MB does, are
+    /// asked for again; a call that makes no progress backs off.
+    async fn batch_get(&self, pks: &[String], sk: &str) -> Result<HashMap<String, Item>> {
+        use aws_sdk_dynamodb::types::KeysAndAttributes;
+        const MAX_STALLS: u32 = 5;
+        let mut found = HashMap::with_capacity(pks.len());
+        for chunk in pks.chunks(100) {
+            let mut keys: Vec<Item> = chunk
+                .iter()
+                .map(|pk| {
+                    HashMap::from([
+                        (ATTR_PK.to_string(), AttributeValue::S(pk.clone())),
+                        (ATTR_SK.to_string(), AttributeValue::S(sk.to_string())),
+                    ])
+                })
+                .collect();
+            let mut stalls = 0;
+            while !keys.is_empty() {
+                let asked = keys.len();
+                let request = KeysAndAttributes::builder()
+                    .set_keys(Some(std::mem::take(&mut keys)))
+                    .consistent_read(true)
+                    .build()
+                    .map_err(|e| storage_err("BatchGetItem request", e))?;
+                let response = self
+                    .client
+                    .batch_get_item()
+                    .request_items(&self.table_name, request)
+                    .send()
+                    .await
+                    .map_err(|e| storage_err("BatchGetItem", e))?;
+                for item in response
+                    .responses()
+                    .and_then(|r| r.get(&self.table_name))
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(pk) = item.get(ATTR_PK).and_then(|v| v.as_s().ok()) {
+                        found.insert(pk.clone(), item.clone());
+                    }
+                }
+                keys = response
+                    .unprocessed_keys()
+                    .and_then(|u| u.get(&self.table_name))
+                    .map(|k| k.keys().to_vec())
+                    .unwrap_or_default();
+                if !keys.is_empty() && keys.len() == asked {
+                    stalls += 1;
+                    if stalls > MAX_STALLS {
+                        return Err(NameServiceError::storage(
+                            "DynamoDB BatchGetItem left keys unprocessed after retries",
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << stalls)).await;
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The live values of the versioned items at `sk` under `pks`.
+    async fn batch_read_versioned<T: DeserializeOwned>(
+        &self,
+        pks: &[String],
+        sk: &str,
+        attr: &str,
+    ) -> Result<Vec<(String, Versioned<T>)>> {
+        let items = self.batch_get(pks, sk).await?;
+        let mut found = Vec::with_capacity(items.len());
+        for pk in pks {
+            if let Some(value) = items.get(pk).map(|item| Self::live_value(item, attr)) {
+                if let Some(value) = value? {
+                    found.push((pk.clone(), value));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// The live value of a versioned item: its version and the JSON in
     /// `attr`, or `None` for no item or a tombstone.
     fn live_value<T: DeserializeOwned>(item: &Item, attr: &str) -> Result<Option<Versioned<T>>> {
@@ -558,16 +639,14 @@ impl LedgerRegistry for DynamoDbNameService {
     /// Listed through the kind index, which is eventually consistent; each
     /// binding it names is then read consistently.
     async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
-        let mut found = Vec::new();
-        for item in self.query_gsi_by_kind(KIND_BINDING).await? {
-            let Some(name) = item.get(ATTR_PK).and_then(|v| v.as_s().ok()) else {
-                continue;
-            };
-            if let Some(binding) = self.get_binding(name).await? {
-                found.push((name.clone(), binding));
-            }
-        }
-        Ok(found)
+        let names: Vec<String> = self
+            .query_gsi_by_kind(KIND_BINDING)
+            .await?
+            .iter()
+            .filter_map(|item| item.get(ATTR_PK)?.as_s().ok().cloned())
+            .collect();
+        self.batch_read_versioned(&names, SK_BINDING, ATTR_BINDING)
+            .await
     }
 
     async fn get_dropped(&self, instance: &InstanceId) -> Result<Option<Versioned<DroppedLedger>>> {
@@ -593,21 +672,22 @@ impl LedgerRegistry for DynamoDbNameService {
     }
 
     async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
-        let mut found = Vec::new();
-        for item in self.query_gsi_by_kind(KIND_DROPPED).await? {
-            let Some(instance) = item
-                .get(ATTR_PK)
-                .and_then(|v| v.as_s().ok())
-                .and_then(|pk| pk.strip_prefix('@'))
-                .and_then(|id| InstanceId::parse(id).ok())
-            else {
-                continue;
-            };
-            if let Some(entry) = self.get_dropped(&instance).await? {
-                found.push(entry);
-            }
-        }
-        Ok(found)
+        let pks: Vec<String> = self
+            .query_gsi_by_kind(KIND_DROPPED)
+            .await?
+            .iter()
+            .filter_map(|item| item.get(ATTR_PK)?.as_s().ok().cloned())
+            .filter(|pk| {
+                pk.strip_prefix('@')
+                    .is_some_and(|id| InstanceId::parse(id).is_ok())
+            })
+            .collect();
+        Ok(self
+            .batch_read_versioned(&pks, SK_DROPPED, ATTR_ENTRY)
+            .await?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect())
     }
 
     /// DynamoDB caps an item at 400 KB, attribute names and the entry's

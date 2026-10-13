@@ -474,24 +474,31 @@ where
     Ok(record.and_then(|record| resolve_record(binding.as_ref().map(|v| &v.value), record)))
 }
 
-/// [`resolve_record`] for many records, reading each name's binding once.
+/// Bindings read at once by [`read_all_resolved`].
+const BINDING_READS_IN_FLIGHT: usize = 16;
+
+/// [`resolve_record`] for many records, reading each name's binding once,
+/// several at a time.
 pub async fn read_all_resolved<S: LedgerRegistry + ?Sized>(
     store: &S,
     records: Vec<NsRecord>,
 ) -> Result<Vec<NsRecord>> {
-    let mut bindings: std::collections::HashMap<String, Option<NameBinding>> =
-        std::collections::HashMap::new();
-    let mut resolved = Vec::with_capacity(records.len());
-    for record in records {
-        if !bindings.contains_key(&record.name) {
-            let binding = store.get_binding(&record.name).await?.map(|v| v.value);
-            bindings.insert(record.name.clone(), binding);
-        }
-        if let Some(record) = resolve_record(bindings[&record.name].as_ref(), record) {
-            resolved.push(record);
-        }
-    }
-    Ok(resolved)
+    use futures::{StreamExt, TryStreamExt};
+    let names: std::collections::BTreeSet<String> =
+        records.iter().map(|r| r.name.clone()).collect();
+    let bindings: std::collections::HashMap<String, Option<NameBinding>> =
+        futures::stream::iter(names)
+            .map(|name| async move {
+                let binding = store.get_binding(&name).await?.map(|v| v.value);
+                Ok::<_, crate::NameServiceError>((name, binding))
+            })
+            .buffer_unordered(BINDING_READS_IN_FLIGHT)
+            .try_collect()
+            .await?;
+    Ok(records
+        .into_iter()
+        .filter_map(|record| resolve_record(bindings[&record.name].as_ref(), record))
+        .collect())
 }
 
 #[cfg(test)]
