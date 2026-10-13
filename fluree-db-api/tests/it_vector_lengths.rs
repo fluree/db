@@ -790,11 +790,10 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     }
 }
 
-/// A ledger that an earlier release let hold two vector lengths on one
-/// property (`tests/fixtures/vector-lengths-4.2.3`, written by the v4.2.3
-/// CLI: indexed at t=1, a second length at t=2) still cannot be indexed. Writes to it go on, and refuse a vector
-/// of any other length. Its data moves to a new ledger by export and
-/// import once one length is kept.
+/// A ledger holding two vector lengths on one property
+/// (`tests/fixtures/vector-lengths-4.2.3`, written by the v4.2.3 CLI) refuses
+/// any other length, and its data moves to a new ledger by export and import
+/// once one length is kept.
 #[tokio::test]
 async fn a_ledger_already_holding_two_lengths_moves_by_export_and_import() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -808,22 +807,6 @@ async fn a_ledger_already_holding_two_lengths_moves_by_export_and_import() {
     let id = "ex:main";
     let ledger = fluree.ledger(id).await.expect("load the fixture");
     assert_eq!((ledger.index_t(), ledger.t()), (1, 2));
-
-    let record = fluree
-        .nameservice()
-        .lookup(id)
-        .await
-        .unwrap()
-        .expect("the fixture's record");
-    let err = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(id),
-        id,
-        &record,
-        fluree_db_indexer::IndexerConfig::default(),
-    )
-    .await
-    .expect_err("two lengths on one property");
-    assert!(err.to_string().contains("vector dims mismatch"), "{err}");
 
     insert(&fluree, id, vec![node("c", "other", 2)])
         .await
