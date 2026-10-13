@@ -400,6 +400,10 @@ subquery.
 - A parameter can be an RDF 1.2 triple term (in Python a `fluree.Triple`; in
   JSON-LD `{"@id": {"@id": s, p: o}}`), so `?claim rdf:reifies $t` finds the
   reifiers of one triple. It can't be a subject or a reifier.
+- A stored blank node's `_:fdb-…` id, as a query returns it, is that node
+  wherever the parameter stands: in a pattern or in an expression
+  (`FILTER(?s = $s)`), on its own or inside a triple term. Any other
+  blank-node label is refused, since it would match every node.
 
 ## Aggregation
 

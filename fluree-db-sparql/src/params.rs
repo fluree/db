@@ -33,8 +33,8 @@ use crate::ast::annotation::{Annotation, AnnotationVerb, ReifierId, TripleTerm};
 use crate::ast::pattern::{ServiceEndpoint, SubSelect};
 use crate::ast::query::DescribeTarget;
 use crate::ast::{
-    BlankNode, Expression, GraphName, GraphPattern, GroupCondition, Iri, IriValue, Literal,
-    LiteralValue, OrderExpr, PredicateTerm, QuadPatternElement, QueryBody, QuotedTriple,
+    BlankNode, BlankNodeValue, Expression, GraphName, GraphPattern, GroupCondition, Iri, IriValue,
+    Literal, LiteralValue, OrderExpr, PredicateTerm, QuadPatternElement, QueryBody, QuotedTriple,
     SelectVariable, SelectVariables, SolutionModifiers, SparqlAst, SubjectTerm, Term,
     TriplePattern, UpdateOperation, Var, VarOrIri,
 };
@@ -721,16 +721,26 @@ impl<'p> Substitution<'p> {
         Ok(())
     }
 
+    /// The parameter's value as an expression. A blank node in it is a
+    /// stored node ([`Value::node`]), named by its `_:fdb-…` id, which lowers
+    /// to that node as the label does in a pattern. The grammar refuses a
+    /// blank node in an expression because one written in the query text is
+    /// a fresh node; a parameter never holds one.
     fn constant(&self, var: &Var, value: Value) -> Result<Expression> {
         match value.term(var.span) {
             Term::Iri(iri) => Ok(Expression::Iri(iri)),
             Term::Literal(literal) => Ok(Expression::Literal(literal)),
-            Term::TripleTerm(triple) => crate::parse::expr::triple_term_to_expr(*triple)
-                .map_err(|reason| ParamError::new(&var.name, reason)),
-            _ => Err(ParamError::new(
-                &var.name,
-                "is a blank node, which can't be used in an expression",
-            )),
+            Term::TripleTerm(triple) => {
+                crate::parse::expr::triple_term_to_expr(stored_nodes_named(*triple))
+                    .map_err(|reason| ParamError::new(&var.name, reason))
+            }
+            Term::BlankNode(node) => stored_node_iri(&node).map(Expression::Iri).ok_or_else(|| {
+                ParamError::new(
+                    &var.name,
+                    "is a blank node, which can't be used in an expression",
+                )
+            }),
+            _ => Err(ParamError::new(&var.name, "can't be used in an expression")),
         }
     }
 
@@ -780,6 +790,33 @@ impl<'p> Substitution<'p> {
         }
         Ok(())
     }
+}
+
+/// A stored node's `_:fdb-…` id as an IRI term; `None` for an anonymous node.
+fn stored_node_iri(node: &BlankNode) -> Option<Iri> {
+    match &node.value {
+        BlankNodeValue::Labeled(label) => Some(Iri::full(format!("_:{label}"), node.span)),
+        BlankNodeValue::Anon => None,
+    }
+}
+
+/// `triple` with each stored node in it, nested triple terms included, named
+/// by its `_:fdb-…` id.
+fn stored_nodes_named(mut triple: TripleTerm) -> TripleTerm {
+    if let SubjectTerm::BlankNode(node) = &triple.subject {
+        if let Some(iri) = stored_node_iri(node) {
+            triple.subject = SubjectTerm::Iri(iri);
+        }
+    }
+    triple.object = match triple.object {
+        Term::BlankNode(node) => match stored_node_iri(&node) {
+            Some(iri) => Term::Iri(iri),
+            None => Term::BlankNode(node),
+        },
+        Term::TripleTerm(inner) => Term::TripleTerm(Box::new(stored_nodes_named(*inner))),
+        other => other,
+    };
+    triple
 }
 
 #[cfg(test)]
@@ -1095,12 +1132,13 @@ mod tests {
             let err = substituted(sparql, json!({"v": "literal"})).unwrap_err();
             assert!(err.reason.contains(reason), "{sparql}: {err}");
         }
-        let err = substituted(
+        // A stored node is that node in an expression too.
+        let ast = substituted(
             "SELECT * WHERE { ?s <p> ?o FILTER(?o = $v) }",
             json!({"v": {"@id": "_:fdb-b"}}),
         )
-        .unwrap_err();
-        assert!(err.reason.contains("blank node"), "{err}");
+        .unwrap();
+        assert!(!mentions_var(&ast, "v"));
     }
 
     #[test]

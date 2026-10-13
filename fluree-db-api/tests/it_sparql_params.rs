@@ -308,6 +308,62 @@ async fn a_blank_node_parameter_is_one_stored_node() {
     );
 }
 
+/// A stored node's `_:fdb-…` id is that node wherever a parameter stands: in
+/// a pattern, and in an expression, on its own or inside a triple term.
+#[tokio::test]
+async fn a_stored_blank_node_parameter_is_one_node_in_an_expression_too() {
+    let fluree = seeded().await;
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .insert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             [] ex:name \"Dan\" ~ ex:claim .\n\
+             ex:alice ex:name \"Alice\" ~ ex:other .",
+        )
+        .commit()
+        .await
+        .unwrap();
+    let db = head(&fluree).await;
+    let dan = rows(&fluree, &db, "SELECT ?s WHERE { ?s ex:name \"Dan\" }", None)
+        .await
+        .unwrap();
+    let dan = dan[0][0].as_str().expect("a blank node id").to_string();
+    assert!(dan.starts_with("_:fdb-"), "{dan}");
+
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let triple =
+        params(json!({ "t": { "@id": { "@id": dan, "http://example.org/name": "Dan" } } }));
+    let as_pattern = rows(
+        &fluree,
+        &db,
+        &format!("SELECT ?r WHERE {{ ?r {reifies} $t }}"),
+        Some(triple.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(as_pattern.len(), 1, "{as_pattern:?}");
+    let in_filter = rows(
+        &fluree,
+        &db,
+        &format!("SELECT ?r WHERE {{ ?r {reifies} ?t FILTER(?t = $t) }}"),
+        Some(triple),
+    )
+    .await
+    .unwrap();
+    assert_eq!(in_filter, as_pattern);
+
+    let names = rows(
+        &fluree,
+        &db,
+        "SELECT ?n WHERE { ?s ex:name ?n FILTER(?s = $s) }",
+        Some(params(json!({ "s": { "@id": dan } }))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(names, vec![json!(["Dan"])]);
+}
+
 #[tokio::test]
 async fn an_id_typed_value_is_an_iri() {
     let fluree = seeded().await;
