@@ -264,6 +264,21 @@ pub fn genesis_ledger_for_fluree(_fluree: &fluree_db_api::Fluree, ledger_id: &st
     LedgerState::new(db, Novelty::new(0))
 }
 
+/// Two instances over one storage and one nameservice, each with its own
+/// ledger cache: the shape of several servers sharing S3 and DynamoDB. A
+/// change one makes reaches the other only through storage.
+pub fn instances_sharing_storage() -> (MemoryFluree, MemoryFluree) {
+    let storage = fluree_db_core::MemoryStorage::new();
+    let nameservice = Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+    let instance = || {
+        fluree_db_api::FlureeBuilder::memory().build_with(
+            storage.clone(),
+            fluree_db_api::NameServiceMode::ReadWrite(nameservice.clone()),
+        )
+    };
+    (instance(), instance())
+}
+
 // =============================================================================
 // SHACL helpers
 // =============================================================================
@@ -371,6 +386,39 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
     )
     .await
     .expect("index build should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
+/// Build the index incrementally over the published one and publish it, with
+/// no fallback to a full rebuild: the build fails if the incremental path
+/// does. For tests whose incremental lane must not quietly become a rebuild.
+#[cfg(feature = "native")]
+pub async fn build_incrementally_and_publish_index(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    assert!(
+        record.index_head_id.is_some(),
+        "an incremental build needs a published index"
+    );
+    let result = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.content_store(ledger_id),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("incremental index build should succeed");
     fluree
         .publisher()
         .expect("read-write nameservice")

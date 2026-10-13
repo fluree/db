@@ -201,9 +201,9 @@ impl Ord for LiteralValue {
             (LiteralValue::String(a), LiteralValue::String(b)) => a.cmp(b),
             (LiteralValue::Boolean(a), LiteralValue::Boolean(b)) => a.cmp(b),
             (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
-            (LiteralValue::Double(a), LiteralValue::Double(b)) => a
-                .partial_cmp(b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits())),
+            // IEEE total order: total with NaN, and Equal exactly when the
+            // bits are equal, as `PartialEq` compares them.
+            (LiteralValue::Double(a), LiteralValue::Double(b)) => a.total_cmp(b),
             (LiteralValue::Json(a), LiteralValue::Json(b)) => a.cmp(b),
             _ => Ordering::Equal, // Should not happen
         }
@@ -628,5 +628,37 @@ mod tests {
         let t1 = Term::double(f64::NAN);
         let t2 = Term::double(f64::NAN);
         assert_eq!(t1, t2);
+    }
+
+    /// `LiteralValue`'s order is a total order that agrees with its equality
+    /// (which compares doubles by bits), NaN of either sign and both zeros
+    /// included, so sorting triples by it is well defined.
+    #[test]
+    fn literal_double_order_is_total_and_matches_equality() {
+        let values: Vec<LiteralValue> = [
+            f64::NEG_INFINITY,
+            -2.5,
+            -0.0,
+            0.0,
+            1.5,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
+            f64::from_bits(0x7FF0_0000_0000_0001),
+        ]
+        .into_iter()
+        .map(LiteralValue::Double)
+        .collect();
+        for a in &values {
+            for b in &values {
+                assert_eq!(a.cmp(b) == Ordering::Equal, a == b, "{a:?} vs {b:?}");
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "{a:?} vs {b:?}");
+                for c in &values {
+                    if a.cmp(b) != Ordering::Greater && b.cmp(c) != Ordering::Greater {
+                        assert_ne!(a.cmp(c), Ordering::Greater, "{a:?} <= {b:?} <= {c:?}");
+                    }
+                }
+            }
+        }
     }
 }

@@ -829,7 +829,7 @@ pub(crate) fn namespace_prefix_map(ns_registry: &NamespaceRegistry) -> HashMap<u
 }
 
 /// Resolve a cross-ledger `f:shapesSource` (if the config carries one) and
-/// open the model ledger at the resolved `t`. Returns `None` when the config
+/// open the model ledger at the resolved head. Returns `None` when the config
 /// has no cross-ledger shapes source. The wire itself is served from the
 /// governance cache when M's head hasn't advanced — the only per-call cost in
 /// the steady state is one nameservice head lookup.
@@ -841,8 +841,12 @@ pub(crate) async fn open_cross_ledger_shapes_model(
     let Some(resolved) = resolve_cross_ledger_shapes_for_tx(config, resolve_ctx).await? else {
         return Ok(None);
     };
+    let head = crate::cross_ledger::ModelHead {
+        t: resolved.resolved_t,
+        commit_id: resolved.commit_id.clone(),
+    };
     let model_db = resolve_ctx
-        .open_model_db(&resolved.model_ledger_id, resolved.resolved_t)
+        .open_model_db(&resolved.model_ledger_id, &head)
         .await
         .map_err(|e| {
             fluree_db_transact::TransactError::Parse(format!(
@@ -910,12 +914,13 @@ pub(crate) async fn resolve_cross_ledger_schema_for_tx(
 
 /// Identity of the shape source a compiled-SHACL cache entry was built from.
 ///
-/// `CrossLedger` carries the wire origin — model ledger, graph, and the `t`
-/// the wire was materialized at. M's head advancing produces a new
-/// `resolved_t` (one cheap nameservice lookup per transaction detects this),
+/// `CrossLedger` carries the wire origin — model ledger, graph, and the head
+/// (`t` and commit) the wire was materialized at. M's head moving produces a
+/// new origin (one cheap nameservice lookup per transaction detects this),
 /// which misses here and forces a recompile; an unchanged head reuses the
 /// already-translated, already-parsed shapes (including pre-parsed sh:sparql
-/// ASTs) with zero re-query of M.
+/// ASTs) with zero re-query of M. The commit is what tells a recreated or
+/// rebased M apart from the one cached at the same `t`.
 #[cfg(feature = "shacl")]
 #[derive(Clone, PartialEq, Eq)]
 enum CachedShapeSource {
@@ -924,6 +929,7 @@ enum CachedShapeSource {
         model_ledger_id: String,
         graph_iri: String,
         resolved_t: i64,
+        commit_id: Option<fluree_db_core::ContentId>,
     },
 }
 
@@ -1226,6 +1232,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                             model_ledger_id: wire.origin.model_ledger_id.clone(),
                             graph_iri: wire.origin.graph_iri.clone(),
                             resolved_t: wire.origin.resolved_t,
+                            commit_id: wire.origin.commit_id.clone(),
                         };
                         precompiled = probe_shacl_compile_cache(base, &source);
                         cache_source = Some(source);
@@ -2856,6 +2863,22 @@ impl crate::Fluree {
             return;
         }
         if let IndexingMode::Background(handle) = &self.indexing_mode {
+            // A halted ledger starts no build on its own: say why writes are
+            // refused, where an operator sees the refusals. (No background
+            // indexer exists on wasm32.)
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Some(status) = handle.status(ledger_id).await.filter(|s| s.halted) {
+                    tracing::error!(
+                        ledger_id = %ledger_id,
+                        base_t,
+                        error = status.last_error.as_deref().unwrap_or_default(),
+                        "novelty at max: writes are refused because indexing of this ledger \
+                         is halted on committed data it cannot index"
+                    );
+                    return;
+                }
+            }
             if handle.trigger_if_idle(ledger_id, base_t).await {
                 tracing::info!(
                     ledger_id = %ledger_id,

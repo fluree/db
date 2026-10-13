@@ -356,6 +356,40 @@ pub fn leaf_entries_for_predicate(
     &branch.leaves[leaf_range]
 }
 
+/// Ascending candidate subject boundaries for partitioning a predicate's scan.
+///
+/// When the predicate has at least `k` leaves, returns each leaf's first subject
+/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
+/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
+/// returns each matching leaflet's first subject, giving finer boundaries for a
+/// predicate that fits in one/few leaves but many leaflets. The returned values
+/// are non-decreasing (leaves and leaflets are subject-sorted).
+pub(crate) fn driver_subject_boundaries(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    k: usize,
+) -> Result<Vec<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    if leaves.len() >= k {
+        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
+    }
+    let mut bounds: Vec<u64> = Vec::new();
+    for leaf in leaves {
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
+            bounds.push(first.s_id.as_u64());
+        }
+    }
+    Ok(bounds)
+}
+
 /// Whether `p_id`'s stored rows make `(s_id, o_type, o_key)` unreliable as a
 /// join key **across two different predicates** (#1652 case 3). True when any
 /// POST leaflet shows either hazard:
@@ -3477,10 +3511,10 @@ pub fn count_predicate_overlay_delta(
         if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
             base_touched = base_touched.saturating_add(leaf.row_count);
         } else {
-            let handle = store
-                .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::from_io("leaf open", e))?;
-            for entry in &handle.dir().entries {
+            let dir = store
+                .open_leaf_dir(&leaf.leaf_cid)
+                .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+            for entry in &dir.entries {
                 if entry.row_count != 0 && entry.p_const == Some(p_id) {
                     base_touched = base_touched.saturating_add(entry.row_count as u64);
                 }
