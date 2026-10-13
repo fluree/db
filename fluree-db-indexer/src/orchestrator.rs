@@ -4959,7 +4959,9 @@ mod tests {
             }
         }
 
-        async fn ticks(owns_catchup: bool) -> usize {
+        /// Ticks counted once `want` arrive, or when `within` runs out: a
+        /// loaded runner can take far longer than the interval per tick.
+        async fn ticks(owns_catchup: bool, want: usize, within: Duration) -> usize {
             let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
             let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
             let config = IndexerConfig::default()
@@ -4969,16 +4971,23 @@ mod tests {
             let count = Arc::new(Count(AtomicUsize::new(0)));
             let run_task = tokio::spawn(worker.run());
             handle.set_housekeeping(count.clone());
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let deadline = tokio::time::Instant::now() + within;
+            while count.0.load(Ordering::SeqCst) < want && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             run_task.abort();
             count.0.load(Ordering::SeqCst)
         }
 
         assert!(
-            ticks(true).await >= 2,
+            ticks(true, 2, Duration::from_secs(30)).await >= 2,
             "the catch-up owner runs it each tick"
         );
-        assert_eq!(ticks(false).await, 0, "no other worker runs it");
+        assert_eq!(
+            ticks(false, 1, Duration::from_millis(200)).await,
+            0,
+            "no other worker runs it"
+        );
     }
 
     #[tokio::test]
