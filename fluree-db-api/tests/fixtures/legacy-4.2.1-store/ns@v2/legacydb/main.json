@@ -1,0 +1,19 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "@id": "legacydb:main",
+  "@type": [
+    "f:LedgerSource"
+  ],
+  "f:ledger": {
+    "@id": "legacydb"
+  },
+  "f:branch": "main",
+  "f:commitCid": "bagaybqabciqh4ofshs6dvuoc37vp22bmw4wch3oi4yseqkdgzkxfyzzw2roz2yq",
+  "f:t": 2,
+  "f:status": "ready",
+  "f:statusV": 1,
+  "f:configV": 0,
+  "f:branches": 1
+}

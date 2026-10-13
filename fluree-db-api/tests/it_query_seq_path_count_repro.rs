@@ -62,7 +62,7 @@ fn graph() -> serde_json::Value {
 }
 
 async fn seed_novelty(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree.insert(ledger0, &graph()).await.unwrap().ledger
 }
 
@@ -206,7 +206,7 @@ async fn seq_path_count_unit_novelty_vs_indexed() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree2, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree2, ledger_id).await;
             let res = fluree2
                 .insert_with_opts(
                     ledger0,

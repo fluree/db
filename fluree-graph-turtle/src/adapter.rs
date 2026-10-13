@@ -237,7 +237,12 @@ fn term_to_object_value(term: &Term) -> JsonValue {
                     if let Some(num) = serde_json::Number::from_f64(*n) {
                         obj.insert("@value".to_string(), JsonValue::Number(num));
                     } else {
-                        obj.insert("@value".to_string(), JsonValue::String(n.to_string()));
+                        // INF, -INF or NaN, in the lexical form the datatype
+                        // defines; JSON has no number for them.
+                        obj.insert(
+                            "@value".to_string(),
+                            JsonValue::String(fluree_graph_ir::canonical_xsd_double(*n)),
+                        );
                     }
                 }
                 LiteralValue::Boolean(b) => {
@@ -395,6 +400,23 @@ mod tests {
     fn parse(turtle: &str) -> JsonValue {
         crate::parse_to_json(&format!("@prefix ex: <http://example.org/> .\n{turtle}"))
             .expect("Turtle-star parses on the collector path")
+    }
+
+    /// A numeral beyond the double range is `INF`/`-INF`, spelled as the
+    /// datatype defines, so a strict reader of the JSON takes it back.
+    #[test]
+    fn an_overflowing_double_numeral_is_spelled_inf() {
+        let json = parse("ex:a ex:v 1e400 , -1e400 .");
+        let values = node(&json, "http://example.org/a")["http://example.org/v"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["@value"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["INF", "-INF"]);
+        for v in values {
+            assert!(fluree_graph_ir::parse_xsd_double(&v).is_some(), "{v}");
+        }
     }
 
     fn node<'a>(json: &'a JsonValue, id: &str) -> &'a JsonValue {

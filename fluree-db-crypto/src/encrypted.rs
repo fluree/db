@@ -391,7 +391,7 @@ where
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> fluree_db_core::error::Result<ContentWriteResult> {
@@ -407,7 +407,7 @@ where
         // (file, s3, memory, etc.) while we store encrypted bytes
         let mut result = self
             .inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, &encrypted)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, &encrypted)
             .await?;
 
         // Restore plaintext size (inner storage reports encrypted size)
@@ -419,11 +419,11 @@ where
     async fn content_write_bytes(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         bytes: &[u8],
     ) -> fluree_db_core::error::Result<ContentWriteResult> {
         let hash_hex = sha256_hex(bytes);
-        self.content_write_bytes_with_hash(kind, ledger_id, &hash_hex, bytes)
+        self.content_write_bytes_with_hash(kind, namespace, &hash_hex, bytes)
             .await
     }
 }
@@ -774,7 +774,11 @@ mod tests {
 
         // Use content-addressed write
         let result = encrypted
-            .content_write_bytes(ContentKind::Commit, "mydb:main", plaintext)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                plaintext,
+            )
             .await
             .unwrap();
 
@@ -827,7 +831,8 @@ mod tests {
                 Arc::new(remote)
             };
             let backend = StorageBackend::Managed(storage).with_disk_cache(dir.path());
-            let cs = backend.content_store("db:main");
+            let cs = backend
+                .content_store(&fluree_db_core::StorageNamespace::parse_legacy("db:main").unwrap());
             let id = cs.put(ContentKind::IndexLeaf, b"leaf bytes").await.unwrap();
             assert_eq!(cs.get(&id).await.unwrap(), b"leaf bytes");
 

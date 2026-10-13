@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::{
     content_address, CasAction, CasOutcome, ContentAddressedWrite, ContentId, ContentKind,
     ContentStore, ContentWriteResult, StorageCas, StorageExtError, StorageExtResult, StorageMethod,
-    StorageRead, StorageWrite,
+    StorageNamespace, StorageRead, StorageWrite,
 };
 
 /// Storage method for in-memory storage.
@@ -190,11 +190,11 @@ impl ContentAddressedWrite for MemoryStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
-        let address = content_address(STORAGE_METHOD_MEMORY, kind, ledger_id, content_hash_hex);
+        let address = content_address(STORAGE_METHOD_MEMORY, kind, namespace, content_hash_hex);
         self.insert(&address, bytes.to_vec());
         Ok(ContentWriteResult {
             address,
@@ -437,7 +437,11 @@ mod tests {
         let storage = MemoryStorage::new();
         let bytes = br#"{"hello":"world"}"#;
         let res = storage
-            .content_write_bytes(ContentKind::Commit, "mydb:main", bytes)
+            .content_write_bytes(
+                ContentKind::Commit,
+                &StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                bytes,
+            )
             .await
             .unwrap();
 
@@ -501,7 +505,11 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_adapter_roundtrip() {
         let storage = MemoryStorage::new();
-        let store = StorageContentStore::new(storage.clone(), "mydb:main", "memory");
+        let store = StorageContentStore::new(
+            storage.clone(),
+            StorageNamespace::parse_legacy("mydb:main").unwrap(),
+            "memory",
+        );
 
         let data = b"bridge test data";
         let id = store.put(ContentKind::Commit, data).await.unwrap();
@@ -515,7 +523,11 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_adapter_put_with_id() {
         let storage = MemoryStorage::new();
-        let store = StorageContentStore::new(storage, "mydb:main", "memory");
+        let store = StorageContentStore::new(
+            storage,
+            StorageNamespace::parse_legacy("mydb:main").unwrap(),
+            "memory",
+        );
 
         let data = b"bridge put_with_id test";
         let id = ContentId::new(ContentKind::IndexRoot, data);
@@ -527,7 +539,11 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_adapter_put_with_id_rejects_mismatch() {
         let storage = MemoryStorage::new();
-        let store = StorageContentStore::new(storage, "mydb:main", "memory");
+        let store = StorageContentStore::new(
+            storage,
+            StorageNamespace::parse_legacy("mydb:main").unwrap(),
+            "memory",
+        );
 
         let id = ContentId::new(ContentKind::IndexRoot, b"real data");
         let result = store.put_with_id(&id, b"fake data").await;
@@ -537,7 +553,11 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_adapter_cid_matches_content_id_new() {
         let storage = MemoryStorage::new();
-        let store = StorageContentStore::new(storage, "test:main", "memory");
+        let store = StorageContentStore::new(
+            storage,
+            StorageNamespace::parse_legacy("test:main").unwrap(),
+            "memory",
+        );
 
         let data = b"cid consistency check";
         let id_from_store = store.put(ContentKind::Commit, data).await.unwrap();

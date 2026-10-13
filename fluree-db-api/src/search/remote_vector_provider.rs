@@ -179,6 +179,7 @@ impl VectorIndexProvider for RemoteVectorSearchProvider {
                         QueryError::InvalidQuery(format!("{code}: {msg}"))
                     }
                     ErrorCode::InvalidRequest => QueryError::InvalidQuery(msg),
+                    ErrorCode::GraphSourceSuspended => QueryError::GraphSourceSuspended(msg),
                     _ => QueryError::Internal(format!("{code}: {msg}")),
                 });
             }

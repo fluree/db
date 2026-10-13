@@ -519,6 +519,31 @@ reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
 ```
 
+### Periodic Maintenance
+
+The indexer's catch-up tick queues ledgers whose indexing has stalled, collects old index versions, and finishes lifecycle operations a crash interrupted:
+
+- a drop, restore or purge that has not moved since the previous tick is resumed, and completes as if it had not been interrupted;
+- a create, import or archive restore that stopped is rolled back: its name is freed and what it wrote is deleted. One that is still running renews its claim on the name every minute, so a create is rolled back only once its claim has gone unrenewed for ten minutes, counted from when this node first saw it. A worker of that create still writing when it is rolled back can leave files behind; only the orphan sweep reclaims them;
+- a branch create that stopped before confirming the branch is rolled back ten minutes after this node first saw it, which frees a dropped branch it was created from.
+
+Only the node that owns catch-up runs the tick: never a peer, and under Raft only the leader. It runs only where background indexing is enabled.
+
+Where the tick never runs, nothing is resumed or rolled back on its own: the CLI on a local store, an application that embeds the Rust crate without background indexing, a server with `--indexer-catchup-interval-secs 0`, and serverless functions, which keep nothing between invocations. There, finish each by hand: dropping the name finishes an interrupted drop or rolls back a create that stopped, and `fluree dropped restore` or `fluree dropped purge` resumes its own. A create that stopped leaves the name unreadable and refuses a new create under it, saying a create is in progress or was interrupted.
+
+| Flag                              | Env Var                                | Default | Description |
+| --------------------------------- | -------------------------------------- | ------- | ----------- |
+| `--indexer-catchup-interval-secs` | `FLUREE_INDEXER_CATCHUP_INTERVAL_SECS` | `300`   | Seconds between ticks. `0` turns the periodic tick off; the sweep for stalled ledgers at start-up still runs |
+| `--orphan-sweep-interval-secs`    | `FLUREE_ORPHAN_SWEEP_INTERVAL_SECS`    | `0`     | Seconds between [orphan sweeps](../cli/dropped.md), which delete storage folders that no ledger or dropped ledger owns. `0` never sweeps. Each sweep lists the whole store, which on a large object store is slow and billed per request. Checked on each tick, and first run one interval after start |
+
+Config file equivalent:
+
+```toml
+[server.indexing]
+# indexer_catchup_interval_secs = 300
+# orphan_sweep_interval_secs = 86400   # daily; unset or 0 never sweeps
+```
+
 ## Server Role Configuration
 
 ### Server Role
@@ -1017,6 +1042,7 @@ fluree server run \
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
 | `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
+| `FLUREE_REMOTE_LEAF_FETCH`              | How index leaves are read from remote storage (S3, HTTP). `whole` fetches a leaf in one request on first access, shared by concurrent readers and kept in the disk cache; `ranged` reads the header and directory, then byte ranges per leaflet, until the leaf is reopened or scanned | `whole` |
 | `FLUREE_ICEBERG_LOCAL_ROOTS`            | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem. Unset disables local-filesystem tables entirely | Unset (local tables disabled) |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |

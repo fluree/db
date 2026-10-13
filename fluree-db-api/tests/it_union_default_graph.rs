@@ -35,7 +35,7 @@ async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
         "#
     );
     fluree
-        .stage_owned(genesis_ledger(fluree, ledger_id))
+        .stage_owned(genesis_ledger(fluree, ledger_id).await)
         .upsert_turtle(&trig)
         .execute()
         .await
@@ -369,7 +369,7 @@ async fn from_the_ledger_and_one_of_its_graphs_reads_just_those() {
     );
 
     let other = fluree
-        .stage_owned(genesis_ledger(&fluree, "union/from-other:main"))
+        .stage_owned(genesis_ledger(&fluree, "union/from-other:main").await)
         .upsert_turtle(&format!(
             r#"
             @prefix ex: <http://example.org/> .
@@ -574,7 +574,7 @@ async fn cypher_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
         "#
     );
     let ledger = fluree
-        .stage_owned(genesis_ledger(fluree, ledger_id))
+        .stage_owned(genesis_ledger(fluree, ledger_id).await)
         .upsert_turtle(&trig)
         .execute()
         .await

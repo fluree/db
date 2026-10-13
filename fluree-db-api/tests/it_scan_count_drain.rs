@@ -48,10 +48,10 @@ async fn variable_predicate_count_counts_the_cursor_without_legacy_bundles() {
     let fluree = FlureeBuilder::memory().build_memory();
     let count = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
 
-    let ledger_id = "it/edge-annotations:count-drain";
+    let ledger_id = "it/edge-annotations-count-drain:main";
     let indexed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({"@context": ctx(), "@id": "ex:x", "ex:worksFor": {"@id": "ex:z"}}),
         )
         .await
@@ -74,10 +74,10 @@ async fn variable_predicate_count_counts_the_cursor_without_legacy_bundles() {
     assert_eq!(result, json!([[4]]), "plain edge, base edge, link, body");
     assert_eq!(outcomes, ["proceed"], "{outcomes:?}");
 
-    let ledger_id = "it/edge-annotations:count-drain-legacy";
+    let ledger_id = "it/edge-annotations-count-drain-legacy:main";
     let indexed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({"@context": ctx(), "@id": "ex:x", "ex:worksFor": {"@id": "ex:z"}}),
         )
         .await

@@ -14,8 +14,7 @@ use crate::support::{
     assert_index_defaults, genesis_ledger_for_fluree, start_background_indexer_local,
     trigger_index_and_wait_outcome,
 };
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig, LedgerState};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 
@@ -35,7 +34,7 @@ async fn seed_test_data(
     ledger_id: &str,
     index_cfg: &IndexConfig,
 ) -> MemoryLedger {
-    let mut ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    let mut ledger = genesis_ledger_for_fluree(fluree, ledger_id).await;
 
     let txns = [
         json!({
@@ -265,7 +264,7 @@ async fn time_travel_below_index_keeps_type_pattern() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             for tx in [
                 json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s1", "ex:name": "S1"}),
                 json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s1", "@type": "ex:Tagged"}),
@@ -336,8 +335,10 @@ async fn time_travel_index_plus_novelty() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let mut ledger = LedgerState::new(db0, Novelty::new(0));
+            let mut ledger = fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
 
             // Insert first 2 transactions
             let tx1 = json!({
@@ -499,8 +500,10 @@ async fn time_travel_updates_across_index_novelty_boundary() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let mut ledger = LedgerState::new(db0, Novelty::new(0));
+            let mut ledger = fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
 
             // t=1: Insert Alice with age 30
             let tx1 = json!({
@@ -637,8 +640,10 @@ async fn time_travel_retraction_across_index_novelty_boundary() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let mut ledger = LedgerState::new(db0, Novelty::new(0));
+            let mut ledger = fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
 
             // t=1: Insert Alice and Bob
             let tx1 = json!({
@@ -866,8 +871,10 @@ async fn time_travel_no_duplicate_overlay_emission() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let mut ledger = LedgerState::new(db0, Novelty::new(0));
+            let mut ledger = fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
 
             // t=1: Insert many subjects to potentially span multiple leaves
             // Each subject has a unique name and sequential ID

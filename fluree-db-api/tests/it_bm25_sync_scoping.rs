@@ -38,7 +38,7 @@ async fn incremental_sync_actually_scopes_the_indexing_query() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/scoping:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let seed = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [

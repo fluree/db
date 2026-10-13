@@ -51,7 +51,7 @@ fn payload_v1() -> JsonValue {
 /// The original in it_sync_graph.rs returns the commit `t`; nothing here needs
 /// it, so this copy does not.
 async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let trig = format!(
         r#"
         @prefix ex: <http://example.org/> .

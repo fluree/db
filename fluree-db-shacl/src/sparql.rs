@@ -571,6 +571,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::StorageAccessDenied { .. }
         | QueryError::CatalogCredentialsNotVended { .. }
         | QueryError::CatalogAccessDenied { .. }
+        | QueryError::GraphSourceSuspended(_)
         | QueryError::Policy(_)
         | QueryError::TimeRangeNotCovered { .. }
         | QueryError::SnapshotNotFound { .. }
@@ -906,6 +907,7 @@ mod tests {
             QueryError::CatalogAccessDenied { .. } => true, [
                 QueryError::CatalogAccessDenied { table: s(), message: s() },
             ];
+            QueryError::GraphSourceSuspended(_) => true, [QueryError::GraphSourceSuspended(s())];
             QueryError::Policy(_) => true, [QueryError::Policy(s())];
             QueryError::TimeRangeNotCovered { .. } => true, [
                 QueryError::TimeRangeNotCovered { requested_t: 1, base_t: 2 },

@@ -182,7 +182,7 @@ async fn incremental_index_appends_new_terms_and_reuses_existing_handles() {
 
     local
         .run_until(async {
-            let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+            let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
             let first = fluree
                 .insert(
                     ledger0,
@@ -562,7 +562,7 @@ async fn incremental_index_follows_a_partial_repoint() {
 
     local
         .run_until(async {
-            let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+            let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
             let first = fluree
                 .upsert_turtle(
                     ledger0,
@@ -695,7 +695,8 @@ async fn link_lowering_keeps_object_types_through_accessors_and_novelty() {
 #[tokio::test]
 async fn rdf_reifies_with_an_ordinary_object_is_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "it/triple-term-links:reifies-firewall");
+    let ledger0 =
+        support::genesis_ledger(&fluree, "it/triple-term-links-reifies-firewall:main").await;
     let bad = "@prefix ex: <http://example.org/> .\n\
                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
                ex:r rdf:reifies ex:x ; ex:source ex:hr .\n";
@@ -706,11 +707,11 @@ async fn rdf_reifies_with_an_ordinary_object_is_refused() {
     assert!(format!("{err}").contains("reifies"), "{err}");
 
     fluree
-        .create_ledger("it/triple-term-links:reifies-firewall-sparql")
+        .create_ledger("it/triple-term-links-reifies-firewall-sparql:main")
         .await
         .expect("create ledger");
     let handle = fluree
-        .ledger_cached("it/triple-term-links:reifies-firewall-sparql")
+        .ledger_cached("it/triple-term-links-reifies-firewall-sparql:main")
         .await
         .expect("ledger handle");
     let err = fluree
@@ -738,7 +739,7 @@ async fn rdf_reifies_with_an_ordinary_object_is_refused() {
         .expect_err("a predicate variable bound to rdf:reifies must be refused too");
     assert!(format!("{err}").contains("reifies"), "{err}");
     let ledger = fluree
-        .ledger("it/triple-term-links:reifies-firewall-sparql")
+        .ledger("it/triple-term-links-reifies-firewall-sparql:main")
         .await
         .expect("reload");
     let err = fluree
@@ -796,7 +797,7 @@ async fn incremental_term_packs_are_compacted() {
 
     local
         .run_until(async {
-            let mut ledger = support::genesis_ledger(&fluree, ledger_id);
+            let mut ledger = support::genesis_ledger(&fluree, ledger_id).await;
             let mut roots: Vec<ContentId> = Vec::new();
             for cycle in 0..CYCLES {
                 let turtle = format!(
@@ -816,7 +817,7 @@ async fn incremental_term_packs_are_compacted() {
                 roots.push(record.index_head_id.expect("index root"));
             }
 
-            let cs = fluree.content_store(ledger_id);
+            let cs = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
             let mut decoded = Vec::new();
             for cid in &roots {
                 decoded.push(IndexRoot::decode(&cs.get(cid).await.expect("root")).expect("decode"));
@@ -1159,7 +1160,7 @@ async fn novelty_carries_links_until_the_index_covers_them() {
 #[tokio::test]
 async fn novelty_carries_links_on_a_ledger_never_indexed() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:never-indexed");
+    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:never-indexed").await;
     let ledger = fluree
         .insert_turtle(ledger, CLAIMS)
         .await
@@ -1396,7 +1397,7 @@ async fn arena_kind_objects_link_through_import_and_reindex() {
 #[tokio::test]
 async fn arena_kind_objects_link_in_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:arena-novelty");
+    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:arena-novelty").await;
     let ledger = fluree
         .insert_turtle(ledger, ARENA_CLAIMS)
         .await
@@ -1584,7 +1585,7 @@ async fn link_counts_follow_every_build() {
     local
         .run_until(async {
             let ledger = fluree
-                .insert_turtle(support::genesis_ledger(&fluree, ledger_id), CLAIMS)
+                .insert_turtle(support::genesis_ledger(&fluree, ledger_id).await, CLAIMS)
                 .await
                 .expect("claims")
                 .ledger;
@@ -1623,7 +1624,7 @@ async fn first_annotation_after_an_index_without_terms() {
         .run_until(async {
             let ledger = fluree
                 .insert_turtle(
-                    support::genesis_ledger(&fluree, ledger_id),
+                    support::genesis_ledger(&fluree, ledger_id).await,
                     "@prefix ex: <http://example.org/> .\nex:alice ex:knows ex:bob .\n",
                 )
                 .await
@@ -1788,7 +1789,7 @@ async fn object_bound_terms_read_the_object_tree() {
             // The first build sees no annotation, so the next one writes the
             // term dictionary over a base that has none.
             let plain = "@prefix ex: <http://example.org/> .\nex:zed ex:knows ex:bob .\n";
-            let mut ledger = support::genesis_ledger(&fluree, ledger_id);
+            let mut ledger = support::genesis_ledger(&fluree, ledger_id).await;
             for body in [plain, CLAIMS, LITERAL_CLAIMS, &padding, erin] {
                 ledger = fluree
                     .insert_turtle(ledger, body)
@@ -1899,7 +1900,7 @@ async fn triple_constructs_the_terms_links_hold() {
 #[tokio::test]
 async fn shacl_sparql_constraints_see_the_transactions_links() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:shacl-staged");
+    let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:shacl-staged").await;
     let ledger = fluree
         .insert_turtle(
             ledger,
@@ -1941,7 +1942,7 @@ async fn previews_read_the_links_of_their_own_annotations() {
     let memory = FlureeBuilder::memory().build_memory();
     let never_indexed = memory
         .insert_turtle(
-            support::genesis_ledger(&memory, "it/triple-term-links:preview-memory"),
+            support::genesis_ledger(&memory, "it/triple-term-links:preview-memory").await,
             CLAIMS,
         )
         .await
@@ -2103,7 +2104,7 @@ async fn construct_templates_reify_through_fresh_blank_nodes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree
         .insert_turtle(
-            support::genesis_ledger(&fluree, "it/triple-term-links:construct-reified"),
+            support::genesis_ledger(&fluree, "it/triple-term-links:construct-reified").await,
             CLAIMS,
         )
         .await
@@ -2367,7 +2368,7 @@ async fn link_reads_refuse_an_index_built_before_links() {
             .expect("ns record");
         let cid = record.index_head_id.clone().expect("index root");
         let bytes = fluree
-            .content_store(ledger_id)
+            .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
             .get(&cid)
             .await
             .expect("root");
@@ -2376,7 +2377,7 @@ async fn link_reads_refuse_an_index_built_before_links() {
     let query = "PREFIX ex: <http://example.org/>\n\
                  SELECT ?r ?s WHERE { << ?s ex:knows ?o ~ ?r >> ex:src ex:x } ORDER BY ?r";
 
-    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
     fluree
         .upsert_turtle(ledger, &claim(1))
         .await
@@ -2387,14 +2388,17 @@ async fn link_reads_refuse_an_index_built_before_links() {
     assert!(root.has_annotations && root.term_dict.is_some());
     root.term_dict = None;
     let cid = fluree
-        .content_store(ledger_id)
+        .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
         .put(ContentKind::IndexRoot, &root.encode())
         .await
         .expect("put root");
+    let fence = fluree_db_nameservice::testing::current_fence(fluree.nameservice(), ledger_id)
+        .await
+        .expect("fence");
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, index_t, &cid)
+        .publish_index_allow_equal_fenced(ledger_id, fence, index_t, &cid)
         .await
         .expect("publish root");
 
@@ -2528,7 +2532,7 @@ async fn links_join_a_subject_only_novelty_holds() {
              ex:alice ex:knows ex:{o} ~ ex:claim1 {{| ex:confidence 0.9 |}} .\n"
         )
     };
-    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
     fluree
         .upsert_turtle(ledger, &ttl("bob"))
         .await
@@ -2697,7 +2701,12 @@ async fn links_written_into_commits_read_back() {
         }
     };
 
-    let ledger = commit_link(support::genesis_ledger(&fluree, ledger_id), "bob", "claim1").await;
+    let ledger = commit_link(
+        support::genesis_ledger(&fluree, ledger_id).await,
+        "bob",
+        "claim1",
+    )
+    .await;
     assert_eq!(
         claims(ledger).await,
         strings(&[&["ex:claim1", "ex:bob"]]),
@@ -2900,7 +2909,7 @@ async fn term_components_stream_in_batches_within_the_budget() {
         ));
     }
     fluree
-        .upsert_turtle(support::genesis_ledger(&fluree, ledger_id), &ttl)
+        .upsert_turtle(support::genesis_ledger(&fluree, ledger_id).await, &ttl)
         .await
         .expect("seed");
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
@@ -2973,7 +2982,7 @@ async fn literal_count_leaves_triple_terms_out() {
     let ledger_id = "it/triple-term-links:literal-count";
     fluree
         .upsert_turtle(
-            support::genesis_ledger(&fluree, ledger_id),
+            support::genesis_ledger(&fluree, ledger_id).await,
             "@prefix ex: <http://example.org/> .\n\
              ex:a ex:name \"x\" .\n\
              ex:a ex:knows ex:b .\n\
@@ -3000,7 +3009,10 @@ async fn triple_terms_are_values_under_any_predicate() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/triple-term-links:values";
     let ledger = fluree
-        .insert_turtle(support::genesis_ledger(&fluree, ledger_id), TERM_VALUES)
+        .insert_turtle(
+            support::genesis_ledger(&fluree, ledger_id).await,
+            TERM_VALUES,
+        )
         .await
         .expect("insert triple-term values")
         .ledger;
@@ -3075,23 +3087,26 @@ async fn triple_terms_are_values_under_any_predicate() {
 #[tokio::test]
 async fn every_write_path_takes_triple_term_values() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let fresh = |id: &str| support::genesis_ledger(&fluree, id);
+    let fresh = |id: &'static str| support::genesis_ledger(&fluree, id);
 
     let ledger = fluree
-        .insert(fresh("it/tt-values:jsonld"), &term_values_jsonld())
+        .insert(
+            fresh("it/tt-values-jsonld:main").await,
+            &term_values_jsonld(),
+        )
         .await
         .expect("JSON-LD insert")
         .ledger;
     assert_term_values(&fluree, &ledger, "JSON-LD insert", 1).await;
 
     let ledger = fluree
-        .upsert_turtle(fresh("it/tt-values:upsert"), TERM_VALUES)
+        .upsert_turtle(fresh("it/tt-values-upsert:main").await, TERM_VALUES)
         .await
         .expect("Turtle upsert")
         .ledger;
     assert_term_values(&fluree, &ledger, "Turtle upsert", 1).await;
 
-    let ledger_id = "it/tt-values:sparql";
+    let ledger_id = "it/tt-values-sparql:main";
     fluree.create_ledger(ledger_id).await.expect("create");
     let update = |body: &str| {
         let body = format!("PREFIX ex: <http://example.org/>\n{body}");
@@ -3136,7 +3151,7 @@ async fn every_write_path_takes_triple_term_values() {
 
     let ledger = fluree
         .update(
-            fluree.ledger("it/tt-values:jsonld").await.expect("load"),
+            fluree.ledger("it/tt-values-jsonld:main").await.expect("load"),
             &json!({
                 "@context": {"ex": "http://example.org/"},
                 "delete": {"@id": "ex:doc", "ex:mentions": {"@id": {"@id": "ex:s", "ex:p": {"@id": "ex:o"}}}}
@@ -3151,18 +3166,21 @@ async fn every_write_path_takes_triple_term_values() {
         "a JSON-LD delete removes the value"
     );
 
-    let (imported, ledger) =
-        import(&[("values.ttl", TERM_VALUES)], "it/tt-values:import-ttl").await;
+    let (imported, ledger) = import(
+        &[("values.ttl", TERM_VALUES)],
+        "it/tt-values-import-ttl:main",
+    )
+    .await;
     assert_term_values(&imported, &ledger, "Turtle import", 1).await;
     let (imported, ledger) = import(
         &[("values.jsonld", &term_values_jsonld().to_string())],
-        "it/tt-values:import-jsonld",
+        "it/tt-values-import-jsonld:main",
     )
     .await;
     assert_term_values(&imported, &ledger, "JSON-LD import", 1).await;
 
     // Graph sync stores them, and a re-sync of the same text finds no delta.
-    let ledger_id = "it/tt-values:sync";
+    let ledger_id = "it/tt-values-sync:main";
     fluree.create_ledger(ledger_id).await.expect("create");
     let sync = || {
         fluree.sync_named_graph_rdf_with(
@@ -3198,14 +3216,14 @@ async fn every_write_path_takes_triple_term_values() {
                   <http://example.org/doc> <http://example.org/mentions> \
                   <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>> \
                   <http://example.org/g> .\n";
-    let (imported, ledger) = import(&[("values.nq", nquads)], "it/tt-values:import-nq").await;
+    let (imported, ledger) = import(&[("values.nq", nquads)], "it/tt-values-import-nq:main").await;
     assert_term_values(&imported, &ledger, "N-Quads import", 1).await;
     let trig = format!("{TERM_VALUES}ex:g {{ ex:doc ex:mentions <<( ex:s ex:p ex:o )>> . }}\n");
     let (imported, imported_ledger) =
-        import(&[("values.trig", &trig)], "it/tt-values:import-trig").await;
+        import(&[("values.trig", &trig)], "it/tt-values-import-trig:main").await;
     assert_term_values(&imported, &imported_ledger, "TriG import", 1).await;
     let inserted = fluree
-        .insert_turtle(fresh("it/tt-values:trig-insert"), &trig)
+        .insert_turtle(fresh("it/tt-values-trig-insert:main").await, &trig)
         .await
         .expect("TriG insert")
         .ledger;
@@ -3318,7 +3336,7 @@ async fn nested_triple_terms_are_values() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/triple-term-links:nested";
     let ledger = fluree
-        .insert_turtle(support::genesis_ledger(&fluree, ledger_id), NESTED)
+        .insert_turtle(support::genesis_ledger(&fluree, ledger_id).await, NESTED)
         .await
         .expect("insert nested terms")
         .ledger;
@@ -3392,7 +3410,7 @@ async fn term_components_offer_novelty_value_terms_when_they_lead() {
         .collect();
     fluree
         .insert_turtle(
-            support::genesis_ledger(&fluree, ledger_id),
+            support::genesis_ledger(&fluree, ledger_id).await,
             &format!("@prefix ex: <http://example.org/> .\n{docs}"),
         )
         .await
@@ -3454,7 +3472,7 @@ async fn term_components_offer_novelty_value_terms_when_they_lead() {
 #[tokio::test]
 async fn every_write_path_takes_nested_triple_terms() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let fresh_ledger = |id: &str| support::genesis_ledger(&fluree, id);
+    let fresh_ledger = |id: &'static str| support::genesis_ledger(&fluree, id);
     let nested_jsonld = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -3469,7 +3487,10 @@ async fn every_write_path_takes_nested_triple_terms() {
         ]
     });
     let ledger = fluree
-        .insert(fresh_ledger("it/tt-nested:jsonld"), &nested_jsonld)
+        .insert(
+            fresh_ledger("it/tt-nested-jsonld:main").await,
+            &nested_jsonld,
+        )
         .await
         .expect("JSON-LD insert")
         .ledger;
@@ -3503,13 +3524,13 @@ async fn every_write_path_takes_nested_triple_terms() {
     assert_eq!(mentions(ledger).await, 0, "a JSON-LD delete removes it");
 
     let ledger = fluree
-        .upsert_turtle(fresh_ledger("it/tt-nested:upsert"), NESTED)
+        .upsert_turtle(fresh_ledger("it/tt-nested-upsert:main").await, NESTED)
         .await
         .expect("Turtle upsert")
         .ledger;
     assert_nested(&fluree, &ledger, "Turtle upsert", 1).await;
 
-    let ledger_id = "it/tt-nested:sparql";
+    let ledger_id = "it/tt-nested-sparql:main";
     fluree.create_ledger(ledger_id).await.expect("create");
     let update = |body: &str| {
         let body = format!("PREFIX ex: <http://example.org/>\n{body}");
@@ -3558,13 +3579,13 @@ async fn every_write_path_takes_nested_triple_terms() {
         "{NESTED}ex:g {{ ex:doc ex:mentions <<( ex:alice ex:says <<( ex:s ex:p ex:o )>> )>> . }}\n"
     );
     let inserted = fluree
-        .insert_turtle(fresh_ledger("it/tt-nested:trig"), &trig)
+        .insert_turtle(fresh_ledger("it/tt-nested-trig:main").await, &trig)
         .await
         .expect("TriG insert")
         .ledger;
     assert_nested(&fluree, &inserted, "TriG insert", 1).await;
     let (imported, imported_ledger) =
-        import(&[("nested.trig", &trig)], "it/tt-nested:import-trig").await;
+        import(&[("nested.trig", &trig)], "it/tt-nested-import-trig:main").await;
     assert_nested(&imported, &imported_ledger, "TriG import", 1).await;
     for (fluree, ledger, label) in [
         (&fluree, &inserted, "TriG insert"),
@@ -3598,7 +3619,7 @@ async fn term_bound_links_probe_in_bulk() {
         .collect();
     fluree
         .insert_turtle(
-            support::genesis_ledger(&fluree, ledger_id),
+            support::genesis_ledger(&fluree, ledger_id).await,
             &turtle(&format!(
                 "<< ex:s1 ex:partOf ex:anchor ~ ex:r1 >> ex:source ex:d1 .\n\
                  << ex:s2 ex:partOf ex:anchor ~ ex:r2 >> ex:source ex:d2 .\n\
@@ -3728,7 +3749,7 @@ async fn construct_templates_write_triple_terms_as_values() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree
         .insert_turtle(
-            support::genesis_ledger(&fluree, "it/triple-term-links:construct-values"),
+            support::genesis_ledger(&fluree, "it/triple-term-links:construct-values").await,
             CLAIMS,
         )
         .await

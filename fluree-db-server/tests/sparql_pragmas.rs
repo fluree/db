@@ -413,13 +413,13 @@ async fn update_fuel_and_meta_pragmas() {
 /// read as of a later instant in that past sees the write.
 #[tokio::test]
 async fn event_time_pragma_backdates_the_commit() {
-    let (_tmp, app) = seeded("prag:evt").await;
+    let (_tmp, app) = seeded("prag-evt:main").await;
     // Backdated commits must not precede the ledger's head, so start fresh.
     let (status, json) = send(
         &app,
         post("/v1/fluree/create", "application/json", &[])
             .body(Body::from(
-                serde_json::json!({ "ledger": "prag:dated" }).to_string(),
+                serde_json::json!({ "ledger": "prag-dated:main" }).to_string(),
             ))
             .unwrap(),
     )
@@ -428,7 +428,7 @@ async fn event_time_pragma_backdates_the_commit() {
 
     let resp = update(
         &app,
-        "prag:dated",
+        "prag-dated:main",
         "# PRAGMA event-time: 2020-01-01T00:00:00Z\n\
          PREFIX ex: <http://example.org/>\nINSERT DATA { ex:dan ex:name \"Dan\" }",
         &[],
@@ -438,7 +438,7 @@ async fn event_time_pragma_backdates_the_commit() {
     assert_eq!(status, StatusCode::OK, "{json}");
 
     let as_of_2020 = "PREFIX ex: <http://example.org/>\n\
-                      SELECT ?name FROM <prag:dated@iso:2020-06-01T00:00:00Z> \
+                      SELECT ?name FROM <prag-dated:main@iso:2020-06-01T00:00:00Z> \
                       WHERE { ?s ex:name ?name }";
     let (status, json) = send(
         &app,
@@ -452,7 +452,7 @@ async fn event_time_pragma_backdates_the_commit() {
 
     let resp = update(
         &app,
-        "prag:dated",
+        "prag-dated:main",
         "# PRAGMA event-time: yesterday\nINSERT DATA { <urn:a> <urn:p> 1 }",
         &[],
     )

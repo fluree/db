@@ -106,7 +106,7 @@ async fn run_sparql_update(
 async fn issue_1721_json_ld_no_op_delete_keeps_filter_equality_results() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "hazard1721-jsonld:main");
+    let ledger0 = genesis_ledger(&fluree, "hazard1721-jsonld:main").await;
     let ledger = fluree
         .insert(ledger0, &seed())
         .await
@@ -148,7 +148,7 @@ async fn issue_1721_json_ld_no_op_delete_keeps_filter_equality_results() {
 async fn issue_1721_sparql_delete_data_no_op_keeps_filter_equality_results() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "hazard1721-sparql:main");
+    let ledger0 = genesis_ledger(&fluree, "hazard1721-sparql:main").await;
     let ledger = fluree
         .insert(ledger0, &seed())
         .await
@@ -182,7 +182,7 @@ async fn issue_1721_sparql_delete_data_no_op_keeps_filter_equality_results() {
 async fn issue_1721_replayed_delete_keeps_filter_equality_results() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "hazard1721-replay:main");
+    let ledger0 = genesis_ledger(&fluree, "hazard1721-replay:main").await;
     let insert = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -241,7 +241,7 @@ async fn ref_only_survives_a_published_index_round_trip() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "hazard1721-refonly:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let insert = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -291,7 +291,7 @@ async fn issue_1721_no_op_delete_does_not_drift_a_published_index() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "hazard1721-indexed:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let _ = fluree
         .insert(ledger0, &seed())
         .await
@@ -354,7 +354,7 @@ async fn issue_1721_time_travel_below_the_index_t_does_not_license_the_fold() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "hazard1721-timetravel:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert(ledger0, &seed())
         .await
@@ -457,7 +457,7 @@ async fn issue_1721_historical_tags_survive_an_incremental_publish() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "hazard1721-monotone:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert(ledger0, &seed())
         .await

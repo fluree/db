@@ -756,7 +756,7 @@ mod tests {
         let pack_bytes = make_pack_bytes(0, 50);
         let cs = fluree_db_core::content_store_for(
             fluree_db_core::MemoryStorage::new().simulating_remote(),
-            "lazy:main",
+            &fluree_db_core::StorageNamespace::parse_legacy("lazy:main").unwrap(),
         );
 
         // Store the pack in the content store.

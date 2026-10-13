@@ -42,7 +42,7 @@ async fn test_trig_named_graph_basic() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // TriG with a named graph block - use upsert_turtle which processes GRAPH blocks
             let trig = r#"
@@ -130,7 +130,7 @@ async fn test_trig_compact_named_graph_block() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Compact form: graph label `<urn:graph:test>` with NO GRAPH keyword,
             // plus a default-graph triple. This is exactly the payload from the
@@ -249,7 +249,7 @@ async fn test_sparql_insert_data_named_graph() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let sparql = r#"
                 INSERT DATA {
@@ -319,7 +319,7 @@ async fn test_sparql_delete_data_named_graph() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Default-graph triple + a named-graph triple (distinct subjects).
             let insert = r#"
@@ -404,7 +404,7 @@ async fn test_sparql_delete_where_named_graph_block() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Same subject/predicate in the default graph, g1 (two values),
             // and g2 — only g1's matches may be deleted.
@@ -545,7 +545,7 @@ async fn test_sparql_update_writes_graph_names_as_terms() {
         .with_ledger_cache_config(LedgerManagerConfig::default())
         .build_memory();
     let ledger_id = "it/sparql-update-graph-name-terms:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = run_sparql_update(
         &fluree,
         ledger,
@@ -608,7 +608,7 @@ async fn test_sparql_update_graph_variable_rewrites_in_place() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
             let insert = r#"
                 INSERT DATA {
                     <https://example.org/a> <https://example.org/status> "old" .
@@ -686,7 +686,7 @@ async fn test_sparql_update_graph_variable_across_more_graphs_than_envelope_cap(
     const GRAPHS: usize = fluree_db_core::commit::codec::envelope::MAX_GRAPH_DELTA_ENTRIES + 44;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-update-graph-var-wide:main";
-    let mut ledger = genesis_ledger(&fluree, ledger_id);
+    let mut ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed in two commits so neither registers more graphs than the cap.
     for half in [0..GRAPHS / 2, GRAPHS / 2..GRAPHS] {
@@ -746,7 +746,7 @@ async fn test_sparql_insert_graph_variable_registers_new_graphs() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
             let seed = r#"
                 INSERT DATA {
                     <https://example.org/alice> <https://example.org/name> "alice" .
@@ -805,7 +805,7 @@ async fn test_sparql_delete_where_graph_variable() {
     // and leaves the default graph alone.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-delete-where-graph-var:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let insert = r#"
         INSERT DATA {
             <https://example.org/a> <https://example.org/knows> "default" .
@@ -849,7 +849,7 @@ async fn test_sparql_insert_graph_variable_refuses_txn_meta() {
     // literal `GRAPH <…#txn-meta>` target gets.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-insert-graph-var-txn-meta:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
     let update = format!(
         r#"INSERT {{ GRAPH ?g {{ <https://example.org/s> <https://example.org/p> "x" }} }}
@@ -872,7 +872,7 @@ async fn test_sparql_update_graph_variable_bound_to_composite_key_writes_that_gr
     // (`books:`), or the key fails validation and the bug hides behind a 400.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "books:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     run_sparql_update(
         &fluree,
         ledger,
@@ -914,7 +914,7 @@ async fn test_sparql_insert_graph_variable_refuses_txn_meta_composite_key() {
     // same refusal as the IRI itself.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "books:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
     let update = format!(
         r#"INSERT {{ GRAPH ?g {{ <https://example.org/s> <https://example.org/p> "x" }} }}
@@ -933,7 +933,7 @@ async fn test_sparql_insert_graph_variable_refuses_txn_meta_composite_key() {
 async fn test_sparql_insert_graph_variable_literal_is_error() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-insert-graph-var-literal:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let update = r#"
         INSERT { GRAPH ?g { <https://example.org/s> <https://example.org/p> "x" } }
         WHERE { BIND("not-an-iri" AS ?g) }
@@ -957,7 +957,7 @@ async fn test_sparql_update_where_graph_variable_enumerates_user_graphs_once() {
     // `GRAPH ?g` template to the wrong graph.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-update-graph-var-enum:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     run_sparql_update(
         &fluree,
         ledger,
@@ -1026,7 +1026,7 @@ async fn test_jsonld_update_where_graph_variable_enumerates_user_graphs_once() {
     // each user graph once.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/jsonld-update-graph-var-enum:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     run_sparql_update(
         &fluree,
         ledger,
@@ -1074,7 +1074,7 @@ async fn test_sparql_update_where_addresses_graph_by_composite_key_and_config_ir
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-update-where-aliases:main";
     let config = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     run_sparql_update(
         &fluree,
         ledger,
@@ -1153,7 +1153,7 @@ async fn test_jsonld_delete_where_named_graph_scoped() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let insert = r#"
                 INSERT DATA {
@@ -1239,7 +1239,7 @@ async fn test_insert_data_same_triple_default_and_named_one_txn() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
             let sparql = r#"
                 INSERT DATA {
                     <https://example.org/s/1> <https://example.org/p> "v" .
@@ -1305,7 +1305,7 @@ async fn test_delete_data_graph_scoped_with_indexed_default_copy() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // txn1: default copy
             let r1 = run_sparql_update(
@@ -1388,7 +1388,7 @@ async fn test_delete_data_same_triple_two_graphs_one_txn() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Seed the same triple in both graphs (one txn; relies on the
             // INSERT-side fix to keep both copies).
@@ -1459,7 +1459,7 @@ async fn test_trig_named_graph_typed_literal_without_prefix_errors() {
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
         .build_memory();
-    let ledger = genesis_ledger(&fluree, "it/named-graph-missing-dt-prefix:main");
+    let ledger = genesis_ledger(&fluree, "it/named-graph-missing-dt-prefix:main").await;
 
     let trig = r#"
         @prefix ex: <http://example.org/> .
@@ -1503,7 +1503,7 @@ async fn test_trig_multiple_named_graphs() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // TriG with multiple named graphs
             let trig = r#"
@@ -1588,7 +1588,7 @@ async fn test_unknown_named_graph_error() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Just insert some data
             let tx = json!({
@@ -1643,7 +1643,7 @@ async fn test_update_default_graph_and_template_graph_sugar() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Seed "old" into a named graph using template sugar.
             let seed = json!({
@@ -1736,7 +1736,7 @@ async fn test_update_from_scopes_where_default_graph() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Seed a value in g1, and ensure g2 is initially empty for the copied predicate.
             let seed = json!({
@@ -1798,7 +1798,7 @@ async fn test_update_from_multiple_default_graphs_merge_where() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Seed ex:a in g1 with ex:p "1" and in g2 with ex:q "2".
             let seed = json!({
@@ -1897,7 +1897,7 @@ async fn test_update_delete_where_graph_block_restricted_to_from_named() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // g2 holds Chris (name + email) and Eve (name); g3 holds Dan.
             let seed = json!({
@@ -1990,7 +1990,7 @@ async fn test_update_from_named_alias_usable_in_templates() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Insert into g2 using the fromNamed alias as the template graph selector.
             let insert = json!({
@@ -2052,7 +2052,7 @@ async fn test_default_graph_isolation() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // TriG with data only in a named graph
             let trig = r#"
@@ -2135,7 +2135,7 @@ async fn test_txn_meta_and_named_graph_coexist() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // TriG with txn-meta and a user named graph
             let trig = r#"
@@ -2247,7 +2247,7 @@ async fn test_named_graph_update_and_query_current() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Transaction 1: Initial data in named graph
             let trig1 = r"
@@ -2370,7 +2370,7 @@ async fn test_named_graph_time_travel() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Transaction 1: Initial prices
             let trig1 = r"
@@ -2586,7 +2586,7 @@ async fn test_named_graph_retraction() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Transaction 1: Add data to named graph
             let trig1 = r"
@@ -2731,7 +2731,7 @@ async fn test_graph_mgmt_transact_builder_parity() {
     );
 
     // --- Builder-API path: clear_graph + copy_graph via the Txn IR ---
-    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-parity-builder:main");
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-parity-builder:main").await;
     let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
     assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 1);
     assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 1);
@@ -2775,7 +2775,7 @@ async fn test_graph_mgmt_transact_builder_parity() {
     );
 
     // --- SPARQL path: identical outcome for CLEAR GRAPH (parity) ---
-    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-parity-sparql:main");
+    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-parity-sparql:main").await;
     let ledger_s = run_sparql_update(&fluree, ledger_s, &seed).await.ledger;
     let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("CLEAR GRAPH <{g1}>"))
         .await
@@ -2836,7 +2836,7 @@ async fn test_graph_mgmt_rejects_reserved_graph_targets() {
     let g1 = "http://example.org/g1";
 
     // Seed one user graph so COPY/MOVE/ADD have a valid non-reserved end.
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let seed = format!(
         r#"INSERT DATA {{ GRAPH <{g1}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
     );
@@ -2894,7 +2894,7 @@ INSERT DATA {
     // Each verb gets a fresh ledger (MOVE is destructive on the source).
     for (verb, source_kept) in [("COPY", true), ("ADD", true), ("MOVE", false)] {
         let ledger_id = format!("it/graph-mgmt-xfer-{}:main", verb.to_lowercase());
-        let ledger = genesis_ledger(&fluree, &ledger_id);
+        let ledger = genesis_ledger(&fluree, &ledger_id).await;
         let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
 
         let sparql = format!("{verb} DEFAULT TO <{g2}>");
@@ -2961,7 +2961,7 @@ INSERT DATA {
 
     // Control: COPY of an annotation-free graph still succeeds.
     let ledger_id = "it/graph-mgmt-xfer-control:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let plain_iri = "http://example.org/plain";
     let plain = format!(
         r#"INSERT DATA {{ GRAPH <{plain_iri}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
@@ -3016,7 +3016,7 @@ async fn sparql_annotation_role(
 async fn test_graph_mgmt_honors_modify_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/graph-mgmt-policy:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // One non-schema flake in the default graph (schema flakes bypass modify
     // policy via is_schema_flake, so use a plain triple).
@@ -3108,7 +3108,7 @@ async fn test_graph_mgmt_missing_source_errors() {
 
     // Seed only the destination; the source IRI is never written, so it is
     // never entered into the graph registry (resolves to `None` at staging).
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let seed = format!(
         r#"INSERT DATA {{ GRAPH <{dest}> {{
             <http://example.org/s1> <http://example.org/p> "a" .
@@ -3162,7 +3162,7 @@ async fn test_graph_mgmt_missing_source_errors() {
     // empty source. Uses an independent ledger so the committed SILENT case
     // above does not advance this scenario's head.
     let src = "http://example.org/src";
-    let ledger_ctl = genesis_ledger(&fluree, "it/graph-mgmt-empty-source:main");
+    let ledger_ctl = genesis_ledger(&fluree, "it/graph-mgmt-empty-source:main").await;
     let seed_ctl = format!(
         r#"INSERT DATA {{
             GRAPH <{src}> {{ <http://example.org/x> <http://example.org/p> "seed" }}
@@ -3222,7 +3222,7 @@ async fn test_using_named_only_where_default_graph_is_empty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/using-named-only:main";
     let h = "http://example.org/h";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let seed = format!(
         r#"INSERT DATA {{
             <http://example.org/s1> <http://example.org/p> "a" .
@@ -3422,7 +3422,7 @@ async fn test_using_or_with_an_unknown_graph_reads_an_empty_default_graph() {
                 let ledger_id = format!("it/using-unknown-graph-{i}:main");
                 let seeded = run_sparql_update(
                     &fluree,
-                    genesis_ledger(&fluree, &ledger_id),
+                    genesis_ledger(&fluree, &ledger_id).await,
                     &unknown_graph_seed(),
                 )
                 .await;
@@ -3514,7 +3514,7 @@ async fn test_jsonld_update_from_an_unknown_graph_reads_an_empty_default_graph()
         let ledger_id = format!("it/jsonld-from-unknown-graph-{i}:main");
         let ledger = run_sparql_update(
             &fluree,
-            genesis_ledger(&fluree, &ledger_id),
+            genesis_ledger(&fluree, &ledger_id).await,
             &unknown_graph_seed(),
         )
         .await
@@ -3678,7 +3678,7 @@ async fn test_updates_on_a_graph_registered_under_the_ledger_address() {
              GRAPH <{address}> {{ ex:a ex:v \"same\" . ex:c ex:v \"legacy only\" . }}\n"
         );
         let ledger = fluree
-            .stage_owned(genesis_ledger(&fluree, &ledger_id))
+            .stage_owned(genesis_ledger(&fluree, &ledger_id).await)
             .upsert_turtle(&fixture)
             .execute()
             .await
@@ -3744,7 +3744,7 @@ async fn test_graph_mgmt_builder_move_add_parity() {
     );
 
     // --- Builder path ---
-    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-builder:main");
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-builder:main").await;
     let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
 
     // add_graph(g1 -> g2): g2 keeps its own triple AND gains g1's; g1 intact.
@@ -3786,7 +3786,7 @@ async fn test_graph_mgmt_builder_move_add_parity() {
     );
 
     // --- SPARQL path: identical outcomes ---
-    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-sparql:main");
+    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-sparql:main").await;
     let ledger_s = run_sparql_update(&fluree, ledger_s, &seed).await.ledger;
     let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("ADD <{g1}> TO <{g2}>"))
         .await
@@ -3809,7 +3809,7 @@ async fn test_graph_mgmt_builder_move_add_parity() {
 async fn test_graph_mgmt_same_graph_transfer_is_noop() {
     let fluree = FlureeBuilder::memory().build_memory();
     let g = "http://example.org/g";
-    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-same-graph:main");
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-same-graph:main").await;
     let seed = format!(
         r#"INSERT DATA {{ GRAPH <{g}> {{
             <http://example.org/s1> <http://example.org/p> "a" .
@@ -3937,7 +3937,7 @@ async fn test_multi_op_update_mixes_data_and_graph_mgmt() {
 async fn test_clear_of_annotation_bearing_graph_is_clean() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/clear-annotations:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let seed = r#"PREFIX ex: <http://example.org/>
 INSERT DATA { ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} . }"#;
     let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
@@ -3976,7 +3976,7 @@ async fn test_create_registers_graph_as_transfer_source() {
     let ledger_id = "it/create-registers:main";
     let dest = "http://example.org/dest";
     let fresh = "http://example.org/fresh";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let seed = format!(
         r#"INSERT DATA {{ GRAPH <{dest}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
     );
@@ -4032,7 +4032,7 @@ async fn test_create_registers_graph_as_transfer_source() {
 async fn test_insert_template_anon_blank_never_merges_with_labeled() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/template-anon-blanks:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let seed = r#"INSERT DATA { <http://example.org/s> <http://example.org/handle> "h1" }"#;
     let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
 
@@ -4095,7 +4095,7 @@ WHERE { ?s ex:handle ?h }",
 async fn test_clear_default_schema_flakes_bypass_modify_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/graph-mgmt-schema-policy:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Schema-only default graph: one class declaration.
     let ledger = run_sparql_update(
@@ -4156,7 +4156,7 @@ async fn test_using_multi_default_union_is_a_set() {
     let ledger_id = "it/using-set-merge:main";
     let g1 = "http://example.org/g1";
     let g2 = "http://example.org/g2";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     // The SAME triple in both graphs.
     let seed = format!(
         r#"INSERT DATA {{
@@ -4208,7 +4208,7 @@ async fn the_config_graph_is_addressable_by_its_full_iri() {
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({
                 "@context": {"ex": "http://example.org/"},
                 "@id": "ex:alice",

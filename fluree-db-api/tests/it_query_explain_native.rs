@@ -7,7 +7,7 @@ use crate::support::{graphdb_from_ledger, start_background_indexer_local};
 use fluree_db_api::{
     tx::IndexingMode, CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty,
 };
-use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
+use fluree_db_core::load_ledger_snapshot;
 use fluree_db_transact::TxnOpts;
 use serde_json::json;
 
@@ -27,13 +27,17 @@ async fn index_and_load_db(
         fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
     };
 
+    let namespace = fluree
+        .storage_namespace(&ledger_id)
+        .await
+        .expect("ledger's namespace");
     let loaded = load_ledger_snapshot(
         &fluree
             .backend()
             .admin_storage_cloned()
             .expect("test uses managed backend"),
         &root_id,
-        &ledger_id,
+        &namespace,
     )
     .await
     .expect("load_ledger_snapshot(root)");
@@ -57,8 +61,7 @@ async fn explain_no_optimization_when_equal_selectivity() {
     local
         .run_until(async move {
             let ledger_id ="test/explain:main";
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -128,8 +131,7 @@ async fn explain_reorders_bound_object_email_first() {
     local
         .run_until(async move {
             let ledger_id ="test/optimize:main";
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -216,8 +218,7 @@ async fn explain_reorders_badge_property_scan_before_class_scan() {
     local
         .run_until(async move {
             let ledger_id ="test/property-opt:main";
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
@@ -282,8 +283,7 @@ async fn explain_includes_inputs_fields_and_flags() {
     local
         .run_until(async move {
             let ledger_id ="test/inputs:main";
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,

@@ -12,7 +12,7 @@ async fn reindex_populates_index_schema_from_subclass_and_subproperty_ops() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reindex-schema:main";
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex": "http://example.org/",

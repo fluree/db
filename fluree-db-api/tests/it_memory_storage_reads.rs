@@ -100,7 +100,7 @@ async fn warm_queries_over_memory_storage_read_nothing_from_the_store() {
     fluree.set_indexing_mode(IndexingMode::Background(handle));
 
     let ledger_id = "it/memory-reads:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     // A full build, then an incremental one, so both leaf shapes exist.
     for (from, to) in [(0, 3000), (3000, 3500)] {
         ledger = fluree

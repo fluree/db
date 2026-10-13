@@ -27,7 +27,9 @@ use crate::tx::{
     IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef, WriteScope,
 };
 use crate::{ApiError, Fluree, PolicyContext, Result, Tracker, TrackingOptions, TrackingTally};
-use fluree_db_core::{ContentId, ContentStore, LedgerSnapshot, Sid, TxnMetaValue};
+use fluree_db_core::{
+    ContentId, ContentStore, LedgerSnapshot, Sid, StorageNamespace, TxnMetaValue,
+};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
@@ -1325,12 +1327,12 @@ impl Fluree {
     fn maybe_spawn_txn_upload(
         &self,
         commit_opts: CommitOpts,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         txn_payload: JsonValue,
         store_raw_txn: bool,
     ) -> CommitOpts {
         if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
-            let content_store = self.content_store(ledger_id);
+            let content_store = self.content_store(namespace);
             commit_opts.with_raw_txn_spawned(content_store, txn_payload)
         } else {
             commit_opts
@@ -1451,7 +1453,7 @@ impl Fluree {
         }
 
         let op = core.operation.unwrap(); // safe: validate checks
-        let ledger_id = ledger_state.ledger_id().to_string();
+        let namespace = ledger_state.storage_namespace();
         let tracker_ref = tracker.is_enabled().then_some(tracker);
 
         // Direct flake path for InsertTurtle (bypass JSON-LD / IR).
@@ -1468,7 +1470,7 @@ impl Fluree {
                 .await?;
             let commit_opts = self.maybe_spawn_txn_upload(
                 core.commit_opts,
-                &ledger_id,
+                &namespace,
                 serde_json::Value::String(turtle.to_string()),
                 store_raw_txn,
             );
@@ -1479,7 +1481,7 @@ impl Fluree {
         if let TransactOperation::UpsertTurtle(text) = op {
             let commit_opts = self.maybe_spawn_txn_upload(
                 core.commit_opts,
-                &ledger_id,
+                &namespace,
                 serde_json::Value::String(text.to_string()),
                 store_raw_txn,
             );
@@ -1513,7 +1515,7 @@ impl Fluree {
                 .await?;
             let commit_opts = self.maybe_spawn_txn_upload(
                 core.commit_opts,
-                &ledger_id,
+                &namespace,
                 op.payload.raw_txn(),
                 store_raw_txn,
             );
@@ -1526,7 +1528,7 @@ impl Fluree {
 
         let commit_opts = self.maybe_spawn_txn_upload(
             core.commit_opts,
-            &ledger_id,
+            &namespace,
             txn_json.clone(),
             store_raw_txn,
         );
@@ -1558,7 +1560,7 @@ impl Fluree {
         index_config: &IndexConfig,
         policy: Option<&PolicyContext>,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
-        let ledger_id = ledger_state.ledger_id().to_string();
+        let namespace = ledger_state.storage_namespace();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
         match op_plan {
             OpPlan::Sparql(sparql, params) => {
@@ -1588,7 +1590,7 @@ impl Fluree {
             OpPlan::InsertTurtle(turtle) => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
-                    &ledger_id,
+                    &namespace,
                     serde_json::Value::String((*turtle).to_string()),
                     store_raw_txn,
                 );
@@ -1607,7 +1609,7 @@ impl Fluree {
             OpPlan::Rdf { txn_type, text } => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
-                    &ledger_id,
+                    &namespace,
                     serde_json::Value::String((*text).to_string()),
                     store_raw_txn,
                 );
@@ -1627,7 +1629,7 @@ impl Fluree {
             OpPlan::JsonLike { txn_type, txn_json } => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
-                    &ledger_id,
+                    &namespace,
                     txn_json.clone(),
                     store_raw_txn,
                 );
@@ -1647,7 +1649,7 @@ impl Fluree {
             OpPlan::Graph(op) => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
-                    &ledger_id,
+                    &namespace,
                     op.payload.raw_txn(),
                     store_raw_txn,
                 );
@@ -2117,11 +2119,10 @@ impl Fluree {
         write_guard: LedgerWriteGuard,
         staged: fluree_db_transact::StagedCommit,
     ) -> Result<fluree_db_transact::CommitReceipt> {
-        let ledger_id = write_guard.state().ledger_id().to_string();
         // Resolve the publisher before detaching so a missing publisher fails
         // without ever emptying the slot.
         let publisher = fluree.publisher()?;
-        let content_store = fluree.content_store(&ledger_id);
+        let content_store = fluree.content_store(&write_guard.state().storage_namespace());
 
         let mut slot = DetachedCacheSlot::detach(write_guard, fluree.ledger_manager.clone());
 
@@ -2212,7 +2213,10 @@ impl Fluree {
         // live in an ancestor's namespace.
         if view.base().head_temporal.is_none() && view.base().head_commit_id.is_some() {
             let store = self
-                .content_store_for_record_or_id(view.base().ns_record.as_ref(), ledger.id())
+                .content_store_for_record_or_id(
+                    view.base().ns_record.as_ref(),
+                    &view.base().storage_namespace(),
+                )
                 .await?;
             view.base_mut()
                 .ensure_head_temporal(store.as_ref())

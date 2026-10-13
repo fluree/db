@@ -11,7 +11,7 @@ fn ctx() -> JsonValue {
 }
 
 async fn seed(fluree: &MemoryFluree, id: &str) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, id);
+    let ledger0 = genesis_ledger(fluree, id).await;
     let txn = json!({"@context": ctx(), "@graph": [{"@id": "ex:anchor", "ex:n": 1}]});
     fluree.insert(ledger0, &txn).await.expect("seed").ledger
 }

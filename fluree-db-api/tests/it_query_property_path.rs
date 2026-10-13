@@ -10,7 +10,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_knows_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -33,7 +33,7 @@ async fn seed_knows_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedge
 ///   ex:addr1 --ex:city--> "Springfield"
 ///   ex:bob   --ex:parent--> ex:alice  (inverse: alice is bob's parent)
 async fn seed_chain_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -47,7 +47,7 @@ async fn seed_chain_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger
 }
 
 async fn seed_y_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -296,7 +296,7 @@ async fn property_path_one_or_more_subject_var_with_and_without_cycle() {
 #[tokio::test]
 async fn property_path_one_or_more_subject_and_object_vars_transitive_closure() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-oneplus-xy:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-oneplus-xy:main").await;
 
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
@@ -393,7 +393,7 @@ async fn property_path_zero_or_more_object_var_and_subject_object_vars() {
     );
 
     // Subject+object vars, disjoint graphs
-    let ledger0 = genesis_ledger(&fluree, "property/path-zeroplus-xy:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-zeroplus-xy:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -522,7 +522,7 @@ async fn property_path_parenthesized_inverse_transitive() {
 async fn property_path_zero_or_one_inside_sequence() {
     // JSON-LD parity for SPARQL `ex:p?/ex:q`. From a: zero p → a q x; one p → b q y.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-zoo-seq:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-zoo-seq:main").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -559,7 +559,7 @@ async fn property_path_composite_transitive_inverse_step() {
     // x0 (^p/q) x1 via hub0, x1 (^p/q) x2 via hub1. Transitively from x0:
     // {x1, x2}.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-composite-inv:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-composite-inv:main").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -594,7 +594,7 @@ async fn property_path_composite_transitive_sequence() {
     // JSON-LD parity for SPARQL `(ex:p/ex:q)+`. Seed a -p-> m -q-> b -p-> n -q-> c
     // so each composite hop advances a→b→c.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-composite:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-composite:main").await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -701,7 +701,7 @@ async fn property_path_inverse_subject_var() {
 async fn property_path_alternative_object_var() {
     // ex:knows|ex:likes from ex:a should return both knows targets and likes targets
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-alt-o:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-alt-o:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -759,7 +759,7 @@ async fn property_path_alternative_with_inverse() {
 async fn property_path_alternative_array_form() {
     // Array form: ["|", "ex:knows", "ex:likes"] should produce same results as string form
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-alt-array:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-alt-array:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -793,7 +793,7 @@ async fn property_path_alternative_duplicate_semantics() {
     // When both predicates match the same (s,o) pair, UNION bag semantics
     // produces the result twice (one per branch).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-alt-dup:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-alt-dup:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -826,7 +826,7 @@ async fn property_path_alternative_duplicate_semantics() {
 /// Mixed `knows`/`likes` chain so an alternation-transitive path reaches nodes
 /// that neither single-predicate closure could: a -knows-> b -likes-> c -knows-> d.
 async fn seed_knows_likes_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -1109,7 +1109,7 @@ async fn property_path_sequence_transitive_step_allowed() {
 ///   ex:bob   --ex:name--> "Bob"
 ///   ex:carol --ex:name--> "Carol"
 async fn seed_alt_seq_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -1220,7 +1220,7 @@ async fn property_path_alternative_of_sequences_duplicate_semantics() {
     // ex:friend → ex:bob, ex:colleague → ex:bob, bob's name → "Bob"
     // So (friend/name)|(colleague/name) should return "Bob" twice.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "property/path-alt-seq-dup:main");
+    let ledger0 = genesis_ledger(&fluree, "property/path-alt-seq-dup:main").await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [
@@ -1310,7 +1310,7 @@ async fn property_path_inverse_zero_or_more() {
 // =============================================================================
 
 async fn seed_alt_in_seq_data(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex":"http://example.org/"},
         "@graph": [

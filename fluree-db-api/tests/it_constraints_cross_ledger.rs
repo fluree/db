@@ -27,7 +27,7 @@ async fn data_ledger_tx_enforces_model_ledger_unique_constraint() {
 
     // --- model ledger M: annotates a property unique in a named graph
     let model_id = "test/cross-ledger-constraints/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let constraints_graph_iri = "http://example.org/governance/constraints";
     let m_trig = format!(
@@ -49,7 +49,7 @@ async fn data_ledger_tx_enforces_model_ledger_unique_constraint() {
 
     // --- data ledger D: seed data + cross-ledger constraints config.
     let data_id = "test/cross-ledger-constraints/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     // Insert the first record. No config yet (config writes are
     // lagging — they take effect on the next tx), so this insert
@@ -130,7 +130,7 @@ async fn cross_ledger_constraints_missing_model_fails_tx_closed() {
 
     let data_id = "test/cross-ledger-constraints/no-model:main";
     let model_id = "test/cross-ledger-constraints/never-created:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
 
     let r1 = fluree
         .insert(

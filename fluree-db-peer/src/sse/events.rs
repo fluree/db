@@ -20,6 +20,9 @@ pub struct LedgerRecord {
     pub index_t: i64,
     #[serde(default)]
     pub retracted: bool,
+    /// The ledger the branch belongs to; sent by servers with name bindings.
+    #[serde(default)]
+    pub instance: Option<String>,
 }
 
 /// Graph source record from SSE ns-record event
@@ -58,14 +61,13 @@ pub struct NsRetractedEvent {
     pub action: String,
     pub kind: String,
     pub resource_id: String,
+    /// The ledger the retracted branch belonged to, when the server knows it.
+    #[serde(default)]
+    pub instance: Option<String>,
     pub emitted_at: String,
 }
 
-/// Snapshot complete event payload
-///
-/// NOTE: The server does not currently emit `snapshot-complete` events.
-/// This type exists for future compatibility when the server adds this feature.
-/// Until then, `SseClientEvent::SnapshotComplete` will never fire.
+/// Snapshot complete event payload. The server sends no `hash`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotCompleteEvent {
     pub hash: Option<String>,
@@ -76,17 +78,19 @@ pub struct SnapshotCompleteEvent {
 pub enum SseClientEvent {
     /// Connected and receiving snapshot
     Connected,
-    /// Snapshot complete marker received
-    ///
-    /// NOTE: The server does not currently emit this event.
-    /// This variant exists for future compatibility.
+    /// The snapshot sent on connecting is complete; live events follow.
     SnapshotComplete { hash: String },
     /// Ledger record received
     LedgerRecord(LedgerRecord),
     /// Graph source record received
     GraphSourceRecord(GraphSourceRecord),
-    /// Resource retracted
-    Retracted { kind: String, resource_id: String },
+    /// Resource retracted. `instance` names the ledger a retracted branch
+    /// belonged to, when the server sends it.
+    Retracted {
+        kind: String,
+        resource_id: String,
+        instance: Option<String>,
+    },
     /// Connection lost (will reconnect)
     Disconnected { reason: String },
     /// Fatal error (will not reconnect)

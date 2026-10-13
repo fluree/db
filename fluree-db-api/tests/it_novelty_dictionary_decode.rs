@@ -40,7 +40,7 @@ async fn novelty_only_strings_subjects_predicates_and_json_decode_with_existing_
             let ledger_id = "it/novelty-dict-decode:main";
 
             // 1) Seed + build an index so the query engine takes the binary scan path.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let index_cfg = IndexConfig {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,

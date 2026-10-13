@@ -35,7 +35,7 @@ fn ctx() -> JsonValue {
 /// Then change the 2 "approved" invoices to "paid" at t=2.
 /// Reindex after each commit so the persisted base index sees t=2 as max.
 async fn seed_invoice_ledger(fluree: &fluree_db_api::Fluree) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, LEDGER_ID);
+    let ledger0 = genesis_ledger(fluree, LEDGER_ID).await;
 
     // t=1: 20 invoices.
     let mut invoices = Vec::with_capacity(20);
@@ -128,7 +128,7 @@ async fn seed_fully_retracted_ledger_with(
     strategy: IndexStrategy,
     invoice_count: usize,
 ) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     // t=1: N invoices, all carrying ns:legacyFlag "true" and a status.
     let mut invoices = Vec::with_capacity(invoice_count);
@@ -641,7 +641,7 @@ async fn time_travel_partially_retracted_predicate_respects_t() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "tt-partial:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let mut invoices = Vec::with_capacity(5);
     for i in 0..5 {
@@ -750,7 +750,7 @@ async fn time_travel_bench_replay_overhead() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "tt-bgp-bench:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     const N: usize = 10_000;
     const MUTATED: usize = 1_000; // ~10%
@@ -1014,7 +1014,7 @@ async fn time_travel_fully_retracted_subject_respects_t() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "tt-dead-subject:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let mut invoices = Vec::with_capacity(5);
     for i in 0..5 {
@@ -1145,7 +1145,7 @@ async fn rebuild_cost_of_retracted_partitions() {
     for rep in 0..REPS {
         let start = Instant::now();
         let r = fluree_db_indexer::rebuild_index_from_commits(
-            fluree.content_store(ledger_id),
+            fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
             ledger_id,
             &record,
             fluree_db_indexer::IndexerConfig::default(),
@@ -1196,7 +1196,7 @@ async fn time_travel_after_everything_is_retracted() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "tt-all-gone:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let tx1 = json!({"@context": ctx(), "@graph": [
         {"@id": "ns:Invoice/inv-00", "@type": "ns:Invoice", "ns:status": "paid"},
@@ -1345,7 +1345,7 @@ async fn time_travel_fully_retracted_subject_survives_later_incremental() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "tt-dead-subject-incr:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let mut invoices = Vec::with_capacity(5);
     for i in 0..5 {

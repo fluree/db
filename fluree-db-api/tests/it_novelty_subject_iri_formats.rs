@@ -13,7 +13,7 @@ use std::sync::Arc;
 async fn novelty_full_iri_subjects_format_as_xml_json_csv_and_tsv() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "novelty-iri-formats:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(
             ledger,
@@ -106,7 +106,7 @@ async fn overflow_subject_in_novelty_formats_and_exports() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "novelty-overflow-e2e:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let label = "http://example.org/label";
     let feat = "http://example.org/feat";
     let num = "http://example.org/num";

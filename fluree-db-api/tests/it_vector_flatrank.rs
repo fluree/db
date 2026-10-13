@@ -480,8 +480,7 @@ async fn vector_search_mixed_datatypes() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn vector_search_post_indexing() {
-    use fluree_db_api::{IndexConfig, LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
+    use fluree_db_api::IndexConfig;
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use support::start_background_indexer_local;
 
@@ -499,8 +498,7 @@ async fn vector_search_post_indexing() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let ctx = json!([
                 support::default_context(),
@@ -604,8 +602,7 @@ async fn vector_search_post_indexing() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn vector_search_novelty_plus_indexed() {
-    use fluree_db_api::{IndexConfig, LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
+    use fluree_db_api::IndexConfig;
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use support::start_background_indexer_local;
 
@@ -623,8 +620,7 @@ async fn vector_search_novelty_plus_indexed() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let ctx = json!([
                 support::default_context(),
@@ -794,8 +790,7 @@ async fn vector_at_type_shorthand() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn vector_cosine_normalized_optimization() {
-    use fluree_db_api::{IndexConfig, LedgerState, Novelty};
-    use fluree_db_core::LedgerSnapshot;
+    use fluree_db_api::IndexConfig;
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use support::start_background_indexer_local;
 
@@ -813,8 +808,7 @@ async fn vector_cosine_normalized_optimization() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = LedgerState::new(db0, Novelty::new(0));
+            let ledger0 = fluree.create_ledger(ledger_id).await.expect("create ledger");
 
             let ctx = json!([
                 support::default_context(),

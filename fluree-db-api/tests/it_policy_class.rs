@@ -19,7 +19,7 @@ use std::collections::HashMap;
 async fn policy_class_restricts_ssn_to_own_user() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_class_ssn");
+    let ledger0 = genesis_ledger(&fluree, "policy_class_ssn").await;
 
     // Create users, identity with policyClass, and policies stored in DB
     let setup = json!({
@@ -139,7 +139,7 @@ async fn policy_class_restricts_ssn_to_own_user() {
 async fn policy_class_allows_non_restricted_properties() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_class_non_restricted");
+    let ledger0 = genesis_ledger(&fluree, "policy_class_non_restricted").await;
 
     // Same setup as above
     let setup = json!({
@@ -241,7 +241,7 @@ async fn policy_class_allows_non_restricted_properties() {
 async fn policy_class_blocks_other_user_ssn_in_where() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_class_blocks_other");
+    let ledger0 = genesis_ledger(&fluree, "policy_class_blocks_other").await;
 
     let setup = json!({
         "@context": {
@@ -346,7 +346,7 @@ async fn policy_class_blocks_other_user_ssn_in_where() {
 async fn policy_class_positional_identity_unbound_fails_closed() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_class_unbound_identity");
+    let ledger0 = genesis_ledger(&fluree, "policy_class_unbound_identity").await;
 
     let setup = json!({
         "@context": {

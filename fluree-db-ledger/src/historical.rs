@@ -63,6 +63,9 @@ pub struct HistoricalLedgerView {
     runtime_small_dicts: Option<Arc<RuntimeSmallDicts>>,
     /// Time bound for all queries
     to_t: i64,
+    /// The bits of the instance the view belongs to; see
+    /// [`LedgerState::instance_bits`](crate::LedgerState::instance_bits).
+    instance_bits: u128,
 }
 
 impl HistoricalLedgerView {
@@ -108,7 +111,7 @@ impl HistoricalLedgerView {
             return Self::load_at_with_store(store, record, target_t).await;
         }
 
-        let store = backend.content_store(&record.ledger_id);
+        let store = backend.content_store(&record.storage_namespace());
         Self::load_at_with_store(store, record, target_t).await
     }
 
@@ -190,6 +193,11 @@ impl HistoricalLedgerView {
             overlay,
             runtime_small_dicts: None,
             to_t: target_t,
+            instance_bits: record
+                .storage_root
+                .as_ref()
+                .and_then(fluree_db_core::StorageRoot::instance_bits)
+                .unwrap_or(0),
         })
     }
 
@@ -410,7 +418,14 @@ impl HistoricalLedgerView {
             overlay,
             runtime_small_dicts,
             to_t,
+            instance_bits: 0,
         }
+    }
+
+    /// The bits of the instance the view belongs to; `0` for a ledger rooted
+    /// at its name or a view built from components.
+    pub fn instance_bits(&self) -> u128 {
+        self.instance_bits
     }
 
     /// Get the time bound for this view
@@ -611,9 +626,18 @@ mod tests {
         ledger_id: &str,
         commit: &fluree_db_novelty::Commit,
     ) -> ContentId {
-        use fluree_db_nameservice::{CasResult, RefPublisher, RefValue};
+        use fluree_db_nameservice::testing::CurrentFence;
+        use fluree_db_nameservice::{CasResult, NameServiceLookup, RefValue};
 
-        let store = content_store_for(storage.clone(), ledger_id);
+        if ns.lookup(ledger_id).await.unwrap().is_none() {
+            fluree_db_nameservice::testing::create_at_name_root(ns, ledger_id)
+                .await
+                .unwrap();
+        }
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
+        );
         let blob = fluree_db_core::commit::codec::write_commit(commit, false, None).unwrap();
         let cid = store.put(ContentKind::Commit, &blob.bytes).await.unwrap();
         let new = RefValue {

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 /// Helper to seed items with a numeric classification level.
 async fn seed_leveled_data(fluree: &support::MemoryFluree, ledger_id: &str) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let txn = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -77,7 +77,7 @@ async fn cypher_policy_inline_property_condition() {
 async fn cypher_policy_stored_relationship_condition() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "policy_cypher_ssn");
+    let ledger0 = genesis_ledger(&fluree, "policy_cypher_ssn").await;
 
     let setup = json!({
         "@context": {

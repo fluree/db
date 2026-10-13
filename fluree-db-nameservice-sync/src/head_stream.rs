@@ -395,10 +395,11 @@ mod tests {
         async fn on_event(&self, event: RemoteEvent) {
             let tag = match event {
                 RemoteEvent::Connected => "connected".to_string(),
+                RemoteEvent::SnapshotComplete => "snapshot-complete".to_string(),
                 RemoteEvent::Disconnected { .. } => "disconnected".to_string(),
                 RemoteEvent::Fatal { reason } => format!("fatal:{reason}"),
                 RemoteEvent::LedgerUpdated(r) => format!("ledger:{}@{}", r.ledger_id, r.commit_t),
-                RemoteEvent::LedgerRetracted { ledger_id } => format!("retracted:{ledger_id}"),
+                RemoteEvent::LedgerRetracted { ledger_id, .. } => format!("retracted:{ledger_id}"),
                 RemoteEvent::GraphSourceUpdated(r) => format!("gs:{}", r.graph_source_id),
                 RemoteEvent::GraphSourceRetracted { graph_source_id } => {
                     format!("gs-retracted:{graph_source_id}")

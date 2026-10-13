@@ -35,7 +35,7 @@ fn ctx() -> JsonValue {
 #[tokio::test]
 async fn nested_subquery_filter_does_not_see_enclosing_var() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "w1/parity:a1");
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:a1").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -89,7 +89,7 @@ async fn nested_subquery_filter_does_not_see_enclosing_var() {
 #[tokio::test]
 async fn optional_nested_filter_referencing_outer_var_does_not_bind() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "w1/parity:a2");
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:a2").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -151,7 +151,7 @@ async fn optional_nested_filter_referencing_outer_var_does_not_bind() {
 #[tokio::test]
 async fn subselect_optional_bound_correlation_var_reconciles_to_empty() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "w1/parity:b");
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:b").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -205,7 +205,7 @@ async fn subselect_optional_bound_correlation_var_reconciles_to_empty() {
 #[tokio::test]
 async fn nested_subselects_reconcile_optional_bound_correlation_var() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "w1/parity:b-nested");
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:b-nested").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -264,7 +264,7 @@ async fn nested_subselects_reconcile_optional_bound_correlation_var() {
 #[tokio::test]
 async fn subselect_group_by_correlation_var_joins_per_group() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "w1/parity:b-groupby");
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:b-groupby").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [
@@ -312,7 +312,7 @@ async fn subselect_group_by_correlation_var_joins_per_group() {
 async fn filter_sees_a_value_a_later_triple_fills_after_an_optional() {
     use crate::support::{query_jsonld, query_sparql};
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "filter-scope:optional-fill");
+    let ledger0 = genesis_ledger(&fluree, "filter-scope:optional-fill").await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [

@@ -89,6 +89,42 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+/// How a remote leaf is fetched when a reader first needs its data.
+///
+/// Directory-only opens ([`BinaryIndexStore::open_leaf_dir`]) read just the
+/// header+directory prefix under either policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemoteLeafFetch {
+    /// One GET for the whole leaf, persisted to the disk cache and shared by
+    /// concurrent readers. A remote request costs about the same for a few KB
+    /// as for a whole leaf, so this halves requests for a point read and
+    /// bounds a traversal's requests by the leaves it touches.
+    #[default]
+    Whole,
+    /// Header+directory, then byte-range reads per leaflet; the whole leaf
+    /// is fetched once a leaf is reopened or scanned. Fewer bytes per cold
+    /// touch, more requests.
+    Ranged,
+}
+
+impl RemoteLeafFetch {
+    /// `FLUREE_REMOTE_LEAF_FETCH=ranged|whole`, else the default.
+    pub fn from_env() -> Self {
+        match std::env::var("FLUREE_REMOTE_LEAF_FETCH").as_deref() {
+            Ok("ranged") => Self::Ranged,
+            Ok("whole") => Self::Whole,
+            Ok(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown FLUREE_REMOTE_LEAF_FETCH; using whole"
+                );
+                Self::Whole
+            }
+            Err(_) => Self::default(),
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
@@ -319,6 +355,7 @@ pub struct BinaryIndexStore {
     /// Once a remote leaf is touched repeatedly, we promote it to the local
     /// disk cache so subsequent opens use `FullBlobLeafHandle`.
     remote_leaf_open_counts: RwLock<HashMap<ContentId, usize>>,
+    remote_leaf_fetch: RemoteLeafFetch,
     max_t: i64,
     base_t: i64,
     language_tags: Vec<String>,
@@ -398,6 +435,7 @@ impl BinaryIndexStore {
             leaflet_cache: None,
             remote_leaf_metadata: RwLock::new(HashMap::new()),
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: RemoteLeafFetch::from_env(),
             max_t: 0,
             base_t: 0,
             language_tags: Vec::new(),
@@ -569,6 +607,7 @@ impl BinaryIndexStore {
             leaflet_cache,
             remote_leaf_metadata: RwLock::new(HashMap::new()),
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: RemoteLeafFetch::from_env(),
             max_t: root.index_t,
             base_t: root.base_t,
             language_tags: normalize_root_lang_tags(&root.language_tags),
@@ -602,6 +641,10 @@ impl BinaryIndexStore {
     /// Set the ledger's split mode for canonical IRI encoding.
     ///
     /// Called after loading to sync with the snapshot's `ns_split_mode`.
+    pub fn set_remote_leaf_fetch(&mut self, policy: RemoteLeafFetch) {
+        self.remote_leaf_fetch = policy;
+    }
+
     pub fn set_ns_split_mode(&mut self, mode: NsSplitMode) {
         self.ns_split_mode = mode;
         self.ns_split_mode_set = true;
@@ -1036,15 +1079,19 @@ impl BinaryIndexStore {
             return self.leaf_handle_from_bytes(bytes, leaf_id, sidecar_cid, need_replay);
         }
 
+        // The whole-leaf policy, and a store whose range reads fetch the whole
+        // object anyway, fetch a leaf whole on its first open.
+        if self.remote_leaf_fetch == RemoteLeafFetch::Whole || !cs.supports_ranged_reads() {
+            tracing::debug!(leaf = %leaf_cid, need_replay, source = "remote_whole", "binary leaf open");
+            let bytes = self.fetch_whole_leaf(leaf_cid, leaf_id)?;
+            return self.leaf_handle_from_bytes(bytes, leaf_id, sidecar_cid, need_replay);
+        }
+
         let touch_count = self.note_remote_leaf_open(leaf_cid);
         let known_dir = self.remote_leaf_metadata.read().get(leaf_cid).cloned();
 
-        // A leaf opened again is fetched whole rather than range-read again,
-        // and so is every leaf of a store whose range reads fetch the whole
-        // object anyway.
-        if !cs.supports_ranged_reads()
-            || (known_dir.is_some() && touch_count >= HOT_REMOTE_LEAF_PROMOTION_TOUCHES)
-        {
+        // A leaf opened again is fetched whole rather than range-read again.
+        if known_dir.is_some() && touch_count >= HOT_REMOTE_LEAF_PROMOTION_TOUCHES {
             tracing::debug!(
                 leaf = %leaf_cid,
                 need_replay,
@@ -1083,10 +1130,13 @@ impl BinaryIndexStore {
         );
         let fetcher = Arc::new(ContentStoreRangeFetcher::new(Arc::clone(cs)));
 
-        let (dir, payload_base) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
+        let (dir, payload_base, whole) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
         self.remote_leaf_metadata
             .write()
             .insert(leaf_cid.clone(), dir.clone());
+        if let Some(bytes) = whole {
+            return self.leaf_handle_from_bytes(bytes.into(), leaf_id, sidecar_cid, need_replay);
+        }
 
         let sc_cid = if need_replay {
             sidecar_cid.cloned()
@@ -1187,8 +1237,7 @@ impl BinaryIndexStore {
                 .map(Arc::new);
         }
         let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs));
-        let (dir, _payload_base) =
-            super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
+        let (dir, _, _) = super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
         Ok(Arc::new(dir))
     }
 
@@ -3652,6 +3701,7 @@ pub(crate) mod tests {
         get_calls: Arc<AtomicUsize>,
         range_calls: Arc<AtomicUsize>,
         ranged: bool,
+        get_delay: Duration,
     }
 
     impl CountingContentStore {
@@ -3661,6 +3711,16 @@ pub(crate) mod tests {
                 get_calls: Arc::new(AtomicUsize::new(0)),
                 range_calls: Arc::new(AtomicUsize::new(0)),
                 ranged: true,
+                get_delay: Duration::ZERO,
+            }
+        }
+
+        /// Holds every whole-object GET open for `delay`, so concurrent
+        /// readers overlap.
+        fn with_get_delay(delay: Duration) -> Self {
+            Self {
+                get_delay: delay,
+                ..Self::new()
             }
         }
 
@@ -3692,6 +3752,9 @@ pub(crate) mod tests {
             id: &ContentId,
         ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
             self.get_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if !self.get_delay.is_zero() {
+                tokio::time::sleep(self.get_delay).await;
+            }
             self.inner.get(id).await
         }
 
@@ -3741,6 +3804,15 @@ pub(crate) mod tests {
             tags.len(),
             "lang_id indexes this vec; no folding"
         );
+    }
+
+    /// `store` behind a disk artifact cache in `dir`, as assembly fronts a
+    /// remote store.
+    fn disk_cached(store: &CountingContentStore, dir: &std::path::Path) -> Arc<dyn ContentStore> {
+        Arc::new(fluree_db_core::disk_cache::CachedContentStore::new(
+            Arc::new(store.clone()),
+            fluree_db_core::disk_cache::DiskArtifactCache::for_dir(dir),
+        ))
     }
 
     pub(crate) fn temp_cache_dir() -> PathBuf {
@@ -3812,17 +3884,35 @@ pub(crate) mod tests {
         writer.finish().unwrap().remove(0).leaf_bytes
     }
 
-    /// Same leaf as [`build_test_leaf_bytes`], keeping the routing keys so a
-    /// `BranchManifest` can be built around it.
-    fn build_test_leaf_info() -> crate::format::leaf::LeafInfo {
-        let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+    /// Rows in [`build_large_test_leaf_info`]'s leaf.
+    const LARGE_TEST_LEAF_ROWS: u64 = 20_000;
+
+    /// A leaf of incompressible rows, too big for the speculative first read,
+    /// so a `Ranged` open loads its columns by range.
+    fn build_large_test_leaf_info() -> crate::format::leaf::LeafInfo {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rows: Vec<(u64, u64)> = (0..LARGE_TEST_LEAF_ROWS)
+            .map(|_| (next() >> 1, next() >> 1))
+            .collect();
+        rows.sort_unstable_by_key(|&(s, o)| (o, s));
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 1_000, 100_000, 1);
         writer.set_skip_history(true);
-        for i in 0..5u64 {
+        for (s, o) in rows {
             writer
-                .push_record(make_rec(i + 1, 1, OType::XSD_INTEGER.as_u16(), i * 10, 1))
+                .push_record(make_rec(s, 1, OType::XSD_INTEGER.as_u16(), o, 1))
                 .unwrap();
         }
-        writer.finish().unwrap().remove(0)
+        let info = writer.finish().unwrap().remove(0);
+        assert!(
+            info.leaf_bytes.len() as u64 > crate::read::leaf_access::SPECULATIVE_HEADER_DIR_BYTES
+        );
+        info
     }
 
     /// Content store that fails exactly one CAS read — the `fail_on`-th
@@ -3903,12 +3993,12 @@ pub(crate) mod tests {
     /// Drive a full scan over the single test leaf through a store whose
     /// `fail_on`-th CAS read fails once, retrying `next_batch` on error.
     /// Returns (rows_seen, errors_seen, cas_calls).
-    fn scan_with_injected_failure(fail_on: usize) -> (u64, usize, usize) {
+    fn scan_with_injected_failure(policy: RemoteLeafFetch, fail_on: usize) -> (u64, usize, usize) {
         use crate::read::binary_cursor::BinaryCursor;
         use crate::read::column_types::{BinaryFilter, ColumnProjection};
 
         let store = FailNthContentStore::new(fail_on);
-        let info = build_test_leaf_info();
+        let info = build_large_test_leaf_info();
         let leaf_cid = run_sync_on_runtime({
             let store = store.clone();
             let bytes = info.leaf_bytes.clone();
@@ -3922,7 +4012,9 @@ pub(crate) mod tests {
         })
         .expect("seed leaf");
 
-        let binary_store = Arc::new(empty_store(Arc::new(store.clone())));
+        let mut binary_store = empty_store(Arc::new(store.clone()));
+        binary_store.set_remote_leaf_fetch(policy);
+        let binary_store = Arc::new(binary_store);
         let branch = Arc::new(crate::format::branch::BranchManifest {
             leaves: vec![crate::format::branch::LeafEntry {
                 first_key: info.first_key,
@@ -3967,28 +4059,33 @@ pub(crate) mod tests {
     /// wasm NeedFetch fetch-and-retry contract at cursor granularity.
     #[test]
     fn cursor_retries_failed_cas_reads_without_losing_rows() {
-        // Baseline: no injected failure. Positively establish that the scan
-        // reads through CAS at all — otherwise the sweep below is vacuous.
-        let (rows, errors, total_calls) = scan_with_injected_failure(0);
-        assert_eq!(rows, 5, "baseline scan must see every row");
-        assert_eq!(errors, 0, "baseline scan must not error");
-        assert!(
-            total_calls >= 2,
-            "expected the remote scan to issue CAS reads (got {total_calls})"
-        );
+        for (policy, min_calls) in [(RemoteLeafFetch::Ranged, 2), (RemoteLeafFetch::Whole, 1)] {
+            // Baseline: no injected failure. Positively establish that the
+            // scan reads through CAS at all — otherwise the sweep is vacuous.
+            let (rows, errors, total_calls) = scan_with_injected_failure(policy, 0);
+            assert_eq!(
+                rows, LARGE_TEST_LEAF_ROWS,
+                "{policy:?}: baseline scan must see every row"
+            );
+            assert_eq!(errors, 0, "{policy:?}: baseline scan must not error");
+            assert!(
+                total_calls >= min_calls,
+                "{policy:?}: expected the remote scan to issue CAS reads (got {total_calls})"
+            );
 
-        // Sweep: fail each CAS call position once (header, directory, column
-        // loads, promotion refetch, ...) and require full recovery.
-        for fail_on in 1..=total_calls {
-            let (rows, errors, _) = scan_with_injected_failure(fail_on);
-            assert_eq!(
-                errors, 1,
-                "injected failure at CAS call {fail_on} must surface exactly once"
-            );
-            assert_eq!(
-                rows, 5,
-                "retry after failure at CAS call {fail_on} must not lose rows"
-            );
+            // Sweep: fail each CAS call position once (header, directory,
+            // column loads, promotion refetch, ...) and require full recovery.
+            for fail_on in 1..=total_calls {
+                let (rows, errors, _) = scan_with_injected_failure(policy, fail_on);
+                assert_eq!(
+                    errors, 1,
+                    "{policy:?}: injected failure at CAS call {fail_on} must surface exactly once"
+                );
+                assert_eq!(
+                    rows, LARGE_TEST_LEAF_ROWS,
+                    "{policy:?}: retry after failure at CAS call {fail_on} must not lose rows"
+                );
+            }
         }
     }
 
@@ -4363,21 +4460,22 @@ pub(crate) mod tests {
         })
         .expect("store leaf bytes");
         let cache_dir = temp_cache_dir();
-        let binary_store = empty_store(Arc::new(
+        let mut binary_store = empty_store(Arc::new(
             fluree_db_core::disk_cache::CachedContentStore::new(
                 Arc::new(store.clone()),
                 fluree_db_core::disk_cache::DiskArtifactCache::for_dir(&cache_dir),
             ),
         ));
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Ranged);
 
         let handle = binary_store
             .open_leaf_handle(&leaf_cid, None, false)
             .expect("first remote open");
         assert_eq!(handle.dir().entries.len(), 1);
         let first_range_calls = store.range_calls();
-        assert!(
-            first_range_calls >= 2,
-            "expected initial remote open to fetch header+directory"
+        assert_eq!(
+            first_range_calls, 1,
+            "initial remote open fetches header+directory in one request"
         );
         drop(handle);
 
@@ -4414,6 +4512,143 @@ pub(crate) mod tests {
             store.get_calls(),
             1,
             "once promoted, repeated opens should not refetch the full blob"
+        );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// A leaf that fits in the speculative first read is served from it: its
+    /// column loads cost no further requests.
+    #[test]
+    fn ranged_policy_serves_a_small_leaf_from_its_first_read() {
+        use crate::read::column_types::ColumnProjection;
+
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let mut binary_store = empty_store(Arc::new(store.clone()));
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Ranged);
+
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("remote open");
+        let batch = handle
+            .load_columns(0, &ColumnProjection::all(), RunSortOrder::Post)
+            .expect("load columns");
+        assert_eq!(batch.row_count, 5);
+        assert_eq!((store.get_calls(), store.range_calls()), (0, 1));
+    }
+
+    #[test]
+    fn whole_policy_fetches_a_remote_leaf_once_and_reuses_the_disk_copy() {
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(disk_cached(&store, &cache_dir));
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+        // A directory-only open stays directory-only under either policy.
+        let dir = binary_store.open_leaf_dir(&leaf_cid).expect("dir open");
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!((store.get_calls(), store.range_calls()), (0, 1));
+
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("first remote open");
+        let batch = handle
+            .load_columns(
+                0,
+                &crate::read::column_types::ColumnProjection::all(),
+                RunSortOrder::Post,
+            )
+            .expect("columns");
+        assert_eq!(batch.row_count, 5);
+        assert_eq!(
+            (store.get_calls(), store.range_calls()),
+            (1, 1),
+            "first data access is one whole-leaf GET, even with the directory known"
+        );
+        assert!(cache_dir.join(leaf_cid.to_string()).exists());
+        drop(handle);
+
+        // A second store over the same cache dir (a restarted process) opens
+        // the persisted copy without touching the remote store.
+        let mut restarted = empty_store(disk_cached(&store, &cache_dir));
+        restarted.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        for s in [&binary_store, &restarted] {
+            let handle = s.open_leaf_handle(&leaf_cid, None, false).expect("reopen");
+            assert_eq!(handle.dir().entries.len(), 1);
+        }
+        assert_eq!((store.get_calls(), store.range_calls()), (1, 1));
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn whole_policy_coalesces_concurrent_cold_opens() {
+        let store = CountingContentStore::with_get_delay(Duration::from_millis(200));
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(disk_cached(&store, &cache_dir));
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        let binary_store = Arc::new(binary_store);
+
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let binary_store = Arc::clone(&binary_store);
+                let leaf_cid = leaf_cid.clone();
+                std::thread::spawn(move || {
+                    let handle = binary_store
+                        .open_leaf_handle(&leaf_cid, None, false)
+                        .expect("concurrent open");
+                    handle
+                        .load_columns(
+                            0,
+                            &crate::read::column_types::ColumnProjection::all(),
+                            RunSortOrder::Post,
+                        )
+                        .expect("columns")
+                        .row_count
+                })
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().expect("reader"), 5);
+        }
+        assert_eq!(
+            (store.get_calls(), store.range_calls()),
+            (1, 0),
+            "concurrent cold opens share one whole-leaf GET"
         );
 
         let _ = std::fs::remove_dir_all(cache_dir);
@@ -4496,9 +4731,9 @@ pub(crate) mod tests {
             "dir-only open must never fetch the full blob"
         );
         let first_range_calls = store.range_calls();
-        assert!(
-            first_range_calls >= 2,
-            "expected header + directory range reads"
+        assert_eq!(
+            first_range_calls, 1,
+            "header + directory come from one range read"
         );
 
         let dir2 = binary_store

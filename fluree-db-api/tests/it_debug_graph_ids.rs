@@ -23,7 +23,7 @@ async fn debug_graph_ids_after_named_graph_index() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let trig = r#"
                 @prefix ex: <http://example.org/> .
@@ -50,7 +50,7 @@ async fn debug_graph_ids_after_named_graph_index() {
                 .expect("ledger exists");
             let root_id = ns.index_head_id.expect("index head id");
 
-            let cs = fluree.content_store(ledger_id);
+            let cs = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
             let bytes = cs.get(&root_id).await.expect("fetch root");
             let root =
                 fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();

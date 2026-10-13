@@ -63,7 +63,7 @@ async fn wga_overlay_lane_declines_below_index_t() {
 
     // One subject per commit so each lands at a distinct t:
     //   s1 @ t=1, s2 @ t=2, s3 @ t=3.
-    let mut ledger = genesis_ledger(&fluree, ledger_id);
+    let mut ledger = genesis_ledger(&fluree, ledger_id).await;
     for i in 1..=3u32 {
         ledger = fluree
             .insert(

@@ -92,11 +92,23 @@ pub const DATATYPE_LIMIT_EXCEEDED: &str = "err:db/DatatypeLimitExceeded";
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 
+/// A write from a writer that loaded the ledger before it was dropped,
+/// restored or replaced; reloading the ledger is the only way forward
+pub const FENCED: &str = "err:db/Fenced";
+
+/// A create, drop, restore or purge refused because another holds the name
+/// or the dropped ledger; retrying once that finishes may succeed
+pub const LIFECYCLE_CONFLICT: &str = "err:db/LifecycleConflict";
+
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 
 /// Graph source not found
 pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
+
+/// A graph source over a ledger that was dropped and its name reused: it
+/// indexes nothing from the new ledger until it is recreated over it
+pub const GRAPH_SOURCE_SUSPENDED: &str = "err:db/GraphSourceSuspended";
 
 /// A graph the target ledger does not have
 pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";

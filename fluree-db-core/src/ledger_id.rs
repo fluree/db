@@ -165,11 +165,6 @@ impl LedgerName {
     pub fn with_branch(&self, branch: &str) -> Result<LedgerId, LedgerIdParseError> {
         LedgerId::from_parts(&self.0, branch)
     }
-
-    /// Storage path prefix for content shared across all branches.
-    pub fn shared_prefix(&self) -> String {
-        format!("{}/{}", self.0, crate::address_path::SHARED_NAMESPACE)
-    }
 }
 
 impl std::ops::Deref for LedgerName {
@@ -305,16 +300,6 @@ impl LedgerId {
     /// Sibling id on another branch of the same ledger.
     pub fn with_branch(&self, branch: &str) -> Result<Self, LedgerIdParseError> {
         Self::from_parts(self.name(), branch)
-    }
-
-    /// Portable storage path prefix `name/branch` (no `:` in storage paths).
-    pub fn path_prefix(&self) -> String {
-        format!("{}/{}", self.name(), self.branch())
-    }
-
-    /// Storage path prefix for content shared across all branches.
-    pub fn shared_prefix(&self) -> String {
-        format!("{}/{}", self.name(), crate::address_path::SHARED_NAMESPACE)
     }
 }
 
@@ -894,7 +879,6 @@ mod tests {
         assert_eq!(id, "mydb:main");
         assert_eq!((id.name(), id.branch()), ("mydb", "main"));
         assert_eq!(LedgerId::parse("mydb:main").unwrap(), id);
-        assert_eq!(id.path_prefix(), "mydb/main");
     }
 
     /// A branchless nested name is a name, never a `name/branch` path: the
@@ -904,15 +888,13 @@ mod tests {
     fn nested_names_keep_every_segment() {
         let id = LedgerId::parse("acme/inventory").unwrap();
         assert_eq!(id, "acme/inventory:main");
-        assert_eq!(id.path_prefix(), "acme/inventory/main");
-        assert_eq!(id.shared_prefix(), "acme/inventory/@shared");
+        assert_eq!((id.name(), id.branch()), ("acme/inventory", "main"));
+        let ns = crate::StorageNamespace::legacy(&id);
+        assert_eq!(ns.branch_prefix(), "acme/inventory/main");
+        assert_eq!(ns.shared_prefix(), "acme/inventory/@shared");
         assert_eq!(
-            LedgerName::parse("test/db").unwrap().shared_prefix(),
+            crate::StorageRoot::legacy(&LedgerName::parse("test/db").unwrap()).shared_prefix(),
             "test/db/@shared"
-        );
-        assert_eq!(
-            crate::address_path::ledger_id_to_path_prefix("acme/inventory").unwrap(),
-            "acme/inventory/main"
         );
     }
 
@@ -1024,8 +1006,15 @@ mod tests {
             ("rep@2026:main", "rep@2026/main/", "rep@2026/@shared/"),
             ("mydb:feature#1", "mydb/feature#1/", "mydb/@shared/"),
         ] {
-            assert!(content_path(ContentKind::Commit, id, "h").starts_with(own));
-            assert!(content_path(dict, id, "h").starts_with(shared), "{id}");
+            let (name, branch) = id.split_once(':').unwrap();
+            let namespace = crate::StorageNamespace::legacy(
+                &LedgerId::from_persisted_parts(name, branch).unwrap(),
+            );
+            assert!(content_path(ContentKind::Commit, &namespace, "h").starts_with(own));
+            assert!(
+                content_path(dict, &namespace, "h").starts_with(shared),
+                "{id}"
+            );
         }
     }
 

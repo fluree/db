@@ -66,6 +66,10 @@ pub enum ErrorCode {
     /// Index has not been built yet.
     IndexNotBuilt,
 
+    /// The index was built over a ledger since dropped, and its source's
+    /// name now holds another ledger.
+    GraphSourceSuspended,
+
     /// Authentication required but not provided.
     Unauthorized,
 
@@ -122,6 +126,7 @@ impl ErrorCode {
             ErrorCode::SyncTimeout => 504,
             ErrorCode::NoSnapshotForAsOfT => 404,
             ErrorCode::IndexNotBuilt => 404,
+            ErrorCode::GraphSourceSuspended => 409,
             ErrorCode::Unauthorized => 401,
             ErrorCode::Forbidden => 403,
             ErrorCode::Internal => 500,
@@ -139,6 +144,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::SyncTimeout => write!(f, "SYNC_TIMEOUT"),
             ErrorCode::NoSnapshotForAsOfT => write!(f, "NO_SNAPSHOT_FOR_AS_OF_T"),
             ErrorCode::IndexNotBuilt => write!(f, "INDEX_NOT_BUILT"),
+            ErrorCode::GraphSourceSuspended => write!(f, "GRAPH_SOURCE_SUSPENDED"),
             ErrorCode::Unauthorized => write!(f, "UNAUTHORIZED"),
             ErrorCode::Forbidden => write!(f, "FORBIDDEN"),
             ErrorCode::Internal => write!(f, "INTERNAL"),

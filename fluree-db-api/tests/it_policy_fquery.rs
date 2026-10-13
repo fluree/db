@@ -17,7 +17,7 @@ async fn policy_baseline_allow_true() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let ledger0 = genesis_ledger(&fluree, "policy/baseline:main");
+    let ledger0 = genesis_ledger(&fluree, "policy/baseline:main").await;
     let txn = json!({
         "@context": { "ex": "http://example.org/ns/" },
         "@graph": [
@@ -61,7 +61,7 @@ async fn policy_baseline_allow_true() {
 
 /// Helper to seed simple classified data
 async fn seed_classified_data(fluree: &MemoryFluree, ledger_id: &str) {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let txn = json!({
         "@context": {
@@ -412,7 +412,7 @@ async fn policy_property_path_filters_hidden_edges() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    let ledger = genesis_ledger(&fluree, "policy/fquery-path:main");
+    let ledger = genesis_ledger(&fluree, "policy/fquery-path:main").await;
     // Chain a -> b -> c -> d. Only ex:a can share, so only the a->b edge is
     // viewable; the b->c and c->d edges are hidden.
     let seed = json!({
@@ -484,7 +484,7 @@ async fn required_policies_are_and_gated() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/required-and:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let seed = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [{"@id": "ex:item1", "@type": "ex:Item", "ex:secret": "classified"}]
@@ -573,7 +573,7 @@ async fn policy_fquery_with_path_context_term() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "policy/fquery-path:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let u1 = "http://example.org/identity/u1";
     let u2 = "http://example.org/identity/u2";
@@ -675,7 +675,7 @@ async fn policy_replace_swaps_allow_for_path_gate() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "policy/replace-gate:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let u1 = "http://example.org/identity/u1";
     let class = "http://example.org/ns/Item/access/read";

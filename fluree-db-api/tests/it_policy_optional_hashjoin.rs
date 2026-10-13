@@ -49,7 +49,7 @@ async fn batched_optional_inner_enforces_view_policy() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "policy/optional-hashjoin:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Posts carry ex:level; level < 5 is "secret". p3 and p4 are secret.
     //   F1 -> members {bob, carol}, contains p1(bob,10), p2(carol,10), p3(bob,1)

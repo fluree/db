@@ -17,7 +17,7 @@ async fn reindex_produces_correct_class_counts_and_property_usage() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reindex-class-stats:main";
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex": "http://example.org/" },
         "@graph": [
@@ -155,7 +155,7 @@ async fn reindex_class_stats_survive_retraction() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reindex-class-retract:main";
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     let high_threshold = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
@@ -241,7 +241,7 @@ async fn reindex_class_stats_report_correct_datatypes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reindex-class-stats-datatypes:main";
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let tx = json!({
         "@context": {
             "ex": "http://example.org/",

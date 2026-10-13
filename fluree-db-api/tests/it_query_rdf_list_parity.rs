@@ -24,7 +24,7 @@ const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 /// in RDF list terms) plus an empty-list assertion
 /// (`ex:e ex:letters rdf:nil`, i.e. `ex:e ex:letters ()`).
 async fn seed_rdf_lists(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {

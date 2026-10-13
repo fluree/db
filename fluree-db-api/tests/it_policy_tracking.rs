@@ -17,7 +17,7 @@ async fn transact_policy_denied_includes_policy_and_fuel_tracking() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Seed base ledger with identities.
-    let ledger0 = genesis_ledger(&fluree, "policy/target:main");
+    let ledger0 = genesis_ledger(&fluree, "policy/target:main").await;
     let seed = json!({
         "@context": { "a": "http://a.co/" },
         "@graph": [

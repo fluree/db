@@ -8,7 +8,8 @@ use super::wal::{self, Acquire, Op, Wal, WAL_DIR};
 use crate::error::Result;
 use crate::{
     content_address, CasAction, CasOutcome, ContentAddressedWrite, ContentKind, ContentWriteResult,
-    StorageCas, StorageExtError, StorageExtResult, StorageMethod, StorageRead, StorageWrite,
+    StorageCas, StorageExtError, StorageExtResult, StorageMethod, StorageNamespace, StorageRead,
+    StorageWrite,
 };
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -1778,11 +1779,11 @@ impl ContentAddressedWrite for FileStorage {
     async fn content_write_bytes_with_hash(
         &self,
         kind: ContentKind,
-        ledger_id: &str,
+        namespace: &StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
-        let address = content_address(STORAGE_METHOD_FILE, kind, ledger_id, content_hash_hex);
+        let address = content_address(STORAGE_METHOD_FILE, kind, namespace, content_hash_hex);
         let durability = self.durability_for(kind);
         self.write_bytes_durable(&address, bytes, durability)
             .await?;
@@ -2363,13 +2364,21 @@ mod tests {
         let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
 
         storage
-            .content_write_bytes(ContentKind::IndexLeaf, "mydb:main", b"leaf")
+            .content_write_bytes(
+                ContentKind::IndexLeaf,
+                &StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                b"leaf",
+            )
             .await
             .unwrap();
         assert_eq!(storage.fsyncs_issued(), 0, "derived content was flushed");
 
         storage
-            .content_write_bytes(ContentKind::Commit, "mydb:main", b"commit")
+            .content_write_bytes(
+                ContentKind::Commit,
+                &StorageNamespace::parse_legacy("mydb:main").unwrap(),
+                b"commit",
+            )
             .await
             .unwrap();
         assert!(
@@ -3459,7 +3468,7 @@ mod wal_tests {
         storage
             .content_write_bytes_with_hash(
                 ContentKind::IndexLeaf,
-                "l:main",
+                &StorageNamespace::parse_legacy("l:main").unwrap(),
                 "ab".repeat(16).as_str(),
                 b"leaf",
             )
@@ -3602,7 +3611,7 @@ mod wal_tests {
                 storage
                     .content_write_bytes_with_hash(
                         ContentKind::IndexLeaf,
-                        "l:main",
+                        &StorageNamespace::parse_legacy("l:main").unwrap(),
                         &format!("{i:0>64}"),
                         &[i],
                     )
@@ -3632,7 +3641,12 @@ mod wal_tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = FileStorage::new(dir.path()).with_durability(Durability::PageCache);
         storage
-            .content_write_bytes_with_hash(ContentKind::IndexLeaf, "l:main", &"a".repeat(64), b"x")
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                &StorageNamespace::parse_legacy("l:main").unwrap(),
+                &"a".repeat(64),
+                b"x",
+            )
             .await
             .unwrap();
         storage.sync().await.unwrap();
@@ -3649,7 +3663,7 @@ mod wal_tests {
         let result = storage
             .content_write_bytes_with_hash(
                 ContentKind::IndexLeaf,
-                "l:main",
+                &StorageNamespace::parse_legacy("l:main").unwrap(),
                 &"a".repeat(64),
                 b"leaf",
             )
@@ -3694,7 +3708,7 @@ mod wal_tests {
         let result = storage
             .content_write_bytes_with_hash(
                 ContentKind::IndexLeaf,
-                "l:main",
+                &StorageNamespace::parse_legacy("l:main").unwrap(),
                 &"a".repeat(64),
                 b"leaf",
             )
@@ -3704,7 +3718,7 @@ mod wal_tests {
         let sentinel = storage
             .content_write_bytes_with_hash(
                 ContentKind::IndexLeaf,
-                "l:main",
+                &StorageNamespace::parse_legacy("l:main").unwrap(),
                 &"b".repeat(64),
                 b"sentinel",
             )
@@ -3759,7 +3773,7 @@ mod wal_tests {
         let result = storage
             .content_write_bytes_with_hash(
                 ContentKind::IndexLeaf,
-                "l:main",
+                &StorageNamespace::parse_legacy("l:main").unwrap(),
                 &"a".repeat(64),
                 b"leaf",
             )

@@ -28,7 +28,7 @@ fn aggregate_input(node: &Value) -> Option<&Value> {
 async fn distinct_chain_counts_preserve_results_and_intermediate_dedup() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "aggregate-distinct:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree.insert(ledger, &json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [

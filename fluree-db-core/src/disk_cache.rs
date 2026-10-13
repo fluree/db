@@ -1735,16 +1735,17 @@ mod tests {
         let data = vec![3u8; 64];
         let leaf = ContentId::new(crate::ContentKind::IndexLeaf, &data);
         let inner = Arc::new(CountingStore::remote(&data));
+        let ns = crate::StorageNamespace::parse_legacy("ns:main").unwrap();
 
         let wrapped = StorageBackend::Permanent(Arc::clone(&inner) as _).with_disk_cache(&dir);
-        wrapped.content_store("ns").get(&leaf).await.unwrap();
+        wrapped.content_store(&ns).get(&leaf).await.unwrap();
         assert!(
             regular_files_under(&dir).is_empty(),
             "no disk copy by default"
         );
 
         let opted = StorageBackend::cached_permanent(Arc::clone(&inner) as _, &dir);
-        opted.content_store("ns").get(&leaf).await.unwrap();
+        opted.content_store(&ns).get(&leaf).await.unwrap();
         assert_eq!(regular_files_under(&dir), vec![dir.join(leaf.to_string())]);
         let _ = fs::remove_dir_all(&dir);
     }

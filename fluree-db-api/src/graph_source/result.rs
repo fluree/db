@@ -67,11 +67,15 @@ pub struct Bm25StalenessCheck {
     /// Current ledger head (latest committed t)
     pub ledger_t: i64,
 
-    /// Whether the index is stale (index_t < ledger_t)
+    /// Whether the index is stale (index_t < ledger_t); never when suspended
     pub is_stale: bool,
 
-    /// How far behind the index is (ledger_t - index_t)
+    /// How far behind the index is (ledger_t - index_t); 0 when suspended
     pub lag: i64,
+
+    /// The source ledger was dropped and another created under its name, so
+    /// sync is refused until the index is recreated over the new ledger.
+    pub suspended: bool,
 }
 
 /// Result of dropping a BM25 full-text index.
@@ -169,11 +173,15 @@ pub struct VectorStalenessCheck {
     /// Current ledger head
     pub ledger_t: i64,
 
-    /// Whether the index is stale
+    /// Whether the index is stale; never when suspended
     pub is_stale: bool,
 
-    /// How far behind the index is
+    /// How far behind the index is; 0 when suspended
     pub lag: i64,
+
+    /// The source ledger was dropped and another created under its name, so
+    /// sync is refused until the index is recreated over the new ledger.
+    pub suspended: bool,
 }
 
 /// Result of dropping a vector index.

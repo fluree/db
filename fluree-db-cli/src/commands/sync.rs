@@ -12,7 +12,7 @@ use fluree_db_core::ContentKind;
 use fluree_db_core::ContentStore;
 use fluree_db_nameservice::{
     ConfigLookup, ConfigPayload, ConfigValue, FileTrackingStore, LedgerConfig, RefKind, RefLookup,
-    RefPublisher, RemoteName, RemoteTrackingStore,
+    RemoteName, RemoteTrackingStore,
 };
 use fluree_db_nameservice_sync::{
     ingest_pack_stream, ingest_pack_stream_with_header, peek_pack_header, FetchResult,
@@ -115,12 +115,25 @@ fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
 }
 
 /// Build a SyncDriver with all configured remotes
+/// Where the local ledger `ledger_id` stores its artifacts.
+async fn local_namespace(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> CliResult<fluree_db_core::StorageNamespace> {
+    fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .map(|record| record.storage_namespace())
+        .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))
+}
+
 async fn build_sync_driver(dirs: &FlureeDir) -> CliResult<(SyncDriver, Arc<TomlSyncConfigStore>)> {
     let fluree = context::build_fluree(dirs).await?;
     let config_store = Arc::new(TomlSyncConfigStore::new(dirs.config_dir().to_path_buf()));
 
-    // Get the nameservice as RefPublisher
-    let local: Arc<dyn RefPublisher> = fluree
+    let local: Arc<dyn fluree_db_nameservice::NameServicePublisher> = fluree
         .nameservice_mode()
         .publisher_arc()
         .ok_or_else(|| CliError::Config("sync requires a read-write nameservice".into()))?;
@@ -291,6 +304,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         .await
         .map_err(|e| CliError::Config(e.to_string()))?
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
+    let namespace = local_namespace(&fluree, &ledger_id).await?;
 
     if remote_t <= local_ref.t {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
@@ -358,7 +372,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                             buf_tail,
                                             &mut body_stream,
                                             &storage,
-                                            &ledger_id,
+                                            &namespace,
                                         )
                                         .await
                                     } else {
@@ -384,7 +398,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                                 ingest_pack_stream(
                                                     resp2,
                                                     &storage,
-                                                    &ledger_id,
+                                                    &namespace,
                                                 )
                                                 .await
                                             }
@@ -405,7 +419,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                         buf_tail,
                                         &mut body_stream,
                                         &storage,
-                                        &ledger_id,
+                                        &namespace,
                                     )
                                     .await
                                 };
@@ -1143,6 +1157,7 @@ pub async fn run_clone(
         .create_ledger(&local_id)
         .await
         .map_err(|e| CliError::Config(format!("failed to create local ledger: {e}")))?;
+    let namespace = local_namespace(&fluree, &local_id).await?;
 
     // Fetch all commit objects from the remote.
     let mut head_commit_id: Option<fluree_db_core::ContentId> = None;
@@ -1197,7 +1212,7 @@ pub async fn run_clone(
                                             buf_tail,
                                             &mut body_stream,
                                             &storage,
-                                            &local_id,
+                                            &namespace,
                                         )
                                         .await
                                     } else {
@@ -1218,7 +1233,7 @@ pub async fn run_clone(
                                                 ingest_pack_stream(
                                                     resp2,
                                                     &storage,
-                                                    &local_id,
+                                                    &namespace,
                                                 )
                                                 .await
                                             }
@@ -1238,7 +1253,7 @@ pub async fn run_clone(
                                         buf_tail,
                                         &mut body_stream,
                                         &storage,
-                                        &local_id,
+                                        &namespace,
                                     )
                                     .await
                                 };
@@ -1461,6 +1476,7 @@ pub async fn run_clone_origin(
         .create_ledger(&local_id)
         .await
         .map_err(|e| CliError::Config(format!("failed to create local ledger: {e}")))?;
+    let namespace = local_namespace(&fluree, &local_id).await?;
 
     // Handle empty remote ledger: local ledger created but nothing to fetch.
     let head_cid = match &ns_record.commit_head_id {
@@ -1483,7 +1499,7 @@ pub async fn run_clone_origin(
     );
 
     // 5. Fetch commit chain — try pack protocol first (single round-trip).
-    let content_store = fluree.content_store(&local_id);
+    let content_store = fluree.content_store(&namespace);
     let mut commits_fetched = 0usize;
     let mut index_artifacts_fetched = 0usize;
 
@@ -1520,7 +1536,7 @@ pub async fn run_clone_origin(
                                 buf_tail,
                                 &mut body_stream,
                                 &storage,
-                                &local_id,
+                                &namespace,
                             )
                             .await
                         } else {
@@ -1533,7 +1549,7 @@ pub async fn run_clone_origin(
                             };
                             match fetcher.fetch_pack_response(&ledger_id, &commits_only).await {
                                 Ok(Some(resp2)) => {
-                                    ingest_pack_stream(resp2, &storage, &local_id).await
+                                    ingest_pack_stream(resp2, &storage, &namespace).await
                                 }
                                 Ok(None) => {
                                     Err(fluree_db_nameservice_sync::SyncError::PackNotSupported)
@@ -1547,7 +1563,7 @@ pub async fn run_clone_origin(
                             buf_tail,
                             &mut body_stream,
                             &storage,
-                            &local_id,
+                            &namespace,
                         )
                         .await
                     };
@@ -1631,7 +1647,7 @@ pub async fn run_clone_origin(
 
                 // Store commit blob locally.
                 storage
-                    .content_write_bytes(ContentKind::Commit, &local_id, &bytes)
+                    .content_write_bytes(ContentKind::Commit, &namespace, &bytes)
                     .await
                     .map_err(|e| CliError::Config(format!("clone failed (store commit): {e}")))?;
 
@@ -1742,10 +1758,16 @@ pub async fn run_clone_origin(
                 extra: existing_payload.extra,
             }),
         );
+        let fence = fluree
+            .nameservice()
+            .lookup(&local_id)
+            .await
+            .map_err(|e| CliError::Config(format!("clone failed (lookup): {e}")))?
+            .and_then(|record| record.fence);
         match fluree
             .publisher()
             .map_err(|e| CliError::Config(e.to_string()))?
-            .push_config(&local_id, current.as_ref(), &new_config)
+            .push_config_fenced(&local_id, fence, current.as_ref(), &new_config)
             .await
             .map_err(|e| CliError::Config(format!("clone failed (push config): {e}")))?
         {
@@ -1805,6 +1827,7 @@ async fn run_pull_via_origins(
         .lookup(ledger_id)
         .await?
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
+    let namespace = ns_record.storage_namespace();
 
     let config_id = ns_record.config_id.ok_or_else(|| {
         CliError::Config(format!(
@@ -1818,7 +1841,7 @@ async fn run_pull_via_origins(
     })?;
 
     // Load LedgerConfig from local CAS.
-    let content_store = fluree.content_store(ledger_id);
+    let content_store = fluree.content_store(&namespace);
     let config_bytes = content_store.get(&config_id).await.map_err(|e| {
         CliError::Config(format!("failed to load LedgerConfig from local CAS: {e}"))
     })?;
@@ -1907,7 +1930,7 @@ async fn run_pull_via_origins(
                                 buf_tail,
                                 &mut body_stream,
                                 &storage,
-                                ledger_id,
+                                &namespace,
                             )
                             .await
                         } else {
@@ -1919,7 +1942,7 @@ async fn run_pull_via_origins(
                                 PackRequest::commits(vec![remote_head_cid.clone()], have);
                             match fetcher.fetch_pack_response(ledger_id, &commits_only).await {
                                 Ok(Some(resp2)) => {
-                                    ingest_pack_stream(resp2, &storage, ledger_id).await
+                                    ingest_pack_stream(resp2, &storage, &namespace).await
                                 }
                                 Ok(None) => {
                                     Err(fluree_db_nameservice_sync::SyncError::PackNotSupported)
@@ -1933,7 +1956,7 @@ async fn run_pull_via_origins(
                             buf_tail,
                             &mut body_stream,
                             &storage,
-                            ledger_id,
+                            &namespace,
                         )
                         .await
                     };
@@ -2086,7 +2109,7 @@ async fn run_pull_via_origins(
     fetched.reverse();
     for fc in &fetched {
         storage
-            .content_write_bytes(ContentKind::Commit, ledger_id, &fc.bytes)
+            .content_write_bytes(ContentKind::Commit, &namespace, &fc.bytes)
             .await
             .map_err(|e| CliError::Config(format!("pull failed (store commit): {e}")))?;
 
