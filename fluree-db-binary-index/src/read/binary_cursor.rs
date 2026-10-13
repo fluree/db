@@ -16,7 +16,7 @@ use fluree_db_core::Tracker;
 use crate::format::branch::BranchManifest;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::cmp_v2_for_order;
-use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE};
+use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2};
 use crate::read::types::cmp_overlay_vs_record;
 use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 
@@ -157,37 +157,13 @@ impl BinaryCursor {
     }
 
     /// Restrict a batched probe to leaflets that can hold one of `keys`
-    /// (sorted, deduplicated): `s_id` for SPOT and single-predicate PSOT
-    /// leaflets, `o_key` for single-`o_type` OPST leaflets. Other leaflets
-    /// pass through. A gap between wanted keys then costs a directory-key
+    /// (sorted, deduplicated), by [`crate::format::leaf::LeafletDirEntryV3::may_hold_keys`] under
+    /// the filter's predicate. A gap between wanted keys then costs a directory-key
     /// compare per leaflet instead of a decode or cache probe, which keeps
     /// gap-tolerant chunking cheap however fine the leaflets are.
     pub fn set_wanted_keys(&mut self, keys: Arc<[u64]>) {
         debug_assert!(keys.windows(2).all(|w| w[0] < w[1]));
         self.wanted_keys = Some(keys);
-    }
-
-    /// Whether a leaflet's directory key range can hold a wanted key.
-    fn leaflet_may_hold_wanted(
-        &self,
-        first_key: &[u8; ORDERED_KEY_V2_SIZE],
-        last_key: &[u8; ORDERED_KEY_V2_SIZE],
-    ) -> bool {
-        let Some(keys) = &self.wanted_keys else {
-            return true;
-        };
-        let first = read_ordered_key_v2(self.order, first_key);
-        let last = read_ordered_key_v2(self.order, last_key);
-        let (lo, hi) = match self.order {
-            RunSortOrder::Spot => (first.s_id.as_u64(), last.s_id.as_u64()),
-            RunSortOrder::Psot if first.p_id == last.p_id => {
-                (first.s_id.as_u64(), last.s_id.as_u64())
-            }
-            RunSortOrder::Opst if first.o_type == last.o_type => (first.o_key, last.o_key),
-            _ => return true,
-        };
-        let i = keys.partition_point(|&k| k < lo);
-        i < keys.len() && keys[i] <= hi
     }
 
     /// Attach a fuel tracker. Charges one index touch
@@ -468,7 +444,9 @@ impl BinaryCursor {
                     }
                     if !has_ov
                         && !needs_history_replay
-                        && !self.leaflet_may_hold_wanted(&entry.first_key, &entry.last_key)
+                        && self.wanted_keys.as_ref().is_some_and(|keys| {
+                            !entry.may_hold_keys(self.order, self.filter.p_id, keys)
+                        })
                     {
                         continue;
                     }
@@ -1380,5 +1358,11 @@ mod tests {
         let (batches, s_ids) = scan(Some(&[10, 150]));
         assert_eq!(batches, 2, "only the two leaflets holding a wanted subject");
         assert_eq!(s_ids, vec![9, 10, 11, 12, 149, 150, 151, 152]);
+        let (batches, s_ids) = scan(Some(&[12, 13]));
+        assert_eq!(
+            batches, 2,
+            "a wanted key equal to a leaflet's last or first subject keeps it"
+        );
+        assert_eq!(s_ids, (9..=16).collect::<Vec<u64>>());
     }
 }

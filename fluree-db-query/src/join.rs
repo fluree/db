@@ -292,38 +292,6 @@ pub(crate) fn prepare_leaf_for_scan(
     })
 }
 
-/// Binary search for the first row in `batch.s_id[start..end]` where `s_id >= target`.
-#[inline]
-/// Whether a PSOT leaflet's current rows can hold one of `s_ids` (sorted)
-/// under `p_id`, read from its directory keys alone, so a scattered probe set
-/// decodes only the leaflets it touches. Keys order by `(p_id, s_id)`: an
-/// end key bounds the predicate's subjects only where it carries `p_id`.
-/// Rows a history replay restores can lie outside these keys.
-fn psot_leaflet_may_hold(
-    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
-    p_id: u32,
-    s_ids: &[u64],
-) -> bool {
-    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-    use fluree_db_binary_index::RunSortOrder;
-    let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
-    let last = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key);
-    if first.p_id > p_id || last.p_id < p_id {
-        return false;
-    }
-    let lo = if first.p_id == p_id {
-        first.s_id.as_u64()
-    } else {
-        0
-    };
-    let hi = if last.p_id == p_id {
-        last.s_id.as_u64()
-    } else {
-        u64::MAX
-    };
-    s_ids.partition_point(|&x| x < lo) < s_ids.partition_point(|&x| x <= hi)
-}
-
 /// The row range of `p_id` in a PSOT leaflet; the whole leaflet when it holds
 /// one predicate.
 fn psot_predicate_run(
@@ -2394,7 +2362,13 @@ impl NestedLoopJoinOperator {
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
-                if !needs_history_replay && !psot_leaflet_may_hold(entry, p_id, unique_s_ids) {
+                if !needs_history_replay
+                    && !entry.may_hold_keys(
+                        fluree_db_binary_index::RunSortOrder::Psot,
+                        Some(p_id),
+                        unique_s_ids,
+                    )
+                {
                     continue;
                 }
 
@@ -3645,7 +3619,9 @@ fn batched_subject_probe_binary_uncharged(
                 continue;
             }
 
-            if !needs_history_replay && !psot_leaflet_may_hold(entry, p_id, &unique_s_ids) {
+            if !needs_history_replay
+                && !entry.may_hold_keys(RunSortOrder::Psot, Some(p_id), &unique_s_ids)
+            {
                 continue;
             }
 
@@ -3816,9 +3792,7 @@ fn batched_subject_star_spot_uncharged(
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{
-        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
-    };
+    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
     if subject_ids.is_empty() || predicates.is_empty() {
@@ -3896,14 +3870,11 @@ fn batched_subject_star_spot_uncharged(
             }
             // Without replay the directory keys bound the leaflet's rows, so a
             // leaflet holding none of the probed subjects is skipped unread.
-            if !needs_history_replay {
-                let first_s = read_ordered_key_v2(RunSortOrder::Spot, &entry.first_key).s_id;
-                let last_s = read_ordered_key_v2(RunSortOrder::Spot, &entry.last_key).s_id;
-                let next = unique_s_ids.partition_point(|&s| s < first_s.as_u64());
-                if unique_s_ids.get(next).is_none_or(|&s| s > last_s.as_u64()) {
-                    leaflets_skipped += 1;
-                    continue;
-                }
+            if !needs_history_replay
+                && !entry.may_hold_keys(RunSortOrder::Spot, None, &unique_s_ids)
+            {
+                leaflets_skipped += 1;
+                continue;
             }
             leaflets_read += 1;
             leaflets_replayed += u64::from(needs_history_replay);
@@ -4343,67 +4314,6 @@ mod tests {
             assert!(join.grouped_count.is_none());
             join.close();
         }
-    }
-
-    /// A leaflet is skipped only when no probed subject of the predicate can
-    /// lie between its directory keys, including where the leaflet spans
-    /// other predicates on either side.
-    #[test]
-    fn psot_leaflet_skip_reads_subject_bounds_per_predicate() {
-        use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
-        use fluree_db_binary_index::format::run_record_v2::{
-            write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
-        };
-        use fluree_db_binary_index::RunSortOrder;
-        let key = |p_id: u32, s_id: u64| {
-            let mut buf = [0u8; ORDERED_KEY_V2_SIZE];
-            let rec = RunRecordV2 {
-                s_id: SubjectId(s_id),
-                o_key: 0,
-                p_id,
-                t: 0,
-                o_i: 0,
-                o_type: 0,
-                g_id: 0,
-            };
-            write_ordered_key_v2(RunSortOrder::Psot, &rec, &mut buf);
-            buf
-        };
-        let entry = |first: (u32, u64), last: (u32, u64)| LeafletDirEntryV3 {
-            row_count: 1,
-            lead_group_count: 0,
-            first_key: key(first.0, first.1),
-            last_key: key(last.0, last.1),
-            p_const: None,
-            o_type_const: None,
-            flags: 0,
-            payload_offset: 0,
-            payload_len: 0,
-            column_refs: Vec::new(),
-            history_offset: 0,
-            history_len: 0,
-            history_min_t: 0,
-            history_max_t: 0,
-        };
-        // One predicate: subjects 100..=200.
-        let only = entry((7, 100), (7, 200));
-        assert!(psot_leaflet_may_hold(&only, 7, &[150]));
-        assert!(psot_leaflet_may_hold(&only, 7, &[100, 900]));
-        assert!(!psot_leaflet_may_hold(&only, 7, &[50, 250]));
-        assert!(!psot_leaflet_may_hold(&only, 8, &[150]));
-        // Starts in an earlier predicate: p=7 rows run from subject 0 to 40.
-        let starts_before = entry((5, 900), (7, 40));
-        assert!(psot_leaflet_may_hold(&starts_before, 7, &[3]));
-        assert!(!psot_leaflet_may_hold(&starts_before, 7, &[41]));
-        // Ends in a later predicate: p=7 rows run from subject 60 upward.
-        let ends_after = entry((7, 60), (9, 2));
-        assert!(psot_leaflet_may_hold(&ends_after, 7, &[10_000]));
-        assert!(!psot_leaflet_may_hold(&ends_after, 7, &[59]));
-        // Spans p=7 entirely: any subject.
-        let spans = entry((5, 900), (9, 2));
-        assert!(psot_leaflet_may_hold(&spans, 7, &[1]));
-        assert!(!psot_leaflet_may_hold(&spans, 4, &[1]));
-        assert!(!psot_leaflet_may_hold(&spans, 10, &[1]));
     }
 
     #[test]

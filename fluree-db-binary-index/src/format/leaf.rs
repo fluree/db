@@ -41,7 +41,7 @@ use super::history_sidecar::{HistEntryV2, HistSidecarBuilder, HistorySegmentRef}
 use super::leaflet::{encode_leaflet, EncodedLeaflet};
 use super::run_record::RunSortOrder;
 use super::run_record_v2::{
-    cmp_v2_for_order, write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+    cmp_v2_for_order, read_ordered_key_v2, write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
 };
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -850,6 +850,46 @@ pub struct LeafletDirEntryV3 {
     pub history_max_t: u32,
 }
 
+impl LeafletDirEntryV3 {
+    /// Whether this leaflet's directory keys allow one of `keys` (sorted
+    /// ascending): subjects for SPOT; for PSOT, `p_id`'s subjects, or the
+    /// leaflet's own predicate's when `p_id` is `None`; objects for a
+    /// single-`o_type` OPST leaflet. A leaflet its keys can't bound may hold
+    /// any key. Rows a history replay restores can lie outside these keys.
+    pub fn may_hold_keys(&self, order: RunSortOrder, p_id: Option<u32>, keys: &[u64]) -> bool {
+        let first = read_ordered_key_v2(order, &self.first_key);
+        let last = read_ordered_key_v2(order, &self.last_key);
+        let (lo, hi) = match (order, p_id) {
+            (RunSortOrder::Spot, _) => (first.s_id.as_u64(), last.s_id.as_u64()),
+            // Keys order by `(p_id, s_id)`: an end key bounds `p`'s subjects
+            // only where it carries `p`.
+            (RunSortOrder::Psot, Some(p)) => {
+                if first.p_id > p || last.p_id < p {
+                    return false;
+                }
+                let lo = if first.p_id == p {
+                    first.s_id.as_u64()
+                } else {
+                    0
+                };
+                let hi = if last.p_id == p {
+                    last.s_id.as_u64()
+                } else {
+                    u64::MAX
+                };
+                (lo, hi)
+            }
+            (RunSortOrder::Psot, None) if first.p_id == last.p_id => {
+                (first.s_id.as_u64(), last.s_id.as_u64())
+            }
+            (RunSortOrder::Opst, _) if first.o_type == last.o_type => (first.o_key, last.o_key),
+            _ => return true,
+        };
+        let i = keys.partition_point(|&k| k < lo);
+        i < keys.len() && keys[i] <= hi
+    }
+}
+
 /// Decode a V3 leaf header. Validates magic bytes.
 pub fn decode_leaf_header_v3(data: &[u8]) -> io::Result<LeafHeaderV3> {
     if data.len() < LEAF_V3_HEADER_SIZE {
@@ -1030,6 +1070,103 @@ mod tests {
             o_type,
             g_id: 0,
         }
+    }
+
+    fn dir_entry(order: RunSortOrder, first: RunRecordV2, last: RunRecordV2) -> LeafletDirEntryV3 {
+        let key = |rec: &RunRecordV2| {
+            let mut buf = [0u8; ORDERED_KEY_V2_SIZE];
+            write_ordered_key_v2(order, rec, &mut buf);
+            buf
+        };
+        LeafletDirEntryV3 {
+            row_count: 1,
+            lead_group_count: 0,
+            first_key: key(&first),
+            last_key: key(&last),
+            p_const: None,
+            o_type_const: None,
+            flags: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            column_refs: Vec::new(),
+            history_offset: 0,
+            history_len: 0,
+            history_min_t: 0,
+            history_max_t: 0,
+        }
+    }
+
+    /// A PSOT leaflet is ruled out only when no probed subject of the
+    /// predicate can lie between its directory keys, including where the
+    /// leaflet spans other predicates on either side.
+    #[test]
+    fn psot_may_hold_keys_reads_subject_bounds_per_predicate() {
+        let entry = |first: (u32, u64), last: (u32, u64)| {
+            dir_entry(
+                RunSortOrder::Psot,
+                make_rec(first.1, first.0, 0, 0, 0),
+                make_rec(last.1, last.0, 0, 0, 0),
+            )
+        };
+        let may_hold = |e: &LeafletDirEntryV3, p_id, keys: &[u64]| {
+            e.may_hold_keys(RunSortOrder::Psot, Some(p_id), keys)
+        };
+        // One predicate: subjects 100..=200, inclusive at both ends.
+        let only = entry((7, 100), (7, 200));
+        assert!(may_hold(&only, 7, &[150]));
+        assert!(may_hold(&only, 7, &[100]));
+        assert!(may_hold(&only, 7, &[200]));
+        assert!(may_hold(&only, 7, &[100, 900]));
+        assert!(!may_hold(&only, 7, &[50, 250]));
+        assert!(!may_hold(&only, 7, &[99, 201]));
+        assert!(!may_hold(&only, 8, &[150]));
+        // Starts in an earlier predicate: p=7 rows run from subject 0 to 40.
+        let starts_before = entry((5, 900), (7, 40));
+        assert!(may_hold(&starts_before, 7, &[3]));
+        assert!(!may_hold(&starts_before, 7, &[41]));
+        // Ends in a later predicate: p=7 rows run from subject 60 upward.
+        let ends_after = entry((7, 60), (9, 2));
+        assert!(may_hold(&ends_after, 7, &[10_000]));
+        assert!(!may_hold(&ends_after, 7, &[59]));
+        // Spans p=7 entirely: any subject.
+        let spans = entry((5, 900), (9, 2));
+        assert!(may_hold(&spans, 7, &[1]));
+        assert!(!may_hold(&spans, 4, &[1]));
+        assert!(!may_hold(&spans, 10, &[1]));
+        // No predicate given: a one-predicate leaflet is bounded by its own
+        // subjects; a mixed one may hold anything.
+        assert!(!only.may_hold_keys(RunSortOrder::Psot, None, &[99, 201]));
+        assert!(only.may_hold_keys(RunSortOrder::Psot, None, &[200]));
+        assert!(spans.may_hold_keys(RunSortOrder::Psot, None, &[1]));
+    }
+
+    #[test]
+    fn spot_and_opst_may_hold_keys() {
+        let spot = dir_entry(
+            RunSortOrder::Spot,
+            make_rec(10, 9, 0, 0, 0),
+            make_rec(20, 1, 0, 0, 0),
+        );
+        assert!(spot.may_hold_keys(RunSortOrder::Spot, None, &[10]));
+        assert!(spot.may_hold_keys(RunSortOrder::Spot, None, &[20]));
+        assert!(!spot.may_hold_keys(RunSortOrder::Spot, None, &[9, 21]));
+
+        let iri = OType::IRI_REF.as_u16();
+        let opst = dir_entry(
+            RunSortOrder::Opst,
+            make_rec(1, 1, iri, 10, 0),
+            make_rec(1, 1, iri, 20, 0),
+        );
+        assert!(opst.may_hold_keys(RunSortOrder::Opst, None, &[10]));
+        assert!(opst.may_hold_keys(RunSortOrder::Opst, None, &[20]));
+        assert!(!opst.may_hold_keys(RunSortOrder::Opst, None, &[9, 21]));
+        // Mixed o_type: o_key alone doesn't order the rows.
+        let mixed = dir_entry(
+            RunSortOrder::Opst,
+            make_rec(1, 1, iri, 10, 0),
+            make_rec(1, 1, OType::XSD_INTEGER.as_u16(), 20, 0),
+        );
+        assert!(mixed.may_hold_keys(RunSortOrder::Opst, None, &[9_000]));
     }
 
     #[test]
