@@ -21,8 +21,8 @@
 //! A node with `@graph` names a graph holding the nodes in it, emitted as
 //! quads to a sink that [supports
 //! them](fluree_graph_ir::GraphSink::supports_quads). A sink that does not
-//! gets none of that graph's contents, rather than them folded into its
-//! default graph.
+//! refuses the document, as it refuses reifiers it cannot hold, rather than
+//! losing that graph's contents or folding them into its default graph.
 //!
 //! # Example
 //!
@@ -221,9 +221,16 @@ fn process_node<S: GraphSink>(
                 }
             }
             // A named graph: this node names it. A sink that cannot hold
-            // named graphs gets none of it rather than the graph folded into
-            // its default graph.
-            "@graph" if sink.supports_quads() => {
+            // named graphs refuses it, rather than losing the graph or
+            // folding it into its default graph.
+            "@graph" => {
+                if !sink.supports_quads() {
+                    return Err(AdapterError::InvalidStructure(
+                        "a node with @graph names a graph, which this destination does not \
+                         hold; load named graphs as TriG or N-Quads"
+                            .to_string(),
+                    ));
+                }
                 for item in values {
                     process_node(item, sink, None, Some(subject_id))?;
                 }
@@ -684,7 +691,7 @@ fn process_literal<S: GraphSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_graph_ir::{GraphCollectorSink, Term};
+    use fluree_graph_ir::{Graph, GraphCollectorSink, Term};
     use fluree_vocab::rdf;
     use serde_json::json;
 
@@ -1368,5 +1375,33 @@ mod tests {
         }]);
         to_graph_events(&expanded, &mut sink).unwrap();
         assert_eq!(sink.graph().len(), 1);
+    }
+
+    /// A node with `@graph` names a graph. A sink that holds named graphs
+    /// gets the graph's contents as quads; one that does not refuses the
+    /// document rather than losing them.
+    #[test]
+    fn named_graph_is_refused_by_a_sink_without_named_graphs() {
+        let expanded = json!([{
+            "@id": "http://example.org/g",
+            "http://example.org/label": [{"@value": "G"}],
+            "@graph": [{
+                "@id": "http://example.org/x",
+                "http://example.org/p": [{"@value": "in-g"}]
+            }]
+        }]);
+
+        let mut sink = GraphCollectorSink::with_named_graphs();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let dataset = sink.into_dataset();
+        assert_eq!(dataset.default.len(), 1, "the graph's own label");
+        let g = Term::iri("http://example.org/g");
+        assert_eq!(dataset.named.get(&g).map(Graph::len), Some(1));
+
+        let err = to_graph_events(&expanded, &mut GraphCollectorSink::new()).unwrap_err();
+        assert!(
+            matches!(&err, AdapterError::InvalidStructure(msg) if msg.contains("@graph")),
+            "{err:?}"
+        );
     }
 }
