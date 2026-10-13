@@ -63,6 +63,14 @@ pub enum IndexerError {
     #[error("Incremental index aborted: {0}")]
     IncrementalAbort(String),
 
+    /// A commit's content could not be resolved into index records. Resolution
+    /// depends only on the commit's bytes and on what the build resolved before
+    /// it, so the same build fails the same way every time it runs: neither a
+    /// timed retry nor a full rebuild in place of an incremental one can
+    /// succeed.
+    #[error("Committed data cannot be indexed: {0}")]
+    Unindexable(String),
+
     /// General-purpose error for spatial index building and other auxiliary pipelines.
     #[error("{0}")]
     Other(String),
@@ -76,6 +84,13 @@ pub enum IndexerError {
 }
 
 impl IndexerError {
+    /// Whether running the same build again can succeed. `false` for
+    /// [`Unindexable`](Self::Unindexable), whose cause is in the commit chain
+    /// itself; every other failure may be transient.
+    pub fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Unindexable(_))
+    }
+
     /// Classify a joined build task's `JoinError`. Cancellation gets its own
     /// variant so the orchestrator can decline to retry; a panic keeps its
     /// payload text and stays a `StorageWrite` failure as before.

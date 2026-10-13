@@ -610,9 +610,10 @@ impl Acc {
 
     /// Fold a single row's value into this accumulator. `col` is the fold's
     /// pre-resolved column for this batch (`None` for `COUNT(*)`). Returns
-    /// `false` when the row cannot be folded exactly — an i128 sum that would
-    /// overflow, or a value with no exact reading — and the caller re-runs on
-    /// the BigDecimal pipeline; all other folds always return `true`.
+    /// `false` when the row cannot be folded — an i128 sum that would overflow,
+    /// a value with no exact reading, or a double text cell that is not an XSD
+    /// lexical form — and the caller re-runs on the generic pipeline; all other
+    /// folds always return `true`.
     fn update_row(&mut self, fold: &Fold, col: Option<&Column>, row: usize) -> bool {
         match (self, fold) {
             (Acc::Count(n), Fold::CountRows) => {
@@ -633,12 +634,10 @@ impl Acc {
                 Some(c) => accumulate_exact_row(c, row, sum, scale, count),
                 None => true,
             },
-            (Acc::Double { sum, count, .. }, Fold::Numeric { .. }) => {
-                if let Some(c) = col {
-                    accumulate_double_row(c, row, sum, count);
-                }
-                true
-            }
+            (Acc::Double { sum, count, .. }, Fold::Numeric { .. }) => match col {
+                Some(c) => accumulate_double_row(c, row, sum, count),
+                None => true,
+            },
             _ => true,
         }
     }
@@ -758,7 +757,7 @@ fn accumulate_exact_row(
 }
 
 /// Fold one value's lexical form into the exact accumulator. An unparseable
-/// lexical (`"abc"`, and `"NaN"`/`"inf"` from a float column) returns `false`
+/// lexical (`"abc"`, or a NaN or infinite value from a float column) returns `false`
 /// to escalate: the generic lane materializes it under the exact datatype,
 /// `binding_to_numeric` fails, and `agg_sum`/`agg_avg` poison the group to
 /// unbound (SPARQL §18.5.1, agg-err-01). Silently omitting the row here would
@@ -817,12 +816,28 @@ fn add_exact(d: BigDecimal, sum: &mut i128, scale: &mut i64, count: &mut u64) ->
     }
 }
 
-/// Add one row's floating value to the accumulator. NaN is dropped (neither
-/// summed nor counted), mirroring the standard aggregate pipeline's numeric
-/// coercion, so a NaN value can't poison SUM/AVG or inflate the count. A
-/// physical exact or text column under a double datatype converts, as the
-/// generic path does.
-fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
+/// Add one row's floating value to the accumulator. NaN and the infinities are
+/// summed and counted like any other double, as the standard aggregate pipeline
+/// does: SUM is `op:numeric-add` (SPARQL 1.1 §18.5.1.3), so a NaN member makes
+/// the sum NaN. A physical exact column under a double datatype converts, as
+/// the generic path does; a text cell is read as the generic path reads an
+/// `xsd:double` string, with the XSD lexical parser (and the `inf`/`-inf`
+/// text of earlier imports). Returns `false` for a text cell that is not such
+/// a form, and the caller re-runs on the generic pipeline, which decides it.
+fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) -> bool {
+    if let Column::String(values) = col {
+        let Some(text) = values.get(row).and_then(|o| o.as_deref()) else {
+            return true;
+        };
+        let Some(v) = fluree_graph_ir::parse_xsd_double(text)
+            .or_else(|| crate::eval::legacy_import_infinity(text))
+        else {
+            return false;
+        };
+        *sum += v;
+        *count += 1;
+        return true;
+    }
     let v: Option<f64> = match col {
         Column::Float64(values) => values.get(row).copied().flatten(),
         Column::Float32(values) => values.get(row).copied().flatten().map(f64::from),
@@ -833,18 +848,13 @@ fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u6
             .copied()
             .flatten()
             .map(|u| u as f64 / 10f64.powi(i32::from(*scale))),
-        Column::String(values) => values
-            .get(row)
-            .and_then(|o| o.as_deref())
-            .and_then(|t| t.trim().parse::<f64>().ok()),
         _ => None,
     };
     if let Some(v) = v {
-        if !v.is_nan() {
-            *sum += v;
-            *count += 1;
-        }
+        *sum += v;
+        *count += 1;
     }
+    true
 }
 
 /// A GROUP BY key column: which table column, how to read it, and the encoded
@@ -7343,23 +7353,37 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_double_row_drops_nan() {
-        // A NaN must be dropped (not summed, not counted), matching the standard
-        // aggregate pipeline — else SUM/AVG poison to NaN and the count inflates.
+    fn accumulate_double_row_sums_nan_and_infinities() {
+        // SUM is op:numeric-add (SPARQL 1.1 §18.5.1.3): a NaN member makes the
+        // sum NaN and is counted, as in the standard aggregate pipeline.
         let col = Column::Float64(vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
         let (mut sum, mut count) = (0.0f64, 0u64);
         for row in 0..3 {
-            accumulate_double_row(&col, row, &mut sum, &mut count);
+            assert!(accumulate_double_row(&col, row, &mut sum, &mut count));
         }
-        assert_eq!(count, 2, "NaN row is not counted");
-        assert_eq!(sum, 4.0, "NaN does not poison the sum");
+        assert_eq!(count, 3, "the NaN row is counted");
+        assert!(sum.is_nan(), "NaN propagates through the sum");
 
         let col32 = Column::Float32(vec![Some(2.0f32), Some(f32::NAN)]);
         let (mut sum, mut count) = (0.0f64, 0u64);
-        accumulate_double_row(&col32, 0, &mut sum, &mut count);
-        accumulate_double_row(&col32, 1, &mut sum, &mut count);
-        assert_eq!(count, 1);
-        assert_eq!(sum, 2.0);
+        assert!(accumulate_double_row(&col32, 0, &mut sum, &mut count));
+        assert!(accumulate_double_row(&col32, 1, &mut sum, &mut count));
+        assert_eq!(count, 2);
+        assert!(sum.is_nan());
+
+        // INF + finite = INF; INF + -INF = NaN.
+        let inf = Column::Float64(vec![
+            Some(f64::INFINITY),
+            Some(2.0),
+            Some(f64::NEG_INFINITY),
+        ]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        assert!(accumulate_double_row(&inf, 0, &mut sum, &mut count));
+        assert!(accumulate_double_row(&inf, 1, &mut sum, &mut count));
+        assert_eq!(sum, f64::INFINITY);
+        assert!(accumulate_double_row(&inf, 2, &mut sum, &mut count));
+        assert!(sum.is_nan());
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -7400,10 +7424,42 @@ mod tests {
 
         let (mut dsum, mut dcount) = (0.0f64, 0u64);
         for row in 0..4 {
-            accumulate_double_row(&col, row, &mut dsum, &mut dcount);
+            assert!(accumulate_double_row(&col, row, &mut dsum, &mut dcount));
         }
         assert_eq!(dcount, 3);
         assert_eq!(dsum, 106.625);
+    }
+
+    /// A text cell under a double datatype is read with the XSD lexical
+    /// parser, as the generic path reads it. Any other text sends the query
+    /// to the generic pipeline rather than being read the Rust way or skipped.
+    #[test]
+    fn double_text_cells_read_as_xsd_or_escalate() {
+        let col = Column::String(vec![
+            Some("INF".into()),
+            Some("-1.5E0".into()),
+            Some("inf".into()),
+            None,
+            Some("Infinity".into()),
+            Some("nan".into()),
+            Some(" 2.5".into()),
+            Some("abc".into()),
+        ]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        assert!(accumulate_double_row(&col, 0, &mut sum, &mut count));
+        assert!(accumulate_double_row(&col, 1, &mut sum, &mut count));
+        assert_eq!((sum, count), (f64::INFINITY, 2));
+        // The text earlier imports stored for INF.
+        assert!(accumulate_double_row(&col, 2, &mut sum, &mut count));
+        assert!(accumulate_double_row(&col, 3, &mut sum, &mut count), "null");
+        assert_eq!((sum, count), (f64::INFINITY, 3));
+        for row in 4..8 {
+            assert!(
+                !accumulate_double_row(&col, row, &mut sum, &mut count),
+                "row {row} escalates"
+            );
+        }
+        assert_eq!(count, 3);
     }
 
     #[test]
