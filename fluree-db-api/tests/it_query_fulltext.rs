@@ -2196,3 +2196,96 @@ async fn fulltext_configured_through_jsonld_node_graph() {
     let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, ["ex:doc1"], "{hits:?}");
 }
+
+/// Commit a label on `ledger_id` without indexing it, in a fresh process over
+/// `path`, and score `probe` against it: `(subject, score)` by subject.
+async fn persisted_novelty_scores(
+    path: &str,
+    ledger_id: &str,
+    novelty: &str,
+    probe: &str,
+) -> Vec<(String, f64)> {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let fluree = FlureeBuilder::file(path).build().expect("open");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let tx = json!({
+        "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "ex": "http://ex.test/"},
+        "@id": "ex:NEW",
+        "rdfs:label": novelty
+    });
+    let ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &tx,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert novelty")
+        .ledger;
+    let query = json!({
+        "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "ex": "http://ex.test/"},
+        "select": ["?s", "?score"],
+        "where": [
+            {"@id": "?s", "rdfs:label": "?label"},
+            ["bind", "?score", format!("(fulltext ?label \"{probe}\")")],
+            ["filter", "(> ?score 0)"]
+        ],
+        "orderBy": "?s"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let row = row.as_array()?;
+            Some((row.first()?.as_str()?.to_string(), row.get(1)?.as_f64()?))
+        })
+        .collect()
+}
+
+/// A ledger dropped and created again under its name restarts its novelty
+/// epoch and `t`. The novelty delta the scorer caches process-wide must then
+/// be the new ledger's own: it scores as the same data under a name nothing
+/// else held.
+#[tokio::test]
+async fn fulltext_novelty_of_a_recreated_ledger_is_its_own() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-recreated:main";
+    let reference_id = "it/fulltext-recreated-reference:main";
+    let docs = json!({
+        "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "ex": "http://ex.test/"},
+        "@graph": [
+            {"@id": "ex:OLD", "rdfs:label": "Qjklm Marker Syndrome"},
+            {"@id": "ex:OTHER", "rdfs:label": "Unrelated cardiac disorder"}
+        ]
+    });
+
+    persisted_setup_with_labels(&path, ledger_id, &docs).await;
+    let dropped =
+        persisted_novelty_scores(&path, ledger_id, "Qjklm qjklm qjklm variant", "qjklm").await;
+    assert_eq!(dropped.len(), 2, "{dropped:?}");
+
+    FlureeBuilder::file(&path)
+        .build()
+        .expect("open")
+        .drop_ledger("it/fulltext-recreated", fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop");
+    persisted_setup_with_labels(&path, ledger_id, &docs).await;
+    persisted_setup_with_labels(&path, reference_id, &docs).await;
+    let novelty = "Gardening tomatoes in raised beds";
+    let recreated = persisted_novelty_scores(&path, ledger_id, novelty, "qjklm").await;
+    let reference = persisted_novelty_scores(&path, reference_id, novelty, "qjklm").await;
+    assert_eq!(recreated, reference);
+}

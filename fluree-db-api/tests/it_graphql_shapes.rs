@@ -36,7 +36,13 @@ async fn run(fluree: &MemoryFluree, db: &GraphDb, query: &str) -> JsonValue {
 /// Two people and a company, plus shapes over both classes.
 async fn seeded(ledger_id: &str, shapes: JsonValue) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    let ledger = seed_into(&fluree, ledger_id, shapes).await;
+    (fluree, ledger)
+}
+
+/// [`seeded`] into `fluree`.
+async fn seed_into(fluree: &MemoryFluree, ledger_id: &str, shapes: JsonValue) -> LedgerState {
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let ledger = fluree
         .insert(
             ledger,
@@ -66,12 +72,11 @@ async fn seeded(ledger_id: &str, shapes: JsonValue) -> (MemoryFluree, LedgerStat
         .expect("seed data")
         .ledger;
 
-    let ledger = fluree
+    fluree
         .insert(ledger, &shapes)
         .await
         .expect("seed shapes")
-        .ledger;
-    (fluree, ledger)
+        .ledger
 }
 
 fn person_shape(extra: Vec<JsonValue>) -> JsonValue {
@@ -286,5 +291,30 @@ async fn editing_a_shape_reshapes_the_schema() {
     assert!(
         sdl.contains("name: [String!]"),
         "the shape cache should have been invalidated by the write:\n{sdl}"
+    );
+}
+
+/// A ledger dropped and created again under its name, with other shapes,
+/// gets its schema from its own shapes: its `t` and shape epoch start over,
+/// at the dropped ledger's values.
+#[tokio::test]
+async fn a_ledger_recreated_under_its_name_gets_its_own_shapes() {
+    let (fluree, ledger) = seeded("gql-shape-recreate", person_shape(vec![])).await;
+    let sdl = schema_sdl(&view(&ledger)).await.expect("sdl");
+    assert!(sdl.contains("internalNote"), "{sdl}");
+
+    fluree
+        .drop_ledger("gql-shape-recreate", fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop");
+    let mut closed = person_shape(vec![]);
+    closed["@graph"][0]["sh:closed"] = json!(true);
+    let recreated = seed_into(&fluree, "gql-shape-recreate", closed).await;
+    assert_eq!(recreated.t(), ledger.t());
+
+    let sdl = schema_sdl(&view(&recreated)).await.expect("sdl");
+    assert!(
+        !sdl.contains("internalNote"),
+        "the dropped ledger's shapes:\n{sdl}"
     );
 }
