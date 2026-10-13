@@ -3856,6 +3856,24 @@ impl Fluree {
         .await?)
     }
 
+    /// Build `ledger_id`'s index in this process: incremental over the
+    /// commits since the last index when possible, a full rebuild otherwise.
+    /// The caller publishes the result.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn build_index(&self, ledger_id: &str) -> Result<fluree_db_indexer::IndexResult> {
+        let config = fluree_db_indexer::IndexerConfig::default()
+            .with_fulltext_config_provider(self.fulltext_config_provider());
+        warn_if_staging_plaintext(&self.backend, &config);
+        let content_store = self.branched_content_store(ledger_id).await?;
+        Ok(fluree_db_indexer::build_index_for_ledger(
+            content_store,
+            self.nameservice(),
+            ledger_id,
+            config,
+        )
+        .await?)
+    }
+
     /// Build a [`fluree_db_indexer::FulltextConfigProvider`] backed by this
     /// connection's storage + nameservice. Attach it to the indexer's
     /// `IndexerConfig` (via `with_fulltext_config_provider`) so every index
@@ -3864,9 +3882,10 @@ impl Fluree {
     /// `f:fullTextDefaults`.
     ///
     /// The background indexer constructed at `FlureeBuilder::build()` time
-    /// already attaches one of these automatically; external callers
-    /// invoking `fluree_db_indexer::build_index_for_ledger` directly should
-    /// attach their own by calling this method.
+    /// already attaches one of these automatically, as does
+    /// [`Self::build_index`]; callers invoking
+    /// `fluree_db_indexer::build_index_for_ledger` directly should attach
+    /// their own by calling this method.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn fulltext_config_provider(&self) -> Arc<dyn fluree_db_indexer::FulltextConfigProvider> {
         Arc::new(
