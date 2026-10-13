@@ -175,7 +175,11 @@ binding:
 - a ledger or branch it drops is not moved to the dropped list;
 - a branch it creates is not listed;
 - it can commit to a branch whose drop is in progress, since it does not check
-  fences.
+  fences;
+- once a ledger it holds has been dropped and created again under its name,
+  it can commit into the new ledger: a commit stored the 4.2 way, whose parent
+  is the dropped ledger's last commit. The new ledger's head starts again at
+  `t` 0, so 4.2's only check, that `t` moves forward, passes.
 
 Running the upgrade again binds the ledgers and lists the branches it created;
 see [A ledger a 4.2 process created on DynamoDB](#a-ledger-a-42-process-created-on-dynamodb).
