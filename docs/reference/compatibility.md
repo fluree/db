@@ -72,6 +72,8 @@ Fluree supports JSON-LD 1.1:
 - Arrays
 - @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
 
+**Bulk import and transactions read some JSON-LD differently.** [Bulk import](../cli/create.md) and [`rdf::parse`](rdf-documents.md) keep an integer too large for 64 bits exact as `xsd:integer`, read a blank-node `@type` (`"@type": "_:t"`) as a blank node, and store `@reverse` and `@included` content. A JSON-LD transaction (insert, upsert) stores such an integer as `xsd:double`, reads `_:t` as an IRI, and treats `@reverse` and `@included` as ordinary property names. Bulk import refuses a node with its own `@graph`, since it names a graph; load named graphs as TriG or N-Quads.
+
 **Specification:** https://www.w3.org/TR/json-ld11/
 
 ### SPARQL 1.1 Query
