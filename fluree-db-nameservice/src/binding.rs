@@ -391,6 +391,11 @@ pub trait LedgerRegistry: Debug + Send + Sync {
     ) -> Result<RegistryCas<DroppedLedger>>;
 
     async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>>;
+
+    /// The largest dropped-ledger entry this store can write, in bytes of
+    /// its JSON, or `None` for no limit. A drop or restore whose entry would
+    /// not fit is refused before it changes anything.
+    fn max_dropped_entry_bytes(&self) -> Option<usize>;
 }
 
 /// Branch-record writes the lifecycle protocols make. Every write that

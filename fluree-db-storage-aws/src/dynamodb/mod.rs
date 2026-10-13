@@ -191,10 +191,12 @@ impl DynamoDbNameService {
             if let Some(key) = last_key.take() {
                 request = request.set_exclusive_start_key(Some(key));
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+            let response = request.send().await.map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB Query failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
             items.extend(response.items().iter().cloned());
             match response.last_evaluated_key() {
                 Some(key) if !key.is_empty() => last_key = Some(key.clone()),
@@ -225,10 +227,12 @@ impl DynamoDbNameService {
             if let Some(key) = last_key.take() {
                 request = request.set_exclusive_start_key(Some(key));
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+            let response = request.send().await.map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB Query failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
             items.extend(response.items().iter().cloned());
             match response.last_evaluated_key() {
                 Some(key) if !key.is_empty() => last_key = Some(key.clone()),
@@ -431,7 +435,12 @@ impl DynamoDbNameService {
             .expression_attribute_names("#pk", ATTR_PK)
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB GetItem failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         Ok(response.item().is_some())
     }
@@ -451,7 +460,12 @@ impl DynamoDbNameService {
             .consistent_read(true)
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB GetItem failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         Ok(response
             .item()
@@ -499,7 +513,10 @@ impl DynamoDbNameService {
             }
 
             let response = query.send().await.map_err(|e| {
-                NameServiceError::storage(format!("DynamoDB GSI query failed: {e}"))
+                NameServiceError::storage(format!(
+                    "DynamoDB GSI query failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
             })?;
 
             items.extend(response.items().iter().cloned());
@@ -662,7 +679,12 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
             .consistent_read(true)
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB Query failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         let items = response.items();
         let ref_from = |sk: &str, id_attr: &str, t_attr: &str| {
@@ -832,7 +854,10 @@ impl BranchLifecycle for DynamoDbNameService {
             }
 
             let resp = req.send().await.map_err(|e| {
-                NameServiceError::storage(format!("DynamoDB commit-index Query failed: {e}"))
+                NameServiceError::storage(format!(
+                    "DynamoDB commit-index Query failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
             })?;
 
             for item in resp.items() {
@@ -896,7 +921,10 @@ impl BranchLifecycle for DynamoDbNameService {
             }
 
             let resp = req.send().await.map_err(|e| {
-                NameServiceError::storage(format!("DynamoDB commit-index prune Query failed: {e}"))
+                NameServiceError::storage(format!(
+                    "DynamoDB commit-index prune Query failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
             })?;
 
             for item in resp.items() {
@@ -1173,7 +1201,12 @@ impl RefLookup for DynamoDbNameService {
             .consistent_read(true)
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB GetItem failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         match response.item() {
             Some(item) => {
@@ -1468,7 +1501,10 @@ impl GraphSourcePublisher for DynamoDbNameService {
             .send()
             .await
             .map_err(|e| {
-                NameServiceError::storage(format!("DynamoDB TransactWriteItems failed: {e}"))
+                NameServiceError::storage(format!(
+                    "DynamoDB TransactWriteItems failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
             })?;
 
         Ok(())
@@ -1530,7 +1566,12 @@ impl GraphSourcePublisher for DynamoDbNameService {
             .expression_attribute_values(":now", AttributeValue::N(now))
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB UpdateItem failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB UpdateItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         Ok(())
     }
@@ -1685,7 +1726,10 @@ impl GraphSourceLookup for DynamoDbNameService {
                     .send()
                     .await
                     .map_err(|e| {
-                        NameServiceError::storage(format!("DynamoDB BatchGetItem failed: {e}"))
+                        NameServiceError::storage(format!(
+                            "DynamoDB BatchGetItem failed: {}",
+                            aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                        ))
                     })?;
 
                 if let Some(table_items) =
@@ -1769,7 +1813,12 @@ impl StatusLookup for DynamoDbNameService {
             .consistent_read(true)
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB GetItem failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         match response.item() {
             Some(item) => {
@@ -1921,7 +1970,12 @@ impl ConfigLookup for DynamoDbNameService {
             .consistent_read(true)
             .send()
             .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB GetItem failed: {e}")))?;
+            .map_err(|e| {
+                NameServiceError::storage(format!(
+                    "DynamoDB GetItem failed: {}",
+                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                ))
+            })?;
 
         match response.item() {
             Some(item) => {

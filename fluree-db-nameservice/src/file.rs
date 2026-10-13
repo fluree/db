@@ -869,6 +869,10 @@ impl LedgerRegistry for FileNameService {
         }
         Ok(found)
     }
+
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[async_trait]

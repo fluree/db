@@ -1521,6 +1521,10 @@ where
     async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
         (**self).list_dropped().await
     }
+
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        (**self).max_dropped_entry_bytes()
+    }
 }
 
 #[async_trait]

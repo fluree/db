@@ -328,6 +328,10 @@ impl fluree_db_nameservice::LedgerRegistry for PausingNameService {
         self.listing()?;
         self.inner.list_dropped().await
     }
+
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        self.inner.max_dropped_entry_bytes()
+    }
 }
 
 #[async_trait]

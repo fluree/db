@@ -892,6 +892,70 @@ pub async fn resume_drop_ledger<S: LifecycleStore + ?Sized>(
     drop_ledger_from(store, name, None).await
 }
 
+/// Refuse `entry` when `store` cannot hold it, before anything is written.
+fn check_entry_fits<S: LifecycleStore + ?Sized>(store: &S, entry: &DroppedLedger) -> Result<()> {
+    let Some(max) = store.max_dropped_entry_bytes() else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(entry)?.len();
+    if bytes <= max {
+        return Ok(());
+    }
+    Err(NameServiceError::TooLarge(format!(
+        "'{}' has {} branches, and recording it as a dropped ledger takes {bytes} bytes, \
+         more than the {max} this nameservice holds in one entry; drop some of its \
+         branches first",
+        entry.name,
+        entry.branches.len()
+    )))
+}
+
+/// The entry a drop of `binding`'s ledger records, holding `records`.
+fn dropped_entry(
+    name: &LedgerName,
+    binding: &NameBinding,
+    hard: bool,
+    records: Vec<NsRecord>,
+) -> DroppedLedger {
+    DroppedLedger {
+        extra: crate::binding::ExtraFields::new(),
+        instance: binding.instance.clone(),
+        state: if hard {
+            DroppedState::Purging
+        } else {
+            DroppedState::Dropped
+        },
+        dropped_at: now_ms(),
+        name: name.to_string(),
+        root: binding.root.clone(),
+        root_branch: binding.root_branch.clone(),
+        branches: records,
+    }
+}
+
+/// The records a drop of `binding`'s ledger copies into its entry: every
+/// listed branch's but a branch still being created.
+async fn records_to_copy<S: LifecycleStore + ?Sized>(
+    store: &S,
+    name: &LedgerName,
+    binding: &NameBinding,
+) -> Result<Vec<NsRecord>> {
+    let mut records = Vec::with_capacity(binding.branches.len());
+    for b in binding.branches.iter().filter(|b| !b.creating) {
+        let id = name.with_branch(&b.branch)?;
+        if let Some(mut record) = store
+            .raw_record(&id)
+            .await?
+            .filter(|r| r.fence == Some(b.fence))
+        {
+            record.storage_root = None;
+            record.retracted = b.dropped;
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 /// [`drop_ledger`] with `start: Some(hard)`; [`resume_drop_ledger`] with
 /// `None`, which claims no drop of its own.
 async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
@@ -927,6 +991,10 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
                     let Some(hard) = start else {
                         return Ok(None);
                     };
+                    if store.max_dropped_entry_bytes().is_some() {
+                        let records = records_to_copy(store, name, &value).await?;
+                        check_entry_fits(store, &dropped_entry(name, &value, hard, records))?;
+                    }
                     let dropping = NameBinding {
                         state: BindingState::Dropping { hard },
                         ..value
@@ -949,21 +1017,12 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     // 2. Freeze every listed branch, and copy its record. A branch still
     // being created is not copied: its creator was not told it succeeded,
     // and fails to confirm it. Step 4 deletes its record.
-    let mut records = Vec::with_capacity(binding.branches.len());
     for b in binding.branches.iter().filter(|b| !b.creating) {
-        let id = name.with_branch(&b.branch)?;
-        if store.freeze_record(&id, b.fence).await? == FenceOutcome::Applied {
-            if let Some(mut record) = store
-                .raw_record(&id)
-                .await?
-                .filter(|r| r.fence == Some(b.fence))
-            {
-                record.storage_root = None;
-                record.retracted = b.dropped;
-                records.push(record);
-            }
-        }
+        store
+            .freeze_record(&name.with_branch(&b.branch)?, b.fence)
+            .await?;
     }
+    let records = records_to_copy(store, name, &binding).await?;
 
     // 3. Record the dropped ledger. A dropped or purging entry already there
     // is this drop's own earlier attempt, written before any record was
@@ -971,20 +1030,7 @@ async fn drop_ledger_from<S: LifecycleStore + ?Sized>(
     // and stopped before forgetting its entry: its copies predate the
     // restore, and resuming it would bring the ledger back, so it is
     // replaced.
-    let entry = DroppedLedger {
-        extra: crate::binding::ExtraFields::new(),
-        instance: binding.instance.clone(),
-        state: if hard {
-            DroppedState::Purging
-        } else {
-            DroppedState::Dropped
-        },
-        dropped_at: now_ms(),
-        name: name.to_string(),
-        root: binding.root.clone(),
-        root_branch: binding.root_branch.clone(),
-        branches: records,
-    };
+    let entry = dropped_entry(name, &binding, hard, records);
     let mut expected = None;
     let entry = loop {
         match cas_dropped(store, &binding.instance, expected, Some(&entry)).await? {
@@ -1076,6 +1122,7 @@ async fn restore_from<S: LifecycleStore + ?Sized>(
                 },
                 ..entry.clone()
             };
+            check_entry_fits(store, &restoring)?;
             match cas_dropped(store, instance, Some(version), Some(&restoring)).await? {
                 RegistryCas::Updated { version: Some(v) } => (fences, v),
                 _ => return Err(contended(&entry.name)),
@@ -1508,15 +1555,21 @@ mod tests {
     use crate::memory::MemoryNameService;
     use async_trait::async_trait;
 
-    /// Applies every write, but reports an error for the binding writes that
-    /// make a ledger active, as a store whose response was lost would.
-    #[derive(Debug)]
-    struct LostActivation(MemoryNameService);
+    /// A memory store that can report an error for the binding writes that
+    /// make a ledger active, applying them anyway, as a store whose response
+    /// was lost would; and can hold dropped-ledger entries of at most
+    /// `max_entry` bytes (0 for no limit).
+    #[derive(Debug, Default)]
+    struct TestStore {
+        inner: MemoryNameService,
+        lose_activation: bool,
+        max_entry: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait]
-    impl LedgerRegistry for LostActivation {
+    impl LedgerRegistry for TestStore {
         async fn get_binding(&self, name: &str) -> Result<Option<Versioned<NameBinding>>> {
-            self.0.get_binding(name).await
+            self.inner.get_binding(name).await
         }
 
         async fn cas_binding(
@@ -1525,22 +1578,22 @@ mod tests {
             expected: Option<u64>,
             new: Option<&NameBinding>,
         ) -> Result<RegistryCas<NameBinding>> {
-            let outcome = self.0.cas_binding(name, expected, new).await?;
-            if new.is_some_and(NameBinding::is_active) {
+            let outcome = self.inner.cas_binding(name, expected, new).await?;
+            if self.lose_activation && new.is_some_and(NameBinding::is_active) {
                 return Err(NameServiceError::storage("the response was lost"));
             }
             Ok(outcome)
         }
 
         async fn list_bindings(&self) -> Result<Vec<(String, Versioned<NameBinding>)>> {
-            self.0.list_bindings().await
+            self.inner.list_bindings().await
         }
 
         async fn get_dropped(
             &self,
             instance: &InstanceId,
         ) -> Result<Option<Versioned<DroppedLedger>>> {
-            self.0.get_dropped(instance).await
+            self.inner.get_dropped(instance).await
         }
 
         async fn cas_dropped(
@@ -1549,38 +1602,45 @@ mod tests {
             expected: Option<u64>,
             new: Option<&DroppedLedger>,
         ) -> Result<RegistryCas<DroppedLedger>> {
-            self.0.cas_dropped(instance, expected, new).await
+            self.inner.cas_dropped(instance, expected, new).await
         }
 
         async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
-            self.0.list_dropped().await
+            self.inner.list_dropped().await
+        }
+
+        fn max_dropped_entry_bytes(&self) -> Option<usize> {
+            match self.max_entry.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => None,
+                max => Some(max),
+            }
         }
     }
 
     #[async_trait]
-    impl BranchRecordStore for LostActivation {
+    impl BranchRecordStore for TestStore {
         async fn raw_record(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-            self.0.raw_record(ledger_id).await
+            self.inner.raw_record(ledger_id).await
         }
 
         async fn all_raw_records(&self) -> Result<Vec<NsRecord>> {
-            self.0.all_raw_records().await
+            self.inner.all_raw_records().await
         }
 
         async fn insert_record(&self, record: &NsRecord) -> Result<Option<NsRecord>> {
-            self.0.insert_record(record).await
+            self.inner.insert_record(record).await
         }
 
         async fn adopt_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-            self.0.adopt_record(ledger_id, fence).await
+            self.inner.adopt_record(ledger_id, fence).await
         }
 
         async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-            self.0.freeze_record(ledger_id, fence).await
+            self.inner.freeze_record(ledger_id, fence).await
         }
 
         async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
-            self.0.delete_record(ledger_id, fence).await
+            self.inner.delete_record(ledger_id, fence).await
         }
     }
 
@@ -1624,7 +1684,10 @@ mod tests {
     /// such an activation, deletes nothing.
     #[tokio::test]
     async fn an_activation_reported_failed_is_kept_when_it_landed() {
-        let store = LostActivation(MemoryNameService::new());
+        let store = TestStore {
+            lose_activation: true,
+            ..TestStore::default()
+        };
         let pending = begin_create(&store, &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap();
@@ -1675,5 +1738,45 @@ mod tests {
         assert_eq!(report.quarantined, refused);
         let mydb = store.get_binding("mydb").await.unwrap().unwrap().value;
         assert!(mydb.listing("main").is_some() && mydb.listing("feature#1").is_none());
+    }
+
+    /// A drop or restore whose dropped-ledger entry the store cannot hold is
+    /// refused before it writes anything: the ledger stays live, or dropped.
+    #[tokio::test]
+    async fn an_entry_too_large_for_the_store_is_refused_before_any_write() {
+        use std::sync::atomic::Ordering;
+        let store = TestStore::default();
+        let name = LedgerName::parse("mydb").unwrap();
+        create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        create_branch(&store, &name, "dev", "main", None)
+            .await
+            .unwrap();
+
+        store.max_entry.store(64, Ordering::SeqCst);
+        let err = drop_ledger(&store, &name, false).await.unwrap_err();
+        assert!(matches!(err, NameServiceError::TooLarge(_)), "{err}");
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.is_active());
+        for branch in ["mydb:main", "mydb:dev"] {
+            assert!(!store.raw_record(branch).await.unwrap().unwrap().frozen);
+        }
+
+        store.max_entry.store(0, Ordering::SeqCst);
+        let instance = drop_ledger(&store, &name, false)
+            .await
+            .unwrap()
+            .expect("dropped")
+            .instance;
+        let dropped = store.get_dropped(&instance).await.unwrap().unwrap().value;
+        // Room for the dropped entry, not for the restoring one with fences.
+        let fits = serde_json::to_vec(&dropped).unwrap().len();
+        store.max_entry.store(fits + 8, Ordering::SeqCst);
+        let err = restore_dropped(&store, &instance).await.unwrap_err();
+        assert!(matches!(err, NameServiceError::TooLarge(_)), "{err}");
+        let entry = store.get_dropped(&instance).await.unwrap().unwrap().value;
+        assert_eq!(entry.state, DroppedState::Dropped);
+        assert!(store.get_binding("mydb").await.unwrap().is_none());
     }
 }

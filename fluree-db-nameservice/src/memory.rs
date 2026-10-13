@@ -248,6 +248,10 @@ impl LedgerRegistry for MemoryNameService {
             .filter_map(|e| live(Some(e)))
             .collect())
     }
+
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[async_trait]

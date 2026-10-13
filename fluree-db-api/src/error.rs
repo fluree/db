@@ -668,7 +668,10 @@ impl ApiError {
             },
             ApiError::InvalidBranch(_) => 400,
             ApiError::InvalidLedgerId(_) => 400,
-            ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
+            ApiError::NameService(
+                fluree_db_nameservice::NameServiceError::InvalidId(_)
+                | fluree_db_nameservice::NameServiceError::TooLarge(_),
+            ) => 400,
             e if e.is_fenced() => 409,
             e if e.is_lifecycle_conflict() => 409,
             ApiError::BranchConflict(_) => 409,

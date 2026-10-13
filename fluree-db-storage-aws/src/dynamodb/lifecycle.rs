@@ -21,8 +21,18 @@ use std::collections::HashMap;
 
 type Result<T> = std::result::Result<T, NameServiceError>;
 
-fn storage_err(what: &str, e: impl std::fmt::Display) -> NameServiceError {
-    NameServiceError::storage(format!("DynamoDB {what} failed: {e}"))
+/// The largest dropped-ledger entry, in bytes of its JSON, written as one
+/// item: DynamoDB caps an item at 400 KB, and the entry's keys and other
+/// attributes take a little of that.
+const MAX_DROPPED_ENTRY_BYTES: usize = 390_000;
+
+/// `e` with its source chain, so a service error names its cause (a
+/// `ValidationException`, say) rather than reading "service error".
+fn storage_err(what: &str, e: impl std::error::Error) -> NameServiceError {
+    NameServiceError::storage(format!(
+        "DynamoDB {what} failed: {}",
+        aws_sdk_dynamodb::error::DisplayErrorContext(e)
+    ))
 }
 
 fn fence_value(fence: Fence) -> AttributeValue {
@@ -598,6 +608,12 @@ impl LedgerRegistry for DynamoDbNameService {
             }
         }
         Ok(found)
+    }
+
+    /// DynamoDB caps an item at 400 KB, attribute names and the entry's
+    /// other attributes included.
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        Some(MAX_DROPPED_ENTRY_BYTES)
     }
 }
 

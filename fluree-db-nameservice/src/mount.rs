@@ -534,6 +534,10 @@ impl crate::LedgerRegistry for CompositeNameService {
     async fn list_dropped(&self) -> Result<Vec<crate::Versioned<crate::DroppedLedger>>> {
         self.local.list_dropped().await
     }
+
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        self.local.max_dropped_entry_bytes()
+    }
 }
 
 #[async_trait]

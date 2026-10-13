@@ -49,6 +49,11 @@ pub enum NameServiceError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// The operation needs to write more than this nameservice holds in one
+    /// item, and was refused before it changed anything.
+    #[error("Too large for this nameservice: {0}")]
+    TooLarge(String),
+
     /// The underlying state machine rejected the propose with a
     /// terminal failure that retrying won't fix — typically a
     /// state-machine invariant the apply path surfaced, or a

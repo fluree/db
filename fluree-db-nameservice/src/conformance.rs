@@ -98,6 +98,10 @@ impl<S: LifecycleStore> LedgerRegistry for PausedBeforeInsert<'_, S> {
     async fn list_dropped(&self) -> Result<Vec<Versioned<DroppedLedger>>> {
         self.inner.list_dropped().await
     }
+
+    fn max_dropped_entry_bytes(&self) -> Option<usize> {
+        self.inner.max_dropped_entry_bytes()
+    }
 }
 
 #[async_trait]

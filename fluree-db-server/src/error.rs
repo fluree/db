@@ -241,7 +241,9 @@ impl ServerError {
             | ServerError::Api(
                 ApiError::InvalidLedgerId(_)
                 | ApiError::InvalidBranch(_)
-                | ApiError::NameService(NameServiceError::InvalidId(_)),
+                | ApiError::NameService(
+                    NameServiceError::InvalidId(_) | NameServiceError::TooLarge(_),
+                ),
             ) => errors::BAD_REQUEST,
             ServerError::InvalidHeader(_) => errors::INVALID_HEADER,
             ServerError::NotImplemented(_) => errors::NOT_IMPLEMENTED,
@@ -403,7 +405,9 @@ impl ServerError {
             ServerError::Api(
                 ApiError::InvalidLedgerId(_)
                 | ApiError::InvalidBranch(_)
-                | ApiError::NameService(NameServiceError::InvalidId(_)),
+                | ApiError::NameService(
+                    NameServiceError::InvalidId(_) | NameServiceError::TooLarge(_),
+                ),
             ) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,

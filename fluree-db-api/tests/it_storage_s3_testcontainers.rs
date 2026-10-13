@@ -838,6 +838,62 @@ async fn dynamodb_refuses_ids_bindings_cannot_carry_before_writing() {
     assert!(record.fence.is_none(), "nothing was bound: {record:?}");
 }
 
+/// The dropped-ledger entry cap leaves room under DynamoDB's 400 KB item
+/// limit: an entry just under it is written. A drop or restore whose entry
+/// would exceed it is refused before it writes anything.
+#[tokio::test]
+async fn dynamodb_dropped_entry_at_the_cap_is_written() {
+    use fluree_db_core::ContentKind;
+    use fluree_db_nameservice::{
+        DroppedLedger, DroppedState, LedgerRegistry, NsRecord, RegistryCas,
+    };
+
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+    ensure_dynamodb_table(&sdk_config, "dropped-entry-cap").await;
+    let ns = DynamoDbNameService::from_client(client, "dropped-entry-cap".into());
+    let cap = ns
+        .max_dropped_entry_bytes()
+        .expect("DynamoDB caps an entry");
+
+    let name = fluree_db_core::LedgerName::parse("big").unwrap();
+    let instance = fluree_db_core::InstanceId::parse("01JB8ZK4X5Y6Z7A8B9C0D1E2F3").unwrap();
+    let mut entry = DroppedLedger {
+        extra: Default::default(),
+        instance: instance.clone(),
+        state: DroppedState::Dropped,
+        dropped_at: 0,
+        name: name.to_string(),
+        root: fluree_db_core::StorageRoot::legacy(&name),
+        root_branch: "main".into(),
+        branches: Vec::new(),
+    };
+    for i in 0.. {
+        let mut record = NsRecord::new(name.with_branch(&format!("b{i}")).unwrap());
+        record.commit_head_id = Some(fluree_db_core::ContentId::new(
+            ContentKind::Commit,
+            format!("c{i}").as_bytes(),
+        ));
+        record.commit_t = 1;
+        entry.branches.push(record);
+        if serde_json::to_vec(&entry).unwrap().len() > cap {
+            entry.branches.pop();
+            break;
+        }
+    }
+    let bytes = serde_json::to_vec(&entry).unwrap().len();
+    assert!(bytes > cap - 1_000, "{bytes} of {cap}");
+
+    let written = ns
+        .cas_dropped(&instance, None, Some(&entry))
+        .await
+        .expect("an entry under the cap is written");
+    assert!(matches!(written, RegistryCas::Updated { .. }));
+    let read = ns.get_dropped(&instance).await.unwrap().expect("read back");
+    assert_eq!(read.value.branches.len(), entry.branches.len());
+}
+
 /// A ledger a 4.2 process created after the upgrade: unbound, so unseen,
 /// and found by a scan for ledger `meta` items without a `fence`. Deleting
 /// the `@format` item runs the upgrade again at the next start, which binds
