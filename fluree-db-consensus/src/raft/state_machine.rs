@@ -2988,6 +2988,7 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
                 existing.last_advanced_index = log_index;
             }
             None => {
+                let (source_branch, branches) = unborn_lineage(state, &ref_key);
                 state.refs.insert(
                     ref_key.clone(),
                     RefEntry {
@@ -2996,8 +2997,8 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
                         last_advanced_at_millis: applied_at_millis,
                         last_advanced_index: log_index,
                         index: None,
-                        source_branch: None,
-                        branches: 0,
+                        source_branch,
+                        branches,
                     },
                 );
             }
@@ -4703,6 +4704,54 @@ mod tests {
         };
         assert_eq!(record.request_cid, cid(7));
         assert_eq!(record.head, cid(42));
+    }
+
+    /// A branch created before its source had a commit keeps its source and
+    /// child count, held for it while it was unborn, across its first
+    /// queued commit.
+    #[test]
+    fn apply_head_keeps_an_unborn_branchs_lineage() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let inserted = apply(
+            &mut state,
+            Command::InsertBranchRecord(FencedBranchRecord {
+                key: RefKey::new("test/db", "dev"),
+                fence: Some(7),
+                frozen: false,
+                retracted: false,
+                head: None,
+                index: None,
+                source_branch: Some("main".into()),
+                branches: 1,
+                applied_at_millis: 0,
+            }),
+            2,
+        );
+        assert!(
+            matches!(inserted, Response::BranchRecordInserted),
+            "{inserted:?}"
+        );
+        let queue_id = match apply(&mut state, enqueue("test/db", "dev", 7, None), 3) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let applied = apply(
+            &mut state,
+            apply_head_cmd("test/db", "dev", queue_id, cid(42), 1),
+            4,
+        );
+        assert!(
+            matches!(applied, Response::HeadApplied { .. }),
+            "{applied:?}"
+        );
+
+        let entry = state
+            .refs
+            .get(&RefKey::new("test/db", "dev"))
+            .expect("born");
+        assert_eq!(entry.source_branch.as_deref(), Some("main"));
+        assert_eq!(entry.branches, 1);
     }
 
     #[test]
