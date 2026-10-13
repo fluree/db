@@ -88,26 +88,42 @@ fn stored_length(
     g_id: GraphId,
     p: &Sid,
 ) -> Result<Option<u16>> {
-    match store {
-        Some(store) => {
-            let indexed = store
-                .sid_to_p_id(p)
-                .and_then(|p_id| store.vector_dims(g_id, p_id));
-            if indexed.is_some() {
-                return Ok(indexed);
-            }
+    if let Some(store) = readable_index(base, store)? {
+        let indexed = store
+            .sid_to_p_id(p)
+            .and_then(|p_id| store.vector_dims(g_id, p_id));
+        if indexed.is_some() {
+            return Ok(indexed);
         }
-        // An index this check cannot read could hold the length, so refuse.
-        // This is the process's state, not the request's, so it is not an
-        // `InvalidVector`.
-        None if base.index_t() > 0 => {
-            return Err(TransactError::Core(fluree_db_core::Error::other(
-                "cannot check a vector's length: the ledger's index is not loaded",
-            )));
-        }
-        None => {}
     }
     Ok(first_length_since_index(novelty, g_id, p))
+}
+
+/// The index store to read lengths from, if the ledger has an index.
+///
+/// Refuses when the ledger has an index this check cannot read: none is
+/// attached, or the one attached is older than the index the ledger's
+/// novelty starts from, so a length indexed in between is in neither. Such
+/// an index could hold the length, so the write is refused rather than
+/// certified. This is the process's state, not the request's, so it is not
+/// an `InvalidVector`.
+fn readable_index<'s>(
+    base: &LedgerState,
+    store: Option<&'s BinaryIndexStore>,
+) -> Result<Option<&'s BinaryIndexStore>> {
+    let refuse = |why: &str| {
+        Err(TransactError::Core(fluree_db_core::Error::other(format!(
+            "cannot check a vector's length: {why}"
+        ))))
+    };
+    match store {
+        Some(store) if store.max_t() < base.index_t() => {
+            refuse("the loaded index is older than the ledger's")
+        }
+        Some(store) => Ok(Some(store)),
+        None if base.index_t() > 0 => refuse("the ledger's index is not loaded"),
+        None => Ok(None),
+    }
 }
 
 /// The length of the first vector asserted on `p` in `novelty`.

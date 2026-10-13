@@ -442,6 +442,54 @@ async fn retracting_the_vectors_keeps_the_length() {
     build_incremental(&fluree, id).await;
 }
 
+/// A ledger whose attached index is older than the index its novelty starts
+/// from cannot have a property's length read (it may have been indexed in
+/// between), so a vector write to it is refused rather than certified.
+#[tokio::test]
+async fn an_attached_index_older_than_the_ledgers_refuses_a_vector() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "vector-lengths/old-store:main";
+    create(&fluree, id).await;
+    insert(&fluree, id, vec![node("a", "embedding", 3)])
+        .await
+        .unwrap();
+    let older = rebuild(&fluree, id).await;
+    let older_store = older.binary_store.clone();
+    assert!(
+        older_store.is_some(),
+        "a loaded index has its store attached"
+    );
+
+    // `ex:other` first gets a length in the next index, not the older one.
+    insert(&fluree, id, vec![node("b", "other", 2)])
+        .await
+        .unwrap();
+    let mut ledger = rebuild(&fluree, id).await;
+    assert!(ledger.index_t() > older.index_t());
+    assert!(ledger.novelty.is_empty());
+
+    // The newer index installed, but the older store left attached.
+    ledger.binary_store = older_store;
+    std::sync::Arc::make_mut(&mut ledger.snapshot).range_provider = None;
+    match insert_state(&fluree, ledger, vec![node("c", "other", 5)]).await {
+        Err(ApiError::Transact(TransactError::Core(e))) => {
+            assert!(e.to_string().contains("older than the ledger's"), "{e}");
+        }
+        Err(e) => panic!("expected the write to be refused, got: {e}"),
+        Ok(()) => panic!("a length this check cannot read was certified"),
+    }
+}
+
+/// Insert JSON-LD nodes in one transaction on a given ledger state.
+async fn insert_state(
+    fluree: &MemoryFluree,
+    ledger: MemoryLedger,
+    nodes: Vec<serde_json::Value>,
+) -> fluree_db_api::Result<()> {
+    let data = json!({"@context": ctx(), "@graph": nodes});
+    fluree.insert(ledger, &data).await.map(|_| ())
+}
+
 /// A vector has at most 65,535 elements, on every write surface.
 #[tokio::test]
 async fn a_vector_has_at_most_65535_elements() {
