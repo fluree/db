@@ -262,7 +262,7 @@ async fn commit_show_resolves_triple_terms() {
         ex:claim rdf:reifies <<( ex:carol ex:says <<( ex:dave ex:label "hi"@en )>> )>> .
     "#;
     let t = fluree
-        .insert_turtle(genesis_ledger(&fluree, ledger_id), turtle)
+        .insert_turtle(genesis_ledger(&fluree, ledger_id).await, turtle)
         .await
         .expect("insert")
         .ledger
