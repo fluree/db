@@ -21,7 +21,10 @@ pub enum ColumnId {
 }
 
 impl ColumnId {
-    pub fn from_u16(v: u16) -> Option<Self> {
+    /// Number of columns; `from_u16` accepts exactly `0..COUNT`.
+    pub const COUNT: usize = 6;
+
+    pub const fn from_u16(v: u16) -> Option<Self> {
         match v {
             0 => Some(Self::SId),
             1 => Some(Self::PId),
@@ -37,6 +40,11 @@ impl ColumnId {
         self as u16
     }
 }
+
+const _: () = assert!(
+    ColumnId::from_u16(ColumnId::COUNT as u16 - 1).is_some()
+        && ColumnId::from_u16(ColumnId::COUNT as u16).is_none()
+);
 
 /// Compression codec identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
