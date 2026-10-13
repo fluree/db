@@ -25,7 +25,7 @@ use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use fluree_db_binary_index::{BinaryPrevIndexRef, LeafletCache};
-use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use fluree_db_core::{ContentBytes, ContentId, ContentKind, ContentStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{IndexerError, Result};
@@ -116,7 +116,7 @@ async fn fetch_cached_index_bytes(
     content_store
         .get(cid)
         .await
-        .map(fluree_db_core::ContentBytes::into_vec)
+        .map(ContentBytes::into_vec)
         .map_err(|e| IndexerError::StorageRead(format!("{context}: {e}")))
 }
 
@@ -124,11 +124,11 @@ async fn fetch_cached_index_bytes(
 async fn fetch_noting_local(
     content_store: &dyn ContentStore,
     id: &ContentId,
-) -> fluree_db_core::Result<(Vec<u8>, bool)> {
+) -> fluree_db_core::Result<(ContentBytes, bool)> {
     if let Some(bytes) = content_store.get_local(id)? {
-        return Ok((bytes.into_vec(), true));
+        return Ok((bytes, true));
     }
-    Ok((content_store.get(id).await?.into_vec(), false))
+    Ok((content_store.get(id).await?, false))
 }
 
 async fn upload_dict_blob_cached(
@@ -213,7 +213,7 @@ async fn run_update_branch(
     let fetch_width = upload_budget.available_permits().max(1);
 
     // Required leaves: any fetch error aborts the fold (preserved).
-    let leaf_pairs: Vec<(ContentId, Vec<u8>)> = stream::iter(leaf_cids)
+    let leaf_pairs: Vec<(ContentId, ContentBytes)> = stream::iter(leaf_cids)
         .map(|cid| async {
             let _permit = upload_budget.acquire().await.expect("upload budget open");
             let started = Instant::now();
@@ -232,15 +232,15 @@ async fn run_update_branch(
             } else {
                 stats.leaf_cache_misses.fetch_add(1, Ordering::Relaxed);
             }
-            Ok::<(ContentId, Vec<u8>), IndexerError>((cid, bytes))
+            Ok::<_, IndexerError>((cid, bytes))
         })
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let leaf_map: HashMap<ContentId, Vec<u8>> = leaf_pairs.into_iter().collect();
+    let leaf_map: HashMap<ContentId, ContentBytes> = leaf_pairs.into_iter().collect();
 
     // Sidecars: NotFound => absent (None); other errors abort (preserved).
-    let sidecar_pairs: Vec<(ContentId, Option<Vec<u8>>)> = stream::iter(sidecar_cids)
+    let sidecar_pairs: Vec<(ContentId, Option<ContentBytes>)> = stream::iter(sidecar_cids)
         .map(|cid| async {
             let _permit = upload_budget.acquire().await.expect("upload budget open");
             let started = Instant::now();
@@ -258,7 +258,7 @@ async fn run_update_branch(
                     } else {
                         stats.sidecar_cache_misses.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok::<(ContentId, Option<Vec<u8>>), IndexerError>((cid, Some(bytes)))
+                    Ok::<_, IndexerError>((cid, Some(bytes)))
                 }
                 // A sidecar listed in the manifest may not exist in storage;
                 // treat NotFound as "absent", same as the previous path.
@@ -274,7 +274,7 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let sidecar_map: HashMap<ContentId, Vec<u8>> = sidecar_pairs
+    let sidecar_map: HashMap<ContentId, ContentBytes> = sidecar_pairs
         .into_iter()
         .filter_map(|(cid, opt)| opt.map(|b| (cid, b)))
         .collect();
@@ -4455,13 +4455,11 @@ async fn compact_window(
         .iter()
         .map(|cid| content_store.get(cid))
         .collect();
-    let fetched: std::result::Result<
-        Vec<fluree_db_core::ContentBytes>,
-        fluree_db_core::error::Error,
-    > = stream::iter(fetches)
-        .buffered(COMPACTION_CONCURRENCY)
-        .try_collect()
-        .await;
+    let fetched: std::result::Result<Vec<ContentBytes>, fluree_db_core::error::Error> =
+        stream::iter(fetches)
+            .buffered(COMPACTION_CONCURRENCY)
+            .try_collect()
+            .await;
 
     let bytes = match fetched {
         Ok(b) => b,
