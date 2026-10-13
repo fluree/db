@@ -368,13 +368,15 @@ fn key_bounds(envelope: &Envelope, kind: DecodeKind) -> Option<(u64, u64)> {
             Some((lo, hi))
         }
         DecodeKind::F64 => {
+            // A comparison never selects NaN (XPath F&O 3.1 §4.3.2), whose key
+            // is the only one above `+INF`'s: an open upper side stops there.
             let lo = match &envelope.lower {
                 None => u64::MIN,
-                Some(v) => ObjKey::encode_f64(f(v)?.next_down()).map_or(u64::MIN, ObjKey::as_u64),
+                Some(v) => ObjKey::encode_f64(f(v)?.next_down()).as_u64(),
             };
             let hi = match &envelope.upper {
-                None => u64::MAX,
-                Some(v) => ObjKey::encode_f64(f(v)?.next_up()).map_or(u64::MAX, ObjKey::as_u64),
+                None => ObjKey::F64_COMPARABLE_MAX.as_u64(),
+                Some(v) => ObjKey::encode_f64(f(v)?.next_up()).as_u64(),
             };
             Some((lo, hi))
         }
@@ -1348,5 +1350,33 @@ mod tests {
                 "rounded walk bounds must include {inside}"
             );
         }
+    }
+
+    #[test]
+    fn double_walk_bounds_cover_the_infinities_and_never_nan() {
+        let key = |d: f64| ObjKey::encode_f64(d).as_u64();
+        let walk = |lower: Option<f64>, upper: Option<f64>| {
+            key_bounds(
+                &Envelope {
+                    lower: lower.map(FlakeValue::Double),
+                    upper: upper.map(FlakeValue::Double),
+                },
+                DecodeKind::F64,
+            )
+        };
+        // An open upper side stops at +INF, below NaN's key: no comparison
+        // selects NaN (F&O 3.1 §4.3.2).
+        let (lo, hi) = walk(Some(0.0), None).unwrap();
+        assert!(lo <= key(1.0) && key(f64::INFINITY) <= hi);
+        assert!(key(f64::NAN) > hi);
+        let (lo, hi) = walk(None, Some(0.0)).unwrap();
+        assert!(lo <= key(f64::NEG_INFINITY) && key(-1.0) <= hi);
+        // Infinite bounds keep the infinities inside the walk.
+        let (lo, hi) = walk(Some(f64::NEG_INFINITY), Some(f64::INFINITY)).unwrap();
+        assert!(lo <= key(f64::NEG_INFINITY) && key(f64::INFINITY) <= hi);
+        assert!(key(f64::NAN) > hi);
+        // A NaN bound has no walk; the row-level check selects nothing.
+        assert!(walk(Some(f64::NAN), None).is_none());
+        assert!(walk(None, Some(f64::NAN)).is_none());
     }
 }
