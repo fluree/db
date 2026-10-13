@@ -528,6 +528,8 @@ The indexer's catch-up tick queues ledgers whose indexing has stalled, collects 
 
 Only the node that owns catch-up runs the tick: never a peer, and under Raft only the leader. It runs only where background indexing is enabled.
 
+Where the tick never runs, nothing is resumed or rolled back on its own: the CLI on a local store, an application that embeds the Rust crate without background indexing, a server with `--indexer-catchup-interval-secs 0`, and serverless functions, which keep nothing between invocations. There, finish each by hand: dropping the name finishes an interrupted drop or rolls back a create that stopped, and `fluree dropped restore` or `fluree dropped purge` resumes its own. A create that stopped leaves the name unreadable and refuses a new create under it, saying a create is in progress or was interrupted.
+
 | Flag                              | Env Var                                | Default | Description |
 | --------------------------------- | -------------------------------------- | ------- | ----------- |
 | `--indexer-catchup-interval-secs` | `FLUREE_INDEXER_CATCHUP_INTERVAL_SECS` | `300`   | Seconds between ticks. `0` turns the periodic tick off; the sweep for stalled ledgers at start-up still runs |

@@ -43,6 +43,14 @@ fn name_taken(name: &str, binding: Option<&NameBinding>) -> NameServiceError {
         Some(BindingState::Dropping { .. }) => {
             NameServiceError::ledger_already_exists(format!("{name} (a drop is in progress)"))
         }
+        // Reads as absent, so the refusal would otherwise look like a bug.
+        Some(BindingState::Creating) => NameServiceError::ledger_already_exists(format!(
+            "{name} (a create is in progress, or was interrupted: dropping the name rolls \
+             it back)"
+        )),
+        Some(BindingState::Restoring) => {
+            NameServiceError::ledger_already_exists(format!("{name} (a restore is in progress)"))
+        }
         _ => NameServiceError::ledger_already_exists(name),
     }
 }
@@ -1778,5 +1786,24 @@ mod tests {
         let entry = store.get_dropped(&instance).await.unwrap().unwrap().value;
         assert_eq!(entry.state, DroppedState::Dropped);
         assert!(store.get_binding("mydb").await.unwrap().is_none());
+    }
+
+    /// A name held by a create that stopped reads as absent, so its refusal
+    /// says what holds it and how to free it.
+    #[tokio::test]
+    async fn a_create_refused_by_a_stopped_create_says_how_to_free_the_name() {
+        let store = MemoryNameService::new();
+        let id = LedgerId::parse("stuck:main").unwrap();
+        begin_create(&store, &id).await.unwrap();
+
+        let err = create_ledger(&store, &id).await.unwrap_err();
+        assert!(
+            matches!(err, NameServiceError::LedgerAlreadyExists(_)),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("dropping the name rolls it back"),
+            "{err}"
+        );
     }
 }
