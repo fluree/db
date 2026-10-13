@@ -90,7 +90,7 @@ async fn load_indexed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
 async fn full_rebuild_past_u8_custom_datatype_limit() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:rebuild";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(ledger0, &insert_range(0..N))
         .await
@@ -130,7 +130,7 @@ async fn full_rebuild_past_u8_custom_datatype_limit() {
 async fn full_rebuild_past_u8_custom_datatype_limit_sparql() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:sparql";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(ledger0, &insert_range(0..N))
         .await
@@ -178,7 +178,7 @@ async fn full_rebuild_past_u8_custom_datatype_limit_sparql() {
 async fn incremental_index_crosses_u8_custom_datatype_limit() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:incremental";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert(ledger0, &insert_range(0..200))
         .await
@@ -225,7 +225,7 @@ fn insert_known_datatype() -> serde_json::Value {
 async fn insert_past_datatype_limit_is_rejected_from_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:reject-novelty";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let full = fluree
         .insert(ledger0, &insert_range(0..CAPACITY))
         .await
@@ -253,7 +253,7 @@ async fn insert_past_datatype_limit_is_rejected_from_novelty() {
 async fn insert_past_datatype_limit_is_rejected_from_index() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:reject-indexed";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(ledger0, &insert_range(0..CAPACITY - 1))
         .await
@@ -287,7 +287,7 @@ async fn insert_past_datatype_limit_is_rejected_from_index() {
 async fn datatype_limit_counts_index_when_runtime_dict_is_unseeded() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "custom-dt-limit:reject-unseeded";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree
         .insert(ledger0, &insert_range(0..CAPACITY))
         .await
@@ -385,7 +385,7 @@ async fn sparql_update_past_datatype_limit_is_rejected() {
 #[tokio::test]
 async fn single_insert_past_datatype_limit_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "custom-dt-limit:reject-single");
+    let ledger0 = genesis_ledger(&fluree, "custom-dt-limit:reject-single").await;
     assert_datatype_limit_rejection(
         fluree.insert(ledger0, &insert_range(0..CAPACITY + 1)).await,
         "one transaction over the limit",
@@ -509,8 +509,8 @@ async fn push(
 #[tokio::test]
 async fn push_past_datatype_limit_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let sender = "custom-dt-limit:push-sender";
-    let ledger0 = genesis_ledger(&fluree, sender);
+    let sender = "custom-dt-limit-push-sender:main";
+    let ledger0 = genesis_ledger(&fluree, sender).await;
     let full = fluree
         .insert(ledger0, &insert_range(0..CAPACITY))
         .await
@@ -564,20 +564,20 @@ async fn push_past_datatype_limit_is_rejected() {
         txn_blob: known.txn_blob.clone(),
     };
 
-    let control = "custom-dt-limit:push-control";
+    let control = "custom-dt-limit-push-control:main";
     fluree.create_ledger(control).await.unwrap();
     push(&fluree, control, &[&fill, &known])
         .await
         .expect("the sender's own commits are accepted");
 
-    let same_push = "custom-dt-limit:push-same";
+    let same_push = "custom-dt-limit-push-same:main";
     fluree.create_ledger(same_push).await.unwrap();
     assert_datatype_limit_rejection(
         push(&fluree, same_push, &[&fill, &over]).await,
         "datatypes filled earlier in the same push",
     );
 
-    let later_push = "custom-dt-limit:push-later";
+    let later_push = "custom-dt-limit-push-later:main";
     fluree.create_ledger(later_push).await.unwrap();
     push(&fluree, later_push, &[&fill])
         .await

@@ -14,7 +14,7 @@ async fn policy_applies_to_time_travel_queries() {
     let ledger_id = "policy/time-travel:main";
 
     // t=1
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": {"ex":"http://example.org/ns/","schema":"http://schema.org/"},
         "@graph": [{

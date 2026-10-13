@@ -8,7 +8,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_subject_as_predicate(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = json!({
         "id": "@id",
         "schema": "http://schema.org/",
@@ -119,7 +119,7 @@ async fn subjects_as_predicates_reverse_crawl_without_star() {
 async fn equivalent_properties_equivalent_symmetric_transitive_and_expansion() {
     // Scenario: equivalent-properties-test
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/equivalent-properties");
+    let ledger0 = genesis_ledger(&fluree, "query/equivalent-properties").await;
 
     // Seed equivalentProperty chain across 3 vocabularies.
     let schema = json!({
@@ -238,7 +238,7 @@ async fn equivalent_properties_equivalent_symmetric_transitive_and_expansion() {
 async fn rdfs_subpropertyof_expansion() {
     // Scenario: rdfs-subpropertyof-test
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "query/rdfs-subpropertyof");
+    let ledger0 = genesis_ledger(&fluree, "query/rdfs-subpropertyof").await;
 
     // Seed property hierarchy.
     let insert1 = json!({

@@ -738,6 +738,7 @@ pub async fn incremental_index(
             ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
             stats: IndexStats::default(),
             fuel: None,
+            fence: None,
         });
     }
 
@@ -4047,6 +4048,7 @@ pub async fn incremental_index(
         },
         // Outer entry point fills fuel from the tracker tally.
         fuel: None,
+        fence: None,
     })
 }
 
@@ -4988,7 +4990,10 @@ mod compaction_tests {
     #[tokio::test]
     async fn quiet_term_streams_are_compacted_from_their_share() {
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
         let mut fragmented = Vec::new();
         for i in 0..9u64 {
             fragmented.push(put_term_pack(&store, 7, i * 3, 3).await);
@@ -5041,7 +5046,10 @@ mod compaction_tests {
         // would grow without limit. Budget here is far too small to walk the
         // prefix, so the tail is only reachable if it is examined first.
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
         let mut refs = table_with_unmergeable_prefix(&store, 40, 10).await;
         let before = refs.len();
 
@@ -5082,7 +5090,10 @@ mod compaction_tests {
     #[tokio::test]
     async fn every_id_survives_a_driver_merge() {
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
         let mut refs = table_with_unmergeable_prefix(&store, 2, 12).await;
 
         let mut cache = PackSizeCache::new();
@@ -5120,7 +5131,10 @@ mod compaction_tests {
         // The off-switch has to be a true no-op: packs are appended and never
         // merged, exactly as before compaction existed.
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
         let mut refs = table_with_unmergeable_prefix(&store, 0, 20).await;
         let before = refs.clone();
 
@@ -5150,7 +5164,10 @@ mod compaction_tests {
         // is cycle-wide, and every probe and fetch that reaches storage is
         // charged against it.
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage.clone(), LEDGER);
+        let store = content_store_for(
+            storage.clone(),
+            &fluree_db_core::StorageNamespace::parse_legacy(LEDGER).unwrap(),
+        );
         let mut refs = table_with_unmergeable_prefix(&store, 4, 20).await;
 
         let mut cache = PackSizeCache::new();

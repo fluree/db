@@ -163,13 +163,13 @@ async fn post_envelope(
 async fn multi_query_without_auth_when_required_returns_401() {
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mqa:x").await;
+    create_ledger(&app, "mqa-x:main").await;
     // Even just creating the envelope: no token, data auth required → 401.
     let envelope = json!({
         "queries": {
             "a": {
                 "language": "jsonld",
-                "query": { "from": "mqa:x", "select": ["?s"], "where": { "@id": "?s" } }
+                "query": { "from": "mqa-x:main", "select": ["?s"], "where": { "@id": "?s" } }
             }
         }
     });
@@ -181,9 +181,9 @@ async fn multi_query_without_auth_when_required_returns_401() {
 async fn multi_query_with_token_inside_scope_succeeds() {
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mqa:y").await;
-    let (_sk, token) = write_scoped_token(&["mqa:y"], 11);
-    insert_one(&app, "mqa:y", "ex:p", "P", &token).await;
+    create_ledger(&app, "mqa-y:main").await;
+    let (_sk, token) = write_scoped_token(&["mqa-y:main"], 11);
+    insert_one(&app, "mqa-y:main", "ex:p", "P", &token).await;
 
     let envelope = json!({
         "queries": {
@@ -191,7 +191,7 @@ async fn multi_query_with_token_inside_scope_succeeds() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from":   "mqa:y",
+                    "from":   "mqa-y:main",
                     "select": ["?name"],
                     "where":  { "@id": "?s", "ex:name": "?name" }
                 }
@@ -210,14 +210,14 @@ async fn multi_query_with_token_outside_scope_returns_404() {
     // existence-leak-avoiding 404 the single-query handler returns.
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mqa:a").await;
-    create_ledger(&app, "mqa:b").await;
-    // Token can read 'mqa:a' but NOT 'mqa:b'.
-    let (_sk_a, write_a) = write_scoped_token(&["mqa:a"], 13);
-    insert_one(&app, "mqa:a", "ex:p", "P", &write_a).await;
-    let (_sk_b, write_b) = write_scoped_token(&["mqa:b"], 14);
-    insert_one(&app, "mqa:b", "ex:q", "Q", &write_b).await;
-    let (_sk, read_a_only) = read_scoped_token(&["mqa:a"], 15);
+    create_ledger(&app, "mqa-a:main").await;
+    create_ledger(&app, "mqa-b:main").await;
+    // Token can read 'mqa-a:main' but NOT 'mqa-b:main'.
+    let (_sk_a, write_a) = write_scoped_token(&["mqa-a:main"], 13);
+    insert_one(&app, "mqa-a:main", "ex:p", "P", &write_a).await;
+    let (_sk_b, write_b) = write_scoped_token(&["mqa-b:main"], 14);
+    insert_one(&app, "mqa-b:main", "ex:q", "Q", &write_b).await;
+    let (_sk, read_a_only) = read_scoped_token(&["mqa-a:main"], 15);
 
     let envelope = json!({
         "queries": {
@@ -225,7 +225,7 @@ async fn multi_query_with_token_outside_scope_returns_404() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from":   "mqa:a",
+                    "from":   "mqa-a:main",
                     "select": ["?name"],
                     "where":  { "@id": "?s", "ex:name": "?name" }
                 }
@@ -234,7 +234,7 @@ async fn multi_query_with_token_outside_scope_returns_404() {
                 "language": "jsonld",
                 "query": {
                     "@context": { "ex": "http://example.org/" },
-                    "from":   "mqa:b",
+                    "from":   "mqa-b:main",
                     "select": ["?name"],
                     "where":  { "@id": "?s", "ex:name": "?name" }
                 }
@@ -243,7 +243,7 @@ async fn multi_query_with_token_outside_scope_returns_404() {
     });
     let (status, _body) = post_envelope(&app, &envelope, Some(&read_a_only)).await;
     // Whole envelope rejected — not partial — to avoid leaking whether
-    // mqa:b exists at all. Matches single-query handler behavior.
+    // mqa-b:main exists at all. Matches single-query handler behavior.
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -251,23 +251,23 @@ async fn multi_query_with_token_outside_scope_returns_404() {
 async fn multi_query_with_token_outside_scope_sparql_returns_404() {
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "mqa:c").await;
-    create_ledger(&app, "mqa:d").await;
-    let (_w_c, write_c) = write_scoped_token(&["mqa:c"], 23);
-    insert_one(&app, "mqa:c", "ex:p", "P", &write_c).await;
-    let (_w_d, write_d) = write_scoped_token(&["mqa:d"], 24);
-    insert_one(&app, "mqa:d", "ex:q", "Q", &write_d).await;
-    let (_, read_c_only) = read_scoped_token(&["mqa:c"], 25);
+    create_ledger(&app, "mqa-c:main").await;
+    create_ledger(&app, "mqa-d:main").await;
+    let (_w_c, write_c) = write_scoped_token(&["mqa-c:main"], 23);
+    insert_one(&app, "mqa-c:main", "ex:p", "P", &write_c).await;
+    let (_w_d, write_d) = write_scoped_token(&["mqa-d:main"], 24);
+    insert_one(&app, "mqa-d:main", "ex:q", "Q", &write_d).await;
+    let (_, read_c_only) = read_scoped_token(&["mqa-c:main"], 25);
 
     let envelope = json!({
         "queries": {
             "good": {
                 "language": "sparql",
-                "query": "PREFIX ex: <http://example.org/> SELECT ?name FROM <mqa:c> WHERE { ?s ex:name ?name }"
+                "query": "PREFIX ex: <http://example.org/> SELECT ?name FROM <mqa-c:main> WHERE { ?s ex:name ?name }"
             },
             "bad": {
                 "language": "sparql",
-                "query": "PREFIX ex: <http://example.org/> SELECT ?name FROM <mqa:d> WHERE { ?s ex:name ?name }"
+                "query": "PREFIX ex: <http://example.org/> SELECT ?name FROM <mqa-d:main> WHERE { ?s ex:name ?name }"
             }
         }
     });

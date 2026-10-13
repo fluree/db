@@ -8,7 +8,8 @@ use crate::config::SyncConfigStore;
 use crate::error::{Result, SyncError};
 use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{
-    CasResult, RefKind, RefPublisher, RefValue, RemoteName, RemoteTrackingStore, TrackingRecord,
+    CasResult, Fence, NameServicePublisher, RefKind, RefPublisher, RefValue, RemoteName,
+    RemoteTrackingStore, TrackingRecord,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -63,8 +64,9 @@ pub enum PushResult {
 
 /// Orchestrates sync operations between local and remote nameservices
 pub struct SyncDriver {
-    /// Local nameservice ref operations
-    local: Arc<dyn RefPublisher>,
+    /// Local nameservice. Its writes present each branch's current fence:
+    /// sync acts on whichever ledger holds the local alias now.
+    local: Arc<dyn NameServicePublisher>,
     /// Remote tracking store
     tracking: Arc<dyn RemoteTrackingStore>,
     /// Sync configuration
@@ -84,7 +86,7 @@ impl Debug for SyncDriver {
 impl SyncDriver {
     /// Create a new sync driver
     pub fn new(
-        local: Arc<dyn RefPublisher>,
+        local: Arc<dyn NameServicePublisher>,
         tracking: Arc<dyn RemoteTrackingStore>,
         config: Arc<dyn SyncConfigStore>,
     ) -> Self {
@@ -94,6 +96,18 @@ impl SyncDriver {
             config,
             clients: HashMap::new(),
         }
+    }
+
+    /// The fence `ledger_id`'s local writes present: its record's now.
+    async fn local_fence(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<Fence>, fluree_db_nameservice::NameServiceError> {
+        Ok(self
+            .local
+            .lookup(ledger_id)
+            .await?
+            .and_then(|record| record.fence))
     }
 
     /// Register a client for a remote
@@ -202,12 +216,22 @@ impl SyncDriver {
             .await
             .map_err(SyncError::Nameservice)?;
 
+        let fence = self
+            .local_fence(local_alias)
+            .await
+            .map_err(SyncError::Nameservice)?;
         match &local_ref {
             None => {
                 // Local doesn't exist yet — create it via CAS
                 let result = self
                     .local
-                    .compare_and_set_ref(local_alias, RefKind::CommitHead, None, remote_commit)
+                    .compare_and_set_ref_fenced(
+                        local_alias,
+                        fence,
+                        RefKind::CommitHead,
+                        None,
+                        remote_commit,
+                    )
                     .await
                     .map_err(SyncError::Nameservice)?;
                 match result {
@@ -216,8 +240,9 @@ impl SyncDriver {
                         if let Some(remote_index) = remote_index.as_ref() {
                             let _ = self
                                 .local
-                                .compare_and_set_ref(
+                                .compare_and_set_ref_fenced(
                                     local_alias,
+                                    fence,
                                     RefKind::IndexHead,
                                     None,
                                     remote_index,
@@ -247,7 +272,7 @@ impl SyncDriver {
                     // Remote is ahead — fast-forward
                     let result = self
                         .local
-                        .fast_forward_commit(local_alias, remote_commit, 3)
+                        .fast_forward_commit_fenced(local_alias, fence, remote_commit, 3)
                         .await
                         .map_err(SyncError::Nameservice)?;
                     match result {
@@ -305,6 +330,7 @@ impl SyncDriver {
         new: &RefValue,
         max_retries: usize,
     ) -> std::result::Result<CasResult, fluree_db_nameservice::NameServiceError> {
+        let fence = self.local_fence(ledger_id).await?;
         for _ in 0..max_retries {
             let current = self.local.get_ref(ledger_id, RefKind::IndexHead).await?;
 
@@ -317,7 +343,13 @@ impl SyncDriver {
 
             match self
                 .local
-                .compare_and_set_ref(ledger_id, RefKind::IndexHead, current.as_ref(), new)
+                .compare_and_set_ref_fenced(
+                    ledger_id,
+                    fence,
+                    RefKind::IndexHead,
+                    current.as_ref(),
+                    new,
+                )
                 .await?
             {
                 CasResult::Updated => return Ok(CasResult::Updated),
@@ -449,7 +481,8 @@ mod tests {
     use crate::config::{MemorySyncConfigStore, UpstreamConfig};
     use fluree_db_core::{ContentId, ContentKind};
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{CommitPublisher, MemoryTrackingStore, NsRecord, RefLookup};
+    use fluree_db_nameservice::testing::CurrentFence;
+    use fluree_db_nameservice::{MemoryTrackingStore, NsRecord, RefLookup};
 
     fn origin() -> RemoteName {
         RemoteName::new("origin")
@@ -527,7 +560,7 @@ mod tests {
         let remote_client = Arc::new(MockRemoteClient::new());
 
         let mut driver = SyncDriver::new(
-            local.clone() as Arc<dyn RefPublisher>,
+            local.clone() as Arc<dyn NameServicePublisher>,
             tracking as Arc<dyn RemoteTrackingStore>,
             config.clone() as Arc<dyn SyncConfigStore>,
         );
@@ -544,6 +577,9 @@ mod tests {
         let (_local, remote, driver, _config) = setup_driver().await;
 
         // Publish something on the remote
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
@@ -561,6 +597,9 @@ mod tests {
     async fn test_fetch_idempotent() {
         let (_local, remote, driver, _config) = setup_driver().await;
 
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-1"))
@@ -591,12 +630,18 @@ mod tests {
             .unwrap();
 
         // Create local at t=1
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await
             .unwrap();
 
         // Remote at t=5
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
@@ -639,8 +684,14 @@ mod tests {
             .unwrap();
 
         // Both at t=5 with same address
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
+            .await
+            .unwrap();
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
             .await
             .unwrap();
         remote
@@ -672,12 +723,18 @@ mod tests {
             .unwrap();
 
         // Local ahead at t=10
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 10, &test_commit_id("commit-10"))
             .await
             .unwrap();
 
         // Remote at t=5
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
@@ -711,7 +768,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_succeeds() {
-        let (local, _remote, driver, config) = setup_driver().await;
+        let (local, remote, driver, config) = setup_driver().await;
+        // The remote holds the ledger: a push moves a head, it creates none.
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
 
         config
             .set_upstream(&UpstreamConfig {
@@ -723,10 +784,15 @@ mod tests {
             .await
             .unwrap();
 
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
             .await
             .unwrap();
+        // The push names the remote head it last saw.
+        driver.fetch_remote(&origin()).await.unwrap();
 
         match driver.push_tracked("mydb:main").await.unwrap() {
             PushResult::Pushed { value, .. } => {
@@ -751,6 +817,9 @@ mod tests {
             .unwrap();
 
         // Remote has data already
+        fluree_db_nameservice::testing::create(&remote.ns, "mydb:main")
+            .await
+            .unwrap();
         remote
             .ns
             .publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
@@ -758,6 +827,9 @@ mod tests {
             .unwrap();
 
         // Local has different data
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 5, &test_commit_id("commit-5"))
             .await
@@ -781,6 +853,9 @@ mod tests {
     async fn test_push_no_upstream() {
         let (local, _remote, driver, _config) = setup_driver().await;
 
+        fluree_db_nameservice::testing::create(&local, "mydb:main")
+            .await
+            .unwrap();
         local
             .publish_commit("mydb:main", 1, &test_commit_id("commit-1"))
             .await

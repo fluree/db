@@ -147,7 +147,10 @@ pub async fn run(
                 match &record.index_head_id {
                     Some(id) => {
                         println!("Index ID:       {id}");
-                        let root = fluree.content_store(&ledger_id).get(id).await?;
+                        let root = fluree
+                            .content_store(&record.storage_namespace())
+                            .get(id)
+                            .await?;
                         let snapshot = fluree_db_core::LedgerSnapshot::from_root_bytes(&root)?;
                         if snapshot.needs_link_reindex {
                             print_link_reindex_warning(&record.ledger_id);

@@ -1,0 +1,130 @@
+//! Which incarnation of a ledger a graph source was built over.
+//!
+//! A ledger dropped and created again under its name is another ledger. An
+//! index graph source records the instance it indexed, and while its source
+//! ledger's name leads to a different instance it is suspended: it syncs
+//! nothing from that ledger until it is recreated over it. A virtual source
+//! records the instance of its model ledger, and is suspended the same way
+//! rather than governed by another ledger's policies. Restoring the dropped
+//! ledger brings back the instance, and with it the graph source.
+
+use crate::{ApiError, Result};
+#[cfg(feature = "iceberg")]
+use fluree_db_core::InstanceId;
+use fluree_db_core::StorageRoot;
+#[cfg(feature = "iceberg")]
+use fluree_db_nameservice::lifecycle::legacy_instance;
+use fluree_db_nameservice::source_instance::{source_instance_mismatch, suspension_message};
+use fluree_db_nameservice::{GraphSourceRecord, NsRecord};
+
+pub(crate) use fluree_db_nameservice::source_instance::{instance_of, SOURCE_INSTANCE};
+
+/// Whether the BM25 or vector index `record` is suspended, given `source`,
+/// the record of the ledger its first dependency names now. For listings: a
+/// record whose config cannot be read counts as not suspended, and a sync of
+/// it reports the error.
+pub fn index_is_suspended(record: &GraphSourceRecord, source: &NsRecord) -> bool {
+    (record.is_bm25() || record.is_vector())
+        && matches!(
+            check_source_instance(record, source.ledger_id.as_ref(), &source.storage_root()),
+            Err(ApiError::GraphSourceSuspended(_))
+        )
+}
+
+/// Whether `record` is suspended: the ledger stored under `root`, which
+/// `source` names now, is not the ledger it indexed.
+pub(crate) fn is_suspended(
+    record: &GraphSourceRecord,
+    source: &str,
+    root: &StorageRoot,
+) -> Result<bool> {
+    match check_source_instance(record, source, root) {
+        Ok(()) => Ok(false),
+        Err(ApiError::GraphSourceSuspended(_)) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Refuse to sync `record` from the ledger stored under `root` unless that is
+/// the ledger it indexed.
+pub(crate) fn check_source_instance(
+    record: &GraphSourceRecord,
+    source: &str,
+    root: &StorageRoot,
+) -> Result<()> {
+    match source_instance_mismatch(record, root)? {
+        None => Ok(()),
+        Some((indexed, current)) => Err(ApiError::GraphSourceSuspended(suspension_message(
+            record, source, &indexed, &current,
+        ))),
+    }
+}
+
+impl crate::Fluree {
+    /// Refuse a query of `record`, a BM25 or vector index, while its source
+    /// ledger's name holds another ledger than the one it indexed; see
+    /// [`check_source_instance`]. A name that holds no ledger does not
+    /// suspend it: the dropped ledger can still be restored.
+    ///
+    /// The source's storage root comes from the ledger manager, which
+    /// remembers it once looked up and forgets it when an event says a
+    /// ledger was created, dropped or replaced under the name: a query pays
+    /// a lookup only the first time.
+    pub(crate) async fn check_index_query(&self, record: &GraphSourceRecord) -> Result<()> {
+        if !(record.is_bm25() || record.is_vector()) {
+            return Ok(());
+        }
+        let Some(source) = record.dependencies.first() else {
+            return Ok(());
+        };
+        match self.source_root(source).await? {
+            Some(root) => check_source_instance(record, source, &root),
+            None => Ok(()),
+        }
+    }
+
+    /// The storage root of the ledger `source` names now, if any.
+    async fn source_root(&self, source: &str) -> Result<Option<StorageRoot>> {
+        let id = fluree_db_core::LedgerId::parse(source)?;
+        let manager = self.ledger_manager();
+        if let Some(root) = manager.and_then(|m| m.remembered_root(&id)) {
+            return Ok(root);
+        }
+        let epoch = manager.map(|m| m.root_epoch());
+        let root = self
+            .nameservice()
+            .lookup(id.as_ref())
+            .await?
+            .map(|record| record.storage_root());
+        if let (Some(manager), Some(epoch)) = (manager, epoch) {
+            manager.remember_root(epoch, &id, root.clone());
+        }
+        Ok(root)
+    }
+}
+
+/// Refuse to govern `record` by `current`, the ledger its `model` names now,
+/// unless that is the ledger it was registered with, `recorded`.
+#[cfg(feature = "iceberg")]
+pub(crate) fn check_model_instance(
+    record: &GraphSourceRecord,
+    model: &str,
+    recorded: Option<&str>,
+    current: &InstanceId,
+) -> Result<()> {
+    let registered = match recorded {
+        Some(id) => InstanceId::parse(id)?,
+        // Registered before sources recorded it, when every ledger was
+        // rooted at its name.
+        None => legacy_instance(&fluree_db_core::LedgerId::parse(model)?.ledger_name()),
+    };
+    if registered == *current {
+        return Ok(());
+    }
+    Err(ApiError::GraphSourceSuspended(format!(
+        "{} is governed by model ledger '{model}' instance {registered}, which was dropped; \
+         '{model}' is now instance {current}. Drop and recreate the graph source to govern it \
+         by the new ledger",
+        record.graph_source_id
+    )))
+}

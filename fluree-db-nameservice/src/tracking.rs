@@ -1,8 +1,8 @@
 //! Remote tracking state for nameservice sync
 //!
 //! This module provides the types and traits for storing "what the remote has" locally,
-//! analogous to git's `refs/remotes/origin/*`. Tracking records live outside the `ns@v2/`
-//! tree (at `{base}/ns-sync/remotes/...`) so that `all_records()` and `list_prefix("ns@v2/")`
+//! analogous to git's `refs/remotes/origin/*`. Tracking records live outside the `ns@v3/`
+//! tree (at `{base}/ns-sync/remotes/...`) so that `all_records()` and `list_prefix("ns@v3/")`
 //! never enumerate sync metadata.
 
 use crate::{RefValue, Result};

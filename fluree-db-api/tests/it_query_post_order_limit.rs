@@ -72,7 +72,7 @@ where
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
         .build_memory();
-    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     fluree.insert(ledger, &seed_json()).await.expect("insert");
     rebuild_and_publish_index(&fluree, ledger_id).await;
     let view = fluree.db(ledger_id).await.expect("load indexed view");
@@ -247,7 +247,7 @@ async fn indexed_post_order_desc_generic_duration_falls_back_correctly() {
         "xsd": "http://www.w3.org/2001/XMLSchema#"
     });
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     // Mixed (year-month + day-time) durations take the generic string-dict
     // path. They differ only in the year component, so all three are mutually
     // comparable; inserted 3Y, 1Y, 2Y but value-DESC order is 3Y, 2Y, 1Y.
@@ -318,7 +318,7 @@ async fn overlay_post_order_desc_reflects_novelty() {
     let ledger_id = "it/post-order-overlay:main";
     let ctx = json!({"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert(ledger0, &seed_json())
         .await
@@ -441,7 +441,7 @@ async fn overlay_post_order_desc_multi_predicate_leaf_window() {
 
     // Base: a foreign predicate `ex:aaa` (lower p_id, huge value) shares one leaf
     // with `ex:score` (10..50). Default leaf size keeps it all in a single leaf.
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert(
             ledger0,

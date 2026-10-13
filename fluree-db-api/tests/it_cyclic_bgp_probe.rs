@@ -54,7 +54,7 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             // Edge data covering: two directed triangles sharing node n1/n3
             // (multiplicity through shared vertices), a "shortcut" triangle,

@@ -22,7 +22,7 @@ async fn datalog_grandparent_rule() {
     // Test: Define a grandparent rule that derives grandparent relationships
     // from parent-of-parent chains.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/grandparent");
+    let ledger0 = genesis_ledger(&fluree, "datalog/grandparent").await;
 
     // First, insert the rule definition
     let rule_data = json!({
@@ -132,7 +132,7 @@ async fn datalog_grandparent_rule() {
 #[tokio::test]
 async fn datalog_reasoning_honored_inside_opts() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/opts-reasoning");
+    let ledger0 = genesis_ledger(&fluree, "datalog/opts-reasoning").await;
 
     let rule_data = json!({
         "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
@@ -197,7 +197,7 @@ async fn datalog_sibling_rule() {
     // Test: Define a sibling rule that derives sibling relationships
     // from shared parent relationships.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/sibling");
+    let ledger0 = genesis_ledger(&fluree, "datalog/sibling").await;
 
     // First, insert the rule definition
     let rule_data = json!({
@@ -264,7 +264,7 @@ async fn datalog_sibling_rule() {
 async fn datalog_no_rules_returns_empty() {
     // Test: When no rules are defined, datalog reasoning returns no derived facts
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/no-rules");
+    let ledger0 = genesis_ledger(&fluree, "datalog/no-rules").await;
 
     // Insert some data without any rules
     let data = json!({
@@ -306,7 +306,7 @@ async fn datalog_no_rules_returns_empty() {
 async fn datalog_combined_with_owl2rl() {
     // Test: Both OWL2-RL and datalog rules can be enabled together
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/combined");
+    let ledger0 = genesis_ledger(&fluree, "datalog/combined").await;
 
     // Insert OWL symmetric property + datalog rule
     let schema_and_rule = json!({
@@ -382,7 +382,7 @@ async fn datalog_recursive_ancestor_rule() {
     // This tests that the fixpoint iteration incorporates derived facts
     // from previous iterations for recursive rules to work correctly.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/recursive-ancestor");
+    let ledger0 = genesis_ledger(&fluree, "datalog/recursive-ancestor").await;
 
     // Define recursive ancestor rule:
     // - Base case: parent is an ancestor
@@ -474,7 +474,7 @@ async fn datalog_chains_off_owl_entailments() {
     // This tests that when both owl2rl and datalog are enabled, datalog rules
     // can match against facts that were derived by OWL2-RL reasoning.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/chains-owl");
+    let ledger0 = genesis_ledger(&fluree, "datalog/chains-owl").await;
 
     // Setup:
     // 1. OWL symmetric property on ex:knows (OWL derives bob->knows->alice from alice->knows->bob)
@@ -651,7 +651,7 @@ async fn datalog_filter_expression() {
     // Test: Filter expressions in rule bodies filter bindings based on conditions.
     // This tests the ["filter", "(op ?var value)"] syntax.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter").await;
 
     // Define a rule that marks people as senior citizens if age >= 62
     let rule_data = json!({
@@ -735,7 +735,7 @@ async fn datalog_filter_expression() {
 async fn datalog_filter_less_than() {
     // Test: Filter with less-than comparison
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-lt");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-lt").await;
 
     // Define a rule that marks items as "affordable" if price < 100
     let rule_data = json!({
@@ -818,7 +818,7 @@ async fn datalog_query_time_rules() {
     // Test: Rules provided at query time via the "rules" field.
     // No rules are stored in the database; they're passed with the query.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules");
+    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules").await;
 
     // Insert family data (no rules in the database)
     let family_data = json!({
@@ -865,7 +865,7 @@ async fn datalog_query_time_rules() {
 async fn datalog_query_time_rules_with_id() {
     // Test: Query-time rules with explicit @id
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-with-id");
+    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-with-id").await;
 
     // Insert family data
     let family_data = json!({
@@ -912,7 +912,7 @@ async fn datalog_query_time_rules_with_id() {
 async fn datalog_query_time_rules_multiple() {
     // Test: Multiple query-time rules that chain together
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-multiple");
+    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-multiple").await;
 
     // Insert family data with uncle relationship
     let family_data = json!({
@@ -968,7 +968,7 @@ async fn datalog_query_time_rules_multiple() {
 async fn datalog_query_time_rules_with_filter() {
     // Test: Query-time rules with filter expressions
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-filter");
+    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-filter").await;
 
     // Insert people with ages
     let data = json!({
@@ -1027,7 +1027,7 @@ async fn datalog_query_time_rules_with_filter() {
 async fn datalog_query_time_rules_merged_with_db_rules() {
     // Test: Query-time rules are merged with rules stored in the database
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-merged");
+    let ledger0 = genesis_ledger(&fluree, "datalog/query-time-rules-merged").await;
 
     // Store an uncle rule in the database
     let db_rule_data = json!({
@@ -1105,7 +1105,7 @@ async fn datalog_query_time_rules_merged_with_db_rules() {
 async fn datalog_query_time_rules_stripped_under_non_root_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "datalog/query-time-rules-policy";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let family = json!({
         "@context": {"ex": "http://example.org/"},
@@ -1179,7 +1179,7 @@ async fn datalog_query_time_rules_stripped_under_non_root_policy() {
 #[tokio::test]
 async fn datalog_rule_insert_property_variable_substituted() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/insert-prop-var");
+    let ledger0 = genesis_ledger(&fluree, "datalog/insert-prop-var").await;
 
     let rule_data = json!({
         "@context": {
@@ -1242,7 +1242,7 @@ async fn datalog_rule_insert_property_variable_substituted() {
 #[tokio::test]
 async fn datalog_rule_where_property_variable_binds_and_substitutes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/where-prop-var");
+    let ledger0 = genesis_ledger(&fluree, "datalog/where-prop-var").await;
 
     let rule_data = json!({
         "@context": {
@@ -1301,7 +1301,7 @@ async fn datalog_rule_where_property_variable_binds_and_substitutes() {
 #[tokio::test]
 async fn datalog_rule_literal_bound_property_variable_does_not_abort_other_rules() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/literal-prop-var");
+    let ledger0 = genesis_ledger(&fluree, "datalog/literal-prop-var").await;
 
     // Rule 1 (sound): derives grandparent. Rule 2 (unsatisfiable): binds ?p to
     // the string value of ex:tag, then reuses ?p in predicate position, where
@@ -1376,7 +1376,7 @@ async fn datalog_rule_literal_bound_property_variable_does_not_abort_other_rules
 #[tokio::test]
 async fn datalog_rule_literal_subject_constant_does_not_abort_other_rules() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/literal-subject");
+    let ledger0 = genesis_ledger(&fluree, "datalog/literal-subject").await;
 
     let rule_data = json!({
         "@context": {
@@ -1449,7 +1449,7 @@ async fn datalog_rule_literal_subject_constant_does_not_abort_other_rules() {
 #[tokio::test]
 async fn datalog_rule_all_unbound_leading_pattern_still_derives_correctly() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/reorder-leading-unbound");
+    let ledger0 = genesis_ledger(&fluree, "datalog/reorder-leading-unbound").await;
 
     let rule_data = json!({
         "@context": {
@@ -1522,7 +1522,7 @@ async fn datalog_rule_all_unbound_leading_pattern_still_derives_correctly() {
 #[tokio::test]
 async fn datalog_filter_iri_exclusion_actually_excludes() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-exclusion");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-exclusion").await;
 
     let rule_data = json!({
         "@context": {
@@ -1588,7 +1588,7 @@ async fn datalog_filter_iri_exclusion_actually_excludes() {
 #[tokio::test]
 async fn datalog_filter_iri_equality_matches() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-equality");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-equality").await;
 
     let rule_data = json!({
         "@context": {
@@ -1647,7 +1647,7 @@ async fn datalog_filter_iri_equality_matches() {
 #[tokio::test]
 async fn datalog_filter_iri_equality_is_namespace_aware() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-namespace");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-namespace").await;
 
     let rule_data = json!({
         "@context": {
@@ -1716,7 +1716,7 @@ async fn datalog_filter_iri_equality_is_namespace_aware() {
 #[tokio::test]
 async fn datalog_filter_iri_object_position_exclusion() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-object");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-object").await;
 
     let rule_data = json!({
         "@context": {
@@ -1780,7 +1780,7 @@ async fn datalog_filter_iri_object_position_exclusion() {
 #[tokio::test]
 async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-unresolvable");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-unresolvable").await;
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -1863,7 +1863,7 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
 #[tokio::test]
 async fn datalog_unbound_insert_variable_reports_named_diagnostic() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/unbound-insert-var");
+    let ledger0 = genesis_ledger(&fluree, "datalog/unbound-insert-var").await;
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -1939,7 +1939,7 @@ async fn datalog_rule_matching_nothing_is_not_flagged() {
     let (store, _guard) = support::span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/no-match-no-warning");
+    let ledger0 = genesis_ledger(&fluree, "datalog/no-match-no-warning").await;
 
     let rule_data = json!({
         "@context": {
@@ -2008,7 +2008,7 @@ async fn datalog_rule_matching_nothing_is_not_flagged() {
 #[tokio::test]
 async fn datalog_filter_literal_does_not_drop_iri_valued_rows() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-literal-vs-iri");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-literal-vs-iri").await;
 
     let rule_data = json!({
         "@context": {
@@ -2074,7 +2074,7 @@ async fn datalog_filter_literal_does_not_drop_iri_valued_rows() {
 #[tokio::test]
 async fn datalog_filter_quoted_operand_with_whitespace_works() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/filter-quoted-whitespace");
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-quoted-whitespace").await;
 
     let rule_data = json!({
         "@context": {
@@ -2154,7 +2154,7 @@ async fn datalog_malformed_filter_does_not_silently_vanish() {
         ),
     ] {
         let fluree = FlureeBuilder::memory().build_memory();
-        let ledger0 = genesis_ledger(&fluree, "datalog/malformed-filter");
+        let ledger0 = genesis_ledger(&fluree, "datalog/malformed-filter").await;
         let rule_data = json!({
             "@context": {
                 "ex": "http://example.org/",
@@ -2231,7 +2231,7 @@ async fn datalog_malformed_filter_does_not_silently_vanish() {
 #[tokio::test]
 async fn datalog_bare_token_filter_operand_is_rejected_with_named_operand() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/bare-local-name-filter");
+    let ledger0 = genesis_ledger(&fluree, "datalog/bare-local-name-filter").await;
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -2319,7 +2319,7 @@ async fn datalog_iri_versus_literal_filter_that_keeps_rows_is_not_flagged() {
     let (store, _guard) = support::span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/iri-vs-literal-no-warn");
+    let ledger0 = genesis_ledger(&fluree, "datalog/iri-vs-literal-no-warn").await;
 
     let rule_data = json!({
         "@context": {
@@ -2387,7 +2387,7 @@ async fn datalog_iri_versus_literal_filter_that_keeps_rows_is_not_flagged() {
 #[tokio::test]
 async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/bare-token-exclusion");
+    let ledger0 = genesis_ledger(&fluree, "datalog/bare-token-exclusion").await;
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -2468,7 +2468,7 @@ async fn datalog_bare_numeric_and_boolean_filter_operands_still_parse() {
     let (store, _guard) = support::span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/bare-numeric-boolean");
+    let ledger0 = genesis_ledger(&fluree, "datalog/bare-numeric-boolean").await;
 
     let rule_data = json!({
         "@context": {
@@ -2563,7 +2563,7 @@ async fn datalog_quoted_curie_lookalike_that_empties_rows_gets_the_runtime_hint(
     let (store, _guard) = support::span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/quoted-curie-lookalike");
+    let ledger0 = genesis_ledger(&fluree, "datalog/quoted-curie-lookalike").await;
 
     let rule_data = json!({
         "@context": {
@@ -2639,7 +2639,7 @@ async fn datalog_quoted_curie_lookalike_that_empties_rows_gets_the_runtime_hint(
 #[tokio::test]
 async fn datalog_multi_head_rule_with_an_unbound_head_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/multi-head-unbound");
+    let ledger0 = genesis_ledger(&fluree, "datalog/multi-head-unbound").await;
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",

@@ -154,19 +154,19 @@ async fn post_query(app: &axum::Router, query: &JsonValue, token: &str) -> (Stat
 async fn connection_from_array_outside_scope_returns_404() {
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "dca:a").await;
-    create_ledger(&app, "dca:b").await;
-    let write_a = write_scoped_token(&["dca:a"], 31);
-    insert_one(&app, "dca:a", "ex:p", "P", &write_a).await;
-    let write_b = write_scoped_token(&["dca:b"], 32);
-    insert_one(&app, "dca:b", "ex:q", "Q", &write_b).await;
+    create_ledger(&app, "dca-a:main").await;
+    create_ledger(&app, "dca-b:main").await;
+    let write_a = write_scoped_token(&["dca-a:main"], 31);
+    insert_one(&app, "dca-a:main", "ex:p", "P", &write_a).await;
+    let write_b = write_scoped_token(&["dca-b:main"], 32);
+    insert_one(&app, "dca-b:main", "ex:q", "Q", &write_b).await;
 
-    // Read token scoped to dca:a ONLY. dca:a is first in `from`, so the old
-    // single-ledger check passed and dca:b leaked into the union.
-    let read_a_only = read_scoped_token(&["dca:a"], 33);
+    // Read token scoped to dca-a:main ONLY. dca-a:main is first in `from`, so the old
+    // single-ledger check passed and dca-b:main leaked into the union.
+    let read_a_only = read_scoped_token(&["dca-a:main"], 33);
     let query = json!({
         "@context": { "ex": "http://example.org/" },
-        "from":   ["dca:a", "dca:b"],
+        "from":   ["dca-a:main", "dca-b:main"],
         "select": ["?name"],
         "where":  { "@id": "?s", "ex:name": "?name" }
     });
@@ -184,17 +184,17 @@ async fn connection_from_array_outside_scope_returns_404() {
 async fn connection_from_array_inside_scope_succeeds() {
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "dca:c").await;
-    create_ledger(&app, "dca:d").await;
-    let write_c = write_scoped_token(&["dca:c"], 41);
-    insert_one(&app, "dca:c", "ex:p", "P", &write_c).await;
-    let write_d = write_scoped_token(&["dca:d"], 42);
-    insert_one(&app, "dca:d", "ex:q", "Q", &write_d).await;
+    create_ledger(&app, "dca-c:main").await;
+    create_ledger(&app, "dca-d:main").await;
+    let write_c = write_scoped_token(&["dca-c:main"], 41);
+    insert_one(&app, "dca-c:main", "ex:p", "P", &write_c).await;
+    let write_d = write_scoped_token(&["dca-d:main"], 42);
+    insert_one(&app, "dca-d:main", "ex:q", "Q", &write_d).await;
 
-    let read_both = read_scoped_token(&["dca:c", "dca:d"], 43);
+    let read_both = read_scoped_token(&["dca-c:main", "dca-d:main"], 43);
     let query = json!({
         "@context": { "ex": "http://example.org/" },
-        "from":   ["dca:c", "dca:d"],
+        "from":   ["dca-c:main", "dca-d:main"],
         "select": ["?name"],
         "where":  { "@id": "?s", "ex:name": "?name" }
     });
@@ -212,18 +212,18 @@ async fn connection_from_array_inside_scope_succeeds() {
 async fn connection_from_named_outside_scope_returns_404() {
     let (_tmp, state) = data_auth_state().await;
     let app = build_router(state);
-    create_ledger(&app, "dca:e").await;
-    create_ledger(&app, "dca:f").await;
-    let write_e = write_scoped_token(&["dca:e"], 51);
-    insert_one(&app, "dca:e", "ex:p", "P", &write_e).await;
-    let write_f = write_scoped_token(&["dca:f"], 52);
-    insert_one(&app, "dca:f", "ex:q", "Q", &write_f).await;
+    create_ledger(&app, "dca-e:main").await;
+    create_ledger(&app, "dca-f:main").await;
+    let write_e = write_scoped_token(&["dca-e:main"], 51);
+    insert_one(&app, "dca-e:main", "ex:p", "P", &write_e).await;
+    let write_f = write_scoped_token(&["dca-f:main"], 52);
+    insert_one(&app, "dca-f:main", "ex:q", "Q", &write_f).await;
 
-    let read_e_only = read_scoped_token(&["dca:e"], 53);
+    let read_e_only = read_scoped_token(&["dca-e:main"], 53);
     let query = json!({
         "@context": { "ex": "http://example.org/" },
-        "from":      "dca:e",
-        "fromNamed": { "other": { "@id": "dca:f" } },
+        "from":      "dca-e:main",
+        "fromNamed": { "other": { "@id": "dca-f:main" } },
         "select":    ["?name"],
         "where":     ["graph", "other", { "@id": "?s", "ex:name": "?name" }]
     });

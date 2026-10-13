@@ -11,7 +11,7 @@ fn decimal(n: usize) -> Value {
 }
 
 async fn seed(fluree: &Fluree, probe: usize, noise: usize, misses: usize) {
-    let ledger = genesis_ledger(fluree, LEDGER);
+    let ledger = genesis_ledger(fluree, LEDGER).await;
     let mut graph = Vec::new();
     for i in 0..8 {
         graph.push(json!({"@id":format!("ex:y{i}"), "ex:p1":decimal(230 + i % 2)}));
@@ -134,7 +134,7 @@ async fn subjects(fluree: &Fluree, sparql: &str) -> Vec<String> {
 async fn decimal_seeks_preserve_scales_mixed_types_and_novelty() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, LEDGER);
+    let ledger = genesis_ledger(&fluree, LEDGER).await;
     fluree
         .insert(
             ledger,
@@ -231,7 +231,7 @@ async fn decimal_seeks_preserve_scales_mixed_types_and_novelty() {
 async fn decimal_join_keeps_equal_overflow_integers() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, LEDGER);
+    let ledger = genesis_ledger(&fluree, LEDGER).await;
     fluree.insert(ledger, &json!({
         "@context":{"ex":"http://example.org/", "xsd":"http://www.w3.org/2001/XMLSchema#"},
         "@graph":[

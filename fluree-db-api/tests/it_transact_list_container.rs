@@ -150,7 +150,7 @@ async fn list_container_multiple_values_test() {
 #[tokio::test]
 async fn list_container_duplicate_values_at_distinct_positions_preserved() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "test/lists:dups");
+    let ledger0 = support::genesis_ledger(&fluree, "test/lists:dups").await;
 
     let txn = json!({
         "@context": [
@@ -194,7 +194,7 @@ async fn list_container_duplicate_values_at_distinct_positions_preserved() {
 #[tokio::test]
 async fn set_container_duplicate_scalar_values_collapse() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "test/lists:set-dups");
+    let ledger0 = support::genesis_ledger(&fluree, "test/lists:set-dups").await;
 
     let txn = json!({
         "@context": [

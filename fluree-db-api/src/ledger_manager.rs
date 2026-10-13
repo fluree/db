@@ -643,6 +643,19 @@ impl LedgerHandle {
         )
     }
 
+    /// The bits of the instance the cached state belongs to; see
+    /// [`LedgerState::instance_bits`].
+    pub async fn instance_bits(&self) -> u128 {
+        self.inner.state.read().await.instance_bits()
+    }
+
+    /// Whether `record` belongs to another activation than the cached state;
+    /// see [`other_activation`].
+    pub async fn is_other_activation(&self, record: &NsRecord) -> bool {
+        let state = self.inner.state.read().await;
+        other_activation(state.ns_record.as_ref(), record)
+    }
+
     /// Check if cached state is fresh vs remote watermark
     pub async fn check_freshness(&self, remote: &RemoteWatermark) -> FreshnessCheck {
         let local_index_t = self.index_t().await;
@@ -1329,6 +1342,20 @@ pub struct LedgerManager {
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
+    /// The storage roots of ledgers graph-source queries have checked their
+    /// indexes against, `None` for a name nothing holds; see
+    /// [`Self::remembered_root`]. Cleared, by [`Self::forget_root`] and
+    /// [`Self::forget_roots`], whenever an event says a ledger was created,
+    /// dropped or replaced, and by a disconnect.
+    source_roots: std::sync::RwLock<SourceRoots>,
+}
+
+/// [`LedgerManager::source_roots`], with the count of clears so far: a root
+/// looked up before a clear is not remembered after it.
+#[derive(Default)]
+struct SourceRoots {
+    roots: HashMap<LedgerId, Option<fluree_db_core::StorageRoot>>,
+    clears: u64,
 }
 
 impl LedgerManager {
@@ -1351,7 +1378,71 @@ impl LedgerManager {
             shutdown: AtomicBool::new(false),
             load_generation: AtomicU64::new(0),
             head_watermarks: std::sync::RwLock::new(HashMap::new()),
+            source_roots: std::sync::RwLock::new(SourceRoots::default()),
         }
+    }
+
+    /// The storage root remembered for `ledger_id`, if any: `Some(None)`
+    /// when the name held no ledger when last looked up.
+    pub fn remembered_root(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Option<Option<fluree_db_core::StorageRoot>> {
+        self.source_roots
+            .read()
+            .expect("source root lock never poisoned")
+            .roots
+            .get(ledger_id)
+            .cloned()
+    }
+
+    /// A token for [`Self::remember_root`], taken before the lookup whose
+    /// result it remembers.
+    pub fn root_epoch(&self) -> u64 {
+        self.source_roots
+            .read()
+            .expect("source root lock never poisoned")
+            .clears
+    }
+
+    /// Remember `root` for `ledger_id`, unless anything was forgotten since
+    /// `epoch` was taken: the lookup may have read the ledger the clear was
+    /// about.
+    pub fn remember_root(
+        &self,
+        epoch: u64,
+        ledger_id: &LedgerId,
+        root: Option<fluree_db_core::StorageRoot>,
+    ) {
+        let mut source_roots = self
+            .source_roots
+            .write()
+            .expect("source root lock never poisoned");
+        if source_roots.clears == epoch {
+            source_roots.roots.insert(ledger_id.clone(), root);
+        }
+    }
+
+    /// Forget `ledger_id`'s root: a ledger was created, dropped or replaced
+    /// under its name.
+    pub fn forget_root(&self, ledger_id: &LedgerId) {
+        let mut source_roots = self
+            .source_roots
+            .write()
+            .expect("source root lock never poisoned");
+        source_roots.clears += 1;
+        source_roots.roots.remove(ledger_id);
+    }
+
+    /// Forget every root: events were missed, or a snapshot replaced the
+    /// state they described.
+    pub fn forget_roots(&self) {
+        let mut source_roots = self
+            .source_roots
+            .write()
+            .expect("source root lock never poisoned");
+        source_roots.clears += 1;
+        source_roots.roots.clear();
     }
 
     /// Record that `ledger_id`'s authoritative commit head reached
@@ -1373,6 +1464,35 @@ impl LedgerManager {
         let entry = watermarks.entry(ledger_id.clone()).or_insert(commit_t);
         if *entry < commit_t {
             *entry = commit_t;
+        }
+    }
+
+    /// Replace every head watermark with `heads`. A snapshot install's
+    /// state is the whole truth: a ledger dropped in it has no head, and one
+    /// recreated under its name may sit below the watermark the dropped one
+    /// left, which [`Self::note_head_advance`] would keep.
+    pub fn reset_head_watermarks(&self, heads: impl IntoIterator<Item = (LedgerId, i64)>) {
+        let mut watermarks = self
+            .head_watermarks
+            .write()
+            .expect("head watermark lock never poisoned: no panics inside critical section");
+        *watermarks = heads.into_iter().collect();
+    }
+
+    /// Check every cached ledger against the nameservice as a notification
+    /// for it would: one dropped since is evicted, and one whose name now
+    /// holds another activation is reloaded.
+    pub async fn reconcile_cached(&self) {
+        self.forget_roots();
+        let cached: Vec<LedgerId> = self.entries.read().await.keys().cloned().collect();
+        for ledger_id in cached {
+            let notify = NsNotify {
+                ledger_id: ledger_id.clone(),
+                record: None,
+            };
+            if let Err(e) = self.notify(notify).await {
+                tracing::warn!(%ledger_id, error = %e, "could not reconcile a cached ledger");
+            }
         }
     }
 
@@ -1724,6 +1844,7 @@ impl LedgerManager {
             .write()
             .expect("head watermark lock never poisoned: no panics inside critical section")
             .remove(&canonical_alias);
+        self.forget_root(&canonical_alias);
     }
 
     /// Remove all ledgers from cache (for shutdown)
@@ -1904,8 +2025,13 @@ impl LedgerManager {
                         // `t` than the in-memory state, we skip the swap and keep
                         // the fresher novelty — transiently forgoing the newer
                         // index, which the next reload picks up. Never clobber a
-                        // newer in-memory commit to adopt a newer index.
-                        if new_state.t() >= write_guard.state().t() {
+                        // newer in-memory commit to adopt a newer index. A state
+                        // of another activation is replaced whatever its t: its
+                        // commits can no longer be published.
+                        let replaced = new_state.ns_record.as_ref().is_some_and(|record| {
+                            other_activation(write_guard.state().ns_record.as_ref(), record)
+                        });
+                        if replaced || new_state.t() >= write_guard.state().t() {
                             let mut bs_guard = handle.inner.binary_store.write().await;
                             write_guard.replace(new_state);
                             *bs_guard = new_binary_store;
@@ -2220,6 +2346,23 @@ impl UpdatePlan {
     }
 }
 
+/// Whether `record` belongs to another activation than `cached`: another
+/// storage root, so another ledger under the name, or, where both carry one,
+/// another fence, so the same ledger dropped and restored. Heads of two
+/// activations are not comparable. A side that carries neither is taken to
+/// match.
+fn other_activation(cached: Option<&NsRecord>, record: &NsRecord) -> bool {
+    let Some(cached) = cached else {
+        return false;
+    };
+    let roots = matches!(
+        (&cached.storage_root, &record.storage_root),
+        (Some(a), Some(b)) if a != b
+    );
+    let fences = matches!((cached.fence, record.fence), (Some(a), Some(b)) if a != b);
+    roots || fences
+}
+
 /// Input for notify: ledger ID + optional fresh NsRecord
 pub struct NsNotify {
     /// Ledger ID
@@ -2244,6 +2387,9 @@ pub enum NotifyResult {
     },
     /// Was stale, reloaded in-place via reload()
     Reloaded,
+    /// The ledger no longer resolves under this id, as after a drop: its
+    /// cached state was removed.
+    Evicted,
 }
 
 /// Options for `Fluree::refresh()`.
@@ -2297,9 +2443,22 @@ impl LedgerManager {
                 .await?
             {
                 Some(r) => r,
-                None => return Ok(NotifyResult::Current), // Ledger doesn't exist
+                // Dropped, or being dropped: the cached state must not go on
+                // answering for it.
+                None => {
+                    self.disconnect(&input.ledger_id).await;
+                    return Ok(NotifyResult::Evicted);
+                }
             },
         };
+
+        // Heads are only comparable within one activation. A record from a
+        // ledger created under the name since, or from this one restored
+        // after a drop, may sit at a lower t than the cached state.
+        if handle.is_other_activation(&ns_record).await {
+            self.reload(&input.ledger_id).await?;
+            return Ok(NotifyResult::Reloaded);
+        }
 
         // Get local state metrics for planning
         let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;
@@ -2730,6 +2889,9 @@ mod tests {
             retracted: false,
             source_branch: None,
             branches: 0,
+            storage_root: None,
+            fence: None,
+            frozen: false,
         }
     }
 

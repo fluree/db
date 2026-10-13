@@ -80,10 +80,7 @@ fn seed(rt: &Runtime, fluree: &Fluree, classes: usize) -> LedgerState {
     }
 
     rt.block_on(async {
-        let ledger = LedgerState::new(
-            fluree_db_core::LedgerSnapshot::genesis(&alias),
-            fluree_db_api::Novelty::new(0),
-        );
+        let ledger = fluree.create_ledger(&alias).await.expect("create ledger");
         fluree
             .insert(ledger, &json!({ "@context": context(), "@graph": nodes }))
             .await

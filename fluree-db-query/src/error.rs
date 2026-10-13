@@ -188,6 +188,12 @@ pub enum QueryError {
         catalog_uri: String,
     },
 
+    /// A BM25 or vector index whose source ledger's name now holds another
+    /// ledger than the one it indexed: it answers for the new ledger only
+    /// once recreated over it. The API surfaces HTTP 409.
+    #[error("{0}")]
+    GraphSourceSuspended(String),
+
     /// The catalog refused this principal access to the table (its 401/403),
     /// in the catalog's own words.
     #[error("Catalog denied access to table '{table}': {message}")]

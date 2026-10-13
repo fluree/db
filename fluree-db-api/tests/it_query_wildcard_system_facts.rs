@@ -67,7 +67,7 @@ fn expected_policy_predicates() -> Vec<String> {
 #[tokio::test]
 async fn wildcard_returns_user_fluree_ns_data_novelty() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "wildcard-sysfacts/novelty");
+    let ledger0 = genesis_ledger(&fluree, "wildcard-sysfacts/novelty").await;
     let ledger = fluree
         .insert(ledger0, &policy_tx())
         .await
@@ -87,7 +87,7 @@ async fn wildcard_returns_user_fluree_ns_data_indexed() {
     use fluree_db_api::ReindexOptions;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "wildcard-sysfacts/indexed";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree.insert(ledger0, &policy_tx()).await.expect("insert");
     fluree
         .reindex(ledger_id, ReindexOptions::default())
@@ -112,7 +112,7 @@ async fn wildcard_dump_carries_no_commit_metadata() {
     use fluree_db_api::ReindexOptions;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "wildcard-sysfacts/no-commit-meta";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     fluree.insert(ledger0, &policy_tx()).await.expect("insert");
     fluree
         .reindex(ledger_id, ReindexOptions::default())

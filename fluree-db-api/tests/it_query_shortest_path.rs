@@ -14,7 +14,7 @@ fn ctx() -> JsonValue {
 }
 
 async fn seed_graph(fluree: &MemoryFluree, id: &str) -> fluree_db_api::LedgerState {
-    let ledger0 = genesis_ledger(fluree, id);
+    let ledger0 = genesis_ledger(fluree, id).await;
     let txn = json!({
         "@context": ctx(),
         "@graph": [

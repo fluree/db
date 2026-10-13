@@ -412,6 +412,11 @@ impl Bm25MaintenanceWorker {
                 );
                 Ok(())
             }
+            // Its ledger was replaced; it waits for an admin to recreate it.
+            Err(e @ ApiError::GraphSourceSuspended(_)) => {
+                warn!(graph_source = %graph_source_id, error = %e, "Graph source suspended; not syncing");
+                Ok(())
+            }
             Err(e) => {
                 self.state.lock().record_sync(false);
                 error!(graph_source = %graph_source_id, error = %e, "Graph source sync failed");

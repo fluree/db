@@ -139,6 +139,12 @@ mod stubs {
         pub async fn trigger_if_idle(&self, _ledger_id: &str, _min_t: i64) -> bool {
             unreachable!("IndexingMode::Background is never constructed on wasm32")
         }
+        pub async fn cancel(&self, _ledger_id: &fluree_db_core::LedgerId) -> bool {
+            unreachable!("IndexingMode::Background is never constructed on wasm32")
+        }
+        pub async fn wait_for_idle(&self, _ledger_id: &fluree_db_core::LedgerId) {
+            unreachable!("IndexingMode::Background is never constructed on wasm32")
+        }
         pub async fn cancel_all(&self) {
             unreachable!("IndexingMode::Background is never constructed on wasm32")
         }

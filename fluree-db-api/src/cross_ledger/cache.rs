@@ -2,7 +2,8 @@
 //!
 //! Lives on the `Fluree` handle so resolved artifacts are shareable
 //! across requests and across every data ledger that references the
-//! same `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)`.
+//! same `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)` of the
+//! same model ledger instance.
 //! That is the property that makes "model edit propagates atomically
 //! to every governed dataset" cheap — one cache entry is reused by
 //! every D that points at the same M graph at the same M-t.
@@ -25,8 +26,11 @@
 //! - Cache invalidation is implicit: new commits to M produce new
 //!   `resolved_t` values and therefore new keys. Old entries age out
 //!   under TinyLFU eviction. There is no watermark-on-write channel.
+//!   A ledger dropped and created again under M's name starts its `t`
+//!   over, so the key carries M's instance too.
 
 use super::types::{ResolutionKey, ResolvedGraph};
+use fluree_db_core::InstanceId;
 // moka's eviction clock reads std::time::Instant at cache construction, which
 // aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
 #[cfg(target_arch = "wasm32")]
@@ -44,13 +48,16 @@ use std::sync::Arc;
 /// described in the module doc.
 const DEFAULT_MAX_ENTRIES: u64 = 4_096;
 
+/// A [`ResolutionKey`] with the instance of the model ledger it names.
+pub(crate) type GovernanceKey = (Option<InstanceId>, ResolutionKey);
+
 /// Per-instance cache of resolved cross-ledger governance artifacts.
 ///
 /// Thin wrapper around `moka::sync::Cache` so the cache type is named
 /// and discoverable. Cheap to clone via `Arc`.
 #[derive(Debug)]
 pub struct GovernanceCache {
-    inner: Cache<ResolutionKey, Arc<ResolvedGraph>>,
+    inner: Cache<GovernanceKey, Arc<ResolvedGraph>>,
 }
 
 impl GovernanceCache {
@@ -71,7 +78,7 @@ impl GovernanceCache {
     /// Look up a resolved artifact. Returns `Some(Arc)` on hit; the
     /// returned Arc is shared with the cache and any other live
     /// references, so a cache hit is a cheap pointer clone.
-    pub fn get(&self, key: &ResolutionKey) -> Option<Arc<ResolvedGraph>> {
+    pub(crate) fn get(&self, key: &GovernanceKey) -> Option<Arc<ResolvedGraph>> {
         self.inner.get(key)
     }
 
@@ -82,7 +89,7 @@ impl GovernanceCache {
     /// materialization, so concurrent racers don't share an Arc —
     /// the second one's writeback wins, the first's Arc becomes
     /// reachable only through any prior `get` clones.
-    pub fn insert(&self, key: ResolutionKey, value: Arc<ResolvedGraph>) {
+    pub(crate) fn insert(&self, key: GovernanceKey, value: Arc<ResolvedGraph>) {
         self.inner.insert(key, value);
     }
 

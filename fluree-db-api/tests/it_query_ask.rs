@@ -18,7 +18,7 @@ fn ctx() -> JsonValue {
 
 async fn seed_people() -> (MemoryFluree, MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/ask:people");
+    let ledger = genesis_ledger(&fluree, "it/ask:people").await;
 
     let tx = json!({
         "@context": ctx(),
@@ -207,7 +207,7 @@ async fn ask_object_shorthand() {
 #[tokio::test]
 async fn ask_rejects_non_pattern_values() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/ask:bad-values");
+    let ledger = genesis_ledger(&fluree, "it/ask:bad-values").await;
 
     // "ask": true — old syntax, no longer valid
     let result = support::query_jsonld(&fluree, &ledger, &json!({"ask": true})).await;

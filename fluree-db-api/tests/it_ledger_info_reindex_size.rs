@@ -16,7 +16,7 @@ async fn ledger_info_size_is_not_reset_to_zero_by_reindex() {
     let ledger_id = "it/ledger-info-reindex-size:main";
 
     // Create a small commit chain (enough to have non-trivial commit bytes).
-    let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     for i in 0..5u32 {
         let tx = json!({
             "@context": { "ex": "http://example.org/" },

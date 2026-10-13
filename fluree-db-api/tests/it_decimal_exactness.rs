@@ -76,7 +76,7 @@ fn memory_fluree() -> MemoryFluree {
 #[tokio::test]
 async fn sparql_insert_data_decimal_roundtrip_is_exact() {
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/insert:main");
+    let ledger = genesis_ledger(&fluree, "decimal/insert:main").await;
 
     // 19.99 has no exact f64 representation; an f64 round-trip surfaces as
     // 19.989999999999998... in exact-decimal output.
@@ -107,7 +107,7 @@ async fn sparql_insert_data_decimal_roundtrip_is_exact() {
 #[tokio::test]
 async fn sparql_insert_data_high_precision_decimal_survives() {
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/precision:main");
+    let ledger = genesis_ledger(&fluree, "decimal/precision:main").await;
 
     // More significant digits than f64 can hold (~17).
     let lexical = "1234567890123456789.0123456789";
@@ -145,7 +145,7 @@ async fn small_decimal_renders_in_plain_form_not_exponent() {
     // form. Output paths must emit the plain form. Exposed by exact storage:
     // these values used to be f64 doubles, now they're exact decimals.
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/plain-form:main");
+    let ledger = genesis_ledger(&fluree, "decimal/plain-form:main").await;
 
     let lexical = "0.0000001";
     let result = run_sparql_update(
@@ -193,7 +193,7 @@ async fn small_decimal_renders_in_plain_form_not_exponent() {
 #[tokio::test]
 async fn sparql_decimal_constant_matches_stored_decimal() {
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/constant:main");
+    let ledger = genesis_ledger(&fluree, "decimal/constant:main").await;
 
     let result = run_sparql_update(
         &fluree,
@@ -247,7 +247,7 @@ async fn jsonld_number_decimal_matches_sparql_constant_across_paths() {
     // The same decimal written as a JSON number via JSON-LD and referenced
     // as a SPARQL constant must be ONE value — not two encodings.
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/crosspath:main");
+    let ledger = genesis_ledger(&fluree, "decimal/crosspath:main").await;
 
     let insert = serde_json::json!({
         "@context": {
@@ -310,7 +310,7 @@ async fn trig_graph_block_decimal_matches_default_graph_decimal() {
     // xsd:decimal — the same as in the default graph — not via f64 as
     // xsd:double.
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/trig:main");
+    let ledger = genesis_ledger(&fluree, "decimal/trig:main").await;
 
     let trig = r"
         @prefix ex: <http://example.org/> .
@@ -361,7 +361,7 @@ async fn integer_beyond_i64_round_trips_exactly() {
     // xsd:integer is unbounded: a literal past i64 must promote to BigInt
     // end to end (it previously lexed to 0).
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/bigint:main");
+    let ledger = genesis_ledger(&fluree, "decimal/bigint:main").await;
 
     let big = "123456789012345678901234567890";
     let turtle = format!(
@@ -494,7 +494,7 @@ async fn indexed_overflow_integer_reports_xsd_integer_not_decimal() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
             let big = "123456789012345678901234567890";
             let result = run_sparql_update(
                 &fluree,
@@ -553,7 +553,7 @@ async fn sum_avg_over_indexed_decimals_is_exact() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let result = run_sparql_update(
                 &fluree,
@@ -628,7 +628,7 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Index a mix of integer and decimal rows.
             let result = run_sparql_update(
@@ -722,7 +722,7 @@ async fn scale_variant_decimal_retracts_indexed_fact() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let result = run_sparql_update(
                 &fluree,
@@ -806,7 +806,7 @@ async fn group_by_and_distinct_unify_decimals_across_index_and_novelty() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let result = run_sparql_update(
                 &fluree,
@@ -905,7 +905,7 @@ async fn named_graph_decimal_decodes_against_its_own_arena() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let trig = r"
                 @prefix ex: <http://example.org/> .
@@ -947,7 +947,7 @@ async fn named_graph_decimal_decodes_against_its_own_arena() {
 #[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
-    let ledger = genesis_ledger(&fluree, "decimal/delete:main");
+    let ledger = genesis_ledger(&fluree, "decimal/delete:main").await;
 
     let result = run_sparql_update(
         &fluree,
@@ -1006,23 +1006,20 @@ async fn full_rebuild_publish_decode_root(
         .await
         .expect("nameservice lookup")
         .expect("ledger record");
+    let store = fluree.content_store(&record.storage_namespace());
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        store.clone(),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
     .await
     .expect("full rebuild");
-    let root_bytes = fluree
-        .content_store(ledger_id)
-        .get(&result.root_id)
-        .await
-        .expect("fetch root bytes");
+    let root_bytes = store.get(&result.root_id).await.expect("fetch root bytes");
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
         .await
         .expect("publish index");
     fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes).expect("decode root")
@@ -1035,7 +1032,7 @@ async fn full_reindex_writes_inline_decimal_v3_format_and_roundtrips() {
     // large to fit inline falls back to the arena — all round-trip exactly.
     let fluree = memory_fluree();
     let ledger_id = "decimal/inline-format:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let result = run_sparql_update(
         &fluree,
@@ -1095,7 +1092,7 @@ async fn inline_decimal_equality_constant_matches_after_reindex() {
     // row so the bound-object lookup hits it (issue #1328 narrowing).
     let fluree = memory_fluree();
     let ledger_id = "decimal/inline-eq:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     run_sparql_update(
         &fluree,
@@ -1182,7 +1179,7 @@ async fn inline_decimal_results_match_novelty_differential() {
     // / aggregation.
     let fluree = memory_fluree();
     let ledger_id = "decimal/inline-differential:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let result = run_sparql_update(
         &fluree,
@@ -1260,7 +1257,7 @@ async fn inline_decimal_order_by_and_range_are_numeric_after_reindex() {
     // equality-keyed layout got wrong.
     let fluree = memory_fluree();
     let ledger_id = "decimal/inline-order:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     run_sparql_update(
         &fluree,
@@ -1401,7 +1398,7 @@ async fn mixed_int_decimal_predicate_range_filter_is_correct() {
     // every numerically-matching value regardless of type.
     let fluree = memory_fluree();
     let ledger_id = "decimal/mixed-range:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     run_sparql_update(
         &fluree,
@@ -1469,7 +1466,7 @@ async fn inline_integer_range_pushdown_is_correct() {
     // the generalized path on a uniform xsd:integer predicate.
     let fluree = memory_fluree();
     let ledger_id = "decimal/inline-int-range:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     run_sparql_update(
         &fluree,
@@ -1553,7 +1550,7 @@ async fn range_narrowing_keeps_cross_type_novelty() {
     // merge + post-filter keeps it.
     let fluree = memory_fluree();
     let ledger_id = "decimal/xtype-novelty:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     run_sparql_update(
         &fluree,
@@ -1618,7 +1615,7 @@ async fn integer_range_narrowing_keeps_cross_type_novelty() {
     // swapped, covering the generalized integer/double pushdown path.)
     let fluree = memory_fluree();
     let ledger_id = "decimal/int-xtype-novelty:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     run_sparql_update(
         &fluree,
@@ -1692,7 +1689,7 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Seed + index an integer-valued double for ex:amount.
             let result = run_sparql_update(
@@ -1796,7 +1793,7 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Indexed base: ex:a is arena-backed after the index build. The
             // trailing zero (19.90) exercises canonicalization on the indexed
@@ -1994,7 +1991,7 @@ async fn indexed_trig(
     );
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
             let result = fluree
                 .stage_owned(ledger)
                 .upsert_turtle(&trig)

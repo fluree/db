@@ -63,6 +63,10 @@ struct NsRecordResponse {
     /// 0 when an older server omits the field.
     #[serde(default)]
     branches: u32,
+    /// The ledger's storage root, when it is not the ledger's name. `None`
+    /// when an older server omits the field.
+    #[serde(default)]
+    storage_root: Option<fluree_db_core::StorageRoot>,
 }
 
 impl NsRecordResponse {
@@ -95,6 +99,9 @@ impl NsRecordResponse {
             retracted: self.retracted,
             source_branch: self.source_branch,
             branches: self.branches,
+            storage_root: self.storage_root,
+            fence: None,
+            frozen: false,
         })
     }
 }
@@ -372,6 +379,7 @@ mod tests {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         };
 
         // A branchless lookup still yields a canonical id (#1540): a
@@ -399,6 +407,7 @@ mod tests {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         }
         .into_ns_record("books:main")
         .unwrap()
@@ -452,6 +461,7 @@ mod tests {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         }
         .into_ns_record("books:main")
         .unwrap();
@@ -478,6 +488,7 @@ mod tests {
             config_id: None,
             source_branch: Some("main".to_string()),
             branches: 3,
+            storage_root: None,
         };
 
         let record = response.into_ns_record("books:feature").unwrap();
@@ -519,6 +530,7 @@ mod tests {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         };
 
         let record = response.into_ns_record("books:main").unwrap();
@@ -541,6 +553,7 @@ mod tests {
             config_id: None,
             source_branch: None,
             branches: 0,
+            storage_root: None,
         };
 
         let record = response.into_ns_record("books").unwrap();

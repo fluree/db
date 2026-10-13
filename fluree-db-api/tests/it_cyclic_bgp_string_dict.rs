@@ -60,7 +60,7 @@ async fn cyclic_bgp_fast_path_stays_on_with_string_dict_datatypes() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             // Shortcut triangle with a literal-valued join var ?c
             // (object-only → EncodedObject mode). The `ex:code`/`ex:ref`

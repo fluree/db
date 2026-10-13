@@ -193,6 +193,7 @@ pub(super) async fn materialize_shapes(
             graph_iri: graph_iri.to_string(),
             resolved_t,
         },
+        model_instance: m_db.instance_bits,
         triples,
     })
 }

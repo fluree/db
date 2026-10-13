@@ -93,7 +93,7 @@ async fn empty_jsonld_list_matches_turtle_empty_collection() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ttl_ledger0 = fluree
-        .create_ledger("tx/jsonld-empty-list:ttl")
+        .create_ledger("tx/jsonld-empty-list-ttl")
         .await
         .expect("genesis");
     let ttl_ledger = fluree
@@ -109,7 +109,7 @@ ex:s2 ex:items () .
         .ledger;
 
     let json_ledger0 = fluree
-        .create_ledger("tx/jsonld-empty-list:json")
+        .create_ledger("tx/jsonld-empty-list-json")
         .await
         .expect("genesis");
     let txn = json!({
@@ -145,7 +145,7 @@ ex:s2 ex:items () .
 async fn empty_jsonld_list_in_array_position_stores_rdf_nil() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = fluree
-        .create_ledger("tx/jsonld-empty-list:arr")
+        .create_ledger("tx/jsonld-empty-list-arr")
         .await
         .expect("genesis");
     let txn = json!({

@@ -45,6 +45,7 @@ pub mod pack_client;
 pub mod proxy_nameservice;
 pub mod proxy_storage;
 mod server_sse;
+pub mod snapshot;
 pub mod transport;
 #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
 pub mod vended_s3;
@@ -82,6 +83,7 @@ pub use pack_client::{
 };
 pub use proxy_nameservice::ProxyNameService;
 pub use proxy_storage::{cid_and_ledger_from_address, ProxyReadMode, ProxyStorage};
+pub use snapshot::{SnapshotNames, SnapshotTracker};
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::ReqwestTransport;
 pub use transport::{

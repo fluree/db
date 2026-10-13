@@ -102,7 +102,7 @@ async fn received_at_flakes(
 async fn backdated_event_times_drive_iso_time_travel() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/event-time-backdated:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Three commits with historical event times, years before "now".
     let ledger1 = insert_at(
@@ -186,7 +186,7 @@ async fn backdated_event_times_drive_iso_time_travel() {
 async fn event_time_earlier_than_head_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/event-time-monotonic:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let ledger1 = insert_at(
         &fluree,
@@ -211,7 +211,7 @@ async fn event_time_earlier_than_head_is_rejected() {
     );
 
     // Equal event time is allowed (non-decreasing, not strictly increasing).
-    let ledger1b = genesis_ledger(&fluree, "it/event-time-equal:main");
+    let ledger1b = genesis_ledger(&fluree, "it/event-time-equal:main").await;
     let ledger2b = insert_at(
         &fluree,
         ledger1b,
@@ -234,7 +234,7 @@ async fn event_time_earlier_than_head_is_rejected() {
 async fn future_event_time_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/event-time-future:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let tomorrow =
         (Utc::now() + chrono::Duration::days(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -251,7 +251,7 @@ async fn future_event_time_is_rejected() {
         "unexpected error: {err}"
     );
 
-    let ledger0 = genesis_ledger(&fluree, "it/event-time-garbage:main");
+    let ledger0 = genesis_ledger(&fluree, "it/event-time-garbage:main").await;
     let err = insert_at(
         &fluree,
         ledger0,
@@ -274,7 +274,7 @@ async fn future_event_time_is_rejected() {
 async fn dual_stamp_recorded_axis_resolution() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/event-time-recorded:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // Fully backdated ledger: event times 2020/2021/2022, recorded times
     // pinned to distinct 2026 instants (deterministic).
@@ -364,7 +364,7 @@ async fn dual_stamp_recorded_axis_resolution() {
 async fn dual_stamp_is_sticky_after_first_event_time() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/event-time-sticky:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     // t=1: plain commit — no receivedAt.
     let ledger1 = insert_at(
@@ -416,7 +416,7 @@ async fn dual_stamp_is_sticky_after_first_event_time() {
 async fn plain_ledger_recorded_equals_iso() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/event-time-plain:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
 
     let ledger1 = insert_at(
         &fluree,

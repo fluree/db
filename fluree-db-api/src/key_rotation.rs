@@ -16,9 +16,10 @@ use crate::error::{ApiError, Result};
 use crate::Fluree;
 use fluree_db_core::storage::GRAPH_SOURCES_PATH_SEGMENT;
 use fluree_db_core::{EncryptionAdmin, Storage, StorageMethod, StorageRead, StorageWrite};
-use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_core::{LedgerId, LedgerName, StorageRoot};
+use fluree_db_nameservice::BindingState;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -85,6 +86,12 @@ pub struct KeyRotationProgress {
     pub unit: Option<String>,
     /// Last address fully processed in `unit`; resumption skips up to it.
     pub cursor: Option<String>,
+    /// Prefix of the last unit finished. Units sweep in prefix order, so a
+    /// resumption starts at the first unit after it: a ledger created or
+    /// purged meanwhile cannot shift the place. Absent from records written
+    /// before it, which resume by `units_done`.
+    #[serde(default)]
+    pub done_through: Option<String>,
     pub scanned: u64,
     pub rewritten: u64,
     pub already_current: u64,
@@ -252,11 +259,13 @@ impl Fluree {
         Ok((storage, admin))
     }
 
-    /// The sweep units in a fixed order: each ledger branch's own prefix,
+    /// The sweep units in prefix order: each ledger branch's own prefix,
     /// each ledger's shared dictionaries, and the graph-source artifacts.
+    ///
+    /// Ledgers that are not live are included: dropped ones, whose data a
+    /// restore must still read, and those part way through a create, drop
+    /// or restore.
     async fn key_rotation_units(&self, method: &str, scope: Option<&str>) -> Result<Vec<Unit>> {
-        let mut records = self.nameservice().all_records().await?;
-        records.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
         // A bare name scopes the whole ledger; `name:branch` one branch.
         let scope = scope
             .map(|s| match LedgerName::parse(s) {
@@ -264,27 +273,65 @@ impl Fluree {
                 Err(_) => LedgerId::parse(s).map(Ok),
             })
             .transpose()?;
-        let in_scope = |id: &LedgerId| match &scope {
+        let in_scope = |name: &str, branch: &str| match &scope {
             None => true,
-            Some(Ok(branch)) => id == branch,
-            Some(Err(name)) => id.name() == name.as_str(),
+            Some(Ok(id)) => id.name() == name && id.branch() == branch,
+            Some(Err(scope)) => scope.as_str() == name,
         };
-        let mut units = Vec::new();
+        // Branch prefix → label; the first source to name a prefix labels it.
+        let mut branches = BTreeMap::new();
         let mut shared = BTreeSet::new();
-        for record in &records {
-            if !in_scope(&record.ledger_id) {
-                continue;
+        let mut add = |root: StorageRoot, name: &str, branch: &str, label: String| {
+            if in_scope(name, branch) {
+                let prefix = root.namespace(branch).branch_prefix().to_string();
+                branches.entry(prefix).or_insert(label);
+                shared.insert(root);
             }
-            units.push(Unit {
-                label: record.ledger_id.to_string(),
-                prefix: format!("fluree:{method}://{}/", record.ledger_id.path_prefix()),
-            });
-            shared.insert(record.ledger_id.ledger_name());
+        };
+        for record in self.nameservice().all_records().await? {
+            let label = record.ledger_id.to_string();
+            add(
+                record.storage_root(),
+                record.ledger_id.name(),
+                record.ledger_id.branch(),
+                label,
+            );
         }
-        for name in shared {
+        if let Some(store) = self.nameservice_mode.publisher() {
+            for (name, binding) in store.list_bindings().await? {
+                let state = match binding.value.state {
+                    BindingState::Active => continue,
+                    BindingState::Creating => "creating",
+                    BindingState::Dropping { .. } => "dropping",
+                    BindingState::Restoring => "restoring",
+                };
+                for listing in &binding.value.branches {
+                    let label = format!("{name}:{} ({state})", listing.branch);
+                    add(binding.value.root.clone(), &name, &listing.branch, label);
+                }
+            }
+            for entry in store.list_dropped().await? {
+                let entry = entry.value;
+                for record in &entry.branches {
+                    let label = format!(
+                        "{}:{} (dropped {})",
+                        entry.name, record.branch, entry.instance
+                    );
+                    add(entry.root.clone(), &entry.name, &record.branch, label);
+                }
+            }
+        }
+        let mut units: Vec<Unit> = branches
+            .into_iter()
+            .map(|(prefix, label)| Unit {
+                label,
+                prefix: format!("fluree:{method}://{prefix}/"),
+            })
+            .collect();
+        for root in shared {
             units.push(Unit {
-                label: format!("{name} (shared dictionaries)"),
-                prefix: format!("fluree:{method}://{}/", name.shared_prefix()),
+                label: format!("{root} (shared dictionaries)"),
+                prefix: format!("fluree:{method}://{}/", root.shared_prefix()),
             });
         }
         if scope.is_none() {
@@ -293,6 +340,7 @@ impl Fluree {
                 prefix: format!("fluree:{method}://{GRAPH_SOURCES_PATH_SEGMENT}/"),
             });
         }
+        units.sort_by(|a, b| a.prefix.cmp(&b.prefix));
         Ok(units)
     }
 
@@ -377,6 +425,7 @@ impl Fluree {
                 if rec.state == KeyRotationState::Swept {
                     rec.units_done = 0;
                     rec.cursor = None;
+                    rec.done_through = None;
                 }
                 rec.state = KeyRotationState::Running;
                 rec.holder = opts.holder.clone();
@@ -398,6 +447,7 @@ impl Fluree {
                 units_done: 0,
                 unit: None,
                 cursor: None,
+                done_through: None,
                 scanned: 0,
                 rewritten: 0,
                 already_current: 0,
@@ -600,6 +650,7 @@ impl Fluree {
                 units_done: 0,
                 unit: None,
                 cursor: None,
+                done_through: None,
                 scanned: 0,
                 rewritten: 0,
                 already_current: 0,
@@ -681,7 +732,13 @@ async fn run_sweep(
         }
     }
 
-    let resume_from = progress.units_done;
+    // Units before the last one finished were finished too, or are new
+    // since the sweep began and written under the current key.
+    let resume_from = match &progress.done_through {
+        Some(done) => units.partition_point(|u| u.prefix.as_str() <= done.as_str()),
+        None => progress.units_done.min(units.len()),
+    };
+    progress.units_done = resume_from;
     let resume_cursor = progress.cursor.clone();
     for (i, unit) in units.iter().enumerate().skip(resume_from) {
         progress.unit = Some(unit.label.clone());
@@ -766,6 +823,7 @@ async fn run_sweep(
             }
         }
         progress.units_done = i + 1;
+        progress.done_through = Some(unit.prefix.clone());
         progress.cursor = None;
         checkpoint(&storage, &shared, &mut progress).await;
     }

@@ -51,7 +51,7 @@ async fn rdf_type_isolated_across_named_graphs() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Insert rdf:type in graph A, data property in graph B.
             // Both share the same subject (ex:alice).
@@ -163,7 +163,7 @@ async fn subject_properties_isolated_per_graph() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let trig = r#"
                 @prefix ex: <http://example.org/> .
@@ -280,7 +280,7 @@ async fn type_filter_query_respects_graph_boundaries() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             let trig = r#"
                 @prefix ex: <http://example.org/> .
@@ -384,7 +384,7 @@ async fn pre_index_upsert_isolates_named_graphs() {
 
     local
         .run_until(async move {
-            let ledger = genesis_ledger(&fluree, ledger_id);
+            let ledger = genesis_ledger(&fluree, ledger_id).await;
 
             // Commit 1: Same subject, same predicate, different values in different graphs.
             let trig1 = r#"

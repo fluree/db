@@ -17,8 +17,7 @@
 
 use crate::support;
 use crate::support::start_background_indexer_local;
-use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_api::{FlureeBuilder, LedgerState};
 use serde_json::{json, Value as JsonValue};
 
 fn fulltext_context() -> JsonValue {
@@ -130,8 +129,7 @@ async fn fulltext_basic_scoring_returns_positive_for_matching_doc() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             let ledger = insert_doc(
                 &fluree,
@@ -176,8 +174,7 @@ async fn fulltext_non_matching_query_excluded_by_filter() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             let ledger = insert_doc(
                 &fluree,
@@ -221,8 +218,7 @@ async fn fulltext_ranking_more_relevant_doc_scores_higher() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Doc 1: mentions "database" once
             let ledger = insert_doc(
@@ -303,8 +299,7 @@ async fn fulltext_retraction_removes_doc_from_results() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert two documents
             let ledger = insert_doc(
@@ -385,8 +380,7 @@ async fn fulltext_novelty_docs_scored_when_arena_exists() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert two @fulltext docs (arena will exist for ex:content)
             let ledger = insert_doc(
@@ -486,8 +480,7 @@ async fn fulltext_multiple_predicates_independent_arenas() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let ledger = LedgerState::new(db0, Novelty::new(0));
+            let ledger = fluree.create_ledger(alias).await.expect("create ledger");
 
             // Insert a doc with two different @fulltext predicates
             let tx = json!({
@@ -613,7 +606,7 @@ async fn fulltext_configured_property_indexed_after_reindex() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-reindex:main";
-    let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
     // Suppress auto-reindex so we can control when indexing happens.
     let no_auto = fluree_db_api::IndexConfig {
@@ -740,7 +733,7 @@ async fn fulltext_unconfigured_plain_string_returns_empty() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-unconfigured:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let no_auto = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -792,7 +785,7 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-steady-state:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let no_auto = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -855,7 +848,7 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -868,7 +861,12 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 
@@ -902,7 +900,7 @@ async fn fulltext_configured_property_first_build_via_provider() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-first-build:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let no_auto = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -959,7 +957,7 @@ async fn fulltext_configured_property_first_build_via_provider() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -971,7 +969,12 @@ async fn fulltext_configured_property_first_build_via_provider() {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 
@@ -996,7 +999,7 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-langtag:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let no_auto = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -1054,7 +1057,7 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1065,7 +1068,12 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
         .nameservice_mode()
         .publisher()
         .expect("read-write nameservice")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish index");
 
@@ -1103,7 +1111,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-incremental:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let no_auto = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -1156,7 +1164,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1167,7 +1175,12 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         .nameservice_mode()
         .publisher()
         .expect("publisher")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish initial");
 
@@ -1196,7 +1209,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
     let idx_config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
         ledger_id,
         idx_config,
@@ -1207,7 +1220,12 @@ async fn fulltext_configured_incremental_adds_to_arena() {
         .nameservice_mode()
         .publisher()
         .expect("publisher")
-        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish incremental");
 
@@ -1268,7 +1286,7 @@ async fn fulltext_configured_two_commits_two_values_full_rebuild() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-two-commits:main";
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let no_auto = fluree_db_api::IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,
@@ -1677,7 +1695,7 @@ async fn fulltext_configured_persisted_incremental_extends_arena() {
         let idx_config = fluree_db_indexer::IndexerConfig::default()
             .with_fulltext_config_provider(fluree.fulltext_config_provider());
         let result = fluree_db_indexer::build_index_for_ledger(
-            fluree.content_store(ledger_id),
+            fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
             fluree.nameservice(),
             ledger_id,
             idx_config,
@@ -1688,7 +1706,12 @@ async fn fulltext_configured_persisted_incremental_extends_arena() {
             .nameservice_mode()
             .publisher()
             .expect("publisher")
-            .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
+            .publish_index_allow_equal_fenced(
+                ledger_id,
+                crate::support::fence_of(&fluree, ledger_id).await,
+                result.index_t,
+                &result.root_id,
+            )
             .await
             .expect("publish incremental");
     }
@@ -2042,8 +2065,7 @@ async fn fulltext_sparql_scores_as_jsonld_does() {
 
     local
         .run_until(async move {
-            let db0 = LedgerSnapshot::genesis(alias);
-            let mut ledger = LedgerState::new(db0, Novelty::new(0));
+            let mut ledger = fluree.create_ledger(alias).await.expect("create");
             for (id, title, content) in [
                 (
                     "ex:doc1",
@@ -2092,7 +2114,8 @@ async fn fulltext_sparql_scores_as_jsonld_does() {
 #[tokio::test]
 async fn fulltext_sparql_spellings_agree() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = support::genesis_ledger_for_fluree(&fluree, "it/fulltext-sparql-names:main");
+    let mut ledger =
+        support::genesis_ledger_for_fluree(&fluree, "it/fulltext-sparql-names:main").await;
     for (id, title, content) in [
         (
             "ex:doc1",
@@ -2127,7 +2150,7 @@ async fn fulltext_configured_through_jsonld_node_graph() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/fulltext-config-jsonld:main";
-    let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger = fluree
         .upsert(
             ledger,
@@ -2172,4 +2195,97 @@ async fn fulltext_configured_through_jsonld_node_graph() {
     let hits = query_fulltext_plain(&fluree, &loaded, "Rust").await;
     let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, ["ex:doc1"], "{hits:?}");
+}
+
+/// Commit a label on `ledger_id` without indexing it, in a fresh process over
+/// `path`, and score `probe` against it: `(subject, score)` by subject.
+async fn persisted_novelty_scores(
+    path: &str,
+    ledger_id: &str,
+    novelty: &str,
+    probe: &str,
+) -> Vec<(String, f64)> {
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let fluree = FlureeBuilder::file(path).build().expect("open");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let tx = json!({
+        "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "ex": "http://ex.test/"},
+        "@id": "ex:NEW",
+        "rdfs:label": novelty
+    });
+    let ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &tx,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto,
+        )
+        .await
+        .expect("insert novelty")
+        .ledger;
+    let query = json!({
+        "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "ex": "http://ex.test/"},
+        "select": ["?s", "?score"],
+        "where": [
+            {"@id": "?s", "rdfs:label": "?label"},
+            ["bind", "?score", format!("(fulltext ?label \"{probe}\")")],
+            ["filter", "(> ?score 0)"]
+        ],
+        "orderBy": "?s"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let row = row.as_array()?;
+            Some((row.first()?.as_str()?.to_string(), row.get(1)?.as_f64()?))
+        })
+        .collect()
+}
+
+/// A ledger dropped and created again under its name restarts its novelty
+/// epoch and `t`. The novelty delta the scorer caches process-wide must then
+/// be the new ledger's own: it scores as the same data under a name nothing
+/// else held.
+#[tokio::test]
+async fn fulltext_novelty_of_a_recreated_ledger_is_its_own() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-recreated:main";
+    let reference_id = "it/fulltext-recreated-reference:main";
+    let docs = json!({
+        "@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "ex": "http://ex.test/"},
+        "@graph": [
+            {"@id": "ex:OLD", "rdfs:label": "Qjklm Marker Syndrome"},
+            {"@id": "ex:OTHER", "rdfs:label": "Unrelated cardiac disorder"}
+        ]
+    });
+
+    persisted_setup_with_labels(&path, ledger_id, &docs).await;
+    let dropped =
+        persisted_novelty_scores(&path, ledger_id, "Qjklm qjklm qjklm variant", "qjklm").await;
+    assert_eq!(dropped.len(), 2, "{dropped:?}");
+
+    FlureeBuilder::file(&path)
+        .build()
+        .expect("open")
+        .drop_ledger("it/fulltext-recreated", fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop");
+    persisted_setup_with_labels(&path, ledger_id, &docs).await;
+    persisted_setup_with_labels(&path, reference_id, &docs).await;
+    let novelty = "Gardening tomatoes in raised beds";
+    let recreated = persisted_novelty_scores(&path, ledger_id, novelty, "qjklm").await;
+    let reference = persisted_novelty_scores(&path, reference_id, novelty, "qjklm").await;
+    assert_eq!(recreated, reference);
 }

@@ -95,7 +95,7 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
         reindex_max_bytes: 1_000_000_000,
     };
 
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert_with_opts(
             ledger0,
@@ -152,7 +152,10 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
     let stray_addr = fluree_db_core::content_address(
         storage.storage_method(),
         ContentKind::IndexLeaf,
-        ledger_id,
+        &fluree
+            .storage_namespace(ledger_id)
+            .await
+            .expect("ledger's namespace"),
         &stray.digest_hex(),
     );
     storage
@@ -278,7 +281,8 @@ async fn collected_index_versions_leave_no_stats_sketches_behind() {
     let first_root = first_root.expect("first build published");
 
     // The collector really ran: the first version is past retention.
-    let store = fluree.content_store(ledger_id.as_str());
+    let namespace = fluree.storage_namespace(ledger_id.as_str()).await.unwrap();
+    let store = fluree.content_store(&namespace);
     let mut collected = false;
     for _ in 0..100 {
         if !store.has(&first_root).await.expect("has") {
@@ -304,7 +308,7 @@ async fn collected_index_versions_leave_no_stats_sketches_behind() {
         .list_prefix(&format!(
             "fluree:{}://{}/index/stats/",
             storage.storage_method(),
-            ledger_id.path_prefix()
+            namespace.branch_prefix()
         ))
         .await
         .expect("list sketches");
@@ -349,12 +353,11 @@ async fn sweep_reclaims_leftover_stats_sketches_and_keeps_the_heads() {
     let StorageBackend::Managed(storage) = fluree.backend().clone() else {
         panic!("memory builder must yield a managed backend");
     };
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
     let stats_prefix = format!(
         "fluree:{}://{}/index/stats/",
         storage.storage_method(),
-        fluree_db_api::LedgerId::parse(ledger_id)
-            .unwrap()
-            .path_prefix()
+        namespace.branch_prefix()
     );
     let heads = storage.list_prefix(&stats_prefix).await.expect("list");
     assert_eq!(heads.len(), 1, "the build writes one sketch: {heads:?}");
@@ -363,7 +366,7 @@ async fn sweep_reclaims_leftover_stats_sketches_and_keeps_the_heads() {
     let leftover_addr = fluree_db_core::content_address(
         storage.storage_method(),
         ContentKind::StatsSketch,
-        ledger_id,
+        &namespace,
         &leftover.digest_hex(),
     );
     storage

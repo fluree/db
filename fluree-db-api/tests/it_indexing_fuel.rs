@@ -8,9 +8,8 @@
 
 #![cfg(feature = "native")]
 
-use fluree_db_api::{Fluree, FlureeBuilder, LedgerState, Novelty};
+use fluree_db_api::{Fluree, FlureeBuilder, LedgerState};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
-use fluree_db_core::LedgerSnapshot;
 use fluree_db_indexer::{
     build_index_for_record_with_tracker, rebuild_index_from_commits_with_tracker, IndexerConfig,
 };
@@ -33,8 +32,10 @@ async fn reindex_with_tracker_reports_positive_fuel() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/indexing-fuel:main";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let mut state = LedgerState::new(db0, Novelty::new(0));
+    let mut state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
 
     // Seed a couple of small commits so the rebuild has real CAS work.
     state = insert_one(
@@ -70,7 +71,7 @@ async fn reindex_with_tracker_reports_positive_fuel() {
 
     let tracker = enabled_tracker();
     let result = rebuild_index_from_commits_with_tracker(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         tracker,
         ledger_id,
         &record,
@@ -91,8 +92,10 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/indexing-fuel-current:main";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let mut state = LedgerState::new(db0, Novelty::new(0));
+    let mut state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     state = insert_one(
         &fluree,
         state,
@@ -112,7 +115,7 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
         .expect("ns lookup")
         .expect("record");
     let result = rebuild_index_from_commits_with_tracker(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         enabled_tracker(),
         ledger_id,
         &record,
@@ -123,7 +126,12 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
     fluree
         .publisher()
         .expect("publisher")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_fenced(
+            ledger_id,
+            crate::support::fence_of(&fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
         .await
         .expect("publish");
 
@@ -137,7 +145,7 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
         .expect("ns lookup")
         .expect("record");
     let result = build_index_for_record_with_tracker(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         enabled_tracker(),
         &record,
         IndexerConfig::default(),
@@ -210,8 +218,10 @@ async fn non_tracked_rebuild_reports_fuel_none() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/indexing-fuel-none:main";
 
-    let db0 = LedgerSnapshot::genesis(ledger_id);
-    let mut state = LedgerState::new(db0, Novelty::new(0));
+    let mut state = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     state = insert_one(
         &fluree,
         state,
@@ -230,7 +240,7 @@ async fn non_tracked_rebuild_reports_fuel_none() {
         .expect("ns lookup")
         .expect("record");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         ledger_id,
         &record,
         IndexerConfig::default(),

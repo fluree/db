@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use fluree_db_core::{format_ledger_id, BranchedContentStore, ContentStore, StorageBackend};
+use fluree_db_core::{
+    format_ledger_id, BranchedContentStore, ContentStore, StorageBackend, StorageNamespace,
+};
 
 use crate::{NameServiceError, NameServiceLookup, NsRecord, Result};
 
@@ -33,7 +35,7 @@ pub async fn branched_content_store_for_record(
     record: &NsRecord,
 ) -> Result<Arc<dyn ContentStore>> {
     if record.source_branch.is_none() {
-        return Ok(backend.content_store(&record.ledger_id));
+        return Ok(backend.content_store(&record.storage_namespace()));
     }
     let branched = build_branched_store(backend, ns, record).await?;
     Ok(Arc::new(branched))
@@ -85,8 +87,7 @@ pub async fn load_default_context_blob(
 }
 
 /// Resolve a content store from an `Option<NsRecord>`, falling back to
-/// the **flat** namespace store keyed by `fallback_id` when no record is
-/// present.
+/// the **flat** store for `fallback` when no record is present.
 ///
 /// Use this for call sites that haven't loaded an `NsRecord` yet (early
 /// bootstrap, etc.) and want best-effort flat behavior — no extra
@@ -99,11 +100,11 @@ pub async fn content_store_for_record_or_id(
     backend: &StorageBackend,
     ns: &dyn NameServiceLookup,
     record: Option<&NsRecord>,
-    fallback_id: &str,
+    fallback: &StorageNamespace,
 ) -> Result<Arc<dyn ContentStore>> {
     match record {
         Some(r) => branched_content_store_for_record(backend, ns, r).await,
-        None => Ok(backend.content_store(fallback_id)),
+        None => Ok(backend.content_store(fallback)),
     }
 }
 
@@ -160,11 +161,11 @@ pub async fn build_branched_store(
     let parent_store = if parent_record.source_branch.is_some() {
         Box::pin(build_branched_store(backend, ns, &parent_record)).await?
     } else {
-        BranchedContentStore::leaf(backend.content_store(&parent_record.ledger_id))
+        BranchedContentStore::leaf(backend.content_store(&parent_record.storage_namespace()))
     };
 
     Ok(BranchedContentStore::with_parents(
-        backend.content_store(&record.ledger_id),
+        backend.content_store(&record.storage_namespace()),
         vec![parent_store],
     ))
 }

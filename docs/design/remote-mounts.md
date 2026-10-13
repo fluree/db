@@ -114,7 +114,7 @@ read-write nameservice and N read-only mounts (`RemoteMount` = prefix +
 `fluree-db-core/src/storage.rs`. `StorageBackend::content_store(namespace)`
 is the single point where a ledger's namespace binds to a store. The
 `Routed` variant holds a default backend plus `(prefix, backend)` mounts and
-selects by namespace prefix at exactly that point — so `LedgerState::load`,
+selects by the namespace's storage-root prefix at exactly that point — so `LedgerState::load`,
 `BranchedContentStore` ancestry, and default-context reads all route with no
 changes. Admin operations (delete, list) apply only to the default backend.
 
