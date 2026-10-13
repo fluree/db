@@ -308,6 +308,62 @@ async fn scope_checks_agree_across_spellings() {
     );
 }
 
+/// `urn:fluree:` is a spelling of a ledger address, so the read check on a
+/// dataset applies to the ledger it names.
+#[tokio::test]
+async fn urn_spelling_in_a_dataset_is_read_checked() {
+    let (_tmp, state) = data_auth_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "open").await;
+    create_ledger(&app, "shut").await;
+    let writer = write_scoped_token(&["open", "shut"], 91);
+    insert_one(&app, "open", "ex:a", "A", &writer).await;
+    insert_one(&app, "shut", "ex:b", "B", &writer).await;
+    let reader = read_scoped_token(&["open"], 92);
+
+    let sparql =
+        |ledger: &str| format!("SELECT ?s FROM <urn:fluree:{ledger}:main> WHERE {{ ?s ?p ?o }}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/fluree/query",
+        &reader,
+        &[],
+        "application/sparql-query",
+        sparql("open"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "control: {body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/fluree/query",
+        &reader,
+        &[],
+        "application/sparql-query",
+        sparql("shut"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let jsonld = json!({
+        "from": "urn:fluree:shut:main",
+        "select": ["?s"],
+        "where": { "@id": "?s" }
+    });
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/fluree/query",
+        &reader,
+        &[],
+        "application/json",
+        jsonld.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
 /// Unauthenticated listing is refused when data auth is required, and a token
 /// sees only the ledgers it can read.
 #[tokio::test]
