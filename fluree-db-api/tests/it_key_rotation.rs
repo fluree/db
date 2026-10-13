@@ -429,3 +429,70 @@ async fn rotation_covers_dropped_ledgers_and_unfinished_drops() {
     set_binding_state(&fluree, "rot-stuck", BindingState::Active).await;
     assert_eq!(count_things(&fluree, "rot-stuck").await, 20);
 }
+
+/// A sweep paused after its first ledger resumes at the next unfinished
+/// unit even when that ledger is dropped before the resume and the unit
+/// list shifts under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_sweep_keeps_its_place_when_a_ledger_before_it_is_dropped() {
+    let data = tempfile::TempDir::new().expect("tempdir");
+    {
+        let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+        seed(&fluree, "rot-first", 10).await;
+        seed(&fluree, "rot-second", 15).await;
+        seed(&fluree, "rot-third", 5).await;
+    }
+    let fluree = client(data.path(), &[(1, KEY1), (2, KEY2)], 2).await;
+    let first = fluree
+        .nameservice()
+        .lookup("rot-first:main")
+        .await
+        .unwrap()
+        .expect("record");
+    let first_root = first.storage_root();
+    // The sweep finished `rot-first`'s units, which sort first, and paused.
+    let done_through = format!(
+        "fluree:file://{}/",
+        first_root.namespace("main").branch_prefix()
+    );
+    assert!(done_through > format!("fluree:file://{}/", first_root.shared_prefix()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let record = json!({
+        "state": "paused",
+        "retire_key_id": 1,
+        "current_key_id": 2,
+        "holder": "test",
+        "dry_run": false,
+        "ledger_scope": null,
+        "started_at": now,
+        "updated_at": now,
+        "units_total": 7,
+        "units_done": 2,
+        "unit": null,
+        "cursor": null,
+        "done_through": done_through,
+        "scanned": 0, "rewritten": 0, "already_current": 0, "on_other_keys": 0,
+        "not_enveloped": 0, "on_retired": 0, "failed": 0, "failed_addresses": [],
+        "bytes_rewritten": 0, "last_error": null, "completion": null
+    });
+    fluree
+        .admin_storage()
+        .expect("managed backend")
+        .write_bytes(
+            &format!("fluree:file://{RECORD_PATH}"),
+            record.to_string().as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    fluree
+        .drop_ledger("rot-first", DropMode::Hard)
+        .await
+        .expect("drop");
+    let done = run_to_end(&fluree, opts(1)).await;
+    assert_eq!(done.state, KeyRotationState::Completed, "{done:?}");
+    assert_eq!(done.completion.expect("verified").remaining_on_retired, 0);
+}

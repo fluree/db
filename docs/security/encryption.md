@@ -323,9 +323,12 @@ The record reports:
 
 - `state`: `running`, `paused`, `cancelled`, `failed`, `swept` or `completed`.
 - The holder, `dry_run`, `ledger_scope`, and progress: `units_done` of
-  `units_total` (each ledger branch, dropped ledgers included, then each
-  ledger's shared dictionaries, then graph sources), the unit in progress
-  and the last address done.
+  `units_total` (each ledger branch, dropped ledgers included, each ledger's
+  shared dictionaries, and graph sources, swept in storage-prefix order),
+  the unit in progress, the last address done, and `done_through`, the
+  prefix of the last unit finished. A resumed sweep continues after that
+  prefix, so ledgers created or purged while it was paused do not move its
+  place.
 - Counters: `scanned`, `rewritten`, `already_current`, `on_other_keys`,
   `not_enveloped` (lock files and any blob written before encryption was
   enabled), `on_retired` (blobs found on the retiring key; in a
