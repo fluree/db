@@ -47,6 +47,11 @@ The Rust `RdfFormat` also accepts common aliases such as `ttl`, `n-quads` and
   label that starts with `-`, which no other syntax allows, gets one more `-`:
   `_:-b1` is read as `--b1`.
 - **Errors:** a malformed document raises an error naming its line and column.
+- **Memory:** a document is read whole, and parsing holds the text, the parsed
+  dataset and, in Python, every `Quad` at once: roughly ten times the
+  document's size from Python. To load a large file into a ledger, use
+  [bulk import](../cli/create.md) rather than parsing it and inserting the
+  quads.
 
 The readers run the W3C RDF 1.1 and RDF 1.2 Turtle, TriG, N-Triples and N-Quads
 test suites in CI. For the few known gaps, see

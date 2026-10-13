@@ -403,6 +403,10 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
   an error rather than dropped.
 - `ledger.insert(quads)` and `upsert(quads)` write quads, named graphs
   included.
+- A document is read whole, and its quads are all built in memory: expect
+  roughly ten times the document's size. To load a large file into a ledger,
+  bulk-load it with `conn.create("name", source=Path("data.nq"))` rather than
+  inserting `fluree.parse()`'s quads.
 
 [RDF documents](https://fluree.github.io/db/reference/rdf-documents.html) in
 the Fluree documentation shows how each syntax writes named graphs,
@@ -500,7 +504,9 @@ async with fluree.aio.connect("./data") as conn:
 ```
 
 Each call runs on a worker thread while the event loop carries on, as do
-`fluree.aio.parse()` and `fluree.aio.serialize()`.
+`fluree.aio.parse()` and `fluree.aio.serialize()`. Building a large
+document's quads holds the GIL, though, so the loop runs less often while
+`parse()` turns one into Python objects.
 Cancelling a task that awaits a query (`asyncio.timeout`, a client that
 disconnects) stops the query in the engine; a write already under way still
 completes. Cancelled inside `async with ledger.transaction()`, the block waits
