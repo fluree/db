@@ -340,6 +340,14 @@ impl ServerError {
             ))
             | ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
 
+            // 422 - well-formed, but a vector the index cannot store beside
+            // the property's others. Permanent; its @type is the generic
+            // `InvalidTransaction`, as when the committer flattens it to
+            // `Http { status: 422 }`. MUST precede the generic arm below.
+            ServerError::Api(ApiError::Transact(fluree_db_api::TransactError::InvalidVector(
+                _,
+            ))) => StatusCode::UNPROCESSABLE_ENTITY,
+
             // 503 - novelty backpressure. The same retryable capacity class
             // as `NoveltyDeferred` above: only the indexer draining clears
             // it. A 400 here tells well-behaved clients (retry 5xx, treat
@@ -1080,6 +1088,30 @@ mod tests {
                     .is_none(),
                 "413 must not invite a retry"
             );
+        }
+    }
+
+    /// A vector the index cannot store is a permanent refusal: 422 +
+    /// `err:db/InvalidTransaction` with no `Retry-After`, as the typed error
+    /// and as the committer flattens it (`Http { status }` from
+    /// `ApiError::status_code`).
+    #[test]
+    fn invalid_vector_is_422_invalid_transaction_without_retry_after() {
+        let typed = ApiError::Transact(fluree_db_api::TransactError::InvalidVector(
+            "vector dims mismatch: expected 3, got 2".into(),
+        ));
+        let flattened = ApiError::Http {
+            status: typed.status_code(),
+            message: typed.to_string(),
+        };
+        for se in [ServerError::Api(typed), ServerError::Api(flattened)] {
+            assert_eq!(se.status_code(), StatusCode::UNPROCESSABLE_ENTITY, "{se}");
+            assert_eq!(se.error_type(), errors::INVALID_TRANSACTION, "{se}");
+            let resp = se.into_response();
+            assert!(resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none());
         }
     }
 

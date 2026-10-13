@@ -118,11 +118,20 @@ async fn t(fluree: &MemoryFluree, ledger_id: &str) -> i64 {
 }
 
 /// The refusal message, or a panic naming `what` if the write was accepted
-/// or failed some other way.
+/// or failed some other way. A refused vector is HTTP 422, as a write past
+/// the datatype limit is.
 fn refused<T>(result: fluree_db_api::Result<T>, what: &str) -> String {
     match result {
-        Err(ApiError::Transact(TransactError::InvalidVector(msg))) => msg,
-        Err(e) => panic!("{what}: expected an invalid-vector refusal, got: {e}"),
+        Err(e) => {
+            let status = e.status_code();
+            match e {
+                ApiError::Transact(TransactError::InvalidVector(msg)) => {
+                    assert_eq!(status, 422, "{what}: {msg}");
+                    msg
+                }
+                e => panic!("{what}: expected an invalid-vector refusal, got: {e}"),
+            }
+        }
         Ok(_) => panic!("{what}: the write was accepted"),
     }
 }
