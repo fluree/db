@@ -100,8 +100,10 @@ pub enum LowerError {
         span: SourceSpan,
     },
 
-    /// Typed literal whose lexical form is not a value of its datatype
-    #[error("{message}")]
+    /// Typed literal whose lexical form is not a value of its datatype. A
+    /// parse error of the request, worded as JSON-LD's refusal of the same
+    /// literal is.
+    #[error("Parse error: {message}")]
     InvalidLiteral { message: String, span: SourceSpan },
 }
 
@@ -2141,7 +2143,7 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
             }
         }
         xsd::DOUBLE => {
-            if let Ok(d) = lexical.parse::<f64>() {
+            if let Some(d) = fluree_graph_ir::parse_xsd_double(lexical) {
                 return UnresolvedTerm::Literal(LiteralValue::Double(d));
             }
         }
