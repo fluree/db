@@ -538,11 +538,26 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
     }
 }
 
+/// Marks the end of the snapshot: a subscriber holding a resource in scope
+/// that the snapshot did not name missed its retraction, and drops it.
+fn snapshot_complete_event(records: usize) -> Event {
+    Event::default()
+        .event("snapshot-complete")
+        .json_data(serde_json::json!({
+            "action": "snapshot-complete",
+            "records": records,
+            "emitted_at": now_iso8601(),
+        }))
+        .unwrap_or_else(|_| Event::default().comment("serialization error"))
+}
+
 /// SSE events endpoint handler
 ///
 /// Streams nameservice record changes to connected clients.
-/// On connect, sends an initial snapshot of all matching records,
-/// then streams live updates.
+/// On connect, sends an initial snapshot of all matching records, a
+/// `snapshot-complete` event, then live updates. A subscriber that falls
+/// behind the live updates has its stream ended, so it reconnects to a
+/// fresh snapshot rather than miss events.
 ///
 /// # Authentication
 /// When events authentication is enabled:
@@ -586,7 +601,8 @@ pub async fn events(
     let subscription = state.fluree.event_bus().subscribe(SubscriptionScope::All);
 
     // 2. Build initial snapshot using effective params
-    let initial_events = build_initial_snapshot(&ns, &effective_params).await;
+    let mut initial_events = build_initial_snapshot(&ns, &effective_params).await;
+    initial_events.push(snapshot_complete_event(initial_events.len()));
     let initial_stream = stream::iter(initial_events.into_iter().map(Ok));
 
     // 3. Create live event stream from broadcast receiver using unfold
@@ -625,10 +641,9 @@ pub async fn events(
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(
                             lagged = n,
-                            "SSE broadcast lagged, some events may have been missed"
+                            "SSE subscriber fell behind; ending its stream so it resyncs"
                         );
-                        // Continue listening after lag
-                        continue;
+                        return None;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Channel closed, end the stream

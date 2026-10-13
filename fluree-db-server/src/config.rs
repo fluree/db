@@ -36,6 +36,17 @@ pub struct PeerSubscription {
     pub graph_sources: Vec<String>,
 }
 
+impl PeerSubscription {
+    /// Whether the subscription takes in `ledger_id`'s events.
+    pub fn covers_ledger(&self, ledger_id: &fluree_db_api::LedgerId) -> bool {
+        self.all
+            || self
+                .ledgers
+                .iter()
+                .any(|l| fluree_db_api::LedgerId::parse(l).is_ok_and(|l| &l == ledger_id))
+    }
+}
+
 /// Authentication mode for the events endpoint
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum EventsAuthMode {

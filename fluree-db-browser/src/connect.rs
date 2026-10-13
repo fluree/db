@@ -17,6 +17,7 @@ use crate::heads::{
 use fluree_db_api::{Fluree, FlureeBuilder, NameServiceMode};
 use fluree_db_nameservice_sync::{
     run_head_stream, HeadStreamConfig, ProxyNameService, ProxyReadMode, ProxyStorage,
+    SnapshotTracker,
 };
 use futures::future::BoxFuture;
 use std::sync::Arc;
@@ -98,6 +99,11 @@ impl BrowserPeer {
         let sink = PeerHeadSink {
             fluree: self.fluree.clone(),
             registry: Arc::clone(&self.heads),
+            ledgers: ledgers
+                .iter()
+                .filter_map(|l| fluree_db_api::LedgerId::parse(l).ok())
+                .collect(),
+            snapshot: SnapshotTracker::new(),
         };
         let sleeper = DriverSleeper::new(self.io.clone());
         let stream_config = HeadStreamConfig {

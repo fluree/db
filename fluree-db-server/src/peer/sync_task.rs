@@ -14,7 +14,7 @@ use fluree_db_nameservice::{
     CasResult, NameServiceError, NameServiceEvent, NsRecord, RefKind, RefValue,
 };
 use fluree_db_nameservice_sync::watch::{RemoteEvent, RemoteWatch};
-use fluree_db_nameservice_sync::SseRemoteWatch;
+use fluree_db_nameservice_sync::{SnapshotNames, SnapshotTracker, SseRemoteWatch};
 use futures::StreamExt;
 
 use crate::config::ServerConfig;
@@ -53,16 +53,27 @@ impl PeerSyncTask {
 
     async fn run(&self) {
         let mut stream = self.watch.watch();
+        let snapshot = SnapshotTracker::new();
+        // Graph sources live only in peer state, which a connect clears.
+        let mut prior_graph_sources = Vec::new();
 
         while let Some(event) = stream.next().await {
+            let named = snapshot.observe(&event);
             match event {
                 RemoteEvent::Connected => {
                     // Mirror PeerSubscriptionTask: clear stale state, mark connected, preload
+                    prior_graph_sources = self.peer_state.known_graph_sources().await;
                     self.peer_state.clear().await;
                     self.peer_state.set_connected(true).await;
 
                     tracing::info!("Connected to transaction server, receiving snapshot");
                     self.preload_configured_ledgers().await;
+                }
+                RemoteEvent::SnapshotComplete => {
+                    if let Some(named) = named {
+                        self.reconcile(&named, std::mem::take(&mut prior_graph_sources))
+                            .await;
+                    }
                 }
                 RemoteEvent::Disconnected { reason } => {
                     self.peer_state.set_connected(false).await;
@@ -121,14 +132,60 @@ impl PeerSyncTask {
                     }
                 }
                 RemoteEvent::GraphSourceRetracted { graph_source_id } => {
-                    self.peer_state.remove_graph_source(&graph_source_id).await;
-                    self.fluree
-                        .event_bus()
-                        .notify(NameServiceEvent::GraphSourceRetracted {
-                            graph_source_id: graph_source_id.clone(),
-                        });
+                    self.retract_graph_source(&graph_source_id).await;
                     tracing::info!(graph_source_id = %graph_source_id, "Graph source retracted from remote");
                 }
+            }
+        }
+    }
+
+    async fn retract_graph_source(&self, graph_source_id: &fluree_db_api::LedgerId) {
+        self.peer_state.remove_graph_source(graph_source_id).await;
+        self.fluree
+            .event_bus()
+            .notify(NameServiceEvent::GraphSourceRetracted {
+                graph_source_id: graph_source_id.clone(),
+            });
+    }
+
+    /// Drop what a completed snapshot did not name: the local copies of
+    /// ledgers the subscription covers, and the graph sources known before
+    /// the connect. The server retracted them while this peer was away.
+    pub(crate) async fn reconcile(
+        &self,
+        named: &SnapshotNames,
+        prior_graph_sources: Vec<fluree_db_api::LedgerId>,
+    ) {
+        let sub = self.config.peer_subscription();
+        if let Some(ns) = self.fluree.nameservice_mode().publisher() {
+            match ns.all_records().await {
+                Ok(records) => {
+                    for record in records {
+                        let id = record.ledger_id;
+                        if !sub.covers_ledger(&id) || named.ledgers.contains(&id) {
+                            continue;
+                        }
+                        match fluree_db_nameservice::lifecycle::unmirror_record(ns, &id, None).await
+                        {
+                            Ok(()) => {
+                                self.peer_state.remove_ledger(&id, None).await;
+                                tracing::info!(ledger_id = %id, "Ledger retracted while disconnected");
+                            }
+                            Err(e) => tracing::warn!(
+                                ledger_id = %id,
+                                error = %e,
+                                "Failed to retract ledger locally"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "Cannot list local ledgers to reconcile"),
+            }
+        }
+        for graph_source_id in prior_graph_sources {
+            if !named.graph_sources.contains(&graph_source_id) {
+                self.retract_graph_source(&graph_source_id).await;
+                tracing::info!(graph_source_id = %graph_source_id, "Graph source retracted while disconnected");
             }
         }
     }
@@ -178,6 +235,9 @@ impl PeerSyncTask {
                 .await
             {
                 Ok(CasResult::Updated) => {}
+                // Already at the head: the copy was just made with it, or
+                // the record repeats it (an index publish, a reconnect).
+                Ok(CasResult::Conflict { actual }) if actual.as_ref() == Some(&commit_head) => {}
                 Ok(CasResult::Conflict { actual }) => {
                     // Local diverged — server is authoritative in Mode B, force-follow.
                     tracing::warn!(
@@ -386,4 +446,82 @@ fn graph_source_config_hash(config: &str) -> String {
 
     let hash = Sha256::digest(config.as_bytes());
     hex::encode(&hash[..4])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{FlureeBuilder, LedgerId};
+    use fluree_db_nameservice::SubscriptionScope;
+    use serde_json::json;
+
+    fn task(fluree: &Arc<fluree_db_api::Fluree>, ledgers: &[&str]) -> PeerSyncTask {
+        let config = ServerConfig {
+            peer_subscribe_all: ledgers.is_empty(),
+            peer_ledgers: ledgers.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        };
+        PeerSyncTask::new(
+            Arc::clone(fluree),
+            Arc::new(PeerState::new()),
+            SseRemoteWatch::new("http://unused/fluree/events".to_string(), None),
+            config,
+        )
+    }
+
+    async fn seeded(fluree: &fluree_db_api::Fluree, name: &str) -> NsRecord {
+        let ledger = fluree.create_ledger(name).await.unwrap();
+        let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:v": 1});
+        fluree.insert(ledger, &tx).await.unwrap();
+        fluree
+            .nameservice()
+            .lookup(&format!("{name}:main"))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A record repeating the head this peer holds, as an index publish or
+    /// a reconnect's snapshot sends, leaves the cached ledger loaded.
+    #[tokio::test]
+    async fn an_unchanged_head_keeps_the_cached_ledger() {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let record = seeded(&fluree, "peer-a").await;
+        fluree.ledger_cached("peer-a:main").await.unwrap();
+
+        task(&fluree, &[]).handle_ledger_updated(&record).await;
+
+        let cached = fluree.ledger_manager().unwrap().cached_aliases().await;
+        assert!(cached.contains(&record.ledger_id), "{cached:?}");
+    }
+
+    /// A completed snapshot that does not name a copy the subscription
+    /// covers removes it, and a graph source known before the connect.
+    #[tokio::test]
+    async fn a_snapshot_removes_what_it_does_not_name() {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let kept = seeded(&fluree, "peer-kept").await;
+        seeded(&fluree, "peer-gone").await;
+        seeded(&fluree, "peer-other").await;
+        let mut sub = fluree.event_bus().subscribe(SubscriptionScope::all());
+        let gone_source = LedgerId::parse("search:main").unwrap();
+        let mut named = SnapshotNames::default();
+        named.ledgers.insert(kept.ledger_id.clone());
+
+        task(&fluree, &["peer-kept", "peer-gone"])
+            .reconcile(&named, vec![gone_source.clone()])
+            .await;
+
+        let ns = fluree.nameservice();
+        assert!(ns.lookup("peer-kept:main").await.unwrap().is_some());
+        assert!(ns.lookup("peer-gone:main").await.unwrap().is_none());
+        assert!(
+            ns.lookup("peer-other:main").await.unwrap().is_some(),
+            "outside the subscription"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| sub.receiver.try_recv().ok()).collect();
+        assert!(events.contains(&NameServiceEvent::GraphSourceRetracted {
+            graph_source_id: gone_source
+        }));
+    }
 }

@@ -28,6 +28,11 @@ pub enum RemoteEvent {
     GraphSourceRetracted { graph_source_id: LedgerId },
     /// Connected to the remote
     Connected,
+    /// The remote has sent every record in scope since [`Connected`]: one
+    /// held locally that it did not name was dropped while disconnected.
+    ///
+    /// [`Connected`]: RemoteEvent::Connected
+    SnapshotComplete,
     /// Disconnected from the remote (will attempt reconnect)
     Disconnected { reason: String },
     /// Fatal error — stop watching, do not retry (e.g., 401/403)

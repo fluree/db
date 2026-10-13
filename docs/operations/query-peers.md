@@ -38,8 +38,11 @@ The transaction server exposes a Server-Sent Events (SSE) stream that emits **na
 |-------|-----------|---------|
 | `ns-record` | A ledger or graph source is created, restored or updated, or a branch is created | `kind` (`ledger` or `graph-source`), `resource_id`, `record`, `emitted_at`. A ledger's `record` carries its heads (`commit_head_id`, `commit_t`, `index_head_id`, `index_t`), its `storage_root` and its `instance`. |
 | `ns-retracted` | A ledger branch or graph source is dropped | `kind`, `resource_id`, `emitted_at`, and for a ledger branch, the `instance` it belonged to when the server knows it |
+| `snapshot-complete` | After the snapshot sent on connecting | `records` (how many the snapshot sent), `emitted_at` |
 
-On connecting, a subscriber first receives an `ns-record` for each resource in scope. The same event may be sent more than once.
+On connecting, a subscriber first receives an `ns-record` for each resource in scope, then `snapshot-complete`, then live events. The same event may be sent more than once.
+
+A resource the subscriber holds that the snapshot did not name was dropped while it was disconnected, and a peer drops it at `snapshot-complete`. A subscriber that falls too far behind the live events has its stream ended, so it reconnects and receives a fresh snapshot instead of missing events.
 
 Every ledger has an **instance** id, fixed when it is created. A ledger dropped and created again under the same name gets a new instance and starts again from `t` 0, so heads compare only within one instance:
 

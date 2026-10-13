@@ -3281,6 +3281,53 @@ async fn test_events_name_the_ledger_instance() {
     assert_ne!(again["record"]["instance"], instance);
 }
 
+/// The snapshot ends with `snapshot-complete`, after every record it sends
+/// and before any live event, so a peer can drop what it holds that the
+/// snapshot did not name.
+#[tokio::test]
+async fn test_events_snapshot_ends_with_snapshot_complete() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state);
+    let create = |ledger: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/create")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "ledger": ledger }).to_string(),
+            ))
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(create("snap:main")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/events?all=true")
+                .header("Accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let mut parser = fluree_sse::SseParser::new();
+    let mut pending = std::collections::VecDeque::new();
+
+    let snapshot = next_sse_event(&mut body, &mut parser, &mut pending, "ns-record").await;
+    assert_eq!(snapshot["resource_id"], "snap:main");
+    let complete = next_sse_event(&mut body, &mut parser, &mut pending, "snapshot-complete").await;
+    assert_eq!(complete["records"], 1, "{complete}");
+
+    let resp = app.clone().oneshot(create("snap-live:main")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let live = next_sse_event(&mut body, &mut parser, &mut pending, "ns-record").await;
+    assert_eq!(live["resource_id"], "snap-live:main");
+}
+
 // =============================================================================
 // Browser-Readiness Header Tests (CORS, immutable caching, conditional GET)
 // =============================================================================

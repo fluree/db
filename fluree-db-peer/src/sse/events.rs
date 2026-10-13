@@ -67,11 +67,7 @@ pub struct NsRetractedEvent {
     pub emitted_at: String,
 }
 
-/// Snapshot complete event payload
-///
-/// NOTE: The server does not currently emit `snapshot-complete` events.
-/// This type exists for future compatibility when the server adds this feature.
-/// Until then, `SseClientEvent::SnapshotComplete` will never fire.
+/// Snapshot complete event payload. The server sends no `hash`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotCompleteEvent {
     pub hash: Option<String>,
@@ -82,10 +78,7 @@ pub struct SnapshotCompleteEvent {
 pub enum SseClientEvent {
     /// Connected and receiving snapshot
     Connected,
-    /// Snapshot complete marker received
-    ///
-    /// NOTE: The server does not currently emit this event.
-    /// This variant exists for future compatibility.
+    /// The snapshot sent on connecting is complete; live events follow.
     SnapshotComplete { hash: String },
     /// Ledger record received
     LedgerRecord(LedgerRecord),

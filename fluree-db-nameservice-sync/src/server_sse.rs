@@ -32,6 +32,7 @@ pub fn parse_server_sse_event(
     match event_type {
         "ns-record" => parse_ns_record(&event.data),
         "ns-retracted" => parse_ns_retracted(&event.data),
+        "snapshot-complete" => Ok(Some(RemoteEvent::SnapshotComplete)),
         _ => Ok(None),
     }
 }
@@ -448,5 +449,18 @@ mod tests {
         };
 
         assert!(parse_server_sse_event(&event).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_snapshot_complete() {
+        let event = fluree_sse::SseEvent {
+            event_type: Some("snapshot-complete".to_string()),
+            data: r#"{"action": "snapshot-complete", "records": 3}"#.to_string(),
+            id: None,
+        };
+        assert!(matches!(
+            parse_server_sse_event(&event).unwrap(),
+            Some(RemoteEvent::SnapshotComplete)
+        ));
     }
 }

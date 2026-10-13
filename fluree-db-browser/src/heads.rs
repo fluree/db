@@ -25,7 +25,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_api::{Fluree, NotifyResult, NsNotify};
 use fluree_db_nameservice_sync::{
-    BoxChunkStream, HeadSink, RemoteEvent, Sleeper, SseChunkSource, SseConnectError,
+    BoxChunkStream, HeadSink, RemoteEvent, Sleeper, SnapshotTracker, SseChunkSource,
+    SseConnectError,
 };
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -178,18 +179,35 @@ impl Sleeper for DriverSleeper {
 /// The browser peer's [`HeadSink`]: ledger updates refresh the cached
 /// ledger through `LedgerManager::notify` (between queries — a query in
 /// flight keeps its frozen view) and fan out to registered callbacks;
-/// retractions evict the cached ledger.
+/// retractions evict the cached ledger, as does a snapshot that does not
+/// name a cached ledger the subscription covers.
 pub(crate) struct PeerHeadSink {
     pub(crate) fluree: Fluree,
     pub(crate) registry: std::sync::Arc<HeadRegistry>,
+    /// The ledgers subscribed to; none subscribes to all.
+    pub(crate) ledgers: Vec<fluree_db_api::LedgerId>,
+    pub(crate) snapshot: SnapshotTracker,
 }
 
 #[async_trait]
 impl HeadSink for PeerHeadSink {
     async fn on_event(&self, event: RemoteEvent) {
+        let named = self.snapshot.observe(&event);
         match event {
             RemoteEvent::Connected => {
                 tracing::info!("head tracking connected");
+            }
+            RemoteEvent::SnapshotComplete => {
+                let (Some(named), Some(mgr)) = (named, self.fluree.ledger_manager()) else {
+                    return;
+                };
+                for id in mgr.cached_aliases().await {
+                    let covered = self.ledgers.is_empty() || self.ledgers.contains(&id);
+                    if covered && !named.ledgers.contains(&id) {
+                        tracing::info!(ledger_id = %id, "ledger retracted on the remote while disconnected");
+                        self.fluree.disconnect_ledger(&id).await;
+                    }
+                }
             }
             RemoteEvent::LedgerUpdated(record) => {
                 let change = HeadChange {
