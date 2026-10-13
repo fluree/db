@@ -326,13 +326,15 @@ pub(super) fn bare_ledger_id(s: &str) -> String {
 /// avoids ever touching IRIs that appear inside comments or string literals.
 /// Replacements are applied right-to-left so earlier spans aren't shifted.
 ///
-/// When the SPARQL fails to parse, the original is returned unchanged — the
-/// downstream parser produces the user-facing parse error rather than this
-/// layer attempting an opaque rewrite.
+/// When the SPARQL has any parse error, even one the parser recovers from,
+/// the original is returned unchanged.
 pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> String {
-    use fluree_db_sparql::ast::{IriValue, QueryBody};
+    use fluree_db_sparql::ast::QueryBody;
 
     let parsed = fluree_db_sparql::parse_sparql(sparql);
+    if parsed.has_errors() {
+        return sparql.to_string();
+    }
     let Some(ast) = parsed.ast.as_ref() else {
         return sparql.to_string();
     };
@@ -347,32 +349,30 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
         return sparql.to_string();
     };
 
-    // Collect (span, replacement) pairs. We work with full IRIs only; prefixed
-    // names need context expansion and are skipped (they also can't be ledger
-    // references in current Fluree SPARQL).
+    // Collect (span, replacement) pairs. A member is read as written (a full
+    // IRI as is, a prefixed name as `prefix:local`); the replacement is a full
+    // IRI naming the same ledger.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
-        if let IriValue::Full(value) = &iri.value {
-            let value_str: &str = value.as_ref();
-            let bare = bare_ledger_id(value_str);
-            if let Some(t) = snapshot.ledgers.get(&bare) {
-                // Defensive: skip IRIs that already carry an explicit
-                // temporal pin. Validation rejects collisions when
-                // envelope asOf is set, so this only fires in the
-                // no-asOf path where an inner pin should win.
-                if string_has_explicit_pin(value_str) {
-                    continue;
-                }
-                // Splice `@t:N` BEFORE any `#fragment` so named-graph
-                // selectors (e.g. `<ledger#txn-meta>`) are pinned
-                // correctly: `<ledger@t:42#txn-meta>`. The dataset parser
-                // reattaches the fragment after temporal parsing.
-                let replacement = match value_str.split_once('#') {
-                    Some((base, fragment)) => format!("<{base}@t:{t}#{fragment}>"),
-                    None => format!("<{value_str}@t:{t}>"),
-                };
-                edits.push((iri.span.start, iri.span.end, replacement));
+        let written = crate::dataset::iri_value_to_string(&iri.value);
+        let bare = bare_ledger_id(&written);
+        if let Some(t) = snapshot.ledgers.get(&bare) {
+            // Defensive: skip IRIs that already carry an explicit
+            // temporal pin. Validation rejects collisions when
+            // envelope asOf is set, so this only fires in the
+            // no-asOf path where an inner pin should win.
+            if string_has_explicit_pin(&written) {
+                continue;
             }
+            // Splice `@t:N` BEFORE any `#fragment` so named-graph
+            // selectors (e.g. `<ledger#txn-meta>`) are pinned
+            // correctly: `<ledger@t:42#txn-meta>`. The dataset parser
+            // reattaches the fragment after temporal parsing.
+            let replacement = match written.split_once('#') {
+                Some((base, fragment)) => format!("<{base}@t:{t}#{fragment}>"),
+                None => format!("<{written}@t:{t}>"),
+            };
+            edits.push((iri.span.start, iri.span.end, replacement));
         }
     }
 
@@ -529,6 +529,19 @@ mod tests {
         assert!(out.contains("FROM NAMED <ledgerB@t:99>"));
     }
 
+    /// A prefixed name in `FROM` (`mq:p2`) is pinned like the bracketed IRI of
+    /// the same ledger.
+    #[test]
+    fn sparql_prefixed_from_is_pinned_as_the_ledger_it_names() {
+        let snap = snapshot(&[("mq:p1", 3), ("mq:p2", 7)]);
+        let sparql = "SELECT ?s FROM <mq:p1> FROM mq:p2 FROM NAMED mq:p2 WHERE { ?s ?p ?o }";
+        let out = apply_snapshot_to_sparql(sparql, &snap);
+        assert_eq!(
+            out,
+            "SELECT ?s FROM <mq:p1@t:3> FROM <mq:p2@t:7> FROM NAMED <mq:p2@t:7> WHERE { ?s ?p ?o }"
+        );
+    }
+
     #[test]
     fn sparql_iri_in_string_literal_is_not_rewritten() {
         // Span-based rewrite only touches the parsed FROM <iri> — markers
@@ -541,6 +554,20 @@ mod tests {
         assert!(out.contains(r#""note: <ledgerA>""#), "got: {out}");
         // The FROM clause is rewritten.
         assert!(out.contains("FROM <ledgerA@t:42>"), "got: {out}");
+    }
+
+    /// Text with a parse error is returned as written, even when the parser
+    /// recovers its `FROM` clause and that ledger is in the snapshot.
+    #[test]
+    fn sparql_with_a_recovered_parse_error_is_returned_unchanged() {
+        let snap = snapshot(&[("ledgerA", 42)]);
+        let sparql = "SELECT ?x FROM <ledgerA> WHERE { ?x ?p ?o . ?x }";
+        let parsed = fluree_db_sparql::parse_sparql(sparql);
+        assert!(
+            parsed.has_errors() && parsed.ast.is_some(),
+            "the fixture must parse with an error and still yield an AST"
+        );
+        assert_eq!(apply_snapshot_to_sparql(sparql, &snap), sparql);
     }
 
     #[test]
