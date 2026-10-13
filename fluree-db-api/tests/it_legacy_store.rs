@@ -115,3 +115,105 @@ async fn a_store_from_before_name_bindings_opens_migrated() {
         .expect("reopen");
     assert_eq!(names(&reopened, "legacydb").await, ["Alice", "Bob", "Eve"]);
 }
+
+/// Every file under `dir`, recursively, relative to `base`.
+fn files_under(base: &Path, dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(files_under(base, &path));
+            } else {
+                found.push(
+                    path.strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    found
+}
+
+/// Purging a ledger stored the 4.2 way, at its name, deletes its files and
+/// none of the ledger created under the name since, whose files sit in an
+/// instance folder inside the same name's folder, though it reuses the
+/// legacy ledger's branch name.
+#[tokio::test]
+async fn purging_a_legacy_ledger_leaves_the_one_created_under_its_name() {
+    use fluree_db_api::{DropMode, ReindexOptions};
+    let tmp = legacy_store();
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .expect("build");
+    let legacy = fluree
+        .drop_ledger("legacydb", DropMode::Soft)
+        .await
+        .expect("drop")
+        .instance
+        .expect("instance");
+
+    let tx = |name: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": format!("ex:{name}"), "ex:name": name});
+    let ledger = fluree
+        .create_ledger("legacydb")
+        .await
+        .expect("create again");
+    fluree
+        .insert(ledger, &tx("Zed"))
+        .await
+        .expect("insert main");
+    fluree
+        .create_branch("legacydb", "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = fluree.ledger("legacydb:dev").await.expect("dev");
+    fluree.insert(dev, &tx("Yan")).await.expect("insert dev");
+    fluree
+        .reindex("legacydb:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let name_dir = tmp.path().join("legacydb");
+    let new_root = fluree
+        .nameservice()
+        .lookup("legacydb:main")
+        .await
+        .unwrap()
+        .unwrap()
+        .storage_root();
+    let instance_dir = format!("{new_root}/");
+    let all = files_under(tmp.path(), &name_dir);
+    let new_files: Vec<_> = all
+        .iter()
+        .filter(|f| f.starts_with(&instance_dir))
+        .collect();
+    assert!(!new_files.is_empty());
+    assert!(all.len() > new_files.len(), "the legacy files are there");
+
+    fluree.purge_dropped(legacy.as_str()).await.expect("purge");
+
+    let left = files_under(tmp.path(), &name_dir);
+    assert!(
+        left.iter().all(|f| f.starts_with(&instance_dir)),
+        "legacy files left: {:?}",
+        left.iter()
+            .filter(|f| !f.starts_with(&instance_dir))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        left.len(),
+        new_files.len(),
+        "the new ledger's files all stay"
+    );
+
+    for id in ["legacydb:main", "legacydb:dev"] {
+        fluree.disconnect_ledger(id).await;
+    }
+    assert_eq!(names(&fluree, "legacydb").await, ["Zed"]);
+    assert_eq!(names(&fluree, "legacydb:dev").await, ["Yan", "Zed"]);
+    let sweep = fluree.sweep_orphan_instances(true).await.expect("sweep");
+    assert!(sweep.orphans.is_empty(), "{:?}", sweep.orphans);
+}
