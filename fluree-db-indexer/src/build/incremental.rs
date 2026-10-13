@@ -4614,6 +4614,10 @@ fn warm_replaced_leaflets(
         return;
     }
     let Ok(permit) = Arc::clone(warm_decode_permits()).try_acquire_owned() else {
+        tracing::debug!(
+            leaflets = to_decode.len(),
+            "warm-on-write pool busy; leaving the leaf to its first reader"
+        );
         if copied {
             warm_leaf_dir(cache, leaf_id, &leaf_bytes);
         }
@@ -5158,5 +5162,32 @@ mod warm_tests {
         assert_eq!(columns(2), Some(ColumnSet::ALL));
         assert_eq!(columns(3), None, "never read, never warmed");
         assert!(cache.get_leaf_dir(new_id).is_some());
+
+        let header = decode_leaf_header_v3(&blob.info.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(&blob.info.leaf_bytes, &header).unwrap();
+        for idx in 0..3 {
+            let (columns, warmed) = cache.v3_leaflet_entry(new_id, idx).unwrap();
+            let fresh = load_leaflet_columns(
+                &blob.info.leaf_bytes,
+                &dir.entries[idx as usize],
+                dir.payload_base,
+                &ColumnProjection {
+                    output: columns,
+                    internal: ColumnSet::EMPTY,
+                },
+                header.order,
+            )
+            .unwrap();
+            let rows = |b: &fluree_db_binary_index::read::column_types::ColumnBatch| {
+                (0..b.row_count)
+                    .map(|i| (b.s_id.get(i), b.o_key.get(i)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rows(&warmed),
+                rows(&fresh),
+                "leaflet {idx} holds the new leaf's rows"
+            );
+        }
     }
 }
