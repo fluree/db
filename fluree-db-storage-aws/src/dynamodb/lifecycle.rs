@@ -865,6 +865,9 @@ impl BranchRecordStore for DynamoDbNameService {
             Some(f) if f != Some(fence) => return Ok(FenceOutcome::Mismatch),
             Some(_) => {}
         }
+        // The commit index carries no fence: its items go in batches. The
+        // fenced items go one conditional delete each, the meta item last.
+        let mut commit_index = Vec::new();
         for item in self.query_all_items_paginated(&pk).await? {
             let Some(sk) = Self::sk_of(&item) else {
                 continue;
@@ -872,24 +875,26 @@ impl BranchRecordStore for DynamoDbNameService {
             if sk == SK_META {
                 continue;
             }
-            let mut delete = self
+            if sk.starts_with(SK_COMMIT_PREFIX) {
+                commit_index.push(sk.to_string());
+                continue;
+            }
+            let delete = self
                 .client
                 .delete_item()
                 .table_name(&self.table_name)
                 .key(ATTR_PK, AttributeValue::S(pk.clone()))
-                .key(ATTR_SK, AttributeValue::S(sk.to_string()));
-            if !sk.starts_with(SK_COMMIT_PREFIX) {
-                delete = delete
-                    .condition_expression("#fence = :fence")
-                    .expression_attribute_names("#fence", ATTR_FENCE)
-                    .expression_attribute_values(":fence", fence_value(fence));
-            }
+                .key(ATTR_SK, AttributeValue::S(sk.to_string()))
+                .condition_expression("#fence = :fence")
+                .expression_attribute_names("#fence", ATTR_FENCE)
+                .expression_attribute_values(":fence", fence_value(fence));
             match delete.send().await {
                 Ok(_) => {}
                 Err(e) if condition_failed(&e) => {}
                 Err(e) => return Err(storage_err("DeleteItem", e)),
             }
         }
+        self.batch_delete(&pk, commit_index).await?;
         match self
             .client
             .delete_item()

@@ -838,6 +838,53 @@ async fn dynamodb_refuses_ids_bindings_cannot_carry_before_writing() {
     assert!(record.fence.is_none(), "nothing was bound: {record:?}");
 }
 
+/// A drop deletes a branch's commit-index items, more than one batch of
+/// them, along with its fenced items.
+#[tokio::test]
+async fn dynamodb_drop_deletes_the_commit_index() {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use fluree_db_core::ContentKind;
+    use fluree_db_nameservice::testing::CurrentFence;
+
+    let (_lock, _container, endpoint) = start_localstack("dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+    ensure_dynamodb_table(&sdk_config, "drop-commit-index").await;
+    let ns = DynamoDbNameService::from_client(client.clone(), "drop-commit-index".into());
+
+    let id = fluree_db_core::LedgerId::parse("many:main").unwrap();
+    fluree_db_nameservice::lifecycle::create_ledger(&ns, &id)
+        .await
+        .unwrap();
+    for t in 1..=40 {
+        let commit =
+            fluree_db_core::ContentId::new(ContentKind::Commit, format!("c{t}").as_bytes());
+        ns.publish_commit("many:main", t, &commit).await.unwrap();
+    }
+    let items = |client: aws_sdk_dynamodb::Client| async move {
+        client
+            .query()
+            .table_name("drop-commit-index")
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(":pk", AttributeValue::S("many:main".into()))
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap()
+            .count()
+    };
+    assert!(
+        items(client.clone()).await > 40,
+        "the commit index is there"
+    );
+
+    let name = fluree_db_core::LedgerName::parse("many").unwrap();
+    fluree_db_nameservice::lifecycle::drop_ledger(&ns, &name, false)
+        .await
+        .unwrap();
+    assert_eq!(items(client).await, 0);
+}
+
 /// Bindings and dropped-ledger entries are listed with batched reads, more
 /// than one batch of them included.
 #[tokio::test]

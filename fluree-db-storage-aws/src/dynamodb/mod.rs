@@ -902,7 +902,7 @@ impl BranchLifecycle for DynamoDbNameService {
         let lo = Self::commit_index_sk(0);
         let hi = Self::commit_index_sk(up_to_t);
 
-        let mut deletes: Vec<aws_sdk_dynamodb::types::WriteRequest> = Vec::new();
+        let mut sks: Vec<String> = Vec::new();
         let mut last_key: Option<Item> = None;
         loop {
             let mut req = self
@@ -929,17 +929,7 @@ impl BranchLifecycle for DynamoDbNameService {
 
             for item in resp.items() {
                 if let Some(sk) = item.get(ATTR_SK).and_then(|v| v.as_s().ok()) {
-                    deletes.push(
-                        aws_sdk_dynamodb::types::WriteRequest::builder()
-                            .delete_request(
-                                aws_sdk_dynamodb::types::DeleteRequest::builder()
-                                    .key(ATTR_PK, AttributeValue::S(pk.clone()))
-                                    .key(ATTR_SK, AttributeValue::S(sk.clone()))
-                                    .build()
-                                    .expect("delete request keys set"),
-                            )
-                            .build(),
-                    );
+                    sks.push(sk.clone());
                 }
             }
 
@@ -949,6 +939,33 @@ impl BranchLifecycle for DynamoDbNameService {
             }
         }
 
+        self.batch_delete(&pk, sks).await?;
+        Ok(())
+    }
+}
+
+impl DynamoDbNameService {
+    /// Delete the items at `sks` under `pk`, unconditionally, 25 to a
+    /// `BatchWriteItem` call, retrying what a call leaves unprocessed.
+    pub(crate) async fn batch_delete(
+        &self,
+        pk: &str,
+        sks: Vec<String>,
+    ) -> std::result::Result<(), NameServiceError> {
+        let mut deletes: Vec<aws_sdk_dynamodb::types::WriteRequest> = sks
+            .into_iter()
+            .map(|sk| {
+                aws_sdk_dynamodb::types::WriteRequest::builder()
+                    .delete_request(
+                        aws_sdk_dynamodb::types::DeleteRequest::builder()
+                            .key(ATTR_PK, AttributeValue::S(pk.to_string()))
+                            .key(ATTR_SK, AttributeValue::S(sk))
+                            .build()
+                            .expect("delete request keys set"),
+                    )
+                    .build()
+            })
+            .collect();
         // BatchWriteItem caps at 25 per call; chunk and retry unprocessed items.
         while !deletes.is_empty() {
             let chunk_size = deletes.len().min(25);
@@ -964,7 +981,8 @@ impl BranchLifecycle for DynamoDbNameService {
                 }
                 let resp = builder.send().await.map_err(|e| {
                     NameServiceError::storage(format!(
-                        "DynamoDB commit-index batch delete failed: {e}"
+                        "DynamoDB BatchWriteItem failed: {}",
+                        aws_sdk_dynamodb::error::DisplayErrorContext(&e)
                     ))
                 })?;
                 remaining = resp.unprocessed_items().cloned().unwrap_or_default();
