@@ -1241,10 +1241,13 @@ impl BinaryIndexStore {
             self.cache_dir.clone(),
         ));
 
-        let (dir, payload_base) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
+        let (dir, payload_base, whole) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
         self.remote_leaf_metadata
             .write()
             .insert(leaf_cid.clone(), dir.clone());
+        if let Some(bytes) = whole {
+            return self.leaf_handle_from_resident(bytes.into(), leaf_id, sidecar_cid, need_replay);
+        }
 
         let sc_cid = if need_replay {
             sidecar_cid.cloned()
@@ -1382,8 +1385,7 @@ impl BinaryIndexStore {
             .as_ref()
             .ok_or_else(|| io::Error::other("no content store"))?;
         let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs), self.cache_dir.clone());
-        let (dir, _payload_base) =
-            super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
+        let (dir, _, _) = super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
         Ok(Arc::new(dir))
     }
 
@@ -3927,17 +3929,35 @@ pub(crate) mod tests {
         writer.finish().unwrap().remove(0).leaf_bytes
     }
 
-    /// Same leaf as [`build_test_leaf_bytes`], keeping the routing keys so a
-    /// `BranchManifest` can be built around it.
-    fn build_test_leaf_info() -> crate::format::leaf::LeafInfo {
-        let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+    /// Rows in [`build_large_test_leaf_info`]'s leaf.
+    const LARGE_TEST_LEAF_ROWS: u64 = 20_000;
+
+    /// A leaf of incompressible rows, too big for the speculative first read,
+    /// so a `Ranged` open loads its columns by range.
+    fn build_large_test_leaf_info() -> crate::format::leaf::LeafInfo {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rows: Vec<(u64, u64)> = (0..LARGE_TEST_LEAF_ROWS)
+            .map(|_| (next() >> 1, next() >> 1))
+            .collect();
+        rows.sort_unstable_by_key(|&(s, o)| (o, s));
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 1_000, 100_000, 1);
         writer.set_skip_history(true);
-        for i in 0..5u64 {
+        for (s, o) in rows {
             writer
-                .push_record(make_rec(i + 1, 1, OType::XSD_INTEGER.as_u16(), i * 10, 1))
+                .push_record(make_rec(s, 1, OType::XSD_INTEGER.as_u16(), o, 1))
                 .unwrap();
         }
-        writer.finish().unwrap().remove(0)
+        let info = writer.finish().unwrap().remove(0);
+        assert!(
+            info.leaf_bytes.len() as u64 > crate::read::leaf_access::SPECULATIVE_HEADER_DIR_BYTES
+        );
+        info
     }
 
     /// Content store that fails exactly one CAS read — the `fail_on`-th
@@ -4024,7 +4044,7 @@ pub(crate) mod tests {
         use crate::read::column_types::{BinaryFilter, ColumnProjection};
 
         let store = FailNthContentStore::new(fail_on);
-        let info = build_test_leaf_info();
+        let info = build_large_test_leaf_info();
         let leaf_cid = run_sync_on_runtime({
             let store = store.clone();
             let bytes = info.leaf_bytes.clone();
@@ -4091,7 +4111,10 @@ pub(crate) mod tests {
             // Baseline: no injected failure. Positively establish that the
             // scan reads through CAS at all — otherwise the sweep is vacuous.
             let (rows, errors, total_calls) = scan_with_injected_failure(policy, 0);
-            assert_eq!(rows, 5, "{policy:?}: baseline scan must see every row");
+            assert_eq!(
+                rows, LARGE_TEST_LEAF_ROWS,
+                "{policy:?}: baseline scan must see every row"
+            );
             assert_eq!(errors, 0, "{policy:?}: baseline scan must not error");
             assert!(
                 total_calls >= min_calls,
@@ -4107,7 +4130,7 @@ pub(crate) mod tests {
                     "{policy:?}: injected failure at CAS call {fail_on} must surface exactly once"
                 );
                 assert_eq!(
-                    rows, 5,
+                    rows, LARGE_TEST_LEAF_ROWS,
                     "{policy:?}: retry after failure at CAS call {fail_on} must not lose rows"
                 );
             }
@@ -4571,6 +4594,40 @@ pub(crate) mod tests {
             1,
             "once promoted, repeated opens should not refetch the full blob"
         );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// A leaf that fits in the speculative first read is served from it: its
+    /// column loads cost no further requests.
+    #[test]
+    fn ranged_policy_serves_a_small_leaf_from_its_first_read() {
+        use crate::read::column_types::ColumnProjection;
+
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Ranged);
+
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("remote open");
+        let batch = handle
+            .load_columns(0, &ColumnProjection::all(), RunSortOrder::Post)
+            .expect("load columns");
+        assert_eq!(batch.row_count, 5);
+        assert_eq!((store.get_calls(), store.range_calls()), (0, 1));
 
         let _ = std::fs::remove_dir_all(cache_dir);
     }

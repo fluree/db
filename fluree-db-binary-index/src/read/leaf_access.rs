@@ -798,10 +798,11 @@ impl LeafHandle for RangeReadLeafHandle {
 /// Speculative first read: the header plus a directory of up to ~330
 /// six-column leaflets in one request. Remote stores are latency-bound, so
 /// over-reading a small leaf's payload costs nothing next to a second trip.
-const SPECULATIVE_HEADER_DIR_BYTES: u64 = 64 * 1024;
+pub(crate) const SPECULATIVE_HEADER_DIR_BYTES: u64 = 64 * 1024;
 
-/// Largest directory entry: 80 fixed + 6 column refs + 20 history bytes.
-const MAX_DIR_ENTRY_BYTES: u64 = 80 + 6 * COLUMN_BLOCK_REF_SIZE as u64 + 20;
+/// Largest directory entry: 80 fixed + a ref per column + 20 history bytes.
+const MAX_DIR_ENTRY_BYTES: u64 =
+    80 + crate::format::column_block::ColumnId::COUNT as u64 * COLUMN_BLOCK_REF_SIZE as u64 + 20;
 
 /// Fetch enough of a V3 leaf blob to decode the header and full directory.
 ///
@@ -809,16 +810,19 @@ const MAX_DIR_ENTRY_BYTES: u64 = 80 + 6 * COLUMN_BLOCK_REF_SIZE as u64 + 20;
 /// directory that outgrows it is fetched once more at its exact upper bound
 /// (`leaflet_count` × the largest entry).
 ///
-/// Returns the parsed directory and payload base offset.
+/// Returns the parsed directory, the payload base offset, and the whole leaf
+/// when it fit inside the speculative read.
 pub fn fetch_header_and_directory(
     fetcher: &dyn RangeReadFetcher,
     leaf_cid: &ContentId,
-) -> io::Result<(DecodedLeafDirV3, u64)> {
+) -> io::Result<(DecodedLeafDirV3, u64, Option<Vec<u8>>)> {
     let mut buf = fetcher.fetch_range(leaf_cid, 0..SPECULATIVE_HEADER_DIR_BYTES)?;
     let header = decode_leaf_header_v3(&buf)?;
     if let Ok(dir) = decode_leaf_dir_v3_with_base(&buf, &header) {
         let payload_base = dir.payload_base as u64;
-        return Ok((dir, payload_base));
+        // A short read stopped at the end of the leaf.
+        let whole = ((buf.len() as u64) < SPECULATIVE_HEADER_DIR_BYTES).then_some(buf);
+        return Ok((dir, payload_base, whole));
     }
     let upper = LEAF_V3_HEADER_SIZE as u64 + header.leaflet_count as u64 * MAX_DIR_ENTRY_BYTES;
     if upper > buf.len() as u64 {
@@ -826,7 +830,7 @@ pub fn fetch_header_and_directory(
     }
     let dir = decode_leaf_dir_v3_with_base(&buf, &header)?;
     let payload_base = dir.payload_base as u64;
-    Ok((dir, payload_base))
+    Ok((dir, payload_base, None))
 }
 
 #[cfg(test)]
@@ -943,7 +947,8 @@ mod tests {
         let fetcher = Arc::new(fetcher);
 
         // Fetch header + directory.
-        let (dir, payload_base) = fetch_header_and_directory(fetcher.as_ref(), &leaf_cid).unwrap();
+        let (dir, payload_base, _) =
+            fetch_header_and_directory(fetcher.as_ref(), &leaf_cid).unwrap();
 
         let handle = RangeReadLeafHandle::new(
             leaf_cid,
@@ -975,7 +980,8 @@ mod tests {
         fetcher.insert(&leaf_cid, leaf_bytes);
         let fetcher = Arc::new(fetcher);
 
-        let (dir, payload_base) = fetch_header_and_directory(fetcher.as_ref(), &leaf_cid).unwrap();
+        let (dir, payload_base, _) =
+            fetch_header_and_directory(fetcher.as_ref(), &leaf_cid).unwrap();
 
         // Clear request log after directory fetch.
         fetcher.requests.lock().unwrap().clear();
@@ -1056,7 +1062,7 @@ mod tests {
         fetcher.insert(&sidecar_cid, sidecar_bytes);
         let fetcher = Arc::new(fetcher);
 
-        let (mut dir, payload_base) =
+        let (mut dir, payload_base, _) =
             fetch_header_and_directory(fetcher.as_ref(), &leaf_cid).unwrap();
 
         // Patch directory entry with sidecar segment refs from the builder.
@@ -1144,7 +1150,7 @@ mod tests {
         fetcher.insert(&sidecar_cid, sidecar_bytes);
         let fetcher = Arc::new(fetcher);
 
-        let (mut dir, payload_base) =
+        let (mut dir, payload_base, _) =
             fetch_header_and_directory(fetcher.as_ref(), &leaf_cid).unwrap();
         dir.entries[0].history_offset = seg.offset;
         dir.entries[0].history_len = seg.len;
@@ -1192,7 +1198,7 @@ mod tests {
             let (bytes, cid) = leaf_with_leaflets(leaflets);
             let mut fetcher = MockFetcher::new();
             fetcher.insert(&cid, bytes);
-            let (dir, _) = fetch_header_and_directory(&fetcher, &cid).unwrap();
+            let (dir, _, _) = fetch_header_and_directory(&fetcher, &cid).unwrap();
             assert_eq!(dir.entries.len() as u64, leaflets);
             assert_eq!(
                 fetcher.request_count(),
@@ -1219,7 +1225,7 @@ mod tests {
         let mut fetcher = MockFetcher::new();
         fetcher.insert(&leaf.leaf_cid, leaf.leaf_bytes);
         let fetcher = Arc::new(fetcher);
-        let (dir, payload_base) =
+        let (dir, payload_base, _) =
             fetch_header_and_directory(fetcher.as_ref(), &leaf.leaf_cid).unwrap();
         let leaflets = dir.entries.len();
         assert_eq!(leaflets, 20);
