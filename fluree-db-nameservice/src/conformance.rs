@@ -964,6 +964,63 @@ pub async fn mirror_binds_the_origin_instance<S: LifecycleStore + crate::NameSer
     assert_eq!(copy.instance(), Some(lifecycle::legacy_instance("old")));
 }
 
+/// A copy's index head reads the same through `lookup` and `get_ref`, and a
+/// compare-and-swap from what `get_ref` read succeeds. A mirror (or a
+/// restore) carries the head in the record itself, beside no index of its
+/// own yet.
+pub async fn a_mirrored_index_head_reads_and_swaps_as_one<
+    S: crate::NameServicePublisher + LifecycleStore,
+>(
+    store: &S,
+) {
+    use crate::RefKind;
+    use fluree_db_core::ContentKind;
+    let origin = crate::memory::MemoryNameService::new();
+    let mut sent = lifecycle::create_ledger(&origin, &id("mydb"))
+        .await
+        .unwrap();
+    sent.commit_head_id = Some(cid(ContentKind::Commit, "c7"));
+    sent.commit_t = 7;
+    sent.index_head_id = Some(cid(ContentKind::IndexRoot, "i5"));
+    sent.index_t = 5;
+    lifecycle::mirror_record(store, &sent).await.unwrap();
+
+    let copy = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!(copy.index_head_id, sent.index_head_id);
+    assert_eq!(copy.index_t, 5);
+    let read = store
+        .get_ref("mydb:main", RefKind::IndexHead)
+        .await
+        .unwrap()
+        .expect("an index head");
+    assert_eq!((read.id.as_ref(), read.t), (sent.index_head_id.as_ref(), 5));
+
+    let next = crate::RefValue {
+        id: Some(cid(ContentKind::IndexRoot, "i6")),
+        t: 6,
+    };
+    let swapped = store
+        .compare_and_set_ref_fenced(
+            "mydb:main",
+            copy.fence,
+            RefKind::IndexHead,
+            Some(&read),
+            &next,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(swapped, crate::CasResult::Updated), "{swapped:?}");
+    let copy = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!((copy.index_head_id, copy.index_t), (next.id.clone(), 6));
+    assert_eq!(
+        store
+            .get_ref("mydb:main", RefKind::IndexHead)
+            .await
+            .unwrap(),
+        Some(next)
+    );
+}
+
 fn assert_fenced<T: std::fmt::Debug>(result: crate::Result<T>, write: &str) {
     match result {
         Err(NameServiceError::Fenced(_)) => {}
@@ -1752,6 +1809,7 @@ where
     a_dropped_branch_reads_as_absent(&make().await).await;
     unknown_binding_fields_survive_rewrites(&make().await).await;
     a_graph_source_keeps_its_key(&make().await).await;
+    a_mirrored_index_head_reads_and_swaps_as_one(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1803,6 +1861,7 @@ macro_rules! lifecycle_conformance_tests {
             a_dropped_branch_reads_as_absent,
             unknown_binding_fields_survive_rewrites,
             a_graph_source_keeps_its_key,
+            a_mirrored_index_head_reads_and_swaps_as_one,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {

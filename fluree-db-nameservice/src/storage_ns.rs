@@ -1085,14 +1085,14 @@ where
     /// Run `write`, an index-file write presenting `fence`, once more when
     /// its refusal was a stale caller's index file, which
     /// [`ns_cas::repair_index_file`] replaces.
-    async fn with_index_repair<Fut>(
+    async fn with_index_repair<T, Fut>(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         write: impl Fn() -> Fut,
-    ) -> Result<()>
+    ) -> Result<T>
     where
-        Fut: std::future::Future<Output = Result<()>>,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         let outcome = write().await;
         if matches!(outcome, Err(NameServiceError::Fenced(_))) {
@@ -1231,54 +1231,10 @@ where
                     t: f.t,
                 }))
             }
-            RefKind::IndexHead => {
-                // Read both main and index files, take the one with higher t
-                // (same merge rule as load_record)
-                let main_key = self.ns_key(&ledger_name, &branch);
-                let index_key = self.index_key(&ledger_name, &branch);
-
-                // A deleted record has no heads, whatever its index file says.
-                let main_file: Option<NsFileV2> = self
-                    .read_json::<NsFileV2>(&main_key)
-                    .await?
-                    .filter(|f| !f.is_deleted());
-                let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
-
-                let main_index = main_file.as_ref().and_then(|f| {
-                    f.index.as_ref().map(|i| RefValue {
-                        id: i.cid.as_deref().and_then(|s| s.parse::<ContentId>().ok()),
-                        t: i.t,
-                    })
-                });
-
-                let separate_index = index_file.map(|f| RefValue {
-                    id: f
-                        .index
-                        .cid
-                        .as_deref()
-                        .and_then(|s| s.parse::<ContentId>().ok()),
-                    t: f.index.t,
-                });
-
-                // If main file doesn't exist at all, the ref is unknown
-                if main_file.is_none() {
-                    return Ok(None);
-                }
-
-                // Merge: take whichever has higher t, preferring separate index file
-                match (main_index, separate_index) {
-                    (None, None) => Ok(Some(RefValue { id: None, t: 0 })),
-                    (Some(m), None) => Ok(Some(m)),
-                    (None, Some(s)) => Ok(Some(s)),
-                    (Some(m), Some(s)) => {
-                        if s.t >= m.t {
-                            Ok(Some(s))
-                        } else {
-                            Ok(Some(m))
-                        }
-                    }
-                }
-            }
+            RefKind::IndexHead => Ok(self
+                .load_heads(&ledger_name, &branch)
+                .await?
+                .map(|heads| heads.index)),
         }
     }
 }
@@ -1381,109 +1337,18 @@ where
                 }
             }
             RefKind::IndexHead => {
-                let key = self.index_key(&ledger_name, &branch);
-                let new_cid = new.id.clone();
-                let new_t = new.t;
-                let expected_id = expected.and_then(|e| e.id.clone());
-                let expect_exists = expected.is_some();
-
-                let outcome = self
-                    .cas_update_with_outcome_fenced::<NsIndexFileV2, _, _>(
-                        ledger_id,
-                        &key,
-                        move |current| index_admits(current, fence),
-                        move |existing| {
-                            let current_ref = existing.as_ref().map(|f| RefValue {
-                                id: f
-                                    .index
-                                    .cid
-                                    .as_deref()
-                                    .and_then(|s| s.parse::<ContentId>().ok()),
-                                t: f.index.t,
-                            });
-
-                            match (expect_exists, &current_ref) {
-                                (false, None) => {
-                                    // Create new index record
-                                    return CasUpdateDecision::Apply(NsIndexFileV2 {
-                                        context: ns_context(),
-                                        index: IndexRef {
-                                            cid: new_cid
-                                                .as_ref()
-                                                .map(std::string::ToString::to_string),
-                                            t: new_t,
-                                        },
-                                        fence,
-                                        frozen: false,
-                                        extra: Default::default(),
-                                    });
-                                }
-                                (false, Some(actual)) => {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: Some(actual.clone()),
-                                    });
-                                }
-                                (true, None) => {
-                                    // The separate index file doesn't exist yet.
-                                    // get_ref returns Some(RefValue { id: None, t: 0 })
-                                    // for a freshly created ledger (from the main file
-                                    // fallback). Allow if the caller expected that empty
-                                    // state; otherwise conflict.
-                                    let expected_is_empty = expected_id.is_none();
-                                    if !expected_is_empty {
-                                        return CasUpdateDecision::Skip(CasResult::Conflict {
-                                            actual: None,
-                                        });
-                                    }
-                                    // Treat as create — fall through to apply
-                                    return CasUpdateDecision::Apply(NsIndexFileV2 {
-                                        context: ns_context(),
-                                        index: IndexRef {
-                                            cid: new_cid
-                                                .as_ref()
-                                                .map(std::string::ToString::to_string),
-                                            t: new_t,
-                                        },
-                                        fence,
-                                        frozen: false,
-                                        extra: Default::default(),
-                                    });
-                                }
-                                (true, Some(actual)) => {
-                                    // Compare by content id
-                                    let identity_matches = match (&expected_id, &actual.id) {
-                                        (Some(a), Some(b)) => a == b,
-                                        (None, None) => true,
-                                        _ => false,
-                                    };
-                                    if !identity_matches {
-                                        return CasUpdateDecision::Skip(CasResult::Conflict {
-                                            actual: Some(actual.clone()),
-                                        });
-                                    }
-                                    // Non-strict for IndexHead: new.t >= current.t
-                                    if new_t < actual.t {
-                                        return CasUpdateDecision::Skip(CasResult::Conflict {
-                                            actual: Some(actual.clone()),
-                                        });
-                                    }
-                                }
-                            }
-
-                            let mut file = existing.unwrap();
-                            file.index = IndexRef {
-                                cid: new_cid.as_ref().map(std::string::ToString::to_string),
-                                t: new_t,
-                            };
-                            CasUpdateDecision::Apply(file)
-                        },
-                    )
-                    .await?;
-
-                match outcome {
-                    CasUpdateOutcome::Updated => Ok(CasResult::Updated),
-                    CasUpdateOutcome::Skipped(cas) => Ok(cas),
-                }
+                let (main, index) = (
+                    self.ns_key(&ledger_name, &branch),
+                    self.index_key(&ledger_name, &branch),
+                );
+                let keys = RecordKeys {
+                    main: &main,
+                    index: &index,
+                };
+                self.with_index_repair(ledger_id, fence, || {
+                    ns_cas::cas_index_head(&self.storage, keys, ledger_id, fence, expected, new)
+                })
+                .await
             }
         }
     }

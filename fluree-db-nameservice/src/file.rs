@@ -1175,14 +1175,14 @@ impl FileNameService {
     /// Run `write`, an index-file write presenting `fence`, once more when
     /// its refusal was a stale caller's index file, which
     /// [`ns_cas::repair_index_file`] replaces.
-    async fn with_index_repair<Fut>(
+    async fn with_index_repair<T, Fut>(
         &self,
         ledger_id: &str,
         fence: Option<Fence>,
         write: impl Fn() -> Fut,
-    ) -> Result<()>
+    ) -> Result<T>
     where
-        Fut: std::future::Future<Output = Result<()>>,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         let outcome = write().await;
         if matches!(outcome, Err(NameServiceError::Fenced(_))) {
@@ -1549,43 +1549,10 @@ impl RefLookup for FileNameService {
                     })),
                 }
             }
-            RefKind::IndexHead => {
-                // A deleted record has no heads, whatever its index file says.
-                let main_address = Self::ns_address(&ledger_name, &branch);
-                let main_file: Option<NsFileV2> =
-                    self.read_json_from_address(&main_address).await?;
-                if main_file.as_ref().is_some_and(NsFileV2::is_deleted) {
-                    return Ok(None);
-                }
-                // Check separate index file first, then fall back to main file.
-                let index_address = Self::index_address(&ledger_name, &branch);
-                let index_file: Option<NsIndexFileV2> =
-                    self.read_json_from_address(&index_address).await?;
-
-                if let Some(idx) = index_file {
-                    return Ok(Some(RefValue {
-                        id: idx
-                            .index
-                            .cid
-                            .as_deref()
-                            .and_then(|s| s.parse::<ContentId>().ok()),
-                        t: idx.index.t,
-                    }));
-                }
-
-                // Fall back to main file's inline index.
-                match main_file {
-                    None => Ok(None),
-                    Some(f) => Ok(Some(RefValue {
-                        id: f
-                            .index
-                            .as_ref()
-                            .and_then(|i| i.cid.as_deref())
-                            .and_then(|s| s.parse::<ContentId>().ok()),
-                        t: f.index.as_ref().map(|i| i.t).unwrap_or(0),
-                    })),
-                }
-            }
+            RefKind::IndexHead => Ok(self
+                .load_heads(&ledger_name, &branch)
+                .await?
+                .map(|heads| heads.index)),
         }
     }
 }
@@ -1728,95 +1695,15 @@ impl RefPublisher for FileNameService {
             }
 
             RefKind::IndexHead => {
-                let address = Self::index_address(&ledger_name, &branch);
-
-                // Pre-read the main file's inline index ref so we can fall
-                // back to it when the separate index file doesn't exist yet.
-                // This matches the fallback logic in `get_ref(IndexHead)`.
-                let main_address = Self::ns_address(&ledger_name, &branch);
-                let main_file_inline_ref: Option<RefValue> = {
-                    let main_file: Option<NsFileV2> =
-                        self.read_json_from_address(&main_address).await?;
-                    main_file.map(|f| RefValue {
-                        id: f
-                            .index
-                            .as_ref()
-                            .and_then(|i| i.cid.as_deref())
-                            .and_then(|s| s.parse::<ContentId>().ok()),
-                        t: f.index.as_ref().map(|i| i.t).unwrap_or(0),
-                    })
+                let (main, index) = Self::record_keys(ledger_id)?;
+                let keys = RecordKeys {
+                    main: &main,
+                    index: &index,
                 };
-
-                let outcome = self
-                    .storage
-                    .compare_and_swap(&address, move |bytes| {
-                        let existing: Option<NsIndexFileV2> =
-                            bytes.map(deserialize_json).transpose()?;
-                        if !index_admits(existing.as_ref(), fence) {
-                            return Ok(CasAction::Abort(Err(FenceRefused)));
-                        }
-
-                        // When the separate index file doesn't exist yet,
-                        // use the main file's inline index ref (matches get_ref
-                        // fallback). This handles freshly created ledgers where
-                        // the main file has index: None but no separate index
-                        // file has been written.
-                        let current_ref = match existing.as_ref() {
-                            Some(f) => Some(RefValue {
-                                id: f
-                                    .index
-                                    .cid
-                                    .as_deref()
-                                    .and_then(|s| s.parse::<ContentId>().ok()),
-                                t: f.index.t,
-                            }),
-                            None => main_file_inline_ref.clone(),
-                        };
-
-                        if let Some(conflict) = check_cas_expectation(
-                            &expected_clone,
-                            &current_ref,
-                            true,
-                            ref_values_match,
-                            |actual| CasResult::Conflict { actual },
-                        ) {
-                            return Ok(CasAction::Abort(Ok(conflict)));
-                        }
-
-                        // Monotonic guard: IndexHead allows new.t >= current.t
-                        if let Some(ref cur) = current_ref {
-                            if new_clone.t < cur.t {
-                                return Ok(CasAction::Abort(Ok(CasResult::Conflict {
-                                    actual: Some(cur.clone()),
-                                })));
-                            }
-                        }
-
-                        // Apply update: CID goes into IndexRef.cid.
-                        let file = NsIndexFileV2 {
-                            context: ns_context(),
-                            index: IndexRef {
-                                cid: new_clone.id.as_ref().map(std::string::ToString::to_string),
-                                t: new_clone.t,
-                            },
-                            fence,
-                            frozen: false,
-                            extra: Default::default(),
-                        };
-                        let new_bytes = serialize_json(&file)?;
-                        Ok(CasAction::Write(new_bytes))
-                    })
-                    .await?;
-
-                let result = match outcome {
-                    CasOutcome::Written => CasResult::Updated,
-                    CasOutcome::Aborted(Ok(r)) => r,
-                    CasOutcome::Aborted(Err(FenceRefused)) => {
-                        return Err(NameServiceError::fenced(ledger_id))
-                    }
-                };
-
-                Ok(result)
+                self.with_index_repair(ledger_id, fence, || {
+                    ns_cas::cas_index_head(&self.storage, keys, ledger_id, fence, expected, new)
+                })
+                .await
             }
         }
     }

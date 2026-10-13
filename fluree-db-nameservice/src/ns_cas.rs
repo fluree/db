@@ -13,7 +13,10 @@ use crate::binding::{FenceOutcome, RegistryCas, Versioned};
 use crate::ns_format::{
     ns_context, IndexRef, NsFileV2, NsIndexFileV2, STATUS_DELETED, STATUS_FROZEN,
 };
-use crate::{deserialize_json, serialize_json, Fence, NameServiceError, NsRecord, Result};
+use crate::{
+    deserialize_json, serialize_json, CasResult, Fence, NameServiceError, NsRecord, RefValue,
+    Result,
+};
 use fluree_db_core::{CasAction, CasOutcome, StorageCas, StorageRead};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -263,6 +266,76 @@ where
         })
         .await?;
     Ok(false)
+}
+
+/// Compare-and-swap the index head of the record at `keys`, presenting
+/// `fence`, from `expected` to `new` (`new.t` at least the current `t`).
+///
+/// The head compared is the one reads see: the higher of the record's
+/// inline index and its index file's. A restore or a mirror writes the head
+/// inline beside an empty index file, so the file alone would refuse a swap
+/// from the head every reader reports.
+pub(crate) async fn cas_index_head<S>(
+    storage: &S,
+    keys: RecordKeys<'_>,
+    ledger_id: &str,
+    fence: Option<Fence>,
+    expected: Option<&RefValue>,
+    new: &RefValue,
+) -> Result<CasResult>
+where
+    S: StorageCas + StorageRead + ?Sized,
+{
+    let main = read_bytes(storage, keys.main)
+        .await?
+        .filter(|b| crate::ns_format::is_ledger_main_record(b))
+        .map(|b| serde_json::from_slice::<NsFileV2>(&b))
+        .transpose()?;
+    let Some(main) = main.filter(|main| main.admits(fence)) else {
+        return Err(NameServiceError::fenced(ledger_id));
+    };
+    let inline = main
+        .index
+        .map_or(RefValue { id: None, t: 0 }, |i| i.to_ref());
+    let expected = expected.cloned();
+    let new = new.clone();
+    let outcome = storage
+        .compare_and_swap(keys.index, move |bytes| {
+            let existing: Option<NsIndexFileV2> = bytes.map(deserialize_json).transpose()?;
+            // Admitted, the file carries the record's fence and so counts.
+            let Some(mut file) = existing.filter(|file| file.admits(fence)) else {
+                return Ok(CasAction::Abort(Err(FenceRefused)));
+            };
+            let current = match file.index.to_ref() {
+                separate if separate.t >= inline.t => separate,
+                _ => inline.clone(),
+            };
+            if let Some(conflict) = crate::check_cas_expectation(
+                &expected,
+                &Some(current.clone()),
+                false,
+                crate::ref_values_match,
+                |actual| CasResult::Conflict { actual },
+            ) {
+                return Ok(CasAction::Abort(Ok(conflict)));
+            }
+            if new.t < current.t {
+                return Ok(CasAction::Abort(Ok(CasResult::Conflict {
+                    actual: Some(current),
+                })));
+            }
+            file.index = IndexRef {
+                cid: new.id.as_ref().map(ToString::to_string),
+                t: new.t,
+            };
+            Ok(CasAction::Write(serialize_json(&file)?))
+        })
+        .await?;
+    match outcome {
+        CasOutcome::Written => Ok(CasResult::Updated),
+        CasOutcome::Aborted(Ok(result)) => Ok(result),
+        CasOutcome::Aborted(Err(FenceRefused)) => Err(NameServiceError::fenced(ledger_id)),
+    }
 }
 
 /// After an index write presenting `fence` was refused: when the record at

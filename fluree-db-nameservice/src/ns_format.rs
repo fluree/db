@@ -365,6 +365,18 @@ pub(crate) struct IndexRef {
     pub t: i64,
 }
 
+impl IndexRef {
+    pub(crate) fn to_ref(&self) -> RefValue {
+        RefValue {
+            id: self
+                .cid
+                .as_deref()
+                .and_then(|s| s.parse::<ContentId>().ok()),
+            t: self.t,
+        }
+    }
+}
+
 /// JSON-LD representation of a branch point in an ns@v3 file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BranchPointRef {

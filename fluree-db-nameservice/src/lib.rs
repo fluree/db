@@ -534,12 +534,9 @@ pub trait NameServiceLookup:
     /// and, on remote backends, more items per read.
     ///
     /// `None` follows [`RefLookup::get_ref`] on the same backend — an
-    /// unknown ledger, and (where the backend tombstones) a retracted one.
-    /// That correspondence is about **existence only**, not values: the file
-    /// backend's `get_ref(IndexHead)` prefers the separate index file
-    /// unconditionally, where this and [`lookup`](Self::lookup) apply the
-    /// read-time `>=` merge, so the two can disagree on a stale index file.
-    /// Where they differ, `heads` sides with `lookup`.
+    /// unknown ledger, and (where the backend tombstones) a retracted one —
+    /// and the heads are the ones `get_ref` and [`lookup`](Self::lookup)
+    /// report.
     ///
     /// Retraction is not applied uniformly across backends — raft tombstones
     /// on this surface, file/DynamoDB/memory do not. See #1670.
