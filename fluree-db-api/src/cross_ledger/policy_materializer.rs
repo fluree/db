@@ -85,9 +85,9 @@ pub(super) async fn materialize_policy_rules(
     ctx: &ResolveCtx<'_>,
 ) -> Result<PolicyArtifactWire, CrossLedgerError> {
     let resolved_t = head.t;
-    // 1. Open M at resolved_t.
+    // 1. Open M at its head.
     let m_db = ctx
-        .open_model_db(canonical_model_ledger_id, resolved_t)
+        .open_model_db(canonical_model_ledger_id, head)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),

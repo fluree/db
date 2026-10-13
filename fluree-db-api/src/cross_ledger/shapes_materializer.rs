@@ -42,7 +42,7 @@ pub(super) async fn materialize_shapes(
 ) -> Result<ShapesArtifactWire, CrossLedgerError> {
     let resolved_t = head.t;
     let m_db = ctx
-        .open_model_db(canonical_model_ledger_id, resolved_t)
+        .open_model_db(canonical_model_ledger_id, head)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),

@@ -12,7 +12,7 @@
 
 #![cfg(all(feature = "native", feature = "shacl"))]
 
-use crate::support::genesis_ledger;
+use crate::support::{genesis_ledger, instances_sharing_storage};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
@@ -884,6 +884,109 @@ async fn recreated_model_ledger_shapes_replace_the_cached_compile() {
     nameless_bob()
         .await
         .expect("the new M's deactivated shape must no longer reject");
+}
+
+const US_STATE_SHAPES_GRAPH: &str = "http://example.org/governance/shapes";
+
+/// Commit model ledger `model`: a shape whose `ex:homeState` must be an
+/// `ex:USState`, and the vocabulary of `states`, in one graph.
+async fn seed_us_state_model(fluree: &fluree_db_api::Fluree, model: &str, states: &[&str]) {
+    let members: String = states
+        .iter()
+        .map(|state| format!("ex:{state} rdf:type ex:USState .\n"))
+        .collect();
+    fluree
+        .stage_owned(genesis_ledger(fluree, &format!("{model}:main")))
+        .upsert_turtle(&format!(
+            r"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{US_STATE_SHAPES_GRAPH}> {{
+                ex:PersonShape rdf:type sh:NodeShape ;
+                               sh:targetClass ex:Person ;
+                               sh:property ex:pshape_state .
+                ex:pshape_state sh:path ex:homeState ; sh:class ex:USState .
+                {members}
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M");
+}
+
+/// `sh:class` membership is read from M itself, not from the shapes wire.
+/// With M recreated by another instance sharing the storage and nameservice,
+/// nothing clears this instance's cached handle of the dropped M, which sits
+/// at the `t` the new M reaches. Membership still comes from the new M.
+#[tokio::test]
+async fn sh_class_membership_follows_a_model_recreated_by_another_instance() {
+    let (writer, reader) = instances_sharing_storage();
+    let model = "test/cross-ledger-shapes/recreate-vocab-model";
+    let data_id = "test/cross-ledger-shapes/recreate-vocab-data:main";
+    seed_us_state_model(&writer, model, &["illinois", "iowa"]).await;
+    let config_iri = config_graph_iri(data_id);
+    writer
+        .stage_owned(genesis_ledger(&writer, data_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model}:main> ;
+                                     f:graphSelector <{US_STATE_SHAPES_GRAPH}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger SHACL config");
+
+    let from_illinois = |person: &'static str| {
+        let reader = &reader;
+        async move {
+            reader
+                .graph(data_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"ex": "http://example.org/ns/"},
+                    "@id": person,
+                    "@type": "ex:Person",
+                    "ex:homeState": {"@id": "ex:illinois"}
+                }))
+                .commit()
+                .await
+        }
+    };
+    from_illinois("ex:alice")
+        .await
+        .expect("M lists Illinois, and the reader caches M");
+
+    writer
+        .drop_ledger(model, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop M");
+    seed_us_state_model(&writer, model, &["iowa"]).await;
+
+    let err = from_illinois("ex:bob")
+        .await
+        .expect_err("the new M does not list Illinois");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "expected ShaclViolation, got: {err:?}"
+    );
 }
 
 /// A `f:shapesSource` whose `f:ledger` names the data ledger itself is a

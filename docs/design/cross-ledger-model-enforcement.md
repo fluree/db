@@ -135,8 +135,10 @@ The helper performs, in order:
    error. Two different `atT` pins of the same `(ledger, graph)` are
    not a cycle; the same triple is. Push the tuple onto `active`
    before recursing into transitive imports.
-6. **Translation and materialization.** The graph at `resolved_t` is
-   read and projected into term-neutral form (see next section).
+6. **Translation and materialization.** The graph at M's head is
+   read and projected into term-neutral form (see next section). A
+   cached handle of M serves the read only when its head is that
+   commit; otherwise M is loaded from storage at `resolved_t`.
    Pop the tuple from `active` and insert the resolved artifact into
    `ctx.memo` and the global cache.
 7. **Caching.** On cache hit the materialized artifact is returned
@@ -314,7 +316,10 @@ entry never short-circuits a `Shapes` lookup of the same
 `(M, graph, head)`. `t` alone is not M's identity: a ledger dropped
 and created again under M's name restarts at `t` 1, so the head
 commit is what keeps it from being served the dropped ledger's
-artifacts. New commits to M produce new keys without explicit
+artifacts. The artifact stored under a key is read at that commit too,
+so an instance sharing storage with the one that dropped and recreated
+M never fills the new key from its cached handle of the dropped
+ledger. New commits to M produce new keys without explicit
 invalidation; unreferenced entries age out under the cache's eviction
 policy. There is no "watermark-on-write" channel.
 

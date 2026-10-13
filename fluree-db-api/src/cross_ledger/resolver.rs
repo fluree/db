@@ -241,6 +241,7 @@ async fn materialize(
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 resolved_t: head.t,
+                commit_id: head.commit_id.clone(),
                 artifact: GovernanceArtifact::PolicyRules(wire),
             })
         }
@@ -256,6 +257,7 @@ async fn materialize(
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 resolved_t: head.t,
+                commit_id: head.commit_id.clone(),
                 artifact: GovernanceArtifact::Constraints(wire),
             })
         }
@@ -271,6 +273,7 @@ async fn materialize(
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 resolved_t: head.t,
+                commit_id: head.commit_id.clone(),
                 artifact: GovernanceArtifact::SchemaClosure(wire),
             })
         }
@@ -286,6 +289,7 @@ async fn materialize(
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 resolved_t: head.t,
+                commit_id: head.commit_id.clone(),
                 artifact: GovernanceArtifact::Shapes(wire),
             })
         }
@@ -301,6 +305,7 @@ async fn materialize(
                 model_ledger_id: canonical_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 resolved_t: head.t,
+                commit_id: head.commit_id.clone(),
                 artifact: GovernanceArtifact::Rules(wire),
             })
         }

@@ -851,7 +851,7 @@ pub(crate) fn namespace_prefix_map(ns_registry: &NamespaceRegistry) -> HashMap<u
 }
 
 /// Resolve a cross-ledger `f:shapesSource` (if the config carries one) and
-/// open the model ledger at the resolved `t`. Returns `None` when the config
+/// open the model ledger at the resolved head. Returns `None` when the config
 /// has no cross-ledger shapes source. The wire itself is served from the
 /// governance cache when M's head hasn't advanced — the only per-call cost in
 /// the steady state is one nameservice head lookup.
@@ -863,8 +863,12 @@ pub(crate) async fn open_cross_ledger_shapes_model(
     let Some(resolved) = resolve_cross_ledger_shapes_for_tx(config, resolve_ctx).await? else {
         return Ok(None);
     };
+    let head = crate::cross_ledger::ModelHead {
+        t: resolved.resolved_t,
+        commit_id: resolved.commit_id.clone(),
+    };
     let model_db = resolve_ctx
-        .open_model_db(&resolved.model_ledger_id, resolved.resolved_t)
+        .open_model_db(&resolved.model_ledger_id, &head)
         .await
         .map_err(|e| {
             fluree_db_transact::TransactError::Parse(format!(

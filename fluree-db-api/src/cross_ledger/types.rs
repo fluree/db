@@ -89,6 +89,8 @@ pub struct ResolvedGraph {
     pub graph_iri: String,
     /// Model ledger `t` at which the artifact was materialized.
     pub resolved_t: i64,
+    /// Model ledger head commit at `resolved_t`.
+    pub commit_id: Option<ContentId>,
     /// The artifact itself, tagged by subsystem. Pattern-match this
     /// against the expected `GovernanceArtifact` variant for the
     /// requesting `ArtifactKind`.
@@ -624,36 +626,41 @@ impl<'a> ResolveCtx<'a> {
         self
     }
 
-    /// Open the model ledger at `t` for a materializer.
+    /// Open the model ledger at `head` for a materializer.
+    ///
+    /// A state is used only at the head's commit, not just its `t`, so what
+    /// is materialized matches the key it is cached under.
     ///
     /// A model that is the data ledger itself never goes through the ledger
     /// cache: the request resolving it may hold that ledger's write lock
     /// (staging does), and the cache's read of the same lock would wait on
     /// it forever. It is served from the state the caller passed, at the
-    /// same `t`, or loaded without the cache otherwise.
+    /// same head, or loaded without the cache otherwise.
     pub async fn open_model_db(
         &self,
         canonical_model_ledger_id: &str,
-        t: i64,
+        head: &ModelHead,
     ) -> crate::error::Result<GraphDb> {
         if canonical_model_ledger_id != self.data_ledger_id {
             return self
                 .fluree
-                .load_graph_db_at_t(canonical_model_ledger_id, t)
+                .load_graph_db_at_commit(canonical_model_ledger_id, head.t, head.commit_id.as_ref())
                 .await;
         }
-        if let Some(state) = self.data_state.as_ref().filter(|s| s.t() == t) {
+        let at_head =
+            |state: &LedgerState| state.t() == head.t && state.head_commit_id == head.commit_id;
+        if let Some(state) = self.data_state.as_ref().filter(|s| at_head(s)) {
             return Ok(GraphDb::from_ledger_state(state));
         }
         let state = self
             .fluree
             .load_ledger_uncached(canonical_model_ledger_id)
             .await?;
-        if state.t() == t {
+        if at_head(&state) {
             return Ok(GraphDb::from_ledger_state(&state));
         }
         self.fluree
-            .load_graph_db_historical(canonical_model_ledger_id, t)
+            .load_graph_db_historical(canonical_model_ledger_id, head.t)
             .await
     }
 
@@ -844,6 +851,7 @@ mod tests {
             model_ledger_id: resolution_key.1.clone(),
             graph_iri: resolution_key.2.clone(),
             resolved_t: resolution_key.3.t,
+            commit_id: None,
             artifact: GovernanceArtifact::PolicyRules(PolicyArtifactWire {
                 origin: fluree_db_policy::WireOrigin {
                     model_ledger_id: resolution_key.1.clone(),

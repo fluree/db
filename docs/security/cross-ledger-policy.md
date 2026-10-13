@@ -662,7 +662,9 @@ the model ledger's head at the time of capture, its `t` and head
 commit id, so new commits to M, and a new ledger created under M's
 name after a drop, produce new cache keys automatically. The next request after M advances captures the
 new head; older entries age out under the cache's LRU/TinyLFU
-policy.
+policy. This holds across servers sharing the storage and
+nameservice: one whose ledger cache still holds a dropped M enforces
+the M created after it.
 
 Within a single request, every cross-ledger reference to the
 same M reuses one `resolved_t` value. Policy and any future
