@@ -467,7 +467,8 @@ fn cases() -> Vec<Case> {
 // Setup + runner
 // ---------------------------------------------------------------------------
 
-/// Insert + reindex with an explicit leaflet size. `leaflet_rows = 3` forces
+/// Insert + reindex with an explicit leaflet size, in leaves of ten leaflets.
+/// `leaflet_rows = 3` forces
 /// multi-leaflet predicates at test scale (the chain ledger's boundary-split
 /// shape); the default keeps single-leaflet layout.
 async fn setup_turtle(
@@ -498,7 +499,11 @@ async fn setup_turtle(
         .expect("insert");
     let mut opts = ReindexOptions::default();
     if let Some(rows) = leaflet_rows {
-        opts = opts.with_indexer_config(IndexerConfig::default().with_leaflet_rows(rows));
+        opts = opts.with_indexer_config(
+            IndexerConfig::default()
+                .with_leaflet_rows(rows)
+                .with_leaf_rows(rows * 10),
+        );
     }
     fluree.reindex(alias, opts).await.expect("reindex");
     (dir, fluree)

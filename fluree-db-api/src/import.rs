@@ -246,12 +246,9 @@ pub struct ImportConfig {
     /// [`fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS`].
     /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
     pub leaflet_rows: usize,
-    /// Number of leaflets per leaf file. Default: 10.
-    /// Larger values produce fewer, bigger leaf files (less tree depth, bigger reads).
-    pub leaflets_per_leaf: usize,
     /// Target rows per leaf. Default:
-    /// [`fluree_db_indexer::config::DEFAULT_LEAF_TARGET_ROWS`].
-    pub leaf_target_rows: usize,
+    /// [`fluree_db_indexer::config::DEFAULT_LEAF_ROWS`].
+    pub leaf_rows: usize,
     /// Optional progress callback invoked at key pipeline milestones.
     pub progress: Option<ProgressFn>,
     /// Optional execution tracker. When enabled, fuel is charged per chunk
@@ -328,8 +325,7 @@ impl Default for ImportConfig {
             max_inflight_chunks: 0,
             coalesce_small_files_threshold: 64,
             leaflet_rows: fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS,
-            leaflets_per_leaf: 10,
-            leaf_target_rows: fluree_db_indexer::config::DEFAULT_LEAF_TARGET_ROWS,
+            leaf_rows: fluree_db_indexer::config::DEFAULT_LEAF_ROWS,
             progress: None,
             tracker: Tracker::disabled(),
             ndjson_first_line_context: FirstLineContextPolicy::Auto,
@@ -3237,17 +3233,10 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
-    /// Set the number of leaflets per leaf file. Default: 10.
-    /// Larger values produce fewer leaf files (shallower tree).
-    pub fn leaflets_per_leaf(mut self, n: usize) -> Self {
-        self.config.leaflets_per_leaf = n;
-        self
-    }
-
     /// Set the target rows per leaf. Default:
-    /// [`fluree_db_indexer::config::DEFAULT_LEAF_TARGET_ROWS`].
-    pub fn leaf_target_rows(mut self, n: usize) -> Self {
-        self.config.leaf_target_rows = n;
+    /// [`fluree_db_indexer::config::DEFAULT_LEAF_ROWS`].
+    pub fn leaf_rows(mut self, n: usize) -> Self {
+        self.config.leaf_rows = n;
         self
     }
 
@@ -6271,7 +6260,7 @@ where
         let v3_index_dir = input.index_dir.to_path_buf();
         let v3_run_dir = input.run_dir.to_path_buf();
         let v3_leaflet_target_rows = config.leaflet_rows;
-        let v3_leaf_target_rows = config.leaf_target_rows;
+        let v3_leaf_target_rows = config.leaf_rows;
         let v3_run_budget = config.effective_run_budget_mb() * 1024 * 1024;
         let v3_worker_count = config.effective_heavy_workers();
         let v3_sorted_commit_infos = input.sorted_commit_infos;

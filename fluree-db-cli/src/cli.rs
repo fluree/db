@@ -356,17 +356,6 @@ pub enum Commands {
         #[arg(long)]
         skolem_namespace: Option<String>,
 
-        /// Records per leaflet in index files.
-        /// Larger values produce fewer, bigger leaflets (less per-leaflet
-        /// overhead, more decode per point read).
-        #[arg(long, default_value_t = fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS)]
-        leaflet_rows: usize,
-
-        /// Leaflets per leaf file. Default: 10.
-        /// Larger values produce fewer leaf files (shallower tree, bigger reads).
-        #[arg(long, default_value_t = 10)]
-        leaflets_per_leaf: usize,
-
         /// Create the ledger on a remote server (by remote name, e.g., "origin").
         /// Empty, or with `--from`: a `.flpack` archive is restored on the
         /// server, and a single source file is imported there when the server

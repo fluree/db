@@ -13,8 +13,6 @@ pub struct ImportOpts {
     pub chunk_size_mb: usize,
     /// Namespace salting minted blank-node ids. `None` = the ledger id.
     pub skolem_namespace: Option<String>,
-    pub leaflet_rows: usize,
-    pub leaflets_per_leaf: usize,
     /// CSV/Cypher import: how relationship (edge) properties are encoded.
     pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
     /// CSV/Cypher import: base IRI namespace for minted ids/predicates/classes.
@@ -550,12 +548,6 @@ async fn run_bulk_import(
     if let Some(ns) = import_opts.skolem_namespace.as_deref() {
         builder = builder.skolem_namespace(ns);
     }
-    if import_opts.leaflet_rows != fluree_db_indexer::config::DEFAULT_LEAFLET_ROWS {
-        builder = builder.leaflet_rows(import_opts.leaflet_rows);
-    }
-    if import_opts.leaflets_per_leaf != 10 {
-        builder = builder.leaflets_per_leaf(import_opts.leaflets_per_leaf);
-    }
     let settings = builder.effective_import_settings();
     let mem_auto = import_opts.memory_budget_mb == 0;
     let par_auto = import_opts.parallelism == 0;
@@ -613,9 +605,7 @@ async fn run_bulk_import(
                     "memory_budget_mb": settings.memory_budget_mb,
                     "parallelism": settings.parallelism,
                     "chunk_size_mb": settings.chunk_size_mb,
-                    "max_inflight_chunks": settings.max_inflight_chunks,
-                    "leaflet_rows": import_opts.leaflet_rows,
-                    "leaflets_per_leaf": import_opts.leaflets_per_leaf
+                    "max_inflight_chunks": settings.max_inflight_chunks
                 },
                 "status": "running",
                 "last_phase": "starting"

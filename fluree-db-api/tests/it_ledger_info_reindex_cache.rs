@@ -53,7 +53,7 @@ async fn ledger_info_cache_busts_on_reindex_allow_equal() {
             ReindexOptions::default().with_indexer_config(
                 IndexerConfig::default()
                     .with_leaflet_rows(10)
-                    .with_leaflets_per_leaf(1),
+                    .with_leaf_rows(10),
             ),
         )
         .await
@@ -78,7 +78,7 @@ async fn ledger_info_cache_busts_on_reindex_allow_equal() {
             ReindexOptions::default().with_indexer_config(
                 IndexerConfig::default()
                     .with_leaflet_rows(50)
-                    .with_leaflets_per_leaf(4),
+                    .with_leaf_rows(200),
             ),
         )
         .await

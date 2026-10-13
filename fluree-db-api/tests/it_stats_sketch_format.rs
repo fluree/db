@@ -31,7 +31,7 @@ type Storage = HookedStorage<IndexWriteCounts>;
 fn indexer_config() -> IndexerConfig {
     IndexerConfig::small()
         .with_leaflet_rows(10)
-        .with_leaflets_per_leaf(2)
+        .with_leaf_rows(20)
         .with_incremental_enabled(true)
         .with_incremental_max_commits(10_000)
 }

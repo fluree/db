@@ -25,7 +25,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
     // Use tiny leaflets/leaves so we can get multi-leaf indexes with small data.
     let indexer_cfg = IndexerConfig::small()
         .with_leaflet_rows(10)
-        .with_leaflets_per_leaf(2)
+        .with_leaf_rows(20)
         .with_incremental_enabled(true)
         .with_incremental_max_commits(10_000);
 

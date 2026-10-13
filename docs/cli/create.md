@@ -25,8 +25,6 @@ fluree create <LEDGER> [OPTIONS]
 | `--base-iri <IRI>` | CSV/Cypher import: base IRI namespace for minted ids, predicates, and classes. CSV defaults to `http://example.org/`; Cypher defaults to **bare names** (namespace 0), which zero-config Cypher queries read directly. |
 | `--no-user` | Exclude user-scoped memories (`.local/user.ttl`) from `--memory` import |
 | `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` or `.nt` file. |
-| `--leaflet-rows <N>` | Rows per leaflet in the binary index (default: 25000). Larger values produce fewer, bigger leaflets — less I/O per scan, more memory per read. |
-| `--leaflets-per-leaf <N>` | Leaflets per leaf file (default: 10). Larger values produce fewer leaf files — shallower tree, bigger reads. |
 
 **Global flags** that affect bulk import when using `--from` (see [CLI README](README.md#global-options)):
 
