@@ -294,7 +294,7 @@ fn flake_value_to_lexical(
         FlakeValue::String(s) => s.clone(),
         FlakeValue::Boolean(b) => b.to_string(),
         FlakeValue::Long(n) => n.to_string(),
-        FlakeValue::Double(f) => f.to_string(),
+        FlakeValue::Double(f) => fluree_graph_ir::canonical_xsd_double(*f),
         FlakeValue::BigInt(b) => b.to_string(),
         FlakeValue::Decimal(d) => d.to_string(),
         FlakeValue::DateTime(v) => v.to_string(),
