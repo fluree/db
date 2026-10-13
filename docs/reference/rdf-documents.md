@@ -43,7 +43,9 @@ The Rust `RdfFormat` also accepts common aliases such as `ttl`, `n-quads` and
   written back keeps its literals exactly.
 - **Blank nodes** keep the document's labels. An anonymous blank node (`[]`, a
   collection, an annotation) is labeled `bN`, avoiding any label the document
-  uses. Every parsed document can therefore be written in any format.
+  uses. Every parsed document can therefore be written in any format. A JSON-LD
+  label that starts with `-`, which no other syntax allows, gets one more `-`:
+  `_:-b1` is read as `--b1`.
 - **Errors:** a malformed document raises an error naming its line and column.
 
 The readers run the W3C RDF 1.1 and RDF 1.2 Turtle, TriG, N-Triples and N-Quads

@@ -166,9 +166,18 @@ fn emit_reification<S: GraphSink>(
 }
 
 /// A node or blank-node reference: `_:label` or an IRI.
+///
+/// A JSON-LD blank-node label is any string, so it can start with `-`, like
+/// the `-bN` labels sinks mint for anonymous nodes. Such a label gets one
+/// more `-`, which keeps it apart from every mint.
 fn node_term<S: GraphSink>(id: &str, sink: &mut S) -> TermId {
     if id.starts_with("_:") {
-        sink.term_blank(Some(strip_blank_prefix(id)))
+        let label = strip_blank_prefix(id);
+        if label.starts_with('-') {
+            sink.term_blank(Some(&format!("-{label}")))
+        } else {
+            sink.term_blank(Some(label))
+        }
     } else {
         sink.term_iri(id)
     }
@@ -1403,5 +1412,25 @@ mod tests {
             matches!(&err, AdapterError::InvalidStructure(msg) if msg.contains("@graph")),
             "{err:?}"
         );
+    }
+
+    /// `_:-b1` is a legal JSON-LD blank node, and stays apart from the
+    /// anonymous node a sink mints as `-b1`.
+    #[test]
+    fn blank_label_starting_with_dash_is_not_an_anonymous_node() {
+        let expanded = json!([{
+            "@id": "_:-b1",
+            "http://example.org/p": [{"@id": "http://example.org/x"}],
+            "http://example.org/q": [{"http://example.org/r": [{"@value": "anon"}]}]
+        }]);
+
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let graph = sink.graph();
+        let q = graph
+            .iter()
+            .find(|t| matches!(&t.p, Term::Iri(iri) if iri.as_ref() == "http://example.org/q"))
+            .unwrap();
+        assert_ne!(q.s, q.o, "the anonymous node merged with _:-b1");
     }
 }
