@@ -115,6 +115,11 @@ object is a triple term into a reification.
   `@reifies`.
 - **Literals:** each literal is written in its lexical form. A Python `float`
   is written in its shortest form (`0.9957`, not `9.957E-1`).
+- **Collections:** Turtle and TriG write a collection as `( … )` when its
+  nodes are blank nodes used nowhere else and its `rdf:rest` chain ends in
+  `rdf:nil`. Otherwise its `rdf:first` and `rdf:rest` triples are written as
+  they are. Writing parsed quads to a ledger therefore stores a collection as
+  a list, as inserting the document's text does.
 
 ## JSON-LD limits
 

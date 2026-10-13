@@ -402,7 +402,8 @@ text = fluree.serialize(quads, "jsonld", prefixes={"ex": "http://example.org/"})
   makes `name` `https://schema.org/name`). A property with no context entry is
   an error rather than dropped.
 - `ledger.insert(quads)` and `upsert(quads)` write quads, named graphs
-  included.
+  included. A collection is stored as a list, as inserting the document's
+  text stores it.
 - A document is read whole, and its quads are all built in memory: expect
   roughly ten times the document's size. To load a large file into a ledger,
   bulk-load it with `conn.create("name", source=Path("data.nq"))` rather than

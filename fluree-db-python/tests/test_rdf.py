@@ -237,6 +237,25 @@ def test_quads_write_to_a_ledger():
             ledger.insert(quads, format="jsonld")
 
 
+def test_a_collection_writes_to_a_ledger_as_its_text_does():
+    """Quads holding a collection write to a ledger as the document's own
+    ``( … )`` does: as a list, not as ``rdf:first``/``rdf:rest`` triples."""
+    doc = PREFIXES + "ex:s ex:list ( 1 2 ) . ex:g { ex:s ex:list ( ex:a ex:b ) }"
+    with fluree.connect(":memory:") as conn:
+        text, quads = conn.create("text"), conn.create("quads")
+        text.insert(doc, format="trig")
+        quads.insert(fluree.parse(doc, "trig"))
+        for ledger in (text, quads):
+            values = ledger.query(PREFIXES + "SELECT ?o WHERE { ex:s ex:list ?o }")
+            assert sorted(row.o for row in values) == [1, 2]
+            in_g = ledger.query(PREFIXES + "SELECT ?o WHERE { GRAPH ex:g { ex:s ex:list ?o } }")
+            assert sorted(row.o for row in in_g) == [ex("a"), ex("b")]
+        text_out, quads_out = (
+            fluree.parse(ledger.export(format="nquads", all_graphs=True), "nquads") for ledger in (text, quads)
+        )
+        assert _shape(quads_out) == _shape(text_out)
+
+
 RDF_TYPE = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 G = ex("g")
 
