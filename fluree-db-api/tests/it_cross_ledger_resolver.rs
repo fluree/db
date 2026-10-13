@@ -759,15 +759,16 @@ async fn single_resolution_t_is_stable_within_a_request() {
         resolved_b.resolved_t, t_at_first_resolution,
     );
 
-    // Verify resolved_ts cached the head exactly once. A new
+    // Verify resolved_heads cached the head exactly once. A new
     // request would re-capture against the advanced M; the cache
     // is per-request, not per-instance.
-    assert_eq!(ctx.resolved_ts.len(), 1);
+    assert_eq!(ctx.resolved_heads.len(), 1);
     assert_eq!(
-        ctx.resolved_ts
-            .get(&fluree_db_api::LedgerId::parse(model_id).unwrap()),
-        Some(&t_at_first_resolution),
-        "resolved_ts must store the captured t once per canonical model id"
+        ctx.resolved_heads
+            .get(&fluree_db_api::LedgerId::parse(model_id).unwrap())
+            .map(|head| head.t),
+        Some(t_at_first_resolution),
+        "resolved_heads must store the captured head once per canonical model id"
     );
 
     // Sanity: a new ResolveCtx against the same Fluree DOES re-capture
@@ -974,4 +975,88 @@ async fn empty_policy_graph_yields_empty_wire_artifact() {
         "non-policy data in graph must yield zero restrictions, got {}",
         wire.restrictions.len()
     );
+}
+
+/// A model ledger dropped and created again under its name restarts at the
+/// same `t`. Its head commit differs, so the resolution is a fresh one, never
+/// the artifact cached for the dropped ledger at that `t`.
+#[tokio::test]
+async fn recreated_model_ledger_is_not_served_the_dropped_ones_artifact() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger/recreate-model:main";
+    let graph = "http://example.org/recreate-policy";
+    let policy = |rule: &str, allow: bool| {
+        format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{graph}> {{
+                ex:{rule} rdf:type f:AccessPolicy ; f:action f:view ; f:allow {allow} .
+            }}
+        "
+        )
+    };
+    let seed = |rule: &'static str, allow: bool| {
+        let fluree = &fluree;
+        let policy = &policy;
+        async move {
+            fluree
+                .stage_owned(genesis_ledger(fluree, model_id))
+                .upsert_turtle(&policy(rule, allow))
+                .execute()
+                .await
+                .expect("seed M");
+        }
+    };
+
+    let data_id = "test/cross-ledger/recreate-data:main";
+    let _ = genesis_ledger(&fluree, data_id);
+    let data = fluree_db_api::LedgerId::parse(data_id).unwrap();
+    let graph_ref = cross_ref(model_id, graph);
+    let rules = |r: &fluree_db_api::cross_ledger::ResolvedGraph| match &r.artifact {
+        GovernanceArtifact::PolicyRules(wire) => wire
+            .restrictions
+            .iter()
+            .map(|x| x.id.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected PolicyRules, got {other:?}"),
+    };
+
+    seed("allowRule", true).await;
+    let before = resolve_graph_ref(
+        &graph_ref,
+        ArtifactKind::PolicyRules,
+        &mut ResolveCtx::new(&data, &fluree),
+    )
+    .await
+    .expect("resolve the first M");
+    assert_eq!(rules(&before), ["http://example.org/ns/allowRule"]);
+
+    fluree
+        .drop_ledger(
+            "test/cross-ledger/recreate-model",
+            fluree_db_api::DropMode::Hard,
+        )
+        .await
+        .expect("drop M");
+    seed("denyRule", false).await;
+
+    let after = resolve_graph_ref(
+        &graph_ref,
+        ArtifactKind::PolicyRules,
+        &mut ResolveCtx::new(&data, &fluree),
+    )
+    .await
+    .expect("resolve the recreated M");
+    assert_eq!(
+        after.resolved_t, before.resolved_t,
+        "the recreated M is at the dropped M's t"
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&before, &after),
+        "the recreated M must not be served the dropped M's cached artifact"
+    );
+    assert_eq!(rules(&after), ["http://example.org/ns/denyRule"]);
 }

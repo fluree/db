@@ -41,19 +41,9 @@ use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
 /// Convert a SPARQL IriValue to a string for use as a ledger identifier.
 ///
 /// - Full IRIs (from `<...>` syntax) return the IRI string directly
-/// - Prefixed IRIs return `prefix:local` (unexpanded)
-///
-/// # Note on Prefixed IRIs
-///
-/// SPARQL `FROM` clauses typically use full IRI syntax: `FROM <ledger:main>`.
-/// The angle brackets make this a full IRI, even if it looks like a CURIE.
-/// Actual prefixed names (`ex:graph` without brackets) would need the prologue
-/// prefix map to expand properly.
-///
-/// For dataset identifiers (ledger aliases), we expect full IRIs in `<...>` form.
-/// If prefixed names appear, they're passed through as-is and will likely fail
-/// nameservice resolution unless the identifier happens to match.
-fn iri_value_to_string(iri: &IriValue) -> String {
+/// - Prefixed names return `prefix:local`, not expanded against the prologue,
+///   so `FROM mq:p2` names the ledger `mq:p2`, as `FROM <mq:p2>` does
+pub(crate) fn iri_value_to_string(iri: &IriValue) -> String {
     match iri {
         IriValue::Full(s) => s.to_string(),
         IriValue::Prefixed { prefix, local } => {
@@ -818,6 +808,13 @@ impl DatasetSpec {
         validate_alias_uniqueness(&spec)?;
 
         Ok(spec)
+    }
+
+    /// The default-graph sources a JSON-LD `from` value names: a string, an
+    /// object naming one source by `@id` (or else `id`), or an array of
+    /// either. Errors if the value cannot be read.
+    pub fn default_graph_sources(from: &JsonValue) -> Result<Vec<GraphSource>, DatasetParseError> {
+        parse_graph_sources(from, "from")
     }
 
     /// Parse dataset + connection options from a query JSON object.

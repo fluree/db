@@ -25,7 +25,7 @@ use std::collections::HashSet;
 /// Term-neutral policy artifact materialized from a model ledger.
 ///
 /// Cached by the API layer keyed on `(origin.model_ledger_id,
-/// origin.graph_iri, origin.resolved_t)`.
+/// origin.graph_iri, origin.resolved_t, origin.commit_id)`.
 #[derive(Debug, Clone)]
 pub struct PolicyArtifactWire {
     /// Provenance for diagnostics and cache key derivation.
@@ -45,6 +45,8 @@ pub struct WireOrigin {
     pub graph_iri: String,
     /// Model ledger `t` at which the artifact was materialized.
     pub resolved_t: i64,
+    /// Model ledger head commit at `resolved_t`.
+    pub commit_id: Option<fluree_db_core::ContentId>,
 }
 
 /// IRI-form mirror of [`PolicyRestriction`].
@@ -278,6 +280,7 @@ mod tests {
             model_ledger_id: "test/model:main".into(),
             graph_iri: "http://example.org/policy".into(),
             resolved_t: 42,
+            commit_id: None,
         }
     }
 

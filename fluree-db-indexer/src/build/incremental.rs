@@ -35,7 +35,7 @@ use crate::run_index::build::incremental_branch::{
 };
 use crate::run_index::build::incremental_leaf::NewLeafBlob;
 use crate::run_index::build::incremental_resolve::{
-    resolve_incremental_commits_v6, IncrementalResolveConfig,
+    resolve_incremental_commits_v6, IncrementalResolveConfig, IncrementalResolveError,
 };
 use crate::run_index::build::incremental_root::IncrementalRootBuilder;
 use crate::{IndexResult, IndexStats, IndexerConfig};
@@ -727,7 +727,12 @@ pub async fn incremental_index(
         Arc::clone(&upload_budget),
     )
     .await
-    .map_err(|e| IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")))?;
+    .map_err(|e| match e {
+        IncrementalResolveError::Resolve(crate::run_index::ResolverError::Unindexable(msg)) => {
+            IndexerError::Unindexable(msg)
+        }
+        e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
+    })?;
 
     if novelty.records.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
