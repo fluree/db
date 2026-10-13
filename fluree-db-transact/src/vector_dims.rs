@@ -97,11 +97,13 @@ fn stored_length(
                 return Ok(indexed);
             }
         }
-        // An index this check cannot read could hold the length.
+        // An index this check cannot read could hold the length, so refuse.
+        // This is the process's state, not the request's, so it is not an
+        // `InvalidVector`.
         None if base.index_t() > 0 => {
-            return Err(TransactError::InvalidVector(
-                "cannot check the vector's length: the ledger's index is not loaded".to_string(),
-            ));
+            return Err(TransactError::Core(fluree_db_core::Error::other(
+                "cannot check a vector's length: the ledger's index is not loaded",
+            )));
         }
         None => {}
     }
@@ -172,6 +174,27 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into(),
         )
+    }
+
+    /// A ledger with an index this check cannot read refuses a vector write
+    /// rather than certify it; without an index there is nothing to read.
+    #[test]
+    fn an_index_that_is_not_loaded_refuses_a_vector() {
+        let p = Sid::new(100, "embedding");
+        let flakes = vec![flake(&p, vector(3, 0.5), 2, true)];
+        let check = |index_t: i64| {
+            let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            snapshot.t = index_t;
+            let base = LedgerState::new(snapshot, Novelty::new(index_t));
+            check_commit(&base, &flakes, || Ok(HashMap::new()), ToString::to_string)
+        };
+        check(0).expect("no index: the first vector sets the length");
+        match check(1) {
+            Err(TransactError::Core(e)) => {
+                assert!(e.to_string().contains("index is not loaded"), "{e}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
