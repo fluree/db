@@ -4955,19 +4955,9 @@ impl Fluree {
 
         let ledger_id = LedgerId::parse(ledger_id)?;
 
-        // Fast path: if min_t is set, check current cached t before hitting NS
-        if let Some(min_t) = opts.min_t {
-            if let Some(current_t) = mgr.current_t(&ledger_id).await {
-                if current_t >= min_t {
-                    return Ok(Some(RefreshResult {
-                        t: current_t,
-                        action: NotifyResult::Current,
-                    }));
-                }
-            }
-        }
-
-        // Step B: Lookup nameservice record
+        // Step B: Lookup nameservice record. Always, even when the cached `t`
+        // already meets `min_t`: a ledger created under the name since starts
+        // again at `t` 1, so only the record tells the two apart.
         let ns_record = match self.nameservice().lookup(&ledger_id).await? {
             Some(record) => record,
             // Gone, or never there: a cached state of it must not outlive it.

@@ -1,7 +1,7 @@
 //! Integration tests for `Fluree::refresh()` with `min_t` support.
 //!
 //! Verifies:
-//! - Fast path: `min_t <= cached_t` returns immediately without hitting NS
+//! - `min_t <= cached_t` returns `Current` once the nameservice confirms the cached ledger
 //! - `AwaitTNotReached` error when `min_t` exceeds the ledger's `t`
 //! - `LedgerManager::current_t()` returns correct values
 
@@ -60,7 +60,7 @@ async fn refresh_min_t_satisfied_returns_immediately() {
         .await
         .expect("ledger_cached");
 
-    // Refresh with min_t already satisfied — should return Current without NS lookup
+    // Refresh with min_t already satisfied — Current
     let result = fluree
         .refresh(ledger_id, RefreshOpts { min_t: Some(t) })
         .await
@@ -247,4 +247,46 @@ async fn refresh_follows_a_ledger_created_under_the_name_elsewhere() {
         .unwrap();
     assert_eq!(result, NotifyResult::Evicted);
     assert_eq!(mgr.current_t(&key).await, None, "no longer cached");
+}
+
+/// The same, with a `min_t` the dropped ledger's cached state already meets:
+/// the cached `t` says nothing about which ledger the name now holds.
+#[tokio::test]
+async fn refresh_with_min_t_follows_a_ledger_created_under_the_name_elsewhere() {
+    use fluree_db_api::{DropMode, LedgerId};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let open = || {
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("build")
+    };
+    let (here, elsewhere) = (open(), open());
+    let id = "it/refresh-min-t-replaced:main";
+    let key = LedgerId::parse(id).unwrap();
+    let tx = |label: &str| json!({"@context": {"ex": "http://example.org/"}, "@id": format!("ex:{label}"), "ex:name": label});
+
+    let mut ledger = here.create_ledger(id).await.unwrap();
+    for label in ["a1", "a2", "a3"] {
+        ledger = here.insert(ledger, &tx(label)).await.unwrap().ledger;
+    }
+    here.ledger_cached(id).await.unwrap();
+    let mgr = here.ledger_manager().expect("caching");
+
+    elsewhere
+        .drop_ledger("it/refresh-min-t-replaced", DropMode::Soft)
+        .await
+        .unwrap();
+    let ledger = elsewhere.create_ledger(id).await.unwrap();
+    elsewhere.insert(ledger, &tx("b1")).await.unwrap();
+
+    let refreshed = here
+        .refresh(id, RefreshOpts { min_t: Some(1) })
+        .await
+        .unwrap()
+        .expect("the name resolves");
+    assert_eq!(refreshed.action, NotifyResult::Reloaded);
+    assert_eq!(refreshed.t, 1);
+    assert_eq!(mgr.current_t(&key).await, Some(1), "the new ledger");
 }
