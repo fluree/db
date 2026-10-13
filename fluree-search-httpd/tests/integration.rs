@@ -245,6 +245,7 @@ mod http_tests {
                     ServiceError::GraphSourceNotFound { .. }
                     | ServiceError::NoSnapshotForAsOfT { .. }
                     | ServiceError::IndexNotBuilt { .. } => StatusCode::NOT_FOUND,
+                    ServiceError::GraphSourceSuspended { .. } => StatusCode::CONFLICT,
                     ServiceError::SyncTimeout { .. } | ServiceError::Timeout { .. } => {
                         StatusCode::GATEWAY_TIMEOUT
                     }

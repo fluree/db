@@ -107,8 +107,9 @@ dropped list, and is logged only when there was something to do.
 ## Before you upgrade
 
 1. **List every process that touches the store.** Servers and query peers,
-   CLIs working on a local store, applications that embed the Rust crate, and
-   serverless functions. All of them must move to this release together. A CLI
+   search services (`fluree-search-httpd`, which upgrades the store it opens
+   as a server does), CLIs working on a local store, applications that embed
+   the Rust crate, and serverless functions. All of them must move to this release together. A CLI
    that only talks to a server through `--remote` does not touch the store and
    can be upgraded on its own schedule; a 4.2 CLI's `fluree drop --remote`
    still asks for a hard drop, as it always did.

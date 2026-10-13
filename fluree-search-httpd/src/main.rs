@@ -35,7 +35,7 @@ use axum::{
 use clap::Parser;
 use fluree_db_core::{ContentStore, FileStorage};
 use fluree_db_nameservice::file::FileNameService;
-use fluree_db_nameservice::GraphSourceLookup;
+use fluree_db_nameservice::{GraphSourceLookup, GraphSourceRecord, NameServiceLookup};
 use fluree_db_query::bm25::{deserialize, Bm25Index, Bm25Manifest};
 #[cfg(feature = "vector")]
 use fluree_db_query::vector::usearch::{deserialize as vector_deserialize, VectorIndex};
@@ -116,6 +116,33 @@ fn open_nameservice(path: impl Into<PathBuf>) -> FileNameService {
     nameservice
 }
 
+/// Refuse `record`, a BM25 or vector index, while the name of the ledger it
+/// indexed holds another ledger, as the db refuses a query of it. A name
+/// that holds no ledger does not suspend it: the dropped ledger can still be
+/// restored.
+async fn check_not_suspended(
+    nameservice: &FileNameService,
+    record: &GraphSourceRecord,
+) -> ServiceResult<()> {
+    use fluree_db_nameservice::source_instance::{source_instance_mismatch, suspension_message};
+    let nameservice_err =
+        |e: fluree_db_nameservice::NameServiceError| ServiceError::NameserviceError {
+            message: e.to_string(),
+        };
+    let Some(source) = record.dependencies.first() else {
+        return Ok(());
+    };
+    let Some(ledger) = nameservice.lookup(source).await.map_err(nameservice_err)? else {
+        return Ok(());
+    };
+    match source_instance_mismatch(record, &ledger.storage_root()).map_err(nameservice_err)? {
+        None => Ok(()),
+        Some((indexed, current)) => Err(ServiceError::GraphSourceSuspended {
+            message: suspension_message(record, source, &indexed, &current),
+        }),
+    }
+}
+
 /// Index loader implementation using file-based storage and nameservice.
 ///
 /// This loader uses:
@@ -151,6 +178,7 @@ impl FileIndexLoader {
             Some(r) => r,
             None => return Ok(Bm25Manifest::new(graph_source_id)),
         };
+        check_not_suspended(&self.nameservice, &record).await?;
 
         let index_cid = match &record.index_id {
             Some(cid) => cid,
@@ -268,6 +296,7 @@ impl VectorIndexLoader for FileVectorIndexLoader {
         let record = record.ok_or_else(|| ServiceError::GraphSourceNotFound {
             address: graph_source_id.to_string(),
         })?;
+        check_not_suspended(&self.nameservice, &record).await?;
 
         let namespace = record.storage_namespace();
         let index_cid = record.index_id.ok_or_else(|| ServiceError::Internal {
@@ -452,6 +481,7 @@ async fn handle_search(
                 ServiceError::GraphSourceNotFound { .. }
                 | ServiceError::NoSnapshotForAsOfT { .. }
                 | ServiceError::IndexNotBuilt { .. } => StatusCode::NOT_FOUND,
+                ServiceError::GraphSourceSuspended { .. } => StatusCode::CONFLICT,
                 ServiceError::SyncTimeout { .. } | ServiceError::Timeout { .. } => {
                     StatusCode::GATEWAY_TIMEOUT
                 }
@@ -509,4 +539,62 @@ async fn handle_health() -> impl IntoResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{Bm25CreateConfig, DropMode, FlureeBuilder};
+    use serde_json::json;
+
+    /// A BM25 index over a ledger since dropped and created again under its
+    /// name is refused here, as the db refuses a query of it. While the name
+    /// holds nothing the index still answers: the ledger can be restored.
+    #[tokio::test]
+    async fn an_index_over_a_dropped_ledger_is_suspended() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .build()
+            .expect("build");
+        let alias = "suspend/docs:main";
+        let ledger = fluree.create_ledger(alias).await.expect("create");
+        let tx = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:d1", "@type": "ex:Article", "ex:title": "rust guide"
+        });
+        fluree.insert(ledger, &tx).await.expect("insert");
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [{"@id": "?x", "@type": "ex:Article", "ex:title": "?title"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        });
+        let graph_source_id = fluree
+            .create_full_text_index(Bm25CreateConfig::new("suspend-idx", alias, query))
+            .await
+            .expect("create index")
+            .graph_source_id;
+        let loader = FileIndexLoader::new(tmp.path(), tmp.path());
+        loader
+            .get_latest_index_t(&graph_source_id)
+            .await
+            .expect("over its own ledger");
+
+        fluree
+            .drop_ledger("suspend/docs", DropMode::Soft)
+            .await
+            .expect("drop");
+        loader
+            .get_latest_index_t(&graph_source_id)
+            .await
+            .expect("over a dropped ledger nothing replaced");
+        fluree.create_ledger(alias).await.expect("create again");
+        let err = loader
+            .get_latest_index_t(&graph_source_id)
+            .await
+            .expect_err("over another ledger");
+        assert!(
+            matches!(err, ServiceError::GraphSourceSuspended { .. }),
+            "{err}"
+        );
+    }
 }

@@ -33,6 +33,7 @@ pub mod mount;
 mod notifying;
 mod ns_cas;
 pub(crate) mod ns_format;
+pub mod source_instance;
 pub mod storage_ns;
 #[cfg(any(test, feature = "conformance"))]
 pub mod testing;

@@ -9,21 +9,15 @@
 //! ledger brings back the instance, and with it the graph source.
 
 use crate::{ApiError, Result};
-use fluree_db_core::{InstanceId, StorageRoot};
+#[cfg(feature = "iceberg")]
+use fluree_db_core::InstanceId;
+use fluree_db_core::StorageRoot;
+#[cfg(feature = "iceberg")]
 use fluree_db_nameservice::lifecycle::legacy_instance;
+use fluree_db_nameservice::source_instance::{source_instance_mismatch, suspension_message};
 use fluree_db_nameservice::{GraphSourceRecord, NsRecord};
-use serde_json::Value as JsonValue;
 
-/// The config key recording the instance a graph source indexed.
-pub(crate) const SOURCE_INSTANCE: &str = "source_instance";
-
-/// The instance of the ledger stored under `root`.
-pub(crate) fn instance_of(root: &StorageRoot) -> InstanceId {
-    // A name root belongs to a ledger from before instance folders, bound
-    // under its legacy instance when the nameservice was migrated.
-    root.instance()
-        .unwrap_or_else(|| legacy_instance(root.name()))
-}
+pub(crate) use fluree_db_nameservice::source_instance::{instance_of, SOURCE_INSTANCE};
 
 /// Whether the BM25 or vector index `record` is suspended, given `source`,
 /// the record of the ledger its first dependency names now. For listings: a
@@ -58,22 +52,12 @@ pub(crate) fn check_source_instance(
     source: &str,
     root: &StorageRoot,
 ) -> Result<()> {
-    let config: JsonValue = serde_json::from_str(&record.config)?;
-    let indexed = match config.get(SOURCE_INSTANCE).and_then(JsonValue::as_str) {
-        Some(id) => InstanceId::parse(id)?,
-        // Built before graph sources recorded it, when every ledger was
-        // rooted at its name.
-        None => legacy_instance(root.name()),
-    };
-    let current = instance_of(root);
-    if indexed == current {
-        return Ok(());
+    match source_instance_mismatch(record, root)? {
+        None => Ok(()),
+        Some((indexed, current)) => Err(ApiError::GraphSourceSuspended(suspension_message(
+            record, source, &indexed, &current,
+        ))),
     }
-    Err(ApiError::GraphSourceSuspended(format!(
-        "{} indexed ledger '{source}' instance {indexed}, which was dropped; '{source}' \
-         is now instance {current}. Drop and recreate the graph source to index it",
-        record.graph_source_id
-    )))
 }
 
 impl crate::Fluree {
