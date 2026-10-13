@@ -33,9 +33,7 @@ use crate::migration::{
     RETIRED_FILE,
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
-use crate::ns_format::{
-    merge_heads, ns_context, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
-};
+use crate::ns_format::{merge_heads, ns_context, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION};
 use crate::{
     check_cas_expectation, deserialize_json, ref_values_match, serialize_json, AdminPublisher,
     CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
@@ -1094,8 +1092,6 @@ impl CommitPublisher for FileNameService {
     ) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
-        let ledger_name_c = ledger_name.clone();
-        let branch_c = branch.clone();
         let cid_str = commit_id.to_string();
         let cid_c = cid_str.clone();
 
@@ -1104,53 +1100,17 @@ impl CommitPublisher for FileNameService {
             .compare_and_swap(&address, move |bytes| {
                 let cid_val = Some(cid_c.clone());
                 let current: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
-                if !main_admits(current.as_ref(), fence) {
+                // Admitted means a live record: publication never creates one.
+                let Some(mut file) = current.filter(|f| main_admits(Some(f), fence)) else {
                     return Ok(CasAction::Abort(Err(FenceRefused)));
+                };
+                // Strictly monotonic update
+                if commit_t <= file.t {
+                    return Ok(CasAction::Abort(Ok(())));
                 }
-
-                match current.filter(|f| !f.is_deleted()) {
-                    Some(mut file) => {
-                        // Strictly monotonic update
-                        if commit_t > file.t {
-                            file.commit_cid = cid_val;
-                            file.t = commit_t;
-                            let new_bytes = serialize_json(&file)?;
-                            Ok(CasAction::Write(new_bytes))
-                        } else {
-                            Ok(CasAction::Abort(Ok(())))
-                        }
-                    }
-                    None => {
-                        // Create new record (always write)
-                        let file = NsFileV2 {
-                            context: ns_context(),
-                            id: format_ledger_id(&ledger_name_c, &branch_c),
-                            record_type: vec!["f:LedgerSource".to_string()],
-                            ledger: LedgerRef {
-                                id: ledger_name_c.clone(),
-                            },
-                            branch: branch_c.clone(),
-                            commit_cid: cid_val,
-                            config_cid: None,
-                            t: commit_t,
-                            index: None,
-                            status: "ready".to_string(),
-                            default_context_cid: None,
-                            // v2 extension fields - initialize with defaults
-                            status_v: Some(1),
-                            status_meta: None,
-                            config_v: Some(0),
-                            config_meta: None,
-                            source_branch: None,
-                            branch_point: None,
-                            branches: 0,
-                            fence: None,
-                            extra: Default::default(),
-                        };
-                        let new_bytes = serialize_json(&file)?;
-                        Ok(CasAction::Write(new_bytes))
-                    }
-                }
+                file.commit_cid = cid_val;
+                file.t = commit_t;
+                Ok(CasAction::Write(serialize_json(&file)?))
             })
             .await?;
 
@@ -1574,76 +1534,45 @@ impl RefPublisher for FileNameService {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let expected_clone = expected.cloned();
         let new_clone = new.clone();
-        let normalized_address = format_ledger_id(&ledger_name, &branch);
 
         match kind {
             RefKind::CommitHead => {
                 let address = Self::ns_address(&ledger_name, &branch);
-                let ledger_name_c = ledger_name.clone();
-                let branch_c = branch.clone();
-                let address_c = normalized_address.clone();
 
                 let phase = std::time::Instant::now();
                 let outcome = self
                     .storage
                     .compare_and_swap(&address, move |bytes| {
                         let existing: Option<NsFileV2> = bytes.map(deserialize_json).transpose()?;
-                        if !main_admits(existing.as_ref(), fence) {
+                        // Admitted means a live record: publication never
+                        // creates one.
+                        let Some(mut file) = existing.filter(|f| main_admits(Some(f), fence))
+                        else {
                             return Ok(CasAction::Abort(Err(FenceRefused)));
-                        }
-
-                        let current_ref = existing.as_ref().map(|f| RefValue {
-                            id: f
+                        };
+                        let current_ref = Some(RefValue {
+                            id: file
                                 .commit_cid
                                 .as_deref()
                                 .and_then(|s| s.parse::<ContentId>().ok()),
-                            t: f.t,
+                            t: file.t,
                         });
 
                         if let Some(conflict) = check_cas_expectation(
                             &expected_clone,
                             &current_ref,
-                            true,
+                            false,
                             ref_values_match,
                             |actual| CasResult::Conflict { actual },
                         ) {
                             return Ok(CasAction::Abort(Ok(conflict)));
                         }
                         // Monotonic guard: CommitHead requires strict new.t > current.t
-                        if let Some(ref cur) = current_ref {
-                            if new_clone.t <= cur.t {
-                                return Ok(CasAction::Abort(Ok(CasResult::Conflict {
-                                    actual: Some(cur.clone()),
-                                })));
-                            }
+                        if new_clone.t <= file.t {
+                            return Ok(CasAction::Abort(Ok(CasResult::Conflict {
+                                actual: current_ref,
+                            })));
                         }
-
-                        // Apply update.
-                        let mut file = existing.unwrap_or_else(|| NsFileV2 {
-                            context: ns_context(),
-                            id: address_c.clone(),
-                            record_type: vec!["f:LedgerSource".to_string()],
-                            ledger: LedgerRef {
-                                id: ledger_name_c.clone(),
-                            },
-                            branch: branch_c.clone(),
-                            commit_cid: None,
-                            config_cid: None,
-                            t: 0,
-                            index: None,
-                            status: "ready".to_string(),
-                            default_context_cid: None,
-                            // v2 extension fields
-                            status_v: Some(1),
-                            status_meta: None,
-                            config_v: Some(0),
-                            config_meta: None,
-                            source_branch: None,
-                            branch_point: None,
-                            branches: 0,
-                            fence: None,
-                            extra: Default::default(),
-                        });
 
                         // CID goes into the commit_cid field.
                         file.commit_cid =

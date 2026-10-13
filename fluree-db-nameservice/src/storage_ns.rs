@@ -22,9 +22,7 @@ use crate::binding::{
     RegistryCas, Versioned,
 };
 use crate::ns_cas::{self, index_admits, main_admits, FenceRefused, RecordKeys};
-use crate::ns_format::{
-    merge_heads, ns_context, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
-};
+use crate::ns_format::{merge_heads, ns_context, IndexRef, NsFileV2, NsIndexFileV2, NS_VERSION};
 use crate::{
     deserialize_json, serialize_json, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
@@ -156,43 +154,6 @@ impl<S> StorageNameService<S> {
     fn is_registry_key(&self, key: &str) -> bool {
         key.strip_prefix(&self.ns_root_key(""))
             .is_some_and(|rest| rest.split('/').any(|segment| segment.starts_with('@')))
-    }
-
-    /// Create a new `NsFileV2` for initial creation.
-    ///
-    /// This is pure data construction and is intentionally available without
-    /// requiring `S` to implement any storage traits (useful for unit tests).
-    fn new_main_file(
-        ledger_name: &str,
-        branch: &str,
-        commit_cid: Option<&str>,
-        commit_t: i64,
-    ) -> NsFileV2 {
-        NsFileV2 {
-            context: ns_context(),
-            id: format_ledger_id(ledger_name, branch),
-            record_type: vec!["f:LedgerSource".to_string()],
-            ledger: LedgerRef {
-                id: ledger_name.to_string(),
-            },
-            branch: branch.to_string(),
-            commit_cid: commit_cid.map(std::string::ToString::to_string),
-            config_cid: None,
-            t: commit_t,
-            index: None,
-            status: "ready".to_string(),
-            default_context_cid: None,
-            // v2 extension fields
-            status_v: Some(1),
-            status_meta: None,
-            config_v: Some(0),
-            config_meta: None,
-            source_branch: None,
-            branch_point: None,
-            branches: 0,
-            fence: None,
-            extra: Default::default(),
-        }
     }
 }
 
@@ -1043,34 +1004,20 @@ where
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
-        let ledger_name_clone = ledger_name.clone();
-        let branch_clone = branch.clone();
         let cid_str = commit_id.to_string();
 
+        // Admitted means a live record: publication never creates one.
         self.cas_update_fenced::<NsFileV2, _, _>(
             ledger_id,
             &key,
             move |current| main_admits(current, fence),
-            move |existing| match existing.filter(|f| !f.is_deleted()) {
-                Some(mut file) => {
-                    // Only update if strictly newer
-                    if commit_t > file.t {
-                        file.commit_cid = Some(cid_str.clone());
-                        file.t = commit_t;
-                        Some(file)
-                    } else {
-                        None // No update needed
-                    }
-                }
-                None => {
-                    // Create new record
-                    Some(Self::new_main_file(
-                        &ledger_name_clone,
-                        &branch_clone,
-                        Some(&cid_str),
-                        commit_t,
-                    ))
-                }
+            move |existing| {
+                // Only update if strictly newer
+                existing.filter(|f| commit_t > f.t).map(|mut file| {
+                    file.commit_cid = Some(cid_str.clone());
+                    file.t = commit_t;
+                    file
+                })
             },
         )
         .await
@@ -1262,7 +1209,6 @@ where
             RefKind::CommitHead => {
                 let key = self.ns_key(&ledger_name, &branch);
                 let new_cid = new.id.clone();
-                let new_cid_str = new.id.as_ref().map(std::string::ToString::to_string);
                 let new_t = new.t;
                 let expected_id = expected.and_then(|e| e.id.clone());
                 let expect_exists = expected.is_some();
@@ -1273,60 +1219,31 @@ where
                         &key,
                         move |current| main_admits(current, fence),
                         move |existing| {
-                            let current_ref = existing.as_ref().map(|f| RefValue {
-                                id: f
+                            // Admitted means a live record: publication
+                            // never creates one.
+                            let Some(mut file) = existing else {
+                                return CasUpdateDecision::Skip(CasResult::Conflict {
+                                    actual: None,
+                                });
+                            };
+                            let actual = RefValue {
+                                id: file
                                     .commit_cid
                                     .as_deref()
                                     .and_then(|s| s.parse::<ContentId>().ok()),
-                                t: f.t,
-                            });
-
-                            // Compare expected with current
-                            match (expect_exists, &current_ref) {
-                                (false, None) => {
-                                    // Create new record
-                                    return CasUpdateDecision::Apply(
-                                        StorageNameService::<S>::new_main_file(
-                                            &ledger_name,
-                                            &branch,
-                                            new_cid_str.as_deref(),
-                                            new_t,
-                                        ),
-                                    );
-                                }
-                                (false, Some(actual)) => {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: Some(actual.clone()),
-                                    });
-                                }
-                                (true, None) => {
-                                    return CasUpdateDecision::Skip(CasResult::Conflict {
-                                        actual: None,
-                                    });
-                                }
-                                (true, Some(actual)) => {
-                                    // Compare by content id
-                                    let identity_matches = match (&expected_id, &actual.id) {
-                                        (Some(a), Some(b)) => a == b,
-                                        (None, None) => true,
-                                        _ => false,
-                                    };
-                                    if !identity_matches {
-                                        return CasUpdateDecision::Skip(CasResult::Conflict {
-                                            actual: Some(actual.clone()),
-                                        });
-                                    }
-                                    // Identity matches — check monotonic guard (strict for CommitHead)
-                                    if new_t <= actual.t {
-                                        return CasUpdateDecision::Skip(CasResult::Conflict {
-                                            actual: Some(actual.clone()),
-                                        });
-                                    }
-                                }
+                                t: file.t,
+                            };
+                            let identity_matches = match (&expected_id, &actual.id) {
+                                (Some(a), Some(b)) => a == b,
+                                (None, None) => true,
+                                _ => false,
+                            };
+                            // Strict monotonic guard for CommitHead.
+                            if !expect_exists || !identity_matches || new_t <= actual.t {
+                                return CasUpdateDecision::Skip(CasResult::Conflict {
+                                    actual: Some(actual),
+                                });
                             }
-
-                            // Apply the update
-                            let mut file = existing.unwrap();
                             file.commit_cid =
                                 new_cid.as_ref().map(std::string::ToString::to_string);
                             file.t = new_t;
@@ -1903,15 +1820,6 @@ mod tests {
     fn test_index_key() {
         let expected = format!("{}/{}/{}.index.json", NS_VERSION, "mydb", "main");
         assert_eq!(expected, "ns@v3/mydb/main.index.json");
-    }
-
-    #[test]
-    fn test_new_main_file() {
-        let file = StorageNameService::<()>::new_main_file("mydb", "main", Some("cid-1"), 10);
-        assert_eq!(file.id, "mydb:main");
-        assert_eq!(file.t, 10);
-        assert_eq!(file.status, "ready");
-        assert_eq!(file.commit_cid, Some("cid-1".to_string()));
     }
 
     // =========================================================================
