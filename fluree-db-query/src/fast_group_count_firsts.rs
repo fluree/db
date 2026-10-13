@@ -1005,8 +1005,7 @@ pub(crate) fn group_count_v6(
 
             for row in 0..batch.row_count {
                 // Per-row `p_id` check needed for mixed-predicate leaflets;
-                // the cached path always loads `p_id`, the no-cache path is
-                // configured to load it via `load_v6_batch` when `p_const` is
+                // `load_v6_batch` decodes `p_id` exactly when `p_const` is
                 // `None`.
                 if entry.p_const.is_none() {
                     let row_p_id = batch.p_id.get_or(row, 0);

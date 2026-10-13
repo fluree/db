@@ -122,9 +122,8 @@ pub fn projection_sid_only() -> ColumnProjection {
 }
 
 /// Decode `projection`'s columns of leaflet `idx`, through the leaflet cache
-/// when the store has one. The cache key carries the column set, so a narrow
-/// request is served by an exact or `ALL` entry and never decodes columns the
-/// caller doesn't read.
+/// when the store has one: an entry that covers them serves them projected;
+/// one that falls short decodes only the missing columns into it.
 pub(crate) fn load_leaflet_projection(
     store: &BinaryIndexStore,
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
