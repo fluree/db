@@ -287,10 +287,15 @@ impl FlakeValue {
     /// Whether two different terms whose values are of this kind can share a
     /// persisted index key, so that storage, which merges ops by key, holds
     /// them as one fact. A big integer is keyed by its value alone, whatever
-    /// XSD subtype it was written with; a double with no order-preserving
-    /// encoding takes the null key, as a null does. For every other kind the
-    /// key is a function of the term that no two terms share: a `dateTime` or
-    /// `time` is keyed to the microsecond, which is all it holds.
+    /// XSD subtype it was written with, and every null shares one key. For
+    /// every other kind the key is a function of the term that no two terms
+    /// share: a `dateTime` or `time` is keyed to the microsecond, which is
+    /// all it holds.
+    ///
+    /// A double is listed although no two double terms share a key: its key
+    /// is its value under its datatype, with every NaN as one and -0.0 as
+    /// 0.0, which is how this type's equality compares doubles too. Listing
+    /// it keys doubles the way storage does without depending on that.
     ///
     /// Exhaustive on purpose: a new kind of value has to say which it is.
     /// The key encoding is `value_to_otype_okey` in `fluree-db-query`.
@@ -322,14 +327,14 @@ impl FlakeValue {
     /// Whether this value, written with datatype `dt`, keeps less in its
     /// persisted index key than the term holds, so the key decodes to a
     /// different term: an integer too large for 64 bits written with an XSD
-    /// subtype (the key keeps no subtype), or a double with no
-    /// order-preserving encoding.
-    /// A query that reads such a term through its key gets the other term.
+    /// subtype (the key keeps no subtype), or a null (every null shares one
+    /// key). A query that reads such a term through its key gets the other
+    /// term. No double does, `±INF` and NaN included: its key decodes to a
+    /// value equal to the one written.
     /// See [`Self::index_key_may_merge_terms`] for the kinds.
     pub fn index_key_loses_detail(&self, dt: &Sid) -> bool {
         match self {
             FlakeValue::BigInt(v) => v.to_i64().is_none() && *dt != Sid::xsd_integer(),
-            FlakeValue::Double(d) => !d.is_finite(),
             FlakeValue::Null => true,
             _ => false,
         }
@@ -1423,6 +1428,28 @@ mod tests {
         assert!(big().index_key_may_merge_terms());
         assert!(!at("2020-01-01T00:00:00.1234567Z").index_key_may_merge_terms());
         assert!(!time("12:00:00.1234567").index_key_may_merge_terms());
+    }
+
+    /// No double loses detail to its index key, `±INF` and NaN included:
+    /// every double's key decodes to a value equal to the one written. What
+    /// the key drops, a NaN's payload and a zero's sign, equality drops too.
+    #[test]
+    fn no_double_loses_detail_to_its_index_key() {
+        use crate::value_id::ObjKey;
+        let xsd = |name: &str| Sid::new(fluree_vocab::namespaces::XSD, name);
+        for bits in special_double_bits() {
+            let written = FlakeValue::Double(f64::from_bits(bits));
+            let decoded = FlakeValue::Double(ObjKey::encode_f64(f64::from_bits(bits)).decode_f64());
+            assert_eq!(decoded, written, "{bits:#018x}");
+            for dt in ["double", "float"] {
+                assert!(
+                    !written.index_key_loses_detail(&xsd(dt)),
+                    "{bits:#018x} {dt}"
+                );
+            }
+            // Listed all the same; see `index_key_may_merge_terms`.
+            assert!(written.index_key_may_merge_terms(), "{bits:#018x}");
+        }
     }
 
     /// `FlakeValue::Vector` is `Arc<[f64]>` behind a `serde(with)` adapter

@@ -1731,8 +1731,8 @@ mod tests {
 
     /// Novelty records an assertion of a term its index key keeps less of (a
     /// big integer written with an XSD subtype), and only an assertion: a
-    /// retraction, or a term the key holds whole, leaves the flag clear. Both
-    /// apply paths set it.
+    /// retraction, or a term the key holds whole (a double, `±INF` and NaN
+    /// included), leaves the flag clear. Both apply paths set it.
     #[test]
     fn a_lossy_term_assertion_sets_the_flag() {
         let big = |dt: &str, t: i64, op: bool| {
@@ -1748,11 +1748,28 @@ mod tests {
         };
         let exact = "integer";
         let lossy = "nonNegativeInteger";
+        let double = |d: f64| {
+            Flake::new(
+                Sid::new(100, "s"),
+                Sid::new(100, "d"),
+                FlakeValue::Double(d),
+                Sid::new(fluree_vocab::namespaces::XSD, "double"),
+                1,
+                true,
+                None,
+            )
+        };
 
         let mut novelty = Novelty::new(0);
         novelty
             .apply_commit(
-                vec![big(exact, 1, true), big(lossy, 1, false)],
+                vec![
+                    big(exact, 1, true),
+                    big(lossy, 1, false),
+                    double(f64::INFINITY),
+                    double(f64::NEG_INFINITY),
+                    double(f64::NAN),
+                ],
                 1,
                 &no_graphs(),
             )
