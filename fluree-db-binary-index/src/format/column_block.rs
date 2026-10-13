@@ -267,7 +267,8 @@ fn compress(raw: &[u8], level: i32) -> io::Result<Vec<u8>> {
     })
 }
 
-/// Decompress `src` (at most `len` bytes of output) and hand the bytes to `f`.
+/// Decompress `src`, which must decode to exactly `len` bytes, and hand the
+/// bytes to `f`.
 fn with_decompressed<R>(src: &[u8], len: usize, f: impl FnOnce(&[u8]) -> R) -> io::Result<R> {
     let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
     DECOMPRESS.with(|cell| {
@@ -278,7 +279,15 @@ fn with_decompressed<R>(src: &[u8], len: usize, f: impl FnOnce(&[u8]) -> R) -> i
         let (dctx, buf) = slot.as_mut().expect("decompressor initialized above");
         buf.clear();
         buf.reserve(len);
+        // The buffer keeps the capacity of the largest block this thread has
+        // decoded, so zstd alone would accept a frame longer than `len`.
         dctx.decompress_to_buffer(src, buf).map_err(invalid)?;
+        if buf.len() != len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("column block decoded {} bytes, expected {len}", buf.len()),
+            ));
+        }
         Ok(f(buf))
     })
 }
@@ -358,6 +367,28 @@ mod tests {
                     "level {level}"
                 );
             }
+        }
+    }
+
+    /// A ref whose declared size disagrees with its frame is refused, even
+    /// once this thread's buffer has grown past the frame.
+    #[test]
+    fn decoded_length_must_match_the_ref() {
+        let big: Vec<u64> = (0..50_000).collect();
+        let (bytes, r) = encode_column_u64(ColumnId::SId, &big, 1).unwrap();
+        assert_eq!(decode_column_u64(&bytes, &r).unwrap(), big);
+
+        let small: Vec<u64> = (0..1_000).collect();
+        let (bytes, r) = encode_column_u64(ColumnId::SId, &small, 1).unwrap();
+        for declared in [r.uncompressed_len / 2, r.uncompressed_len * 2] {
+            let r = ColumnBlockRef {
+                uncompressed_len: declared,
+                ..r
+            };
+            assert!(
+                decode_column_u64(&bytes, &r).is_err(),
+                "declared {declared}"
+            );
         }
     }
 
