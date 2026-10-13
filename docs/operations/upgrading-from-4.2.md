@@ -118,6 +118,14 @@ dropped list, and is logged only when there was something to do.
    - DynamoDB: take an on-demand backup or enable point-in-time recovery. The
      upgrade writes in place, and a backup is the only way back.
    - Raft: copy each node's `--raft-storage-path`.
+
+   On every backend the backup names each ledger's index as it was at the
+   upgrade, and the new release's index garbage collection deletes that index
+   once newer ones replace it (by default, five newer builds and fifteen
+   minutes later). To keep it for as long as you might roll back, raise
+   `--gc-max-old-indexes` for that time, at the cost of the disk the old
+   indexes hold. Otherwise a rollback reindexes the ledgers whose index was
+   collected.
 3. **Check your scripts** for `fluree drop` (now soft; add `--hard --force` to
    delete) and for creating separate ledgers as branches of one name.
 4. **Check ledger names for `@` and `#`.** Older releases let a ledger
@@ -272,18 +280,27 @@ stopping every process first still spares their users failed requests.
 
 ## Rolling back
 
-- **File and object stores:** stop every process, then put the files under
-  `ns@v2.bak/` back in place of `ns@v2/`. A 4.2 release then sees the ledgers
-  as they were at the upgrade. Commits made since are not in them, and ledgers
-  created since live in folders 4.2 cannot read. To upgrade again later, delete
-  `ns@v3/` first, so the upgrade starts from what 4.2 wrote; what this release
-  wrote before the rollback is then lost, and the orphan sweep deletes the
-  folders of ledgers it created.
+- **File and object stores:** stop every process, then move `ns@v2.bak/`
+  back in place of `ns@v2/`, leaving no `ns@v2.bak/` behind: a later upgrade
+  keeps a file it retires only where `ns@v2.bak/` holds none, so a copy left
+  there would keep this upgrade's state in place of the next one's. A 4.2
+  release then sees the ledgers as they were at the upgrade. Commits made
+  since are not in them, and ledgers created since live in folders 4.2
+  cannot read. To upgrade again later, delete `ns@v3/` first, so the upgrade
+  starts from what 4.2 wrote; what this release wrote before the rollback is
+  then lost, and the orphan sweep deletes the folders of ledgers it created.
 - **DynamoDB:** restore the backup taken before the upgrade. Running 4.2
   against the upgraded table is not supported.
 - **Raft:** see [Rolling upgrades](raft-clusters.md#rolling-upgrades); a
   downgraded node restores its `--raft-storage-path` from before the upgrade
   or rejoins and takes a snapshot.
+
+On every backend, after the rollback:
+
+- A ledger whose index the new release collected fails to load. Its commits
+  are all kept: `fluree reindex <ledger>` on 4.2 rebuilds the index from them.
+- A ledger hard-dropped or purged since the upgrade is listed again, but its
+  files are gone. Drop it again on 4.2.
 
 ## A newer release on the same store
 
