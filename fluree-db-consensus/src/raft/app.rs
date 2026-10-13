@@ -60,7 +60,7 @@ use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::TypeConfig;
 use fluree_db_api::LedgerManager;
 use fluree_db_core::ContentId;
-use fluree_db_nameservice::{LedgerEventBus, NameServiceEvent};
+use fluree_db_nameservice::{Fence, LedgerEventBus, NameBinding, NameServiceEvent};
 use fluree_raft_core::node::NodeId;
 use fluree_raft_core::state_machine::{
     AppStateMachine, MembershipView, ReadOnlyState, SnapshotCodecError, SnapshotLoad,
@@ -287,15 +287,26 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
 
     fn on_command(
         &self,
-        _state: &NameServiceState,
+        state: &NameServiceState,
         command: &Command,
         response: &mut Response,
         _log_index: u64,
         out: &mut Vec<Effect>,
     ) {
-        if let Some(event) = event_for(command, response) {
+        // A fenced write is the write it wraps, once the state machine has
+        // admitted it.
+        let command = match command {
+            Command::Fenced { command, .. } => command.as_ref(),
+            command => command,
+        };
+        if let Some(event) = event_for(command, response, state) {
             out.push(Effect::Event(event));
         }
+        out.extend(
+            created_events(command, response, state)
+                .into_iter()
+                .map(Effect::Event),
+        );
         if let Some(resolution) = waiter_resolution_for(command, response) {
             out.push(Effect::Waiter(resolution));
         }
@@ -330,7 +341,19 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
     fn publish(&self, effects: Vec<Effect>) {
         // Phase one: every watermark, before any event reaches the bus.
         // See the module docs — this ordering is the point of the split.
-        if let Some(manager) = self.ledger_manager.get() {
+        // A live install replaces them: its heads are the whole truth.
+        let live_install = effects
+            .iter()
+            .any(|e| matches!(e, Effect::InvalidateInFlight));
+        if let (Some(manager), true) = (self.ledger_manager.get(), live_install) {
+            manager.reset_head_watermarks(effects.iter().filter_map(|effect| match effect {
+                Effect::HeadAdvance {
+                    ledger_id,
+                    commit_t,
+                } => Some((ledger_id.clone(), *commit_t)),
+                _ => None,
+            }));
+        } else if let Some(manager) = self.ledger_manager.get() {
             for effect in &effects {
                 match effect {
                     Effect::Event(NameServiceEvent::LedgerCommitPublished {
@@ -380,6 +403,15 @@ impl StateMachineObserver<NameServiceApp> for NameServiceObserver {
                     }
                     if let Some(stash) = self.staged_receipts.as_ref() {
                         stash.clear_all();
+                    }
+                    // The install announces no drop or create, so a ledger
+                    // dropped or recreated in it is still cached as it was.
+                    if let (Some(manager), Ok(runtime)) = (
+                        self.ledger_manager.get(),
+                        tokio::runtime::Handle::try_current(),
+                    ) {
+                        let manager = Arc::clone(manager);
+                        runtime.spawn(async move { manager.reconcile_cached().await });
                     }
                 }
             }
@@ -496,6 +528,18 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
             ref_key: RefKey::new(ledger_id, branch),
             reason: AbortReason::BranchRetracted,
         }),
+        (Command::FreezeBranch { key, .. }, Response::BranchFrozen { .. }) => {
+            Some(WaiterResolution::AbortBranch {
+                ref_key: key.clone(),
+                reason: AbortReason::BranchRetracted,
+            })
+        }
+        (Command::DeleteBranch { key, .. }, Response::BranchDeleted { .. }) => {
+            Some(WaiterResolution::AbortBranch {
+                ref_key: key.clone(),
+                reason: AbortReason::BranchPurged,
+            })
+        }
         _ => None,
     }
 }
@@ -519,7 +563,11 @@ fn parsed_event_ledger_id(ledger_id: &str) -> Option<fluree_db_core::LedgerId> {
 /// Translate an apply-path `(Command, Response)` pair into the
 /// matching [`NameServiceEvent`]. Returns `None` for pairs that
 /// don't advance head state — desyncs, no-ops, idempotency hits.
-fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
+fn event_for(
+    cmd: &Command,
+    response: &Response,
+    state: &NameServiceState,
+) -> Option<NameServiceEvent> {
     match (cmd, response) {
         (
             Command::ApplyHead(args),
@@ -549,6 +597,32 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
         | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
                 ledger_id: parsed_event_ledger_id(ledger_id)?,
+                instance: None,
+            })
+        }
+        // A drop deletes its records while the binding still lists them,
+        // which names the ledger they belonged to.
+        (Command::DeleteBranch { key, fence, .. }, Response::BranchDeleted { ledger_id, .. }) => {
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: parsed_event_ledger_id(ledger_id)?,
+                instance: state_binding(state, &key.ledger_name)
+                    .filter(|b| b.fence_of(&key.branch) == Some(Fence::from_u64(*fence)))
+                    .map(|b| b.instance),
+            })
+        }
+        // A branch drop freezes the branch first, and one with children
+        // deletes nothing until its last child goes, so the drop is
+        // announced here. A ledger drop announces as it deletes.
+        (Command::FreezeBranch { key, fence, .. }, Response::BranchFrozen { ledger_id, .. }) => {
+            let binding = state_binding(state, &key.ledger_name)?;
+            let listing = binding.listing(&key.branch)?;
+            if !(binding.is_active() && listing.dropped && listing.fence == Fence::from_u64(*fence))
+            {
+                return None;
+            }
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: parsed_event_ledger_id(ledger_id)?,
+                instance: Some(binding.instance),
             })
         }
         (Command::CreateBranch(_), Response::BranchCreated { ledger_id, head, t }) => {
@@ -558,7 +632,84 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
                 commit_t: *t,
             })
         }
+        // A branch created or restored with a head announces it, as a
+        // branch created before fencing did.
+        (Command::InsertBranchRecord(record), Response::BranchRecordInserted) => {
+            let (commit_id, commit_t) = record.head.clone()?;
+            Some(NameServiceEvent::LedgerCommitPublished {
+                ledger_id: event_ledger_id(&record.key.ledger_name, &record.key.branch)?,
+                commit_id,
+                commit_t,
+            })
+        }
         _ => None,
+    }
+}
+
+/// The binding `state` holds for `name`. One that does not decode is logged
+/// and treated as absent: it only costs an event its instance.
+fn state_binding(state: &NameServiceState, name: &str) -> Option<NameBinding> {
+    let json = state.bindings.get(name)?.json.as_deref()?;
+    serde_json::from_str(json)
+        .inspect_err(
+            |e| tracing::error!(error = %e, name, "raft state holds an unreadable binding"),
+        )
+        .ok()
+}
+
+/// [`NameServiceEvent::LedgerCreated`] for each branch a command made
+/// visible. A binding written active announces every branch it shows that
+/// has a record: the state holds no copy of the binding it replaced, so
+/// branches it already showed are announced again; a new branch is
+/// announced by the write that confirms its create. A record registered
+/// under a binding that already shows its branch, as a mirrored copy's is,
+/// announces that branch.
+fn created_events(
+    cmd: &Command,
+    response: &Response,
+    state: &NameServiceState,
+) -> Vec<NameServiceEvent> {
+    let created = |binding: &NameBinding, name: &str, branch: &str| {
+        Some(NameServiceEvent::LedgerCreated {
+            ledger_id: event_ledger_id(name, branch)?,
+            instance: binding.instance.clone(),
+        })
+    };
+    match (cmd, response) {
+        (
+            Command::CasBinding {
+                name,
+                json: Some(_),
+                ..
+            },
+            Response::RegistryCasUpdated { version: Some(_) },
+        ) => {
+            let Some(binding) = state_binding(state, name) else {
+                return Vec::new();
+            };
+            binding
+                .branches
+                .iter()
+                .filter(|l| binding.shows(&l.branch))
+                .filter(|l| {
+                    state
+                        .fences
+                        .get(&RefKey::new(name, &l.branch))
+                        .is_some_and(|f| f.fence == l.fence.as_u64())
+                })
+                .filter_map(|l| created(&binding, name, &l.branch))
+                .collect()
+        }
+        (Command::InsertBranchRecord(record), Response::BranchRecordInserted) => {
+            let key = &record.key;
+            state_binding(state, &key.ledger_name)
+                .filter(|b| b.shows(&key.branch))
+                .filter(|b| b.fence_of(&key.branch).map(Fence::as_u64) == record.fence)
+                .and_then(|b| created(&b, &key.ledger_name, &key.branch))
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -582,6 +733,12 @@ fn drain_releases(response: &mut Response) -> Vec<(String, ContentId)> {
             released_envelopes, ..
         }
         | Response::Retracted {
+            released_envelopes, ..
+        }
+        | Response::BranchFrozen {
+            released_envelopes, ..
+        }
+        | Response::BranchDeleted {
             released_envelopes, ..
         } => std::mem::take(released_envelopes),
         // A keyless queue entry's envelope isn't held by any
@@ -661,6 +818,43 @@ mod tests {
         assert_eq!(
             drain_releases(&mut poisoned),
             vec![("test/db:main".to_string(), cid(3))]
+        );
+    }
+
+    /// A write presenting a fence reaches the observer wrapped, as it was
+    /// logged; it announces what it wraps.
+    #[test]
+    fn a_fenced_index_publish_is_announced() {
+        let command = Command::Fenced {
+            fence: 7,
+            command: Box::new(Command::AdvanceIndexHead(
+                crate::raft::state_machine::NewIndexHead {
+                    ledger_id: "test/db".into(),
+                    branch: "main".into(),
+                    new_index_head: cid(2),
+                    t: 3,
+                    applied_at_millis: 1_000,
+                },
+            )),
+        };
+        let mut response = Response::IndexAdvanced {
+            index_t: 3,
+            index_head: cid(2),
+        };
+        let mut effects = Vec::new();
+        NameServiceObserver::new().on_command(
+            &NameServiceState::default(),
+            &command,
+            &mut response,
+            1,
+            &mut effects,
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Event(NameServiceEvent::LedgerIndexPublished { index_t: 3, .. })
+            )),
+            "no index event for a fenced publish"
         );
     }
 
@@ -949,7 +1143,7 @@ mod tests {
         .unwrap();
 
         match sub.receiver.try_recv().expect("retracted event") {
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 assert_eq!(ledger_id, "test/db:main");
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
@@ -1018,7 +1212,7 @@ mod tests {
         .unwrap();
 
         match sub.receiver.try_recv().expect("purge event") {
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 assert_eq!(ledger_id, "test/db:main");
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
@@ -1132,7 +1326,7 @@ mod tests {
         .unwrap();
 
         match sub.receiver.try_recv().expect("drop-branch event") {
-            NameServiceEvent::LedgerRetracted { ledger_id } => {
+            NameServiceEvent::LedgerRetracted { ledger_id, .. } => {
                 assert_eq!(ledger_id, "test/db:feature");
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
@@ -1216,6 +1410,100 @@ mod tests {
             manager.head_watermark(&fluree_db_core::LedgerId::parse("test/db:main").unwrap()),
             Some(42)
         );
+    }
+
+    /// A snapshot that dropped and recreated a ledger puts it below the
+    /// watermark the dropped one left, and one it dropped has no head: the
+    /// install's heads replace the watermarks, never raise them.
+    #[tokio::test]
+    async fn a_live_install_replaces_head_watermarks() {
+        let source_storage =
+            storage_holding(&state_with_branch_head("test/db", "main", cid(8), 3)).await;
+        let mut source = StateMachineAdapter::open(source_storage, NameServiceObserver::new())
+            .await
+            .expect("adapter opens");
+        let snap = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let observer = NameServiceObserver::new();
+        let cell = observer.ledger_manager_cell();
+        let mut target = StateMachineAdapter::new(Arc::new(MemoryRaftStorage::new()), observer);
+        let manager = memory_ledger_manager();
+        cell.set(Arc::clone(&manager)).ok().expect("cell empty");
+        let id = |s: &str| fluree_db_core::LedgerId::parse(s).unwrap();
+        manager.note_head_advance(&id("test/db:main"), 42);
+        manager.note_head_advance(&id("gone/db:main"), 7);
+
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.head_watermark(&id("test/db:main")), Some(3));
+        assert_eq!(manager.head_watermark(&id("gone/db:main")), None);
+    }
+
+    /// An install announces no drop, so the ledger cache is reconciled
+    /// against the nameservice: a ledger dropped there is evicted.
+    #[tokio::test]
+    async fn a_live_install_evicts_a_cached_ledger_dropped_since() {
+        use fluree_db_api::{LedgerManagerConfig, NameServiceMode};
+        use fluree_db_core::{LedgerId, LedgerName, MemoryStorage, StorageBackend};
+        use fluree_db_nameservice::{lifecycle, memory::MemoryNameService};
+
+        let ns = Arc::new(MemoryNameService::new());
+        let manager = Arc::new(LedgerManager::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            NameServiceMode::ReadWrite(Arc::clone(&ns) as _),
+            LedgerManagerConfig::default(),
+        ));
+        let ledger_id = LedgerId::parse("cached/db:main").unwrap();
+        lifecycle::create_ledger(ns.as_ref(), &ledger_id)
+            .await
+            .unwrap();
+        manager.get_or_load(&ledger_id).await.expect("load");
+        lifecycle::drop_ledger(ns.as_ref(), &LedgerName::parse("cached/db").unwrap(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.cached_aliases().await,
+            std::slice::from_ref(&ledger_id)
+        );
+
+        let source_storage =
+            storage_holding(&state_with_branch_head("test/db", "main", cid(8), 3)).await;
+        let mut source = StateMachineAdapter::open(source_storage, NameServiceObserver::new())
+            .await
+            .expect("adapter opens");
+        let snap = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let observer = NameServiceObserver::new();
+        observer
+            .ledger_manager_cell()
+            .set(Arc::clone(&manager))
+            .ok()
+            .expect("cell empty");
+        let mut target = StateMachineAdapter::new(Arc::new(MemoryRaftStorage::new()), observer);
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        for _ in 0..200 {
+            if manager.cached_aliases().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the dropped ledger is still cached after the install");
     }
 
     #[tokio::test]
@@ -1494,6 +1782,67 @@ mod tests {
         );
     }
 
+    /// Freezing a branch its binding lists as dropped announces the drop: a
+    /// branch with children deletes nothing else until its last child goes.
+    /// A ledger drop's freezes, under a dropping binding, do not; it
+    /// announces as it deletes.
+    #[test]
+    fn freezing_a_dropped_branch_announces_it() {
+        use fluree_db_nameservice::{BindingState, BranchFence};
+        let fence = Fence::from_u64(7);
+        let instance = fluree_db_nameservice::lifecycle::legacy_instance("test/db");
+        let state_with = |state: BindingState, dropped: bool| {
+            let binding = NameBinding {
+                extra: Default::default(),
+                instance: instance.clone(),
+                root: fluree_db_core::StorageRoot::legacy(
+                    &fluree_db_core::LedgerName::parse("test/db").unwrap(),
+                ),
+                root_branch: "main".into(),
+                state,
+                branches: vec![BranchFence {
+                    dropped,
+                    ..BranchFence::new("dev", fence)
+                }],
+            };
+            let mut ns = NameServiceState::default();
+            ns.bindings.insert(
+                "test/db".into(),
+                state_machine::VersionedJson {
+                    version: 1,
+                    json: Some(serde_json::to_string(&binding).unwrap()),
+                },
+            );
+            ns
+        };
+        let freeze = Command::FreezeBranch {
+            key: RefKey::new("test/db", "dev"),
+            fence: fence.as_u64(),
+            applied_at_millis: 0,
+        };
+        let frozen = Response::BranchFrozen {
+            ledger_id: "test/db:dev".into(),
+            released_envelopes: Vec::new(),
+        };
+
+        assert_eq!(
+            event_for(&freeze, &frozen, &state_with(BindingState::Active, true)),
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: fluree_db_core::LedgerId::parse("test/db:dev").unwrap(),
+                instance: Some(instance.clone()),
+            })
+        );
+        let dropping = BindingState::Dropping { hard: false };
+        assert_eq!(
+            event_for(&freeze, &frozen, &state_with(dropping, true)),
+            None
+        );
+        assert_eq!(
+            event_for(&freeze, &frozen, &state_with(BindingState::Active, false)),
+            None
+        );
+    }
+
     /// Phase one of `publish` has to catch *every* effect that carries a
     /// head, or a cache keyed on the old value never revalidates. The
     /// failure mode is a new event variant carrying a head that nobody
@@ -1523,6 +1872,7 @@ mod tests {
             // Carries no head; must not be mistaken for one.
             Effect::Event(NameServiceEvent::LedgerRetracted {
                 ledger_id: fluree_db_core::LedgerId::parse("c/db:main").unwrap(),
+                instance: None,
             }),
         ]);
 

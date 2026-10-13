@@ -17,7 +17,7 @@ const BETA_IRI: &str = "http://example.org/graphs/beta";
 /// Insert a default-graph triple plus one triple each into graphs alpha and beta.
 /// Returns the post-insert commit `t`.
 async fn seed_two_graphs(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> i64 {
-    let ledger = genesis_ledger(fluree, ledger_id);
+    let ledger = genesis_ledger(fluree, ledger_id).await;
     let trig = format!(
         r#"
         @prefix ex: <http://example.org/> .
@@ -161,7 +161,7 @@ async fn drop_named_graph_rejects_txn_meta_graph() {
 #[tokio::test]
 async fn drop_named_graph_rejects_config_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/drop-named-graph/config:main";
+    let ledger_id = "it/drop-named-graph/cfg:main";
     seed_two_graphs(&fluree, ledger_id).await;
 
     let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);

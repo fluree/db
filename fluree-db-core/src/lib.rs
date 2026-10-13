@@ -96,6 +96,7 @@ pub mod wasm_cache;
 
 // Re-export main types
 pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
+pub use address_path::{InstanceId, StorageNamespace, StorageRoot};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
@@ -184,7 +185,6 @@ pub use storage::{
     content_path,
     content_store_for,
     // Helper functions for storage implementations
-    ledger_id_prefix_for_path,
     sha256_hex,
     BranchedContentStore,
     CasAction,

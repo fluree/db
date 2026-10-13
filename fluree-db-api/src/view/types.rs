@@ -118,6 +118,10 @@ pub struct GraphDb {
 
     /// Ledger ID (e.g., "mydb:main").
     pub ledger_id: Arc<str>,
+    /// The bits of the ledger's instance
+    /// ([`LedgerState::instance_bits`]), which tells a ledger from one
+    /// dropped before it under the same name; `0` when unknown.
+    pub(crate) instance_bits: u128,
 
     /// Graph ID within the ledger (0 = default graph).
     ///
@@ -298,6 +302,7 @@ impl GraphDb {
             novelty,
             t,
             ledger_id: ledger_id.into(),
+            instance_bits: 0,
             graph_id: 0,
             policy: None,
             policy_enforcer: None,
@@ -343,6 +348,7 @@ impl GraphDb {
             ledger.t(),
             ledger.ledger_id(),
         );
+        gdb.instance_bits = ledger.instance_bits();
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
         // Extract binary_store from LedgerState's TypeErasedStore
@@ -379,6 +385,7 @@ impl GraphDb {
             view.to_t(),
             view.snapshot.ledger_id.as_str(),
         );
+        gdb.instance_bits = view.instance_bits();
         gdb.runtime_small_dicts = view.runtime_small_dicts().cloned();
         gdb
     }
@@ -474,6 +481,7 @@ impl GraphDb {
             staged_t,
             base.ledger_id(),
         );
+        gdb.instance_bits = base.instance_bits();
         gdb.dict_novelty = Some(dict_novelty);
         gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
@@ -507,6 +515,7 @@ impl GraphDb {
             base.t(),
             base.ledger_id(),
         );
+        gdb.instance_bits = base.instance_bits();
         gdb.runtime_small_dicts = Some(base.runtime_small_dicts.clone());
         // Carry binary store from the base ledger state
         gdb.binary_store = base

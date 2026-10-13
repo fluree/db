@@ -31,7 +31,7 @@ async fn join_count_preserves_filters_multiplicity_and_visible_facts() {
     const PEOPLE: usize = 1200;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "join-count:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let mut graph = vec![
         json!({"@id": "ex:a", "ex:knows": [{"@id": "ex:a"}, {"@id": "ex:x"}, {"@id": "ex:y"}]}),
         json!({"@id": "ex:b", "ex:knows": {"@id": "ex:x"}}),

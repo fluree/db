@@ -110,8 +110,8 @@ async fn empty_collection_object_stores_rdf_nil() {
 #[tokio::test]
 async fn empty_collection_matches_literal_rdf_nil() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let from_sugar = seed_turtle(&fluree, "tx/turtle-empty-coll:sugar", REPRO_TTL).await;
-    let from_iri = seed_turtle(&fluree, "tx/turtle-empty-coll:iri", CONTROL_TTL).await;
+    let from_sugar = seed_turtle(&fluree, "tx/turtle-empty-coll-sugar", REPRO_TTL).await;
+    let from_iri = seed_turtle(&fluree, "tx/turtle-empty-coll-iri", CONTROL_TTL).await;
 
     let q = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
     assert_eq!(
@@ -127,7 +127,7 @@ async fn empty_collection_matches_literal_rdf_nil() {
 #[tokio::test]
 async fn non_empty_collections_unchanged_no_spine() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_turtle(&fluree, "tx/turtle-empty-coll:nospine", REPRO_TTL).await;
+    let ledger = seed_turtle(&fluree, "tx/turtle-empty-coll-nospine", REPRO_TTL).await;
 
     let items = rows(
         &fluree,
@@ -160,7 +160,7 @@ async fn empty_collection_subject_is_rdf_nil() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_turtle(
         &fluree,
-        "tx/turtle-empty-coll:subject",
+        "tx/turtle-empty-coll-subject",
         r"@prefix ex: <http://example.org/> .
           () ex:p ex:o .
 ",

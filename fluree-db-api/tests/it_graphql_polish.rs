@@ -22,7 +22,7 @@ fn view(ledger: &LedgerState) -> GraphDb {
 
 async fn seeded(ledger_id: &str, graph: JsonValue) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree
         .insert(ledger, &json!({ "@context": context(), "@graph": graph }))
         .await

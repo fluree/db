@@ -14,8 +14,10 @@
 //! - Otherwise, filter to explicitly provided aliases
 //!
 //! ## Event Types
-//! - `ns-record` - Record published/updated (ledger or graph source)
-//! - `ns-retracted` - Record retracted/deleted
+//! - `ns-record` - Record created, published or updated (ledger or graph
+//!   source). A ledger record carries its `instance`.
+//! - `ns-retracted` - Record retracted/deleted. A ledger retraction carries
+//!   the `instance` the branch belonged to when the server knows it.
 
 use axum::{
     extract::{RawQuery, State},
@@ -23,6 +25,7 @@ use axum::{
 };
 use chrono::Utc;
 use fluree_db_api::LedgerId;
+use fluree_db_core::InstanceId;
 use fluree_db_nameservice::{
     GraphSourceRecord, NameServiceEvent, NameServiceLookup, NsRecord, SubscriptionScope,
 };
@@ -195,6 +198,8 @@ struct NsRetractedData {
     action: &'static str,
     kind: &'static str,
     resource_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<InstanceId>,
     emitted_at: String,
 }
 
@@ -266,6 +271,8 @@ fn ledger_to_sse_event(record: &NsRecord) -> Event {
             "retracted": record.retracted,
             "source_branch": record.source_branch,
             "branches": record.branches,
+            "storage_root": record.storage_root,
+            "instance": record.instance(),
         }),
         emitted_at: now_iso8601(),
     };
@@ -317,13 +324,18 @@ fn graph_source_to_sse_event(record: &GraphSourceRecord) -> Event {
 }
 
 /// Create a retracted SSE Event
-fn retracted_sse_event(kind: &'static str, resource_id: &str) -> Event {
+fn retracted_sse_event(
+    kind: &'static str,
+    resource_id: &str,
+    instance: Option<InstanceId>,
+) -> Event {
     let event_id = retracted_event_id(kind, resource_id);
 
     let data = NsRetractedData {
         action: "ns-retracted",
         kind,
         resource_id: resource_id.to_string(),
+        instance,
         emitted_at: now_iso8601(),
     };
 
@@ -394,7 +406,8 @@ fn event_resource_id(event: &NameServiceEvent) -> &LedgerId {
     match event {
         NameServiceEvent::LedgerCommitPublished { ledger_id, .. } => ledger_id,
         NameServiceEvent::LedgerIndexPublished { ledger_id, .. } => ledger_id,
-        NameServiceEvent::LedgerRetracted { ledger_id } => ledger_id,
+        NameServiceEvent::LedgerRetracted { ledger_id, .. } => ledger_id,
+        NameServiceEvent::LedgerCreated { ledger_id, .. } => ledger_id,
         NameServiceEvent::GraphSourceConfigPublished {
             graph_source_id, ..
         } => graph_source_id,
@@ -410,7 +423,8 @@ fn event_kind(event: &NameServiceEvent) -> &'static str {
     match event {
         NameServiceEvent::LedgerCommitPublished { .. }
         | NameServiceEvent::LedgerIndexPublished { .. }
-        | NameServiceEvent::LedgerRetracted { .. } => SSE_KIND_LEDGER,
+        | NameServiceEvent::LedgerRetracted { .. }
+        | NameServiceEvent::LedgerCreated { .. } => SSE_KIND_LEDGER,
         NameServiceEvent::GraphSourceConfigPublished { .. }
         | NameServiceEvent::GraphSourceIndexPublished { .. }
         | NameServiceEvent::GraphSourceRetracted { .. } => SSE_KIND_GRAPH_SOURCE,
@@ -425,22 +439,28 @@ where
     let resource_id = event_resource_id(&event).to_string();
 
     match event {
+        // A created branch goes out as its record. One announced before its
+        // record can be looked up is skipped: it is announced again.
         NameServiceEvent::LedgerCommitPublished { .. }
-        | NameServiceEvent::LedgerIndexPublished { .. } => {
+        | NameServiceEvent::LedgerIndexPublished { .. }
+        | NameServiceEvent::LedgerCreated { .. } => {
             let record = ns.lookup(&resource_id).await.ok()??;
             Some(ledger_to_sse_event(&record))
         }
-        NameServiceEvent::LedgerRetracted { ledger_id } => {
-            Some(retracted_sse_event(SSE_KIND_LEDGER, &ledger_id))
-        }
+        NameServiceEvent::LedgerRetracted {
+            ledger_id,
+            instance,
+        } => Some(retracted_sse_event(SSE_KIND_LEDGER, &ledger_id, instance)),
         NameServiceEvent::GraphSourceConfigPublished { .. }
         | NameServiceEvent::GraphSourceIndexPublished { .. } => {
             let record = ns.lookup_graph_source(&resource_id).await.ok()??;
             Some(graph_source_to_sse_event(&record))
         }
-        NameServiceEvent::GraphSourceRetracted { graph_source_id } => {
-            Some(retracted_sse_event(SSE_KIND_GRAPH_SOURCE, &graph_source_id))
-        }
+        NameServiceEvent::GraphSourceRetracted { graph_source_id } => Some(retracted_sse_event(
+            SSE_KIND_GRAPH_SOURCE,
+            &graph_source_id,
+            None,
+        )),
     }
 }
 
@@ -518,11 +538,26 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
     }
 }
 
+/// Marks the end of the snapshot: a subscriber holding a resource in scope
+/// that the snapshot did not name missed its retraction, and drops it.
+fn snapshot_complete_event(records: usize) -> Event {
+    Event::default()
+        .event("snapshot-complete")
+        .json_data(serde_json::json!({
+            "action": "snapshot-complete",
+            "records": records,
+            "emitted_at": now_iso8601(),
+        }))
+        .unwrap_or_else(|_| Event::default().comment("serialization error"))
+}
+
 /// SSE events endpoint handler
 ///
 /// Streams nameservice record changes to connected clients.
-/// On connect, sends an initial snapshot of all matching records,
-/// then streams live updates.
+/// On connect, sends an initial snapshot of all matching records, a
+/// `snapshot-complete` event, then live updates. A subscriber that falls
+/// behind the live updates has its stream ended, so it reconnects to a
+/// fresh snapshot rather than miss events.
 ///
 /// # Authentication
 /// When events authentication is enabled:
@@ -566,7 +601,8 @@ pub async fn events(
     let subscription = state.fluree.event_bus().subscribe(SubscriptionScope::All);
 
     // 2. Build initial snapshot using effective params
-    let initial_events = build_initial_snapshot(&ns, &effective_params).await;
+    let mut initial_events = build_initial_snapshot(&ns, &effective_params).await;
+    initial_events.push(snapshot_complete_event(initial_events.len()));
     let initial_stream = stream::iter(initial_events.into_iter().map(Ok));
 
     // 3. Create live event stream from broadcast receiver using unfold
@@ -605,10 +641,9 @@ pub async fn events(
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(
                             lagged = n,
-                            "SSE broadcast lagged, some events may have been missed"
+                            "SSE subscriber fell behind; ending its stream so it resyncs"
                         );
-                        // Continue listening after lag
-                        continue;
+                        return None;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Channel closed, end the stream
@@ -657,6 +692,9 @@ mod tests {
             retracted: false,
             source_branch: None,
             branches: 0,
+            storage_root: None,
+            fence: None,
+            frozen: false,
         };
         let id = ledger_event_id("test:main", &record);
         assert_eq!(id, "ledger:test:main:42:40");

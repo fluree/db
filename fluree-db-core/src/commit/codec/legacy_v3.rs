@@ -1072,7 +1072,10 @@ mod tests {
         assert_eq!(blob[4], format::VERSION_V3);
 
         let storage = MemoryStorage::new();
-        let store = content_store_for(storage, "test/v3-probe:main");
+        let store = content_store_for(
+            storage,
+            &crate::StorageNamespace::parse_legacy("test/v3-probe:main").unwrap(),
+        );
         let cid = store
             .put(ContentKind::Commit, &blob)
             .await

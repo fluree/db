@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use fluree_db_api::{Fluree, LedgerManager, NotifyResult, NsNotify};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_nameservice_sync::{
-    run_head_stream, HeadSink, HeadStreamConfig, RemoteEvent, ReqwestSseSource, TokioSleeper,
+    run_head_stream, HeadSink, HeadStreamConfig, RemoteEvent, ReqwestSseSource, SnapshotNames,
+    SnapshotTracker, TokioSleeper,
 };
 
 /// Background task that maintains SSE subscription to transaction server
@@ -57,6 +58,7 @@ impl PeerSubscriptionTask {
             config: self.config.clone(),
             peer_state: Arc::clone(&self.peer_state),
             fluree: Arc::clone(&self.fluree),
+            snapshot: SnapshotTracker::new(),
         };
         let stream_config = HeadStreamConfig {
             reconnect_initial: Duration::from_millis(self.config.peer_reconnect_initial_ms),
@@ -104,9 +106,26 @@ struct PeerEventSink {
     config: ServerConfig,
     peer_state: Arc<PeerState>,
     fluree: Arc<Fluree>,
+    snapshot: SnapshotTracker,
 }
 
 impl PeerEventSink {
+    /// Evict cached ledgers the subscription covers that a completed
+    /// snapshot did not name: the server retracted them while this peer
+    /// was away.
+    async fn reconcile(&self, named: &SnapshotNames) {
+        let Some(mgr) = self.fluree.ledger_manager() else {
+            return;
+        };
+        let sub = self.config.peer_subscription();
+        for id in mgr.cached_aliases().await {
+            if sub.covers_ledger(&id) && !named.ledgers.contains(&id) {
+                self.fluree.disconnect_ledger(&id).await;
+                tracing::info!(ledger_id = %id, "Ledger retracted while disconnected");
+            }
+        }
+    }
+
     async fn preload_configured_ledgers(&self) {
         let sub = self.config.peer_subscription();
         if sub.all || sub.ledgers.is_empty() {
@@ -152,6 +171,9 @@ impl PeerEventSink {
             Ok(NotifyResult::Current) => {
                 // Already up to date.
             }
+            Ok(NotifyResult::Evicted) => {
+                tracing::info!(ledger_id = %ledger_id, "Evicted a cached ledger that no longer resolves");
+            }
             Ok(
                 result @ (NotifyResult::Reloaded
                 | NotifyResult::IndexUpdated
@@ -177,7 +199,13 @@ fn config_hash(config: &str) -> String {
 #[async_trait]
 impl HeadSink for PeerEventSink {
     async fn on_event(&self, event: RemoteEvent) {
+        let named = self.snapshot.observe(&event);
         match event {
+            RemoteEvent::SnapshotComplete => {
+                if let Some(named) = named {
+                    self.reconcile(&named).await;
+                }
+            }
             RemoteEvent::Connected => {
                 // Clear state on reconnect (new snapshot coming).
                 self.peer_state.clear().await;
@@ -199,6 +227,7 @@ impl HeadSink for PeerEventSink {
                         record.index_t,
                         record.commit_head_id.as_ref().map(ToString::to_string),
                         record.index_head_id.as_ref().map(ToString::to_string),
+                        record.instance(),
                     )
                     .await;
                 if changed {
@@ -229,8 +258,18 @@ impl HeadSink for PeerEventSink {
                     );
                 }
             }
-            RemoteEvent::LedgerRetracted { ledger_id } => {
-                self.peer_state.remove_ledger(&ledger_id).await;
+            RemoteEvent::LedgerRetracted {
+                ledger_id,
+                instance,
+            } => {
+                if !self
+                    .peer_state
+                    .remove_ledger(&ledger_id, instance.as_ref())
+                    .await
+                {
+                    tracing::debug!(ledger_id = %ledger_id, "Ignoring the retraction of an earlier ledger under the name");
+                    return;
+                }
                 tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
 
                 // Evict any cached state for the ledger (no-op if not cached).

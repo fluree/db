@@ -13,7 +13,7 @@ use serde_json::json;
 /// Seed a tiny in-memory ledger with a single named subject.
 async fn seed_one() -> (support::MemoryFluree, support::MemoryLedger) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = support::genesis_ledger(&fluree, "fuel/floor:main");
+    let ledger0 = support::genesis_ledger(&fluree, "fuel/floor:main").await;
     let seed = json!({
         "@context": { "a": "http://a.co/" },
         "@graph": [{ "@id": "http://a.co/x", "a:name": "X" }]
@@ -326,7 +326,7 @@ async fn tracked_sparql_meta_pragma_selects_tracking() {
 #[tokio::test]
 async fn untracked_sparql_max_fuel_pragma_caps_a_within_ledger_dataset_query() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = support::genesis_ledger(&fluree, "fuel/floor-dataset:main");
+    let ledger = support::genesis_ledger(&fluree, "fuel/floor-dataset:main").await;
     let ledger = fluree
         .stage_owned(ledger)
         .upsert_turtle("GRAPH <urn:fuel:g> { <http://a.co/x> <http://a.co/name> \"X\" . }")

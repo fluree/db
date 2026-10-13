@@ -25,7 +25,7 @@ fn rows(value: JsonValue) -> Vec<(String, f64)> {
 #[tokio::test]
 async fn a_constant_query_vector_scores_as_a_values_binding() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/sparql-vector-constant:main");
+    let ledger = genesis_ledger(&fluree, "it/sparql-vector-constant:main").await;
     let ledger = fluree
         .insert(
             ledger,
@@ -98,7 +98,7 @@ async fn a_constant_query_vector_scores_as_a_values_binding() {
 #[tokio::test]
 async fn a_constant_vector_matches_in_a_pattern() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/vector-pattern:main");
+    let ledger = genesis_ledger(&fluree, "it/vector-pattern:main").await;
     let ledger = fluree
         .insert(
             ledger,

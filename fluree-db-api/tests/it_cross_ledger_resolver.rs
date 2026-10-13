@@ -37,7 +37,7 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
 
     // Model ledger M: holds one policy in a named graph.
     let model_id = "test/cross-ledger/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     // Use TriG to drop the policy directly into a named graph (the
     // simplest way to populate a non-default graph in one transaction).
@@ -68,7 +68,7 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
     // contents don't matter for the resolver — only the resolver's
     // ability to find and read M without touching D.
     let data_id = "test/cross-ledger/data:main";
-    let _data = genesis_ledger(&fluree, data_id);
+    let _data = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -155,7 +155,7 @@ async fn structural_detection_picks_up_custom_typed_policies() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger/custom-typed:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     let policy_graph_iri = "http://example.org/custom-policy-graph";
     // Policy is typed as ex:OrgPolicy, NOT f:AccessPolicy. It has
@@ -184,7 +184,7 @@ async fn structural_detection_picks_up_custom_typed_policies() {
         .expect("write custom-typed policy");
 
     let data_id = "test/cross-ledger/custom-typed-d:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -225,7 +225,7 @@ async fn structural_detection_picks_up_custom_typed_policies() {
 async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     let fluree = FlureeBuilder::memory().build_memory();
     let model_id = "test/cross-ledger/multi-typed:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/multi-typed-graph";
     let trig = format!(
         r"
@@ -250,7 +250,7 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
         .expect("write dual-typed policy");
 
     let data_id = "test/cross-ledger/multi-typed-d:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -292,7 +292,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger/schema:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let schema_graph_iri = "http://example.org/ontology/core";
 
     // M's schema graph: a small class hierarchy + a property
@@ -323,7 +323,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
         .expect("seed M schema graph");
 
     let data_id = "test/cross-ledger/schema-d:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -391,7 +391,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
 async fn cross_ledger_schema_empty_graph_yields_empty_wire() {
     let fluree = FlureeBuilder::memory().build_memory();
     let model_id = "test/cross-ledger/schema-empty:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     // Non-schema data in a named graph so the graph EXISTS.
     let graph_iri = "http://example.org/non-schema";
@@ -411,7 +411,7 @@ async fn cross_ledger_schema_empty_graph_yields_empty_wire() {
         .expect("seed non-schema data");
 
     let data_id = "test/cross-ledger/schema-empty-d:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -443,7 +443,7 @@ async fn cross_ledger_schema_empty_graph_yields_empty_wire() {
 async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     let fluree = FlureeBuilder::memory().build_memory();
     let model_id = "test/cross-ledger/missing-effect:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/missing-effect-graph";
 
     // Policy is canonically typed but declares no f:allow / f:query.
@@ -473,7 +473,7 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
         .expect("write canonical-typed effect-less policy");
 
     let data_id = "test/cross-ledger/missing-effect-d:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -527,7 +527,7 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
 
     // Build M first with the policy graph using ex:User.
     let model_id = "test/cross-ledger/canary/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/canary-policy";
     fluree
         .stage_owned(model)
@@ -555,7 +555,7 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
     // an ns_code first, so when ex:User finally lands, its prefix
     // ends up at a different code than M assigned.
     let data_id = "test/cross-ledger/canary/data:main";
-    let data = genesis_ledger(&fluree, data_id);
+    let data = genesis_ledger(&fluree, data_id).await;
     let r1 = fluree
         .insert(
             data,
@@ -685,7 +685,7 @@ async fn single_resolution_t_is_stable_within_a_request() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger/stable-t/model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     // M holds two policy graphs from the start so both resolutions
     // can succeed without M needing to advance for them to exist.
@@ -713,7 +713,7 @@ async fn single_resolution_t_is_stable_within_a_request() {
     let model = r1.ledger;
 
     let data_id = "test/cross-ledger/stable-t/data:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     // Single ResolveCtx = single request. Resolve A, advance M, then
     // resolve B. B's resolved_t must equal A's — captured once at the
@@ -799,7 +799,7 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger/cache:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
     let policy_graph_iri = "http://example.org/cache-policy";
     fluree
         .stage_owned(model)
@@ -822,9 +822,9 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
     // Both resolve the same (M, policy_graph, t). The second one
     // must hit the per-instance governance cache.
     let data_a = "test/cross-ledger/cache/d-a:main";
-    let _ = genesis_ledger(&fluree, data_a);
+    let _ = genesis_ledger(&fluree, data_a).await;
     let data_b = "test/cross-ledger/cache/d-b:main";
-    let _ = genesis_ledger(&fluree, data_b);
+    let _ = genesis_ledger(&fluree, data_b).await;
 
     let graph_ref = cross_ref(model_id, policy_graph_iri);
 
@@ -864,7 +864,7 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
 
     // A new context against a third data ledger sees the same hit.
     let data_c = "test/cross-ledger/cache/d-c:main";
-    let _ = genesis_ledger(&fluree, data_c);
+    let _ = genesis_ledger(&fluree, data_c).await;
     let data_c_ledger = fluree_db_api::LedgerId::parse(data_c).unwrap();
     let mut ctx_c = ResolveCtx::new(&data_c_ledger, &fluree);
     let resolved_c = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_c)
@@ -882,7 +882,7 @@ async fn unknown_graph_on_model_ledger_surfaces_graph_missing_at_t() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let model_id = "test/cross-ledger/empty-model:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     // Transact something into the default graph so the model has a
     // commit t, but never touch any named graph.
@@ -899,7 +899,7 @@ async fn unknown_graph_on_model_ledger_surfaces_graph_missing_at_t() {
         .expect("seed model ledger");
 
     let data_id = "test/cross-ledger/empty-data:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 
@@ -931,7 +931,7 @@ async fn unknown_graph_on_model_ledger_surfaces_graph_missing_at_t() {
 async fn empty_policy_graph_yields_empty_wire_artifact() {
     let fluree = FlureeBuilder::memory().build_memory();
     let model_id = "test/cross-ledger/no-policies:main";
-    let model = genesis_ledger(&fluree, model_id);
+    let model = genesis_ledger(&fluree, model_id).await;
 
     // Put NON-policy data in the named graph so the graph exists.
     let graph_iri = "http://example.org/data-only";
@@ -952,7 +952,7 @@ async fn empty_policy_graph_yields_empty_wire_artifact() {
         .expect("write non-policy data");
 
     let data_id = "test/cross-ledger/no-policies-d:main";
-    let _ = genesis_ledger(&fluree, data_id);
+    let _ = genesis_ledger(&fluree, data_id).await;
 
     let data_id_ledger = fluree_db_api::LedgerId::parse(data_id).unwrap();
 

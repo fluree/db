@@ -12,7 +12,7 @@ async fn bm25_create_full_text_index_indexes_docs_and_is_loadable() {
 
     // Seed a small ledger
     let ledger_id = "bm25/docs:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -49,7 +49,7 @@ async fn bm25_search_returns_scored_results() {
 
     // Seed ledger with documents
     let ledger_id = "bm25/search:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -124,7 +124,7 @@ async fn bm25_sync_indexes_new_documents() {
 
     // Create initial ledger with one doc
     let ledger_id = "bm25/sync:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -177,7 +177,7 @@ async fn bm25_snapshot_history_tracks_versions() {
 
     // Create ledger with doc
     let ledger_id = "bm25/history:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -237,7 +237,7 @@ async fn bm25_drop_full_text_index_cleans_up() {
 
     // Create ledger with doc
     let ledger_id = "bm25/drop:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -318,7 +318,7 @@ async fn bm25_recreate_after_drop() {
 
     // Create ledger with docs
     let ledger_id = "bm25/recreate:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -415,7 +415,7 @@ async fn bm25_query_after_drop_is_not_found() {
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "bm25/dropped:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming" }]
@@ -475,7 +475,7 @@ async fn bm25_federated_query_via_provider() {
 
     // Create ledger with documents
     let ledger_id = "bm25/federated:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -677,7 +677,7 @@ async fn bm25_query_connection_with_idx_pattern() {
 
     // Create ledger with documents
     let ledger_id = "bm25/qc:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -797,7 +797,7 @@ async fn bm25_embedded_search_via_plain_query_connection() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/plain-qc:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -862,7 +862,7 @@ async fn bm25_federated_query_with_aggregation() {
 
     // Create ledger with books having year and category metadata
     let ledger_id = "bm25/agg:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -960,7 +960,7 @@ async fn bm25_search_enforces_view_policy_on_indexed_flake() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/policy:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex": "http://example.org/" },
         "@graph": [
@@ -1064,7 +1064,7 @@ async fn bm25_embedded_search_via_dataset_path() {
     // Two ledgers so `from` is a dataset, forcing the dataset execution path.
     let l1 = "bm25/dataset-a:main";
     let l2 = "bm25/dataset-b:main";
-    let a0 = support::genesis_ledger(&fluree, l1);
+    let a0 = support::genesis_ledger(&fluree, l1).await;
     let _ = fluree
         .insert(
             a0,
@@ -1080,7 +1080,7 @@ async fn bm25_embedded_search_via_dataset_path() {
         .await
         .expect("insert a");
 
-    let b0 = support::genesis_ledger(&fluree, l2);
+    let b0 = support::genesis_ledger(&fluree, l2).await;
     let _ = fluree
         .insert(
             b0,
@@ -1141,7 +1141,7 @@ async fn bm25_embedded_search_enforces_policy_via_plain_query_connection() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/plain-policy:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let _ = fluree
         .insert(
             ledger0,
@@ -1257,7 +1257,7 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
 
     let l1 = "bm25/tracked-a:main";
     let l2 = "bm25/tracked-b:main";
-    let a0 = support::genesis_ledger(&fluree, l1);
+    let a0 = support::genesis_ledger(&fluree, l1).await;
     let _ = fluree
         .insert(
             a0,
@@ -1273,7 +1273,7 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
         .await
         .expect("insert a");
 
-    let b0 = support::genesis_ledger(&fluree, l2);
+    let b0 = support::genesis_ledger(&fluree, l2).await;
     let _ = fluree
         .insert(
             b0,
@@ -1511,7 +1511,7 @@ async fn bm25_sync_refuses_a_retracted_index() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/retracted:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Original document one" }]
@@ -1573,7 +1573,7 @@ async fn bm25_incremental_sync_matches_full_resync() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/diff:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let seed = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [
@@ -1713,7 +1713,7 @@ async fn scoped_indexing_query_narrows_the_indexed_scan() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/fuel:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
 
     const CORPUS: usize = 400;
     let docs: Vec<_> = (0..CORPUS)
@@ -1797,7 +1797,7 @@ async fn sync_without_indexed_changes_advances_watermark_without_resync() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/noop:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
@@ -1890,7 +1890,7 @@ async fn sync_with_wildcard_select_rebuilds_instead_of_advancing_past_the_change
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/wildcard:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
@@ -1945,7 +1945,7 @@ async fn sync_with_nested_projection_rebuilds_when_the_referenced_subject_change
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/nested:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ {
@@ -2008,7 +2008,7 @@ async fn sync_with_variable_predicate_always_rebuilds() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     let ledger_id = "bm25/varpred:main";
-    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id).await;
     let tx1 = json!({
         "@context": { "ex":"http://example.org/" },
         "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
@@ -2054,4 +2054,155 @@ async fn sync_with_variable_predicate_always_rebuilds() {
         .await
         .unwrap();
     assert!(after.term_idx("quokka").is_some());
+}
+
+/// A graph source records the ledger instance it indexed. Once that ledger
+/// is dropped and its name reused, the source refuses to sync from the new
+/// ledger until it is recreated over it; restoring the dropped ledger
+/// instead keeps it syncing.
+#[tokio::test]
+async fn bm25_suspends_when_its_ledger_is_replaced() {
+    use fluree_db_api::{ApiError, DropMode};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "bm25/replaced:main";
+    let doc = |id: &str, title: &str| {
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [{ "@id": id, "@type":"ex:Doc", "ex:title": title }]
+        })
+    };
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let hits = |idx: &fluree_db_query::bm25::Bm25Index, word: &str| {
+        let terms = Analyzer::english_default().analyze_to_strings(word);
+        let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+        Bm25Scorer::new(idx, &terms).top_k(10).len()
+    };
+
+    // Several commits, so the index head is past any `t` the replacement
+    // reaches.
+    let mut ledger = support::genesis_ledger(&fluree, ledger_id).await;
+    for i in 0..3 {
+        let tx = doc(&format!("ex:doc{i}"), &format!("original {i}"));
+        ledger = fluree.insert(ledger, &tx).await.unwrap().ledger;
+    }
+    let gs = fluree
+        .create_full_text_index(Bm25CreateConfig::new("replaced", ledger_id, query.clone()))
+        .await
+        .unwrap()
+        .graph_source_id;
+    let search = |text: &str| {
+        json!({
+            "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "where": [{
+                "f:graphSource": &gs,
+                "f:searchText": text,
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+            }],
+            "select": ["?doc"]
+        })
+    };
+    // Searched before the drops below: whatever a search remembers about
+    // the ledger must not outlive them.
+    fluree
+        .query_connection(&search("original"))
+        .await
+        .expect("searched");
+
+    // Dropped and restored: the same ledger, so the source keeps syncing.
+    let dropped = fluree
+        .drop_ledger("bm25/replaced", DropMode::Soft)
+        .await
+        .unwrap();
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    fluree
+        .insert(ledger, &doc("ex:doc3", "original 3"))
+        .await
+        .unwrap();
+    let check = fluree.check_bm25_staleness(&gs).await.unwrap();
+    assert!(!check.suspended);
+    assert!(check.is_stale);
+    assert_eq!(check.lag, 1);
+    fluree
+        .sync_bm25_index(&gs)
+        .await
+        .expect("a restored ledger is the one indexed");
+    fluree
+        .query_connection(&search("original"))
+        .await
+        .expect("the restored ledger's index is searched");
+
+    // Dropped and its name reused: another ledger.
+    fluree
+        .drop_ledger("bm25/replaced", DropMode::Hard)
+        .await
+        .unwrap();
+    let ledger = support::genesis_ledger(&fluree, ledger_id).await;
+    fluree
+        .insert(ledger, &doc("ex:new", "replacement"))
+        .await
+        .unwrap();
+    for sync in [
+        fluree.sync_bm25_index(&gs).await,
+        fluree.resync_bm25_index(&gs).await,
+    ] {
+        let err = sync.expect_err("the replacement is not the ledger indexed");
+        assert!(matches!(err, ApiError::GraphSourceSuspended(_)), "{err}");
+        assert_eq!(err.status_code(), 409);
+    }
+    // Nor is it searched, by a query through the path `POST /query` takes,
+    // or loaded: its hits are the dropped ledger's.
+    let err = fluree
+        .query_connection(&search("original"))
+        .await
+        .expect_err("a suspended index is not searched");
+    assert_eq!(err.status_code(), 409, "{err}");
+    let err = fluree
+        .load_bm25_index(&gs)
+        .await
+        .expect_err("a suspended index is not loaded");
+    assert_eq!(err.status_code(), 409, "{err}");
+    // Staleness reports the suspension rather than comparing against the
+    // replacement's head, which is behind the index.
+    let check = fluree.check_bm25_staleness(&gs).await.unwrap();
+    assert!(check.suspended);
+    assert!(!check.is_stale);
+    assert_eq!(check.lag, 0);
+
+    // Recreated over the replacement, it indexes the replacement alone.
+    fluree.drop_full_text_index(&gs).await.unwrap();
+    fluree
+        .create_full_text_index(Bm25CreateConfig::new("replaced", ledger_id, query))
+        .await
+        .unwrap();
+    let idx = fluree.load_bm25_index(&gs).await.unwrap();
+    assert_eq!(hits(&idx, "replacement"), 1);
+    assert_eq!(hits(&idx, "original"), 0);
+    let found = fluree
+        .query_connection(&search("replacement"))
+        .await
+        .expect("the recreated index is searched");
+    assert_eq!(
+        found
+            .batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .sum::<usize>(),
+        1
+    );
+    assert!(!fluree.check_bm25_staleness(&gs).await.unwrap().suspended);
+    fluree
+        .sync_bm25_index(&gs)
+        .await
+        .expect("it syncs from the ledger it now indexes");
 }

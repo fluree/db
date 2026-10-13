@@ -203,13 +203,27 @@ async fn shutdown_tracer() {
 /// lazily, so the unused headroom costs no resident memory.
 const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Stack size for the thread that drives the CLI's top-level future.
+///
+/// A command runs on that thread, not on a worker, and an unoptimized build's
+/// async chain for a load or an ingest (planning a query inside a commit)
+/// outgrows the 8 MB an OS gives a main thread, whose size cannot be set.
+const DRIVER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 fn main() {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_STACK_SIZE)
         .build()
-        .expect("failed to build Tokio runtime")
-        .block_on(async_main());
+        .expect("failed to build Tokio runtime");
+    let driver = std::thread::Builder::new()
+        .name("main".to_string())
+        .stack_size(DRIVER_STACK_SIZE)
+        .spawn(move || runtime.block_on(async_main()))
+        .expect("failed to start the CLI's driver thread");
+    if let Err(panic) = driver.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 async fn async_main() {

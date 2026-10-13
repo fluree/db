@@ -23,7 +23,7 @@ const SEG: &str = r#"(IF(?a = "Net", "network", "other") AS ?seg)"#;
 
 /// e1–e3 Net, e4–e5 Local, e6 Remote: 6 solutions, 3 groups, 2 labels.
 async fn seed_areas(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -495,7 +495,7 @@ async fn cypher_aggregate_of_a_sibling_aggregate_is_a_named_error() {
 #[tokio::test]
 async fn having_tests_the_value_an_alias_returns() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "grouped-projection/having-alias-once:main");
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection/having-alias-once:main").await;
     let graph: Vec<JsonValue> = (0..40)
         .map(|i| json!({"@id": format!("ex:e{i}"), "ex:area": format!("A{i}")}))
         .collect();
@@ -886,7 +886,7 @@ async fn trailing_values_join_before_grouping() {
 
 /// e1 and e3 have `ex:n 1`, e2 has `ex:n 20`.
 async fn seed_numbers(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -1326,7 +1326,7 @@ async fn equijoin_fold_keeps_exists_body_variables_free_over_the_group_row() {
 
 /// The area fixture with `ex:E` types, for Cypher's label match.
 async fn seed_typed_areas(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -1378,7 +1378,7 @@ async fn cypher_grouped_read_error_names_no_internal_variable() {
 
 /// People who know each other, typed `ex:P`, with ages. Alice also likes Carol.
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -1502,7 +1502,7 @@ async fn cypher_reads_a_key_nodes_property_after_grouping() {
 
 /// People with names and scores, typed `ex:P`; Alice has two ages (40 and 41).
 async fn seed_people_two_ages(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(
             ledger0,
@@ -2028,7 +2028,7 @@ async fn grouped_select_expression_matches_cypher() {
 #[tokio::test]
 async fn solo_grouped_sparql_shapes_are_unchanged() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "grouped-projection/solo-sparql:main");
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection/solo-sparql:main").await;
     let ledger = fluree
         .insert(
             ledger0,

@@ -21,7 +21,7 @@ async fn seed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
         "#
     );
     fluree
-        .stage_owned(genesis_ledger(fluree, ledger_id))
+        .stage_owned(genesis_ledger(fluree, ledger_id).await)
         .upsert_turtle(&trig)
         .execute()
         .await

@@ -93,7 +93,7 @@ async fn hydration_reads_indexed_annotations() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_insert = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -136,7 +136,7 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         .build_memory();
     let ledger_id = "it/edge-annotations-indexed:non-annotation-skip";
 
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
     let plain_insert = json!({
         "@context": ctx(),
         "@graph": [
@@ -216,7 +216,7 @@ async fn explain_expands_annotations_as_the_executor_does() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after = fluree
                 .insert(ledger0, &annotated_insert())
                 .await
@@ -292,7 +292,7 @@ async fn transfer_named_to_named_survives_reindex() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let seeded = fluree
                 .insert(
                     ledger0,
@@ -373,7 +373,7 @@ async fn transfer_default_to_named_synthesized_anchor_survives_reindex() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             // Default-graph annotated edge.
             let seeded = fluree
                 .insert(
@@ -457,7 +457,7 @@ async fn indexed_literal_object_annotation_matches() {
 
     local
         .run_until(async move {
-            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let ledger0 = genesis_ledger(&fluree, ledger_id).await;
             let after_insert = fluree
                 .insert(
                     ledger0,
@@ -537,7 +537,7 @@ async fn indexed_named_graph_annotation_stays_writable() {
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &annotate(json!({"@id": "ex:claim1", "ex:confidence": 0.9})),
         )
         .await
@@ -633,7 +633,7 @@ async fn deleting_an_indexed_named_graph_edge_in_lpg_mode_cascades_to_its_claim(
 
     let committed = fluree
         .insert(
-            genesis_ledger(&fluree, ledger_id),
+            genesis_ledger(&fluree, ledger_id).await,
             &json!({
                 "@context": ctx(),
                 "@id": "ex:alice",

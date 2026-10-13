@@ -115,7 +115,7 @@ async fn reindex(fluree: &Fluree, storage: &Storage, ledger_id: &str) -> (IndexR
 
 async fn load_root(fluree: &Fluree, ledger_id: &str, root_id: &ContentId) -> IndexRoot {
     let bytes = fluree
-        .content_store(ledger_id)
+        .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
         .get(root_id)
         .await
         .expect("root bytes");
@@ -259,7 +259,7 @@ async fn incremental_build_carries_ndv_from_a_v2_sketch() {
     local
         .run_until(async move {
             let ledger_id = "it/sketch-v2:main";
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger = insert_values(&fluree, ledger, 0..300).await;
             let (base, _) = index(&fluree, &storage, ledger_id).await;
             assert!(
@@ -286,7 +286,7 @@ async fn incremental_build_upgrades_a_v1_sketch() {
     local
         .run_until(async move {
             let ledger_id = "it/sketch-v1:main";
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger = insert_values(&fluree, ledger, 0..300).await;
             let (base, _) = index(&fluree, &storage, ledger_id).await;
 
@@ -320,7 +320,7 @@ async fn unreadable_sketch_keeps_counts_exact_and_thins_ndv_until_rebuild() {
     local
         .run_until(async move {
             let ledger_id = "it/sketch-fallback:main";
-            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             ledger = insert_values(&fluree, ledger, 0..100).await;
             let (mut root, _) = index(&fluree, &storage, ledger_id).await;
 

@@ -22,6 +22,11 @@ pub enum ServiceError {
     #[error("index not built for graph source: {address}")]
     IndexNotBuilt { address: String },
 
+    /// The index was built over a ledger since dropped, and its source's
+    /// name now holds another ledger.
+    #[error("graph source suspended: {message}")]
+    GraphSourceSuspended { message: String },
+
     /// Sync timeout - index didn't reach expected head in time.
     #[error("sync timeout after {elapsed:?} waiting for t={target_t:?}")]
     SyncTimeout {
@@ -61,6 +66,7 @@ impl ServiceError {
             ServiceError::GraphSourceNotFound { .. } => ErrorCode::GraphSourceNotFound,
             ServiceError::NoSnapshotForAsOfT { .. } => ErrorCode::NoSnapshotForAsOfT,
             ServiceError::IndexNotBuilt { .. } => ErrorCode::IndexNotBuilt,
+            ServiceError::GraphSourceSuspended { .. } => ErrorCode::GraphSourceSuspended,
             ServiceError::SyncTimeout { .. } => ErrorCode::SyncTimeout,
             ServiceError::Timeout { .. } => ErrorCode::Timeout,
             ServiceError::InvalidRequest { .. } => ErrorCode::InvalidRequest,

@@ -15,7 +15,7 @@
 
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{FlureeBuilder, IndexConfig};
-use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
+use fluree_db_core::load_ledger_snapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use std::sync::Arc;
@@ -47,8 +47,10 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
         .run_until(async move {
             // Genesis ledger state (uncommitted; nameservice record created on first commit).
             let ledger_id = "it/index-wait:main";
-            let db0 = LedgerSnapshot::genesis(ledger_id);
-            let ledger0 = fluree_db_api::LedgerState::new(db0, fluree_db_api::Novelty::new(0));
+            let ledger0 = fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
 
             // Force indexing_needed=true for the test.
             // Must be large enough to allow the novelty write; we just want min_bytes=0
@@ -94,13 +96,17 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
                     assert!(root_id.is_some(), "expected a root_id after indexing");
 
                     let root_cid = root_id.unwrap();
+                    let namespace = fluree
+                        .storage_namespace("it/index-wait:main")
+                        .await
+                        .expect("ledger's namespace");
                     let loaded = load_ledger_snapshot(
                         &fluree
                             .backend()
                             .admin_storage_cloned()
                             .expect("test uses managed backend"),
                         &root_cid,
-                        "it/index-wait:main",
+                        &namespace,
                     )
                     .await
                     .expect("load_ledger_snapshot(root_cid)");

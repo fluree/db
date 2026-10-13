@@ -45,7 +45,7 @@ async fn apply_trig(
 async fn schema_source_in_named_graph_expands_subclass_queries() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-basic:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Put instance data (ex:alice typed as ex:Employee) in the DEFAULT graph.
     let ledger = apply_trig(
@@ -121,7 +121,7 @@ async fn schema_source_in_named_graph_expands_subclass_queries() {
 async fn transitive_owl_imports_are_followed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-transitive:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Instance data in the default graph.
     let ledger = apply_trig(
@@ -202,7 +202,7 @@ async fn transitive_owl_imports_are_followed() {
 async fn ontology_import_map_resolves_external_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-mapped:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let ledger = apply_trig(
         &fluree,
@@ -286,7 +286,7 @@ async fn ontology_import_map_resolves_external_iri() {
 async fn unresolved_owl_import_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-unresolved:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
@@ -341,7 +341,7 @@ async fn unresolved_owl_import_errors() {
 async fn owl_imports_cycle_terminates() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-cycle:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let ledger = apply_trig(
         &fluree,
@@ -422,7 +422,7 @@ async fn owl_imports_cycle_terminates() {
 async fn instance_data_in_schema_graph_does_not_leak() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-whitelist:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Put ex:real in the default graph; put ex:leaked in the schema graph
     // (as instance data, not a schema axiom).
@@ -493,7 +493,7 @@ async fn instance_data_in_schema_graph_does_not_leak() {
 async fn mapping_table_cannot_target_system_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-system-map:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Main ontology imports an external IRI that the mapping table then
     // aims at the txn-meta system graph (via `f:txnMetaGraph` sentinel).
@@ -565,7 +565,7 @@ async fn mapping_table_cannot_target_system_graph() {
 async fn reasoning_none_skips_bundle_resolution() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-disabled:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed one fact in the default graph.
     let ledger = apply_trig(
@@ -639,7 +639,7 @@ async fn reasoning_none_skips_bundle_resolution() {
 async fn schema_source_at_t_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-at-t:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
@@ -715,7 +715,7 @@ async fn schema_source_at_t_rejected() {
 async fn owl2rl_transitive_property_axiom_from_transitive_import() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-owl2rl-trans:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Instance data in the default graph; ancestry chain of three.
     let ledger = apply_trig(
@@ -801,7 +801,7 @@ async fn owl2rl_transitive_property_axiom_from_transitive_import() {
 async fn owl2rl_inverse_of_axiom_from_transitive_import() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-owl2rl-inverse:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Instance data: alice is bob's parent.
     let ledger = apply_trig(
@@ -881,7 +881,7 @@ async fn owl2rl_inverse_of_axiom_from_transitive_import() {
 async fn owl2rl_domain_axiom_from_transitive_import_types_instance() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/reasoning-imports-owl2rl-domain:main";
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Instance data: alice has a name, no explicit rdf:type.
     let ledger = apply_trig(
@@ -947,5 +947,91 @@ async fn owl2rl_domain_axiom_from_transitive_import_types_instance() {
         normalized.contains(&json!("ex:alice")),
         "rdfs:domain from imported graph B should type alice as Employee; \
          got {normalized:?}"
+    );
+}
+
+// ============================================================================
+// A ledger recreated under a dropped one's name
+// ============================================================================
+
+/// A ledger whose schema source says `ex:Employee rdfs:subClassOf {parent}`,
+/// with `ex:alice` an `ex:Employee`, at t=2.
+async fn seed_schema_ledger(fluree: &fluree_db_api::Fluree, ledger_id: &str, parent: &str) {
+    let ledger = genesis_ledger(fluree, ledger_id).await;
+    let ledger = apply_trig(
+        fluree,
+        ledger,
+        r"
+        @prefix ex: <http://example.org/> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        ex:alice rdf:type ex:Employee .
+        ",
+    )
+    .await;
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix ex: <http://example.org/> .
+
+        GRAPH <http://example.org/ontology/core> {{
+            ex:Employee rdfs:subClassOf {parent} .
+        }}
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:schemaSource <urn:config:schema-ref> .
+            <urn:config:schema-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:schema-source> .
+            <urn:config:schema-source> f:graphSelector <http://example.org/ontology/core> .
+        }}
+        "
+    );
+    apply_trig(fluree, ledger, &trig).await;
+}
+
+async fn people(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec<serde_json::Value> {
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?s",
+        "where": {"@id": "?s", "@type": "ex:Person"},
+        "reasoning": "rdfs"
+    });
+    let view = fluree.db(ledger_id).await.unwrap();
+    let rows = fluree
+        .query(&view, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&view.snapshot)
+        .unwrap();
+    support::normalize_rows(&rows)
+}
+
+/// The resolved schema is cached by ledger and `t`. A ledger dropped and
+/// created again under its name reaches the same `t` with another schema,
+/// and must be reasoned over with its own, not the dropped one's.
+#[tokio::test]
+async fn a_recreated_ledger_is_not_reasoned_over_with_the_dropped_ones_schema() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-imports-recreated:main";
+
+    seed_schema_ledger(&fluree, ledger_id, "ex:Person").await;
+    assert_eq!(people(&fluree, ledger_id).await, [json!("ex:alice")]);
+
+    fluree
+        .drop_ledger(
+            "it/reasoning-imports-recreated",
+            fluree_db_api::DropMode::Soft,
+        )
+        .await
+        .unwrap();
+    seed_schema_ledger(&fluree, ledger_id, "ex:Agent").await;
+    assert_eq!(
+        people(&fluree, ledger_id).await,
+        Vec::<serde_json::Value>::new(),
+        "the recreated ledger's schema makes ex:Employee an ex:Agent, not an ex:Person"
     );
 }

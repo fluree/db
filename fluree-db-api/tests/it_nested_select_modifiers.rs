@@ -16,7 +16,7 @@ fn context() -> JsonValue {
 /// Alice knows four people with distinct names and ages; Bob knows nobody.
 async fn seed(ledger_id: &str) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
     let ledger = fluree
         .insert(
             ledger,
@@ -213,7 +213,7 @@ async fn nested_order_by_handles_large_integers() {
     const BASE: i64 = 1 << 53;
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "nested-order-bigint:main");
+    let ledger = genesis_ledger(&fluree, "nested-order-bigint:main").await;
     let ledger = fluree
         .insert(
             ledger,

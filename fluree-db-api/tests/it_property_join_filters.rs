@@ -31,7 +31,7 @@ async fn seed(fluree: &fluree_db_api::Fluree) {
         .collect();
     fluree
         .insert(
-            genesis_ledger(fluree, LEDGER_ID),
+            genesis_ledger(fluree, LEDGER_ID).await,
             &json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph}),
         )
         .await

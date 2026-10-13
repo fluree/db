@@ -9,7 +9,7 @@ const LEDGER: &str = "subquery-unbound:main";
 async fn seed() -> Fluree {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, LEDGER);
+    let ledger = genesis_ledger(&fluree, LEDGER).await;
     fluree
         .insert(
             ledger,

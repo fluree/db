@@ -74,6 +74,11 @@ pub const DEFAULT_PER_LEDGER_PENDING_LIMIT: usize = DEFAULT_PENDING_LIMIT / 8;
 struct CachedSubmission {
     state: SubmissionState,
     body_hash: [u8; 32],
+    /// The instance of the ledger the submission was made to
+    /// ([`Committer::ledger_instance`]), when known. An answer recorded for
+    /// one instance is never given for another: the ledger was dropped and
+    /// another created under its name.
+    instance: Option<u128>,
 }
 
 /// Outcome of [`CachingCommitter::try_claim_slot`]: either an earlier
@@ -252,7 +257,9 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         | SubmissionError::NoveltyBackpressure { message }
         | SubmissionError::NoveltyDeltaTooLarge { message }
         | SubmissionError::DatatypeLimitExceeded { message }
-        | SubmissionError::CommitNotFound { message } => message.capacity(),
+        | SubmissionError::CommitNotFound { message }
+        | SubmissionError::Fenced { message }
+        | SubmissionError::LifecycleConflict { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -500,6 +507,10 @@ impl<C: Committer> CachingCommitter<C> {
         // failures are re-attemptable. Concurrent submissions for the same
         // key see `is_fresh() == false` and collapse onto the existing
         // submission; only the caller that wins the claim goes on to execute.
+        //
+        // A settled answer recorded for another instance of the ledger is
+        // replaced too: it belongs to a ledger dropped since.
+        let instance = self.executor.ledger_instance(&cache_key.ledger_id).await;
         let claim = self
             .cache
             .entry(cache_key.clone())
@@ -507,10 +518,15 @@ impl<C: Committer> CachingCommitter<C> {
                 std::future::ready(CachedSubmission {
                     state: SubmissionState::InFlight,
                     body_hash,
+                    instance,
                 }),
                 |existing| {
-                    matches!(existing.state, SubmissionState::Failed(_))
-                        && existing.body_hash == body_hash
+                    let retry = matches!(existing.state, SubmissionState::Failed(_))
+                        && existing.body_hash == body_hash;
+                    let other_ledger = instance.is_some()
+                        && existing.instance != instance
+                        && !matches!(existing.state, SubmissionState::InFlight);
+                    retry || other_ledger
                 },
             )
             .await;
@@ -575,18 +591,20 @@ impl<C: Committer> CachingCommitter<C> {
             Err(err) if !err.is_settled() => return,
             Err(err) => SubmissionState::Failed(err.clone()),
         };
-        let value = CachedSubmission {
-            state: final_state,
-            body_hash,
-        };
         // Go through `and_compute_with` rather than `cache.insert` so
         // this terminal write serializes against `ClaimGuard::drop`'s
         // cleanup on the same key (which uses the same compute path).
         // Otherwise drop's `Op::Remove` decision could race against a
-        // bare insert and erase this state.
+        // bare insert and erase this state. The instance is the claim's.
         self.cache
             .entry(cache_key)
-            .and_compute_with(|_| async move { Op::Put(value) })
+            .and_compute_with(|claimed| async move {
+                Op::Put(CachedSubmission {
+                    state: final_state,
+                    body_hash,
+                    instance: claimed.and_then(|c| c.into_value().instance),
+                })
+            })
             .await;
     }
 
@@ -1048,6 +1066,7 @@ impl<C: Committer + SubmissionLookup> SubmissionLookup for CachingCommitter<C> {
                                 CachedSubmission {
                                     state: inner.clone(),
                                     body_hash: entry.body_hash,
+                                    instance: entry.instance,
                                 },
                             )
                             .await;
@@ -1145,6 +1164,7 @@ mod tests {
                 receipt: None,
             })),
             body_hash: [0u8; 32],
+            instance: None,
         }
     }
 
@@ -1177,6 +1197,7 @@ mod tests {
                 receipt: None,
             })),
             body_hash: [0u8; 32],
+            instance: None,
         }
     }
 
@@ -1306,6 +1327,7 @@ mod tests {
                 CachedSubmission {
                     state: SubmissionState::InFlight,
                     body_hash: [7u8; 32],
+                    instance: None,
                 },
             )
             .await;
@@ -1362,6 +1384,7 @@ mod tests {
                 CachedSubmission {
                     state: SubmissionState::InFlight,
                     body_hash: [7u8; 32],
+                    instance: None,
                 },
             )
             .await;
@@ -1398,6 +1421,7 @@ mod tests {
                 CachedSubmission {
                     state: committed_state("k1"),
                     body_hash: [7u8; 32],
+                    instance: None,
                 },
             )
             .await;
@@ -1519,6 +1543,7 @@ mod tests {
                 CachedSubmission {
                     state: committed_state("k1"),
                     body_hash,
+                    instance: None,
                 },
             )
             .await;
@@ -1843,6 +1868,7 @@ mod tests {
                 Op::Put(CachedSubmission {
                     state: committed_state("k1"),
                     body_hash,
+                    instance: None,
                 })
             })
             .await;
@@ -1985,10 +2011,12 @@ mod tests {
         let unknown = CachedSubmission {
             state: SubmissionState::Unknown,
             body_hash: [0u8; 32],
+            instance: None,
         };
         let in_flight = CachedSubmission {
             state: SubmissionState::InFlight,
             body_hash: [0u8; 32],
+            instance: None,
         };
         let unknown_w = weigh_cached_submission(&key, &unknown);
         let inflight_w = weigh_cached_submission(&key, &in_flight);
@@ -2114,6 +2142,61 @@ mod tests {
         // If it had, the new transaction would advance `t` past the first.
         assert_eq!(first.commit.t, second.commit.t);
         assert_eq!(first.commit.commit_id, second.commit.commit_id);
+    }
+
+    /// A ledger dropped and created again under its name is another ledger:
+    /// a keyed retry against it runs, rather than being answered with the
+    /// dropped ledger's receipt. A restore brings back the same ledger, and
+    /// with it the answer.
+    #[tokio::test]
+    async fn a_recreated_ledger_is_not_answered_for_the_dropped_one() {
+        let (fluree, committer, ledger_id) = setup().await;
+        let key = "01J5RECREATE01";
+        let body = sample_insert("alice");
+        let t = |fluree: Arc<fluree_db_api::Fluree>, id: String| async move {
+            fluree.disconnect_ledger(&id).await;
+            fluree.db(&id).await.expect("load").t
+        };
+        committer
+            .transact(request(&ledger_id, Some(key), body.clone()))
+            .await
+            .expect("first submission");
+
+        fluree
+            .drop_ledger("test/committer", fluree_db_api::DropMode::Soft)
+            .await
+            .expect("drop");
+        fluree.create_ledger(&ledger_id).await.expect("recreate");
+        let recreated = committer
+            .transact(request(&ledger_id, Some(key), body.clone()))
+            .await
+            .expect("retry on the new ledger");
+        assert_eq!(
+            t(Arc::clone(&fluree), ledger_id.clone()).await,
+            1,
+            "the retry ran on the new ledger"
+        );
+
+        let instance = fluree
+            .drop_ledger("test/committer", fluree_db_api::DropMode::Soft)
+            .await
+            .expect("drop again")
+            .instance
+            .expect("instance");
+        fluree
+            .restore_dropped(instance.as_str())
+            .await
+            .expect("restore");
+        let restored = committer
+            .transact(request(&ledger_id, Some(key), body))
+            .await
+            .expect("retry on the restored ledger");
+        assert_eq!(restored.commit.commit_id, recreated.commit.commit_id);
+        assert_eq!(
+            t(Arc::clone(&fluree), ledger_id).await,
+            1,
+            "the restored ledger answered from the cache"
+        );
     }
 
     #[tokio::test]

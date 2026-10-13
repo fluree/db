@@ -94,12 +94,12 @@ impl ContentAddressedWrite for RootReadCounting {
     async fn content_write_bytes_with_hash(
         &self,
         kind: fluree_db_core::content_kind::ContentKind,
-        ledger_id: &str,
+        namespace: &fluree_db_core::StorageNamespace,
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> fluree_db_core::Result<ContentWriteResult> {
         self.inner
-            .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+            .content_write_bytes_with_hash(kind, namespace, content_hash_hex, bytes)
             .await
     }
 }
@@ -123,7 +123,7 @@ async fn loading_an_indexed_ledger_reads_its_root_once() {
         )
     };
     let seed = FlureeBuilder::memory().build_with(storage.clone(), mode());
-    let ledger = support::genesis_ledger_for_fluree(&seed, LEDGER);
+    let ledger = support::genesis_ledger_for_fluree(&seed, LEDGER).await;
     seed.insert(
         ledger,
         &json!({

@@ -416,8 +416,8 @@ impl crate::Fluree {
         // ---- Build branched stores. ---------------------------------------
         // Either side may be a root branch, which has only its own
         // namespace. The union store below chains both.
-        let source_store = self.branch_store(&source_record, &source_id).await?;
-        let target_branched = self.branch_store(&target_record, &target_id).await?;
+        let source_store = self.branch_store(&source_record).await?;
+        let target_branched = self.branch_store(&target_record).await?;
 
         let source_head = source_record.commit_head_id.clone();
         let target_head = target_record.commit_head_id.clone();

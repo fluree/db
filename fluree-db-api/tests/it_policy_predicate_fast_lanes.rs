@@ -31,7 +31,7 @@ const PROBE_SITE: &str = "policy_predicate_probe";
 /// Three people over a persisted index: two plain users and one admin.
 async fn indexed_people() -> Fluree {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, LEDGER);
+    let ledger = genesis_ledger(&fluree, LEDGER).await;
     // Hold off background indexing so the reindex below is the only build.
     let no_background = IndexConfig {
         reindex_min_bytes: 1_000_000_000,
@@ -70,7 +70,7 @@ const TEAMS: usize = 2;
 
 async fn indexed_crowd() -> Fluree {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, CROWD_LEDGER);
+    let ledger = genesis_ledger(&fluree, CROWD_LEDGER).await;
     let no_background = IndexConfig {
         reindex_min_bytes: 1_000_000_000,
         reindex_max_bytes: 1_000_000_000,

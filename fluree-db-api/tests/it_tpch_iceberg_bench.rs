@@ -188,7 +188,7 @@ async fn tpch_lineitem_q1_q6() {
     std::env::set_var("AWS_REGION", "us-east-1");
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut ledger = genesis_ledger(&fluree, "tpch:main");
+    let mut ledger = genesis_ledger(&fluree, "tpch:main").await;
 
     // Register vocab + subject IRI namespaces so SPARQL predicate IRIs encode to
     // Sids and materialized subjects are encodable (rows are skipped otherwise).

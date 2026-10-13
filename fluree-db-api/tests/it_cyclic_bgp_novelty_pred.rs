@@ -46,7 +46,7 @@ async fn cyclic_bgp_novelty_only_predicate_matches_fallback() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             // Phase 1: p1/p2 legs of two directed triangles plus dangling
             // edges. The closing predicate ex:np is deliberately absent so it

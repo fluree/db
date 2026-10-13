@@ -159,9 +159,18 @@ impl<C: PeerCallbacks + 'static> PeerRuntime<C> {
                 }
             }
 
-            SseClientEvent::Retracted { kind, resource_id } => {
-                self.state.handle_retracted(&kind, &resource_id).await;
-                self.callbacks.on_retracted(&kind, &resource_id).await;
+            SseClientEvent::Retracted {
+                kind,
+                resource_id,
+                instance,
+            } => {
+                if self
+                    .state
+                    .handle_retracted(&kind, &resource_id, instance.as_deref())
+                    .await
+                {
+                    self.callbacks.on_retracted(&kind, &resource_id).await;
+                }
             }
 
             SseClientEvent::Disconnected { reason } => {
@@ -244,6 +253,7 @@ mod tests {
             index_head_id: Some("index-cid:1".to_string()),
             index_t: 3,
             retracted: false,
+            instance: None,
         };
 
         runtime
@@ -271,6 +281,7 @@ mod tests {
             index_head_id: Some("index-cid:1".to_string()),
             index_t: 3,
             retracted: false,
+            instance: None,
         };
         runtime
             .handle_event(SseClientEvent::LedgerRecord(record))
@@ -282,6 +293,7 @@ mod tests {
             .handle_event(SseClientEvent::Retracted {
                 kind: "ledger".to_string(),
                 resource_id: "books:main".to_string(),
+                instance: None,
             })
             .await;
 
@@ -305,6 +317,7 @@ mod tests {
             index_head_id: Some("index-cid:1".to_string()),
             index_t: 3,
             retracted: false,
+            instance: None,
         };
         runtime
             .handle_event(SseClientEvent::LedgerRecord(record))

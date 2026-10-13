@@ -435,6 +435,48 @@ async fn ledgers_reports_graph_source_dependencies() {
     );
 }
 
+/// An index whose source ledger was dropped and another created under its
+/// name is reported suspended, so a client pairing `t`s does not take the new
+/// ledger's head for its own.
+#[tokio::test]
+async fn ledgers_reports_a_suspended_index() {
+    let (_tmp, state) = state_with_index().await;
+    let list = |state: Arc<AppState>| async move {
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/fluree/ledgers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "body: {json}");
+        json.as_array()
+            .expect("array of entries")
+            .iter()
+            .find(|e| e.get("type").and_then(JsonValue::as_str) == Some("BM25"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no BM25 entry: {json}"))
+    };
+    assert!(list(state.clone()).await.get("suspended").is_none());
+
+    state
+        .fluree
+        .drop_ledger("docs", fluree_db_api::DropMode::Hard)
+        .await
+        .unwrap();
+    state.fluree.create_ledger("docs:main").await.unwrap();
+    let index = list(state).await;
+    assert_eq!(
+        index.get("suspended").and_then(JsonValue::as_bool),
+        Some(true),
+        "{index}"
+    );
+}
+
 /// `POST /drop` reaches the generic graph-source drop, which must sweep the
 /// index's snapshot blobs rather than only retracting the record.
 #[tokio::test]

@@ -165,6 +165,7 @@ impl Bm25SearchProvider for RemoteBm25SearchProvider {
                         QueryError::InvalidQuery(format!("{code}: {msg}"))
                     }
                     ErrorCode::InvalidRequest => QueryError::InvalidQuery(msg),
+                    ErrorCode::GraphSourceSuspended => QueryError::GraphSourceSuspended(msg),
                     _ => QueryError::Internal(format!("{code}: {msg}")),
                 });
             }

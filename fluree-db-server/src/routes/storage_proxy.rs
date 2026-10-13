@@ -206,6 +206,10 @@ pub struct NsRecordResponse {
     /// invariant.
     #[serde(skip_serializing_if = "is_zero")]
     pub branches: u32,
+    /// The folder holding the ledger's artifacts, when it is not the
+    /// ledger's name. Peers need it to form storage paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<fluree_db_core::StorageRoot>,
     /// Serving tiers this server offers for the ledger (`"query"`,
     /// `"blocks"`), computed from the ledger's `f:servingDefaults`.
     /// Clients use this to pick between query-shipping and peer (local
@@ -406,14 +410,14 @@ async fn resolve_block_ledger(
     fluree: &fluree_db_api::Fluree,
     kind: ContentKind,
     ledger: &str,
-) -> Result<Option<fluree_db_api::LedgerId>, ServerError> {
+) -> Result<Option<fluree_db_api::NsRecord>, ServerError> {
     let ns = fluree.nameservice();
     if let Some(record) = ns
         .lookup(ledger)
         .await
         .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
     {
-        return Ok(Some(record.ledger_id));
+        return Ok(Some(record));
     }
 
     if matches!(kind, ContentKind::DictBlob { .. }) {
@@ -423,7 +427,7 @@ async fn resolve_block_ledger(
                 .await
                 .map_err(|e| ServerError::internal(format!("Branch listing failed: {e}")))?;
             if let Some(record) = branches.into_iter().next() {
-                return Ok(Some(record.ledger_id));
+                return Ok(Some(record));
             }
         }
     }
@@ -506,6 +510,7 @@ pub async fn get_ns_record(
             .map(std::string::ToString::to_string),
         source_branch: ns_record.source_branch.clone(),
         branches: ns_record.branches,
+        storage_root: ns_record.storage_root.clone(),
         serving,
     };
     let body_bytes = serde_json::to_vec(&body).map_err(|e| ServerError::internal(e.to_string()))?;
@@ -579,7 +584,8 @@ pub async fn get_block(
     let fluree = &state.fluree;
     let effective_ledger = resolve_block_ledger(fluree, kind, &body.ledger)
         .await?
-        .ok_or_else(|| ServerError::not_found("Block not found"))?;
+        .ok_or_else(|| ServerError::not_found("Block not found"))?
+        .ledger_id;
 
     // 4. Authorize: token scope must include this ledger
     block_fetch::authorize_ledger(&principal.to_block_access_scope(), &effective_ledger)
@@ -637,7 +643,7 @@ pub async fn get_block(
         .ok_or_else(|| ServerError::internal("block fetch requires a managed storage backend"))?;
     let fetched = block_fetch::fetch_and_decode_block(
         &admin_storage,
-        &effective_ledger,
+        &snapshot.storage_namespace(),
         &cid,
         Some(&ledger_ctx),
         &mode,
@@ -816,9 +822,10 @@ pub async fn get_object_by_cid(
 
     // 3. Namespace guard: resolve `ledger` to a real ledger (not a graph
     //    source alias); dict-blob requests may need branch resolution.
-    let effective_ledger = resolve_block_ledger(&state.fluree, kind, &query.ledger)
+    let effective_record = resolve_block_ledger(&state.fluree, kind, &query.ledger)
         .await?
         .ok_or_else(|| ServerError::not_found("Object not found"))?;
+    let effective_ledger = effective_record.ledger_id.clone();
 
     // 3b. Authorize: principal must have access to the resolved ledger.
     if !principal.is_authorized_for_ledger(&effective_ledger) {
@@ -855,8 +862,12 @@ pub async fn get_object_by_cid(
         .admin_storage_cloned()
         .ok_or_else(|| ServerError::internal("object fetch requires a managed storage backend"))?;
     let method = admin_storage.storage_method();
-    let address =
-        fluree_db_core::content_address(method, kind, &effective_ledger, &id.digest_hex());
+    let address = fluree_db_core::content_address(
+        method,
+        kind,
+        &effective_record.storage_namespace(),
+        &id.digest_hex(),
+    );
 
     let bytes = admin_storage
         .read_bytes(&address)

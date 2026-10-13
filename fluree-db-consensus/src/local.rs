@@ -84,6 +84,17 @@ impl LocalCommitter {
 
 #[async_trait]
 impl Committer for LocalCommitter {
+    /// From the ledger's cached state, which the operation loads anyway.
+    /// Without a ledger cache that would be a load per call, so it is not
+    /// answered.
+    async fn ledger_instance(&self, ledger_id: &str) -> Option<u128> {
+        if !self.fluree.is_caching_enabled() {
+            return None;
+        }
+        let handle = self.fluree.ledger_cached(ledger_id).await.ok()?;
+        Some(handle.instance_bits().await)
+    }
+
     async fn transact(
         &self,
         request: TransactionRequest,
@@ -407,8 +418,11 @@ impl SubmissionLookup for LocalCommitter {
 /// delta at or above the ceiling fails even against drained novelty. The
 /// datatype limit keeps its identity for the same reason: 422 +
 /// `err:db/DatatypeLimitExceeded`, and so does a commit reference that names
-/// no commit: 404 + `err:db/CommitNotFound`.
+/// no commit: 404 + `err:db/CommitNotFound`. A stale writer and a lifecycle
+/// conflict keep theirs too, rather than reading as a retryable commit
+/// conflict: 409 + `err:db/Fenced` or `err:db/LifecycleConflict`.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
+    use fluree_db_nameservice::NameServiceError;
     match &err {
         ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
             delta_bytes,
@@ -429,6 +443,18 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
             }
         }
         ApiError::CommitNotFound(message) => SubmissionError::CommitNotFound {
+            message: message.clone(),
+        },
+        ApiError::NameService(NameServiceError::Fenced(id))
+        | ApiError::Transact(fluree_db_api::TransactError::Nameservice(
+            NameServiceError::Fenced(id),
+        )) => SubmissionError::Fenced {
+            message: id.clone(),
+        },
+        ApiError::NameService(NameServiceError::Conflict(message))
+        | ApiError::Transact(fluree_db_api::TransactError::Nameservice(
+            NameServiceError::Conflict(message),
+        )) => SubmissionError::LifecycleConflict {
             message: message.clone(),
         },
         _ => SubmissionError::Execution {
@@ -589,5 +615,34 @@ mod tests {
                 found: "b".into(),
             },
         )));
+    }
+
+    /// A stale writer and a lifecycle conflict keep their identity through
+    /// the committer, in either shape the API raises them, rather than
+    /// flattening to a 409 the server reads as a retryable commit conflict.
+    #[test]
+    fn a_stale_writer_and_a_lifecycle_conflict_keep_their_identity() {
+        use fluree_db_api::TransactError;
+        use fluree_db_nameservice::NameServiceError;
+        for err in [
+            ApiError::NameService(NameServiceError::fenced("mydb:main")),
+            ApiError::Transact(TransactError::Nameservice(NameServiceError::fenced(
+                "mydb:main",
+            ))),
+        ] {
+            assert!(
+                matches!(execution_failure(err), SubmissionError::Fenced { ref message } if message == "mydb:main")
+            );
+        }
+        for err in [
+            ApiError::NameService(NameServiceError::conflict("restoring")),
+            ApiError::Transact(TransactError::Nameservice(NameServiceError::conflict(
+                "restoring",
+            ))),
+        ] {
+            assert!(
+                matches!(execution_failure(err), SubmissionError::LifecycleConflict { ref message } if message == "restoring")
+            );
+        }
     }
 }

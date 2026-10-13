@@ -309,7 +309,7 @@ async fn incremental_index_string_folds_exact() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let first = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [

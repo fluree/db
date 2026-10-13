@@ -32,7 +32,7 @@ async fn seed_custom_ns_indexed(
     ledger_id: &str,
     index_cfg: &IndexConfig,
 ) -> MemoryLedger {
-    let ledger = genesis_ledger_for_fluree(fluree, ledger_id);
+    let ledger = genesis_ledger_for_fluree(fluree, ledger_id).await;
 
     let insert = json!({
         "@context": {
@@ -303,7 +303,7 @@ async fn indexed_then_insert_novelty_custom_pred_returns_results() {
             };
 
             // Phase 1: Seed baseline data and index it
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": {
                     "skos": "http://www.w3.org/2004/02/skos/core#",
@@ -408,7 +408,7 @@ async fn indexed_then_insert_expansion_custom_type_returns_properties() {
             };
 
             // Phase 1: Seed baseline and index
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": {
                     "skos": "http://www.w3.org/2004/02/skos/core#",
@@ -511,7 +511,7 @@ async fn indexed_repeated_vars_in_triple_pattern_do_not_duplicate_schema() {
             };
 
             // Seed and index.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -605,7 +605,7 @@ async fn indexed_multicolumn_join_shared_object_var_executes() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -684,7 +684,7 @@ async fn indexed_multicolumn_join_counts_pairs_not_product() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             // s1: p1 -> {o1,o2,o3}, p2 -> {o1,o2,o4}  → shared pairs (s1,o1),(s1,o2) = 2
             // s2: p1 -> {o5},        p2 -> {o5}        → shared pair  (s2,o5)         = 1
             // Total matching (s,o) pairs = 3.
@@ -777,7 +777,7 @@ async fn indexed_sum_compare_as_count_matches_value() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": { "person": "http://example.org/Person#" },
                 "@graph": [
@@ -866,7 +866,7 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
     // Memory reference (always the general pipeline).
     let mem = FlureeBuilder::memory().build_memory();
     let mem_ledger = {
-        let l0 = genesis_ledger_for_fluree(&mem, "it/sum-empty-mem:main");
+        let l0 = genesis_ledger_for_fluree(&mem, "it/sum-empty-mem:main").await;
         mem.insert_with_opts(
             l0,
             &seed(),
@@ -913,7 +913,7 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger1 = fluree
                 .insert_with_opts(
                     ledger0,
@@ -976,7 +976,7 @@ async fn indexed_scalar_sum_avg_absent_predicate_returns_zero() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             // Seed an unrelated predicate so the ledger indexes; `ex:missing` is
             // never asserted, so it stays absent from the dictionary.
             let ledger = fluree
@@ -1053,7 +1053,7 @@ async fn indexed_rdf_type_star_count_exact_after_incremental_retraction() {
             };
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": [
@@ -1150,7 +1150,7 @@ async fn indexed_inline_type_join_aggregate_includes_overlay_multivalue() {
 
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": [
@@ -1320,7 +1320,7 @@ async fn indexed_inline_type_join_aggregate_matches_bare_multivalue() {
 
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": graph
@@ -1444,7 +1444,7 @@ async fn indexed_inline_type_star_aggregate_with_overlay_multivalue_and_facet() 
 
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": [
@@ -1610,7 +1610,7 @@ async fn indexed_rdf_type_star_count_exact_across_incremental_builds() {
             // Seed (full build).
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": [
@@ -1720,7 +1720,7 @@ async fn indexed_number_of_predicates_from_stats_matches_general() {
     let mem = FlureeBuilder::memory().build_memory();
     let mem_ledger = mem
         .insert_with_opts(
-            genesis_ledger_for_fluree(&mem, "it/nop-mem:main"),
+            genesis_ledger_for_fluree(&mem, "it/nop-mem:main").await,
             &seed(),
             TxnOpts::default(),
             CommitOpts::default(),
@@ -1765,7 +1765,7 @@ async fn indexed_number_of_predicates_from_stats_matches_general() {
             };
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &seed(),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -1841,7 +1841,7 @@ async fn indexed_number_of_subjects_and_objects_matches_general() {
     let mem = FlureeBuilder::memory().build_memory();
     let mem_ledger = mem
         .insert_with_opts(
-            genesis_ledger_for_fluree(&mem, "it/nos-mem:main"),
+            genesis_ledger_for_fluree(&mem, "it/nos-mem:main").await,
             &seed(),
             TxnOpts::default(),
             CommitOpts::default(),
@@ -1894,7 +1894,7 @@ async fn indexed_number_of_subjects_and_objects_matches_general() {
             };
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &seed(),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -1975,7 +1975,7 @@ async fn indexed_parallel_number_of_subjects_objects_matches_general() {
     let mem = FlureeBuilder::memory().build_memory();
     let mem_ledger = mem
         .insert_with_opts(
-            genesis_ledger_for_fluree(&mem, "it/pnos-mem:main"),
+            genesis_ledger_for_fluree(&mem, "it/pnos-mem:main").await,
             &seed(),
             TxnOpts::default(),
             CommitOpts::default(),
@@ -2029,7 +2029,7 @@ async fn indexed_parallel_number_of_subjects_objects_matches_general() {
             };
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &seed(),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2110,7 +2110,7 @@ async fn indexed_parallel_star_join_count_matches_serial() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2197,7 +2197,7 @@ async fn indexed_parallel_optional_join_count_matches_serial() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2289,7 +2289,7 @@ async fn indexed_parallel_union_constraint_count_matches_serial() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2389,7 +2389,7 @@ async fn indexed_parallel_minus_intersect_count_matches_serial() {
             let _ = expected_exists;
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2478,7 +2478,7 @@ async fn indexed_parallel_exists_intersect_count_matches_serial() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2559,7 +2559,7 @@ async fn indexed_parallel_encoded_filter_count_matches_serial() {
             let expected = n; // self-typed rows excluded
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2637,7 +2637,7 @@ async fn indexed_parallel_numeric_compare_count_matches_serial() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2722,7 +2722,7 @@ async fn indexed_numeric_compare_mixed_int_double_counts_correctly() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2803,7 +2803,7 @@ async fn indexed_numeric_compare_global_shortcut_counts_correctly() {
             }
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -2885,7 +2885,7 @@ async fn overlay_numeric_compare_sum_folds_novelty() {
             // Baseline: s0=1, s1=2, s2=-1 (two > 0). Index it.
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": [
                         {"@id": "ex:s0", "ex:num": 1},
                         {"@id": "ex:s1", "ex:num": 2},
@@ -2974,7 +2974,7 @@ async fn overlay_parallel_encoded_filter_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3068,7 +3068,7 @@ async fn overlay_parallel_numeric_compare_sum_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3158,7 +3158,7 @@ async fn overlay_parallel_star_join_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3255,7 +3255,7 @@ async fn overlay_parallel_optional_join_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3355,7 +3355,7 @@ async fn overlay_parallel_union_constraint_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3457,7 +3457,7 @@ async fn overlay_parallel_minus_exists_intersect_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3564,7 +3564,7 @@ async fn overlay_delta_single_predicate_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3669,7 +3669,7 @@ async fn overlay_delta_count_folds_novelty_below_first_leaf() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": anchors
@@ -3772,7 +3772,7 @@ async fn overlay_delta_union_count_folds_novelty() {
             }
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
                     TxnOpts::default(),
                     CommitOpts::default(),
@@ -3859,7 +3859,7 @@ async fn indexed_bound_class_property_count_from_class_stats() {
             };
             let ledger1 = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({
                         "@context": { "ex": "http://example.org/ns/" },
                         "@graph": [
@@ -3943,7 +3943,7 @@ async fn overlay_lang_filter_count_folds_novelty() {
             // Baseline: 2 en + 1 fr. Index it.
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" },
                         "@graph": [en("ex:a", "A"), en("ex:c", "C"), fr("ex:b", "B")]}),
                     TxnOpts::default(),
@@ -4012,7 +4012,7 @@ async fn overlay_encoded_filter_count_folds_novelty() {
             // Baseline: s0, s1 typed ex:C (s != o); self0 typed itself (s == o, excluded).
             let ledger = fluree
                 .insert_with_opts(
-                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    genesis_ledger_for_fluree(&fluree, ledger_id).await,
                     &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": [
                         {"@id": "ex:s0", "@type": "ex:C"},
                         {"@id": "ex:s1", "@type": "ex:C"},
@@ -4091,7 +4091,7 @@ async fn indexed_group_by_object_count_topk_run_spanning() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 50_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             // object 10 -> 2000 subjects, 20 -> 400, 30 -> 80, 40 -> 20.
             let mut nodes: Vec<serde_json::Value> = Vec::new();
             for (val, n) in [(10, 2000), (20, 400), (30, 80), (40, 20)] {
@@ -4165,7 +4165,7 @@ async fn indexed_predicate_count_excludes_indexed_retractions() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 50_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let nodes: Vec<serde_json::Value> = (0..2000)
                 .map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": i}))
                 .collect();
@@ -4251,7 +4251,7 @@ async fn indexed_star_join_seek_strategy_counts_correctly() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 50_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             // Driver p1 rows = 3 (ex:a:2, ex:c:1). Probe p2 rows = 3 + 24_600 filler
             // = 24_603 > 3 * 8192 = 24_576, so the seek strategy fires.
             let filler: Vec<serde_json::Value> = (0..24_600).map(|n| json!(n)).collect();
@@ -4329,7 +4329,7 @@ async fn indexed_modifier_seek_exists_minus_counts_correctly() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 50_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let filler: Vec<serde_json::Value> = (0..16_400).map(|n| json!(n)).collect();
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
@@ -4429,7 +4429,7 @@ async fn indexed_optional_seek_counts_correctly() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 50_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let filler: Vec<serde_json::Value> = (0..24_600).map(|n| json!(n)).collect();
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
@@ -4520,7 +4520,7 @@ async fn indexed_union_count_all_rows_metadata_lane() {
             };
             // p1 rows: a{1,2}, b{3} => 3.  p2 rows: a{1}, c{4,5} => 3.
             // a appears under both predicates and must be counted in each branch.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -4591,7 +4591,7 @@ async fn indexed_overlay_union_count_reflects_overlay() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -4693,7 +4693,7 @@ async fn indexed_union_count_time_travel_uses_cursor_path() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger1 = fluree
                 .insert_with_opts(
                     ledger0,
@@ -4800,7 +4800,7 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
             };
 
             // Phase 1: Seed and index 4 ex:Person facts.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -4942,7 +4942,7 @@ async fn indexed_overlay_count_star_drain_count_reflects_overlay() {
             };
 
             // Phase 1: Seed and index 3 ex:knows edges (a→b, a→c, b→c).
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5075,7 +5075,7 @@ async fn indexed_overlay_count_encoded_filter_reflects_overlay() {
             };
 
             // Phase 1: Seed two self-loops (a→a, b→b) and one non-loop (c→d).
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5209,7 +5209,7 @@ async fn indexed_overlay_star_join_count_reflects_overlay() {
             };
 
             // Phase 1: a,b have both age+name; c has age only. Star count = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5342,7 +5342,7 @@ async fn indexed_overlay_minus_subject_count_reflects_overlay() {
             };
 
             // a,c are retired; b,d are not. All four have age. MINUS retired => {b,d} = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5475,7 +5475,7 @@ async fn indexed_overlay_exists_subject_count_reflects_overlay() {
             };
 
             // a,c are active; all four have age. EXISTS active => {a,c} = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5611,7 +5611,7 @@ async fn indexed_overlay_optional_count_reflects_overlay() {
 
             // a: 2 tags, b: 1 tag, c: 0 tags. Each has one age.
             // COUNT(*) = 1×2 + 1×1 + 1×max(1,0) = 4.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5745,7 +5745,7 @@ async fn indexed_overlay_composite_join_count_reflects_overlay() {
 
             // a likes {x,y} owns {x,z} → shared {x}; b likes {p} owns {p} → shared {p}.
             // COUNT(*) over (?s likes ?o . ?s owns ?o) = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -5880,7 +5880,7 @@ async fn indexed_overlay_object_exists_count_reflects_overlay() {
             };
 
             // a knows {b,c,d}; b,c active. EXISTS active on object => (a,b),(a,c) = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6011,7 +6011,7 @@ async fn indexed_overlay_object_minus_count_reflects_overlay() {
             };
 
             // a knows {b,c,d} (3 edges); b active. MINUS active object => not-active = c,d = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6144,7 +6144,7 @@ async fn indexed_overlay_object_chain_exists_count_reflects_overlay() {
 
             // a knows {x,y,z}; x,z like m; y likes n; m tasty.
             // Qualifying objects (like something tasty): x, z. Edges (a,x),(a,z) => 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6280,7 +6280,7 @@ async fn indexed_overlay_chain2_count_reflects_overlay() {
             };
 
             // a p1 {b,e}; b p2 {c,d}; e p2 {f}. Paths = od(b)+od(e) = 2+1 = 3.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6396,7 +6396,7 @@ async fn indexed_overlay_chain3_count_reflects_overlay() {
             };
 
             // a p1 b; b p2 {c,x}; c p3 {d,e}; x p3 {}. Paths = comp2[b] = od(c)+od(x) = 2+0 = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6513,7 +6513,7 @@ async fn indexed_overlay_chain_tail_exists_count_reflects_overlay() {
             };
 
             // a p1 b; b p2 {c,x}; c p3 d. Tail EXISTS p3 → only c qualifies → 1.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6630,7 +6630,7 @@ async fn indexed_overlay_chain_tail_minus_count_reflects_overlay() {
             };
 
             // a p1 b; b p2 {c,x}; c p3 d. Tail MINUS p3 → only x (no p3) qualifies → 1.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6751,7 +6751,7 @@ async fn indexed_overlay_optional_chain_head_count_reflects_overlay() {
 
             // a follows {b,e}; b likes {c,f}; e likes {}; c rates {x,y}; f rates {z}.
             // comp2(b)=rates(c)+rates(f)=2+1=3 → (a,b)→max(1,3)=3; comp2(e)=0 → (a,e)→1. Total 4.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6872,7 +6872,7 @@ async fn indexed_optional_chain_head_literal_p1_object_counts_once() {
             };
             // a follows {b (IRI), "lit1", "lit2"}; b likes c; c rates {x,y}.
             // comp2(b) = rates(c) = 2 → (a,b) → max(1,2) = 2; each literal → 1. Total 4.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -6965,7 +6965,7 @@ async fn indexed_optional_chain_head_absent_p2_counts_all_p1_rows() {
             };
             // a follows {b, e} (IRI). `ex:rates` exists so p3 resolves; `ex:missing`
             // is never used so p2 is absent. Inner chain can never match ⇒ count 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7040,7 +7040,7 @@ async fn indexed_overlay_property_path_plus_count_reflects_overlay() {
 
             // Phase 1: Seed and index a knows-chain p1 -> p2 -> p3 -> p4.
             // Reachable from p1 via knows+ = {p2, p3, p4} = 3.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7179,7 +7179,7 @@ async fn indexed_overlay_property_path_plus_count_subject_in_overlay_only() {
             };
 
             // Phase 1: Seed and index a knows-chain p1 -> p2 -> p3 (no ex:new).
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7271,7 +7271,7 @@ async fn indexed_overlay_group_by_count_topk_reflects_overlay() {
 
             // Phase 1: Seed and index baseline policyState distribution:
             // CA = 3, WA = 2
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7404,7 +7404,7 @@ async fn indexed_novelty_only_subject_returns_data() {
             };
 
             // Phase 1: Seed baseline data and index it.
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7514,7 +7514,7 @@ async fn indexed_novelty_only_string_object_returns_data() {
             };
 
             // Phase 1: Seed baseline and index.
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7623,7 +7623,7 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7870,7 +7870,7 @@ async fn indexed_count_with_lang_filter_counts_matching_lang_tag_rows() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -7947,7 +7947,7 @@ async fn indexed_numeric_sum_fast_paths_work_for_identity_and_add_self() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8039,7 +8039,7 @@ async fn indexed_numeric_count_fast_path_handles_threshold_filters() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8136,7 +8136,7 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8244,7 +8244,7 @@ async fn indexed_strstarts_sum_counts_prefix_matches() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8326,7 +8326,7 @@ async fn indexed_novelty_only_ref_object_returns_data() {
             };
 
             // Phase 1: Seed baseline and index.
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8442,7 +8442,7 @@ async fn indexed_iri_ref_and_blank_node_resolve_correctly() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
 
             // Insert data with both IRI references and blank nodes.
             // The blank node (no @id) will get a system-generated blank node ID.
@@ -8588,7 +8588,7 @@ async fn indexed_count_literal_objects_from_stats() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8665,7 +8665,7 @@ async fn indexed_count_literal_objects_with_blank_node_object() {
                 reindex_max_bytes: 10_000_000,
             };
 
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8754,7 +8754,7 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 SELECT (COUNT(DISTINCT ?o) AS ?v) WHERE { ?s ex:tag ?o }";
 
             // Phase 1: seed + index. n: a=10, b=20, c=30; tag: a→X, b→Y, c→X.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -8924,7 +8924,7 @@ async fn indexed_overlay_count_no_cache_projection_invariant() {
             // Baseline: a,c active; all four have age. EXISTS(active) over the
             // age subjects drives a subject-count fold through the narrow overlay
             // cursor. Indexed-only => {a, c} = 2.
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -9020,7 +9020,7 @@ async fn indexed_inline_type_star_aggregate_overlay_undercount_regression() {
             };
 
             // Phase 1: seed and index multivalue line items.
-            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let baseline = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -9410,7 +9410,7 @@ async fn indexed_values_bound_subject_through_type_anchor() {
                 "@graph": graph
             });
 
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger1 = fluree
                 .insert_with_opts(
                     ledger0,
@@ -9588,7 +9588,7 @@ async fn indexed_values_seeded_star_replays_at_historical_t() {
                     {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "keep"}
                 ]
             });
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger1 = fluree
                 .insert_with_opts(
                     ledger0,
@@ -9679,7 +9679,7 @@ async fn indexed_values_seeded_star_sees_novelty_overlay() {
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [{"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "indexed"}]
             });
-            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger1 = fluree
                 .insert_with_opts(
                     ledger0,
@@ -9767,7 +9767,7 @@ async fn indexed_values_seeded_star_replays_fully_retracted_predicate() {
             {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "n2", "ex:legacy": "yes"}
         ]
     });
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let ledger1 = fluree
         .insert(ledger0, &seed)
         .await

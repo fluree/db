@@ -67,6 +67,8 @@ use crate::error::{ApiError, Result};
 pub struct ResolvedSchemaBundle {
     /// Ledger the bundle was resolved against.
     pub ledger_id: Arc<str>,
+    /// That ledger's instance bits (see [`SchemaBundleCacheKey::instance`]).
+    pub instance: u128,
     /// Logical `t` at which the closure was walked.
     pub to_t: i64,
     /// Deduplicated graph IDs in BFS discovery order; the starting graph
@@ -93,6 +95,7 @@ pub struct ResolvedSchemaBundle {
 ///   [`resolve_local_graph_source`] for the full list of enforced invariants.
 pub async fn resolve_schema_bundle(
     snapshot: &LedgerSnapshot,
+    instance: u128,
     overlay: &dyn OverlayProvider,
     to_t: i64,
     reasoning: &ReasoningDefaults,
@@ -110,6 +113,7 @@ pub async fn resolve_schema_bundle(
     // is transactional) so they don't need separate key dimensions.
     let cache_key = SchemaBundleCacheKey {
         ledger_id: Arc::from(snapshot.ledger_id.as_str()),
+        instance,
         to_t,
         starting_g_id,
         follow_imports,
@@ -138,6 +142,7 @@ pub async fn resolve_schema_bundle(
 
     let bundle = Arc::new(ResolvedSchemaBundle {
         ledger_id: Arc::from(snapshot.ledger_id.as_str()),
+        instance,
         to_t,
         sources,
     });
@@ -364,6 +369,11 @@ async fn scan_owl_imports_in_graph(
 pub struct SchemaBundleCacheKey {
     /// Ledger the bundle was resolved against.
     pub ledger_id: Arc<str>,
+    /// The bits of that ledger's instance
+    /// ([`LedgerState::instance_bits`](fluree_db_ledger::LedgerState::instance_bits)):
+    /// a ledger dropped and recreated under its name reaches the same `t`
+    /// again, and must not be answered with the dropped one's bundle.
+    pub instance: u128,
     /// Query "as-of" `t`.
     pub to_t: i64,
     /// The `f:schemaSource` starting `GraphId`. Per-graph overrides can
@@ -441,6 +451,8 @@ pub fn global_schema_bundle_cache() -> &'static SchemaBundleCache {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SchemaBundleFlakesCacheKey {
     pub ledger_id: Arc<str>,
+    /// See [`SchemaBundleCacheKey::instance`].
+    pub instance: u128,
     pub to_t: i64,
     pub sources: Vec<GraphId>,
 }
@@ -519,6 +531,7 @@ pub async fn get_or_build_schema_bundle_flakes(
 ) -> Result<Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>> {
     let key = SchemaBundleFlakesCacheKey {
         ledger_id: bundle.ledger_id.clone(),
+        instance: bundle.instance,
         to_t: bundle.to_t,
         sources: bundle.sources.clone(),
     };
@@ -565,7 +578,7 @@ mod tests {
     async fn no_schema_source_returns_none() {
         let snapshot = LedgerSnapshot::genesis("test:a");
         let reasoning = make_reasoning(None, None, Vec::new());
-        let bundle = resolve_schema_bundle(&snapshot, &fluree_db_core::NoOverlay, 0, &reasoning)
+        let bundle = resolve_schema_bundle(&snapshot, 0, &fluree_db_core::NoOverlay, 0, &reasoning)
             .await
             .unwrap();
         assert!(bundle.is_none());
@@ -585,7 +598,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let err = resolve_schema_bundle(&snapshot, &fluree_db_core::NoOverlay, 0, &reasoning)
+        let err = resolve_schema_bundle(&snapshot, 0, &fluree_db_core::NoOverlay, 0, &reasoning)
             .await
             .unwrap_err();
         match err {
@@ -613,7 +626,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let bundle = resolve_schema_bundle(&snapshot, &fluree_db_core::NoOverlay, 0, &reasoning)
+        let bundle = resolve_schema_bundle(&snapshot, 0, &fluree_db_core::NoOverlay, 0, &reasoning)
             .await
             .unwrap()
             .expect("bundle");
@@ -634,7 +647,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let err = resolve_schema_bundle(&snapshot, &fluree_db_core::NoOverlay, 0, &reasoning)
+        let err = resolve_schema_bundle(&snapshot, 0, &fluree_db_core::NoOverlay, 0, &reasoning)
             .await
             .unwrap_err();
         match err {

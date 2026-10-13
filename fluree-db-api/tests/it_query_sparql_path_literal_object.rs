@@ -19,7 +19,7 @@ use serde_json::json;
 /// 2 makers, 3 models (maker1 has 2, maker2 has 1). `ex:alias` gives the
 /// alternative-path tests a second branch that also ends at `"Acme"`.
 async fn seed_makers(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [

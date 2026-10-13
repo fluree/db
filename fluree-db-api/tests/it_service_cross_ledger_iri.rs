@@ -24,7 +24,7 @@ const ALPHA: &str = "http://alpha.example/";
 const BETA: &str = "http://beta.example/";
 
 async fn seed(fluree: &MemoryFluree, ledger_id: &str, graph: JsonValue) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     fluree
         .insert(ledger0, &json!({ "@graph": graph }))
         .await

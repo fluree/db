@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// File-based tracking store.
 ///
-/// Stores tracking state outside the `ns@v2/` tree at:
+/// Stores tracking state outside the `ns@v3/` tree at:
 /// `{base_path}/ns-sync/remotes/{remote}/{address_encoded}.json`
 #[derive(Debug)]
 pub struct FileTrackingStore {
@@ -25,7 +25,7 @@ impl FileTrackingStore {
     /// Create a new file-based tracking store.
     ///
     /// `base_path` is the same root used by `FileNameService` — tracking
-    /// state goes into `{base_path}/ns-sync/` (outside `ns@v2/`).
+    /// state goes into `{base_path}/ns-sync/` (outside `ns@v3/`).
     pub fn new(base_path: impl AsRef<Path>) -> Self {
         Self {
             base_path: base_path.as_ref().to_path_buf(),
@@ -307,15 +307,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify file is under ns-sync/, not ns@v2/
+        // Verify file is under ns-sync/, not ns@v3/
         let expected_path = tmp.path().join("ns-sync/remotes/origin/mydb%3Amain.json");
         assert!(
             expected_path.exists(),
             "File should exist at {expected_path:?}"
         );
 
-        // Verify ns@v2 directory does NOT exist
-        assert!(!tmp.path().join("ns@v2").exists());
+        // Verify ns@v3 directory does NOT exist
+        assert!(!tmp.path().join("ns@v3").exists());
     }
 
     #[tokio::test]

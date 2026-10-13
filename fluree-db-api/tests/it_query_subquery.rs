@@ -10,7 +10,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let ctx = context_ex_schema();
 
     // Matches the dataset used across other query tests (people-strings)

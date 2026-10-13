@@ -196,7 +196,7 @@ async fn incremental_index_min_max_is_value_ordered() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let first = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [
@@ -294,7 +294,7 @@ async fn min_max_value_ordered_alongside_group_concat() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             // Reverse lex order: zebra/zzz get LOWER dictionary ids.
             let first = json!({
                 "@context": { "ex": "http://example.org/ns/" },
@@ -387,7 +387,7 @@ async fn novelty_above_index_head_is_visible() {
                 reindex_min_bytes: 0,
                 reindex_max_bytes: 10_000_000,
             };
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let indexed = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [

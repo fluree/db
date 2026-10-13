@@ -11,7 +11,7 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
 
 async fn seed_areas(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ledger0 = genesis_ledger(fluree, ledger_id).await;
     let insert = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
@@ -555,7 +555,7 @@ async fn jsonld_order_by_a_variable_nothing_binds_orders_nothing() {
 #[tokio::test]
 async fn jsonld_values_reach_generated_binds() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "jsonld-grouped/values-binds:main");
+    let ledger0 = genesis_ledger(&fluree, "jsonld-grouped/values-binds:main").await;
     let ledger = fluree
         .insert(
             ledger0,
@@ -822,7 +822,7 @@ async fn jsonld_having_refuses_exists() {
 #[tokio::test]
 async fn solo_grouped_jsonld_shapes_are_unchanged() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "jsonld-grouped/solo:main");
+    let ledger0 = genesis_ledger(&fluree, "jsonld-grouped/solo:main").await;
     let ledger = fluree
         .insert(
             ledger0,

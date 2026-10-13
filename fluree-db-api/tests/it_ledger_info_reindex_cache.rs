@@ -18,7 +18,7 @@ async fn ledger_info_cache_busts_on_reindex_allow_equal() {
 
     // Create a dataset large enough that different indexer configs produce
     // different physical index layouts (different root CID) at the same `t`.
-    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id).await;
     let mut graph = Vec::new();
     for i in 0..400u32 {
         graph.push(json!({

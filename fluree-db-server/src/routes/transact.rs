@@ -206,6 +206,16 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::CommitNotFound { message } => {
             return ServerError::Api(ApiError::CommitNotFound(message.clone()));
         }
+        SubmissionError::Fenced { message } => {
+            return ServerError::Api(ApiError::NameService(
+                fluree_db_nameservice::NameServiceError::Fenced(message.clone()),
+            ));
+        }
+        SubmissionError::LifecycleConflict { message } => {
+            return ServerError::Api(ApiError::NameService(
+                fluree_db_nameservice::NameServiceError::Conflict(message.clone()),
+            ));
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -304,7 +314,7 @@ fn with_event_time(commit_opts: CommitOpts, event_time: &str, field: &str) -> Re
 /// Encodes the effective identity (so the commit records its author) and,
 /// for signed requests, spawns the raw-envelope upload in parallel so it
 /// overlaps with the rest of the pipeline.
-fn build_commit_opts(
+async fn build_commit_opts(
     did: Option<&str>,
     credential: &MaybeCredential,
     fluree: &Fluree,
@@ -315,7 +325,7 @@ fn build_commit_opts(
         None => CommitOpts::default(),
     };
     if let Some(raw_txn) = raw_txn_from_credential(credential) {
-        let content_store = fluree.content_store(handle.id());
+        let content_store = fluree.content_store(&handle.snapshot().await.storage_namespace());
         commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
     }
     commit_opts
@@ -2008,7 +2018,7 @@ pub(crate) async fn execute_transaction(
         };
 
         let did = effective_did(&prepared_transaction.governance, author);
-        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
+        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle).await;
 
         if let Some(event_time_raw) = prepared_transaction
             .body
@@ -2168,7 +2178,8 @@ pub(crate) async fn execute_turtle_transaction(
             credential,
             &state.fluree,
             &handle,
-        );
+        )
+        .await;
 
         // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
@@ -2262,7 +2273,8 @@ async fn execute_cypher_transact(
         credential,
         &state.fluree,
         &handle,
-    );
+    )
+    .await;
     let tracking = tracking_from_headers(headers);
 
     // A multi-clause statement runs through the sequential write driver
@@ -2501,7 +2513,8 @@ pub(crate) async fn submit_sparql_update(
         credential,
         &state.fluree,
         &handle,
-    );
+    )
+    .await;
     if let Some(event_time) = &pragmas.event_time {
         commit_opts = with_event_time(commit_opts, event_time, "pragma `event-time`")
             .inspect_err(|_| set_span_error_code(parent_span, "error:BadRequest"))?;
@@ -2600,6 +2613,12 @@ mod tests {
             SubmissionError::CommitNotFound {
                 message: "No commit found with prefix: ffffffff".into(),
             },
+            SubmissionError::Fenced {
+                message: "mydb:main".into(),
+            },
+            SubmissionError::LifecycleConflict {
+                message: "'mydb' is being restored".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2620,6 +2639,8 @@ mod tests {
                     (422, errors::DATATYPE_LIMIT_EXCEEDED)
                 }
                 SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
+                SubmissionError::Fenced { .. } => (409, errors::FENCED),
+                SubmissionError::LifecycleConflict { .. } => (409, errors::LIFECYCLE_CONFLICT),
             };
             let se = submission_error_to_server_error(variant);
             assert_eq!(se.status_code().as_u16(), expected_status, "{se}");
