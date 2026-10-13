@@ -443,7 +443,8 @@ where
         acc.matched.extend(output.matched);
     }
 
-    for new_leaf in output.leaves {
+    for mut new_leaf in output.leaves {
+        new_leaf.replaced_leaf_cid = Some(existing.leaf_cid.clone());
         let header = decode_leaf_header_v3(&new_leaf.info.leaf_bytes)?;
         let first_key = read_ordered_key_v2(order, &header.first_key);
         let last_key = read_ordered_key_v2(order, &header.last_key);
