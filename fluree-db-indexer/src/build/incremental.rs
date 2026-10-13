@@ -4651,7 +4651,11 @@ async fn upload_one_leaf_blob(
         .await
         .map_err(|e| IndexerError::StorageWrite(format!("upload budget closed: {e}")))?;
 
-    let info = blob.info;
+    let NewLeafBlob {
+        info,
+        leaflet_origins,
+        replaced_leaf_cid,
+    } = blob;
     let mut counts = LeafUploadCounts::default();
 
     let leaf_cid = content_store
@@ -4669,25 +4673,17 @@ async fn upload_one_leaf_blob(
     );
     counts.leaf_bytes = info.leaf_bytes.len() as u64;
 
-    // Warm-on-write (co-located only): seed the shared read cache with the
-    // leaflets we just wrote, from bytes already in hand, so the query server's
-    // immediate read of this new-CID leaf hits the cache instead of cold decode.
-    //
-    // The zstd decode runs on a blocking thread, not this async uploader task —
-    // in the co-located deployment the same runtime serves queries, and a churn
-    // build must not stall a query worker on decompression. Warming is
-    // best-effort and fire-and-forget: a read that races a not-yet-finished warm
-    // just cold-decodes as before, and the remaining build steps (branch + root
-    // write, head swap) almost always outlast the decode, so the immediate
-    // post-swap read still hits. `leaf_bytes` is at its last use here, so it
-    // moves into the task rather than being copied.
-    if let Some(cache) = warm_cache {
-        let cache = Arc::clone(cache);
-        let leaf_cid = info.leaf_cid.clone();
-        let leaf_bytes = info.leaf_bytes;
-        tokio::task::spawn_blocking(move || {
-            warm_leaf_into_cache(&cache, &leaf_cid, &leaf_bytes);
-        });
+    // Warm-on-write (co-located only): carry what readers had cached for the
+    // replaced leaf over to the new one, so a query reading it after the swap
+    // hits the cache. See `warm_replaced_leaflets`.
+    if let (Some(cache), Some(replaced)) = (warm_cache, replaced_leaf_cid.as_ref()) {
+        warm_replaced_leaflets(
+            cache,
+            replaced,
+            &info.leaf_cid,
+            info.leaf_bytes,
+            &leaflet_origins,
+        );
     }
 
     if let Some(sc_bytes) = info.sidecar_bytes.as_deref() {
@@ -4709,20 +4705,108 @@ async fn upload_one_leaf_blob(
         counts.sidecar_count = 1;
     }
     // `info`'s sidecar buffer drops here; `leaf_bytes` was moved into the warm
-    // task above (or already dropped when no warm cache is configured).
+    // step above (or already dropped when no warm cache is configured).
     Ok(counts)
 }
 
-/// Warm-on-write: seed the shared read cache with the leaflets this build just
-/// wrote so a co-located query server's immediate read of the freshly-rewritten
-/// (new-CID) leaf hits the cache instead of re-reading + re-decoding from disk.
+/// Warm-on-write: give a rewritten leaf the cache entries readers had for the
+/// leaf it replaced, so a co-located query reading it after the swap hits the
+/// cache instead of decoding from disk.
 ///
-/// Decodes from the bytes already in hand (no re-fetch) and inserts each leaflet
-/// under `ColumnSet::ALL`; the read-side superset fallback projects that down to
-/// any narrower request, so we never have to guess a reader's projection. The
-/// `leaf_id` derivation matches the reader's (`xxh3_128(leaf_cid.to_bytes())`).
-/// Best-effort: a decode error just leaves the reader to cold-decode as before.
-fn warm_leaf_into_cache(cache: &LeafletCache, leaf_cid: &ContentId, leaf_bytes: &[u8]) {
+/// Only leaflets whose source leaflet was cached are warmed, with the columns
+/// that were cached:
+/// - a byte-copied leaflet decodes to the same columns, so it takes the cached
+///   batch under its new key without a decode;
+/// - a re-encoded leaflet is decoded from the bytes in hand, on a blocking
+///   thread from a small pool (see [`warm_decode_permits`]). When the pool is
+///   busy the leaf is skipped and its first reader decodes it, so a large
+///   build cannot queue decode work, or fill the cache, beyond what readers
+///   were using.
+///
+/// The leaf directory is seeded whenever a leaflet is.
+fn warm_replaced_leaflets(
+    cache: &Arc<LeafletCache>,
+    replaced_cid: &ContentId,
+    leaf_cid: &ContentId,
+    leaf_bytes: Vec<u8>,
+    origins: &[crate::run_index::LeafletOrigin],
+) {
+    use fluree_db_binary_index::V3BatchCacheKey;
+
+    let replaced_id = LeafletCache::cid_cache_key(&replaced_cid.to_bytes());
+    let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
+    let mut copied = false;
+    let mut to_decode = Vec::new();
+    for (idx, origin) in origins.iter().enumerate() {
+        let Some((columns, batch)) = cache.v3_leaflet_entry(replaced_id, origin.leaflet_idx) else {
+            continue;
+        };
+        if origin.copied {
+            cache.insert_v3_batch(
+                V3BatchCacheKey {
+                    leaf_id,
+                    leaflet_idx: idx as u32,
+                    columns: columns.0,
+                },
+                batch,
+            );
+            copied = true;
+        } else {
+            to_decode.push((idx, columns));
+        }
+    }
+    if to_decode.is_empty() {
+        if copied {
+            warm_leaf_dir(cache, leaf_id, &leaf_bytes);
+        }
+        return;
+    }
+    let Ok(permit) = Arc::clone(warm_decode_permits()).try_acquire_owned() else {
+        tracing::debug!(
+            leaflets = to_decode.len(),
+            "warm-on-write pool busy; leaving the leaf to its first reader"
+        );
+        if copied {
+            warm_leaf_dir(cache, leaf_id, &leaf_bytes);
+        }
+        return;
+    };
+    let cache = Arc::clone(cache);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_into_cache(&cache, leaf_id, &leaf_bytes, &to_decode);
+    });
+}
+
+/// Blocking threads warm-on-write may decode on at once: a quarter of the
+/// cores, at least one.
+fn warm_decode_permits() -> &'static Arc<Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        Arc::new(Semaphore::new((cores / 4).max(1)))
+    })
+}
+
+fn warm_leaf_dir(cache: &LeafletCache, leaf_id: u128, leaf_bytes: &[u8]) {
+    use fluree_db_binary_index::format::leaf::{
+        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
+    };
+    if let Ok(dir) =
+        decode_leaf_header_v3(leaf_bytes).and_then(|h| decode_leaf_dir_v3_with_base(leaf_bytes, &h))
+    {
+        cache.insert_leaf_dir(leaf_id, Arc::new(dir));
+    }
+}
+
+/// Decode `leaflets` (index, columns) of a just-written leaf into the cache.
+/// Best-effort: a decode error leaves the reader to decode it as before.
+fn decode_into_cache(
+    cache: &LeafletCache,
+    leaf_id: u128,
+    leaf_bytes: &[u8],
+    leaflets: &[(usize, fluree_db_binary_index::read::column_types::ColumnSet)],
+) {
     use fluree_db_binary_index::format::leaf::{
         decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
     };
@@ -4733,34 +4817,38 @@ fn warm_leaf_into_cache(cache: &LeafletCache, leaf_cid: &ContentId, leaf_bytes: 
     let Ok(header) = decode_leaf_header_v3(leaf_bytes) else {
         return;
     };
-    let order = header.order;
     let Ok(dir) = decode_leaf_dir_v3_with_base(leaf_bytes, &header) else {
         return;
     };
-    let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
-    for (idx, entry) in dir.entries.iter().enumerate() {
+    for &(idx, columns) in leaflets {
+        let Some(entry) = dir.entries.get(idx) else {
+            continue;
+        };
         if entry.row_count == 0 {
             continue;
         }
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
         if let Ok(batch) = load_leaflet_columns(
             leaf_bytes,
             entry,
             dir.payload_base,
-            &ColumnProjection::all(),
-            order,
+            &projection,
+            header.order,
         ) {
             cache.insert_v3_batch(
                 V3BatchCacheKey {
                     leaf_id,
                     leaflet_idx: idx as u32,
-                    columns: ColumnSet::ALL.0,
+                    columns: columns.0,
                 },
                 batch,
             );
         }
     }
-    // Seed the directory too (used once the local scan path consults it).
-    cache.insert_leaf_dir(leaf_id, std::sync::Arc::new(dir));
+    cache.insert_leaf_dir(leaf_id, Arc::new(dir));
 }
 
 /// Upload a fully-materialized set of leaf blobs (the fresh-build paths produce
@@ -4850,7 +4938,7 @@ fn build_fresh_default_graph_v3(
             sidecar_cid: info.sidecar_cid.clone(),
         });
 
-        new_blobs.push(NewLeafBlob { info });
+        new_blobs.push(NewLeafBlob::fresh(info));
     }
 
     let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
@@ -5196,5 +5284,150 @@ mod compaction_tests {
             budget.requests < 64,
             "storage operations were not charged to the shared budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use crate::run_index::{update_leaf, LeafUpdateInput};
+    use fluree_db_binary_index::format::leaf::{
+        decode_leaf_dir_v3_with_base, decode_leaf_header_v3, LeafWriter,
+    };
+    use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
+    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+    use fluree_db_binary_index::V3BatchCacheKey;
+    use fluree_db_core::o_type::OType;
+    use fluree_db_core::subject_id::SubjectId;
+    use fluree_db_core::value_id::ObjKey;
+
+    fn record(s_id: u64, t: u32) -> RunRecordV2 {
+        RunRecordV2 {
+            s_id: SubjectId(s_id),
+            o_key: ObjKey::encode_i64(0).as_u64(),
+            p_id: 1,
+            t,
+            o_i: u32::MAX,
+            o_type: OType::XSD_INTEGER.as_u16(),
+            g_id: 0,
+        }
+    }
+
+    fn cache_leaflet(
+        cache: &LeafletCache,
+        leaf_cid: &ContentId,
+        leaf_bytes: &[u8],
+        leaflet_idx: u32,
+        columns: ColumnSet,
+    ) {
+        let header = decode_leaf_header_v3(leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).unwrap();
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        let batch = load_leaflet_columns(
+            leaf_bytes,
+            &dir.entries[leaflet_idx as usize],
+            dir.payload_base,
+            &projection,
+            header.order,
+        )
+        .unwrap();
+        let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
+        cache.insert_v3_batch(
+            V3BatchCacheKey {
+                leaf_id,
+                leaflet_idx,
+                columns: columns.0,
+            },
+            batch,
+        );
+    }
+
+    /// A rewritten leaf gets only what readers had cached for the leaf it
+    /// replaced: a copied leaflet takes its cached batch and columns without a
+    /// decode, a re-encoded one is decoded for the cached columns, and a
+    /// leaflet no reader touched stays cold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_carries_only_cached_leaflets_to_the_rewritten_leaf() {
+        // Three leaflets of 100 rows; the insert lands in leaflet 1 and splits it.
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 10_000, 1);
+        writer.set_skip_history(true);
+        for i in 1..=300 {
+            writer.push_record(record(i * 2, 1)).unwrap();
+        }
+        let old = writer.finish().unwrap().remove(0);
+        let novelty = [record(301, 5)];
+        let output = update_leaf(&LeafUpdateInput {
+            leaf_bytes: &old.leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &[1],
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10_000,
+            sidecar_bytes: None,
+        })
+        .unwrap();
+        let blob = output.leaves.into_iter().next().unwrap();
+
+        let cache = Arc::new(LeafletCache::with_max_bytes(64 << 20));
+        cache_leaflet(&cache, &old.leaf_cid, &old.leaf_bytes, 0, ColumnSet::CORE);
+        cache_leaflet(&cache, &old.leaf_cid, &old.leaf_bytes, 1, ColumnSet::ALL);
+        let new_id = LeafletCache::cid_cache_key(&blob.info.leaf_cid.to_bytes());
+        warm_replaced_leaflets(
+            &cache,
+            &old.leaf_cid,
+            &blob.info.leaf_cid,
+            blob.info.leaf_bytes.clone(),
+            &blob.leaflet_origins,
+        );
+
+        let columns = |idx| cache.v3_leaflet_entry(new_id, idx).map(|(c, _)| c);
+        assert_eq!(columns(0), Some(ColumnSet::CORE), "copied without a decode");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (columns(1).is_none() || columns(2).is_none()) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            columns(1),
+            Some(ColumnSet::ALL),
+            "re-encoded halves decoded"
+        );
+        assert_eq!(columns(2), Some(ColumnSet::ALL));
+        assert_eq!(columns(3), None, "never read, never warmed");
+        assert!(cache.get_leaf_dir(new_id).is_some());
+
+        let header = decode_leaf_header_v3(&blob.info.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(&blob.info.leaf_bytes, &header).unwrap();
+        for idx in 0..3 {
+            let (columns, warmed) = cache.v3_leaflet_entry(new_id, idx).unwrap();
+            let fresh = load_leaflet_columns(
+                &blob.info.leaf_bytes,
+                &dir.entries[idx as usize],
+                dir.payload_base,
+                &ColumnProjection {
+                    output: columns,
+                    internal: ColumnSet::EMPTY,
+                },
+                header.order,
+            )
+            .unwrap();
+            let rows = |b: &fluree_db_binary_index::read::column_types::ColumnBatch| {
+                (0..b.row_count)
+                    .map(|i| (b.s_id.get(i), b.o_key.get(i)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rows(&warmed),
+                rows(&fresh),
+                "leaflet {idx} holds the new leaf's rows"
+            );
+        }
     }
 }

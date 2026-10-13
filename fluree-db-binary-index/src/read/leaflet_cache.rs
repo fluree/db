@@ -936,6 +936,22 @@ impl LeafletCache {
         }
     }
 
+    /// A leaflet's cached batch and the columns it holds, whatever they are.
+    pub fn v3_leaflet_entry(
+        &self,
+        leaf_id: u128,
+        leaflet_idx: u32,
+    ) -> Option<(
+        super::column_types::ColumnSet,
+        super::column_types::ColumnBatch,
+    )> {
+        self.get_v3_entry(&V3LeafletKey {
+            leaf_id,
+            leaflet_idx,
+        })
+        .map(|entry| (entry.columns, entry.batch))
+    }
+
     /// Get a cached V3 column batch covering `key.columns` (read-only, no
     /// insertion).
     pub fn get_v3_batch(&self, key: &V3BatchCacheKey) -> Option<super::column_types::ColumnBatch> {
