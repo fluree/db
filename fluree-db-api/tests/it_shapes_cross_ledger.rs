@@ -1050,6 +1050,82 @@ async fn recreated_model_ledger_shapes_reject_what_the_cached_compile_passed() {
     );
 }
 
+/// A transaction reads a model ledger at the head its first cross-ledger
+/// lookup found, for every operation it stages, as it reads its own ledger's
+/// governance from the state it began on: a shape the model activates while
+/// the transaction is open does not apply to the transaction's later
+/// operations, also after a rollback stages the earlier ones again. A
+/// transaction begun after that enforces it.
+#[tokio::test]
+async fn a_transaction_reads_a_model_ledger_at_one_head() {
+    use fluree_db_api::{CommitOpts, TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/txn-head-model:main";
+    let data_id = "test/cross-ledger-shapes/txn-head-data:main";
+    seed_person_name_shape(&fluree, model_id, false).await;
+    seed_shapes_source_config(&fluree, data_id, model_id, "").await;
+    let person = |id: &str, name: Option<&str>| {
+        let mut node = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": id,
+            "@type": "ex:Person"
+        });
+        if let Some(name) = name {
+            node["ex:name"] = json!(name);
+        }
+        TxnOperation::Insert(node)
+    };
+
+    let mut txn = fluree
+        .begin_transaction(data_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(person("ex:alice", Some("Alice")))
+        .await
+        .expect("the first operation reads M, whose shape is deactivated");
+    fluree
+        .graph(model_id)
+        .transact()
+        .upsert_turtle(
+            r"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://example.org/ns/> .
+            GRAPH <http://example.org/governance/shapes> {
+                ex:PersonShape sh:deactivated false .
+            }
+        ",
+        )
+        .commit()
+        .await
+        .expect("M activates its shape");
+    let savepoint = txn.savepoint();
+    txn.stage(person("ex:dave", Some("Dave")))
+        .await
+        .expect("a named Person conforms under either head");
+    txn.rollback_to(savepoint)
+        .await
+        .expect("rolling back stages the first operation again");
+    txn.stage(person("ex:bob", None))
+        .await
+        .expect("a later operation reads M at the head the first one read");
+    txn.commit(CommitOpts::default())
+        .await
+        .expect("the transaction commits");
+
+    let mut txn = fluree
+        .begin_transaction(data_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    let err = match txn.stage(person("ex:carol", None)).await {
+        Err(err) => err,
+        Ok(()) => txn
+            .commit(CommitOpts::default())
+            .await
+            .expect_err("a new transaction reads M's new head"),
+    };
+    assert_shacl_violation(err, "a transaction begun after M's change");
+}
+
 const US_STATE_SHAPES_GRAPH: &str = "http://example.org/governance/shapes";
 
 /// Commit model ledger `model`: a shape whose `ex:homeState` must be an

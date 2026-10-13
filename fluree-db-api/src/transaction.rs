@@ -43,7 +43,7 @@
 use crate::cypher_write::{self, ResolvedConditional, WritePlan};
 use crate::format::cypher_typed::CypherCell;
 use crate::ledger_manager::{RefreshOpts, WritePath};
-use crate::tx::{SequentialStager, TransactResultRef};
+use crate::tx::{RequestGovernance, SequentialStager, TransactResultRef};
 use crate::tx_builder::{is_retryable_commit_conflict, OpPlan, TransactOperation};
 use crate::{
     ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, PolicyContext, Result, Tracker,
@@ -310,6 +310,7 @@ impl Transaction {
             self.base.clone(),
             &self.operations[..len],
             &self.context,
+            Some(self.stager.governance().clone()),
         )
         .await?;
         self.operations.truncate(len);
@@ -358,6 +359,7 @@ impl Transaction {
                 self.base.clone(),
                 &self.operations,
                 &self.context,
+                Some(self.stager.governance().clone()),
             )
             .await?;
             self.stale = false;
@@ -378,6 +380,7 @@ impl Transaction {
                 self.base.clone(),
                 &self.operations,
                 &self.context,
+                Some(self.stager.governance().clone()),
             )
             .await?;
             GraphDb::from_ledger_state(stager.state())
@@ -442,7 +445,7 @@ impl Transaction {
                         // transaction began may have changed it.
                         context.policy =
                             transact_policy(&fluree, &state, &context.governance).await?;
-                        stage_all(&fluree, state, &operations, &context)
+                        stage_all(&fluree, state, &operations, &context, None)
                             .await?
                             .finish()
                             .await?
@@ -676,13 +679,20 @@ async fn stage_cypher(
     Ok(pending)
 }
 
+/// Stage `operations` over `base`. Staged again from the transaction's own
+/// base, the operations keep the request's `governance`; over a newer head
+/// (`None`) they are governed as that head is.
 async fn stage_all(
     fluree: &Fluree,
     base: LedgerState,
     operations: &[Op],
     context: &StageContext,
+    governance: Option<RequestGovernance>,
 ) -> Result<SequentialStager> {
-    let mut stager = SequentialStager::new(base);
+    let mut stager = match governance {
+        Some(governance) => SequentialStager::resume(base, governance),
+        None => SequentialStager::new(base),
+    };
     for op in operations {
         stage_one(fluree, &mut stager, &op.staged, context).await?;
     }

@@ -1351,7 +1351,9 @@ is a deliberate choice (every intermediate state must satisfy the shapes,
 like a database without deferred constraints).
 
 What is enforced is read once, from the state before the request: the ledger
-config, the shapes and the uniqueness constraints. An operation that turns
+config, the shapes and the uniqueness constraints. Shapes from another ledger
+(a cross-ledger `f:shapesSource`) are read at the head the request first reads
+that ledger at. An operation that turns
 SHACL or uniqueness off, or removes a shape or a constraint, does not relax
 the checks on a later operation in the same request, and one that turns them
 on does not apply them to the request, as in a single transaction. The config

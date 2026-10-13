@@ -172,6 +172,21 @@ impl SequentialStager {
         }
     }
 
+    /// A stager for the same request staged again from the base it began on
+    /// (after a failed operation, or to roll back to a savepoint): it keeps
+    /// the request's governance, the model-ledger heads it read included.
+    pub(crate) fn resume(ledger: LedgerState, governance: RequestGovernance) -> Self {
+        Self {
+            governance,
+            ..Self::new(ledger)
+        }
+    }
+
+    /// What governs the request's operations.
+    pub(crate) fn governance(&self) -> &RequestGovernance {
+        &self.governance
+    }
+
     /// The current virtual state (base + every staged operation so far).
     /// Probe queries against it observe earlier operations' writes.
     pub(crate) fn state(&self) -> &LedgerState {
@@ -530,13 +545,17 @@ impl ConfigRead {
 /// the uniqueness constraints from this state, so an earlier operation in the
 /// request cannot change what governs a later one (the rule a single
 /// transaction follows by reading them from its own pre-transaction state).
-/// The config is read once for the whole request. Built only where the
-/// request's merged view is checked by the config guard
-/// ([`SequentialStager::finish`], [`crate::Fluree::stage_pair_from_txns`]).
+/// The config is read once for the whole request, and a cross-ledger model
+/// ledger is read at one head: the one the request's first lookup of it found,
+/// as within one transaction. Built only where the request's merged view is
+/// checked by the config guard ([`SequentialStager::finish`],
+/// [`crate::Fluree::stage_pair_from_txns`]).
 #[derive(Clone)]
 pub(crate) struct RequestGovernance {
     state: LedgerState,
     config: ConfigRead,
+    /// The model-ledger heads the request has read, shared by its clones.
+    model_heads: Arc<parking_lot::Mutex<HashMap<LedgerId, crate::cross_ledger::ModelHead>>>,
 }
 
 impl RequestGovernance {
@@ -544,6 +563,31 @@ impl RequestGovernance {
         Self {
             state,
             config: ConfigRead::default(),
+            model_heads: Arc::default(),
+        }
+    }
+
+    /// The resolution context for one of the request's operations: it reads
+    /// each model ledger at the head the request pinned, and a model that is
+    /// the data ledger itself from the state before the request.
+    fn resolve_ctx<'a>(
+        &self,
+        ledger_id: &'a LedgerId,
+        fluree: &'a crate::Fluree,
+    ) -> crate::cross_ledger::ResolveCtx<'a> {
+        crate::cross_ledger::ResolveCtx::with_resolved_heads(
+            ledger_id,
+            fluree,
+            self.model_heads.lock().clone(),
+        )
+        .with_data_state(self.state.clone())
+    }
+
+    /// Pin the heads an operation's lookups found, for the operations after it.
+    fn pin_model_heads(&self, ctx: &crate::cross_ledger::ResolveCtx<'_>) {
+        let mut heads = self.model_heads.lock();
+        for (ledger, head) in &ctx.resolved_heads {
+            heads.entry(ledger.clone()).or_insert_with(|| head.clone());
         }
     }
 }
@@ -2748,8 +2792,11 @@ impl crate::Fluree {
         let inline_unique_properties = txn.opts.unique_properties.clone();
         let ledger_id = ledger.snapshot.ledger_id.clone();
         let base_t = ledger.t();
-        let mut resolve_ctx =
-            crate::cross_ledger::ResolveCtx::new(&ledger_id, self).with_data_state(ledger.clone());
+        let mut resolve_ctx = match request {
+            Some(request) => request.resolve_ctx(&ledger_id, self),
+            None => crate::cross_ledger::ResolveCtx::new(&ledger_id, self)
+                .with_data_state(ledger.clone()),
+        };
         let tracker = options.tracker;
         let policy = options.policy_ctx;
         #[cfg(feature = "shacl")]
@@ -2771,7 +2818,7 @@ impl crate::Fluree {
             }
         };
 
-        let governed = Box::pin(check_staged_write(
+        let checked = Box::pin(check_staged_write(
             &mut view,
             &mut ns_registry,
             &graph_delta,
@@ -2788,7 +2835,11 @@ impl crate::Fluree {
             },
             &mut resolve_ctx,
         ))
-        .await?;
+        .await;
+        if let Some(request) = request {
+            request.pin_model_heads(&resolve_ctx);
+        }
+        let governed = checked?;
 
         Ok(CheckedStage {
             view,
@@ -4145,9 +4196,12 @@ impl crate::Fluree {
         // applies with the caller's programmatic options (inline shapes, a
         // requested validation mode, inline uniqueness constraints), as for
         // TriG, and violations name full IRIs.
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
-            .with_data_state(view.base().clone());
-        check_staged_write(
+        let mut resolve_ctx = match request {
+            Some(request) => request.resolve_ctx(&ledger_id_owned, self),
+            None => crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+                .with_data_state(view.base().clone()),
+        };
+        let checked = check_staged_write(
             &mut view,
             &mut ns_registry,
             &rustc_hash::FxHashMap::default(),
@@ -4162,8 +4216,11 @@ impl crate::Fluree {
             },
             &mut resolve_ctx,
         )
-        .await
-        .map_err(|e| ApiError::from(fluree_db_transact::TransactError::from(e)))?;
+        .await;
+        if let Some(request) = request {
+            request.pin_model_heads(&resolve_ctx);
+        }
+        checked.map_err(|e| ApiError::from(fluree_db_transact::TransactError::from(e)))?;
 
         // Plain Turtle doesn't support named graphs or txn-meta extraction (TriG support handles these)
         Ok(StageResult {
