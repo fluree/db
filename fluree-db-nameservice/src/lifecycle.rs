@@ -1385,7 +1385,7 @@ pub async fn migrate_legacy<S: LifecycleStore + ?Sized>(store: &S) -> Result<Mig
         }
         // A name bound since, by a ledger created over records that were all
         // retracted, keeps its ledger; those records were soft-dropped.
-        if records.iter().any(|r| !r.retracted) && (bound.is_none() || binding_is_legacy) {
+        if records.iter().any(|r| !legacy_dropped(r)) && (bound.is_none() || binding_is_legacy) {
             bind_legacy(store, &ledger_name, &records).await?;
             report.bound.push(name);
         } else {
@@ -1394,6 +1394,14 @@ pub async fn migrate_legacy<S: LifecycleStore + ?Sized>(store: &S) -> Result<Mig
         }
     }
     Ok(report)
+}
+
+/// Whether a record the migration finds was dropped: retracted by a release
+/// from before name bindings, or frozen by a drop on this one, which no
+/// earlier release does. A migration run again finds the second kind when a
+/// branch drop stopped between unlisting the branch and deleting its record.
+fn legacy_dropped(record: &NsRecord) -> bool {
+    record.retracted || record.frozen
 }
 
 async fn bind_legacy<S: LifecycleStore + ?Sized>(
@@ -1414,7 +1422,7 @@ async fn bind_legacy<S: LifecycleStore + ?Sized>(
             store.freeze_record(&id, fence).await?;
         }
         branches.push(BranchFence {
-            dropped: record.retracted,
+            dropped: legacy_dropped(record),
             ..BranchFence::for_record(record, fence)
         });
     }

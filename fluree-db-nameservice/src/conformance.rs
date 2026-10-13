@@ -1530,6 +1530,54 @@ pub async fn a_rerun_migration_binds_late_legacy_records<S: crate::NameServicePu
     assert_eq!(store.get_binding("fresh").await.unwrap(), Some(fresh));
 }
 
+/// The upgrade run again, as a Raft leader runs it on each election, finds
+/// the record of a branch whose drop stopped between unlisting it and
+/// deleting the record. It lists the branch as dropped, not live: its data
+/// is already deleted.
+pub async fn a_rerun_migration_keeps_a_stopped_branch_drop_dropped<
+    S: crate::NameServicePublisher,
+>(
+    store: &S,
+) {
+    for record in [
+        legacy_record("mydb:main", None, false),
+        legacy_record("mydb:dev", Some("main"), false),
+    ] {
+        assert!(store.insert_record(&record).await.unwrap().is_none());
+    }
+    lifecycle::migrate_legacy(store).await.unwrap();
+    let BranchDrop::Purge(dev) = lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap()
+    else {
+        panic!("a leaf branch is purged");
+    };
+    // Unlisted, as the drop's last step does before deleting the record.
+    let binding = store.get_binding("mydb").await.unwrap().unwrap();
+    let mut unlisted = binding.value.clone();
+    unlisted.branches.retain(|b| b.branch != "dev");
+    store
+        .cas_binding("mydb", Some(binding.version), Some(&unlisted))
+        .await
+        .unwrap();
+
+    lifecycle::migrate_legacy(store).await.unwrap();
+
+    assert!(store
+        .lookup("mydb:dev")
+        .await
+        .unwrap()
+        .is_none_or(|r| r.retracted));
+    let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+    assert!(binding.listing("dev").is_none_or(|l| l.dropped));
+    assert!(store.lookup("mydb:main").await.unwrap().is_some());
+    // The drop can still finish.
+    lifecycle::finish_drop_branch(store, &name("mydb"), &dev)
+        .await
+        .unwrap();
+    assert!(store.raw_record("mydb:dev").await.unwrap().is_none());
+}
+
 pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store: &S) {
     for record in [
         legacy_record("mydb:main", None, false),
@@ -1910,6 +1958,7 @@ where
     a_mirrored_index_head_reads_and_swaps_as_one(&make().await).await;
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
+    a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh
@@ -1964,6 +2013,7 @@ macro_rules! lifecycle_conformance_tests {
             a_mirrored_index_head_reads_and_swaps_as_one,
             an_unmirrored_branch_with_children_is_kept,
             a_rerun_migration_binds_late_legacy_records,
+            a_rerun_migration_keeps_a_stopped_branch_drop_dropped,
         );
     };
     (@cases $make:expr; $($case:ident),* $(,)?) => {
