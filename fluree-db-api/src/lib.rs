@@ -2845,7 +2845,12 @@ impl FlureeBuilder {
             api_url: api_url.into(),
             pin_on_put: true,
         });
-        let backend = StorageBackend::Permanent(Arc::new(ipfs_store));
+        // IPFS serves the bytes as published, so a disk copy is no exposure.
+        let cache_dir = self.ledger_cache_config.as_ref().map_or_else(
+            || LedgerManagerConfig::default().cache_dir,
+            |c| c.cache_dir.clone(),
+        );
+        let backend = StorageBackend::cached_permanent(Arc::new(ipfs_store), &cache_dir);
         let nameservice = MemoryNameService::new();
         let event_bus = self.resolve_event_bus();
         let notifying =

@@ -1382,8 +1382,9 @@ impl StorageBackend {
     /// copy only pays off when reads leave the machine, and is only allowed
     /// when the bytes may sit outside the storage in plaintext. A remote
     /// storage that decrypts on read still gets its fetches coalesced, among
-    /// its own readers only. An append-only content store (IPFS) is remote
-    /// and returns the bytes at rest. Applying it twice changes nothing.
+    /// its own readers only, and so does a `Permanent` store, which can't be
+    /// asked; one known to allow a disk copy opts in with
+    /// [`Self::cached_permanent`]. Applying it twice changes nothing.
     #[cfg(any(feature = "native", target_arch = "wasm32"))]
     pub fn with_disk_cache(self, cache_dir: &std::path::Path) -> Self {
         use crate::disk_cache::DiskArtifactCache;
@@ -1403,7 +1404,7 @@ impl StorageBackend {
             }
             StorageBackend::Permanent(store) => StorageBackend::Cached(Arc::new(CachedBackend {
                 inner: StorageBackend::Permanent(store),
-                disk: Some(DiskArtifactCache::for_dir(cache_dir)),
+                disk: None,
                 flights: Arc::default(),
             })),
             StorageBackend::Routed(routed) => StorageBackend::Routed(Arc::new(RoutedBackend {
@@ -1418,6 +1419,18 @@ impl StorageBackend {
             })),
             cached @ StorageBackend::Cached(_) => cached,
         }
+    }
+
+    /// A `Permanent` store fronted by the disk artifact cache in `cache_dir`,
+    /// for a store whose bytes at rest may be copied to local disk (IPFS
+    /// returns them as published).
+    #[cfg(any(feature = "native", target_arch = "wasm32"))]
+    pub fn cached_permanent(store: Arc<dyn ContentStore>, cache_dir: &std::path::Path) -> Self {
+        StorageBackend::Cached(Arc::new(CachedBackend {
+            inner: StorageBackend::Permanent(store),
+            disk: Some(crate::disk_cache::DiskArtifactCache::for_dir(cache_dir)),
+            flights: Arc::default(),
+        }))
     }
 
     /// This backend with every disk-cache wrapper removed: reads go to the
