@@ -310,6 +310,10 @@ pub enum ApiError {
     #[error("Drop error: {0}")]
     Drop(String),
 
+    /// An operation on a graph source that has been dropped (409).
+    #[error("{0}")]
+    GraphSourceRetracted(String),
+
     /// Invalid branch operation (merge into self, missing branch point, etc.)
     #[error("Invalid branch operation: {0}")]
     InvalidBranch(String),
@@ -476,6 +480,21 @@ pub enum ApiError {
         current: i64,
     },
 
+    /// Every commit attempt lost its race with other writers to the ledger.
+    ///
+    /// Retryable (503): nothing was committed, and the same request can
+    /// succeed once the other writers ease off.
+    #[error(
+        "Commit contention: {attempts} commit attempts lost to concurrent writers; nothing was \
+         committed, retry the transaction. Last conflict: {last}"
+    )]
+    CommitContention {
+        attempts: usize,
+        /// The conflict the final attempt hit.
+        #[source]
+        last: Box<ApiError>,
+    },
+
     /// Ledger advanced during reindex (conflict)
     #[error("Ledger advanced during reindex: expected t={expected}, found t={found}")]
     ReindexConflict {
@@ -572,6 +591,20 @@ impl ApiError {
         ApiError::Drop(msg.into())
     }
 
+    /// The error a commit retry loop returns once its last attempt also
+    /// lost a race. An inner loop's contention is unwrapped, so `last` is
+    /// always the conflict itself.
+    pub fn commit_contention(attempts: usize, last: ApiError) -> Self {
+        let last = match last {
+            ApiError::CommitContention { last, .. } => *last,
+            last => last,
+        };
+        ApiError::CommitContention {
+            attempts,
+            last: Box::new(last),
+        }
+    }
+
     /// Create an internal error
     pub fn internal(msg: impl Into<String>) -> Self {
         ApiError::Internal(msg.into())
@@ -618,39 +651,101 @@ impl ApiError {
         ))
     }
 
-    /// HTTP status code for error (useful for HTTP server layer)
+    /// The HTTP status for this error.
     ///
-    /// NOTE: fluree-db-api has no server layer; this is for consumers
-    /// like fluree-db-server or external HTTP wrappers.
+    /// The one status table: fluree-db-server answers with it, and every path
+    /// that flattens an error to [`ApiError::Http`] (the consensus committer,
+    /// shared ledger loads, tracked queries) carries it, so an error answers
+    /// the same whichever route it leaves by. Its `@type` is
+    /// [`Self::error_type`].
     pub fn status_code(&self) -> u16 {
+        use fluree_db_transact::TransactError as TE;
         match self {
             ApiError::Http { status, .. } => *status,
+            // Signed-request verification failures are documented as 401,
+            // malformed or not.
             #[cfg(feature = "credential")]
-            ApiError::Credential(e) => e.status_code(),
-            // A correctly-configured Iceberg table that merely carries
-            // merge-on-read delete files is a conflict (unsupported state), not
-            // bad input — 409. Other Iceberg errors preserve the pre-typed-variant
-            // 400 (they previously flowed through `ApiError::config`).
-            #[cfg(feature = "iceberg")]
-            ApiError::Iceberg(e) => match e {
-                fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
-                _ => 400,
-            },
-            ApiError::InvalidBranch(_) => 400,
-            ApiError::InvalidLedgerId(_) => 400,
-            ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_)) => 400,
-            ApiError::BranchConflict(_) => 409,
-            ApiError::NotFound(_) | ApiError::GraphNotFound(_) => 404,
-            ApiError::CommitNotFound(_) => 404,
-            ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
-            ApiError::LedgerExists(_) => 409,
-            ApiError::ReindexConflict { .. } => 409,
-            ApiError::IndexTimeout(_) => 504, // Gateway Timeout
-            // 503 + retryable: novelty is at capacity and only the indexer can clear
-            // it. Not the caller's fault (no 4xx) and not a fault at all (no 500) —
-            // the correct client behaviour is to try again shortly.
-            ApiError::NoveltyDeferred { .. } => 503,
-            ApiError::IndexingDisabled => 400, // Bad Request
+            ApiError::Credential(_) => 401,
+            ApiError::Query(e) => query_error_status(e),
+
+            ApiError::NotFound(_)
+            | ApiError::GraphNotFound(_)
+            | ApiError::CommitNotFound(_)
+            | ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
+
+            ApiError::Parse(_)
+            | ApiError::Batch(_)
+            | ApiError::Config(_)
+            | ApiError::Sparql { .. }
+            | ApiError::SparqlLower(_)
+            | ApiError::Cypher { .. }
+            | ApiError::CypherLower(_)
+            | ApiError::CypherUpdateLower(_)
+            | ApiError::Turtle(_)
+            | ApiError::Format(_)
+            | ApiError::Builder(_)
+            | ApiError::InvalidBranch(_)
+            | ApiError::InvalidLedgerId(_)
+            | ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_))
+            | ApiError::IndexingDisabled
+            | ApiError::Ledger(fluree_db_ledger::LedgerError::FutureTime { .. }) => 400,
+
+            ApiError::LedgerExists(_)
+            | ApiError::BranchConflict(_)
+            | ApiError::ReindexConflict { .. }
+            | ApiError::GraphSourceRetracted(_) => 409,
+
+            // Read-after-write: the ledger has not caught up to the `t` the
+            // caller asked for.
+            ApiError::AwaitTNotReached { .. } => 408,
+            ApiError::IndexTimeout(_) => 504,
+
+            // 503 + retryable: capacity that clears on its own (the indexer
+            // draining, other writers easing off), so neither the caller's
+            // fault (4xx) nor a fault at all (500).
+            ApiError::NoveltyDeferred { .. } | ApiError::CommitContention { .. } => 503,
+            // A failed target is a fault and must not be dressed up as
+            // backpressure, or a permanently broken target would 503 forever.
+            ApiError::MaterializePartial { tally, .. } => {
+                if tally.failed > 0 {
+                    500
+                } else {
+                    503
+                }
+            }
+
+            ApiError::StorageAccessDenied { .. } | ApiError::CatalogCredentialsNotVended { .. } => {
+                403
+            }
+            // The write was understood but refused by its policy. Other
+            // policy errors (invalid definitions, evaluation failures) are
+            // not authorization denials.
+            ApiError::Policy(fluree_db_policy::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(TE::PolicyViolation(
+                fluree_db_policy::PolicyError::ModifyDenied { .. },
+            )) => 403,
+            ApiError::Policy(_) => 500,
+
+            ApiError::Transact(
+                TE::CommitConflict { .. }
+                | TE::CommitIdMismatch { .. }
+                | TE::PublishLostRace { .. }
+                | TE::NamespaceConflict(_),
+            ) => 409,
+            // The transaction's own delta meets or exceeds
+            // `reindex_max_bytes` (the commit check is `current + delta >=
+            // max`, so with drained novelty this still fails): no amount of
+            // draining can ever admit it, so 413, not the retryable 503 below.
+            ApiError::Transact(TE::NoveltyWouldExceed {
+                delta_bytes,
+                max_bytes,
+                ..
+            }) if delta_bytes >= max_bytes => 413,
+            ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
+            // Permanent: datatype IDs are never released.
+            ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => 422,
+            ApiError::Transact(_) => 400,
+
             ApiError::Indexer(e) => {
                 use crate::wasm_compat::IndexerError;
                 match e {
@@ -659,92 +754,193 @@ impl ApiError {
                     _ => 500,
                 }
             }
-            // Builder validation errors
-            ApiError::Builder(_) => 400,
-            ApiError::Query(fluree_db_query::QueryError::Cancelled { .. }) => 408,
-            // R3-B: memory-budget abort → 507 (Insufficient Storage), distinct from
-            // the 408 timeout so the caller can degrade on it specifically.
-            ApiError::Query(fluree_db_query::QueryError::MemoryBudgetExceeded { .. }) => 507,
-            // Storage-permission / fail-closed errors are 403 (Forbidden),
-            // whether raised directly (preview path) or wrapped from the query
-            // engine (scan path). These arms MUST precede the generic
-            // `ApiError::Query(_) => 400` below.
-            ApiError::StorageAccessDenied { .. }
-            | ApiError::CatalogCredentialsNotVended { .. }
-            | ApiError::Query(
-                fluree_db_query::QueryError::StorageAccessDenied { .. }
-                | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
-                | fluree_db_query::QueryError::CatalogAccessDenied { .. },
-            ) => 403,
-            // The write was understood but refused by its policy. Other
-            // policy errors (invalid definitions, evaluation failures) are
-            // not authorization denials.
-            ApiError::Policy(fluree_db_policy::PolicyError::ModifyDenied { .. })
-            | ApiError::Transact(fluree_db_transact::TransactError::PolicyViolation(
-                fluree_db_policy::PolicyError::ModifyDenied { .. },
-            )) => 403,
-            // A malformed ledger config graph is the operator's to fix, and no
-            // change to the request can clear it.
-            ApiError::LedgerConfig(_) => 500,
-            // Most errors are client errors (bad input)
-            ApiError::Parse(_)
-            | ApiError::Query(_)
-            | ApiError::Config(_)
-            | ApiError::Sparql { .. }
-            | ApiError::SparqlLower(_)
-            | ApiError::Cypher { .. }
-            | ApiError::CypherLower(_)
-            | ApiError::CypherUpdateLower(_)
-            | ApiError::Turtle(_)
+
+            // A table that merely carries merge-on-read delete files is a
+            // conflict (unsupported state), not bad input. Other Iceberg
+            // errors are configuration the caller supplied.
+            #[cfg(feature = "iceberg")]
+            ApiError::Iceberg(e) => match e {
+                fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
+                _ => 400,
+            },
+
+            // A cross-ledger model dependency could not be resolved or used:
+            // an upstream-dependency failure, not an internal one.
+            ApiError::CrossLedger(_) => 502,
+
+            // Stored data and infrastructure. `Json` is here because every
+            // `serde_json` error that reaches it parses stored records
+            // (graph-source configs, index manifests), and `LedgerConfig`
+            // because no change to the request can clear a fault in the
+            // ledger's config graph.
+            ApiError::Connection(_)
+            | ApiError::NameService(_)
+            | ApiError::Ledger(_)
+            | ApiError::Bm25Builder(_)
+            | ApiError::Bm25Serialize(_)
+            | ApiError::Novelty(_)
+            | ApiError::Core(_)
             | ApiError::Json(_)
-            | ApiError::Batch(_)
-            | ApiError::Format(_) => 400,
+            | ApiError::LedgerConfig(_)
+            | ApiError::MaterializeMemoryBudget { .. }
+            | ApiError::OntologyImport(_)
+            | ApiError::Drop(_)
+            | ApiError::Internal(_) => 500,
+            #[cfg(feature = "vector")]
+            ApiError::Vector(_) => 500,
+        }
+    }
+
+    /// The `@type` code ([`fluree_vocab::errors`]) for this error, the
+    /// companion to [`Self::status_code`].
+    pub fn error_type(&self) -> &'static str {
+        use fluree_db_query::QueryError as QE;
+        use fluree_db_transact::TransactError as TE;
+        use fluree_vocab::errors;
+        match self {
+            // Flattened: only the status survives, so name the status.
+            ApiError::Http { status, .. } => match status {
+                400 => errors::BAD_REQUEST,
+                401 => errors::UNAUTHORIZED,
+                403 => errors::ACCESS_DENIED,
+                404 => errors::NOT_FOUND,
+                // Only a tracked query flattens a 408.
+                408 => errors::QUERY_CANCELLED,
+                409 => errors::COMMIT_CONFLICT,
+                // The HTTP body-size cap. An oversized novelty delta is the
+                // other 413, and stays typed end to end so the two carry
+                // distinct codes.
+                413 => errors::PAYLOAD_TOO_LARGE,
+                422 => errors::INVALID_TRANSACTION,
+                _ => errors::INTERNAL,
+            },
+
+            ApiError::GraphNotFound(_) => errors::GRAPH_NOT_FOUND,
+            ApiError::CommitNotFound(_) => errors::COMMIT_NOT_FOUND,
+            ApiError::NotFound(msg) => {
+                if msg.contains("Graph source") || msg.contains("graph source") {
+                    errors::GRAPH_SOURCE_NOT_FOUND
+                } else {
+                    errors::LEDGER_NOT_FOUND
+                }
+            }
+            ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => {
+                errors::LEDGER_NOT_FOUND
+            }
+            ApiError::GraphSourceRetracted(_) => errors::GRAPH_SOURCE_RETRACTED,
+
+            ApiError::NoveltyDeferred { .. } => errors::NOVELTY_DEFERRED,
+            ApiError::MaterializePartial { tally, .. } => {
+                if tally.failed > 0 {
+                    errors::MATERIALIZE_PARTIAL
+                } else {
+                    errors::NOVELTY_DEFERRED
+                }
+            }
+            ApiError::LedgerExists(_) => errors::LEDGER_EXISTS,
+            ApiError::BranchConflict(_) => errors::COMMIT_CONFLICT,
+            ApiError::CommitContention { .. } => errors::COMMIT_CONTENTION,
+
+            ApiError::IndexTimeout(_) => errors::INDEX_TIMEOUT,
+            ApiError::IndexingDisabled => errors::INDEXING_DISABLED,
+            ApiError::ReindexConflict { .. } => errors::REINDEX_CONFLICT,
+            ApiError::Indexer(e) => {
+                use crate::wasm_compat::IndexerError;
+                match e {
+                    IndexerError::LedgerNotFound(_) => errors::LEDGER_NOT_FOUND,
+                    IndexerError::NoCommits => errors::BAD_REQUEST,
+                    _ => errors::INDEXING,
+                }
+            }
+
+            ApiError::Parse(fluree_db_query::parse::ParseError::TypeCoercion(_)) => {
+                errors::TYPE_COERCION
+            }
+            ApiError::Parse(_) => errors::JSONLD_PARSE,
+            ApiError::Turtle(_) => errors::TURTLE_PARSE,
+            ApiError::Sparql { .. } => errors::SPARQL_PARSE,
+            ApiError::SparqlLower(_) => errors::SPARQL_LOWER,
+            ApiError::Cypher { .. } => errors::CYPHER_PARSE,
+            ApiError::CypherLower(_) | ApiError::CypherUpdateLower(_) => errors::CYPHER_LOWER,
+
+            ApiError::AwaitTNotReached { .. } => errors::READ_AFTER_WRITE_TIMEOUT,
+            ApiError::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
+            ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
+            ApiError::Query(e) => match e {
+                QE::Cancelled { .. } => errors::QUERY_CANCELLED,
+                QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
+                QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
+                QE::CatalogAccessDenied { .. } => errors::CATALOG_ACCESS_DENIED,
+                // Well-formed but unsupported on this source: still a 400,
+                // with its own code so clients can branch on it.
+                QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                e if query_error_status(e) == 500 => errors::INTERNAL,
+                _ => errors::INVALID_QUERY,
+            },
+            ApiError::Batch(_) => errors::INVALID_QUERY,
+
+            ApiError::Policy(fluree_db_policy::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(TE::PolicyViolation(
+                fluree_db_policy::PolicyError::ModifyDenied { .. },
+            )) => errors::ACCESS_DENIED,
             ApiError::Transact(
-                fluree_db_transact::TransactError::CommitConflict { .. }
-                | fluree_db_transact::TransactError::CommitIdMismatch { .. }
-                | fluree_db_transact::TransactError::PublishLostRace { .. }
-                | fluree_db_transact::TransactError::NamespaceConflict(_),
-            ) => 409,
-            // 413: the transaction's own delta meets or exceeds
-            // `reindex_max_bytes` (the commit check is `current + delta >=
-            // max`, so with drained novelty this still fails) — no amount of
-            // indexer draining can ever admit it. A 503 here would tell the
-            // client to retry a request that can never work; 413 says the
-            // payload itself is the problem. MUST precede the drainable
-            // novelty arm below.
-            ApiError::Transact(fluree_db_transact::TransactError::NoveltyWouldExceed {
+                TE::CommitConflict { .. }
+                | TE::CommitIdMismatch { .. }
+                | TE::PublishLostRace { .. }
+                | TE::NamespaceConflict(_),
+            ) => errors::COMMIT_CONFLICT,
+            ApiError::Transact(TE::NoveltyWouldExceed {
                 delta_bytes,
                 max_bytes,
                 ..
-            }) if delta_bytes >= max_bytes => 413,
-            // 503 + retryable: novelty backpressure, the same class as
-            // `NoveltyDeferred` above. `NoveltyAtMax` (novelty already at
-            // `reindex_max_bytes`) and drainable `NoveltyWouldExceed` (this
-            // delta would cross it, but fits once novelty drains) are cleared
-            // by the indexer, not by changing the request — a 400 tells
-            // retrying clients the write is permanently invalid and to drop
-            // it.
-            ApiError::Transact(
-                fluree_db_transact::TransactError::NoveltyAtMax
-                | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
-            ) => 503,
-            // 422: well-formed, but the ledger has no room for its new
-            // datatypes. Permanent: datatype IDs are never released.
-            ApiError::Transact(fluree_db_transact::TransactError::DatatypeLimitExceeded {
-                ..
-            }) => 422,
-            // Other transaction errors are usually validation failures
-            ApiError::Transact(_) => 400,
-            // Cross-ledger model dependency could not be resolved /
-            // used. Conceptually an upstream-dependency failure, not
-            // an internal panic. 502 Bad Gateway is the pragmatic
-            // choice; 424 Failed Dependency is closer semantically
-            // but less commonly handled by client tooling. The
-            // wrapped variant is preserved for callers that branch
-            // on the specific failure.
-            ApiError::CrossLedger(_) => 502,
-            // Internal/infrastructure errors
-            _ => 500,
+            }) if delta_bytes >= max_bytes => errors::NOVELTY_DELTA_TOO_LARGE,
+            // One code for both at-max and would-exceed: clients branch on
+            // "the indexer needs to drain".
+            ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => {
+                errors::NOVELTY_AT_MAX
+            }
+            ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ApiError::Transact(_) => errors::INVALID_TRANSACTION,
+
+            ApiError::InvalidLedgerId(_)
+            | ApiError::InvalidBranch(_)
+            | ApiError::NameService(fluree_db_nameservice::NameServiceError::InvalidId(_))
+            | ApiError::Ledger(fluree_db_ledger::LedgerError::FutureTime { .. }) => {
+                errors::BAD_REQUEST
+            }
+            ApiError::Builder(errs) => errs
+                .0
+                .first()
+                .map_or(errors::BAD_REQUEST, BuilderError::error_code),
+            #[cfg(feature = "credential")]
+            ApiError::Credential(_) => errors::INVALID_CREDENTIAL,
+            #[cfg(feature = "iceberg")]
+            ApiError::Iceberg(e) => match e {
+                fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => {
+                    errors::MERGE_ON_READ_DELETES
+                }
+                _ => errors::CONFIG,
+            },
+
+            ApiError::Connection(_) => errors::CONNECTION,
+            ApiError::NameService(_) => errors::NAMESERVICE,
+            ApiError::Bm25Builder(_) | ApiError::Bm25Serialize(_) => errors::BM25,
+            ApiError::Config(_) | ApiError::LedgerConfig(_) => errors::CONFIG,
+            ApiError::Format(_) => errors::FORMAT,
+            // The specific failure stays in the message; this is the umbrella.
+            ApiError::CrossLedger(_) => errors::CROSS_LEDGER,
+
+            ApiError::Ledger(_)
+            | ApiError::Novelty(_)
+            | ApiError::Core(_)
+            | ApiError::Json(_)
+            | ApiError::MaterializeMemoryBudget { .. }
+            | ApiError::OntologyImport(_)
+            | ApiError::Drop(_)
+            | ApiError::Policy(_)
+            | ApiError::Internal(_) => errors::INTERNAL,
+            #[cfg(feature = "vector")]
+            ApiError::Vector(_) => errors::INTERNAL,
         }
     }
 
@@ -757,12 +953,495 @@ impl ApiError {
     }
 }
 
+/// The HTTP status for a query engine error, wherever it surfaces: wrapped in
+/// [`ApiError::Query`], or reported directly by a tracked query.
+///
+/// Exhaustive so a new variant has to be classified.
+pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
+    use fluree_db_query::QueryError as QE;
+    match err {
+        QE::Cancelled { .. } => 408,
+        // The in-memory join/aggregate budget: distinct from the 408 timeout
+        // so the caller degrades on it specifically (too memory-heavy, not
+        // too slow).
+        QE::MemoryBudgetExceeded { .. } => 507,
+        QE::StorageAccessDenied { .. }
+        | QE::CatalogCredentialsNotVended { .. }
+        | QE::CatalogAccessDenied { .. } => 403,
+        // Engine and storage faults no change to the query can clear.
+        QE::Core(_)
+        | QE::OperatorNotOpened
+        | QE::OperatorAlreadyOpened
+        | QE::OperatorClosed
+        | QE::NoSuitableIndex
+        | QE::DictionaryLookup(_)
+        | QE::NeedFetch(_)
+        | QE::Policy(_)
+        | QE::Internal(_) => 500,
+        QE::Batch(_)
+        | QE::R2rml(_)
+        | QE::VariableNotFound(_)
+        | QE::InvalidQuery(_)
+        | QE::UngroupedRead(_)
+        | QE::InvalidFilter(_)
+        | QE::InvalidExpression(_)
+        | QE::SnapshotNotFound { .. }
+        | QE::NoSnapshotAtTime { .. }
+        | QE::ResourceLimit(_)
+        | QE::FuelLimitExceeded(_)
+        | QE::R2rmlUnsupportedPattern { .. }
+        | QE::UnsupportedMode(_)
+        | QE::UnsupportedFeature(_)
+        | QE::TimeRangeNotCovered { .. }
+        | QE::Arithmetic(_)
+        | QE::Comparison(_) => 400,
+    }
+}
+
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_ledger::CrossLedgerError;
+    use crate::wasm_compat::IndexerError as IE;
+    use fluree_db_connection::ConnectionError;
+    use fluree_db_core::LedgerIdParseError;
+    use fluree_db_core::QueryCancellationReason::Timeout;
+    #[cfg(feature = "credential")]
+    use fluree_db_credential::CredentialError as CE;
+    use fluree_db_cypher::LowerError as CypherLowerError;
+    #[cfg(feature = "iceberg")]
+    use fluree_db_iceberg::IcebergError as IbE;
+    use fluree_db_ledger::LedgerError as LE;
+    use fluree_db_nameservice::NameServiceError as NSE;
+    use fluree_db_novelty::NoveltyError;
+    use fluree_db_policy::PolicyError as PE;
+    use fluree_db_query::bm25;
+    use fluree_db_query::parse::ParseError;
+    use fluree_db_query::QueryError as QE;
+    use fluree_db_sparql::{LowerError as SLE, SourceSpan};
+    use fluree_db_transact::lower_cypher_update::LowerCypherError;
+    use fluree_db_transact::TransactError as TE;
+    use fluree_graph_turtle::TurtleError;
+    use fluree_vocab::errors::*;
+
+    /// Distinct `ApiError` variants `every_variant` must cover. Adding a
+    /// variant breaks the match in `every_variant`; give it a row there and
+    /// count it here.
+    const VARIANTS: usize = 47
+        + cfg!(feature = "vector") as usize
+        + cfg!(feature = "credential") as usize
+        + cfg!(feature = "iceberg") as usize;
+
+    fn conflict() -> ApiError {
+        ApiError::Transact(TE::CommitConflict {
+            expected_t: 1,
+            head_t: 2,
+        })
+    }
+
+    /// A fan-out window with one target deferred and `failed` failed.
+    fn partial(failed: usize) -> ApiError {
+        ApiError::MaterializePartial {
+            tally: TargetTally {
+                ok: 1,
+                deferred: 1,
+                failed,
+            },
+            detail: "x".into(),
+        }
+    }
+
+    /// Every `ApiError` variant (several forms of the ones that split), with
+    /// the status and `@type` it must answer with, in status order.
+    fn every_variant() -> Vec<(ApiError, u16, &'static str)> {
+        // Every `serde_json` error that reaches `ApiError::Json` parses stored
+        // records, not the request.
+        let json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let span = SourceSpan::from(0..1);
+        let rows = vec![
+            (
+                ApiError::Parse(ParseError::MissingField("select")),
+                400,
+                JSONLD_PARSE,
+            ),
+            (
+                ApiError::Parse(ParseError::TypeCoercion("x".into())),
+                400,
+                TYPE_COERCION,
+            ),
+            (ApiError::invalid_query("x"), 400, INVALID_QUERY),
+            (
+                ApiError::Query(QE::r2rml_unsupported_pattern("x")),
+                400,
+                R2RML_UNSUPPORTED_PATTERN,
+            ),
+            (
+                ApiError::Batch(fluree_db_query::BatchError::ColumnLengthMismatch {
+                    expected: 1,
+                    got: 2,
+                    column: 0,
+                }),
+                400,
+                INVALID_QUERY,
+            ),
+            (
+                ApiError::Ledger(LE::future_time("db", 9, 1)),
+                400,
+                BAD_REQUEST,
+            ),
+            (
+                ApiError::NameService(NSE::InvalidId("a@b".into())),
+                400,
+                BAD_REQUEST,
+            ),
+            (
+                ApiError::Transact(TE::InvalidTerm("x".into())),
+                400,
+                INVALID_TRANSACTION,
+            ),
+            (ApiError::sparql("x", vec![]), 400, SPARQL_PARSE),
+            (
+                ApiError::SparqlLower(SLE::AggregateWithoutAlias { span }),
+                400,
+                SPARQL_LOWER,
+            ),
+            (ApiError::cypher("x", vec![]), 400, CYPHER_PARSE),
+            (
+                ApiError::CypherLower(CypherLowerError::WriteOnQueryPath),
+                400,
+                CYPHER_LOWER,
+            ),
+            (
+                ApiError::CypherUpdateLower(LowerCypherError::NotAnUpdate),
+                400,
+                CYPHER_LOWER,
+            ),
+            (
+                ApiError::Turtle(TurtleError::IriResolution("x".into())),
+                400,
+                TURTLE_PARSE,
+            ),
+            #[cfg(feature = "iceberg")]
+            (ApiError::Iceberg(IbE::Config("x".into())), 400, CONFIG),
+            (ApiError::config("x"), 400, CONFIG),
+            (
+                ApiError::Format(FormatError::InvalidBinding("x".into())),
+                400,
+                FORMAT,
+            ),
+            (ApiError::InvalidBranch("x".into()), 400, BAD_REQUEST),
+            (
+                ApiError::InvalidLedgerId(LedgerIdParseError::new("x")),
+                400,
+                BAD_REQUEST,
+            ),
+            (ApiError::IndexingDisabled, 400, INDEXING_DISABLED),
+            (ApiError::Indexer(IE::NoCommits), 400, BAD_REQUEST),
+            (
+                ApiError::Builder(BuilderErrors(vec![BuilderError::Missing {
+                    field: "input",
+                    hint: "h",
+                }])),
+                400,
+                MISSING_PARAMETER,
+            ),
+            // Signed requests: every verification failure is documented as 401.
+            #[cfg(feature = "credential")]
+            (
+                ApiError::Credential(CE::InvalidSignature("x".into())),
+                401,
+                INVALID_CREDENTIAL,
+            ),
+            (
+                ApiError::Query(QE::CatalogAccessDenied {
+                    table: "t".into(),
+                    message: "m".into(),
+                }),
+                403,
+                CATALOG_ACCESS_DENIED,
+            ),
+            (
+                ApiError::Transact(TE::PolicyViolation(PE::modify_denied("no"))),
+                403,
+                ACCESS_DENIED,
+            ),
+            (
+                ApiError::StorageAccessDenied {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    region: None,
+                    message: "m".into(),
+                },
+                403,
+                STORAGE_ACCESS_DENIED,
+            ),
+            (
+                ApiError::CatalogCredentialsNotVended {
+                    catalog_uri: "c".into(),
+                },
+                403,
+                CATALOG_CREDENTIALS_NOT_VENDED,
+            ),
+            (
+                ApiError::Policy(PE::modify_denied("no")),
+                403,
+                ACCESS_DENIED,
+            ),
+            (ApiError::Ledger(LE::not_found("db")), 404, LEDGER_NOT_FOUND),
+            (ApiError::NotFound("db".into()), 404, LEDGER_NOT_FOUND),
+            (
+                ApiError::graph_source_not_found("gs"),
+                404,
+                GRAPH_SOURCE_NOT_FOUND,
+            ),
+            (ApiError::GraphNotFound("g".into()), 404, GRAPH_NOT_FOUND),
+            (ApiError::CommitNotFound("c".into()), 404, COMMIT_NOT_FOUND),
+            (ApiError::http(404, "x"), 404, NOT_FOUND),
+            (
+                ApiError::Indexer(IE::LedgerNotFound("db".into())),
+                404,
+                LEDGER_NOT_FOUND,
+            ),
+            (
+                ApiError::Query(QE::Cancelled { reason: Timeout }),
+                408,
+                QUERY_CANCELLED,
+            ),
+            (
+                ApiError::AwaitTNotReached {
+                    requested: 2,
+                    current: 1,
+                },
+                408,
+                READ_AFTER_WRITE_TIMEOUT,
+            ),
+            (conflict(), 409, COMMIT_CONFLICT),
+            (
+                ApiError::Transact(TE::CommitIdMismatch {
+                    expected: "a".into(),
+                    found: "b".into(),
+                }),
+                409,
+                COMMIT_CONFLICT,
+            ),
+            #[cfg(feature = "iceberg")]
+            (
+                ApiError::Iceberg(IbE::MergeOnReadDeletes("x".into())),
+                409,
+                MERGE_ON_READ_DELETES,
+            ),
+            (
+                ApiError::GraphSourceRetracted("x".into()),
+                409,
+                GRAPH_SOURCE_RETRACTED,
+            ),
+            (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
+            (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
+            (
+                ApiError::ReindexConflict {
+                    expected: 1,
+                    found: 2,
+                },
+                409,
+                REINDEX_CONFLICT,
+            ),
+            (
+                ApiError::Transact(TE::NoveltyWouldExceed {
+                    current_bytes: 0,
+                    delta_bytes: 100,
+                    max_bytes: 100,
+                }),
+                413,
+                NOVELTY_DELTA_TOO_LARGE,
+            ),
+            (
+                ApiError::Transact(TE::DatatypeLimitExceeded {
+                    used: 1,
+                    adding: 1,
+                    max: 1,
+                }),
+                422,
+                DATATYPE_LIMIT_EXCEEDED,
+            ),
+            (
+                ApiError::Connection(ConnectionError::InvalidConfig("x".into())),
+                500,
+                CONNECTION,
+            ),
+            (ApiError::Query(QE::Internal("x".into())), 500, INTERNAL),
+            (ApiError::Ledger(LE::InvalidData("x".into())), 500, INTERNAL),
+            (
+                ApiError::NameService(NSE::Storage("x".into())),
+                500,
+                NAMESERVICE,
+            ),
+            (
+                ApiError::Bm25Builder(bm25::BuilderError::MissingId("x".into())),
+                500,
+                BM25,
+            ),
+            (
+                ApiError::Bm25Serialize(std::io::Error::other("x").into()),
+                500,
+                BM25,
+            ),
+            #[cfg(feature = "vector")]
+            (
+                ApiError::Vector(
+                    fluree_db_query::vector::usearch::VectorError::DimensionMismatch {
+                        expected: 1,
+                        actual: 2,
+                    },
+                ),
+                500,
+                INTERNAL,
+            ),
+            (
+                ApiError::Novelty(NoveltyError::Storage("x".into())),
+                500,
+                INTERNAL,
+            ),
+            (
+                ApiError::Core(fluree_db_core::Error::Storage("x".into())),
+                500,
+                INTERNAL,
+            ),
+            (ApiError::Json(json), 500, INTERNAL),
+            (ApiError::ledger_config("x"), 500, CONFIG),
+            (
+                ApiError::MaterializeMemoryBudget {
+                    table: "t".into(),
+                    estimated_bytes: 2,
+                    budget_bytes: 1,
+                    distinct_subjects: 1,
+                },
+                500,
+                INTERNAL,
+            ),
+            (ApiError::OntologyImport("x".into()), 500, INTERNAL),
+            (ApiError::drop_error("x"), 500, INTERNAL),
+            (partial(1), 500, MATERIALIZE_PARTIAL),
+            (ApiError::internal("x"), 500, INTERNAL),
+            (ApiError::Policy(PE::invalid_query("x")), 500, INTERNAL),
+            (ApiError::Indexer(IE::Other("x".into())), 500, INDEXING),
+            (
+                ApiError::CrossLedger(CrossLedgerError::ModelLedgerMissing {
+                    ledger_id: "m".into(),
+                }),
+                502,
+                CROSS_LEDGER,
+            ),
+            (ApiError::Transact(TE::NoveltyAtMax), 503, NOVELTY_AT_MAX),
+            (
+                ApiError::NoveltyDeferred { remaining: 1 },
+                503,
+                NOVELTY_DEFERRED,
+            ),
+            (partial(0), 503, NOVELTY_DEFERRED),
+            (
+                ApiError::commit_contention(16, conflict()),
+                503,
+                COMMIT_CONTENTION,
+            ),
+            (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
+            (
+                ApiError::Query(QE::MemoryBudgetExceeded {
+                    used_bytes: 2,
+                    budget_bytes: 1,
+                }),
+                507,
+                INVALID_QUERY,
+            ),
+        ];
+        for (e, ..) in &rows {
+            match e {
+                ApiError::Connection(_)
+                | ApiError::Parse(_)
+                | ApiError::Query(_)
+                | ApiError::Batch(_)
+                | ApiError::Ledger(_)
+                | ApiError::NameService(_)
+                | ApiError::Transact(_)
+                | ApiError::Sparql { .. }
+                | ApiError::SparqlLower(_)
+                | ApiError::Cypher { .. }
+                | ApiError::CypherLower(_)
+                | ApiError::CypherUpdateLower(_)
+                | ApiError::Turtle(_)
+                | ApiError::Bm25Builder(_)
+                | ApiError::Bm25Serialize(_)
+                | ApiError::Novelty(_)
+                | ApiError::Core(_)
+                | ApiError::Json(_)
+                | ApiError::Config(_)
+                | ApiError::LedgerConfig(_)
+                | ApiError::MaterializeMemoryBudget { .. }
+                | ApiError::OntologyImport(_)
+                | ApiError::Format(_)
+                | ApiError::Drop(_)
+                | ApiError::GraphSourceRetracted(_)
+                | ApiError::InvalidBranch(_)
+                | ApiError::InvalidLedgerId(_)
+                | ApiError::BranchConflict(_)
+                | ApiError::NotFound(_)
+                | ApiError::GraphNotFound(_)
+                | ApiError::CommitNotFound(_)
+                | ApiError::LedgerExists(_)
+                | ApiError::NoveltyDeferred { .. }
+                | ApiError::MaterializePartial { .. }
+                | ApiError::Internal(_)
+                | ApiError::StorageAccessDenied { .. }
+                | ApiError::CatalogCredentialsNotVended { .. }
+                | ApiError::Http { .. }
+                | ApiError::IndexTimeout(_)
+                | ApiError::IndexingDisabled
+                | ApiError::AwaitTNotReached { .. }
+                | ApiError::CommitContention { .. }
+                | ApiError::ReindexConflict { .. }
+                | ApiError::Policy(_)
+                | ApiError::Indexer(_)
+                | ApiError::Builder(_)
+                | ApiError::CrossLedger(_) => {}
+                #[cfg(feature = "vector")]
+                ApiError::Vector(_) => {}
+                #[cfg(feature = "credential")]
+                ApiError::Credential(_) => {}
+                #[cfg(feature = "iceberg")]
+                ApiError::Iceberg(_) => {}
+            }
+        }
+        rows
+    }
+
+    /// The one table, row by row, and the same answer whether an error
+    /// reaches the response typed or flattened to `ApiError::Http` (the
+    /// consensus committer, shared ledger loads, tracked queries).
+    #[test]
+    fn every_variant_answers_the_same_typed_or_flattened() {
+        let rows = every_variant();
+        let variants: std::collections::HashSet<_> = rows
+            .iter()
+            .map(|(e, ..)| std::mem::discriminant(e))
+            .collect();
+        assert_eq!(variants.len(), VARIANTS, "every_variant misses a variant");
+
+        for (typed, status, code) in rows {
+            assert_eq!(typed.status_code(), status, "{typed:?}");
+            assert_eq!(typed.error_type(), code, "{typed:?}");
+            let flattened = ApiError::http(status, typed.to_string());
+            assert_eq!(flattened.status_code(), status, "{flattened:?}");
+            // A client error must not read as a fault, in either form.
+            for form in [&typed, &flattened] {
+                assert!(
+                    form.error_type() != INTERNAL || status >= 500,
+                    "{status} answers {INTERNAL}: {form:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn storage_permission_errors_are_403() {

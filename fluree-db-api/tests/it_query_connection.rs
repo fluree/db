@@ -642,3 +642,57 @@ async fn query_from_jsonld_with_track_all_reports_fuel_and_time() {
     assert!(tracked.fuel.is_some() && tracked.fuel.unwrap() > 0.0);
     assert!(tracked.time.is_some());
 }
+
+/// A tracked connection query answers the status the same query answers
+/// untracked: resolving its dataset (a missing ledger, a graph the ledger
+/// lacks) is classified by `ApiError`, not by a status the tracked path picks.
+#[tokio::test]
+async fn tracked_connection_query_errors_answer_the_untracked_status() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_people_ledger(&fluree, "people:main").await;
+
+    let jsonld = |from: serde_json::Value| {
+        json!({
+            "@context": context_ex_schema(),
+            "from": from,
+            "select": ["?s"],
+            "where": {"@id": "?s", "schema:name": "?name"}
+        })
+    };
+    for (from, expected) in [
+        (json!("nope:main"), 404),
+        (json!("people:main#http://example.org/nonexistent"), 404),
+        (json!(["people:main", "nope:main"]), 404),
+    ] {
+        let query = jsonld(from.clone());
+        let untracked = fluree
+            .query_connection(&query)
+            .await
+            .expect_err("untracked")
+            .status_code();
+        let tracked = fluree
+            .query_connection_tracked(&query)
+            .await
+            .expect_err("tracked")
+            .status;
+        assert_eq!((untracked, tracked), (expected, expected), "from {from}");
+    }
+
+    for (sparql, expected) in [
+        ("SELECT ?s FROM <nope:main> WHERE { ?s ?p ?o }", 404),
+        ("SELECT ?s FROM <people:main> WHERE { ?s ?p", 400),
+    ] {
+        let untracked = fluree
+            .query_connection_sparql(sparql)
+            .await
+            .expect_err("untracked")
+            .status_code();
+        let tracked = fluree
+            .query_connection_sparql_tracked(sparql, None, None)
+            .await
+            .expect_err("tracked")
+            .status;
+        assert_eq!((untracked, tracked), (expected, expected), "{sparql}");
+    }
+}

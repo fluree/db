@@ -167,13 +167,7 @@ async fn validate_local(
             .fluree
             .validate_ledger(&alias, &options)
             .await
-            .map_err(|e| {
-                if e.is_not_found() {
-                    ServerError::not_found(format!("Ledger not found: {alias}"))
-                } else {
-                    ServerError::Api(e)
-                }
-            })?;
+            .map_err(ServerError::Api)?;
 
         tracing::info!(
             status = "success",

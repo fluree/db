@@ -362,7 +362,12 @@ where
 
                 let resolved = shared
                     .resolve_commit_into_chunk(&bytes, &cid.digest_hex(), &mut chunk)
-                    .map_err(|e| IndexerError::StorageRead(e.to_string()))?;
+                    .map_err(|e| match e {
+                        run_index::ResolverError::Unindexable(_) => {
+                            IndexerError::Unindexable(format!("commit {cid}: {e}"))
+                        }
+                        e => IndexerError::StorageRead(e.to_string()),
+                    })?;
 
                 // Accumulate totals
                 total_commit_size += resolved.size;

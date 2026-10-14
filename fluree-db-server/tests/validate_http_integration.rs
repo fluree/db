@@ -292,6 +292,8 @@ async fn validate_unknown_graph_is_not_found() {
 #[tokio::test]
 async fn validate_unknown_ledger_is_not_found() {
     let (_tmp, state) = server_state().await;
-    let (status, _) = post_json(&state, "/v1/fluree/validate/it/no-such-ledger", json!({})).await;
+    let (status, body) =
+        post_json(&state, "/v1/fluree/validate/it/no-such-ledger", json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["@type"], "err:db/LedgerNotFound", "body: {body}");
 }

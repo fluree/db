@@ -2376,56 +2376,78 @@ impl Fluree {
         let tracker_ref = tracker.is_enabled().then_some(&tracker);
 
         const MAX_RETRIES: usize = 16;
-        for attempt in 0..MAX_RETRIES {
-            let (write_guard, stage_result, txn_type, commit_opts) = if attempt == 0 {
-                let snapshot_started = fluree_db_core::clock::Instant::now();
-                let snap = ledger.snapshot().await;
-                let snapshot_us = snapshot_started.elapsed().as_micros() as u64;
-                let base_t = snap.t;
-                let base_head_id = snap.head_commit_id.clone();
-                let ledger_state = snap.to_ledger_state();
+        let attempts_span = tracing::debug_span!("txn_attempts", attempts = tracing::field::Empty);
+        let committed = async {
+            let mut attempt = 0;
+            loop {
+                tracing::Span::current().record("attempts", attempt + 1);
+                let (write_guard, stage_result, txn_type, commit_opts) = if attempt == 0 {
+                    let snapshot_started = fluree_db_core::clock::Instant::now();
+                    let snap = ledger.snapshot().await;
+                    let snapshot_us = snapshot_started.elapsed().as_micros() as u64;
+                    let base_t = snap.t;
+                    let base_head_id = snap.head_commit_id.clone();
+                    let ledger_state = snap.to_ledger_state();
 
-                let stage_started = fluree_db_core::clock::Instant::now();
-                let (stage_result, txn_type, commit_opts) = self
-                    .stage_plan(
-                        &op_plan,
-                        ledger_state,
-                        txn_opts.clone(),
-                        &commit_opts_base,
-                        tracker_ref,
-                        &index_config,
-                        None,
-                    )
-                    .await?;
-                let stage_us = stage_started.elapsed().as_micros() as u64;
-                if let Some(gate) = ledger.take_stage_gate() {
-                    gate.park().await;
-                }
+                    let stage_started = fluree_db_core::clock::Instant::now();
+                    let (stage_result, txn_type, commit_opts) = self
+                        .stage_plan(
+                            &op_plan,
+                            ledger_state,
+                            txn_opts.clone(),
+                            &commit_opts_base,
+                            tracker_ref,
+                            &index_config,
+                            None,
+                        )
+                        .await?;
+                    let stage_us = stage_started.elapsed().as_micros() as u64;
+                    if let Some(gate) = ledger.take_stage_gate() {
+                        gate.park().await;
+                    }
 
-                let lock_started = fluree_db_core::clock::Instant::now();
-                let write_guard = ledger.lock_for_write().await;
-                tracing::debug!(
-                    target: "fluree::write_path",
-                    ledger = %ledger.id(),
-                    base_t,
-                    snapshot_us,
-                    stage_us,
-                    lock_wait_us = lock_started.elapsed().as_micros() as u64,
-                    "staged"
-                );
-                let unchanged = write_guard.state().t() == base_t
-                    && write_guard.state().head_commit_id.as_ref() == base_head_id.as_ref();
-                if unchanged {
-                    ledger.note_write_path(WritePath::Direct);
-                    tracing::debug!(target: "fluree::write_path", ledger = %ledger.id(), base_t, "direct");
-                    (write_guard, stage_result, txn_type, commit_opts)
-                } else if let Some(rebased) =
-                    Self::rebase_stage(&write_guard, stage_result, base_t, base_head_id.as_ref())
-                {
-                    ledger.note_write_path(WritePath::Rebased);
-                    (write_guard, rebased, txn_type, commit_opts)
+                    let lock_started = fluree_db_core::clock::Instant::now();
+                    let write_guard = ledger.lock_for_write().await;
+                    tracing::debug!(
+                        target: "fluree::write_path",
+                        ledger = %ledger.id(),
+                        base_t,
+                        snapshot_us,
+                        stage_us,
+                        lock_wait_us = lock_started.elapsed().as_micros() as u64,
+                        "staged"
+                    );
+                    let unchanged = write_guard.state().t() == base_t
+                        && write_guard.state().head_commit_id.as_ref() == base_head_id.as_ref();
+                    if unchanged {
+                        ledger.note_write_path(WritePath::Direct);
+                        tracing::debug!(target: "fluree::write_path", ledger = %ledger.id(), base_t, "direct");
+                        (write_guard, stage_result, txn_type, commit_opts)
+                    } else if let Some(rebased) = Self::rebase_stage(
+                        &write_guard,
+                        stage_result,
+                        base_t,
+                        base_head_id.as_ref(),
+                    ) {
+                        ledger.note_write_path(WritePath::Rebased);
+                        (write_guard, rebased, txn_type, commit_opts)
+                    } else {
+                        ledger.note_write_path(WritePath::Restaged);
+                        let (stage_result, txn_type, commit_opts) = self
+                            .stage_plan(
+                                &op_plan,
+                                write_guard.clone_state(),
+                                txn_opts.clone(),
+                                &commit_opts_base,
+                                tracker_ref,
+                                &index_config,
+                                None,
+                            )
+                            .await?;
+                        (write_guard, stage_result, txn_type, commit_opts)
+                    }
                 } else {
-                    ledger.note_write_path(WritePath::Restaged);
+                    let write_guard = ledger.lock_for_write().await;
                     let (stage_result, txn_type, commit_opts) = self
                         .stage_plan(
                             &op_plan,
@@ -2438,67 +2460,53 @@ impl Fluree {
                         )
                         .await?;
                     (write_guard, stage_result, txn_type, commit_opts)
-                }
-            } else {
-                let write_guard = ledger.lock_for_write().await;
-                let (stage_result, txn_type, commit_opts) = self
-                    .stage_plan(
-                        &op_plan,
-                        write_guard.clone_state(),
-                        txn_opts.clone(),
-                        &commit_opts_base,
-                        tracker_ref,
+                };
+
+                match self
+                    .commit_and_finalize(
+                        write_guard,
+                        stage_result,
+                        txn_type,
+                        commit_opts,
                         &index_config,
+                        tracker.tally(),
                         None,
                     )
-                    .await?;
-                (write_guard, stage_result, txn_type, commit_opts)
-            };
-
-            match self
-                .commit_and_finalize(
-                    write_guard,
-                    stage_result,
-                    txn_type,
-                    commit_opts,
-                    &index_config,
-                    tracker.tally(),
-                    None,
-                )
-                .await
-            {
-                Ok(r) => return Ok(r),
-                Err(e) if attempt + 1 < MAX_RETRIES && is_retryable_commit_conflict(&e) => {
-                    // The cached writer state agreed with our snapshot under
-                    // the lock yet `commit_staged` still failed — the cache
-                    // and durable head moved out of sync from outside this
-                    // committer (see [`is_retryable_commit_conflict`]).
-                    // Reconcile via `refresh` and retry against the healed
-                    // cache; `commit_and_finalize` has already dropped the
-                    // write guard, so `refresh` can re-acquire it.
-                    tracing::warn!(
-                        attempt,
-                        error = %e,
-                        "commit conflict under matching snapshot; reconciling and retrying"
-                    );
-                    if let Err(refresh_err) =
-                        self.refresh(ledger.id(), RefreshOpts::default()).await
-                    {
+                    .await
+                {
+                    Ok(r) => return Ok(r),
+                    Err(e) if is_retryable_commit_conflict(&e) => {
+                        if attempt + 1 == MAX_RETRIES {
+                            return Err(ApiError::commit_contention(MAX_RETRIES, e));
+                        }
+                        // The cached writer state agreed with our snapshot under
+                        // the lock yet `commit_staged` still failed — the cache
+                        // and durable head moved out of sync from outside this
+                        // committer (see [`is_retryable_commit_conflict`]).
+                        // Reconcile via `refresh` and retry against the healed
+                        // cache; `commit_and_finalize` has already dropped the
+                        // write guard, so `refresh` can re-acquire it.
                         tracing::warn!(
                             attempt,
-                            error = %refresh_err,
-                            "refresh during commit-conflict retry failed; retrying anyway"
+                            error = %e,
+                            "commit conflict under matching snapshot; reconciling and retrying"
                         );
+                        if let Err(refresh_err) =
+                            self.refresh(ledger.id(), RefreshOpts::default()).await
+                        {
+                            tracing::warn!(
+                                attempt,
+                                error = %refresh_err,
+                                "refresh during commit-conflict retry failed; retrying anyway"
+                            );
+                        }
+                        attempt += 1;
                     }
-                    continue;
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
-        }
-
-        Err(ApiError::internal(format!(
-            "transaction commit retry limit exceeded ({MAX_RETRIES} attempts)"
-        )))
+        };
+        tracing::Instrument::instrument(committed, attempts_span).await
     }
 }
 
