@@ -2851,13 +2851,9 @@ async fn cypher_call_subquery_import_all() {
     );
 }
 
-/// `x AS x` projects `x` unchanged, on novelty and on an indexed ledger. It
-/// used to lower to a bind of `x` to itself, which keeps a row only when the
-/// two bindings compare equal: an encoded binding from the index never equals
-/// its decoded value, so on an indexed ledger every row dropped.
-/// `MATCH (a:Person) WITH a AS a RETURN a.name` returned nothing there, and so
-/// did `CALL (a) { WITH a AS a … }` once the CALL's import reached the body.
-/// The five CALL shapes are #1894's: each person gets its own name, once.
+/// `x AS x` projects `x` unchanged, on novelty and on an indexed ledger, at
+/// the top level and inside `CALL (a) { … }`. The five CALL shapes are
+/// #1894's: each person gets its own name, once.
 #[tokio::test]
 async fn cypher_with_aliasing_a_variable_to_itself_keeps_every_row() {
     let fluree = FlureeBuilder::memory().build_memory();
