@@ -521,3 +521,151 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Every first and last op of a multi-operation update over a value the index
+/// keeps less of: the value is there afterwards exactly when the last
+/// operation inserts it, whatever subtype (or digits past the microsecond)
+/// each operation writes it with, whether the base holds it in novelty, in
+/// the index, or not at all, read in process, after a reload and after the
+/// next incremental and full index builds. A retraction that survives the
+/// fold names the value as the base stores it, so storage does not read it
+/// as a retraction of some other term.
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    // (stored, then three more spellings of the same value)
+    let values = [
+        [
+            "\"123456789012345678901234567890\"^^xsd:integer",
+            "\"123456789012345678901234567890\"^^xsd:nonNegativeInteger",
+            "\"123456789012345678901234567890\"^^xsd:positiveInteger",
+        ],
+        [
+            "\"2020-01-01T00:00:00.123456Z\"^^xsd:dateTime",
+            "\"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime",
+            "\"2020-01-01T00:00:00.1234561Z\"^^xsd:dateTime",
+        ],
+    ];
+    // (true = INSERT DATA, false = DELETE DATA, spelling)
+    let sequences: [&[(bool, usize)]; 9] = [
+        &[(true, 2)],
+        &[(false, 0), (true, 1), (false, 1)],
+        &[(false, 0), (false, 1)],
+        &[(false, 0), (true, 1)],
+        &[(true, 1), (false, 1)],
+        &[(true, 1), (false, 1), (true, 2)],
+        &[(true, 1), (true, 2)],
+        &[(false, 0), (true, 1), (false, 1), (true, 2)],
+        &[(true, 1), (false, 1), (true, 2), (false, 2)],
+    ];
+    #[derive(Clone, Copy, Debug)]
+    enum Base {
+        Absent,
+        Novelty,
+        Indexed,
+    }
+    let count = |fluree: fluree_db_api::Fluree, ledger_id: String| async move {
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        let q = format!("{PFX}SELECT (COUNT(?o) AS ?n) WHERE {{ ex:s ex:p ?o }}");
+        let json = query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("query")
+            .to_sparql_json(&ledger.snapshot)
+            .expect("json");
+        json["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .expect("count")
+            .to_string()
+    };
+    let mut failures = Vec::new();
+    let mut case = 0;
+    for spellings in &values {
+        for base in [Base::Absent, Base::Novelty, Base::Indexed] {
+            for ops in sequences {
+                case += 1;
+                let ledger_id = &format!("it/multiop-last-op-{case}:main");
+                let tmp = tempfile::TempDir::new().expect("tempdir");
+                let path = tmp.path().to_string_lossy().to_string();
+                let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                fluree.create_ledger(ledger_id).await.expect("create");
+                let seed = match base {
+                    Base::Absent => format!("{PFX}INSERT DATA {{ ex:s ex:q \"keep\" }}"),
+                    _ => format!(
+                        "{PFX}INSERT DATA {{ ex:s ex:p {} ; ex:q \"keep\" }}",
+                        spellings[0]
+                    ),
+                };
+                fluree
+                    .graph(ledger_id)
+                    .transact()
+                    .sparql_update(&seed)
+                    .commit()
+                    .await
+                    .expect("seed");
+                let fluree = if let Base::Indexed = base {
+                    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+                    FlureeBuilder::file(path.clone())
+                        .build()
+                        .expect("cold reload")
+                } else {
+                    fluree
+                };
+                let update = ops
+                    .iter()
+                    .map(|(insert, n)| {
+                        format!(
+                            "{} DATA {{ ex:s ex:p {} }}",
+                            if *insert { "INSERT" } else { "DELETE" },
+                            spellings[*n]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ;\n");
+                fluree
+                    .graph(ledger_id)
+                    .transact()
+                    .sparql_update(&format!("{PFX}{update}"))
+                    .commit()
+                    .await
+                    .expect("update");
+                let want = if ops.last().expect("an op").0 {
+                    "1"
+                } else {
+                    "0"
+                };
+                let reload = || FlureeBuilder::file(path.clone()).build().expect("reload");
+                let in_process = count(fluree, ledger_id.clone()).await;
+                let reloaded = count(reload(), ledger_id.clone()).await;
+                let incremental = {
+                    crate::support::build_and_publish_index(&reload(), ledger_id).await;
+                    count(reload(), ledger_id.clone()).await
+                };
+                let rebuilt = {
+                    crate::support::rebuild_and_publish_index(&reload(), ledger_id).await;
+                    count(reload(), ledger_id.clone()).await
+                };
+                // Novelty holds each term of a value as its own fact until
+                // the next build (#2090), so a value it holds and asserts
+                // under another subtype reads twice before then, as after an
+                // `INSERT DATA` of that subtype alone.
+                let two_terms_in_novelty = matches!(base, Base::Novelty) && want == "1";
+                let unbuilt_ok = |n: &String| n == want || (two_terms_in_novelty && n == "2");
+                let got = [in_process, reloaded, incremental, rebuilt];
+                if !got[..2].iter().all(unbuilt_ok) || got[2..].iter().any(|n| n != want) {
+                    failures.push(format!(
+                        "{base:?} base, {}: values in process, reloaded, after an incremental \
+                         build, after a rebuild = {got:?}; expected {want} each{}",
+                        update.replace('\n', " "),
+                        if two_terms_in_novelty {
+                            " (2 before a build)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

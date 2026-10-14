@@ -93,6 +93,12 @@ pub(crate) struct SequentialStager {
     /// fact whose first and last ops differ may net to no change; see
     /// [`Self::finish`].
     first_ops: Vec<bool>,
+    /// The retraction each fact first staged as a retraction was staged
+    /// with, by `folded` index, kept once a later operation overwrote it.
+    /// That retraction was staged against the base, so it names the fact as
+    /// the base stores it; a later one may name it as an earlier operation
+    /// wrote it. See [`Self::drop_reversed_facts`].
+    first_retractions: HashMap<usize, fluree_db_core::Flake>,
     fold_index: HashMap<SequentialFactKey, usize>,
     /// Simulated sequential per-op graph-id assignment, so the merged view's
     /// routing matches the ids each op's staging (and each intermediate
@@ -135,6 +141,7 @@ impl SequentialStager {
             final_t,
             folded: Vec::new(),
             first_ops: Vec::new(),
+            first_retractions: HashMap::new(),
             fold_index: HashMap::new(),
             sim_registry: ledger.snapshot.graph_registry.clone(),
             merged_graph_iris: Vec::new(),
@@ -231,7 +238,11 @@ impl SequentialStager {
             );
             match self.fold_index.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    self.folded[*entry.get()] = merged;
+                    let i = *entry.get();
+                    let replaced = std::mem::replace(&mut self.folded[i], merged);
+                    if !self.first_ops[i] {
+                        self.first_retractions.entry(i).or_insert(replaced);
+                    }
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(self.folded.len());
@@ -272,12 +283,20 @@ impl SequentialStager {
     /// retracts a stored fact.)
     ///
     /// The base is asked through [`CurrentFacts::named_by`], by the identity
-    /// the fold keyed the fact by, and a retraction that stays names the
-    /// fact as the base stores it: an earlier operation may have written the
-    /// value with more detail than the index keeps.
+    /// the fold keyed the fact by. Every retraction that stays names the
+    /// fact as the base stores it, since an earlier operation may have
+    /// written the value with more detail than the index keeps: one whose
+    /// first op asserted is renamed to what the base answers, and one whose
+    /// first op retracted is that first retraction again, which staging
+    /// read from the base.
     ///
     /// [`CurrentFacts::named_by`]: fluree_db_transact::CurrentFacts::named_by
     async fn drop_reversed_facts(&mut self) -> Result<()> {
+        for (i, first) in std::mem::take(&mut self.first_retractions) {
+            if !self.folded[i].op {
+                self.folded[i] = first;
+            }
+        }
         let reversed: Vec<usize> = (0..self.folded.len())
             .filter(|&i| self.folded[i].op != self.first_ops[i])
             .collect();
