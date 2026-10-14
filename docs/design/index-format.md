@@ -46,8 +46,8 @@ Fact indexes exist in up to four sort orders (see `RunSortOrder`):
 ## Terminology
 
 - **Leaflet**: a compressed block of rows (default build target: `leaflet_rows = 25_000`).
-- **Leaf**: a container of multiple leaflets (default: `leaflets_per_leaf = 10`) plus a directory for
-  random access to its leaflets.
+- **Leaf**: a container of multiple leaflets (default build target: `leaf_rows = 250_000`) plus a
+  directory for random access to its leaflets.
 - **Branch manifest**: maps key ranges to leaf files; used for routing.
 - **Column block**: a separately compressed single-column section inside a leaflet.
 - **History sidecar**: a separate CAS object holding a leaf's time-travel transition log.
@@ -244,8 +244,10 @@ By grouping N leaflets into one leaf object:
   - caching hot leaflets (decoded) independent of unrelated ones
   - future optimizations like ranged reads (leaflet offsets are explicit)
 
-The default build targets (`leaflet_rows = 25_000`, `leaflets_per_leaf = 10`) yield a leaf that is
+The default build targets (`leaflet_rows = 25_000`, `leaf_rows = 250_000`) yield a leaf that is
 large enough to amortize object-store overhead but still small enough to cache and move efficiently.
+Import, rebuild and incremental builds share both, and neither is user-configurable: readers take
+any geometry, so the defaults can change without a reindex.
 
 ## Leaflet format (compressed block inside a leaf)
 

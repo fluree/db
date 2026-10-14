@@ -52,8 +52,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             memory_budget_mb,
             parallelism,
             skolem_namespace,
-            leaflet_rows,
-            leaflets_per_leaf,
             remote,
         } => {
             if from.is_some() && memory.is_some() {
@@ -139,8 +137,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 },
                 chunk_size_mb,
                 skolem_namespace,
-                leaflet_rows,
-                leaflets_per_leaf,
                 edge_policy,
                 base_iri,
             };

@@ -917,7 +917,7 @@ where
                     index_dir: index_dir.clone(),
                     g_id,
                     leaflet_target_rows: config.leaflet_rows,
-                    leaf_target_rows: config.leaflet_rows * config.leaflets_per_leaf,
+                    leaf_target_rows: config.leaf_rows,
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,

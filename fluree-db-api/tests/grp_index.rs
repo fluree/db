@@ -23,6 +23,8 @@ mod it_indexing_stats;
 mod it_indexing_wait;
 #[path = "it_indexing_workflow.rs"]
 mod it_indexing_workflow;
+#[path = "it_leaf_rows_wiring.rs"]
+mod it_leaf_rows_wiring;
 #[path = "it_ledger_info_reindex_cache.rs"]
 mod it_ledger_info_reindex_cache;
 #[path = "it_ledger_info_reindex_size.rs"]

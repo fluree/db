@@ -1875,6 +1875,7 @@ async fn indexed_number_of_subjects_and_objects_matches_general() {
     let ledger_id = "it/nos-indexed:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2009,6 +2010,7 @@ async fn indexed_parallel_number_of_subjects_objects_matches_general() {
     let ledger_id = "it/pnos-indexed:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 4_000;
     idx_config.leaf_max_bytes = 8_000;
     let (local, handle) = start_background_indexer_local(
@@ -2075,6 +2077,7 @@ async fn indexed_parallel_star_join_count_matches_serial() {
     // benchmark predicate has thousands) and the parallel partitioner engages.
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2157,6 +2160,7 @@ async fn indexed_parallel_optional_join_count_matches_serial() {
     // Tiny leaflets so the data spans many leaves and the partitioner engages.
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2243,6 +2247,7 @@ async fn indexed_parallel_union_constraint_count_matches_serial() {
     let ledger_id = "it/indexed-parallel-union-constraint:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2336,6 +2341,7 @@ async fn indexed_parallel_minus_intersect_count_matches_serial() {
     let ledger_id = "it/indexed-parallel-minus-intersect:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2431,6 +2437,7 @@ async fn indexed_parallel_exists_intersect_count_matches_serial() {
     let ledger_id = "it/indexed-parallel-exists-intersect:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2520,6 +2527,7 @@ async fn indexed_parallel_encoded_filter_count_matches_serial() {
     let ledger_id = "it/indexed-parallel-encoded-filter:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2598,6 +2606,7 @@ async fn indexed_parallel_numeric_compare_count_matches_serial() {
     let ledger_id = "it/indexed-parallel-numeric-compare:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2676,6 +2685,7 @@ async fn indexed_numeric_compare_mixed_int_double_counts_correctly() {
     let ledger_id = "it/indexed-numeric-compare-mixed:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         fluree
@@ -2762,6 +2772,7 @@ async fn indexed_numeric_compare_global_shortcut_counts_correctly() {
     let ledger_id = "it/indexed-numeric-compare-shortcut:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -2937,6 +2948,7 @@ async fn overlay_parallel_encoded_filter_count_folds_novelty() {
     let ledger_id = "it/overlay-parallel-encoded:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3025,6 +3037,7 @@ async fn overlay_parallel_numeric_compare_sum_folds_novelty() {
     let ledger_id = "it/overlay-parallel-numeric:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3116,6 +3129,7 @@ async fn overlay_parallel_star_join_count_folds_novelty() {
     let ledger_id = "it/overlay-parallel-star:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3207,6 +3221,7 @@ async fn overlay_parallel_optional_join_count_folds_novelty() {
     let ledger_id = "it/overlay-parallel-optional:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3301,6 +3316,7 @@ async fn overlay_parallel_union_constraint_count_folds_novelty() {
     let ledger_id = "it/overlay-parallel-union:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3398,6 +3414,7 @@ async fn overlay_parallel_minus_exists_intersect_count_folds_novelty() {
     let ledger_id = "it/overlay-parallel-minus-exists:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3522,6 +3539,7 @@ async fn overlay_delta_single_predicate_count_folds_novelty() {
     let ledger_id = "it/overlay-delta-single:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3619,6 +3637,7 @@ async fn overlay_delta_count_folds_novelty_below_first_leaf() {
     let ledger_id = "it/overlay-delta-low-id:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     idx_config.leaf_target_bytes = 8_000;
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
@@ -3725,6 +3744,7 @@ async fn overlay_delta_union_count_folds_novelty() {
     let ledger_id = "it/overlay-delta-union:main";
     let mut idx_config = fluree_db_indexer::IndexerConfig::small();
     idx_config.leaflet_rows = 100;
+    idx_config.leaf_rows = 1_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         fluree

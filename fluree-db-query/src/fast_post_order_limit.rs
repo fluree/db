@@ -76,7 +76,7 @@ use std::sync::Arc;
 /// filter is far more selective than the ordering predicate is broad.
 ///
 /// Checked *per leaf* (after each leaf's rows are scanned), so the bound is
-/// one-leaf-granular, not exact: a single large leaf — up to `leaf_target_rows`
+/// one-leaf-granular, not exact: a single large leaf — up to `leaf_rows`
 /// (default 250k, larger than this budget) — is fully scanned before the bail.
 const SCAN_BUDGET: usize = 200_000;
 
