@@ -489,6 +489,15 @@ pub(crate) fn reencode_sid(
         .and_then(|iri| target.encode_iri(&iri))
 }
 
+/// Whether a SID in namespace `ns_code` names the same IRI, coded the same
+/// way, in every ledger: the built-in prefixes (`xsd:`, `rdf:`, …). A user
+/// namespace's code is allocated per ledger, and a full-IRI code (`EMPTY`,
+/// `OVERFLOW`) holds an IRI another ledger may code under a namespace, so a
+/// SID in either needs re-coding to cross ledgers.
+pub(crate) fn namespace_code_is_shared(ns_code: u16) -> bool {
+    ns_code != fluree_vocab::namespaces::EMPTY && ns_code < fluree_vocab::namespaces::USER_START
+}
+
 impl<'a> ExecutionContext<'a> {
     /// Create a new execution context
     pub fn new(snapshot: &'a LedgerSnapshot, vars: &'a VarRegistry) -> Self {

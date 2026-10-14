@@ -433,11 +433,14 @@ pub(crate) fn stamp_provenance(
 
     let (schema, columns, _len) = batch.into_parts();
 
+    // A column's literals usually share one datatype, so the batch keeps its
+    // last re-coding and re-codes a datatype once, not per row.
+    let mut recoded: Option<(Sid, Sid)> = None;
     let stamped_columns: Vec<Vec<Binding>> = columns
         .into_iter()
         .map(|col| {
             col.into_iter()
-                .map(|binding| stamp_binding(binding, ledger_id, ctx))
+                .map(|binding| stamp_binding(binding, ledger_id, ctx, &mut recoded))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -477,12 +480,13 @@ pub(crate) fn stamp_seed_row(row: Vec<Binding>, ctx: &ExecutionContext<'_>) -> V
 
 /// Stamp a single binding with ledger provenance.
 ///
-/// `Binding::Sid` is converted to `IriMatch`. A literal whose datatype is a
-/// user namespace's has that datatype re-coded into the primary snapshot's
-/// namespace space, the one the rest of the query (its patterns, its keys,
-/// its output) uses: ledgers code their namespaces independently, so the
-/// same datatype IRI is a different `Sid` in another ledger. All other
-/// variants are moved through unchanged (no cloning).
+/// `Binding::Sid` is converted to `IriMatch`. A literal whose datatype is
+/// outside the built-in namespaces has that datatype re-coded into the
+/// primary snapshot's namespace space, the one the rest of the query (its
+/// patterns, its keys, its output) uses: ledgers code their namespaces
+/// independently, so the same datatype IRI is a different `Sid` in another
+/// ledger. `recoded` holds the last re-coding, `(member's, primary's)`. All
+/// other variants are moved through unchanged (no cloning).
 ///
 /// # Errors
 ///
@@ -497,6 +501,7 @@ fn stamp_binding(
     binding: Binding,
     ledger_id: &Arc<str>,
     ctx: &ExecutionContext<'_>,
+    recoded: &mut Option<(Sid, Sid)>,
 ) -> Result<Binding> {
     match binding {
         Binding::Sid { ref sid, .. } => sid_to_iri_match(sid, ledger_id, ctx),
@@ -506,14 +511,20 @@ fn stamp_binding(
             t,
             op,
             p_id,
-        } if dt.namespace_code >= fluree_vocab::namespaces::USER_START
-            && dt.namespace_code != fluree_vocab::namespaces::OVERFLOW
+        } if !crate::context::namespace_code_is_shared(dt.namespace_code)
             && ledger_id.as_ref() != ctx.original_snapshot.ledger_id.as_str() =>
         {
-            let dt = ctx
-                .decode_sid_in_ledger(&dt, ledger_id)
-                .and_then(|iri| ctx.original_snapshot.encode_iri(&iri))
-                .unwrap_or(dt);
+            let dt = match recoded {
+                Some((from, to)) if *from == dt => to.clone(),
+                _ => {
+                    let to = ctx
+                        .decode_sid_in_ledger(&dt, ledger_id)
+                        .and_then(|iri| ctx.original_snapshot.encode_iri(&iri))
+                        .unwrap_or_else(|| dt.clone());
+                    *recoded = Some((dt, to.clone()));
+                    to
+                }
+            };
             Ok(Binding::Lit {
                 val,
                 dtc: DatatypeConstraint::Explicit(dt),

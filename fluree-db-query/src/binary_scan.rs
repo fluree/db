@@ -944,10 +944,11 @@ impl BinaryScanOperator {
         // DatasetOperator which wraps this operator at all scan sites.
         let overlay: &dyn OverlayProvider = ctx.overlay.unwrap_or(&no_overlay);
         let match_val = build_match_val_for_snapshot(ctx, ctx.active_snapshot, &self.pattern)?;
-        self.range_dt = self.pattern.dtc.as_ref().map(|dtc| {
-            crate::context::reencode_sid(ctx, ctx.active_snapshot, dtc.datatype())
-                .unwrap_or_else(|| dtc.datatype().clone())
-        });
+        self.range_dt = self
+            .pattern
+            .dtc
+            .as_ref()
+            .map(|dtc| datatype_in_snapshot(ctx, ctx.active_snapshot, dtc.datatype()));
         let opts = RangeOptions {
             to_t: Some(ctx.to_t),
             from_t: ctx.from_t,
@@ -2029,10 +2030,29 @@ fn build_match_val_for_snapshot(
     // tag's `rdf:langString`, or a custom datatype. Carry it so the range
     // reads that datatype, not every bound string as `xsd:string`.
     if let (Term::Value(FlakeValue::String(_)), Some(dtc)) = (&pattern.o, pattern.dtc.as_ref()) {
-        match_val.dt = reencode_sid(dtc.datatype());
+        match_val.dt = Some(datatype_in_snapshot(ctx, snapshot, dtc.datatype()));
     }
 
     Ok(match_val)
+}
+
+/// A pattern's datatype, coded in the primary snapshot's namespace space, in
+/// `snapshot`'s. A built-in namespace codes it the same in every ledger, and a
+/// snapshot of the primary's ledger codes it as the primary does, so only a
+/// datatype read from another ledger outside the built-in namespaces is
+/// re-coded. One `snapshot` cannot code stays as it is, as the pattern's terms
+/// do.
+fn datatype_in_snapshot(
+    ctx: &ExecutionContext<'_>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    dt: &Sid,
+) -> Sid {
+    if crate::context::namespace_code_is_shared(dt.namespace_code)
+        || snapshot.ledger_id == ctx.original_snapshot.ledger_id
+    {
+        return dt.clone();
+    }
+    crate::context::reencode_sid(ctx, snapshot, dt).unwrap_or_else(|| dt.clone())
 }
 
 /// Pre-compute which repeated-variable equality checks are needed for a pattern.
