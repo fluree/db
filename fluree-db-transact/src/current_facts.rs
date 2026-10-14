@@ -548,9 +548,7 @@ impl<'l> FactIdentity<'l> {
             return None;
         }
         let key = match &flake.o {
-            FlakeValue::BigInt(v) if i64::try_from(v.as_ref()).is_err() => {
-                FactKey::BigInt(v.clone())
-            }
+            FlakeValue::BigInt(v) if flake.o.index_keys_by_value() => FactKey::BigInt(v.clone()),
             _ => FactKey::Index(self.keys.key(g_id()?, p_id(), flake)?),
         };
         Some((key, list_index_of(flake)))

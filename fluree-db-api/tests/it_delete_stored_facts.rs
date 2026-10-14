@@ -2162,3 +2162,159 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Merge and revert net a range of commits per fact, and an integer too large
+/// for 64 bits is one fact whatever XSD subtype it is written with. So a
+/// range that deletes it under one subtype and writes it again under another
+/// replays as that one fact's last op, not as a retraction of one term and
+/// an assertion of the other at one `t`, which storage resolves as the
+/// retraction. Reverting `DELETE x^^integer` and `INSERT x^^nonNegativeInteger`
+/// brings the value back, and merging a branch that ends by writing it keeps
+/// it, on a ledger indexed before the range and on one never indexed, read
+/// after the write and after the next index build.
+#[tokio::test]
+async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    let integer = format!("\"{BIG}\"^^xsd:integer");
+    let nonneg = format!("\"{BIG}\"^^xsd:nonNegativeInteger");
+    let write = |fluree: &Fluree, id: &str, body: String| {
+        let (fluree, id) = (fluree.clone(), id.to_string());
+        async move {
+            fluree
+                .graph(&id)
+                .transact()
+                .sparql_update(&format!("{PFX}{body}"))
+                .commit()
+                .await
+                .expect("write")
+                .receipt
+        }
+    };
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        let index_note = if indexed { "indexed" } else { "never indexed" };
+        // Revert both commits of `DELETE x^^integer`, `INSERT x^^nonNegativeInteger`.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+            let name = format!("it/revert-subtype-{indexed}");
+            let id = format!("{name}:main");
+            fluree.create_ledger(&id).await.expect("create");
+            write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {integer} ; ex:k \"keep\" }}"),
+            )
+            .await;
+            if indexed {
+                support::rebuild_and_publish_index(&fluree, &id).await;
+            }
+            let deleted = write(
+                &fluree,
+                &id,
+                format!("DELETE DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            let inserted = write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
+            )
+            .await;
+            let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+            fluree
+                .revert_commits(
+                    &name,
+                    "main",
+                    vec![
+                        CommitRef::Exact(deleted.commit_id),
+                        CommitRef::Exact(inserted.commit_id),
+                    ],
+                    ConflictStrategy::TakeSource,
+                )
+                .await
+                .expect("revert");
+            let after = values_of(&path, &id, "ex:p").await;
+            support::build_and_publish_index(
+                &FlureeBuilder::file(path.clone()).build().expect("reload"),
+                &id,
+            )
+            .await;
+            let reindexed = values_of(&path, &id, "ex:p").await;
+            if after != [BIG] || reindexed != [BIG] {
+                failures.push(format!(
+                    "revert, {index_note}: values {after:?}, after a build {reindexed:?}"
+                ));
+            }
+        }
+        // Merge a branch that inserts, deletes, and inserts again under
+        // another subtype, into a main that moved on meanwhile.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+            let name = format!("it/merge-subtype-{indexed}");
+            let id = format!("{name}:main");
+            let dev = format!("{name}:dev");
+            fluree.create_ledger(&id).await.expect("create");
+            write(
+                &fluree,
+                &id,
+                "INSERT DATA { ex:base ex:k \"b\" }".to_string(),
+            )
+            .await;
+            if indexed {
+                support::rebuild_and_publish_index(&fluree, &id).await;
+            }
+            fluree
+                .create_branch(&name, "dev", None, None)
+                .await
+                .expect("branch");
+            write(
+                &fluree,
+                &dev,
+                format!("INSERT DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            write(
+                &fluree,
+                &dev,
+                format!("DELETE DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            write(
+                &fluree,
+                &dev,
+                format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
+            )
+            .await;
+            write(
+                &fluree,
+                &id,
+                "INSERT DATA { ex:other ex:k \"o\" }".to_string(),
+            )
+            .await;
+            let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+            let report = fluree
+                .merge_branch(&name, "dev", None, ConflictStrategy::default())
+                .await
+                .expect("merge");
+            assert!(!report.fast_forward, "the merge replays the branch");
+            let after = values_of(&path, &id, "ex:p").await;
+            support::build_and_publish_index(
+                &FlureeBuilder::file(path.clone()).build().expect("reload"),
+                &id,
+            )
+            .await;
+            let reindexed = values_of(&path, &id, "ex:p").await;
+            if after != [BIG] || reindexed != [BIG] {
+                failures.push(format!(
+                    "merge, {index_note}: values {after:?}, after a build {reindexed:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

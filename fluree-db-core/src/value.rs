@@ -324,6 +324,15 @@ impl FlakeValue {
         }
     }
 
+    /// Whether the index keys this value by the value alone, whatever XSD
+    /// datatype it is written with: an integer too large for 64 bits, which
+    /// its `(graph, predicate)` arena keys by value, so every subtype it is
+    /// written under is one stored fact. Decided without an index, unlike
+    /// the other kinds of [`Self::index_key_may_merge_terms`].
+    pub fn index_keys_by_value(&self) -> bool {
+        matches!(self, FlakeValue::BigInt(v) if v.to_i64().is_none())
+    }
+
     /// Whether this value, written with datatype `dt`, keeps less in its
     /// persisted index key than the term holds, so the key decodes to a
     /// different term: an integer too large for 64 bits written with an XSD
