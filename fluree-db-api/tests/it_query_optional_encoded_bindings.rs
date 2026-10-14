@@ -2838,6 +2838,88 @@ async fn sparql_parameters_answer_as_the_inline_values() {
     failures.assert_none();
 }
 
+/// Custom datatypes that only a member ledger codes (#1771). The primary
+/// ledger C has never seen `ct:`, so a pattern's `ct:T` is lowered against it
+/// as a full IRI, and the member D's literals carry D's own codes for `ct:T`
+/// and `ct:U`. The scan re-codes the pattern's datatype into D's space, and
+/// D's literal datatypes are re-coded into C's as they leave the member, two
+/// datatypes in one column, so COUNT(DISTINCT) keys each as itself; before
+/// and after the first index.
+#[tokio::test(flavor = "current_thread")]
+async fn custom_datatypes_only_a_member_ledger_codes() {
+    let mut failures = Failures::default();
+    for indexed in [false, true] {
+        let state = if indexed { "indexed" } else { "novelty" };
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_c = format!("it/member-datatypes-c-{state}:main");
+        let ledger_d = format!("it/member-datatypes-d-{state}:main");
+        for (ledger_id, ttl) in [
+            (
+                &ledger_c,
+                r#"@prefix ex: <http://example.org/> . ex:c1 ex:p "a" ."#,
+            ),
+            (
+                &ledger_d,
+                r#"@prefix ex: <http://example.org/> . @prefix ct: <http://custom-types.test/> .
+                   ex:d1 ex:p "a"^^ct:T . ex:d2 ex:p "a"^^ct:U ."#,
+            ),
+        ] {
+            fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+            fluree
+                .stage(&handle)
+                .upsert_turtle(ttl)
+                .execute()
+                .await
+                .expect("seed");
+            if indexed {
+                rebuild_and_publish_index(&fluree, ledger_id).await;
+                fluree.disconnect_ledger(ledger_id).await;
+            }
+        }
+        let both = format!("FROM <{ledger_c}> FROM <{ledger_d}>");
+        let ct = "PREFIX ct: <http://custom-types.test/> ";
+        for (label, body, want) in [
+            (
+                "a constant of a datatype only D codes",
+                format!("SELECT ?s {both} WHERE {{ ?s ex:p \"a\"^^ct:T }}"),
+                rows(&[&["d1"]]),
+            ),
+            (
+                "each literal's datatype, two from D in one column",
+                format!("SELECT ?s (STR(DATATYPE(?o)) AS ?dt) {both} WHERE {{ ?s ex:p ?o }}"),
+                rows(&[
+                    &["c1", "http://www.w3.org/2001/XMLSchema#string"],
+                    &["d1", "http://custom-types.test/T"],
+                    &["d2", "http://custom-types.test/U"],
+                ]),
+            ),
+            (
+                "COUNT(DISTINCT) over the three literals",
+                format!("SELECT (COUNT(DISTINCT ?o) AS ?n) {both} WHERE {{ ?s ex:p ?o }}"),
+                rows(&[&["3"]]),
+            ),
+        ] {
+            let label = format!("{state} / {label}");
+            let query = format!("{PREFIXES}{ct}{body}");
+            match fluree.query_connection_sparql(&query).await {
+                Ok(result) => {
+                    let ledger = fluree.ledger(&ledger_c).await.expect("ledger C");
+                    match result.to_jsonld_async(ledger.as_graph_db_ref(0)).await {
+                        Ok(json) => failures.eq(jsonld_rows(&json), want, &label),
+                        Err(e) => failures.0.push(format!("{label}: format failed: {e}")),
+                    }
+                }
+                Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+            }
+        }
+    }
+    failures.assert_none();
+}
+
 /// The partitioned GROUP BY and the geo index search over a default graph of
 /// two ledgers: both read one graph's index, so both stand down and every
 /// member answers.
