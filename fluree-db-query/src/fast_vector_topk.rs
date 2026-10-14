@@ -300,12 +300,8 @@ impl Fold {
         match need {
             Some(n) => Fold::TopK {
                 need: n,
-                // Cap the eager reservation: `n` is a user literal (limit +
-                // offset), so a large-but-legal LIMIT would otherwise reserve an
-                // oversized heap per partition. The heap grows if genuinely
-                // needed, and `push` caps it at `need`. `saturating_add` also
-                // avoids the `n + 1` overflow debug-panic at pathological limits.
-                heap: BinaryHeap::with_capacity(n.saturating_add(1).min(4096)),
+                // `push` caps the heap at `need`.
+                heap: BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(n)),
             },
             None => Fold::All(Vec::new()),
         }
