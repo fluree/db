@@ -733,7 +733,7 @@ impl R2rmlScanOperator {
         if join_vars.is_empty() {
             return JoinPlan::Cross;
         }
-        let store = ctx.binary_store.as_deref();
+        let dicts = crate::object_binding::TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let gv = gv.as_ref();
 
@@ -751,7 +751,7 @@ impl R2rmlScanOperator {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(binding_to_group_key_normalized(b, store, gv)));
+                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1726,7 +1726,7 @@ fn emit_produced_window(
             full_index,
             partial_rows,
         } => {
-            let store = ctx.binary_store.as_deref();
+            let dicts = crate::object_binding::TermDicts::of(ctx);
             let gv = ctx.graph_view();
             let gv = gv.as_ref();
             for prod in produced {
@@ -1737,7 +1737,7 @@ fn emit_produced_window(
                     .filter_map(|jv| {
                         prod.iter()
                             .find(|(v, _)| v == jv)
-                            .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
+                            .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
                     })
                     .collect();
                 if pkey.len() != join_vars.len() {

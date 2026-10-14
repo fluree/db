@@ -274,7 +274,7 @@ impl NsVecBiDict {
 
     /// Reverse lookup: find sid64 by `(ns_code, suffix)`.
     pub fn find_subject(&self, ns_code: u16, suffix: &str) -> Option<u64> {
-        self.find_by_key(&lookup_key(ns_code, suffix))
+        with_lookup_key(ns_code, suffix, |key| self.find_by_key(key))
     }
 
     /// The local_id the next allocation in `ns_code` would take, following
@@ -422,6 +422,23 @@ pub fn lookup_key(ns_code: u16, suffix: &str) -> Vec<u8> {
     key.extend_from_slice(&ns_code.to_be_bytes());
     key.extend_from_slice(suffix.as_bytes());
     key
+}
+
+/// Run `probe` over the [`lookup_key`] of `(ns_code, suffix)`, encoded on the
+/// stack when it fits, so a reverse lookup does not allocate. Query-time
+/// equality surfaces probe the novelty dictionary once per decoded subject
+/// the persisted dictionary does not hold.
+#[inline]
+pub fn with_lookup_key<R>(ns_code: u16, suffix: &str, probe: impl FnOnce(&[u8]) -> R) -> R {
+    const INLINE: usize = 192;
+    let len = 2 + suffix.len();
+    if len > INLINE {
+        return probe(&lookup_key(ns_code, suffix));
+    }
+    let mut buf = [0u8; INLINE];
+    buf[..2].copy_from_slice(&ns_code.to_be_bytes());
+    buf[2..len].copy_from_slice(suffix.as_bytes());
+    probe(&buf[..len])
 }
 
 // ===========================================================================
