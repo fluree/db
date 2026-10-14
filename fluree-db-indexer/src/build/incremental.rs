@@ -5084,6 +5084,48 @@ mod warm_tests {
         }
     }
 
+    /// A fresh branch materializes only facts whose window ends asserted;
+    /// a fact asserted then retracted leaves its two transitions in the
+    /// sidecar and no row.
+    #[test]
+    fn fresh_branch_writes_no_row_for_a_retracted_fact() {
+        let config = IndexerConfig::small();
+        // Net ops: s=2 asserted at t=2; s=4 retracted at t=3, after its
+        // superseded assert at t=2.
+        let records = [record(2, 2), record(4, 3)];
+        let superseded = [record(4, 2)];
+        let fresh = build_fresh_branch_v3(
+            &records,
+            &[1, 0],
+            &superseded,
+            &[1],
+            RunSortOrder::Spot,
+            0,
+            &config,
+        )
+        .expect("fresh branch");
+        let rows: u64 = fresh.leaf_entries.iter().map(|e| e.row_count).sum();
+        assert_eq!(rows, 1, "only the asserted fact is a row");
+        let sidecars = fresh
+            .new_leaf_blobs
+            .iter()
+            .filter(|b| b.info.sidecar_bytes.is_some())
+            .count();
+        assert_eq!(sidecars, 1, "the retracted fact's history is kept");
+
+        // A superseded event with no winner is lost history: refuse.
+        let stranded = build_fresh_branch_v3(
+            &records[..1],
+            &[1],
+            &superseded,
+            &[1],
+            RunSortOrder::Spot,
+            0,
+            &config,
+        );
+        assert!(stranded.is_err(), "a stranded superseded event must fail");
+    }
+
     fn cache_leaflet(
         cache: &LeafletCache,
         leaf_cid: &ContentId,
