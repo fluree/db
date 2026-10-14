@@ -8,8 +8,10 @@
 //! again, while what is kept stays inside the cache's one budget and is
 //! evicted with everything else.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -25,44 +27,158 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FLUREE_ENCRYPTED_SEGMENT_CACHE").map_or(true, |v| v != "0"))
 }
 
+/// Units one open [`UnitMemoScope`] keeps on its thread.
+const MEMO_UNITS: usize = 8;
+
+thread_local! {
+    static MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MEMO: RefCell<Memo> = const {
+        RefCell::new(Memo {
+            depth: 0,
+            slots: Vec::new(),
+            next: 0,
+        })
+    };
+}
+
+/// The units served on this thread while a scope is open, most recent
+/// overwriting the oldest.
+struct Memo {
+    depth: u32,
+    slots: Vec<(SourceUnitKey, Arc<[u8]>)>,
+    next: usize,
+}
+
+/// While open, the units this thread reads through [`CachedUnits`] are kept
+/// beside the shared cache, so a run of lookups landing in the same few
+/// units — formatting a batch of rows, whose ids mostly ascend — takes them
+/// from here rather than asking the cache each time. Each unit is still
+/// read through the cache the first time the scope meets it.
+///
+/// At most `MEMO_UNITS` units are held per open scope, and they are
+/// released when the outermost scope on the thread closes. Not `Send`, so a
+/// scope cannot be held across an await that may resume on another thread.
+pub struct UnitMemoScope {
+    _thread_bound: PhantomData<*const ()>,
+}
+
+impl UnitMemoScope {
+    pub fn enter() -> Self {
+        MEMO.with(|m| m.borrow_mut().depth += 1);
+        Self {
+            _thread_bound: PhantomData,
+        }
+    }
+}
+
+impl Drop for UnitMemoScope {
+    fn drop(&mut self) {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            m.depth -= 1;
+            if m.depth == 0 {
+                m.slots.clear();
+                m.next = 0;
+            }
+        });
+    }
+}
+
+/// Units this thread has taken from a scope's memo, for diagnostics.
+pub fn unit_memo_hits() -> u64 {
+    MEMO_HITS.with(std::cell::Cell::get)
+}
+
+fn memo_get(key: &SourceUnitKey) -> Option<Arc<[u8]>> {
+    let hit = MEMO.with(|m| {
+        let m = m.borrow();
+        if m.depth == 0 {
+            return None;
+        }
+        m.slots
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, unit)| Arc::clone(unit))
+    });
+    if hit.is_some() {
+        MEMO_HITS.with(|h| h.set(h.get() + 1));
+    }
+    hit
+}
+
+fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.depth == 0 {
+            return;
+        }
+        let entry = (key, Arc::clone(unit));
+        if m.slots.len() < MEMO_UNITS {
+            m.slots.push(entry);
+        } else {
+            let at = m.next;
+            m.slots[at] = entry;
+            m.next = (at + 1) % MEMO_UNITS;
+        }
+    });
+}
+
 /// `source` with its read units kept in `cache`, keyed by the source's
 /// identity, so only readers of the same storage and the same envelope
 /// share them.
 pub struct CachedUnits {
     source: Arc<dyn RangeSource>,
     cache: Arc<LeafletCache>,
+    // The source's constants, read once rather than per unit.
+    identity: u128,
+    unit_size: u64,
+    len: u64,
 }
 
 impl CachedUnits {
     pub fn new(source: Arc<dyn RangeSource>, cache: Arc<LeafletCache>) -> Self {
-        Self { source, cache }
+        Self {
+            identity: source.cache_identity(),
+            unit_size: source.read_unit(),
+            len: source.len(),
+            source,
+            cache,
+        }
     }
 
-    /// Unit `index`'s bytes, from the cache or read once from the source.
+    /// Unit `index`'s bytes, from the scope's memo, the cache, or read once
+    /// from the source.
     fn unit(&self, index: u64) -> io::Result<Arc<[u8]>> {
-        let size = self.source.read_unit();
-        let start = index * size;
-        let expected = size.min(self.source.len().saturating_sub(start)) as usize;
-        self.cache.try_get_or_load_source_unit(
-            SourceUnitKey {
-                source: self.source.cache_identity(),
-                unit: index,
-            },
-            || {
-                let bytes = self
-                    .source
-                    .read_range(start..start + size)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                if bytes.len() != expected {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "read unit shorter than the source declares",
-                    ));
-                }
-                fluree_db_core::io_stats::record_work("source unit cached", bytes.len());
-                Ok(Arc::from(bytes))
-            },
-        )
+        let key = SourceUnitKey {
+            source: self.identity,
+            unit: index,
+        };
+        if let Some(unit) = memo_get(&key) {
+            return Ok(unit);
+        }
+        let unit = self.load_unit(key)?;
+        memo_put(key, &unit);
+        Ok(unit)
+    }
+
+    fn load_unit(&self, key: SourceUnitKey) -> io::Result<Arc<[u8]>> {
+        let size = self.unit_size;
+        let start = key.unit * size;
+        let expected = size.min(self.len.saturating_sub(start)) as usize;
+        self.cache.try_get_or_load_source_unit(key, || {
+            let bytes = self
+                .source
+                .read_range(start..start + size)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            if bytes.len() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read unit shorter than the source declares",
+                ));
+            }
+            fluree_db_core::io_stats::record_work("source unit cached", bytes.len());
+            Ok(Arc::from(bytes))
+        })
     }
 
     /// Append the bytes of `range`, clamped to the source, to `out`. A
@@ -72,7 +188,7 @@ impl CachedUnits {
         if range.start >= range.end {
             return Ok(());
         }
-        let len = self.source.len();
+        let len = self.len;
         let (start, end) = (range.start.min(len), range.end.min(len));
         if start >= end {
             // Nothing to copy, but the source vouches for where its end is.
@@ -81,7 +197,7 @@ impl CachedUnits {
                 .map_err(|e| io::Error::other(e.to_string()))?;
             return Ok(());
         }
-        let size = self.source.read_unit();
+        let size = self.unit_size;
         out.reserve((end - start) as usize);
         for index in start / size..=(end - 1) / size {
             let unit = self.unit(index)?;
@@ -266,6 +382,72 @@ mod tests {
         assert_eq!(source.reads(), 2);
         source.fail.store(false, Ordering::SeqCst);
         assert_eq!(units.read_range(0..3).unwrap(), [0, 1, 2]);
+    }
+
+    /// Inside a scope, units served once come from the thread's memo, even
+    /// after the shared cache drops them; when the outermost scope closes
+    /// the memo is released and reads go back to the cache and the source.
+    #[test]
+    fn a_scope_keeps_its_units_until_the_outermost_scope_closes() {
+        let cache = Arc::new(LeafletCache::with_max_mb(4));
+        let source = Source::new(4_000, 1);
+        let units = cached(&source, &cache);
+        {
+            let _outer = UnitMemoScope::enter();
+            units.read_range(10..20).unwrap();
+            {
+                let _inner = UnitMemoScope::enter();
+                units.read_range(1_010..1_020).unwrap();
+            }
+            cache.invalidate_all();
+            assert_eq!(units.read_range(15..25).unwrap(), source.bytes[15..25]);
+            assert_eq!(
+                units.read_range(1_500..1_501).unwrap(),
+                source.bytes[1_500..1_501]
+            );
+            assert_eq!(source.reads(), 2, "served from the memo");
+        }
+        cache.invalidate_all();
+        units.read_range(15..25).unwrap();
+        assert_eq!(source.reads(), 3, "released with the scope");
+        cache.invalidate_all();
+        let _next = UnitMemoScope::enter();
+        units.read_range(1_010..1_020).unwrap();
+        assert_eq!(source.reads(), 4, "a later scope starts empty");
+    }
+
+    /// Without a scope nothing is memoized; a scope holds a bounded number
+    /// of units, oldest replaced first, and never mixes identities.
+    #[test]
+    fn the_memo_is_bounded_and_scoped() {
+        let cache = Arc::new(LeafletCache::with_max_mb(4));
+        let source = Source::new(20_000, 1);
+        let units = cached(&source, &cache);
+        units.read_range(0..1).unwrap();
+        cache.invalidate_all();
+        units.read_range(0..1).unwrap();
+        assert_eq!(source.reads(), 2, "no scope, no memo");
+
+        let _scope = UnitMemoScope::enter();
+        for unit in 0..=MEMO_UNITS as u64 {
+            units.read_range(unit * 1000..unit * 1000 + 1).unwrap();
+        }
+        cache.invalidate_all();
+        let reads = source.reads();
+        units
+            .read_range(MEMO_UNITS as u64 * 1000..MEMO_UNITS as u64 * 1000 + 1)
+            .unwrap();
+        assert_eq!(source.reads(), reads, "the newest unit is held");
+        units.read_range(0..1).unwrap();
+        assert_eq!(source.reads(), reads + 1, "the oldest was replaced");
+
+        let other = Source::new(20_000, 2);
+        cached(&other, &cache).read_range(3000..3001).unwrap();
+        assert_eq!(
+            other.reads(),
+            1,
+            "another identity is not served from the memo"
+        );
     }
 
     /// An end-of-object answer comes from the source, which authenticates

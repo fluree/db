@@ -400,12 +400,20 @@ async fn encrypted_file_reads_leaves_and_packs_by_range() {
             "select": ["?s", "?name"],
             "where": {"@id": "?s", "ex:name": "?name"}
         });
-        let rows = support::query_jsonld(&fluree, &ledger, &query)
+        let result = support::query_jsonld(&fluree, &ledger, &query)
             .await
-            .expect("query")
+            .expect("query");
+        let memo_hits = fluree_db_binary_index::unit_memo_hits();
+        let rows = result
             .to_jsonld_async(ledger.as_graph_db_ref(0))
             .await
             .expect("to_jsonld");
+        if encrypted {
+            assert!(
+                fluree_db_binary_index::unit_memo_hits() > memo_hits,
+                "formatting rows in order reuses the dictionary units it reads"
+            );
+        }
         let mut rows: Vec<(String, String)> = rows
             .as_array()
             .expect("rows")

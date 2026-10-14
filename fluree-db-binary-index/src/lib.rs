@@ -22,6 +22,7 @@ pub use read::batched_lookup::{
 };
 pub use read::binary_cursor::BinaryCursor;
 pub use read::binary_index_store::{BinaryGraphView, BinaryIndexStore, RemoteLeafFetch};
+pub use read::cached_units::{unit_memo_hits, UnitMemoScope};
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 pub use read::leaflet_cache::{
     CachedOverlaySegment, LeafletCache, LeafletCacheKey, V3BatchCacheKey,
