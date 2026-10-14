@@ -410,6 +410,18 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
     )
 }
 
+/// Where a task's novelty goes once its base branch is known.
+enum Phase2Route {
+    DefaultMerge {
+        leaves: Vec<LeafEntry>,
+    },
+    NamedMerge {
+        branch_bytes: Vec<u8>,
+    },
+    /// No base facts in this graph and order: no branch, or one with no leaves.
+    Fresh,
+}
+
 enum Phase2TaskUpdate {
     Default {
         leaf_entries: Vec<LeafEntry>,
@@ -479,8 +491,40 @@ async fn execute_phase2_task(
         .warm_cache_source
         .as_ref()
         .and_then(|s| s.warm_cache());
-    let output = match kind {
-        Phase2TaskKind::DefaultExisting { leaves } => {
+    // A branch with no leaves holds no base facts, exactly like no branch at
+    // all, so it is built fresh too: the merge has no leaf to route its
+    // novelty into.
+    let route = match kind {
+        Phase2TaskKind::DefaultExisting { leaves } if !leaves.is_empty() => {
+            Phase2Route::DefaultMerge { leaves }
+        }
+        Phase2TaskKind::NamedExisting { branch_cid } => {
+            let branch_bytes = fetch_cached_index_bytes(
+                content_store.as_ref(),
+                &branch_cid,
+                &cache_dir,
+                format!("fetch V3 branch g_id={g_id} {order:?}"),
+            )
+            .await?;
+            let manifest =
+                fluree_db_binary_index::format::branch::read_branch_from_bytes(&branch_bytes)
+                    .map_err(|e| {
+                        IndexerError::StorageRead(format!(
+                            "decode V3 branch g_id={g_id} {order:?}: {e}"
+                        ))
+                    })?;
+            if manifest.leaves.is_empty() {
+                Phase2Route::Fresh
+            } else {
+                Phase2Route::NamedMerge { branch_bytes }
+            }
+        }
+        Phase2TaskKind::DefaultExisting { .. }
+        | Phase2TaskKind::DefaultFresh
+        | Phase2TaskKind::NamedFresh => Phase2Route::Fresh,
+    };
+    let output = match route {
+        Phase2Route::DefaultMerge { leaves } => {
             let branch_bytes =
                 fluree_db_binary_index::format::branch::build_branch_bytes(order, g_id, &leaves);
             let (meta, fetch_stats) = run_update_branch(
@@ -512,14 +556,7 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::NamedExisting { branch_cid } => {
-            let branch_bytes = fetch_cached_index_bytes(
-                content_store.as_ref(),
-                &branch_cid,
-                &cache_dir,
-                format!("fetch V3 branch g_id={g_id} {order:?}"),
-            )
-            .await?;
+        Phase2Route::NamedMerge { branch_bytes } => {
             let (meta, fetch_stats) = run_update_branch(
                 branch_bytes,
                 sorted_records,
@@ -559,7 +596,7 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::DefaultFresh | Phase2TaskKind::NamedFresh => {
+        Phase2Route::Fresh => {
             let fresh = build_fresh_branch_v3(
                 &sorted_records,
                 &sorted_ops,
@@ -723,6 +760,10 @@ pub async fn incremental_index(
     );
 
     // ---- Phase 2: Per-(graph, order) branch updates ----
+    check_order_sets(
+        &novelty.base_root.default_graph_orders,
+        &novelty.base_root.named_graphs,
+    )?;
     let all_orders = [
         RunSortOrder::Spot,
         RunSortOrder::Psot,
@@ -4716,6 +4757,42 @@ async fn upload_leaf_blobs(
     Ok(())
 }
 
+/// Refuse a base root in which a graph has some of the four orders but not
+/// all of them.
+///
+/// Every writer builds a graph's four orders from one fact set, so a graph has
+/// all of them or none. A missing order would take the fresh path here and be
+/// built from this window's novelty alone, without the graph's base facts.
+/// Aborting falls back to a full rebuild, which builds every order from the
+/// commits.
+fn check_order_sets(
+    default_graph_orders: &[fluree_db_binary_index::format::index_root::DefaultGraphOrder],
+    named_graphs: &[fluree_db_binary_index::format::index_root::NamedGraphRouting],
+) -> Result<()> {
+    let mut all = RunSortOrder::all_build_orders().to_vec();
+    all.sort_unstable();
+    let complete = |mut orders: Vec<RunSortOrder>| {
+        orders.sort_unstable();
+        orders.dedup();
+        orders.is_empty() || orders == all
+    };
+    let default_orders = default_graph_orders.iter().map(|o| o.order).collect();
+    let partial = if complete(default_orders) {
+        named_graphs
+            .iter()
+            .find(|ng| !complete(ng.orders.iter().map(|(o, _)| *o).collect()))
+            .map(|ng| ng.g_id)
+    } else {
+        Some(0)
+    };
+    match partial {
+        Some(g_id) => Err(IndexerError::IncrementalAbort(format!(
+            "base root has some but not all sort orders for graph {g_id}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Build a fresh V3 branch from pure novelty, for a graph (default or
 /// named) or order that has no branch in the base root.
 ///
@@ -5145,6 +5222,104 @@ mod warm_tests {
                 matches!(output.update, Phase2TaskUpdate::Unchanged),
                 "g_id={g_id}: an empty fresh branch must not be published"
             );
+        }
+    }
+
+    /// A branch with no leaves holds no base facts, so its novelty is built
+    /// fresh, for the default graph and for a named graph alike.
+    #[tokio::test]
+    async fn leafless_branch_is_built_fresh() {
+        use fluree_db_binary_index::format::branch::{build_branch_bytes, read_branch_from_bytes};
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let store: Arc<dyn fluree_db_core::storage::ContentStore> =
+            Arc::new(fluree_db_core::storage::content_store_for(
+                fluree_db_core::MemoryStorage::new(),
+                "test/leafless:main",
+            ));
+        let leafless = build_branch_bytes(RunSortOrder::Spot, 3, &[]);
+        let leafless_cid = store
+            .put(ContentKind::IndexBranch, &leafless)
+            .await
+            .expect("put leafless branch");
+        let kinds = [
+            (0, Phase2TaskKind::DefaultExisting { leaves: Vec::new() }),
+            (
+                3,
+                Phase2TaskKind::NamedExisting {
+                    branch_cid: leafless_cid,
+                },
+            ),
+        ];
+        for (g_id, kind) in kinds {
+            let task = Phase2Task {
+                seq: 0,
+                g_id,
+                order: RunSortOrder::Spot,
+                sorted_records: vec![record(2, 2)],
+                sorted_ops: vec![1],
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                kind,
+            };
+            let output = execute_phase2_task(
+                task,
+                &IndexerConfig::small(),
+                Arc::clone(&store),
+                fluree_db_core::tracking::Tracker::disabled(),
+                Arc::new(Semaphore::new(4)),
+                4,
+                cache_dir.path().to_path_buf(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("g_id={g_id}: {e}"));
+            let rows: u64 = match output.update {
+                Phase2TaskUpdate::Default { leaf_entries } => {
+                    leaf_entries.iter().map(|e| e.row_count).sum()
+                }
+                Phase2TaskUpdate::Named { branch_cid } => {
+                    let bytes = store.get(&branch_cid).await.expect("new branch");
+                    read_branch_from_bytes(&bytes)
+                        .expect("decode branch")
+                        .leaves
+                        .iter()
+                        .map(|e| e.row_count)
+                        .sum()
+                }
+                Phase2TaskUpdate::Unchanged => 0,
+            };
+            assert_eq!(rows, 1, "g_id={g_id}: the asserted fact must land");
+        }
+    }
+
+    /// Every graph in a base root has all four orders or none.
+    #[test]
+    fn partial_order_root_is_refused() {
+        use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
+        let default = |orders: &[RunSortOrder]| -> Vec<DefaultGraphOrder> {
+            orders
+                .iter()
+                .map(|&order| DefaultGraphOrder {
+                    order,
+                    leaves: Vec::new(),
+                })
+                .collect()
+        };
+        let branch = ContentId::new(ContentKind::IndexBranch, b"branch");
+        let named = |orders: &[RunSortOrder]| NamedGraphRouting {
+            g_id: 3,
+            orders: orders.iter().map(|&o| (o, branch.clone())).collect(),
+        };
+        let all = RunSortOrder::all_build_orders();
+        let some = &all[..2];
+
+        assert!(check_order_sets(&[], &[]).is_ok());
+        assert!(check_order_sets(&default(all), &[named(all)]).is_ok());
+        for (defaults, named_graphs) in [(default(some), vec![]), (default(all), vec![named(some)])]
+        {
+            assert!(matches!(
+                check_order_sets(&defaults, &named_graphs),
+                Err(IndexerError::IncrementalAbort(_))
+            ));
         }
     }
 

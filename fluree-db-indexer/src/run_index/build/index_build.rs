@@ -278,7 +278,14 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
     }
 
     let result = writer.finish()?;
-    let graph_results = vec![result];
+    // A graph whose log nets to no row and no history (only retractions of
+    // facts never asserted) has nothing to index: publish no branch for it, as
+    // for a graph with no records at all.
+    let graph_results = if result.leaf_infos.is_empty() {
+        Vec::new()
+    } else {
+        vec![result]
+    };
 
     // Reclaim the cascade's final-pass intermediates (a full zstd copy of
     // this order) now that the merge has consumed them, instead of carrying
@@ -1139,6 +1146,50 @@ mod tests {
             vec![(10, 1, 1), (10, 2, 0)],
             "transitions preceding a row are recorded; the surviving row \
              carries its own assert and the never-asserted retract leaves none"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A graph whose log is only retractions of facts never asserted has no
+    /// row and no history, so the build publishes no branch for it.
+    #[test]
+    fn build_publishes_no_branch_for_a_graph_with_nothing_to_hold() {
+        let dir = std::env::temp_dir().join("fluree_test_build_v2_nothing_to_hold");
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_dir = dir.join("runs");
+        let index_dir = dir.join("index");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let records = vec![make_rec(0, 20, 1, OType::XSD_INTEGER.as_u16(), 200, 3)];
+        crate::run_index::runs::run_file::write_run_file_with_op(
+            &run_dir.join("run_00000.frn"),
+            &records,
+            &[0],
+            RunSortOrder::Spot,
+            3,
+            3,
+        )
+        .unwrap();
+
+        let config = IndexBuildConfig {
+            run_dir,
+            index_dir,
+            sort_order: RunSortOrder::Spot,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 1000,
+            zstd_level: 1,
+            import_unique_asserts: false,
+            skip_history: false,
+            g_id: 0,
+            progress: None,
+            fan_in_cap: usize::MAX,
+        };
+        let result = build_index(&config).unwrap();
+        assert_eq!(result.total_rows, 0);
+        assert!(
+            result.graphs.is_empty(),
+            "a graph with no leaves must not be published"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
