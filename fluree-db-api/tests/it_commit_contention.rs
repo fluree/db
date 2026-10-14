@@ -94,3 +94,28 @@ async fn a_transaction_that_loses_every_race_is_commit_contention() {
     let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
     assert_eq!(handle.t().await, 1, "nothing was committed");
 }
+
+/// The tracked write path answers a lost commit race with the status the
+/// error carries, not a 500 of its own.
+#[tokio::test]
+async fn a_tracked_write_that_loses_its_race_keeps_the_conflict_status() {
+    let fluree = contended().await;
+    let mut txn = json!({
+        "ledger": LEDGER,
+        "@context": { "ex": "http://example.org/" },
+        "insert": person("bob")
+    });
+    txn["insert"]
+        .as_object_mut()
+        .expect("object")
+        .remove("@context");
+
+    let err = fluree
+        .update_with_ledger_tracked(&txn)
+        .await
+        .expect_err("the commit loses its race");
+
+    assert_eq!(err.status_code(), 409, "{err}");
+    let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
+    assert_eq!(handle.t().await, 1, "nothing was committed");
+}
