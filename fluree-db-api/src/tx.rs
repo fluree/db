@@ -3144,7 +3144,7 @@ impl crate::Fluree {
                 input.txn_opts,
                 &mut ns_registry,
             )
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
+            .map_err(|e| TrackedErrorResponse::from_api(e, tracker.tally()))?
         };
 
         // Extract txn_meta and the sync target before staging consumes the Txn.
@@ -3176,9 +3176,7 @@ impl crate::Fluree {
                 input.txn_json.get("@context"),
             )
             .await
-            // The 400 is preserved as-is: correcting the status for novelty
-            // backpressure is a separate concern from noticing it.
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+            .map_err(|e| TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         Ok(StageResult {
             view: staged.view,
@@ -3225,7 +3223,7 @@ impl crate::Fluree {
         let result = self
             .commit_stage_result(staged, txn_type, commit_opts, index_config)
             .await
-            .map_err(|e| TrackedErrorResponse::new(500, e.to_string(), tracker.tally()))?;
+            .map_err(|e| TrackedErrorResponse::from_api(e, tracker.tally()))?;
         Ok((result, tracker.tally()))
     }
 
