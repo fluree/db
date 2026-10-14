@@ -402,13 +402,9 @@ mod inner {
                     // The decode path uses the property's datatype to select
                     // DecodeKind::F64, which would reinterpret integer-encoded
                     // bits as IEEE 754 floats, producing garbage. (fluree/db-r#142)
-                    match ObjKey::encode_f64(*v) {
-                        Ok(key) => (ObjKind::NUM_F64.as_u8(), key.as_u64()),
-                        Err(_) => {
-                            let id = self.assign_string_id(&v.to_string());
-                            (ObjKind::LEX_ID.as_u8(), ObjKey::encode_u32_id(id).as_u64())
-                        }
-                    }
+                    // Every double, ±INF and NaN included, is stored as the
+                    // number it is, as the transaction path stores it.
+                    (ObjKind::NUM_F64.as_u8(), ObjKey::encode_f64(*v).as_u64())
                 }
                 FlakeValue::Boolean(b) => (ObjKind::BOOL.as_u8(), ObjKey::encode_bool(*b).as_u64()),
                 FlakeValue::Null => (ObjKind::NULL.as_u8(), 0),

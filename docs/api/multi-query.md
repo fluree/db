@@ -509,6 +509,10 @@ Response (HTTP 200):
 }
 ```
 
+A sub-query that fails, in either language, is reported in `errors` like
+this, whether it does not parse or fails while it runs, and the other
+sub-queries still run.
+
 ---
 
 ## Limitations

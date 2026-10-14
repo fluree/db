@@ -1954,7 +1954,7 @@ mod tests {
                 1,
                 4,
                 ObjKind::NUM_F64,
-                ObjKey::encode_f64(3.125).unwrap().as_u64(),
+                ObjKey::encode_f64(3.125).as_u64(),
                 1,
             ),
             make_record(1, 5, ObjKind::BOOL, ObjKey::encode_bool(true).as_u64(), 1),

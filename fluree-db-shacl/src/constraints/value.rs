@@ -5,10 +5,11 @@ use fluree_db_core::FlakeValue;
 
 /// Value equality for sh:hasValue / sh:in: numeric literals compare by value
 /// across representations (1 == 1.0 == 1.00), everything else by term equality.
+///
+/// This is `FlakeValue`'s own equality, under which a NaN equals a NaN: the
+/// constraints test membership of a term, and NaN has one lexical form. (The
+/// SPARQL `=` operator, by contrast, is false for NaN.)
 fn values_equal(a: &FlakeValue, b: &FlakeValue) -> bool {
-    if a.is_numeric() && b.is_numeric() {
-        return a.numeric_cmp(b) == Some(std::cmp::Ordering::Equal);
-    }
     a == b
 }
 
@@ -184,6 +185,28 @@ mod tests {
             FlakeValue::Long(3),
         ];
         assert!(validate_in(&value, &allowed).is_none());
+    }
+
+    #[test]
+    fn test_special_doubles_as_terms_and_against_ranges() {
+        let nan = FlakeValue::Double(f64::NAN);
+        let inf = FlakeValue::Double(f64::INFINITY);
+        // sh:hasValue / sh:in test membership of a term: NaN is one term.
+        assert!(validate_has_value(std::slice::from_ref(&nan), &nan).is_none());
+        assert!(validate_in(&nan, &[FlakeValue::Long(1), nan.clone()]).is_none());
+        assert!(validate_in(&inf, std::slice::from_ref(&inf)).is_none());
+        assert!(validate_in(&nan, &[FlakeValue::Long(1)]).is_some());
+        // Range facets are SPARQL comparisons, which are false for NaN
+        // (SHACL 1.0 §4.4), so NaN violates every one of them.
+        assert!(validate_min_inclusive(&nan, &FlakeValue::Long(0)).is_some());
+        assert!(validate_max_inclusive(&nan, &FlakeValue::Long(0)).is_some());
+        assert!(validate_min_exclusive(&nan, &FlakeValue::Long(0)).is_some());
+        assert!(validate_max_exclusive(&nan, &FlakeValue::Long(0)).is_some());
+        // INF is above every number, -INF below.
+        assert!(validate_min_inclusive(&inf, &FlakeValue::Long(0)).is_none());
+        assert!(validate_max_inclusive(&inf, &FlakeValue::Long(0)).is_some());
+        let ninf = FlakeValue::Double(f64::NEG_INFINITY);
+        assert!(validate_max_exclusive(&ninf, &FlakeValue::Long(0)).is_none());
     }
 
     #[test]
