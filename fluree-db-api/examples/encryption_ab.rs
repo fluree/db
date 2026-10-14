@@ -14,9 +14,10 @@
 //!     query --dir /data/v2 --encrypted --variant v2 --out v2.jsonl --cache-mb 4096
 //! ```
 //!
-//! The envelope new writes use and whether encrypted packs are paged come
-//! from the experiment environment (`FLUREE_ENCRYPTION_ENVELOPE`,
-//! `FLUREE_ENCRYPTED_PAGED_PACKS`). Builds without the counter API (the
+//! The envelope new writes use, how encrypted packs are held and the
+//! dictionary allowance come from the experiment environment
+//! (`FLUREE_ENCRYPTION_ENVELOPE`, `FLUREE_ENCRYPTED_PACKS`,
+//! `FLUREE_DICT_ALLOWANCE_MB`). Builds without the counter API (the
 //! baseline branch) compile with `--cfg no_counters`.
 
 #![allow(unexpected_cfgs)]
@@ -237,7 +238,45 @@ fn workloads(n: u64) -> Vec<Workload> {
                 q("SELECT ?s ?c WHERE { ?s ex:city ?c } LIMIT 2000".into()),
             ],
         },
+        // Dictionary working sets, for `--plan`: names and bios of subjects
+        // drawn from one fifth of the id space (a, b), or from all of it.
+        Workload {
+            name: "sub_a",
+            queries: values_queries(&prefix, n / 10..n * 3 / 10, 11),
+        },
+        Workload {
+            name: "sub_b",
+            queries: values_queries(&prefix, n * 11 / 20..n * 15 / 20, 12),
+        },
+        Workload {
+            name: "scatter",
+            queries: values_queries(&prefix, 0..n, 13),
+        },
+        Workload {
+            name: "dense",
+            queries: vec![q("SELECT ?s ?b WHERE { ?s ex:age 3 ; ex:bio ?b }".into())],
+        },
     ]
+}
+
+/// Twenty queries each formatting the name and bio of 250 subjects drawn
+/// from `range`.
+fn values_queries(prefix: &str, range: std::ops::Range<u64>, salt: u64) -> Vec<String> {
+    let span = range.end - range.start;
+    (0..20u64)
+        .map(|k| {
+            let ids: Vec<String> = (0..250u64)
+                .map(|j| {
+                    let x = (k * 250 + j + salt * 1_000_003).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    format!("p:{}", range.start + (x >> 11) % span)
+                })
+                .collect();
+            format!(
+                "{prefix}SELECT ?s ?n ?b WHERE {{ VALUES ?s {{ {} }} ?s ex:name ?n ; ex:bio ?b }}",
+                ids.join(" ")
+            )
+        })
+        .collect()
 }
 
 /// Order-insensitive digest and row count of a formatted SPARQL result.
@@ -285,6 +324,21 @@ fn occupancy(fluree: &fluree_db_api::Fluree) -> Value {
 
 #[cfg(no_counters)]
 fn occupancy(_fluree: &fluree_db_api::Fluree) -> Value {
+    Value::Null
+}
+
+#[cfg(not(no_counters))]
+fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
+    let s = fluree.leaflet_cache().dictionary_allowance().stats();
+    json!({
+        "capacity": (s.capacity != u64::MAX).then_some(s.capacity), "used": s.used,
+        "packs": s.packs, "admitted": s.admitted, "declined": s.declined,
+        "shared": s.shared, "released": s.released,
+    })
+}
+
+#[cfg(no_counters)]
+fn allowance(_fluree: &fluree_db_api::Fluree) -> Value {
     Value::Null
 }
 
@@ -347,6 +401,9 @@ fn cgroup() -> Value {
         "pgfault": stat_of("pgfault"),
         "pgmajfault": stat_of("pgmajfault"),
         "workingset_refault_file": stat_of("workingset_refault_file"),
+        "oom_kill": std::fs::read_to_string(format!("{dir}/memory.events"))
+            .ok()
+            .and_then(|e| e.lines().find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse::<u64>().ok())),
     })
 }
 
@@ -363,6 +420,16 @@ async fn query(args: &[String]) {
     let snapshots = arg(args, "--snapshots").unwrap_or_else(|| "pass".into());
     let only: Option<Vec<String>> =
         arg(args, "--workloads").map(|v| v.split(',').map(str::to_string).collect());
+    // `--plan sub_a*5,sub_b*5` runs each workload for its passes in turn,
+    // numbering passes across the plan; it replaces `--reps`/`--workloads`.
+    let plan: Option<Vec<(String, usize)>> = arg(args, "--plan").map(|v| {
+        v.split(',')
+            .map(|step| {
+                let (name, passes) = step.split_once('*').unwrap_or((step, "1"));
+                (name.to_string(), passes.parse().expect("--plan passes"))
+            })
+            .collect()
+    });
     let out_path = PathBuf::from(arg(args, "--out").expect("--out"));
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
@@ -385,14 +452,33 @@ async fn query(args: &[String]) {
         "memory": memory(), "work": work(),
     }));
 
-    let workloads: Vec<Workload> = workloads(n)
-        .into_iter()
-        .filter(|w| only.as_ref().is_none_or(|o| o.iter().any(|x| x == w.name)))
-        .collect();
+    let all = workloads(n);
     // Pass 0 meets empty decoded caches; later passes find them warm.
-    for pass in 0..=reps {
+    let passes: Vec<(usize, Vec<&Workload>)> = match &plan {
+        Some(plan) => plan
+            .iter()
+            .flat_map(|(name, k)| {
+                let w = all
+                    .iter()
+                    .find(|w| w.name == name)
+                    .unwrap_or_else(|| panic!("no workload {name}"));
+                std::iter::repeat_n(vec![w], *k)
+            })
+            .enumerate()
+            .collect(),
+        None => (0..=reps)
+            .map(|pass| {
+                let ws = all
+                    .iter()
+                    .filter(|w| only.as_ref().is_none_or(|o| o.iter().any(|x| x == w.name)))
+                    .collect();
+                (pass, ws)
+            })
+            .collect(),
+    };
+    for (pass, workloads) in passes {
         let phase = if pass == 0 { "first" } else { "repeat" };
-        for w in &workloads {
+        for w in workloads {
             for (qi, sparql) in w.queries.iter().enumerate() {
                 let before = work();
                 let t = Instant::now();
@@ -416,6 +502,7 @@ async fn query(args: &[String]) {
                     "type": "workload_snapshot", "variant": variant, "state": state,
                     "pass": pass, "workload": w.name,
                     "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
+                    "allowance": allowance(&fluree),
                 }));
             }
         }
@@ -423,6 +510,7 @@ async fn query(args: &[String]) {
             emit(json!({
                 "type": "snapshot", "variant": variant, "state": state, "pass": pass,
                 "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
+                "allowance": allowance(&fluree),
             }));
         }
     }
