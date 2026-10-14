@@ -331,12 +331,12 @@ fn padding(graph: Option<&str>, tag: &str, count: usize) -> String {
     in_graph(graph, &body)
 }
 
-/// The same window, indexed by the background indexer on its own: no build
-/// is driven here. The insert stays under the soft threshold and the delete
-/// commit crosses it, so one build covers both.
+/// The same window, indexed by the background indexer on its own, with the
+/// production defaults: no build is driven here. A large write keeps the
+/// indexer busy while the insert and the delete commit, so its next build
+/// takes both in one window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn background_indexing_keeps_deleted_facts_deleted() {
-    const MIN_BYTES: usize = 20_000;
     for target in [None, Some(G1)] {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = format!(
@@ -344,38 +344,42 @@ async fn background_indexing_keeps_deleted_facts_deleted() {
             target.map_or("default", |g| &g[g.len() - 2..])
         );
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-            .with_indexing_thresholds(MIN_BYTES, 256 * 1024 * 1024)
             .build()
             .expect("file fluree");
         let ledger = fluree.create_ledger(&id).await.expect("create");
         let ledger = sparql(
             &fluree,
             ledger,
-            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "seed", 1_000)),
+            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "seed", 10)),
         )
         .await;
         wait_for_index_t(&fluree, &id, ledger.t()).await;
         let ledger = fluree.ledger(&id).await.expect("reload");
-
-        let fact = in_graph(target, "ex:s ex:p \"x\"");
-        let ledger = sparql(&fluree, ledger, &format!("INSERT DATA {{ {fact} }}")).await;
-        assert!(
-            ledger.novelty_size() < MIN_BYTES,
-            "the insert alone must not trigger a build"
-        );
-        let t_insert = ledger.t();
         let ledger = sparql(
             &fluree,
             ledger,
-            &format!(
-                "DELETE {{ {fact} }} INSERT {{ {} }} WHERE {{}}",
-                padding(Some(G2), "more", 1_000)
-            ),
+            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "busy", 20_000)),
         )
         .await;
-        assert_eq!(ledger.t(), t_insert + 1);
+
+        let fact = in_graph(target, "ex:s ex:p \"x\"");
+        let ledger = sparql(&fluree, ledger, &format!("INSERT DATA {{ {fact} }}")).await;
+        let t_insert = ledger.t();
+        let ledger = sparql(&fluree, ledger, &format!("DELETE DATA {{ {fact} }}")).await;
         let t_delete = ledger.t();
         drop(ledger);
+        let index_t = fluree
+            .nameservice()
+            .lookup(&id)
+            .await
+            .expect("nameservice lookup")
+            .expect("ledger record")
+            .index_t;
+        assert!(
+            index_t < t_insert,
+            "{id}: the insert was indexed before the delete committed (index_t {index_t}), \
+             so no build covers both"
+        );
         wait_for_index_t(&fluree, &id, t_delete).await;
 
         let from = from_alias(&id, target, None);
