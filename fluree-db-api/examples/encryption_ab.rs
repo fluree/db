@@ -68,18 +68,35 @@ fn knows(i: u64, n: u64) -> [u64; 2] {
     ]
 }
 
-fn write_turtle(path: &Path, n: u64) -> std::io::Result<()> {
+/// Subject `i`'s local name. In an ordered dataset it is zero-padded and
+/// leads its name and bio, so dictionary order — lexicographic — follows
+/// `i`, and a range of subjects is a contiguous slice of each dictionary.
+fn pid(i: u64, ordered: bool) -> String {
+    if ordered {
+        format!("{i:08}")
+    } else {
+        i.to_string()
+    }
+}
+
+fn write_turtle(path: &Path, n: u64, ordered: bool) -> std::io::Result<()> {
     let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     writeln!(out, "@prefix ex: <{EX}> .")?;
     writeln!(out, "@prefix p: <{EX}person/> .")?;
     for i in 0..n {
-        let [a, b] = knows(i, n);
+        let [a, b] = knows(i, n).map(|k| pid(k, ordered));
+        let id = pid(i, ordered);
         let w = word(i);
+        let lead = if ordered {
+            format!("{id}: ")
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "p:{i} a ex:Person ; ex:name \"Person {i} {w}\" ; ex:age {} ; \
+            "p:{id} a ex:Person ; ex:name \"Person {id} {w}\" ; ex:age {} ; \
              ex:city \"City {}\" ; ex:knows p:{a} , p:{b} ; \
-             ex:bio \"{w} lives in city {} and was born in year {}; \
+             ex:bio \"{lead}{w} lives in city {} and was born in year {}; \
              profile {i} of the synthetic people graph for {w}.\" .",
             i * 7 % 100,
             i % 1000,
@@ -108,10 +125,11 @@ async fn import(args: &[String]) {
     let dir = PathBuf::from(arg(args, "--dir").expect("--dir"));
     let n: u64 = arg(args, "--subjects").map_or(1_500_000, |v| v.parse().unwrap());
     let encrypted = flag(args, "--encrypted");
+    let ordered = flag(args, "--ordered");
     std::fs::create_dir_all(&dir).unwrap();
     let ttl = dir.with_extension("ttl");
     let started = Instant::now();
-    write_turtle(&ttl, n).unwrap();
+    write_turtle(&ttl, n, ordered).unwrap();
     let generate_ms = started.elapsed().as_millis();
 
     let fluree = open(&dir.join("db"), encrypted, None).await;
@@ -128,6 +146,7 @@ async fn import(args: &[String]) {
     let bytes: u64 = walk(&dir.join("db")).iter().map(|(_, len)| len).sum();
     let meta = json!({
         "subjects": n,
+        "ordered": ordered,
         "encrypted": encrypted,
         "envelope": std::env::var("FLUREE_ENCRYPTION_ENVELOPE").unwrap_or_default(),
         "generate_ms": generate_ms,
@@ -163,7 +182,7 @@ struct Workload {
     queries: Vec<String>,
 }
 
-fn workloads(n: u64) -> Vec<Workload> {
+fn workloads(n: u64, ordered: bool) -> Vec<Workload> {
     let prefix = format!("PREFIX ex: <{EX}> PREFIX p: <{EX}person/> ");
     // Spread over the whole id space, seeded so every variant runs the same.
     let pick = |count: u64, salt: u64| -> Vec<u64> {
@@ -177,7 +196,10 @@ fn workloads(n: u64) -> Vec<Workload> {
             name: "point",
             queries: pick(200, 1)
                 .into_iter()
-                .map(|i| q(format!("SELECT ?p ?o WHERE {{ p:{i} ?p ?o }}")))
+                .map(|i| {
+                    let i = pid(i, ordered);
+                    q(format!("SELECT ?p ?o WHERE {{ p:{i} ?p ?o }}"))
+                })
                 .collect(),
         },
         Workload {
@@ -185,6 +207,7 @@ fn workloads(n: u64) -> Vec<Workload> {
             queries: pick(200, 2)
                 .into_iter()
                 .map(|i| {
+                    let i = pid(i, ordered);
                     q(format!(
                         "SELECT ?f ?n WHERE {{ p:{i} ex:knows ?f . ?f ex:name ?n }}"
                     ))
@@ -242,15 +265,15 @@ fn workloads(n: u64) -> Vec<Workload> {
         // drawn from one fifth of the id space (a, b), or from all of it.
         Workload {
             name: "sub_a",
-            queries: values_queries(&prefix, n / 10..n * 3 / 10, 11),
+            queries: values_queries(&prefix, n / 10..n * 3 / 10, 11, ordered),
         },
         Workload {
             name: "sub_b",
-            queries: values_queries(&prefix, n * 11 / 20..n * 15 / 20, 12),
+            queries: values_queries(&prefix, n * 11 / 20..n * 15 / 20, 12, ordered),
         },
         Workload {
             name: "scatter",
-            queries: values_queries(&prefix, 0..n, 13),
+            queries: values_queries(&prefix, 0..n, 13, ordered),
         },
         Workload {
             name: "dense",
@@ -261,14 +284,19 @@ fn workloads(n: u64) -> Vec<Workload> {
 
 /// Twenty queries each formatting the name and bio of 250 subjects drawn
 /// from `range`.
-fn values_queries(prefix: &str, range: std::ops::Range<u64>, salt: u64) -> Vec<String> {
+fn values_queries(
+    prefix: &str,
+    range: std::ops::Range<u64>,
+    salt: u64,
+    ordered: bool,
+) -> Vec<String> {
     let span = range.end - range.start;
     (0..20u64)
         .map(|k| {
             let ids: Vec<String> = (0..250u64)
                 .map(|j| {
                     let x = (k * 250 + j + salt * 1_000_003).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    format!("p:{}", range.start + (x >> 11) % span)
+                    format!("p:{}", pid(range.start + (x >> 11) % span, ordered))
                 })
                 .collect();
             format!(
@@ -434,6 +462,7 @@ async fn query(args: &[String]) {
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
     let n = meta["subjects"].as_u64().unwrap();
+    let ordered = meta["ordered"].as_bool().unwrap_or(false);
     let mut out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -452,7 +481,7 @@ async fn query(args: &[String]) {
         "memory": memory(), "work": work(),
     }));
 
-    let all = workloads(n);
+    let all = workloads(n, ordered);
     // Pass 0 meets empty decoded caches; later passes find them warm.
     let passes: Vec<(usize, Vec<&Workload>)> = match &plan {
         Some(plan) => plan
