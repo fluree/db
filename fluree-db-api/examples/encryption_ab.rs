@@ -545,6 +545,70 @@ async fn query(args: &[String]) {
     }
 }
 
+/// For each query of the `VALUES` workloads: how many subject IRIs it
+/// resolves and how many distinct subject reverse-tree leaves those lookups
+/// route to (no I/O), against the tree's leaf count.
+#[cfg(not(no_counters))]
+async fn probe(args: &[String]) {
+    let dir = PathBuf::from(arg(args, "--dir").expect("--dir"));
+    let encrypted = flag(args, "--encrypted");
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+    let n = meta["subjects"].as_u64().unwrap();
+    let ordered = meta["ordered"].as_bool().unwrap_or(false);
+    let fluree = open(&dir.join("db"), encrypted, Some(256)).await;
+    let snapshot = fluree.graph(ALIAS).load().await.expect("load");
+    let store = snapshot.db().binary_store().expect("indexed").clone();
+    for w in workloads(n, ordered) {
+        if !matches!(w.name, "sub_a" | "sub_b" | "scatter") {
+            continue;
+        }
+        let mut all = Vec::new();
+        for (qi, sparql) in w.queries.iter().enumerate() {
+            let sids: Vec<_> = sparql
+                .split_whitespace()
+                .filter_map(|t| t.strip_prefix("p:").filter(|local| !local.is_empty()))
+                .map(|local| store.encode_iri(&format!("{EX}person/{local}")))
+                .collect();
+            let parts: Vec<(u16, &str)> = sids
+                .iter()
+                .map(|sid| (sid.namespace_code, sid.name.as_ref()))
+                .collect();
+            let (touched, leaves) = store.subject_reverse_leaves_touched(&parts);
+            all.extend(parts.iter().map(|&(ns, s)| (ns, s.to_string())));
+            println!(
+                "{}",
+                json!({"workload": w.name, "q": qi, "keys": parts.len(),
+                       "leaves_touched": touched, "tree_leaves": leaves,
+                       "units": units_touched(&store, &parts)})
+            );
+        }
+        let parts: Vec<(u16, &str)> = all.iter().map(|(ns, s)| (*ns, s.as_str())).collect();
+        let (touched, leaves) = store.subject_reverse_leaves_touched(&parts);
+        println!(
+            "{}",
+            json!({"workload": w.name, "q": "pass", "keys": parts.len(),
+                   "leaves_touched": touched, "tree_leaves": leaves,
+                   "units": units_touched(&store, &parts)})
+        );
+    }
+}
+
+/// Per 64 KiB unit size: units the lookups of `parts` read across the
+/// reverse leaves they touch, against those leaves' units in all.
+#[cfg(not(no_counters))]
+fn units_touched(store: &fluree_db_binary_index::BinaryIndexStore, parts: &[(u16, &str)]) -> Value {
+    [4096usize, 16384, 65536]
+        .into_iter()
+        .map(|unit| {
+            let per_leaf = store.subject_reverse_units_touched(parts, unit).unwrap();
+            let read: usize = per_leaf.iter().map(|(_, n)| n).sum();
+            let whole: usize = per_leaf.iter().map(|(len, _)| len.div_ceil(unit)).sum();
+            json!({"unit": unit, "read": read, "of": whole})
+        })
+        .collect()
+}
+
 /// Encrypt/decrypt throughput of the storage envelope this process writes,
 /// through `EncryptedStorage` over memory storage: whole writes and reads,
 /// and one-segment range reads from the local source when segmented.
@@ -613,6 +677,8 @@ fn main() {
         Some("import") => runtime.block_on(import(&args)),
         Some("query") => runtime.block_on(query(&args)),
         Some("crypto") => runtime.block_on(crypto(&args)),
+        #[cfg(not(no_counters))]
+        Some("probe") => runtime.block_on(probe(&args)),
         _ => eprintln!("usage: encryption_ab import|query|crypto ..."),
     }
 }

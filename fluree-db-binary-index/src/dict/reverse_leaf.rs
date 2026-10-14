@@ -192,6 +192,39 @@ impl<'a> ReverseLeaf<'a> {
         None
     }
 
+    /// [`Self::lookup`], reporting each byte range of the leaf it reads:
+    /// what a lookup reading the leaf by range would need.
+    pub fn lookup_reading(
+        &self,
+        target_key: &[u8],
+        read: &mut impl FnMut(std::ops::Range<usize>),
+    ) -> Option<u64> {
+        if self.entry_count == 0 {
+            return None;
+        }
+        read(0..HEADER_SIZE);
+        let mut lo = 0usize;
+        let mut hi = self.entry_count as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let table_pos = self.offset_table_start + mid * 4;
+            read(table_pos..table_pos + 4);
+            let offset = self.entry_offset(mid);
+            let key_len =
+                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as usize;
+            read(offset..offset + 4 + key_len);
+            match self.key_at(mid).cmp(target_key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    read(offset + 4 + key_len..offset + 12 + key_len);
+                    return Some(self.id_at(mid));
+                }
+            }
+        }
+        None
+    }
+
     /// Return the first key in this leaf (for branch boundary keys).
     pub fn first_key(&self) -> Option<&'a [u8]> {
         if self.entry_count > 0 {
@@ -276,6 +309,34 @@ impl<'a> Iterator for ReverseLeafIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ranges a lookup reports are all it reads: over a copy of the leaf
+    /// with every other byte zeroed it finds the same ids, hits and misses.
+    #[test]
+    fn lookup_reading_reports_every_byte_it_reads() {
+        let entries: Vec<ReverseEntry> = (0..500u64)
+            .map(|i| ReverseEntry {
+                key: format!("key-{:05}", i * 2).into_bytes(),
+                id: i,
+            })
+            .collect();
+        let blob = encode_reverse_leaf(&entries);
+        let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
+        for probe in 0..1001u64 {
+            let key = format!("key-{probe:05}").into_bytes();
+            let mut masked = vec![0u8; blob.len()];
+            let found = leaf.lookup_reading(&key, &mut |range| {
+                masked[range.clone()].copy_from_slice(&blob[range]);
+            });
+            assert_eq!(found, leaf.lookup(&key), "{probe}");
+            let masked = ReverseLeaf::from_bytes(&masked).unwrap();
+            assert_eq!(
+                masked.lookup(&key),
+                found,
+                "{probe} over the reported ranges"
+            );
+        }
+    }
 
     #[test]
     fn test_string_reverse_round_trip() {

@@ -414,6 +414,41 @@ impl DictTreeReader {
         Ok(results)
     }
 
+    /// For lookups of `keys`, per leaf they touch: its length and the
+    /// distinct `unit`-byte units of it the lookups read, as a lookup reading
+    /// the leaf by range would. Loads each touched leaf whole; a diagnostic.
+    pub fn reverse_units_touched<'a, I>(
+        &self,
+        keys: I,
+        unit: usize,
+    ) -> io::Result<Vec<(usize, usize)>>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut keys_by_leaf = vec![Vec::<&[u8]>::new(); self.branch.leaves.len()];
+        for key in keys {
+            if let Some(leaf_idx) = self.branch.find_leaf(key) {
+                keys_by_leaf[leaf_idx].push(key);
+            }
+        }
+        let mut out = Vec::new();
+        for (leaf_idx, keys) in keys_by_leaf.iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let leaf_data = self.load_leaf(&self.branch.leaves[leaf_idx].address)?;
+            let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
+            let mut units = std::collections::BTreeSet::new();
+            for key in keys {
+                leaf.lookup_reading(key, &mut |range| {
+                    units.extend(range.start / unit..=(range.end - 1) / unit);
+                });
+            }
+            out.push((leaf_data.len(), units.len()));
+        }
+        Ok(out)
+    }
+
     /// Range scan: find all entries whose key is in `[start_key, end_key)`.
     ///
     /// Scans across multiple B-tree leaves as needed. Returns `(key_bytes, id)` pairs

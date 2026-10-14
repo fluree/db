@@ -2587,6 +2587,46 @@ impl BinaryIndexStore {
         }
     }
 
+    /// The distinct subject reverse-tree leaves lookups of `parts` route to,
+    /// and the tree's leaf count. Routing only, no I/O: a diagnostic for
+    /// how far batching those lookups could cut leaf loads.
+    pub fn subject_reverse_leaves_touched(&self, parts: &[(u16, &str)]) -> (usize, usize) {
+        let Some(tree) = self.dicts.subject_reverse_tree.as_ref() else {
+            return (0, 0);
+        };
+        let keys: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|&(ns_code, suffix)| {
+                crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+            })
+            .collect();
+        (
+            tree.touched_leaf_addresses(keys.iter().map(Vec::as_slice))
+                .len(),
+            tree.leaf_count(),
+        )
+    }
+
+    /// [`DictTreeReader::reverse_units_touched`] for subject lookups of
+    /// `parts`: per subject reverse leaf touched, its length and the distinct
+    /// `unit`-byte units the lookups read. A diagnostic.
+    pub fn subject_reverse_units_touched(
+        &self,
+        parts: &[(u16, &str)],
+        unit: usize,
+    ) -> io::Result<Vec<(usize, usize)>> {
+        let Some(tree) = self.dicts.subject_reverse_tree.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let keys: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|&(ns_code, suffix)| {
+                crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+            })
+            .collect();
+        tree.reverse_units_touched(keys.iter().map(Vec::as_slice), unit)
+    }
+
     /// [`Self::find_subject_id_by_parts`] for many subjects, reading each
     /// reverse-tree leaf once.
     pub fn find_subject_ids_by_parts(&self, parts: &[(u16, &str)]) -> io::Result<Vec<Option<u64>>> {
