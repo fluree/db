@@ -4,7 +4,7 @@
 //! six-digit form before the ledger is reloaded and after, and a DELETE that
 //! names it as written finds it either way. Every write lane reads its
 //! literals through the same parse, and a query constant does too: it
-//! matches the stored value for equality, and orders by every digit.
+//! compares as the value written with it, for equality and ordering alike.
 
 use crate::support;
 use fluree_db_api::{
@@ -406,116 +406,151 @@ async fn an_identical_reupsert_after_a_reload_keeps_the_temporal() {
 }
 
 /// A constant just past the stored value's microsecond, and the time-of-day
-/// one: XSD orders a stored `DT_US` / `TIME_US` below them.
+/// one: each is held as the stored `DT_US` / `TIME_US`.
 const DT_ABOVE: &str = "2020-01-01T00:00:00.1234569Z";
 const TIME_ABOVE: &str = "12:00:00.1234569";
+/// Constants a microsecond either side of `DT_US`.
+const DT_NEXT: &str = "2020-01-01T00:00:00.123457Z";
+const DT_PREV: &str = "2020-01-01T00:00:00.1234559Z";
 
-/// A constant past the microsecond is matched for equality as the value it
-/// was written as, and ordered by every digit, as XSD orders it: a value
-/// stored at `DT_US` is below `DT_ABOVE`, and so is one at `TIME_US` below
-/// `TIME_ABOVE`. On both surfaces, for a typed literal, a cast and a string,
-/// either way round; in process, reloaded and indexed.
+/// Which of `<`, `<=`, `=`, `>=`, `>` hold for a stored value against a
+/// constant it orders `ord` against.
+fn holds(op: &str, ord: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::*;
+    match op {
+        "<" => ord == Less,
+        "<=" => ord != Greater,
+        "=" => ord == Equal,
+        ">=" => ord != Less,
+        ">" => ord == Greater,
+        _ => unreachable!("{op}"),
+    }
+}
+
+/// The operator `op` reads as with its operands swapped.
+fn mirrored(op: &str) -> &str {
+    match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        other => other,
+    }
+}
+
+const OPS: [&str; 5] = ["<", "<=", "=", ">=", ">"];
+
+/// A `dateTime` or `time` constant past the microsecond is held to it like
+/// every value, for ordering as well as equality, so a stored value is
+/// exactly one of `<`, `=` and `>` it. The value is written as `DT_NS` and
+/// `TIME_NS`, and `>=` that same constant finds it, which is how a client
+/// pages from a timestamp it wrote. On SPARQL as a typed literal, a cast, a
+/// constant on the left, and one bound first through `BIND` or `VALUES`,
+/// which all answer alike; on JSON-LD as a string constant and through
+/// `values`; in process, reloaded and indexed.
 #[tokio::test]
-async fn a_constant_past_the_microsecond_orders_by_every_digit() {
+async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
+    use std::cmp::Ordering::{self, *};
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().to_string();
-    let dt = |lexical: &str| format!("\"{lexical}\"^^xsd:dateTime");
-    let time = |lexical: &str| format!("\"{lexical}\"^^xsd:time");
-    let filter = |f: String| format!("{PFX}ASK {{ ex:s ex:d ?d ; ex:t ?t FILTER({f}) }}");
-    // (check, SPARQL ASK or JSON-LD query, whether ex:s matches)
-    let sparql: Vec<(&str, String, bool)> = vec![
-        ("?d < c", filter(format!("?d < {}", dt(DT_ABOVE))), true),
-        ("?d <= c", filter(format!("?d <= {}", dt(DT_ABOVE))), true),
-        ("?d > c", filter(format!("?d > {}", dt(DT_ABOVE))), false),
-        ("?d >= c", filter(format!("?d >= {}", dt(DT_ABOVE))), false),
-        ("c > ?d", filter(format!("{} > ?d", dt(DT_ABOVE))), true),
-        ("c <= ?d", filter(format!("{} <= ?d", dt(DT_ABOVE))), false),
-        (
-            "?d < cast",
-            filter(format!("?d < xsd:dateTime(\"{DT_ABOVE}\")")),
-            true,
-        ),
-        (
-            "?d >= cast",
-            filter(format!("?d >= xsd:dateTime(\"{DT_ABOVE}\")")),
-            false,
-        ),
-        ("?d < string", filter(format!("?d < \"{DT_ABOVE}\"")), true),
-        (
-            "string <= ?d",
-            filter(format!("\"{DT_ABOVE}\" <= ?d")),
-            false,
-        ),
-        (
-            "?t < time",
-            filter(format!("?t < {}", time(TIME_ABOVE))),
-            true,
-        ),
-        (
-            "?t >= time",
-            filter(format!("?t >= {}", time(TIME_ABOVE))),
-            false,
-        ),
-        (
-            "?d = c, rounded",
-            filter(format!("?d = {}", dt(DT_NS))),
-            true,
-        ),
-        (
-            "sameTerm, rounded",
-            filter(format!("sameTerm(?d, {})", dt(DT_NS))),
-            true,
-        ),
+    // (constant, how the stored value orders against it)
+    let dt_constants: [(&str, Ordering); 5] = [
+        (DT_NS, Equal),
+        (DT_ABOVE, Equal),
+        (DT_US, Equal),
+        (DT_NEXT, Less),
+        (DT_PREV, Greater),
     ];
-    let jsonld = |op: &str, var: &str, lexical: &str| {
-        let pred = if var == "?d" { "ex:d" } else { "ex:t" };
+    // (check, SPARQL ASK or JSON-LD query, whether ex:s matches)
+    let mut sparql: Vec<(String, String, bool)> = Vec::new();
+    let mut jsonld: Vec<(String, JsonValue, bool)> = Vec::new();
+    let ask_where = |body: String| format!("{PFX}ASK {{ ex:s ex:d ?d ; ex:t ?t {body} }}");
+    for (c, ord) in dt_constants {
+        let typed = format!("\"{c}\"^^xsd:dateTime");
+        for op in OPS {
+            let want = holds(op, ord);
+            let mirror = mirrored(op);
+            for (form, body) in [
+                ("typed", format!("FILTER(?d {op} {typed})")),
+                ("cast", format!("FILTER(?d {op} xsd:dateTime(\"{c}\"))")),
+                ("on the left", format!("FILTER({typed} {mirror} ?d)")),
+                ("BIND", format!("BIND({typed} AS ?c) FILTER(?d {op} ?c)")),
+                (
+                    "VALUES",
+                    format!("VALUES ?c {{ {typed} }} FILTER(?d {op} ?c)"),
+                ),
+            ] {
+                sparql.push((format!("?d {op} {c} ({form})"), ask_where(body), want));
+            }
+            let filter = |rhs: JsonValue| {
+                json!({
+                    "@context": ctx(),
+                    "select": ["?d"],
+                    "where": [{"@id": "ex:s", "ex:d": "?d"}, ["filter", [op, "?d", rhs]]]
+                })
+            };
+            jsonld.push((format!("JSON-LD ?d {op} \"{c}\""), filter(json!(c)), want));
+            let mut by_values = filter(json!("?c"));
+            by_values["values"] = json!(["?c", [{"@value": c, "@type": "xsd:dateTime"}]]);
+            jsonld.push((format!("JSON-LD values ?d {op} {c}"), by_values, want));
+        }
+    }
+    for op in OPS {
+        let want = holds(op, Equal);
+        let typed = format!("\"{TIME_ABOVE}\"^^xsd:time");
+        sparql.push((
+            format!("?t {op} {TIME_ABOVE}"),
+            ask_where(format!("FILTER(?t {op} {typed})")),
+            want,
+        ));
+        sparql.push((
+            format!("?t {op} {TIME_ABOVE} (VALUES)"),
+            ask_where(format!("VALUES ?c {{ {typed} }} FILTER(?t {op} ?c)")),
+            want,
+        ));
+        jsonld.push((
+            format!("JSON-LD ?t {op} \"{TIME_ABOVE}\""),
+            json!({
+                "@context": ctx(),
+                "select": ["?t"],
+                "where": [{"@id": "ex:s", "ex:t": "?t"}, ["filter", [op, "?t", TIME_ABOVE]]]
+            }),
+            want,
+        ));
+    }
+    sparql.push((
+        "sameTerm".to_string(),
+        ask_where(format!(
+            "FILTER(sameTerm(?d, \"{DT_ABOVE}\"^^xsd:dateTime))"
+        )),
+        true,
+    ));
+    sparql.push((
+        "a pattern's object".to_string(),
+        format!("{PFX}ASK {{ ex:s ex:d \"{DT_ABOVE}\"^^xsd:dateTime }}"),
+        true,
+    ));
+    jsonld.push((
+        "JSON-LD a pattern's object".to_string(),
         json!({
             "@context": ctx(),
-            "select": [var],
-            "where": [{"@id": "ex:s", pred: var}, ["filter", [op, var, lexical]]]
-        })
-    };
-    let jsonld_checks: Vec<(&str, JsonValue, bool)> = vec![
-        ("JSON-LD ?d < string", jsonld("<", "?d", DT_ABOVE), true),
-        ("JSON-LD ?d >= string", jsonld(">=", "?d", DT_ABOVE), false),
-        ("JSON-LD ?t < string", jsonld("<", "?t", TIME_ABOVE), true),
-        (
-            "JSON-LD ?t >= string",
-            jsonld(">=", "?t", TIME_ABOVE),
-            false,
-        ),
-        (
-            "JSON-LD bound object, rounded",
-            json!({
-                "@context": ctx(),
-                "select": ["?s"],
-                "where": {"@id": "?s", "ex:d": {"@value": DT_NS, "@type": "xsd:dateTime"}}
-            }),
-            true,
-        ),
-        (
-            "JSON-LD VALUES, rounded",
-            json!({
-                "@context": ctx(),
-                "select": ["?s"],
-                "values": ["?d", [{"@value": DT_NS, "@type": "xsd:dateTime"}]],
-                "where": {"@id": "?s", "ex:d": "?d"}
-            }),
-            true,
-        ),
-    ];
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:d": {"@value": DT_ABOVE, "@type": "xsd:dateTime"}}
+        }),
+        true,
+    ));
     let run = |fluree: fluree_db_api::Fluree| {
         let sparql = sparql.clone();
-        let jsonld_checks = jsonld_checks.clone();
+        let jsonld = jsonld.clone();
         async move {
             let db = fluree.db(LEDGER).await.expect("db");
             let mut wrong = Vec::new();
             for (check, q, want) in &sparql {
                 if ask(&fluree, q).await != *want {
-                    wrong.push(*check);
+                    wrong.push(check.clone());
                 }
             }
-            for (check, q, want) in &jsonld_checks {
+            for (check, q, want) in &jsonld {
                 let rows = fluree
                     .query(&db, q)
                     .await
@@ -525,7 +560,7 @@ async fn a_constant_past_the_microsecond_orders_by_every_digit() {
                     .expect("jsonld");
                 let found = rows.as_array().is_some_and(|rows| !rows.is_empty());
                 if found != *want {
-                    wrong.push(*check);
+                    wrong.push(check.clone());
                 }
             }
             wrong
@@ -533,7 +568,7 @@ async fn a_constant_past_the_microsecond_orders_by_every_digit() {
     };
     let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
     fluree.create_ledger(LEDGER).await.expect("create");
-    let insert = format!("{PFX}INSERT DATA {{ {} }}", triples(DT_US, TIME_US));
+    let insert = format!("{PFX}INSERT DATA {{ {} }}", triples(DT_NS, TIME_NS));
     fluree
         .graph(LEDGER)
         .transact()
@@ -545,7 +580,7 @@ async fn a_constant_past_the_microsecond_orders_by_every_digit() {
     let reloaded = run(FlureeBuilder::file(path.clone()).build().expect("reload")).await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
     let indexed = run(FlureeBuilder::file(path).build().expect("reload")).await;
-    let none: Vec<&str> = Vec::new();
+    let none: Vec<String> = Vec::new();
     assert_eq!(
         (in_process, reloaded, indexed),
         (none.clone(), none.clone(), none),
@@ -553,57 +588,128 @@ async fn a_constant_past_the_microsecond_orders_by_every_digit() {
     );
 }
 
-/// A Cypher `datetime()` or `time()` constant past the microsecond orders by
-/// every digit too, before a reload and after.
+/// A plain string that reads as a `dateTime` is ordered against a temporal
+/// value as the value it reads as, held to the microsecond: a stored
+/// `"…1234565Z"` and a constant `"…1234569Z"^^xsd:dateTime` both read as
+/// `…123456Z`, so exactly one of `<`, `=` and `>` holds, `=`, either way
+/// round, as for a string equal to the constant at every digit. In process,
+/// reloaded and indexed.
 #[tokio::test]
-async fn a_cypher_constant_past_the_microsecond_orders_by_every_digit() {
+async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().to_string();
-    let counts = |fluree: fluree_db_api::Fluree, ledger: fluree_db_api::LedgerState| async move {
-        let db = support::graphdb_from_ledger(&ledger);
-        let mut out = Vec::new();
-        for condition in [
-            format!("e.at < datetime(\"{DT_ABOVE}\")"),
-            format!("e.at >= datetime(\"{DT_ABOVE}\")"),
-            format!("datetime(\"{DT_ABOVE}\") > e.at"),
-            format!("e.t <= time(\"{TIME_ABOVE}\")"),
-            format!("e.t > time(\"{TIME_ABOVE}\")"),
-            "e.at < datetime({year: 2020, month: 1, day: 1, nanosecond: 123456900})".to_string(),
-            format!("e.at = datetime(\"{DT_NS}\")"),
-        ] {
-            let query = format!("MATCH (e:Event) WHERE {condition} RETURN count(e)");
-            let rows = fluree
-                .query_cypher(&db, &query)
-                .await
-                .expect("query")
-                .to_jsonld_async(db.as_graph_db_ref())
-                .await
-                .expect("jsonld");
-            out.push(rows[0][0].as_i64().expect("count"));
+    let c = "\"2020-01-01T00:00:00.1234569Z\"^^xsd:dateTime";
+    let mut checks: Vec<(String, String, bool)> = Vec::new();
+    for op in OPS {
+        let want = holds(op, std::cmp::Ordering::Equal);
+        let mirror = mirrored(op);
+        checks.push((
+            format!("?v {op} c"),
+            format!("{PFX}ASK {{ ex:s ex:str ?v FILTER(?v {op} {c}) }}"),
+            want,
+        ));
+        checks.push((
+            format!("c {mirror} ?v"),
+            format!("{PFX}ASK {{ ex:s ex:str ?v FILTER({c} {mirror} ?v) }}"),
+            want,
+        ));
+    }
+    let run = |fluree: fluree_db_api::Fluree| {
+        let checks = checks.clone();
+        async move {
+            let mut wrong = Vec::new();
+            for (check, q, want) in &checks {
+                if ask(&fluree, q).await != *want {
+                    wrong.push(check.clone());
+                }
+            }
+            wrong
         }
-        out
     };
+    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+    fluree.create_ledger(LEDGER).await.expect("create");
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update(&format!(
+            "{PFX}INSERT DATA {{ ex:s ex:str \"2020-01-01T00:00:00.1234565Z\" }}"
+        ))
+        .commit()
+        .await
+        .expect("insert");
+    let in_process = run(fluree.clone()).await;
+    let reloaded = run(FlureeBuilder::file(path.clone()).build().expect("reload")).await;
+    support::rebuild_and_publish_index(&fluree, LEDGER).await;
+    let indexed = run(FlureeBuilder::file(path).build().expect("reload")).await;
+    let none: Vec<String> = Vec::new();
+    assert_eq!(
+        (in_process, reloaded, indexed),
+        (none.clone(), none.clone(), none),
+        "checks answered wrongly in process, reloaded, indexed"
+    );
+}
+
+/// A Cypher `datetime()` or `time()` constant past the microsecond is held to
+/// it too, so a stored value is exactly one of `<`, `=` and `>` it, a
+/// component map's `nanosecond` included, before a reload and after.
+#[tokio::test]
+async fn a_cypher_constant_is_held_to_the_microsecond_for_ordering_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().to_string();
+    let mut conditions: Vec<(String, i64)> = Vec::new();
+    for op in OPS {
+        let want = i64::from(holds(op, std::cmp::Ordering::Equal));
+        let mirror = mirrored(op);
+        conditions.push((format!("e.at {op} datetime(\"{DT_ABOVE}\")"), want));
+        conditions.push((format!("e.at {op} datetime(\"{DT_NS}\")"), want));
+        conditions.push((format!("datetime(\"{DT_ABOVE}\") {mirror} e.at"), want));
+        conditions.push((format!("e.t {op} time(\"{TIME_ABOVE}\")"), want));
+        conditions.push((
+            format!("e.at {op} datetime({{year: 2020, month: 1, day: 1, nanosecond: 123456900}})"),
+            want,
+        ));
+    }
+    conditions.push((format!("e.at < datetime(\"{DT_NEXT}\")"), 1));
+    conditions.push((format!("e.at > datetime(\"{DT_PREV}\")"), 1));
+    let wrong = |fluree: fluree_db_api::Fluree, ledger: fluree_db_api::LedgerState| {
+        let conditions = conditions.clone();
+        async move {
+            let db = support::graphdb_from_ledger(&ledger);
+            let mut out = Vec::new();
+            for (condition, want) in &conditions {
+                let query = format!("MATCH (e:Event) WHERE {condition} RETURN count(e)");
+                let rows = fluree
+                    .query_cypher(&db, &query)
+                    .await
+                    .expect("query")
+                    .to_jsonld_async(db.as_graph_db_ref())
+                    .await
+                    .expect("jsonld");
+                if rows[0][0].as_i64().expect("count") != *want {
+                    out.push(condition.clone());
+                }
+            }
+            out
+        }
+    };
+    let none: Vec<String> = Vec::new();
     {
         let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
         let ledger = fluree.create_ledger(LEDGER).await.expect("create");
         let create =
-            format!("CREATE (:Event {{at: datetime(\"{DT_US}\"), t: time(\"{TIME_US}\")}})");
+            format!("CREATE (:Event {{at: datetime(\"{DT_NS}\"), t: time(\"{TIME_NS}\")}})");
         let written = fluree
             .transact_cypher(ledger, &create)
             .await
             .expect("create")
             .ledger;
         assert_eq!(
-            counts(fluree.clone(), written).await,
-            [1, 0, 1, 1, 0, 1, 1],
+            wrong(fluree.clone(), written).await,
+            none,
             "before a reload"
         );
     }
     let fluree = FlureeBuilder::file(path).build().expect("reload");
     let ledger = fluree.ledger(LEDGER).await.expect("ledger");
-    assert_eq!(
-        counts(fluree, ledger).await,
-        [1, 0, 1, 1, 0, 1, 1],
-        "after a reload"
-    );
+    assert_eq!(wrong(fluree, ledger).await, none, "after a reload");
 }

@@ -179,10 +179,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<Expression> {
         let l = self.lower_expression(left)?;
         let r = self.lower_expression(right)?;
-        let func = func.against_digits_past_micros(
-            temporal_past_micros(left, &l),
-            temporal_past_micros(right, &r),
-        );
         Ok(Expression::binary(func, l, r))
     }
 
@@ -391,33 +387,5 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
 
         Ok(Expression::call(func, lowered_args))
-    }
-}
-/// Whether `ast`, lowered to `lowered`, is a `dateTime` or `time` constant
-/// whose lexical form has digits past the microsecond, which the value drops
-/// (see [`Function::against_digits_past_micros`]): a typed literal, or a cast
-/// of a string literal.
-fn temporal_past_micros(ast: &AstExpression, lowered: &Expression) -> bool {
-    use fluree_db_core::temporal::digits_past_micros;
-    let mut ast = ast;
-    while let AstExpression::Bracketed { inner, .. } = ast {
-        ast = inner;
-    }
-    match lowered {
-        Expression::Const(FlakeValue::DateTime(_) | FlakeValue::Time(_)) => matches!(
-            ast,
-            AstExpression::Literal(Literal {
-                value: LiteralValue::Typed { value, .. },
-                ..
-            }) if digits_past_micros(value)
-        ),
-        Expression::Call {
-            func: Function::XsdDateTime | Function::XsdTime,
-            args,
-        } => matches!(
-            args.as_slice(),
-            [Expression::Const(FlakeValue::String(lexical))] if digits_past_micros(lexical)
-        ),
-        _ => false,
     }
 }
