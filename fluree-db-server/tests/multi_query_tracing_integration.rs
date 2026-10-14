@@ -288,9 +288,9 @@ async fn sub_query_span_records_error_status_on_per_alias_failure() {
 
     let (store, _guard) = init_capture();
 
-    // The 'bad' alias parses fine at envelope validation (deferred to
-    // downstream parser) but fails at execution — sub_query span must
-    // record result_status = "error".
+    // The 'bad' alias parses, so envelope validation passes, but it fails at
+    // execution (its WHERE uses a prefix it never declares) — sub_query span
+    // must record result_status = "error".
     let envelope = json!({
         "queries": {
             "good": {
@@ -304,7 +304,7 @@ async fn sub_query_span_records_error_status_on_per_alias_failure() {
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mqt:e> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mqt:e> WHERE { ?x undeclared:p ?y }"
             }
         }
     });

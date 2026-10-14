@@ -74,7 +74,7 @@ mimalloc = { version = "0.1", default-features = false }
 thiserror = "1.0"
 # Persistent/immutable data structures (structural sharing -> O(1) clone).
 # Used by fluree-db-novelty's current-state fact index.
-imbl = "3"
+imbl = "7"
 winnow = "0.7"
 
 # GraphQL runtime (fluree-db-graphql): parse/validate/introspect/execute over a
@@ -228,7 +228,7 @@ parquet = { version = "58.4", default-features = false, features = ["zstd", "sna
 arrow = { version = "58.4", default-features = false }
 
 # LRU cache for Parquet footers
-lru = "0.12"
+lru = "0.18"
 
 # High-performance concurrent cache with TinyLFU eviction
 moka = { version = "0.12", features = ["sync"] }

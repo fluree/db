@@ -47,7 +47,7 @@ use crate::eval::vector_math;
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_overlay_cursor_for_predicate,
     build_overlay_cursor_for_subject_range, cached_overlay_ops, count_rows_for_predicate_psot,
-    cursor_projection_sid_otype_okey, empty_batch, leaf_entries_for_predicate, normalize_pred_sid,
+    cursor_projection_sid_otype_okey, driver_subject_boundaries, empty_batch, normalize_pred_sid,
     parallel_map_pooled, slice_overlay_ops_by_subject, FastPathOperator,
 };
 use crate::ir::{Expression, Function, Pattern, Query, Ref, Term};
@@ -693,29 +693,7 @@ fn scan_partitioned(
     if k < 2 {
         return Ok(PartitionScan::TooFewPartitions);
     }
-    // Candidate subject boundaries: leaf first-subjects when there are
-    // enough leaves; else refine to leaflet first-subjects (opens the few
-    // driver leaves, which the partitions scan anyway).
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
-    let candidates: Vec<u64> = if leaves.len() >= k {
-        leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect()
-    } else {
-        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-        let mut bounds: Vec<u64> = Vec::new();
-        for leaf in leaves {
-            let handle = store
-                .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::from_io("leaf open", e))?;
-            for entry in &handle.dir().entries {
-                if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                    continue;
-                }
-                let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
-                bounds.push(first.s_id.as_u64());
-            }
-        }
-        bounds
-    };
+    let candidates = driver_subject_boundaries(store, g_id, p_id, k)?;
     if candidates.len() < 2 {
         return Ok(PartitionScan::TooFewPartitions);
     }

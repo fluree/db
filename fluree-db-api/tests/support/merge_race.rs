@@ -1,6 +1,6 @@
-//! A deterministic pause immediately before the merge's ref CAS, and an
-//! opt-in listing failure. All other operations use the real nameservice,
-//! including rollback.
+//! A deterministic pause immediately before the merge's ref CAS, an opt-in
+//! listing failure, and an opt-in loss of every commit-head race. All other
+//! operations use the real nameservice, including rollback.
 
 use async_trait::async_trait;
 use fluree_db_core::ContentId;
@@ -23,6 +23,7 @@ pub(super) struct PausingNameService {
     inner: Arc<dyn NameServicePublisher>,
     armed: AtomicBool,
     failing_listings: AtomicBool,
+    losing_commits: AtomicBool,
     pub(super) entered: Notify,
     pub(super) resume: Notify,
 }
@@ -33,6 +34,7 @@ impl PausingNameService {
             inner,
             armed: AtomicBool::new(true),
             failing_listings: AtomicBool::new(false),
+            losing_commits: AtomicBool::new(false),
             entered: Notify::new(),
             resume: Notify::new(),
         }
@@ -41,6 +43,12 @@ impl PausingNameService {
     /// Make every `all_records` call fail from now on.
     pub(super) fn fail_listings(&self) {
         self.failing_listings.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every commit-head CAS lose from now on, as if another writer
+    /// always published first.
+    pub(super) fn lose_commit_races(&self) {
+        self.losing_commits.store(true, Ordering::SeqCst);
     }
 }
 
@@ -214,6 +222,10 @@ impl RefPublisher for PausingNameService {
         {
             self.entered.notify_one();
             self.resume.notified().await;
+        }
+        if kind == RefKind::CommitHead && self.losing_commits.load(Ordering::SeqCst) {
+            let actual = self.inner.get_ref(ledger_id, kind).await?;
+            return Ok(CasResult::Conflict { actual });
         }
         self.inner
             .compare_and_set_ref(ledger_id, kind, expected, new)
