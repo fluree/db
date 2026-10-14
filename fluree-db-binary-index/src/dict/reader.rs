@@ -22,9 +22,10 @@ use crate::read::leaflet_cache::LeafletCache;
 use fluree_db_core::{ContentId, ContentStore};
 
 /// A clock for the slow-lookup debug logs below, read only when this module
-/// logs at debug level. A clock read costs a few hundred instructions, a large
-/// share of a lookup that hits a cached leaf, and nothing else reads these
-/// timings.
+/// logs at debug level. Nothing else reads these timings, and a clock read is
+/// a large share of a lookup that hits a cached leaf. Its cost depends on the
+/// platform and clock source: on arm64, macOS and Linux alike, a read and its
+/// `elapsed()` take about 35 ns.
 struct DebugClock(Option<Instant>);
 
 impl DebugClock {
@@ -1309,5 +1310,55 @@ mod tests {
 
         assert_eq!(reader.reverse_lookup(b"key_0050").unwrap(), Some(50));
         assert_eq!(reader.reverse_lookup(b"nonexistent").unwrap(), None);
+    }
+
+    /// The target the slow-lookup logs, and the clock's `enabled!` check, use.
+    const DICT_READER_TARGET: &str = "fluree_db_binary_index::dict::reader";
+
+    /// Runs `f` under `subscriber` as this thread's default, with callsite
+    /// interest rebuilt so a cached interest from another test can't decide
+    /// whether the clock runs.
+    fn with_subscriber<S, R>(subscriber: S, f: impl FnOnce() -> R) -> R
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        })
+    }
+
+    fn reader_at(level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::Targets::new().with_target(DICT_READER_TARGET, level))
+    }
+
+    fn lap_after_sleep() -> (bool, std::time::Duration) {
+        let mut clock = DebugClock::start();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (clock.0.is_some(), clock.lap())
+    }
+
+    #[test]
+    fn debug_clock_does_not_read_without_debug() {
+        let none = with_subscriber(
+            tracing::subscriber::NoSubscriber::default(),
+            lap_after_sleep,
+        );
+        assert_eq!(none, (false, std::time::Duration::ZERO), "no subscriber");
+
+        let info = with_subscriber(reader_at(tracing::Level::INFO), lap_after_sleep);
+        assert_eq!(info, (false, std::time::Duration::ZERO), "reader at INFO");
+    }
+
+    #[test]
+    fn debug_clock_times_laps_with_debug() {
+        let (timing, lap) = with_subscriber(reader_at(tracing::Level::DEBUG), lap_after_sleep);
+        assert!(timing, "reader at DEBUG should read the clock");
+        assert!(
+            lap >= std::time::Duration::from_millis(5),
+            "lap {lap:?} should cover the 5ms sleep"
+        );
     }
 }
