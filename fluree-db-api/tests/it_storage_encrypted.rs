@@ -367,8 +367,9 @@ async fn build_client_file_honours_key_and_spills_no_plaintext() {
 }
 
 /// Over encrypted file storage, indexed reads decrypt what they use: leaves
-/// are held as range sources and dictionary values as decrypted pages in the
-/// leaflet cache, never a leaf decrypted whole. Results match plain storage.
+/// and dictionary packs are read by range, and what they decrypt is kept as
+/// segments in the leaflet cache — never a leaf decrypted whole, never a
+/// dictionary page assembled. Results match plain storage.
 #[tokio::test]
 async fn encrypted_file_reads_leaves_and_packs_by_range() {
     async fn names(encrypted: bool) -> (Vec<(String, String)>, Vec<(&'static str, u64, u64)>) {
@@ -426,10 +427,14 @@ async fn encrypted_file_reads_leaves_and_packs_by_range() {
     assert_eq!(encrypted, plain);
     let held = |kind: &str| occupancy.iter().any(|(k, n, _)| *k == kind && *n > 0);
     assert!(held("ranged-leaf"), "{occupancy:?}");
-    assert!(held("forward-page"), "{occupancy:?}");
+    assert!(held("source-unit"), "{occupancy:?}");
     assert!(
         !held("leaf-bytes-heap"),
         "a leaf decrypted whole: {occupancy:?}"
+    );
+    assert!(
+        !held("forward-page"),
+        "a dictionary page assembled: {occupancy:?}"
     );
 }
 

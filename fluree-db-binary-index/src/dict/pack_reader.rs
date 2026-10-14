@@ -19,8 +19,10 @@ use super::forward_pack::{
     ForwardPage, PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
 };
 use crate::format::wire_helpers::PackBranchEntry;
+use crate::read::cached_units::CachedUnits;
 use crate::read::leaflet_cache::{ForwardPageKey, LeafletCache};
 use fluree_db_core::{ContentBytes, ContentId, ContentStore, RangeSource};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // PackHandle — owns routing info + backing store for a single pack
@@ -67,6 +69,102 @@ enum PackBacking {
         /// `xxh3_128(pack CID bytes)`, the pack half of a page's cache key.
         pack_key: u128,
     },
+    /// A local pack whose store decrypts on read, where a lookup reads only
+    /// its entry's two offsets and its value, through the leaflet cache's
+    /// decrypted units: a page is never assembled.
+    Ranged {
+        units: PackUnits,
+        /// Per page: whether its own entry count and final offset have been
+        /// checked against its directory entry.
+        checked: Box<[AtomicBool]>,
+    },
+}
+
+/// How a ranged pack's bytes are read: through the leaflet cache's kept
+/// units, or straight from the source when the reader has no cache.
+enum PackUnits {
+    Cached(CachedUnits),
+    Direct(Arc<dyn RangeSource>),
+}
+
+impl PackUnits {
+    /// Append exactly the bytes of `range`, which must lie in the pack.
+    fn extend_into(&self, range: std::ops::Range<u64>, out: &mut Vec<u8>) -> io::Result<()> {
+        let want = (range.end - range.start) as usize;
+        let mark = out.len();
+        match self {
+            PackUnits::Cached(units) => units.extend_into(range, out)?,
+            PackUnits::Direct(source) => out.extend_from_slice(
+                &source
+                    .read_range(range)
+                    .map_err(|e| io::Error::other(format!("forward pack: {e}")))?,
+            ),
+        }
+        if out.len() - mark != want {
+            out.truncate(mark);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forward pack: read past the end of the pack",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `n` little-endian u32s at `at`, read through `scratch`.
+    fn u32s<const N: usize>(&self, at: u64, scratch: &mut Vec<u8>) -> io::Result<[u32; N]> {
+        let mark = scratch.len();
+        self.extend_into(at..at + 4 * N as u64, scratch)?;
+        let mut out = [0u32; N];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let b = &scratch[mark + 4 * i..mark + 4 * i + 4];
+            *slot = u32::from_le_bytes(b.try_into().expect("four bytes"));
+        }
+        scratch.truncate(mark);
+        Ok(out)
+    }
+}
+
+/// Look `id` up in page `dir` of a ranged pack, appending its value to
+/// `out`. Reads the page's two offsets for `id` and then the value; on the
+/// page's first visit also its entry count and final offset, which must
+/// agree with the directory. Offsets are bounds-checked on every lookup.
+fn ranged_lookup(
+    units: &PackUnits,
+    checked: &AtomicBool,
+    dir: &PageDirEntry,
+    id: u64,
+    out: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let invalid = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("forward pack page: {what}"),
+        )
+    };
+    let base = u64::from(dir.page_offset);
+    let count = u64::from(dir.entry_count);
+    // `parse_pack_meta_parts` checked the page is at least this long.
+    let data_start = 4 + (count + 1) * 4;
+    let data_len = u64::from(dir.page_len) - data_start;
+    if !checked.load(Ordering::Acquire) {
+        let [entries] = units.u32s::<1>(base, out)?;
+        let [last] = units.u32s::<1>(base + 4 + count * 4, out)?;
+        if u64::from(entries) != count {
+            return Err(invalid("entry count does not match its directory entry"));
+        }
+        if u64::from(last) != data_len {
+            return Err(invalid("final offset does not match its length"));
+        }
+        checked.store(true, Ordering::Release);
+    }
+    let local = id - dir.page_first_id;
+    let [lo, hi] = units.u32s::<2>(base + 4 + local * 4, out)?;
+    if lo > hi || u64::from(hi) > data_len {
+        return Err(invalid("value offsets out of order or out of bounds"));
+    }
+    let from = base + data_start + u64::from(lo);
+    units.extend_into(from..from + u64::from(hi - lo), out)?;
+    Ok(true)
 }
 
 impl PackBacking {
@@ -98,6 +196,21 @@ impl PackBacking {
                 Ok(
                     ForwardPage::from_bytes_unchecked(&page, dir.page_first_id)
                         .lookup_into(id, out),
+                )
+            }
+            PackBacking::Ranged { units, checked } => {
+                if id < meta.first_id || id > meta.last_id {
+                    return Ok(false);
+                }
+                let Some(page_idx) = find_page_in_dir(&meta.directory, id) else {
+                    return Ok(false);
+                };
+                ranged_lookup(
+                    units,
+                    &checked[page_idx],
+                    &meta.directory[page_idx],
+                    id,
+                    out,
                 )
             }
         }
@@ -133,6 +246,34 @@ struct LoadContext {
     /// Where pages of paged packs are kept; without one, each lookup reads
     /// its page again.
     page_cache: Option<Arc<LeafletCache>>,
+    /// How packs a store reads by range are held.
+    encrypted_packs: EncryptedPacks,
+}
+
+/// How a local pack whose store decrypts on read is held. Experiment
+/// control for the segmented-envelope A/B, not a supported configuration:
+/// `FLUREE_ENCRYPTED_PACKS=whole|pages|ranged`, default `ranged`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncryptedPacks {
+    /// Decrypted whole and held for the reader's lifetime.
+    Whole,
+    /// Whole pages decrypted into the leaflet cache.
+    Pages,
+    /// Offsets and values read through the leaflet cache's decrypted units.
+    Ranged,
+}
+
+impl EncryptedPacks {
+    fn from_env() -> Self {
+        static MODE: std::sync::OnceLock<EncryptedPacks> = std::sync::OnceLock::new();
+        *MODE.get_or_init(
+            || match std::env::var("FLUREE_ENCRYPTED_PACKS").as_deref() {
+                Ok("whole") => EncryptedPacks::Whole,
+                Ok("pages") => EncryptedPacks::Pages,
+                _ => EncryptedPacks::Ranged,
+            },
+        )
+    }
 }
 
 // ============================================================================
@@ -214,6 +355,7 @@ impl ForwardPackReader {
                         expected_kind,
                         expected_ns_code,
                         page_cache: None,
+                        encrypted_packs: EncryptedPacks::from_env(),
                     }),
                 });
             }
@@ -275,8 +417,17 @@ impl ForwardPackReader {
                 expected_kind,
                 expected_ns_code,
                 page_cache: None,
+                encrypted_packs: EncryptedPacks::from_env(),
             }),
         })
+    }
+
+    #[cfg(test)]
+    fn with_encrypted_packs(mut self, mode: EncryptedPacks) -> Self {
+        if let Some(ctx) = &mut self.load_ctx {
+            ctx.encrypted_packs = mode;
+        }
+        self
     }
 
     /// Keep pages of packs read by range (encrypted local packs) in `cache`,
@@ -363,7 +514,7 @@ impl ForwardPackReader {
                 Ok((_, PackBacking::Whole(bytes))) => bytes,
                 // Pages decrypt on use; opening read the header and
                 // directory, which is what counts against the budget.
-                Ok((meta, PackBacking::Paged { .. })) => {
+                Ok((meta, PackBacking::Paged { .. } | PackBacking::Ranged { .. })) => {
                     warmed += (PACK_HEADER_SIZE + meta.directory.len() * 20) as u64;
                     continue;
                 }
@@ -507,7 +658,7 @@ fn fetch_and_load(
         return loaded(backing, expected_first_id, expected_last_id, ctx);
     }
 
-    if ctx.cs.costly_local_reads() && paged_packs_enabled() {
+    if ctx.cs.costly_local_reads() && ctx.encrypted_packs != EncryptedPacks::Whole {
         if let Some(source) = ctx
             .cs
             .get_local_ranged(pack_cid)
@@ -591,14 +742,6 @@ fn loaded(
     })
 }
 
-/// Experiment control for the segmented-envelope A/B, not a supported
-/// configuration: `FLUREE_ENCRYPTED_PAGED_PACKS=0` holds encrypted local
-/// packs whole even when they can be read by range.
-fn paged_packs_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLUREE_ENCRYPTED_PAGED_PACKS").map_or(true, |v| v != "0"))
-}
-
 /// Open a pack read by range: its header and page directory are read and
 /// validated now, its pages on use.
 fn loaded_paged(
@@ -622,13 +765,26 @@ fn loaded_paged(
         "pack opened paged",
         header_bytes.len() + dir_bytes.len(),
     );
-    Ok(LazyLoaded {
-        meta,
-        backing: PackBacking::Paged {
+    let backing = match ctx.encrypted_packs {
+        EncryptedPacks::Pages => PackBacking::Paged {
             source,
             pack_key: xxhash_rust::xxh3::xxh3_128(pack_cid.to_bytes().as_ref()),
         },
-    })
+        _ => PackBacking::Ranged {
+            checked: meta
+                .directory
+                .iter()
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            units: match &ctx.page_cache {
+                Some(cache) if crate::read::cached_units::enabled() => {
+                    PackUnits::Cached(CachedUnits::new(source, Arc::clone(cache)))
+                }
+                _ => PackUnits::Direct(source),
+            },
+        },
+    };
+    Ok(LazyLoaded { meta, backing })
 }
 
 /// A paged pack's page, from the cache or read and validated: a page that
@@ -1520,6 +1676,15 @@ mod tests {
             pack: &[u8],
             cache: Option<Arc<LeafletCache>>,
         ) -> ForwardPackReader {
+            reader_in(cs, pack, cache, EncryptedPacks::Pages)
+        }
+
+        fn reader_in(
+            cs: &SegmentedContentStore,
+            pack: &[u8],
+            cache: Option<Arc<LeafletCache>>,
+            mode: EncryptedPacks,
+        ) -> ForwardPackReader {
             let pack_cid = cs.put_sync(
                 ContentKind::DictBlob {
                     dict: DictKind::StringForward,
@@ -1537,6 +1702,7 @@ mod tests {
             })
             .unwrap()
             .with_page_cache(cache)
+            .with_encrypted_packs(mode)
         }
 
         fn lookup(reader: &ForwardPackReader, id: u64) -> Option<Vec<u8>> {
@@ -1633,6 +1799,122 @@ mod tests {
             );
             assert!(reader.prewarm(u64::MAX) > 0);
             assert_eq!(cs.reads().len(), 2, "header and directory only");
+        }
+
+        /// A pack of a few large pages, so a page spans many read units.
+        fn large_page_pack() -> Vec<u8> {
+            let entries: Vec<(u64, Vec<u8>)> = (0..COUNT as u64)
+                .map(|i| (FIRST + i, value(FIRST + i)))
+                .collect();
+            let refs: Vec<(u64, &[u8])> =
+                entries.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+            encode_forward_pack(&refs, KIND_STRING_FWD, 0, 32 * 1024).unwrap()
+        }
+
+        /// A ranged lookup reads the units holding its offsets and value,
+        /// not the page: the page check on first visit, the offsets and the
+        /// value are each a unit or two of a page that spans many.
+        #[test]
+        fn ranged_lookups_read_a_few_units_of_a_page() {
+            let cs = SegmentedContentStore::new(true);
+            let pack = large_page_pack();
+            let meta = parse_pack_meta(&pack).unwrap();
+            assert!(
+                meta.directory[0].page_len > 6 * 4096,
+                "a page spans many units"
+            );
+            let cache = Arc::new(LeafletCache::with_max_mb(16));
+            let reader = reader_in(&cs, &pack, Some(Arc::clone(&cache)), EncryptedPacks::Ranged);
+
+            let opened = {
+                assert_eq!(lookup(&reader, FIRST + 7), Some(value(FIRST + 7)));
+                cs.reads()
+            };
+            // Header and directory, then whole units through the cache.
+            let units: Vec<_> = opened[2..].to_vec();
+            assert!(units.len() <= 4, "{units:?}");
+            assert!(units
+                .iter()
+                .all(|r| r.start % 4096 == 0 && r.end - r.start == 4096));
+
+            assert_eq!(lookup(&reader, FIRST + 8), Some(value(FIRST + 8)));
+            assert_eq!(
+                cs.reads().len(),
+                opened.len(),
+                "a neighbour reads nothing new"
+            );
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+            assert!(cache
+                .occupancy()
+                .iter()
+                .all(|(kind, _, _)| *kind != "forward-page"));
+        }
+
+        #[test]
+        fn every_value_reads_back_by_range() {
+            for (cache, pack) in [
+                (
+                    Some(Arc::new(LeafletCache::with_max_mb(16))),
+                    many_page_pack(),
+                ),
+                (None, large_page_pack()),
+            ] {
+                let cs = SegmentedContentStore::new(true);
+                let reader = reader_in(&cs, &pack, cache, EncryptedPacks::Ranged);
+                for id in FIRST..FIRST + COUNT as u64 {
+                    assert_eq!(lookup(&reader, id), Some(value(id)), "id {id}");
+                }
+                assert_eq!(lookup(&reader, FIRST + COUNT as u64), None);
+                assert_eq!(
+                    reader.forward_lookup_str(FIRST).unwrap(),
+                    Some(String::from_utf8(value(FIRST)).unwrap())
+                );
+            }
+        }
+
+        /// Offsets out of order, a final offset or an entry count that
+        /// disagree with the directory: each is an error for lookups on that
+        /// page, and other pages still read.
+        #[test]
+        fn ranged_lookups_check_the_page_structure() {
+            let pack = large_page_pack();
+            let meta = parse_pack_meta(&pack).unwrap();
+            let page = meta.directory[0];
+            let base = page.page_offset as usize;
+            let count = page.entry_count as usize;
+            let last = FIRST + COUNT as u64 - 1;
+            let corruptions: [(&str, usize, u32); 3] = [
+                ("entry count", base, page.entry_count + 1),
+                ("final offset", base + 4 + count * 4, 1),
+                ("offsets out of order", base + 4 + 4, u32::MAX),
+            ];
+            for (what, at, bytes) in corruptions {
+                let mut bad = pack.clone();
+                bad[at..at + 4].copy_from_slice(&bytes.to_le_bytes());
+                let cs = SegmentedContentStore::new(true);
+                let reader = reader_in(
+                    &cs,
+                    &bad,
+                    Some(Arc::new(LeafletCache::with_max_mb(16))),
+                    EncryptedPacks::Ranged,
+                );
+                let mut out = Vec::new();
+                let id = if what == "offsets out of order" {
+                    FIRST + 1
+                } else {
+                    FIRST
+                };
+                assert!(reader.forward_lookup_into(id, &mut out).is_err(), "{what}");
+                assert!(
+                    reader.forward_lookup_into(id, &mut out).is_err(),
+                    "{what} again"
+                );
+                assert_eq!(
+                    lookup(&reader, last),
+                    Some(value(last)),
+                    "{what}: other pages"
+                );
+            }
         }
 
         /// Without a ranged source the pack is held whole, as before.
