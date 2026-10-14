@@ -41,6 +41,17 @@ pub(crate) fn api_error(e: ApiError) -> PyErr {
                 details.set_item("head_t", head_t)?;
                 "ConflictError"
             }
+            // Every retry lost a race: still a conflict, so `transact` retries
+            // it. A 503 would otherwise read as a plain `FlureeError`.
+            ApiError::CommitContention { last, .. } => {
+                if let ApiError::Transact(TransactError::CommitConflict { expected_t, head_t }) =
+                    last.as_ref()
+                {
+                    details.set_item("expected_t", expected_t)?;
+                    details.set_item("head_t", head_t)?;
+                }
+                "ConflictError"
+            }
             _ => class_for_status(status),
         };
         Ok::<_, PyErr>(raise_with(class, message, Some(status), &details))

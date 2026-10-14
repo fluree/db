@@ -139,6 +139,7 @@ These are the most useful spans and fields for application-level correlation:
 | `query_prepare` | DEBUG | `pattern_count` | Query planning phase |
 | `query_run` | DEBUG | | Query execution phase |
 | `transact_execute` | DEBUG | `ledger_id` | Every transaction |
+| `txn_attempts` | DEBUG | `attempts` | Stage-and-commit attempts; more than one means commit contention |
 | `txn_stage` | DEBUG | `insert_count`, `delete_count` | Transaction staging |
 | `txn_commit` | DEBUG | `flake_count`, `delta_bytes` | Commit to storage |
 | `format` | DEBUG | `output_format`, `result_count` | Result serialization |

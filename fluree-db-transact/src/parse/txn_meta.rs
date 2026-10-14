@@ -47,29 +47,29 @@ use crate::namespace::NamespaceRegistry;
 use crate::parse::jsonld::expand_datatype_iri;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES};
 use fluree_graph_json_ld::{details_with_policy, ParsedContext};
-use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
 use serde_json::Value;
 
-/// Namespace codes that are reserved for Fluree-generated provenance and must
-/// never appear as a user-supplied txn-meta predicate. System provenance
-/// (commit address, t, time, identity, etc.) is emitted on the same commit
-/// subject as user metadata — allowing these namespaces would let a user
-/// clobber or shadow real provenance properties.
+/// Refuse a txn-meta predicate a transaction may not set.
 ///
-/// FLUREE_DB is handled separately via `FLUREE_DB_USER_ALLOWED` below:
-/// `f:message` and `f:author` are explicitly permitted as user claims.
+/// System provenance (commit address, t, time, identity, revert targets, …)
+/// lives on the same commit subject as user metadata, so a predicate in a
+/// Fluree namespace would clobber or shadow it. Only `f:message` and
+/// `f:author` are user claims ([`fluree_vocab::txn_meta::user_may_set`]).
+/// Every reader of user txn-meta calls this: the JSON-LD sidecar and envelope
+/// here, and the TriG `<#txn-meta>` block in a transaction and in bulk import.
 ///
-/// Why check by namespace code (not IRI string): the code is already resolved
-/// at the call site, comparison is O(1), and it's immune to IRI encoding
-/// tricks (percent-encoding, alternate prefixes, etc.).
-const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_COMMIT, FLUREE_URN];
-
-/// Local names in the `FLUREE_DB` namespace that users *may* set as txn-meta.
-///
-/// `f:message` — commit message (free-form user claim).
-/// `f:author` — commit author (user claim; distinct from `f:identity` which is
-/// the authenticated subject and is system-controlled).
-const FLUREE_DB_USER_ALLOWED: &[&str] = &[fluree_vocab::db::MESSAGE, fluree_vocab::db::AUTHOR];
+/// The check is by namespace code, not IRI string: the code is already
+/// resolved at the call site, and it's immune to IRI encoding tricks
+/// (percent-encoding, alternate prefixes, etc.). `shown` names the predicate
+/// as the user wrote it.
+pub(crate) fn check_user_predicate(ns: u16, name: &str, shown: &str) -> Result<()> {
+    if fluree_vocab::txn_meta::user_may_set(ns, name) {
+        return Ok(());
+    }
+    Err(TransactError::Parse(format!(
+        "txn-meta predicate {shown} uses a Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable"
+    )))
+}
 
 /// The top-level body key for the txn-meta sidecar.
 ///
@@ -195,17 +195,11 @@ fn extract_one_entry(
     let predicate_ns = sid.namespace_code;
     let predicate_name = sid.name.to_string();
 
-    if RESERVED_PREDICATE_NAMESPACES.contains(&predicate_ns) {
-        return Err(TransactError::Parse(format!(
-            "txn-meta predicate '{key}' (expanded: '{expanded_iri}') uses Fluree-reserved namespace and would collide with system provenance; use a different namespace"
-        )));
-    }
-
-    if predicate_ns == FLUREE_DB && !FLUREE_DB_USER_ALLOWED.contains(&predicate_name.as_str()) {
-        return Err(TransactError::Parse(format!(
-            "txn-meta predicate '{key}' (expanded: '{expanded_iri}') uses Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable"
-        )));
-    }
+    check_user_predicate(
+        predicate_ns,
+        &predicate_name,
+        &format!("'{key}' (expanded: '{expanded_iri}')"),
+    )?;
 
     let meta_values = json_to_txn_meta_values(value, context, ns_registry, strict)?;
     for mv in meta_values {
