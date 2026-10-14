@@ -61,7 +61,7 @@ impl TopKHeap {
     fn new(k: usize) -> Self {
         Self {
             k,
-            heap: BinaryHeap::with_capacity(crate::sort::topk_initial_capacity(k)),
+            heap: BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(k)),
         }
     }
 

@@ -25,17 +25,6 @@ use tracing::Instrument;
 const SORT_DEBUG_MIN_ROWS: u64 = 1_000;
 const SORT_DEBUG_MIN_MS: u64 = 25;
 
-/// Most entries a top-k buffer reserves before any row arrives.
-const TOPK_INITIAL_CAPACITY: usize = 4096;
-
-/// Initial capacity for a buffer that keeps the best `k` rows, plus the one a
-/// full buffer takes in before it evicts. `k` comes from a query's `LIMIT`
-/// and `OFFSET`, which may far exceed the rows there are, so the buffer
-/// starts at most [`TOPK_INITIAL_CAPACITY`] and grows as rows arrive.
-pub(crate) fn topk_initial_capacity(k: usize) -> usize {
-    k.saturating_add(1).min(TOPK_INITIAL_CAPACITY)
-}
-
 /// Materialize an encoded binding to its decoded form for sort comparison.
 ///
 /// This ensures ORDER BY uses correct term ordering (namespace/name for IRIs,
@@ -661,7 +650,7 @@ impl Operator for SortOperator {
                     if k == 0 {
                         BinaryHeap::new()
                     } else {
-                        BinaryHeap::with_capacity(topk_initial_capacity(k))
+                        BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(k))
                     }
                 });
 

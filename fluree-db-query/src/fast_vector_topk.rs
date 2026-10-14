@@ -301,7 +301,7 @@ impl Fold {
             Some(n) => Fold::TopK {
                 need: n,
                 // `push` caps the heap at `need`.
-                heap: BinaryHeap::with_capacity(crate::sort::topk_initial_capacity(n)),
+                heap: BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(n)),
             },
             None => Fold::All(Vec::new()),
         }
