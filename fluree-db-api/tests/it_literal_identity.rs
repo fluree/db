@@ -857,3 +857,126 @@ async fn unencodable_datatype_matches_nothing_in_novelty_and_index() {
         })
         .await;
 }
+
+/// A typed literal in expression position keeps its datatype when that
+/// datatype has no value kind of its own (a customer datatype, `xsd:anyURI`,
+/// `xsd:token`): SPARQL lowered `"abc"^^ex:custom` there to a bare string
+/// constant, an `xsd:string`, so `sameTerm` and `IN` matched the plain
+/// `"abc"` instead, a BIND of it reported `xsd:string`, and `=` was pushed
+/// into the scan as a bare string. It now lowers as `STRDT("abc", ex:custom)`
+/// would, as a language-tagged literal already lowers as `STRLANG`. JSON-LD
+/// writes the same constant with `strdt`, which kept its datatype; pinned
+/// alongside, as the twin.
+#[tokio::test]
+async fn typed_literal_constants_in_expressions_keep_their_datatype() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let id = "it/typed-literal-expressions:main";
+            let ledger = fluree.create_ledger(id).await.unwrap();
+            let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+                {"@id": "ex:s1", "ex:p": "abc"},
+                {"@id": "ex:s2", "ex:p": {"@value": "abc", "@type": "http://example.org/ns/custom"}},
+                {"@id": "ex:s3", "ex:p": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#anyURI"}},
+                {"@id": "ex:s4", "ex:p": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#token"}},
+                {"@id": "ex:s5", "ex:p": {"@value": "abc", "@language": "fr"}}
+            ]});
+            let r = fluree.insert(ledger, &data).await.unwrap();
+
+            for phase in ["novelty", "indexed"] {
+                if phase == "indexed" {
+                    trigger_index_and_wait_outcome(&handle, id, r.receipt.t).await;
+                }
+                let view = fluree.ledger(id).await.unwrap();
+                assert_eq!(
+                    view.snapshot.range_provider.is_some(),
+                    phase == "indexed",
+                    "{phase}: setup"
+                );
+
+                let cases: &[(&str, &str, Value)] = &[
+                    (
+                        "sameTerm with a customer datatype",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o FILTER(sameTerm(?o, "abc"^^ex:custom)) }"#,
+                        json!([["ex:s2"]]),
+                    ),
+                    (
+                        "sameTerm with xsd:anyURI",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o FILTER(sameTerm(?o, "abc"^^xsd:anyURI)) }"#,
+                        json!([["ex:s3"]]),
+                    ),
+                    (
+                        "= with a customer datatype",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = "abc"^^ex:custom) }"#,
+                        json!([["ex:s2"]]),
+                    ),
+                    (
+                        "= with xsd:token",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o FILTER(?o = "abc"^^xsd:token) }"#,
+                        json!([["ex:s4"]]),
+                    ),
+                    (
+                        "IN over two typed literals",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o
+                             FILTER(?o IN ("abc"^^ex:custom, "abc"^^xsd:token)) } ORDER BY ?s"#,
+                        json!([["ex:s2"], ["ex:s4"]]),
+                    ),
+                    (
+                        "BIND reports the literal's datatype",
+                        r#"SELECT (DATATYPE(?x) AS ?d) WHERE { BIND("abc"^^ex:custom AS ?x) }"#,
+                        json!([["ex:custom"]]),
+                    ),
+                    // Controls: a plain string and an explicit xsd:string are
+                    // the one term `"abc"`.
+                    (
+                        "sameTerm with a plain string",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o FILTER(sameTerm(?o, "abc")) }"#,
+                        json!([["ex:s1"]]),
+                    ),
+                    (
+                        "sameTerm with xsd:string",
+                        r#"SELECT ?s WHERE { ?s ex:p ?o FILTER(sameTerm(?o, "abc"^^xsd:string)) }"#,
+                        json!([["ex:s1"]]),
+                    ),
+                ];
+                for (name, body, expected) in cases {
+                    let got = sparql(&fluree, &view, body).await;
+                    assert_eq!(&got, expected, "{phase}: {name}");
+                }
+
+                let jl = |filter: &str| {
+                    json!({"@context": {"ex": "http://example.org/ns/"},
+                           "select": "?s",
+                           "where": [{"@id": "?s", "ex:p": "?o"}, ["filter", filter]]})
+                };
+                for (name, filter, expected) in [
+                    (
+                        "json-ld sameTerm with strdt",
+                        r#"(sameTerm ?o (strdt "abc" "http://example.org/ns/custom"))"#,
+                        json!(["ex:s2"]),
+                    ),
+                    (
+                        "json-ld = with strdt",
+                        r#"(= ?o (strdt "abc" "http://www.w3.org/2001/XMLSchema#token"))"#,
+                        json!(["ex:s4"]),
+                    ),
+                ] {
+                    let got = query_jsonld_formatted(&fluree, &view, &jl(filter))
+                        .await
+                        .unwrap();
+                    assert_eq!(got, expected, "{phase}: {name}");
+                }
+            }
+        })
+        .await;
+}
