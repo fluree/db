@@ -411,8 +411,15 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
 }
 
 enum Phase2TaskUpdate {
-    Default { leaf_entries: Vec<LeafEntry> },
-    Named { branch_cid: ContentId },
+    Default {
+        leaf_entries: Vec<LeafEntry>,
+    },
+    Named {
+        branch_cid: ContentId,
+    },
+    /// A fresh branch with nothing to hold: the graph keeps no branch for
+    /// this order, and the next build sees it as fresh again.
+    Unchanged,
 }
 
 struct Phase2TaskOutput {
@@ -505,42 +512,6 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::DefaultFresh => {
-            let BranchUpdateResult {
-                leaf_entries,
-                new_leaf_blobs,
-                ..
-            } = build_fresh_branch_v3(
-                &sorted_records,
-                &sorted_ops,
-                &sorted_superseded,
-                &sorted_superseded_ops,
-                order,
-                g_id,
-                config,
-            )?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget.as_ref(),
-                upload_buffer,
-                new_leaf_blobs,
-                &cache_dir,
-            )
-            .await?;
-            Phase2TaskOutput {
-                seq,
-                g_id,
-                order,
-                update: Phase2TaskUpdate::Default { leaf_entries },
-                replaced_leaf_cids: Vec::new(),
-                replaced_sidecar_cids: Vec::new(),
-                new_leaf_count,
-                fetch_stats: Phase2FetchStatsSnapshot::default(),
-                matched: Vec::new(),
-            }
-        }
         Phase2TaskKind::NamedExisting { branch_cid } => {
             let branch_bytes = fetch_cached_index_bytes(
                 content_store.as_ref(),
@@ -588,15 +559,8 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::NamedFresh => {
-            let BranchUpdateResult {
-                new_leaf_blobs,
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
-                branch_bytes,
-                branch_cid: expected_branch_cid,
-                ..
-            } = build_fresh_branch_v3(
+        Phase2TaskKind::DefaultFresh | Phase2TaskKind::NamedFresh => {
+            let fresh = build_fresh_branch_v3(
                 &sorted_records,
                 &sorted_ops,
                 &sorted_superseded,
@@ -605,35 +569,49 @@ async fn execute_phase2_task(
                 g_id,
                 config,
             )?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget.as_ref(),
-                upload_buffer,
-                new_leaf_blobs,
-                &cache_dir,
-            )
-            .await?;
-            let branch_cid = content_store
-                .put(ContentKind::IndexBranch, &branch_bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(
-                &*content_store,
-                &cache_dir,
-                &branch_cid,
-                &branch_bytes,
-                "index_branch",
-            );
+            let new_leaf_count = fresh.new_leaf_blobs.len();
+            let update = if fresh.leaf_entries.is_empty() {
+                // Every fact in the window netted to no row and no history.
+                // Publishing the empty branch would register a branch with no
+                // leaves, which routes no later novelty anywhere.
+                Phase2TaskUpdate::Unchanged
+            } else {
+                upload_leaf_blobs(
+                    content_store.as_ref(),
+                    &tracker,
+                    upload_budget.as_ref(),
+                    upload_buffer,
+                    fresh.new_leaf_blobs,
+                    &cache_dir,
+                )
+                .await?;
+                if g_id == 0 {
+                    Phase2TaskUpdate::Default {
+                        leaf_entries: fresh.leaf_entries,
+                    }
+                } else {
+                    let branch_cid = content_store
+                        .put(ContentKind::IndexBranch, &fresh.branch_bytes)
+                        .await
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                    debug_assert!(branch_cid == fresh.branch_cid);
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &branch_cid,
+                        &fresh.branch_bytes,
+                        "index_branch",
+                    );
+                    Phase2TaskUpdate::Named { branch_cid }
+                }
+            };
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
-                update: Phase2TaskUpdate::Named { branch_cid },
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
+                update,
+                replaced_leaf_cids: Vec::new(),
+                replaced_sidecar_cids: Vec::new(),
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
                 matched: Vec::new(),
@@ -911,6 +889,7 @@ pub async fn incremental_index(
             Phase2TaskUpdate::Named { branch_cid } => {
                 root_builder.set_named_graph_branch(output.g_id, output.order, branch_cid);
             }
+            Phase2TaskUpdate::Unchanged => {}
         }
         root_builder.add_replaced_cids(output.replaced_leaf_cids);
         root_builder.add_replaced_cids(output.replaced_sidecar_cids);
@@ -5124,6 +5103,49 @@ mod warm_tests {
             &config,
         );
         assert!(stranded.is_err(), "a stranded superseded event must fail");
+    }
+
+    /// A fresh task whose facts net to no row and no history publishes no
+    /// branch: a branch with no leaves would route no later novelty.
+    #[tokio::test]
+    async fn fresh_task_with_nothing_to_hold_publishes_no_branch() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let store: Arc<dyn fluree_db_core::storage::ContentStore> =
+            Arc::new(fluree_db_core::storage::content_store_for(
+                fluree_db_core::MemoryStorage::new(),
+                "test/fresh-empty:main",
+            ));
+        for (g_id, kind) in [
+            (0, Phase2TaskKind::DefaultFresh),
+            (3, Phase2TaskKind::NamedFresh),
+        ] {
+            // A retraction of a fact that was never asserted: no transition.
+            let task = Phase2Task {
+                seq: 0,
+                g_id,
+                order: RunSortOrder::Spot,
+                sorted_records: vec![record(2, 2)],
+                sorted_ops: vec![0],
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                kind,
+            };
+            let output = execute_phase2_task(
+                task,
+                &IndexerConfig::small(),
+                Arc::clone(&store),
+                fluree_db_core::tracking::Tracker::disabled(),
+                Arc::new(Semaphore::new(4)),
+                4,
+                cache_dir.path().to_path_buf(),
+            )
+            .await
+            .expect("phase 2 task");
+            assert!(
+                matches!(output.update, Phase2TaskUpdate::Unchanged),
+                "g_id={g_id}: an empty fresh branch must not be published"
+            );
+        }
     }
 
     fn cache_leaflet(
