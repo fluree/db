@@ -8,13 +8,13 @@ description = "RDF graph formatters for JSON-LD, Turtle, and other formats"
 
 [dependencies]
 fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-vocab = { path = "../fluree-vocab" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
-fluree-vocab = { path = "../fluree-vocab" }
 pretty_assertions = "1.4"
 
 [lints]

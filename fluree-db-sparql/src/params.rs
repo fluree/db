@@ -21,7 +21,8 @@
 //! as an IRI); `{"@value": s, "@language": tag}`. IRIs are full IRIs: no
 //! prefix or `@context` applies. A blank node is a stored node's `_:fdb-…`
 //! id; any other label would lower to a variable and match every node. An
-//! `f:embeddingVector` takes its numbers as a JSON array.
+//! `f:embeddingVector` takes its numbers as a JSON array. A triple term is
+//! `{"@id": {"@id": s, p: o}}`, its object any of these forms.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,8 +33,8 @@ use crate::ast::annotation::{Annotation, AnnotationVerb, ReifierId, TripleTerm};
 use crate::ast::pattern::{ServiceEndpoint, SubSelect};
 use crate::ast::query::DescribeTarget;
 use crate::ast::{
-    BlankNode, Expression, GraphName, GraphPattern, GroupCondition, Iri, IriValue, Literal,
-    LiteralValue, OrderExpr, PredicateTerm, QuadPatternElement, QueryBody, QuotedTriple,
+    BlankNode, BlankNodeValue, Expression, GraphName, GraphPattern, GroupCondition, Iri, IriValue,
+    Literal, LiteralValue, OrderExpr, PredicateTerm, QuadPatternElement, QueryBody, QuotedTriple,
     SelectVariable, SelectVariables, SolutionModifiers, SparqlAst, SubjectTerm, Term,
     TriplePattern, UpdateOperation, Var, VarOrIri,
 };
@@ -154,6 +155,7 @@ enum Value {
     Iri(Arc<str>),
     Blank(Arc<str>),
     Literal(LiteralValue),
+    Triple(Box<TripleTerm>),
 }
 
 impl Value {
@@ -191,10 +193,14 @@ impl Value {
             if let Some(err) = unexpected(&["@id"]) {
                 return Err(err);
             }
-            let Some(id) = id.as_str() else {
-                return Err(ParamError::new(name, "has an `@id` that is not a string"));
+            return match id {
+                JsonValue::String(id) => Self::node(name, id),
+                JsonValue::Object(term) => Self::triple(name, term),
+                _ => Err(ParamError::new(
+                    name,
+                    "has an `@id` that is neither a string nor a triple term",
+                )),
             };
-            return Self::node(name, id);
         }
         let Some(value) = object.get("@value") else {
             return Err(ParamError::new(
@@ -290,11 +296,39 @@ impl Value {
         }
     }
 
+    /// The triple term `{"@id": {"@id": s, p: o}}`: its subject an IRI or a
+    /// stored node, its predicate an IRI.
+    fn triple(name: &str, term: &serde_json::Map<String, JsonValue>) -> Result<Self> {
+        let parts = fluree_graph_json_ld::triple_term::triple_term_parts(term)
+            .map_err(|reason| ParamError::new(name, format!("is a triple term, but {reason}")))?;
+        let span = SourceSpan::new(0, 0);
+        let subject = match parts.subject.as_str().map(|id| Self::node(name, id)) {
+            Some(Ok(Value::Iri(iri))) => SubjectTerm::Iri(Iri::full(iri, span)),
+            Some(Ok(Value::Blank(label))) => {
+                SubjectTerm::BlankNode(BlankNode::labeled(label, span))
+            }
+            Some(Err(err)) => return Err(err),
+            _ => {
+                return Err(ParamError::new(
+                    name,
+                    "is a triple term whose subject is not an IRI or a blank node",
+                ))
+            }
+        };
+        Ok(Value::Triple(Box::new(TripleTerm {
+            subject,
+            predicate: PredicateTerm::Iri(Iri::full(parts.predicate, span)),
+            object: Self::parse(name, parts.object)?.term(span),
+            span,
+        })))
+    }
+
     fn term(self, span: SourceSpan) -> Term {
         match self {
             Value::Iri(iri) => Term::Iri(Iri::full(iri, span)),
             Value::Blank(label) => Term::BlankNode(BlankNode::labeled(label, span)),
             Value::Literal(value) => Term::Literal(Literal { value, span }),
+            Value::Triple(triple) => Term::TripleTerm(Box::new(TripleTerm { span, ..*triple })),
         }
     }
 }
@@ -389,7 +423,7 @@ impl<'p> Substitution<'p> {
                 Some(Value::Blank(label)) => {
                     *subject = SubjectTerm::BlankNode(BlankNode::labeled(label, v.span));
                 }
-                Some(Value::Literal(_)) => {
+                Some(Value::Literal(_) | Value::Triple(_)) => {
                     return Err(ParamError::new(
                         &v.name,
                         "is a subject, so it must be an IRI or a blank node",
@@ -443,7 +477,7 @@ impl<'p> Substitution<'p> {
                 Some(Value::Blank(label)) => {
                     *reifier = ReifierId::BlankNode(BlankNode::labeled(label, v.span));
                 }
-                Some(Value::Literal(_)) => {
+                Some(Value::Literal(_) | Value::Triple(_)) => {
                     return Err(ParamError::new(
                         &v.name,
                         "is a reifier, so it must be an IRI or a blank node",
@@ -687,14 +721,26 @@ impl<'p> Substitution<'p> {
         Ok(())
     }
 
+    /// The parameter's value as an expression. A blank node in it is a
+    /// stored node ([`Value::node`]), named by its `_:fdb-…` id, which lowers
+    /// to that node as the label does in a pattern. The grammar refuses a
+    /// blank node in an expression because one written in the query text is
+    /// a fresh node; a parameter never holds one.
     fn constant(&self, var: &Var, value: Value) -> Result<Expression> {
         match value.term(var.span) {
             Term::Iri(iri) => Ok(Expression::Iri(iri)),
             Term::Literal(literal) => Ok(Expression::Literal(literal)),
-            _ => Err(ParamError::new(
-                &var.name,
-                "is a blank node, which can't be used in an expression",
-            )),
+            Term::TripleTerm(triple) => {
+                crate::parse::expr::triple_term_to_expr(stored_nodes_named(*triple))
+                    .map_err(|reason| ParamError::new(&var.name, reason))
+            }
+            Term::BlankNode(node) => stored_node_iri(&node).map(Expression::Iri).ok_or_else(|| {
+                ParamError::new(
+                    &var.name,
+                    "is a blank node, which can't be used in an expression",
+                )
+            }),
+            _ => Err(ParamError::new(&var.name, "can't be used in an expression")),
         }
     }
 
@@ -744,6 +790,33 @@ impl<'p> Substitution<'p> {
         }
         Ok(())
     }
+}
+
+/// A stored node's `_:fdb-…` id as an IRI term; `None` for an anonymous node.
+fn stored_node_iri(node: &BlankNode) -> Option<Iri> {
+    match &node.value {
+        BlankNodeValue::Labeled(label) => Some(Iri::full(format!("_:{label}"), node.span)),
+        BlankNodeValue::Anon => None,
+    }
+}
+
+/// `triple` with each stored node in it, nested triple terms included, named
+/// by its `_:fdb-…` id.
+fn stored_nodes_named(mut triple: TripleTerm) -> TripleTerm {
+    if let SubjectTerm::BlankNode(node) = &triple.subject {
+        if let Some(iri) = stored_node_iri(node) {
+            triple.subject = SubjectTerm::Iri(iri);
+        }
+    }
+    triple.object = match triple.object {
+        Term::BlankNode(node) => match stored_node_iri(&node) {
+            Some(iri) => Term::Iri(iri),
+            None => Term::BlankNode(node),
+        },
+        Term::TripleTerm(inner) => Term::TripleTerm(Box::new(stored_nodes_named(*inner))),
+        other => other,
+    };
+    triple
 }
 
 #[cfg(test)]
@@ -888,6 +961,19 @@ mod tests {
                 "both",
             ),
             (json!({"@value": 1, "@language": "en"}), "must be strings"),
+            (json!({"@id": 5}), "neither a string nor a triple term"),
+            (
+                json!({"@id": {"@id": "http://example.org/a"}}),
+                "exactly one triple",
+            ),
+            (
+                json!({"@id": {"@id": 5, "http://example.org/p": 1}}),
+                "subject is not an IRI or a blank node",
+            ),
+            (
+                json!({"@id": {"@id": "_:x", "http://example.org/p": 1}}),
+                "blank node label",
+            ),
         ] {
             let err =
                 substituted("SELECT ?s WHERE { ?s <p> $v }", json!({ "v": value })).unwrap_err();
@@ -908,6 +994,64 @@ mod tests {
                 assert!(err.reason.contains("blank node label"), "{sparql}: {err}");
             }
         }
+    }
+
+    #[test]
+    fn a_triple_term_is_a_value() {
+        let ast = substituted(
+            "SELECT ?r WHERE { ?r <p> $t }",
+            json!({"t": {"@id": {
+                "@id": "http://example.org/a",
+                "http://example.org/says": {"@id": {
+                    "@id": "_:fdb-1",
+                    "http://example.org/age": 30,
+                }},
+            }}}),
+        )
+        .unwrap();
+        let triple = first_triple(&select(&ast).where_clause.pattern);
+        let Term::TripleTerm(outer) = &triple.object else {
+            panic!("expected a triple term, got {:?}", triple.object)
+        };
+        assert!(
+            matches!(&outer.subject, SubjectTerm::Iri(Iri { value: IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/a")
+        );
+        assert!(
+            matches!(&outer.predicate, PredicateTerm::Iri(Iri { value: IriValue::Full(i), .. }) if i.as_ref() == "http://example.org/says")
+        );
+        let Term::TripleTerm(inner) = &outer.object else {
+            panic!("expected a nested triple term, got {:?}", outer.object)
+        };
+        assert!(
+            matches!(&inner.subject, SubjectTerm::BlankNode(BlankNode { value: crate::ast::BlankNodeValue::Labeled(l), .. }) if l.as_ref() == "fdb-1")
+        );
+        assert!(matches!(
+            &inner.object,
+            Term::Literal(Literal {
+                value: LiteralValue::Integer(30),
+                ..
+            })
+        ));
+        assert!(!mentions_var(&ast, "t"));
+    }
+
+    #[test]
+    fn a_triple_term_is_not_a_subject_and_is_a_constructor_in_an_expression() {
+        let term = json!({"@id": {"@id": "http://example.org/a", "http://example.org/b": "c"}});
+        let err = substituted(
+            "SELECT ?o WHERE { $t <p> ?o }",
+            json!({ "t": term.clone() }),
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("is a subject"), "{err}");
+
+        let ast = substituted(
+            "SELECT ?r WHERE { ?r <p> ?o FILTER(?o = $t) }",
+            json!({ "t": term }),
+        )
+        .unwrap();
+        assert!(format!("{ast:?}").contains("FunctionCall { name: Triple"));
+        assert!(!mentions_var(&ast, "t"));
     }
 
     #[test]
@@ -988,12 +1132,13 @@ mod tests {
             let err = substituted(sparql, json!({"v": "literal"})).unwrap_err();
             assert!(err.reason.contains(reason), "{sparql}: {err}");
         }
-        let err = substituted(
+        // A stored node is that node in an expression too.
+        let ast = substituted(
             "SELECT * WHERE { ?s <p> ?o FILTER(?o = $v) }",
             json!({"v": {"@id": "_:fdb-b"}}),
         )
-        .unwrap_err();
-        assert!(err.reason.contains("blank node"), "{err}");
+        .unwrap();
+        assert!(!mentions_var(&ast, "v"));
     }
 
     #[test]

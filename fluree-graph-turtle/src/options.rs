@@ -76,6 +76,18 @@ pub enum RelativeIris {
     Verbatim,
 }
 
+/// Which grammar the parser reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Dialect {
+    /// Turtle: triples in the default graph.
+    #[default]
+    Turtle,
+    /// TriG: Turtle plus graph blocks (`GRAPH g { … }`, `g { … }`, and a
+    /// default-graph `{ … }`). A named graph needs a sink that
+    /// [supports quads](fluree_graph_ir::GraphSink::supports_quads).
+    TriG,
+}
+
 /// Conformance knobs for the Turtle parser.
 ///
 /// The default is today's ingest behavior in every field; opting in is
@@ -89,11 +101,13 @@ pub struct ParserOptions {
     pub numerics: NumericStyle,
     /// What a relative IRI reference means when no base is in force.
     pub relative_iris: RelativeIris,
+    /// Turtle, or TriG.
+    pub dialect: Dialect,
 }
 
 impl ParserOptions {
     /// Ingest defaults: [`CollectionStyle::IndexedItems`] +
-    /// [`NumericStyle::Canonicalize`].
+    /// [`NumericStyle::Canonicalize`], reading Turtle.
     pub fn new() -> Self {
         Self::default()
     }
@@ -105,6 +119,7 @@ impl ParserOptions {
             collections: CollectionStyle::Spine,
             numerics: NumericStyle::PreserveLexical,
             relative_iris: RelativeIris::Resolve,
+            dialect: Dialect::Turtle,
         }
     }
 
@@ -125,6 +140,12 @@ impl ParserOptions {
         self.relative_iris = relative_iris;
         self
     }
+
+    /// Set the dialect.
+    pub fn with_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +157,7 @@ mod tests {
         let o = ParserOptions::default();
         assert_eq!(o.collections, CollectionStyle::IndexedItems);
         assert_eq!(o.numerics, NumericStyle::Canonicalize);
+        assert_eq!(o.dialect, Dialect::Turtle);
         assert_eq!(o, ParserOptions::new());
     }
 

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -98,6 +99,29 @@ def test_an_exception_rolls_the_transaction_back():
             assert len(await ledger.query(NAMES)) == 0
 
     run(main())
+
+
+def test_parse_and_serialize_run_on_a_worker_thread(monkeypatch):
+    doc = f"<{EX}a> <{EX}p> <{EX}b> <{EX}g> .\n"
+    threads = []
+
+    def recording(fn):
+        def call(*args, **kwargs):
+            threads.append(threading.current_thread())
+            return fn(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(fluree, "parse", recording(fluree.parse))
+    monkeypatch.setattr(fluree, "serialize", recording(fluree.serialize))
+
+    async def main():
+        quads = await fluree.aio.parse(doc, "nquads")
+        assert quads == [fluree.Quad(EX + "a", EX + "p", fluree.IRI(EX + "b"), EX + "g")]
+        assert await fluree.aio.serialize(quads, "nquads") == doc
+
+    run(main())
+    assert len(threads) == 2 and threading.main_thread() not in threads
 
 
 def test_queries_run_concurrently():
