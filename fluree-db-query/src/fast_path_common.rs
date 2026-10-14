@@ -121,6 +121,34 @@ pub fn projection_sid_only() -> ColumnProjection {
     }
 }
 
+/// Decode `projection`'s columns of leaflet `idx`, through the leaflet cache
+/// when the store has one: an entry that covers them serves them projected;
+/// one that falls short decodes only the missing columns into it.
+pub(crate) fn load_leaflet_projection(
+    store: &BinaryIndexStore,
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    idx: usize,
+    projection: &ColumnProjection,
+    order: RunSortOrder,
+) -> Result<ColumnBatch> {
+    let batch = match store.leaflet_cache() {
+        Some(cache) => load_columns_cached_via_handle(
+            handle,
+            cache,
+            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                leaf_id: handle.leaf_id(),
+                leaflet_idx: idx
+                    .try_into()
+                    .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                order,
+                decode_set: projection.effective(),
+            },
+        ),
+        None => handle.load_columns(idx, projection, order),
+    };
+    batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
+}
+
 /// Projection that loads only the OKey column (internal, not output).
 #[inline]
 pub fn projection_okey_only() -> ColumnProjection {
@@ -354,6 +382,40 @@ pub fn leaf_entries_for_predicate(
     let (min_key, max_key) = predicate_range_keys(p_id, g_id);
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     &branch.leaves[leaf_range]
+}
+
+/// Ascending candidate subject boundaries for partitioning a predicate's scan.
+///
+/// When the predicate has at least `k` leaves, returns each leaf's first subject
+/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
+/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
+/// returns each matching leaflet's first subject, giving finer boundaries for a
+/// predicate that fits in one/few leaves but many leaflets. The returned values
+/// are non-decreasing (leaves and leaflets are subject-sorted).
+pub(crate) fn driver_subject_boundaries(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    k: usize,
+) -> Result<Vec<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    if leaves.len() >= k {
+        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
+    }
+    let mut bounds: Vec<u64> = Vec::new();
+    for leaf in leaves {
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
+            bounds.push(first.s_id.as_u64());
+        }
+    }
+    Ok(bounds)
 }
 
 /// Whether `p_id`'s stored rows make `(s_id, o_type, o_key)` unreliable as a
@@ -860,26 +922,13 @@ impl<'a> PsotSubjectCountIter<'a> {
                 if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
                     continue;
                 }
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Psot,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(idx, &projection, RunSortOrder::Psot)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    &projection,
+                    RunSortOrder::Psot,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 return Ok(Some(()));
@@ -1090,26 +1139,13 @@ impl<'a> PsotSubjectSeek<'a> {
                 if last.s_id.as_u64() < target_s {
                     continue;
                 }
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Psot,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(idx, &self.projection, RunSortOrder::Psot)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    &self.projection,
+                    RunSortOrder::Psot,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 return Ok(Some(()));
@@ -1298,30 +1334,13 @@ impl<'a> PostObjectGroupCountIter<'a> {
                     // off every IRI group sorting after the leaflet's o_type.)
                     continue;
                 }
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Post,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(
-                            idx,
-                            if mixed { &proj_otype_okey } else { &proj_okey },
-                            RunSortOrder::Post,
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    if mixed { &proj_otype_okey } else { &proj_okey },
+                    RunSortOrder::Post,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 self.mixed = mixed;
@@ -1541,34 +1560,17 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                     continue;
                 }
 
-                let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx
-                        .try_into()
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                    load_columns_cached_via_handle(
-                        handle.as_ref(),
-                        cache,
-                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                            leaf_id: handle.leaf_id(),
-                            leaflet_idx: idx_u32,
-                            order: RunSortOrder::Psot,
-                            decode_set: ColumnSet::ALL,
-                        },
-                    )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                } else {
-                    handle
-                        .load_columns(
-                            idx,
-                            if mixed {
-                                &proj_sid_otype_okey
-                            } else {
-                                &proj_sid_okey
-                            },
-                            RunSortOrder::Psot,
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                };
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    if mixed {
+                        &proj_sid_otype_okey
+                    } else {
+                        &proj_sid_okey
+                    },
+                    RunSortOrder::Psot,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 self.mixed = mixed;
@@ -3477,10 +3479,10 @@ pub fn count_predicate_overlay_delta(
         if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
             base_touched = base_touched.saturating_add(leaf.row_count);
         } else {
-            let handle = store
-                .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::from_io("leaf open", e))?;
-            for entry in &handle.dir().entries {
+            let dir = store
+                .open_leaf_dir(&leaf.leaf_cid)
+                .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+            for entry in &dir.entries {
                 if entry.row_count != 0 && entry.p_const == Some(p_id) {
                     base_touched = base_touched.saturating_add(entry.row_count as u64);
                 }

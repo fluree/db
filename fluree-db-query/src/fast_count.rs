@@ -473,10 +473,10 @@ fn boundary_leaf_pid_extent(
     leaf: &LeafEntry,
     last: bool,
 ) -> Result<Option<(u16, u64)>> {
-    let handle = store
-        .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-        .map_err(|e| QueryError::from_io("leaf open", e))?;
-    let entries = &handle.dir().entries;
+    let dir = store
+        .open_leaf_dir(&leaf.leaf_cid)
+        .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+    let entries = &dir.entries;
     let mut indices = (0..entries.len()).collect::<Vec<_>>();
     if last {
         indices.reverse();

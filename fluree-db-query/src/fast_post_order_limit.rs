@@ -360,10 +360,10 @@ fn base_predicate_o_type(
 ) -> Result<OneOType> {
     let mut found = OneOType::Empty;
     for leaf in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
-        let handle = store
-            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }

@@ -51,6 +51,7 @@
 
 use crate::error::{Result, TransactError};
 use crate::namespace::NamespaceRegistry;
+use crate::parse::txn_meta::check_user_predicate;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES};
 use fluree_graph_turtle::{tokenize, Token, TokenKind};
 use rustc_hash::FxHashMap;
@@ -228,6 +229,11 @@ pub fn resolve_trig_meta(
 
         // Convert predicate to namespace code + name
         let pred_sid = ns_registry.sid_for_iri(&predicate_iri);
+        check_user_predicate(
+            pred_sid.namespace_code,
+            &pred_sid.name,
+            &format!("<{predicate_iri}>"),
+        )?;
 
         // Convert each object to TxnMetaEntry
         for obj in &triple.objects {

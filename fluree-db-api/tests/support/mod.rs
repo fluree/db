@@ -264,6 +264,21 @@ pub fn genesis_ledger_for_fluree(_fluree: &fluree_db_api::Fluree, ledger_id: &st
     LedgerState::new(db, Novelty::new(0))
 }
 
+/// Two instances over one storage and one nameservice, each with its own
+/// ledger cache: the shape of several servers sharing S3 and DynamoDB. A
+/// change one makes reaches the other only through storage.
+pub fn instances_sharing_storage() -> (MemoryFluree, MemoryFluree) {
+    let storage = fluree_db_core::MemoryStorage::new();
+    let nameservice = Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+    let instance = || {
+        fluree_db_api::FlureeBuilder::memory().build_with(
+            storage.clone(),
+            fluree_db_api::NameServiceMode::ReadWrite(nameservice.clone()),
+        )
+    };
+    (instance(), instance())
+}
+
 // =============================================================================
 // Common seeding helpers
 // =============================================================================
