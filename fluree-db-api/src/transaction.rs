@@ -407,70 +407,82 @@ impl Transaction {
         };
 
         const MAX_RETRIES: usize = 16;
-        for attempt in 0..MAX_RETRIES {
-            let guard = handle.lock_for_write().await;
-            let unchanged = guard.state().t() == base_t
-                && guard.state().head_commit_id.as_ref() == base_head.as_ref();
-            if read && !unchanged {
-                return Err(ApiError::Transact(TransactError::CommitConflict {
-                    expected_t: base_t,
-                    head_t: guard.state().t(),
-                }));
-            }
-            let stage = match prestaged.take() {
-                Some(stage) if unchanged => {
-                    handle.note_write_path(WritePath::Direct);
-                    stage
+        let attempts_span = tracing::debug_span!("txn_attempts", attempts = tracing::field::Empty);
+        let committed = async {
+            let mut attempt = 0;
+            loop {
+                tracing::Span::current().record("attempts", attempt + 1);
+                let guard = handle.lock_for_write().await;
+                let unchanged = guard.state().t() == base_t
+                    && guard.state().head_commit_id.as_ref() == base_head.as_ref();
+                if read && !unchanged {
+                    return Err(ApiError::Transact(TransactError::CommitConflict {
+                        expected_t: base_t,
+                        head_t: guard.state().t(),
+                    }));
                 }
-                prestaged => match prestaged.and_then(|stage| {
-                    Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref())
-                }) {
-                    Some(stage) => {
-                        handle.note_write_path(WritePath::Rebased);
+                let stage = match prestaged.take() {
+                    Some(stage) if unchanged => {
+                        handle.note_write_path(WritePath::Direct);
                         stage
                     }
-                    None => {
-                        handle.note_write_path(WritePath::Restaged);
-                        let state = guard.clone_state();
-                        // The policy the ledger has now: a commit since the
-                        // transaction began may have changed it.
-                        context.policy =
-                            transact_policy(&fluree, &state, &context.governance).await?;
-                        stage_all(&fluree, state, &operations, &context)
-                            .await?
-                            .finish()
-                            .await?
+                    prestaged => match prestaged.and_then(|stage| {
+                        Fluree::rebase_stage(&guard, stage, base_t, base_head.as_ref())
+                    }) {
+                        Some(stage) => {
+                            handle.note_write_path(WritePath::Rebased);
+                            stage
+                        }
+                        None => {
+                            handle.note_write_path(WritePath::Restaged);
+                            let state = guard.clone_state();
+                            // The policy the ledger has now: a commit since the
+                            // transaction began may have changed it.
+                            context.policy =
+                                transact_policy(&fluree, &state, &context.governance).await?;
+                            stage_all(&fluree, state, &operations, &context)
+                                .await?
+                                .finish()
+                                .await?
+                        }
+                    },
+                };
+                match fluree
+                    .commit_and_finalize(
+                        guard,
+                        stage,
+                        TxnType::Update,
+                        commit_opts.clone(),
+                        &context.index_config,
+                        context.tracker.tally(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(result) => return Ok(result),
+                    Err(e) if is_retryable_commit_conflict(&e) => {
+                        if attempt + 1 == MAX_RETRIES {
+                            return Err(ApiError::commit_contention(MAX_RETRIES, e));
+                        }
+                        // The durable head moved under the cache (another
+                        // process); heal the cache and stage again.
+                        tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "transaction commit conflict; reconciling and retrying"
+                        );
+                        if let Err(refresh_err) =
+                            fluree.refresh(&ledger_id, RefreshOpts::default()).await
+                        {
+                            tracing::warn!(error = %refresh_err, "refresh after transaction commit conflict failed");
+                        }
+                        attempt += 1;
                     }
-                },
-            };
-            match fluree
-                .commit_and_finalize(
-                    guard,
-                    stage,
-                    TxnType::Update,
-                    commit_opts.clone(),
-                    &context.index_config,
-                    context.tracker.tally(),
-                    None,
-                )
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) if attempt + 1 < MAX_RETRIES && is_retryable_commit_conflict(&e) => {
-                    // The durable head moved under the cache (another
-                    // process); heal the cache and stage again.
-                    if let Err(refresh_err) =
-                        fluree.refresh(&ledger_id, RefreshOpts::default()).await
-                    {
-                        tracing::warn!(error = %refresh_err, "refresh after transaction commit conflict failed");
-                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
-        }
-        Err(ApiError::internal(format!(
-            "transaction commit retry limit exceeded ({MAX_RETRIES} attempts)"
-        )))
+        };
+        tracing::Instrument::instrument(committed, attempts_span).await
     }
 }
 

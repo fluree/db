@@ -1501,7 +1501,7 @@ impl<'a> FromQueryBuilder<'a> {
 
         let authorized_json = self
             .prepare_authorization()
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), None))?;
+            .map_err(|e| TrackedErrorResponse::from_api(e, None))?;
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
@@ -1526,7 +1526,7 @@ impl<'a> FromQueryBuilder<'a> {
                     return Ok(TrackedQueryResponse::success(expanded, None));
                 }
                 Ok(None) => {}
-                Err(e) => return Err(TrackedErrorResponse::new(500, e.to_string(), None)),
+                Err(e) => return Err(TrackedErrorResponse::from_api(e, None)),
             }
         }
         // SPARQL policy via connection opts (multi-query aliases) — see

@@ -327,6 +327,17 @@ impl TrackedErrorResponse {
         }
     }
 
+    /// An engine error, answering the status [`crate::ApiError::status_code`]
+    /// gives it, so a tracked request answers what the same request untracked
+    /// does. The message is the error's own.
+    pub fn from_api<E>(err: E, tally: Option<TrackingTally>) -> Self
+    where
+        E: std::fmt::Display + Into<crate::ApiError>,
+    {
+        let error = err.to_string();
+        Self::new(err.into().status_code(), error, tally)
+    }
+
     /// Create a fuel exceeded error response
     pub fn fuel_exceeded(err: &FuelExceededError, tally: Option<TrackingTally>) -> Self {
         Self::new(400, err.to_string(), tally)

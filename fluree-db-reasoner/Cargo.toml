@@ -11,7 +11,7 @@ fluree-db-core = { path = "../fluree-db-core" }
 fluree-vocab = { path = "../fluree-vocab" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-lru = "0.12"
+lru = { workspace = true }
 bigdecimal = "0.4"
 num-bigint = "0.4"
 parking_lot = "0.12"

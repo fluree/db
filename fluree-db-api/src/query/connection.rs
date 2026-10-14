@@ -72,7 +72,7 @@ impl Fluree {
         // ~2 MB worker stack on a plain `select *` query (fluree/db#1408).
         let view = Box::pin(self.try_single_view_from_spec(spec))
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
 
         let Some(view) = view else {
             return Ok(None);
@@ -81,7 +81,7 @@ impl Fluree {
         let source = &spec.default_graphs[0];
         let view = Box::pin(self.apply_source_or_global_policy(view, source, qc_opts))
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
         Ok(Some(view))
     }
 
@@ -96,7 +96,7 @@ impl Fluree {
             self.build_dataset_view_as(spec, qc_opts.server_identity.as_ref())
                 .await
         };
-        dataset.map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))
+        dataset.map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))
     }
 
     async fn prepare_single_view_for_connection_with_policy(
@@ -321,9 +321,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = connection_dataset_spec(query_json, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -471,9 +470,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = connection_dataset_spec(query_json, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -535,9 +533,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -550,7 +547,7 @@ impl Fluree {
         let single_view = self
             .try_single_view_from_spec(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
 
         if let Some(view) = single_view {
             let view = view.with_policy(Arc::new(policy.clone()));
@@ -569,7 +566,7 @@ impl Fluree {
         let dataset = self
             .build_dataset_view(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
         self.query_dataset_tracked_with_r2rml_options(
             &dataset,
@@ -599,9 +596,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -615,7 +611,7 @@ impl Fluree {
         let single_view = self
             .try_single_view_from_spec(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
 
         if let Some(view) = single_view {
             let view = view.with_policy(Arc::new(policy.clone()));
@@ -634,7 +630,7 @@ impl Fluree {
         let dataset = self
             .build_dataset_view(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
         self.query_dataset_tracked_with_options(
             &dataset,
@@ -892,12 +888,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-        let spec = connection_sparql_dataset_spec(&ast, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let ast = parse_and_validate_sparql(sparql, None)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -910,7 +904,7 @@ impl Fluree {
         let dataset = self
             .build_dataset_view(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
 
         self.query_dataset_tracked_with_options(
             &dataset,
@@ -957,12 +951,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-        let spec = connection_sparql_dataset_spec(&ast, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let ast = parse_and_validate_sparql(sparql, None)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -975,7 +967,7 @@ impl Fluree {
         let dataset = self
             .build_dataset_view(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
 
         self.query_dataset_tracked_with_r2rml_options(
             &dataset,
@@ -1005,12 +997,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-        let spec = connection_sparql_dataset_spec(&ast, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let ast = parse_and_validate_sparql(sparql, None)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -1023,7 +1013,7 @@ impl Fluree {
         let dataset = self
             .build_dataset_view(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
 
         self.query_dataset_tracked_with_options(
@@ -1055,12 +1045,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-        let spec = connection_sparql_dataset_spec(&ast, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let ast = parse_and_validate_sparql(sparql, None)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -1114,12 +1102,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-        let spec = connection_sparql_dataset_spec(&ast, &options).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let ast = parse_and_validate_sparql(sparql, None)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -1132,7 +1118,7 @@ impl Fluree {
         let dataset = self
             .build_dataset_view(&spec)
             .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
 
         self.query_dataset_tracked_with_r2rml_options(

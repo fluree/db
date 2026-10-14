@@ -929,6 +929,12 @@ pub enum SubmissionError {
     #[error("{message}")]
     CommitNotFound { message: String },
 
+    /// Every commit attempt lost its race with other writers to the ledger
+    /// (HTTP 503, `err:db/CommitContention`, `Retry-After`). Retryable, and
+    /// typed because a 503 `Execution` status reads as unsettled.
+    #[error("{message}")]
+    CommitContention { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -969,6 +975,10 @@ impl SubmissionError {
             Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
             // Decided before commit construction, like the novelty refusals.
             Self::DatatypeLimitExceeded { .. } | Self::CommitNotFound { .. } => true,
+            // Every attempt's commit failed its head check, so nothing
+            // committed; settled, like the novelty refusals, so a keyed retry
+            // re-executes.
+            Self::CommitContention { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }

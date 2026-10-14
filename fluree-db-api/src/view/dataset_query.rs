@@ -5,7 +5,7 @@
 use crate::query::helpers::{
     build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
     parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset,
-    status_for_query_error, tracked_query_tracker, tracker_for_input_limits,
+    tracked_query_tracker, tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
@@ -366,9 +366,9 @@ impl Fluree {
     {
         // Tracker: caller-provided options if given, else per-input defaults.
         let tracker = tracked_query_tracker(&input, &tracking_override, parsed_ast.as_ref());
-        let params = options.sparql_params(&input).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-        })?;
+        let params = options
+            .sparql_params(&input)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)
@@ -394,9 +394,7 @@ impl Fluree {
                 primary.default_context.as_ref(),
                 None,
             )
-            .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-            })?,
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
             QueryInput::Sparql(sparql) => {
                 let lowered = match parsed_ast {
                     Some(ast) => lower_sparql_ast(
@@ -412,9 +410,8 @@ impl Fluree {
                         params,
                     ),
                 };
-                lowered.map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-                })?
+                lowered
+                    .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
             }
         };
 
@@ -428,9 +425,7 @@ impl Fluree {
             &parsed,
             super::query::QuerySyntax::of(&input),
         )
-        .map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-        })?;
+        .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         // Build executable
         // Report the error's own status, as the single-view tracked path
@@ -439,17 +434,14 @@ impl Fluree {
         let executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
-            .map_err(|e| {
-                let status = e.status_code();
-                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
-            })?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         // Execute with tracking
         let batches = self
             .execute_dataset_tracked(dataset, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
-                let status = status_for_query_error(&e);
+                let status = crate::error::query_error_status(&e);
                 crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
@@ -474,9 +466,7 @@ impl Fluree {
         let result_json = query_result
             .format_async_for_view_tracked(primary, &format_config, &tracker)
             .await
-            .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-            })?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         Ok(crate::query::TrackedQueryResponse::success(
             result_json,
@@ -497,9 +487,9 @@ impl Fluree {
         let input = q.into();
 
         let tracker = tracked_query_tracker(&input, &tracking_override, None);
-        let params = options.sparql_params(&input).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-        })?;
+        let params = options
+            .sparql_params(&input)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
         charge_query_floor(&tracker)
@@ -522,18 +512,14 @@ impl Fluree {
                 primary.default_context.as_ref(),
                 None,
             )
-            .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-            })?,
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
             QueryInput::Sparql(sparql) => parse_sparql_to_ir(
                 sparql,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 params,
             )
-            .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-            })?,
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
         };
 
         // Auto-wrap for graph source context, then refuse whatever the wrap
@@ -546,9 +532,7 @@ impl Fluree {
             &parsed,
             super::query::QuerySyntax::of(&input),
         )
-        .map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-        })?;
+        .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         // Report the error's own status, as the single-view tracked path
         // does: query preparation completes the ledger's config defaults, so
@@ -556,10 +540,7 @@ impl Fluree {
         let executable = self
             .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
-            .map_err(|e| {
-                let status = e.status_code();
-                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
-            })?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         let batches = self
             .execute_dataset_tracked_with_r2rml(
@@ -572,7 +553,7 @@ impl Fluree {
             )
             .await
             .map_err(|e| {
-                let status = status_for_query_error(&e);
+                let status = crate::error::query_error_status(&e);
                 crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
@@ -594,9 +575,7 @@ impl Fluree {
         let result_json = query_result
             .format_async_for_view_tracked(primary, &format_config, &tracker)
             .await
-            .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-            })?;
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         Ok(crate::query::TrackedQueryResponse::success(
             result_json,
