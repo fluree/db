@@ -650,7 +650,7 @@ impl Operator for SortOperator {
                     if k == 0 {
                         BinaryHeap::new()
                     } else {
-                        BinaryHeap::with_capacity(k + 1)
+                        BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(k))
                     }
                 });
 
