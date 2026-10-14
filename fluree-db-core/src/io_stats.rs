@@ -63,6 +63,25 @@ pub fn record_work(kind: &'static str, bytes: usize) {
     entry.1 += bytes as u64;
 }
 
+/// The reads recorded so far: `(kind, source, count, bytes)`.
+pub fn reads_snapshot() -> Vec<(String, &'static str, u64, u64)> {
+    TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|((kind, source), (n, b))| (kind.clone(), *source, *n, *b))
+        .collect()
+}
+
+/// The work recorded so far: `(kind, count, bytes)`.
+pub fn work_snapshot() -> Vec<(&'static str, u64, u64)> {
+    WORK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(kind, (n, b))| (*kind, *n, *b))
+        .collect()
+}
+
 /// Forget everything recorded so far.
 pub fn reset() {
     if enabled() {
