@@ -390,7 +390,7 @@ struct Phase2Task {
     sorted_ops: Vec<u8>,
     /// Superseded events for this (graph, order), sorted like
     /// `sorted_records`. Their real-transition subset becomes history-sidecar
-    /// entries in the leaf merge.
+    /// entries in the leaf merge, or in the fresh branch's writer.
     sorted_superseded: Vec<RunRecordV2>,
     sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
@@ -506,27 +506,19 @@ async fn execute_phase2_task(
             }
         }
         Phase2TaskKind::DefaultFresh => {
-            if !sorted_superseded.is_empty() {
-                // Permanent gap: these are real in-window transitions (e.g. a
-                // fact born and deleted between two index builds) and the next
-                // window's novelty never re-sees them. Reachable beyond
-                // genesis — the root format permits graphs with fewer than
-                // four materialized orders, so a newly added order takes this
-                // arm for an existing graph, leaving that order's replay
-                // without history its sibling orders have.
-                tracing::warn!(
-                    g_id,
-                    ?order,
-                    dropped = sorted_superseded.len(),
-                    "fresh default-graph order has no sidecar to merge into; \
-                     dropping this window's intra-window transition history"
-                );
-            }
             let BranchUpdateResult {
                 leaf_entries,
                 new_leaf_blobs,
                 ..
-            } = build_fresh_default_graph_v3(&sorted_records, &sorted_ops, order, g_id, config)?;
+            } = build_fresh_branch_v3(
+                &sorted_records,
+                &sorted_ops,
+                &sorted_superseded,
+                &sorted_superseded_ops,
+                order,
+                g_id,
+                config,
+            )?;
             let new_leaf_count = new_leaf_blobs.len();
             upload_leaf_blobs(
                 content_store.as_ref(),
@@ -597,16 +589,6 @@ async fn execute_phase2_task(
             }
         }
         Phase2TaskKind::NamedFresh => {
-            if !sorted_superseded.is_empty() {
-                // Permanent gap; see the DefaultFresh arm above.
-                tracing::warn!(
-                    g_id,
-                    ?order,
-                    dropped = sorted_superseded.len(),
-                    "fresh named-graph order has no sidecar to merge into; \
-                     dropping this window's intra-window transition history"
-                );
-            }
             let BranchUpdateResult {
                 new_leaf_blobs,
                 replaced_leaf_cids,
@@ -614,7 +596,15 @@ async fn execute_phase2_task(
                 branch_bytes,
                 branch_cid: expected_branch_cid,
                 ..
-            } = build_fresh_named_graph_v3(&sorted_records, order, g_id, config)?;
+            } = build_fresh_branch_v3(
+                &sorted_records,
+                &sorted_ops,
+                &sorted_superseded,
+                &sorted_superseded_ops,
+                order,
+                g_id,
+                config,
+            )?;
             let new_leaf_count = new_leaf_blobs.len();
             upload_leaf_blobs(
                 content_store.as_ref(),
@@ -4747,19 +4737,25 @@ async fn upload_leaf_blobs(
     Ok(())
 }
 
-/// Build a fresh V3 branch from pure novelty for the default graph.
-fn build_fresh_default_graph_v3(
+/// Build a fresh V3 branch from pure novelty, for a graph (default or
+/// named) or order that has no branch in the base root.
+///
+/// Nothing precedes the window in this branch, so each fact's in-window
+/// events — its net op plus the events lifecycle dedup superseded — resolve
+/// from absent, exactly as a full rebuild resolves its complete log: the
+/// transitions go to the history sidecar and only a final assert becomes a
+/// row. A fact whose net op is a retraction leaves history and no row.
+fn build_fresh_branch_v3(
     sorted_records: &[RunRecordV2],
-    // Kept for: filtering retractions in fresh branches once the rebuild
-    // pipeline supports retraction-aware builds. Currently only assertions
-    // appear in fresh branches so ops are not consulted.
     sorted_ops: &[u8],
+    sorted_superseded: &[RunRecordV2],
+    sorted_superseded_ops: &[u8],
     order: RunSortOrder,
     g_id: u16,
     config: &IndexerConfig,
 ) -> Result<BranchUpdateResult> {
-    let _ = sorted_ops;
     use crate::run_index::build::incremental_leaf::NewLeafBlob;
+    use crate::run_index::build::novelty_merge::gather_identity_events;
     use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
     use fluree_db_binary_index::format::leaf::LeafWriter;
     use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
@@ -4768,10 +4764,32 @@ fn build_fresh_default_graph_v3(
     let leaf_target = leaflet_target.saturating_mul(config.leaflets_per_leaf.max(1));
 
     let mut writer = LeafWriter::new(order, leaflet_target, leaf_target, 1);
-    for rec in sorted_records {
+    let mut events = Vec::new();
+    let mut si = 0;
+    for (rec, &op) in sorted_records.iter().zip(sorted_ops) {
+        gather_identity_events(
+            sorted_superseded,
+            sorted_superseded_ops,
+            &mut si,
+            rec,
+            op,
+            &mut events,
+        );
         writer
-            .push_record(*rec)
+            .push_lifecycle(&mut events)
             .map_err(|e| IndexerError::StorageWrite(format!("V3 fresh branch writer: {e}")))?;
+    }
+    // Every superseded event's identity has a winner in this graph's
+    // novelty, so the cursor must have consumed them all; a stranded event
+    // would mean lost history.
+    if sorted_records.len() != sorted_ops.len() || si != sorted_superseded.len() {
+        return Err(IndexerError::StorageWrite(format!(
+            "V3 fresh branch g_id={g_id} {order:?}: {} records with {} ops, \
+             {si} of {} superseded events matched a record",
+            sorted_records.len(),
+            sorted_ops.len(),
+            sorted_superseded.len(),
+        )));
     }
 
     let leaf_infos = writer
@@ -4815,18 +4833,6 @@ fn build_fresh_default_graph_v3(
         branch_cid,
         matched: Vec::new(),
     })
-}
-
-/// Build a fresh V3 branch from pure novelty for a named graph.
-///
-/// Same as `build_fresh_default_graph_v3` — the build pipeline is graph-agnostic.
-fn build_fresh_named_graph_v3(
-    sorted_records: &[RunRecordV2],
-    order: RunSortOrder,
-    g_id: u16,
-    config: &IndexerConfig,
-) -> Result<BranchUpdateResult> {
-    build_fresh_default_graph_v3(sorted_records, &[], order, g_id, config)
 }
 
 /// Build predicate SIDs from resolver state for the index root.

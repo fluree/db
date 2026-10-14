@@ -13,11 +13,9 @@ use super::merge::KWayMerge;
 use crate::run_index::runs::run_file::StreamingRunFileWriter;
 use crate::run_index::runs::streaming_reader::StreamingRunReader;
 use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
-use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::leaf::{LeafInfo, LeafWriter};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
-use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_core::ContentId;
 use fluree_db_core::GraphId;
 use std::io;
@@ -257,27 +255,9 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
             events.extend(history);
             events.push((record, op));
             // A rebuild sees the complete log, so lifecycles walk from
-            // absent; `events` is left holding the sidecar transitions.
-            let row = resolve_transitions(&mut events, false);
-            if !config.skip_history {
-                for &(rec, rec_op) in &events {
-                    writer.push_history_entry(
-                        fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
-                            s_id: rec.s_id,
-                            p_id: rec.p_id,
-                            o_type: rec.o_type,
-                            o_key: rec.o_key,
-                            o_i: rec.o_i,
-                            t: rec.t,
-                            op: rec_op,
-                        },
-                    );
-                }
-            }
-            // Identities without a materialized row (final state absent)
-            // still count toward progress below.
-            if let Some(row) = row {
-                writer.push_record(row)?;
+            // absent. Identities without a materialized row (final state
+            // absent) still count toward progress below.
+            if writer.push_lifecycle(&mut events)? {
                 total_rows += 1;
             }
         }
@@ -482,8 +462,15 @@ impl PersistingLeafWriter {
         Ok(())
     }
 
-    pub(crate) fn push_history_entry(&mut self, entry: HistEntryV2) {
-        self.inner.push_history_entry(entry);
+    pub(crate) fn push_lifecycle(
+        &mut self,
+        events: &mut Vec<(RunRecordV2, u8)>,
+    ) -> io::Result<bool> {
+        let wrote_row = self.inner.push_lifecycle(events)?;
+        for info in self.inner.drain_completed_leaves() {
+            self.persisted.push(persist_leaf(&self.graph_dir, info)?);
+        }
+        Ok(wrote_row)
     }
 
     pub(crate) fn finish(mut self) -> io::Result<GraphIndexResult> {
@@ -835,6 +822,7 @@ pub fn build_all_indexes(
 mod tests {
     use super::*;
     use crate::run_index::runs::run_file::write_run_file;
+    use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
     use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3, decode_leaf_header_v3};
     use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
     use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
