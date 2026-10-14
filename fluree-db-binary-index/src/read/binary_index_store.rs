@@ -1256,7 +1256,20 @@ impl BinaryIndexStore {
             return Ok(None);
         };
         Ok(Some(match &self.leaflet_cache {
-            Some(cache) if keep => cache.get_or_insert_ranged_leaf(leaf_id, source),
+            Some(cache) if keep => {
+                // Its decrypted units are kept too, so a reader that loads
+                // columns without the decoded cache does not decrypt again.
+                let source: Arc<dyn fluree_db_core::RangeSource> = if super::cached_units::enabled()
+                {
+                    Arc::new(super::cached_units::CachedUnits::new(
+                        source,
+                        Arc::clone(cache),
+                    ))
+                } else {
+                    source
+                };
+                cache.get_or_insert_ranged_leaf(leaf_id, source)
+            }
             _ => source,
         }))
     }
@@ -5821,6 +5834,7 @@ pub(crate) mod tests {
         pub(crate) struct RecordingSource {
             bytes: Vec<u8>,
             unit: u64,
+            identity: u128,
             reads: Mutex<Vec<Range<u64>>>,
         }
 
@@ -5849,6 +5863,10 @@ pub(crate) mod tests {
 
             fn cache_weight(&self) -> usize {
                 1024
+            }
+
+            fn cache_identity(&self) -> u128 {
+                self.identity
             }
         }
 
@@ -5950,10 +5968,11 @@ pub(crate) mod tests {
                 let Some(bytes) = self.inner.get_local(id)? else {
                     return Ok(None);
                 };
-                self.opens.fetch_add(1, AtomicOrdering::SeqCst);
+                let opened = self.opens.fetch_add(1, AtomicOrdering::SeqCst);
                 let source = Arc::new(RecordingSource {
                     bytes: bytes.to_vec(),
                     unit: self.unit,
+                    identity: opened as u128,
                     reads: Mutex::new(Vec::new()),
                 });
                 self.sources.lock().unwrap().push(Arc::clone(&source));
@@ -6097,6 +6116,43 @@ pub(crate) mod tests {
             assert!(largest < len / 4, "largest read {largest} of {len}");
             assert!(bytes_read(&reads, len) <= len + 4096 * reads.len() as u64);
             assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        /// Readers that load columns without the decoded cache, as scan
+        /// fast paths do, read each of a leaf's units from the source once:
+        /// the decrypted units are kept in the leaflet cache.
+        #[test]
+        fn uncached_column_loads_read_each_unit_once() {
+            let (cs, store, leaf_cid, _) = setup(true);
+            let projection = ColumnProjection {
+                output: okey_and_sid(),
+                internal: ColumnSet::EMPTY,
+            };
+            let scan = || {
+                let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+                for idx in 0..handle.dir().entries.len() {
+                    handle
+                        .load_columns(idx, &projection, RunSortOrder::Post)
+                        .unwrap();
+                }
+            };
+            scan();
+            let reads = cs.reads();
+            assert!(
+                reads.iter().all(|r| r.start % 4096 == 0),
+                "whole units: {reads:?}"
+            );
+            scan();
+            assert_eq!(
+                cs.reads().len(),
+                reads.len(),
+                "a second scan decrypts nothing"
+            );
+            let cache = store.leaflet_cache.as_ref().unwrap();
+            assert!(cache
+                .occupancy()
+                .iter()
+                .any(|(kind, _, _)| *kind == "source-unit"));
         }
 
         /// A directory walk reads the leaf's prefix and keeps nothing but

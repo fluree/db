@@ -959,6 +959,10 @@ impl RangeSource for CountedSource {
     fn cache_weight(&self) -> usize {
         self.source.cache_weight()
     }
+
+    fn cache_identity(&self) -> u128 {
+        self.source.cache_identity()
+    }
 }
 
 /// Bridge adapter that wraps an existing `S: Storage` to provide `ContentStore`.

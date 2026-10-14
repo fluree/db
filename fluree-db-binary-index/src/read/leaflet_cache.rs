@@ -219,6 +219,10 @@ enum CacheKey {
     /// One decrypted page of a forward dictionary pack read by range.
     /// Content-addressed through the pack's CID.
     ForwardPage(ForwardPageKey),
+    /// One read unit (a decrypted segment) of a ranged local source, keyed
+    /// by the source's identity, which is scoped to the storage instance and
+    /// to the object's envelope.
+    SourceUnit(SourceUnitKey),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -260,6 +264,14 @@ pub struct V3BatchCacheKey {
     /// covers is served projected, and a wider one decodes only the missing
     /// columns and widens the entry.
     pub columns: u16,
+}
+
+/// A read unit of a ranged source: `source` is its
+/// [`cache_identity`](fluree_db_core::RangeSource::cache_identity).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct SourceUnitKey {
+    pub source: u128,
+    pub unit: u64,
 }
 
 /// A forward pack page: `pack` is `xxh3_128(pack CID bytes)`.
@@ -433,6 +445,7 @@ enum CachedEntry {
     LeafBytes(ContentBytes),
     RangedLeaf(Arc<dyn RangeSource>),
     ForwardPage(Arc<[u8]>),
+    SourceUnit(Arc<[u8]>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -457,6 +470,7 @@ impl CachedEntry {
             CachedEntry::LeafBytes(ContentBytes::Mapped(_)) => "leaf-bytes-mapped",
             CachedEntry::RangedLeaf(_) => "ranged-leaf",
             CachedEntry::ForwardPage(_) => "forward-page",
+            CachedEntry::SourceUnit(_) => "source-unit",
             CachedEntry::Bm25Leaflet(_) => "bm25-leaflet",
             CachedEntry::VectorShard(_) => "vector-shard",
             CachedEntry::LedgerInfo(_) => "ledger-info",
@@ -477,6 +491,7 @@ impl CachedEntry {
             CachedEntry::LeafBytes(bytes) => bytes.cache_weight(),
             CachedEntry::RangedLeaf(source) => source.cache_weight(),
             CachedEntry::ForwardPage(page) => page.len(),
+            CachedEntry::SourceUnit(unit) => unit.len(),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -841,6 +856,32 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::ForwardPage(page)) => Ok(page),
             Ok(_) => unreachable!("ForwardPage key always maps to ForwardPage entry"),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
+        }
+    }
+
+    /// A ranged source's read unit, read by `load` at most once however
+    /// many readers race on it. A failed load is not cached.
+    pub fn try_get_or_load_source_unit<F>(
+        &self,
+        key: SourceUnitKey,
+        load: F,
+    ) -> io::Result<Arc<[u8]>>
+    where
+        F: FnOnce() -> io::Result<Arc<[u8]>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(CachedEntry::SourceUnit(unit)) = self.inner.get(&CacheKey::SourceUnit(key)) {
+            return Ok(unit);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::SourceUnit(key), || {
+                load().map(CachedEntry::SourceUnit)
+            })
+        });
+        match result {
+            Ok(CachedEntry::SourceUnit(unit)) => Ok(unit),
+            Ok(_) => unreachable!("SourceUnit key always maps to SourceUnit entry"),
             Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }

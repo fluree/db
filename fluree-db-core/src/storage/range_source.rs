@@ -38,4 +38,11 @@ pub trait RangeSource: fmt::Debug + Send + Sync {
 
     /// Bytes this source keeps alive, as a cache budget should count them.
     fn cache_weight(&self) -> usize;
+
+    /// Identifies what this source reads, for a cache of what it returns.
+    /// Two sources share an identity only when they read the same stored
+    /// bytes for the same reader: an object written again at its address
+    /// (re-encrypted) gets a new one, and so does a reader holding other
+    /// keys, so neither is served what was cached for another.
+    fn cache_identity(&self) -> u128;
 }

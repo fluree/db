@@ -87,6 +87,9 @@ use std::sync::Arc;
 pub struct EncryptedStorage<S, K> {
     inner: S,
     keys: Arc<K>,
+    /// Random per instance (shared by clones): scopes what a cache of
+    /// decrypted bytes may serve to readers of this storage.
+    context: [u8; 16],
 }
 
 impl<S, K> EncryptedStorage<S, K>
@@ -100,17 +103,20 @@ where
     /// * `inner` - The underlying storage to wrap
     /// * `keys` - Key provider for encryption/decryption
     pub fn new(inner: S, keys: K) -> Self {
-        Self {
-            inner,
-            keys: Arc::new(keys),
-        }
+        Self::with_arc_keys(inner, Arc::new(keys))
     }
 
     /// Create with an existing Arc'd key provider.
     ///
     /// Useful when sharing a key provider across multiple storage instances.
     pub fn with_arc_keys(inner: S, keys: Arc<K>) -> Self {
-        Self { inner, keys }
+        let mut context = [0u8; 16];
+        OsRng.fill_bytes(&mut context);
+        Self {
+            inner,
+            keys,
+            context,
+        }
     }
 
     /// Get a reference to the underlying storage.
@@ -269,6 +275,7 @@ fn write_format() -> WriteFormat {
 struct SegmentedSource {
     envelope: fluree_db_core::ContentBytes,
     key: segmented::ObjectKey,
+    identity: u128,
 }
 
 impl Debug for SegmentedSource {
@@ -299,6 +306,12 @@ impl fluree_db_core::RangeSource for SegmentedSource {
     fn cache_weight(&self) -> usize {
         self.envelope.cache_weight() + std::mem::size_of::<segmented::ObjectKey>()
     }
+
+    /// This storage instance and this envelope: its header carries the
+    /// salt drawn for each encryption.
+    fn cache_identity(&self) -> u128 {
+        self.identity
+    }
 }
 
 // Debug impl that doesn't expose key material
@@ -317,6 +330,7 @@ impl<S: Clone, K> Clone for EncryptedStorage<S, K> {
         Self {
             inner: self.inner.clone(),
             keys: Arc::clone(&self.keys),
+            context: self.context,
         }
     }
 }
@@ -399,7 +413,20 @@ where
         }
         let key = Self::object_key(&self.keys, &envelope)?;
         segmented::check_envelope_len(key.header(), envelope.len() as u64)?;
-        Ok(Some(Arc::new(SegmentedSource { envelope, key })))
+        let identity = {
+            use sha2::Digest;
+            let digest = sha2::Sha256::new()
+                .chain_update(b"fluree-db/segment-cache")
+                .chain_update(self.context)
+                .chain_update(&envelope[..segmented::HEADER_LEN])
+                .finalize();
+            u128::from_le_bytes(digest[..16].try_into().expect("16 of 32 bytes"))
+        };
+        Ok(Some(Arc::new(SegmentedSource {
+            envelope,
+            key,
+            identity,
+        })))
     }
 
     async fn exists(&self, address: &str) -> fluree_db_core::error::Result<bool> {
@@ -768,6 +795,34 @@ mod tests {
             let start = (range.start as usize).min(end);
             assert_eq!(source.read_range(range.clone()).unwrap(), plain[start..end]);
         }
+    }
+
+    /// A cache keyed by source identity serves a reader only what was
+    /// decrypted for that storage and that envelope: re-encryption and a
+    /// second storage over the same bytes both get identities of their own.
+    #[tokio::test]
+    async fn ranged_source_identity_is_scoped_to_storage_and_envelope() {
+        let storage = MemoryStorage::new();
+        let encrypted = EncryptedStorage::new(storage.clone(), test_provider());
+        encrypted.write_bytes("seg", &[1u8; 1000]).await.unwrap();
+        let identity = |s: &EncryptedStorage<MemoryStorage, StaticKeyProvider>| {
+            s.get_local_ranged("seg").unwrap().unwrap().cache_identity()
+        };
+        let first = identity(&encrypted);
+        assert_eq!(identity(&encrypted), first, "stable for one envelope");
+        assert_eq!(
+            identity(&encrypted.clone()),
+            first,
+            "clones share a context"
+        );
+        let other = EncryptedStorage::new(storage.clone(), test_provider());
+        assert_ne!(identity(&other), first, "another storage instance");
+        encrypted.write_bytes("seg", &[1u8; 1000]).await.unwrap();
+        assert_ne!(
+            identity(&encrypted),
+            first,
+            "the same plaintext re-encrypted"
+        );
     }
 
     /// A ranged source reads the envelope it opened: replacing the object
