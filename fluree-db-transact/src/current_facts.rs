@@ -531,15 +531,16 @@ impl<'l> FactIdentity<'l> {
     /// the state does not have, which holds nothing indexed), when storage
     /// tells it by key ([`FactTerm::Key`]).
     pub fn key(&self, g_id: Option<GraphId>, flake: &Flake) -> Option<MergeKey> {
-        self.key_under(g_id, || self.keys.p_id(&flake.p), flake)
+        self.key_under(|| g_id, || self.keys.p_id(&flake.p), flake)
     }
 
-    /// [`Self::key`], with `flake.p`'s persisted id from `p_id`, asked only
-    /// for an index key: a caller keying many facts of one predicate looks
-    /// it up once.
+    /// [`Self::key`], with the graph id from `g_id` and `flake.p`'s persisted
+    /// id from `p_id`, each asked only for an index key: most values have
+    /// none, and a caller keying many facts of one predicate looks it up
+    /// once.
     fn key_under(
         &self,
-        g_id: Option<GraphId>,
+        g_id: impl FnOnce() -> Option<GraphId>,
         p_id: impl FnOnce() -> Option<u32>,
         flake: &Flake,
     ) -> Option<MergeKey> {
@@ -550,14 +551,20 @@ impl<'l> FactIdentity<'l> {
             FlakeValue::BigInt(v) if i64::try_from(v.as_ref()).is_err() => {
                 FactKey::BigInt(v.clone())
             }
-            _ => FactKey::Index(self.keys.key(g_id?, p_id(), flake)?),
+            _ => FactKey::Index(self.keys.key(g_id()?, p_id(), flake)?),
         };
         Some((key, list_index_of(flake)))
     }
 
-    /// `flake`'s identity in its own graph (`flake.g`).
+    /// `flake`'s identity in its own graph (`flake.g`). The graph is resolved
+    /// only for a value with an index key.
     pub fn of_flake(&self, flake: &Flake) -> FactTerm {
-        match self.key(self.graph_id(&flake.g), flake) {
+        let key = self.key_under(
+            || self.graph_id(&flake.g),
+            || self.keys.p_id(&flake.p),
+            flake,
+        );
+        match key {
             Some((key, at)) => FactTerm::Key(key, at),
             None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
         }
@@ -666,7 +673,7 @@ impl<'l> CurrentFacts<'l> {
                 terms.insert(&fact.flake, n);
                 if fact.flake.o.index_key_may_merge_terms() {
                     let p_id = || *slot_p_id.get_or_insert_with(|| self.keys.p_id(&slot.p));
-                    if let Some(key) = ids.key_under(Some(slot.g_id), p_id, &fact.flake) {
+                    if let Some(key) = ids.key_under(|| Some(slot.g_id), p_id, &fact.flake) {
                         keys.insert(key, n);
                     }
                 }
