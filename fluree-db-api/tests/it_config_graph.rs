@@ -4777,6 +4777,11 @@ async fn push_validates_each_named_graph_under_its_own_config() {
                 .await
                 .expect("seed");
         }
+        // Retire the root's WAL before copying the root. Dropping the instance
+        // can leave its log live, and the log's flush thread deletes a segment
+        // once the files it covers are on the device, which a copy running at
+        // the same time finds missing.
+        fluree.disconnect().await;
     }
 
     let bad = |graph: &str| match graph {
@@ -4883,6 +4888,8 @@ async fn pushed_graphs_are_validated_apart_from_the_ledgers_other_graphs() {
             .commit()
             .await
             .expect("seed");
+        // Retire the root's WAL before copying it, as in the test above.
+        fluree.disconnect().await;
     }
     let src_dir = dir.path().join("src");
     let tgt_dir = dir.path().join("tgt");
