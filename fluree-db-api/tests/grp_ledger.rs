@@ -10,6 +10,8 @@ mod it_branch;
 mod it_branch_shacl;
 #[path = "it_branch_time_travel.rs"]
 mod it_branch_time_travel;
+#[path = "it_commit_contention.rs"]
+mod it_commit_contention;
 #[path = "it_drop_ledger.rs"]
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]

@@ -43,7 +43,8 @@ const MAX_TXN_RETRIES: usize = 16;
 /// `tx_builder` deliberately excludes `NamespaceConflict` from its
 /// internal retry — re-staging would consume the already-built
 /// `stage_result`. The consensus layer (this loop) preserves the
-/// request body across attempts, so it's the right altitude.
+/// request body across attempts, so it's the right altitude. For the
+/// same reason it retries a builder whose own attempts all conflicted.
 fn is_retryable_txn_conflict(e: &ApiError) -> bool {
     matches!(
         e,
@@ -51,7 +52,7 @@ fn is_retryable_txn_conflict(e: &ApiError) -> bool {
             TransactError::CommitConflict { .. }
                 | TransactError::PublishLostRace { .. }
                 | TransactError::NamespaceConflict(_)
-        )
+        ) | ApiError::CommitContention { .. }
     )
 }
 
@@ -124,8 +125,9 @@ impl Committer for LocalCommitter {
         // builder from scratch — the body is borrowed, so the
         // per-iteration cost is one extra clone of `TxnOpts` /
         // `CommitOpts` / `TrackingOptions`.
-        let mut last_error: Option<ApiError> = None;
-        for attempt in 1..=MAX_TXN_RETRIES {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             let policy_ctx =
                 build_policy_context(&self.fluree, &ledger_handle, &governance).await?;
 
@@ -224,7 +226,13 @@ impl Committer for LocalCommitter {
                         cypher_return: result.cypher_return,
                     });
                 }
-                Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                Err(e) if is_retryable_txn_conflict(&e) => {
+                    if attempt == MAX_TXN_RETRIES {
+                        return Err(execution_failure(ApiError::commit_contention(
+                            MAX_TXN_RETRIES,
+                            e,
+                        )));
+                    }
                     tracing::warn!(
                         attempt,
                         max_attempts = MAX_TXN_RETRIES,
@@ -242,16 +250,10 @@ impl Committer for LocalCommitter {
                             "refresh during commit-conflict retry failed; retrying anyway"
                         );
                     }
-                    last_error = Some(e);
-                    continue;
                 }
                 Err(e) => return Err(execution_failure(e)),
             }
         }
-
-        Err(execution_failure(last_error.unwrap_or_else(|| {
-            ApiError::internal("transaction failed after retries with no captured error")
-        })))
     }
 
     async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
@@ -417,10 +419,12 @@ impl SubmissionLookup for LocalCommitter {
 /// fit. The split mirrors the commit check (`current + delta >= max`): a
 /// delta at or above the ceiling fails even against drained novelty. The
 /// datatype limit keeps its identity for the same reason: 422 +
-/// `err:db/DatatypeLimitExceeded`, and so does a commit reference that names
-/// no commit: 404 + `err:db/CommitNotFound`. A stale writer and a lifecycle
-/// conflict keep theirs too, rather than reading as a retryable commit
-/// conflict: 409 + `err:db/Fenced` or `err:db/LifecycleConflict`.
+/// `err:db/DatatypeLimitExceeded`, a commit reference that names no commit
+/// (404 + `err:db/CommitNotFound`), and commit contention (503 +
+/// `err:db/CommitContention`, which an `Execution` status would leave
+/// unsettled). A stale writer and a lifecycle conflict keep theirs too,
+/// rather than reading as a retryable commit conflict: 409 + `err:db/Fenced`
+/// or `err:db/LifecycleConflict`.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
     use fluree_db_nameservice::NameServiceError;
     match &err {
@@ -456,6 +460,9 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
             NameServiceError::Conflict(message),
         )) => SubmissionError::LifecycleConflict {
             message: message.clone(),
+        },
+        ApiError::CommitContention { .. } => SubmissionError::CommitContention {
+            message: err.to_string(),
         },
         _ => SubmissionError::Execution {
             status: err.status_code(),

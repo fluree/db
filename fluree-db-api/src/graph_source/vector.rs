@@ -437,7 +437,7 @@ impl crate::Fluree {
 
         // Check if graph source has been dropped
         if record.retracted {
-            return Err(crate::ApiError::Drop(format!(
+            return Err(crate::ApiError::GraphSourceRetracted(format!(
                 "Cannot sync retracted graph source: {graph_source_id}"
             )));
         }
@@ -685,7 +685,7 @@ impl crate::Fluree {
             })?;
 
         if record.retracted {
-            return Err(crate::ApiError::Drop(format!(
+            return Err(crate::ApiError::GraphSourceRetracted(format!(
                 "Cannot resync retracted graph source: {graph_source_id}"
             )));
         }

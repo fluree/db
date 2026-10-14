@@ -100,6 +100,15 @@ pub const FENCED: &str = "err:db/Fenced";
 /// or the dropped ledger; retrying once that finishes may succeed
 pub const LIFECYCLE_CONFLICT: &str = "err:db/LifecycleConflict";
 
+/// Every commit attempt the server made lost its race with other writers to
+/// the same ledger.
+///
+/// Retryable contention, surfaced as HTTP 503 with `Retry-After`: nothing was
+/// committed, and the same request can succeed once the other writers ease
+/// off. Distinct from [`COMMIT_CONFLICT`], which the server returns without
+/// having retried.
+pub const COMMIT_CONTENTION: &str = "err:db/CommitContention";
+
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 
@@ -109,6 +118,9 @@ pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
 /// A graph source over a ledger that was dropped and its name reused: it
 /// indexes nothing from the new ledger until it is recreated over it
 pub const GRAPH_SOURCE_SUSPENDED: &str = "err:db/GraphSourceSuspended";
+
+/// The graph source was dropped, so it can no longer be synced (HTTP 409)
+pub const GRAPH_SOURCE_RETRACTED: &str = "err:db/GraphSourceRetracted";
 
 /// A graph the target ledger does not have
 pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
@@ -227,6 +239,15 @@ pub const CONNECTION: &str = "err:storage/ConnectionError";
 /// message. Mirrors the distinct-code precedent of [`STORAGE_ACCESS_DENIED`] /
 /// [`CATALOG_CREDENTIALS_NOT_VENDED`], but keeps the 400 status.
 pub const R2RML_UNSUPPORTED_PATTERN: &str = "err:r2rml/UnsupportedPattern";
+
+// =============================================================================
+// Iceberg Errors (iceberg)
+// =============================================================================
+
+/// The Iceberg table carries merge-on-read delete files, which the reader
+/// does not apply (HTTP 409). The table is correctly configured; its current
+/// state is what is refused.
+pub const MERGE_ON_READ_DELETES: &str = "err:iceberg/MergeOnReadDeletes";
 
 // =============================================================================
 // Policy/Auth Errors (policy)

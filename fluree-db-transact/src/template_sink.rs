@@ -23,6 +23,7 @@ use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
 use crate::ir::{TemplateTerm, TemplateTripleTerm, TripleTemplate};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
+use crate::parse::txn_meta::check_user_predicate;
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue};
@@ -326,8 +327,18 @@ impl<'a> TemplateSink<'a> {
                 return;
             }
         }
-        let predicate = match self.node(p) {
-            Some(TemplateTerm::Sid(p)) => p,
+        let predicate = match self.term(p) {
+            SinkTerm::Node {
+                term: TemplateTerm::Sid(sid),
+                iri: Some(iri),
+                ..
+            } => match check_user_predicate(sid.namespace_code, &sid.name, &format!("<{iri}>")) {
+                Ok(()) => sid.clone(),
+                Err(e) => {
+                    self.error.get_or_insert(e);
+                    return;
+                }
+            },
             _ => {
                 self.fail("a txn-meta predicate must be an IRI");
                 return;

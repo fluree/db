@@ -216,6 +216,9 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
                 fluree_db_nameservice::NameServiceError::Conflict(message.clone()),
             ));
         }
+        SubmissionError::CommitContention { message } => {
+            return ServerError::CommitContention(message.clone());
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -2619,6 +2622,9 @@ mod tests {
             SubmissionError::LifecycleConflict {
                 message: "'mydb' is being restored".into(),
             },
+            SubmissionError::CommitContention {
+                message: "Commit contention: 16 commit attempts lost".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2641,6 +2647,7 @@ mod tests {
                 SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
                 SubmissionError::Fenced { .. } => (409, errors::FENCED),
                 SubmissionError::LifecycleConflict { .. } => (409, errors::LIFECYCLE_CONFLICT),
+                SubmissionError::CommitContention { .. } => (503, errors::COMMIT_CONTENTION),
             };
             let se = submission_error_to_server_error(variant);
             assert_eq!(se.status_code().as_u16(), expected_status, "{se}");

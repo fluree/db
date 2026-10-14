@@ -1605,7 +1605,7 @@ impl crate::Fluree {
         if let Some(message) = opts.message {
             commit_opts = commit_opts.with_txn_meta(vec![fluree_db_core::TxnMetaEntry::new(
                 fluree_vocab::namespaces::FLUREE_DB,
-                "message",
+                fluree_vocab::db::MESSAGE,
                 fluree_db_core::TxnMetaValue::string(message),
             )]);
         }

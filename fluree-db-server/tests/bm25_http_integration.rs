@@ -292,6 +292,7 @@ async fn missing_source_ledger_is_404() {
     .await;
 
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {json}");
+    assert_eq!(json["@type"], "err:db/LedgerNotFound", "body: {json}");
 }
 
 // ============================================================================
@@ -543,13 +544,10 @@ async fn sync_of_a_dropped_index_is_refused_by_both_forms() {
         !pinned_status.is_success(),
         "pinned sync must not resurrect a dropped index: {pinned_json}"
     );
-    // Equality rather than a literal status: the refusal currently surfaces as
-    // a 500 via the blanket `ApiError::Drop` arm, which is tracked separately.
-    // What this pins is that the two forms agree.
-    assert_eq!(
-        head_status, pinned_status,
-        "both forms should agree; head={head_json} pinned={pinned_json}"
-    );
+    for (status, json) in [(head_status, head_json), (pinned_status, pinned_json)] {
+        assert_eq!(status, StatusCode::CONFLICT, "body: {json}");
+        assert_eq!(json["@type"], "err:db/GraphSourceRetracted", "body: {json}");
+    }
 }
 
 #[tokio::test]
@@ -559,6 +557,18 @@ async fn sync_of_an_unknown_index_is_404() {
     let (status, json) = sync_index(&state, "/v1/fluree/bm25/sync", "nosuch:main").await;
 
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {json}");
+}
+
+/// A `t` past the source ledger's head names a commit that does not exist
+/// yet: the caller's mistake, not a server fault.
+#[tokio::test]
+async fn sync_through_a_t_beyond_the_head_is_400() {
+    let (_tmp, state) = state_with_index().await;
+
+    let (status, json) = sync_index(&state, "/v1/fluree/bm25/sync?t=999", "docsearch:main").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+    assert_eq!(json["@type"], "err:api/BadRequest", "body: {json}");
 }
 
 /// An unparseable `t` must be rejected rather than silently falling back to a

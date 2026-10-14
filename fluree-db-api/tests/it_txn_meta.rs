@@ -7,8 +7,11 @@
 
 #![cfg(feature = "native")]
 
-use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig};
+use crate::support::{
+    genesis_ledger, rebuild_and_publish_index, start_background_indexer_local,
+    trigger_index_and_wait,
+};
+use fluree_db_api::{CommitRef, ConflictStrategy, FlureeBuilder, IndexConfig, LedgerManagerConfig};
 use serde_json::json;
 
 /// Extract an i64 from a JSON value, handling both bare numbers and typed literals
@@ -1953,4 +1956,169 @@ async fn test_txn_meta_sidecar_rejects_f_identity() {
     assert!(err
         .to_string()
         .contains("only f:message and f:author are user-settable"));
+}
+
+/// The Fluree-namespace entries a commit's txn-meta holds (a user's
+/// `f:message` and `f:author`, a revert's `f:reverts`) survive an index build
+/// and read back from `#txn-meta`. A debug build's index build panicked on
+/// them: the resolver's reserved-namespace guard admitted only `f:identity`
+/// and `db:receivedAt`.
+#[tokio::test]
+async fn fluree_namespace_txn_meta_survives_indexing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/txn-meta-fluree-ns";
+    let ledger_id = format!("{name}:main");
+    let ledger = fluree.create_ledger(name).await.expect("create");
+    let first = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@graph": [{"@id": "ex:a", "ex:p": 1}],
+                "txn-meta": {"f:message": "first", "f:author": "ana"}
+            }),
+        )
+        .await
+        .expect("insert with a message and author");
+    let second = fluree
+        .insert(
+            first.ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:b", "ex:p": 2}),
+        )
+        .await
+        .expect("insert");
+    let reverted = second.receipt.commit_id.clone();
+    drop(second);
+    fluree
+        .revert_commit(
+            name,
+            "main",
+            CommitRef::Exact(reverted.clone()),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("revert");
+
+    rebuild_and_publish_index(&fluree, &ledger_id).await;
+    let ledger = fluree
+        .ledger(&ledger_id)
+        .await
+        .expect("load indexed ledger");
+    assert!(ledger.snapshot.range_provider.is_some(), "indexed");
+
+    let query = json!({
+        "from": format!("{ledger_id}#txn-meta"),
+        "select": ["?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let rows = fluree
+        .query_connection(&query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let values: Vec<String> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .flat_map(|row| match row {
+            serde_json::Value::Array(cells) => cells.clone(),
+            cell => vec![cell.clone()],
+        })
+        .filter_map(|cell| cell.as_str().map(str::to_string))
+        .collect();
+    for expected in ["first".to_string(), "ana".to_string(), reverted.to_string()] {
+        assert!(
+            values.contains(&expected),
+            "{expected} in #txn-meta after indexing: {values:?}"
+        );
+    }
+}
+
+/// A TriG `<#txn-meta>` block is held to the JSON-LD sidecar's rule: a
+/// predicate in a Fluree namespace other than `f:message` / `f:author` is
+/// refused, so a transaction can't forge its identity or revert targets, or
+/// give its commit a second `f:t`.
+#[tokio::test]
+async fn trig_txn_meta_refuses_fluree_provenance_predicates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let claims = [
+        r#"fluree:identity "did:example:forged""#,
+        r#"fluree:reverts "bafyforged""#,
+        "fluree:t 99",
+        r#"<fluree:commit:sha256:abc> "x""#,
+        r#"<urn:fluree:x> "x""#,
+    ];
+    for (i, claim) in claims.into_iter().enumerate() {
+        let ledger = genesis_ledger(&fluree, &format!("it/trig-txn-meta-reserved-{i}:main")).await;
+        let trig = format!(
+            "
+            @prefix ex: <http://example.org/> .
+            @prefix fluree: <https://ns.flur.ee/db#> .
+            ex:a ex:p 1 .
+            GRAPH <#txn-meta> {{ fluree:commit:this {claim} . }}
+            "
+        );
+        let err = fluree.insert_turtle(ledger, &trig).await.expect_err(claim);
+        assert!(
+            err.to_string()
+                .contains("only f:message and f:author are user-settable"),
+            "{claim}: {err}"
+        );
+    }
+}
+
+/// `f:message` and `f:author` in a TriG `<#txn-meta>` block commit, index and
+/// read back.
+#[tokio::test]
+async fn trig_txn_meta_message_and_author_survive_indexing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-txn-meta-claims:main";
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    fluree
+        .insert_turtle(
+            ledger,
+            r#"
+            @prefix ex: <http://example.org/> .
+            @prefix fluree: <https://ns.flur.ee/db#> .
+            ex:a ex:p 1 .
+            GRAPH <#txn-meta> {
+                fluree:commit:this fluree:message "load the seed" ;
+                                   fluree:author "ana" .
+            }
+            "#,
+        )
+        .await
+        .expect("insert with a message and author");
+
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load indexed ledger");
+    assert!(ledger.snapshot.range_provider.is_some(), "indexed");
+    let query = json!({
+        "from": format!("{ledger_id}#txn-meta"),
+        "select": ["?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let rows = fluree
+        .query_connection(&query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let values: Vec<&str> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .flat_map(|row| match row {
+            serde_json::Value::Array(cells) => cells.iter().collect(),
+            cell => vec![cell],
+        })
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for expected in ["load the seed", "ana"] {
+        assert!(
+            values.contains(&expected),
+            "{expected} in #txn-meta: {values:?}"
+        );
+    }
 }

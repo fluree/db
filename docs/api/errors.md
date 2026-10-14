@@ -88,6 +88,7 @@ The request is malformed or contains invalid data.
 - Invalid IRI format
 - Type mismatch
 - Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
+- A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
 
 **Error typing:**
 
@@ -214,16 +215,17 @@ prefix that matches several commits) is a 400.
 The request took too long to process.
 
 **Common Causes:**
-- Query timeout exceeded
+- Query timeout exceeded, or the query was cancelled (`err:db/QueryCancelled`)
 - Complex query taking too long
 - Database under heavy load
+- A read-after-write wait for a `t` the ledger has not reached yet (`err:db/ReadAfterWriteTimeout`)
 
 **Example:**
 ```json
 {
-  "error": "Query execution exceeded timeout",
+  "error": "Query error: Query cancelled: timeout",
   "status": 408,
-  "@type": "err:db/Timeout"
+  "@type": "err:db/QueryCancelled"
 }
 ```
 
@@ -239,10 +241,12 @@ The request took too long to process.
 The request conflicts with current server state.
 
 **Common Causes:**
-- Concurrent modification conflict
-- Ledger already exists
+- Concurrent modification conflict (`err:db/CommitConflict`) that the server did not retry. When the server retried and every attempt lost, the answer is a 503 `err:db/CommitContention` instead.
+- Ledger already exists (`err:db/LedgerExists`)
 - Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
-- Resource state conflict
+- The ledger advanced while a reindex ran (`err:system/ReindexConflict`)
+- Syncing a graph source that has been dropped (`err:db/GraphSourceRetracted`)
+- An Iceberg table that carries merge-on-read delete files (`err:iceberg/MergeOnReadDeletes`)
 
 **Example:**
 ```json
@@ -490,6 +494,7 @@ of them indicate a fault in the request. The `@type` identifies the cause:
 |---|---|
 | `err:db/NoveltyAtMax` | Novelty backpressure: in-memory novelty is at `reindex_max_bytes` (or this transaction would cross it, while still fitting once novelty drains). Clears when the indexer catches up. |
 | `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
+| `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
 | `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 
 **Example:**
@@ -523,6 +528,7 @@ Upstream service didn't respond in time.
 - Storage backend timeout
 - Long-running query
 - Network latency
+- Waiting on an index build that did not finish within its timeout (`err:system/IndexTimeout`)
 
 **Example:**
 ```json
@@ -538,6 +544,17 @@ Upstream service didn't respond in time.
 - Check storage backend performance
 - Simplify query
 - Increase timeout settings
+
+#### 507 Insufficient Storage
+
+The query's in-memory joins or aggregates outgrew the query memory budget, so
+it was stopped before it could exhaust the server's memory. Distinct from the
+408 timeout: the query is too memory-heavy, not too slow, and retrying it
+unchanged fails the same way.
+
+**How to Fix:**
+- Narrow the query with more selective patterns or filters
+- Aggregate over fewer groups, or page through the results
 
 ## Error Handling Best Practices
 

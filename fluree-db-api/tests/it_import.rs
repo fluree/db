@@ -3674,6 +3674,46 @@ GRAPH <#txn-meta> {
         .expect("the `<#txn-meta>` sidecar spelling must remain accepted");
 }
 
+/// The sidecar is held to a transaction's predicate rule: a Fluree provenance
+/// predicate such as `f:identity` is refused rather than imported as the
+/// commit's provenance.
+#[tokio::test]
+async fn import_trig_txn_meta_refuses_fluree_provenance_predicates() {
+    let ledger_id = "test/txn-meta-provenance:main";
+    let trig = r#"@prefix f: <https://ns.flur.ee/db#> .
+
+<http://example.org/seed> <http://example.org/v> "base" .
+
+GRAPH <#txn-meta> {
+    <fluree:commit:this> f:identity "did:example:forged" .
+}
+"#;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let path = data_dir.path().join("meta.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let err = fluree
+        .create(ledger_id)
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("f:identity in the sidecar must be refused");
+    assert!(
+        err.to_string()
+            .contains("only f:message and f:author are user-settable"),
+        "{err}"
+    );
+}
+
 /// The forgery channel, tested in the only state where it is live.
 ///
 /// On an INDEXED ledger the forged records are invisible — the graph-scoped

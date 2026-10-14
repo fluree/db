@@ -24,15 +24,7 @@ use fluree_db_core::temporal::{
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::DatatypeDictId;
 use fluree_db_core::GraphId;
-use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
 use fluree_vocab::{db, fluree};
-
-/// Namespace codes reserved for Fluree system provenance. User-supplied
-/// `TxnMetaEntry`s must never land here — `extract_txn_meta` in
-/// fluree-db-transact rejects them at parse time. This list is duplicated
-/// (not imported) to avoid adding a transact → indexer layering inversion;
-/// the two sites are asserted in sync by the debug_assert in emit paths.
-const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
 
 /// Narrow a datatype dictionary ID to the width the index stores.
 ///
@@ -48,15 +40,6 @@ fn checked_dt_id(dt_id: u32) -> Result<u16, String> {
         })
 }
 
-/// System-injected txn-meta predicates that legitimately live in a reserved
-/// namespace: `build_commit` strips any user-supplied claim for these and
-/// injects the system-controlled value (`f:identity` for provenance,
-/// `db:receivedAt` for the dual-stamp audit axis). They must flow through
-/// the resolver like ordinary entries so they stay queryable post-index.
-fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
-    entry.predicate_ns == FLUREE_DB
-        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
-}
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -522,10 +505,10 @@ impl CommitResolver {
         writer: &mut W,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
-                || is_system_txn_meta_entry(entry),
-            "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
-            entry.predicate_ns
+            fluree_vocab::txn_meta::may_hold(entry.predicate_ns, &entry.predicate_name),
+            "TxnMetaEntry {}:{} in a reserved namespace reached the resolver — a txn-meta reader skipped the user-predicate check?",
+            entry.predicate_ns,
+            entry.predicate_name
         );
 
         // Resolve predicate using ns_code + name
@@ -2159,10 +2142,10 @@ impl SharedResolverState {
         chunk: &mut RebuildChunk,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
-                || is_system_txn_meta_entry(entry),
-            "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
-            entry.predicate_ns
+            fluree_vocab::txn_meta::may_hold(entry.predicate_ns, &entry.predicate_name),
+            "TxnMetaEntry {}:{} in a reserved namespace reached the resolver — a txn-meta reader skipped the user-predicate check?",
+            entry.predicate_ns,
+            entry.predicate_name
         );
 
         let p_prefix = self
