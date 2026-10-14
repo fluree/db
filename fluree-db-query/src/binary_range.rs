@@ -638,7 +638,36 @@ fn binary_range_eq_v3(
                             )
                         }
                     };
-                filter.o_type = Some(OType::XSD_STRING.as_u16());
+                // The string's datatype picks its o_type: `xsd:string` when
+                // none is given, the datatype's own for a custom one, and any
+                // of a language's for `rdf:langString` (one o_type per tag;
+                // rows are kept by their decoded datatype below and their tag
+                // by the caller).
+                filter.o_type = match match_val.dt.as_ref() {
+                    None => Some(OType::XSD_STRING.as_u16()),
+                    Some(dt) if *dt == Sid::xsd_string() => Some(OType::XSD_STRING.as_u16()),
+                    Some(dt)
+                        if dt.namespace_code == fluree_vocab::namespaces::RDF
+                            && dt.name.as_ref() == fluree_vocab::rdf_names::LANG_STRING =>
+                    {
+                        None
+                    }
+                    Some(dt) => match encode_bound_object_prefilter(
+                        o_val,
+                        Some(dt),
+                        None,
+                        store,
+                        Some(dict_novelty),
+                    ) {
+                        Ok((o_type, _)) => Some(o_type.as_u16()),
+                        // A datatype the index does not hold: only novelty can.
+                        Err(_) => {
+                            return overlay_only_flakes(
+                                store, g_id, index, match_val, opts, overlay,
+                            )
+                        }
+                    },
+                };
                 filter.o_key = Some(str_id as u64);
             }
             fluree_db_core::FlakeValue::Json(s) => {
@@ -893,6 +922,9 @@ fn binary_range_eq_v3(
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
+            if match_val.dt.as_ref().is_some_and(|want| *want != dt) {
+                continue;
+            }
             // Language tag.
             let lang = store
                 .resolve_lang_tag(o_type)

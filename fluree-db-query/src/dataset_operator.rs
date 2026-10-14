@@ -24,7 +24,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_core::{IndexType, ObjectBounds, Sid};
+use fluree_db_core::{DatatypeConstraint, IndexType, ObjectBounds, Sid};
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
@@ -477,8 +477,12 @@ pub(crate) fn stamp_seed_row(row: Vec<Binding>, ctx: &ExecutionContext<'_>) -> V
 
 /// Stamp a single binding with ledger provenance.
 ///
-/// `Binding::Sid` is converted to `IriMatch`; all other variants are moved
-/// through unchanged (no cloning).
+/// `Binding::Sid` is converted to `IriMatch`. A literal whose datatype is a
+/// user namespace's has that datatype re-coded into the primary snapshot's
+/// namespace space, the one the rest of the query (its patterns, its keys,
+/// its output) uses: ledgers code their namespaces independently, so the
+/// same datatype IRI is a different `Sid` in another ledger. All other
+/// variants are moved through unchanged (no cloning).
 ///
 /// # Errors
 ///
@@ -496,6 +500,28 @@ fn stamp_binding(
 ) -> Result<Binding> {
     match binding {
         Binding::Sid { ref sid, .. } => sid_to_iri_match(sid, ledger_id, ctx),
+        Binding::Lit {
+            val,
+            dtc: DatatypeConstraint::Explicit(dt),
+            t,
+            op,
+            p_id,
+        } if dt.namespace_code >= fluree_vocab::namespaces::USER_START
+            && dt.namespace_code != fluree_vocab::namespaces::OVERFLOW
+            && ledger_id.as_ref() != ctx.original_snapshot.ledger_id.as_str() =>
+        {
+            let dt = ctx
+                .decode_sid_in_ledger(&dt, ledger_id)
+                .and_then(|iri| ctx.original_snapshot.encode_iri(&iri))
+                .unwrap_or(dt);
+            Ok(Binding::Lit {
+                val,
+                dtc: DatatypeConstraint::Explicit(dt),
+                t,
+                op,
+                p_id,
+            })
+        }
         Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => Err(QueryError::Internal(
             "EncodedSid/EncodedPid reached stamp_provenance — binary store should have \
                  been disabled for multi-ledger datasets"
