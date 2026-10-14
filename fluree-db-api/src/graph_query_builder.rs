@@ -340,7 +340,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             .await
             // Not a blanket 404: `load_view` now also reports a malformed `opts`
             // block, which is a 400, and a load can fail for other reasons too.
-            .map_err(|e| TrackedErrorResponse::new(e.status_code(), e.to_string(), None))?;
+            .map_err(|e| TrackedErrorResponse::from_api(e, None))?;
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
@@ -371,7 +371,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     return Ok(TrackedQueryResponse::success(expanded, None));
                 }
                 Ok(None) => {}
-                Err(e) => return Err(TrackedErrorResponse::new(500, e.to_string(), None)),
+                Err(e) => return Err(TrackedErrorResponse::from_api(e, None)),
             }
         }
 

@@ -4,7 +4,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use fluree_db_api::{ApiError, SparqlUpdateLowerError};
 use fluree_db_nameservice::NameServiceError;
-use fluree_db_query::parse::ParseError;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -60,7 +59,7 @@ pub enum ServerError {
     /// and the indexer must drain it before new commits are accepted.
     /// Carries the pipeline's message for submissions whose typed
     /// `ApiError::Transact` variant was flattened at the consensus boundary;
-    /// errors that still carry the variant map via the `ApiError` arms.
+    /// errors that still carry the variant answer through `ApiError`'s table.
     #[error("{0}")]
     NoveltyBackpressure(String),
 
@@ -79,163 +78,25 @@ pub enum ServerError {
     /// `NoveltyBackpressure`.
     #[error("{0}")]
     DatatypeLimitExceeded(String),
+
+    /// Every commit attempt lost its race with other writers (503 +
+    /// `err:db/CommitContention` + `Retry-After`). Same consensus-boundary
+    /// role as `NoveltyBackpressure`.
+    #[error("{0}")]
+    CommitContention(String),
 }
 
 impl ServerError {
-    /// Map error to error type IRI (compact form)
+    /// Map error to error type IRI (compact form). An API error carries its
+    /// own, beside its status ([`ApiError::error_type`]).
     pub fn error_type(&self) -> &'static str {
         use fluree_vocab::errors;
 
         match self {
-            // API errors (explicit HTTP status passthrough)
-            //
-            // Map common statuses to stable error types so clients can branch on `@type`.
-            ServerError::Api(ApiError::Http { status, .. }) => match status {
-                // The committer flattens typed errors to this shape (merge,
-                // rebase and revert's `InvalidBranch`, among others), so a 400
-                // must not read as an internal error here.
-                400 => errors::BAD_REQUEST,
-                401 => errors::UNAUTHORIZED,
-                403 => errors::ACCESS_DENIED,
-                409 => errors::COMMIT_CONFLICT,
-                // The HTTP body-size cap (`read_limited_body`). The other
-                // 413 — an oversized novelty delta — never takes this arm:
-                // it stays typed end-to-end (`ServerError::NoveltyDeltaTooLarge`
-                // / the `Transact` variant below) precisely so the two 413s
-                // carry distinct codes for clients to branch on.
-                413 => errors::PAYLOAD_TOO_LARGE,
-                422 => errors::INVALID_TRANSACTION,
-                _ => errors::INTERNAL,
-            },
-
-            // Not Found
-            ServerError::Api(ApiError::GraphNotFound(_)) => errors::GRAPH_NOT_FOUND,
-            ServerError::Api(ApiError::CommitNotFound(_)) => errors::COMMIT_NOT_FOUND,
-            ServerError::Api(ApiError::NotFound(msg)) => {
-                // Distinguish graph source not found from ledger not found
-                if msg.contains("Graph source") || msg.contains("graph source") {
-                    errors::GRAPH_SOURCE_NOT_FOUND
-                } else {
-                    errors::LEDGER_NOT_FOUND
-                }
-            }
-
-            // Ledger management
-            ServerError::Api(ApiError::NoveltyDeferred { .. }) => errors::NOVELTY_DEFERRED,
-            ServerError::Api(ApiError::MaterializePartial { tally, .. }) => {
-                if tally.failed > 0 {
-                    errors::MATERIALIZE_PARTIAL
-                } else {
-                    errors::NOVELTY_DEFERRED
-                }
-            }
-            ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
-            // The code a merge or rebase conflict already gets from the
-            // committer as a flattened 409.
-            ServerError::Api(ApiError::BranchConflict(_)) => errors::COMMIT_CONFLICT,
-
-            // Index operations
-            ServerError::Api(ApiError::IndexTimeout(_)) => errors::INDEX_TIMEOUT,
-            ServerError::Api(ApiError::IndexingDisabled) => errors::INDEXING_DISABLED,
-            ServerError::Api(ApiError::ReindexConflict { .. }) => errors::REINDEX_CONFLICT,
-
-            // Parsing errors
-            ServerError::Api(ApiError::Parse(ParseError::TypeCoercion(_))) => errors::TYPE_COERCION,
-            ServerError::Api(ApiError::Parse(_)) => errors::JSONLD_PARSE,
-            ServerError::Api(ApiError::Turtle(_)) => errors::TURTLE_PARSE,
-            ServerError::Api(ApiError::Sparql { .. }) => errors::SPARQL_PARSE,
-            ServerError::Api(ApiError::SparqlLower(_)) => errors::SPARQL_LOWER,
-            ServerError::Api(ApiError::Cypher { .. }) => errors::CYPHER_PARSE,
-            ServerError::Api(ApiError::CypherLower(_)) => errors::CYPHER_LOWER,
-            ServerError::Api(ApiError::CypherUpdateLower(_)) => errors::CYPHER_LOWER,
-            ServerError::Json(_) => errors::JSON_PARSE,
-
-            // Query/Transaction errors
-            ServerError::Api(ApiError::AwaitTNotReached { .. }) => errors::READ_AFTER_WRITE_TIMEOUT,
-            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
-                ..
-            })) => errors::QUERY_CANCELLED,
-
-            // Storage-permission / fail-closed errors (403). Raised directly on
-            // the preview path or wrapped from the query engine on the scan
-            // path; both surface the same distinct `@type` so clients can branch.
-            // These MUST precede the generic `ApiError::Query(_)` arm below.
-            ServerError::Api(
-                ApiError::StorageAccessDenied { .. }
-                | ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied { .. }),
-            ) => errors::STORAGE_ACCESS_DENIED,
-            ServerError::Api(
-                ApiError::CatalogCredentialsNotVended { .. }
-                | ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
-                    ..
-                }),
-            ) => errors::CATALOG_CREDENTIALS_NOT_VENDED,
-            ServerError::Api(ApiError::Query(
-                fluree_db_query::QueryError::CatalogAccessDenied { .. },
-            )) => errors::CATALOG_ACCESS_DENIED,
-
-            // Virtual-dataset (R2RML) unsupported-pattern refusal: a distinct
-            // `@type` so Solo's browse UI can gate on the condition instead of
-            // matching prose. Stays HTTP 400 (well-formed request, unsupported on
-            // this source) — unlike the 403/507 distinct-status precedents — via
-            // the generic `Query(_)` arm in `status_code()`. MUST precede the
-            // generic `ApiError::Query(_)` arm below.
-            // The same fact as it leaves the ledger loader, unconverted.
-            ServerError::Api(e) if e.is_not_found() => errors::LEDGER_NOT_FOUND,
-            ServerError::Api(ApiError::Query(
-                fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
-            )) => errors::R2RML_UNSUPPORTED_PATTERN,
-
-            ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
-            ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
-            ServerError::Api(
-                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
-                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
-                    fluree_db_api::PolicyError::ModifyDenied { .. },
-                )),
-            ) => errors::ACCESS_DENIED,
-            // Optimistic-concurrency conflicts: a distinct, retryable class so
-            // clients can branch on `@type` (and the 409 status below).
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::CommitConflict { .. }
-                | fluree_db_api::TransactError::PublishLostRace { .. }
-                | fluree_db_api::TransactError::NamespaceConflict(_),
-            )) => errors::COMMIT_CONFLICT,
-            // Oversized single delta: `delta >= max` can never succeed by
-            // drain, so it must not carry the retryable code below. MUST
-            // precede the drainable novelty arm.
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::NoveltyWouldExceed {
-                    delta_bytes,
-                    max_bytes,
-                    ..
-                },
-            )) if delta_bytes >= max_bytes => errors::NOVELTY_DELTA_TOO_LARGE,
-            ServerError::NoveltyDeltaTooLarge(_) => errors::NOVELTY_DELTA_TOO_LARGE,
-            // Novelty backpressure: retryable capacity pressure, not an
-            // invalid transaction. Both variants carry the same machine code
-            // (the message distinguishes at-max from would-exceed) so clients
-            // branch on one `@type` for "the indexer needs to drain".
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::NoveltyAtMax
-                | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
-            ))
-            | ServerError::NoveltyBackpressure(_) => errors::NOVELTY_AT_MAX,
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
-            ))
-            | ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
-            ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
-
-            // API-level errors
+            ServerError::Api(e) => e.error_type(),
             ServerError::MissingLedger => errors::MISSING_LEDGER,
-            // The same code as an id refused at the edge (`From<LedgerIdParseError>`).
-            ServerError::BadRequest(_)
-            | ServerError::Api(
-                ApiError::InvalidLedgerId(_)
-                | ApiError::InvalidBranch(_)
-                | ApiError::NameService(NameServiceError::InvalidId(_)),
-            ) => errors::BAD_REQUEST,
+            ServerError::Json(_) => errors::JSON_PARSE,
+            ServerError::BadRequest(_) => errors::BAD_REQUEST,
             ServerError::InvalidHeader(_) => errors::INVALID_HEADER,
             ServerError::NotImplemented(_) => errors::NOT_IMPLEMENTED,
             ServerError::Unauthorized(_) => errors::UNAUTHORIZED,
@@ -243,210 +104,36 @@ impl ServerError {
             ServerError::NotAcceptable(_) => errors::NOT_ACCEPTABLE,
             ServerError::UnsupportedMediaType(_) => errors::UNSUPPORTED_MEDIA_TYPE,
             ServerError::SparqlUpdateLower(_) => errors::SPARQL_LOWER,
-
-            // Auth/Policy (requires credential feature)
-            #[cfg(feature = "credential")]
-            ServerError::Api(ApiError::Credential(_)) => errors::INVALID_CREDENTIAL,
-
-            // System errors
-            ServerError::Api(ApiError::Connection(_)) => errors::CONNECTION,
-            ServerError::Api(ApiError::NameService(_)) => errors::NAMESERVICE,
-            ServerError::Api(ApiError::Core(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Ledger(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Novelty(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Bm25Builder(_)) => errors::BM25,
-            ServerError::Api(ApiError::Bm25Serialize(_)) => errors::BM25,
-            ServerError::Api(ApiError::Internal(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Drop(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Json(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Config(_) | ApiError::LedgerConfig(_)) => errors::CONFIG,
-            ServerError::Api(ApiError::Format(_)) => errors::FORMAT,
-
-            // Cross-ledger model dependency failure (502). The variant
-            // is preserved in ApiError::CrossLedger so structured
-            // callers can branch on the specific failure; the `@type`
-            // surfaced here is the umbrella IRI.
-            ServerError::Api(ApiError::CrossLedger(_)) => errors::CROSS_LEDGER,
-
-            // Catch any new ApiError variants as internal
-            #[allow(unreachable_patterns)]
-            ServerError::Api(_) => errors::INTERNAL,
+            ServerError::NoveltyBackpressure(_) => errors::NOVELTY_AT_MAX,
+            ServerError::NoveltyDeltaTooLarge(_) => errors::NOVELTY_DELTA_TOO_LARGE,
+            ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ServerError::CommitContention(_) => errors::COMMIT_CONTENTION,
         }
     }
 
-    /// Map error to HTTP status code
+    /// Map error to HTTP status code. An API error answers with the API's
+    /// table ([`ApiError::status_code`]), the one every flattened form of it
+    /// carries too.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            // Explicit HTTP status passthrough (e.g. credentialed tx/query tracked errors)
-            ServerError::Api(ApiError::Http { status, .. }) => {
-                StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            ServerError::Api(e) => {
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
-
-            // 404 - Not Found
-            // Retryable backpressure, NOT a fault. The 503 belonged here, in
-            // ServerError's mapping, which is what the HTTP layer consults — putting it
-            // only on `ApiError::status_code()` left it dead and a deferral surfaced as
-            // a 500 `err:system/InternalError`, telling operators a normal capacity
-            // condition was an internal error.
-            ServerError::Api(ApiError::NoveltyDeferred { .. }) => StatusCode::SERVICE_UNAVAILABLE,
-            // A partial fan-out window splits by WHY it is incomplete. Deferral-only is
-            // the same retryable capacity condition as above; a target that actually
-            // failed is a fault and must not be dressed up as backpressure, or a
-            // permanently broken target would 503 forever and read as "just busy".
-            ServerError::Api(ApiError::MaterializePartial { tally, .. }) => {
-                if tally.failed > 0 {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
-            }
-            // Every form `ApiError` gives a missing ledger, not only `NotFound`:
-            // the ledger loader's own error is one, and read as a 500 here.
-            ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
-            ServerError::Api(ApiError::GraphNotFound(_)) => StatusCode::NOT_FOUND,
-            ServerError::Api(ApiError::CommitNotFound(_)) => StatusCode::NOT_FOUND,
-
-            // 409 - Conflict
-            ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
-            ServerError::Api(ApiError::BranchConflict(_)) => StatusCode::CONFLICT,
-            // Optimistic-concurrency / namespace-allocation conflicts are
-            // retryable: 409 lets clients distinguish "retry" from a 400 "bad
-            // request". (After server-side reconcile-and-retry these only reach
-            // the client when the bounded retry budget is exhausted.)
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::CommitConflict { .. }
-                | fluree_db_api::TransactError::PublishLostRace { .. }
-                | fluree_db_api::TransactError::NamespaceConflict(_),
-            )) => StatusCode::CONFLICT,
-
-            // 413 - the transaction's own delta meets or exceeds
-            // `reindex_max_bytes`: no drain can ever admit it, so a 503
-            // would wedge the client retrying a request that can never
-            // work. MUST precede the drainable 503 arm below.
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::NoveltyWouldExceed {
-                    delta_bytes,
-                    max_bytes,
-                    ..
-                },
-            )) if delta_bytes >= max_bytes => StatusCode::PAYLOAD_TOO_LARGE,
-            ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-
-            // 422 - well-formed, but the ledger has no room for the new
-            // datatypes. Permanent, so no `Retry-After`. MUST precede the
-            // generic `ApiError::Transact(_)` arm below.
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::DatatypeLimitExceeded { .. },
-            ))
-            | ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
-
-            // 422 - well-formed, but a vector the index cannot store beside
-            // the property's others. Permanent; its @type is the generic
-            // `InvalidTransaction`, as when the committer flattens it to
-            // `Http { status: 422 }`. MUST precede the generic arm below.
-            ServerError::Api(ApiError::Transact(fluree_db_api::TransactError::InvalidVector(
-                _,
-            ))) => StatusCode::UNPROCESSABLE_ENTITY,
-
-            // 503 - novelty backpressure. The same retryable capacity class
-            // as `NoveltyDeferred` above: only the indexer draining clears
-            // it. A 400 here tells well-behaved clients (retry 5xx, treat
-            // 4xx as permanent) to drop the write. MUST precede the generic
-            // `ApiError::Transact(_)` arm below.
-            ServerError::Api(ApiError::Transact(
-                fluree_db_api::TransactError::NoveltyAtMax
-                | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
-            ))
-            | ServerError::NoveltyBackpressure(_) => StatusCode::SERVICE_UNAVAILABLE,
-
-            // 403 - Forbidden (storage-permission / fail-closed). Raised
-            // directly (preview path) or wrapped from the query engine (scan
-            // path). MUST precede the generic `ApiError::Query(_)` arm below.
-            ServerError::Api(
-                ApiError::StorageAccessDenied { .. }
-                | ApiError::CatalogCredentialsNotVended { .. }
-                | ApiError::Query(
-                    fluree_db_query::QueryError::StorageAccessDenied { .. }
-                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
-                    | fluree_db_query::QueryError::CatalogAccessDenied { .. },
-                ),
-            ) => StatusCode::FORBIDDEN,
-            ServerError::Api(
-                ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
-                | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
-                    fluree_db_api::PolicyError::ModifyDenied { .. },
-                )),
-            ) => StatusCode::FORBIDDEN,
-
-            // 400 - Bad Request (client errors)
-            ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
-                ..
-            })) => StatusCode::REQUEST_TIMEOUT,
-            ServerError::Api(ApiError::Query(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Batch(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Transact(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Turtle(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Sparql { .. }) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::SparqlLower(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Cypher { .. }) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::CypherLower(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::CypherUpdateLower(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::Config(_)) => StatusCode::BAD_REQUEST,
-            // Operator data, not caller input. See `ApiError::LedgerConfig`.
-            ServerError::Api(ApiError::LedgerConfig(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
-            ServerError::Api(
-                ApiError::InvalidLedgerId(_)
-                | ApiError::InvalidBranch(_)
-                | ApiError::NameService(NameServiceError::InvalidId(_)),
-            ) => StatusCode::BAD_REQUEST,
-            ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
-            ServerError::MissingLedger => StatusCode::BAD_REQUEST,
-            ServerError::Json(_) => StatusCode::BAD_REQUEST,
-            ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ServerError::InvalidHeader(_) => StatusCode::BAD_REQUEST,
-            ServerError::SparqlUpdateLower(_) => StatusCode::BAD_REQUEST,
-
-            // 501 - Not Implemented
-            ServerError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
-
-            // 401 - Unauthorized
+            ServerError::MissingLedger
+            | ServerError::Json(_)
+            | ServerError::BadRequest(_)
+            | ServerError::InvalidHeader(_)
+            | ServerError::SparqlUpdateLower(_) => StatusCode::BAD_REQUEST,
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-
-            // 404 - Not Found (explicit, not from ApiError)
             ServerError::NotFound(_) => StatusCode::NOT_FOUND,
-
-            // 406 - Not Acceptable (content negotiation failure)
             ServerError::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
             ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            #[cfg(feature = "credential")]
-            ServerError::Api(ApiError::Credential(_)) => StatusCode::UNAUTHORIZED,
-
-            // 500 - Internal Server Error (server-side errors and catch-all)
-            ServerError::Api(ApiError::Connection(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::NameService(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Core(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Ledger(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Novelty(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Bm25Builder(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Bm25Serialize(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Internal(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Drop(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Api(ApiError::Json(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-
-            // 502 - Bad Gateway. Cross-ledger model dependency failure
-            // is conceptually an upstream-dependency error, not an
-            // internal panic — operators can distinguish "your data
-            // ledger is broken" (500) from "the model ledger this
-            // data ledger depends on is broken" (502). The wrapped
-            // CrossLedgerError variant is preserved in the JSON body
-            // so callers can branch on the specific failure.
-            ServerError::Api(ApiError::CrossLedger(_)) => StatusCode::BAD_GATEWAY,
-
-            // Catch any new ApiError variants as 500
-            #[allow(unreachable_patterns)]
-            ServerError::Api(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ServerError::NoveltyBackpressure(_) | ServerError::CommitContention(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -605,14 +292,17 @@ pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
 ///   drainable commit-time would-exceed) — clears when the indexer drains.
 /// - `NOVELTY_DEFERRED`: materialization deferred (including the
 ///   deferral-only `MaterializePartial` split) — same capacity class.
+/// - `COMMIT_CONTENTION`: every commit attempt lost its race with other
+///   writers — clears when they ease off.
 /// - `INTERNAL`: the status-passthrough hole — `SubmissionError::Overloaded`
 ///   (committer in-flight cap, retryable by its contract) and any tracked
 ///   error relayed via `ApiError::Http { status: 503 }` reach `error_type`'s
 ///   `Http` catch-all. If a new 503 lands here, give it a typed code instead
 ///   of relying on this entry.
-pub(crate) const RETRYABLE_503_TYPES: [&str; 3] = [
+pub(crate) const RETRYABLE_503_TYPES: [&str; 4] = [
     fluree_vocab::errors::NOVELTY_AT_MAX,
     fluree_vocab::errors::NOVELTY_DEFERRED,
+    fluree_vocab::errors::COMMIT_CONTENTION,
     fluree_vocab::errors::INTERNAL,
 ];
 
@@ -969,7 +659,7 @@ mod tests {
     #[test]
     fn every_503_source_is_classified_retryable_capacity() {
         // One entry per 503-producing path, with the code it must carry.
-        let sources: [(ServerError, &str, &str); 6] = [
+        let sources: [(ServerError, &str, &str); 8] = [
             (
                 ServerError::Api(ApiError::NoveltyDeferred { remaining: 3 }),
                 errors::NOVELTY_DEFERRED,
@@ -1004,6 +694,22 @@ mod tests {
                 "consensus-flattened novelty backpressure",
             ),
             (
+                ServerError::Api(ApiError::commit_contention(
+                    16,
+                    ApiError::Transact(fluree_db_api::TransactError::CommitConflict {
+                        expected_t: 1,
+                        head_t: 2,
+                    }),
+                )),
+                errors::COMMIT_CONTENTION,
+                "every commit attempt lost its race",
+            ),
+            (
+                ServerError::CommitContention("commit contention (flattened)".into()),
+                errors::COMMIT_CONTENTION,
+                "consensus-flattened commit contention",
+            ),
+            (
                 // `SubmissionError::Overloaded` reaches this shape via
                 // `submission_error_to_server_error` — retryable by its
                 // contract (in-flight cap), but its `@type` is the `Http`
@@ -1034,7 +740,7 @@ mod tests {
         }
         // The allowlist itself is part of the contract: growing it is a
         // conscious act, recorded here.
-        assert_eq!(RETRYABLE_503_TYPES.len(), 3);
+        assert_eq!(RETRYABLE_503_TYPES.len(), 4);
     }
 
     /// The two 413s carry distinct codes for clients to branch on: the HTTP

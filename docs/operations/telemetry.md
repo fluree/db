@@ -365,6 +365,15 @@ transact_execute (debug)
     └── commit_apply_to_novelty (debug)
 ```
 
+A transaction that stages against a snapshot and commits optimistically runs
+its stage and commit inside `txn_attempts` (debug, target `fluree_db_api`),
+which records `attempts`, the number of stage-and-commit attempts made. More
+than one means the commit lost a race with another writer to the ledger and
+was retried. When every attempt loses, the request fails with 503
+`err:db/CommitContention`. With `fluree_db_api` below debug, `txn_attempts` is
+not recorded and `txn_stage` / `txn_commit` sit directly under
+`transact_execute`, as above.
+
 #### Span Tree (Indexing)
 
 Indexing runs as a **separate top-level trace** (not nested under an HTTP request). Each index refresh cycle starts its own trace root:

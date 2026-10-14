@@ -127,7 +127,7 @@ pub(crate) fn commit_opts(message: Option<String>) -> CommitOpts {
     match message {
         Some(message) => opts.with_txn_meta(vec![TxnMetaEntry::new(
             FLUREE_DB,
-            "message",
+            fluree_vocab::db::MESSAGE,
             TxnMetaValue::string(message),
         )]),
         None => opts,
