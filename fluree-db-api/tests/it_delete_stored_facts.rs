@@ -2034,3 +2034,131 @@ async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// ADD, COPY and MOVE tell the facts of the source and the destination apart
+/// the way storage does: a big integer by value, whatever XSD subtype either
+/// side holds it with. So a value both graphs hold, one in its index and the
+/// other since its last build, is a restatement: it stays in the destination,
+/// read in process, after a reload and after the next index build. Before,
+/// the destination's term was retracted and the source's asserted at one
+/// `t`, and the retraction won. Both directions (indexed destination,
+/// novelty source and the reverse), into a named graph and into the default
+/// graph. A `dateTime` written past the microsecond is a control: both sides
+/// hold it at the microsecond.
+#[tokio::test]
+async fn a_transfer_keeps_a_value_both_graphs_hold() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    const BIG: &str = "\"123456789012345678901234567890\"";
+    // (source spelling, destination spelling)
+    let values = [
+        (
+            format!("{BIG}^^xsd:nonNegativeInteger"),
+            format!("{BIG}^^xsd:nonNegativeInteger"),
+        ),
+        (
+            format!("{BIG}^^xsd:positiveInteger"),
+            format!("{BIG}^^xsd:nonNegativeInteger"),
+        ),
+        (
+            "\"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime".to_string(),
+            "\"2020-01-01T00:00:00.1234567Z\"^^xsd:dateTime".to_string(),
+        ),
+        ("\"x\"".to_string(), "\"x\"".to_string()),
+    ];
+    let src = "<http://example.org/g1>";
+    let count = |fluree: Fluree, id: String, graph: Option<&'static str>| async move {
+        let ledger = fluree.ledger(&id).await.expect("ledger");
+        let pattern = match graph {
+            Some(g) => format!("GRAPH {g} {{ ex:s ex:p ?o }}"),
+            None => "ex:s ex:p ?o".to_string(),
+        };
+        let q = format!("{PFX}SELECT (COUNT(?o) AS ?n) WHERE {{ {pattern} }}");
+        let json = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("query")
+            .to_sparql_json(&ledger.snapshot)
+            .expect("json");
+        json["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .expect("count")
+            .to_string()
+    };
+    let mut failures = Vec::new();
+    let mut case = 0;
+    for (src_value, dest_value) in &values {
+        for dest in [Some("<http://example.org/g2>"), None] {
+            for dest_indexed in [true, false] {
+                for verb in ["ADD", "COPY", "MOVE"] {
+                    case += 1;
+                    let id = &format!("it/transfer-keeps-{case}:main");
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().to_string_lossy().to_string();
+                    let insert = |graph: Option<&str>, value: &str| {
+                        let triple = format!("ex:s ex:p {value}");
+                        match graph {
+                            Some(g) => format!("{PFX}INSERT DATA {{ GRAPH {g} {{ {triple} }} }}"),
+                            None => format!("{PFX}INSERT DATA {{ {triple} }}"),
+                        }
+                    };
+                    // The indexed side first, then the other since the build.
+                    let (first, second) = if dest_indexed {
+                        (insert(dest, dest_value), insert(Some(src), src_value))
+                    } else {
+                        (insert(Some(src), src_value), insert(dest, dest_value))
+                    };
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                    fluree.create_ledger(id).await.expect("create");
+                    for (n, seed) in [first, second].iter().enumerate() {
+                        fluree
+                            .graph(id)
+                            .transact()
+                            .sparql_update(seed)
+                            .commit()
+                            .await
+                            .expect("seed");
+                        if n == 0 {
+                            support::rebuild_and_publish_index(&fluree, id).await;
+                        }
+                    }
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let transfer = format!("{verb} {src} TO {}", dest.unwrap_or("DEFAULT"));
+                    fluree
+                        .graph(id)
+                        .transact()
+                        .sparql_update(&transfer)
+                        .commit()
+                        .await
+                        .expect("transfer");
+                    let reload = || FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let mut got = vec![
+                        count(fluree, id.clone(), dest).await,
+                        count(reload(), id.clone(), dest).await,
+                    ];
+                    let src_left = count(reload(), id.clone(), Some(src)).await;
+                    {
+                        let fluree = reload();
+                        support::build_and_publish_index(&fluree, id).await;
+                    }
+                    got.push(count(reload(), id.clone(), dest).await);
+                    let want_src = if verb == "MOVE" { "0" } else { "1" };
+                    if got.iter().any(|n| n != "1") || src_left != want_src {
+                        failures.push(format!(
+                            "{verb} of {src_value} onto {dest_value} ({} indexed) into {}: \
+                             destination values in process, reloaded, after an index build \
+                             = {got:?}, source values reloaded {src_left}; expected 1 each and \
+                             {want_src}",
+                            if dest_indexed {
+                                "destination"
+                            } else {
+                                "source"
+                            },
+                            dest.unwrap_or("the default graph"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

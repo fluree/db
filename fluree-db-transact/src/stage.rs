@@ -9,7 +9,8 @@
 //! staged view against SHACL shapes.
 
 use crate::current_facts::{
-    CurrentFacts, DeleteResolver, ListFree, ResolveStats, Retraction, Slot, StoredFact,
+    graph_id_in, CurrentFacts, DeleteResolver, FactIdentity, FactTerm, ListFree, ResolveStats,
+    Retraction, Slot, StoredFact,
 };
 use crate::delete_witness::{witnessed_templates, WitnessContext};
 use crate::error::{Result, TransactError};
@@ -24,7 +25,7 @@ use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+use fluree_db_core::{Flake, FlakeValue, GraphId, Sid};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
@@ -1316,20 +1317,13 @@ fn route_var_graphs(
     Ok(())
 }
 
-/// Content identity of a flake, ignoring its graph, transaction time, and
-/// assertion flag. Two flakes with the same identity denote "the same triple"
-/// and may be moved between graphs by carrying only a different `g`.
-type FlakeContent = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
-
-fn flake_content(f: &Flake) -> FlakeContent {
-    (
-        f.s.clone(),
-        f.p.clone(),
-        f.o.clone(),
-        f.dt.clone(),
-        f.m.clone(),
-    )
-}
+/// A fact as a graph-transfer destination tells it apart, ignoring the graph
+/// it was read from, transaction time and assertion flag: subject, predicate
+/// and the object's identity in the destination ([`FactIdentity`]). A fact
+/// the source and destination share, whatever term each holds it under, is
+/// left in place, so the destination's retraction and the source's
+/// assertion never land at one `t`, where storage keeps the retraction.
+type FlakeContent = (Sid, Sid, FactTerm);
 
 /// Default for [`whole_graph_scan_limit`]: ~2 GB peak at the accumulator's
 /// two-copies-per-fact profile. Any graph that worked before the limit
@@ -1643,6 +1637,13 @@ async fn stage_graph_mgmt(
                         whole_graph_facts(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
                             .await?;
 
+                    // Every fact compared below is told apart as the
+                    // destination will hold it.
+                    let ids = FactIdentity::new(&ledger);
+                    let dest_in = graph_id_in(&ledger, &dest_sid);
+                    let flake_content = |f: &Flake| -> FlakeContent {
+                        (f.s.clone(), f.p.clone(), ids.in_graph(dest_in, f))
+                    };
                     let dest_contents: HashSet<FlakeContent> = dest_facts
                         .iter()
                         .map(|f| flake_content(f.flake()))

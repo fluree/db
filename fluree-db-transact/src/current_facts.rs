@@ -564,6 +564,17 @@ impl<'l> FactIdentity<'l> {
             || self.keys.p_id(&flake.p),
             flake,
         );
+        Self::term(key, flake)
+    }
+
+    /// `flake`'s identity in graph `g_id` (`None` for a graph the state does
+    /// not have), whatever graph it names: the identity a fact copied into
+    /// that graph has there.
+    pub fn in_graph(&self, g_id: Option<GraphId>, flake: &Flake) -> FactTerm {
+        Self::term(self.key(g_id, flake), flake)
+    }
+
+    fn term(key: Option<MergeKey>, flake: &Flake) -> FactTerm {
         match key {
             Some((key, at)) => FactTerm::Key(key, at),
             None => FactTerm::Term(flake.o.clone(), flake.dt.clone(), flake.m.clone()),
