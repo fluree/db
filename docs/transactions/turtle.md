@@ -732,6 +732,8 @@ GRAPH <http://example.org/graphs/products> {
 }
 ```
 
+The block's predicates follow the same rule as JSON-LD txn-meta: in Fluree's namespaces only `fluree:message` and `fluree:author` may be set. Any other, such as `fluree:identity` or `fluree:t`, fails the transaction, because the commit's own provenance lives on the same subject. Bulk import applies the same rule to a `<#txn-meta>` block.
+
 ### Limits
 
 - Maximum 256 named graphs per transaction

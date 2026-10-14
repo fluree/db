@@ -237,6 +237,8 @@ pub async fn build_index_for_record_with_tracker(
                     result.fuel = tally_fuel(&tracker);
                     return Ok(result);
                 }
+                // A full rebuild resolves the same commit and fails the same way.
+                Err(e) if !e.is_retryable() => return Err(e),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -400,6 +402,26 @@ where
         commit_store,
         fluree_db_core::tracking::Tracker::disabled(),
         ledger_id,
+        record,
+        config,
+    )
+    .await
+}
+
+/// Build `record`'s index incrementally over its published index, as
+/// [`build_index_for_record`] tries first, but with no fallback to a full
+/// rebuild: an incremental failure is returned. For tests that must know the
+/// incremental path ran. Only with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+pub async fn build_incremental_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    incremental_index(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record.ledger_id.as_str(),
         record,
         config,
     )
