@@ -196,8 +196,12 @@ The preview stages the merge's resolved change set on the target and validates i
 See what's different between two branches:
 
 ```bash
-# Query branch for entities not in main
-fluree query --ledger mydb:my-branch 'SELECT ?s ?p ?o WHERE {
+# Query branch for entities not in main. The SERVICE endpoint must be in the
+# query's dataset, so name both branches.
+fluree query --ledger mydb:my-branch 'SELECT ?s ?p ?o
+FROM <mydb:my-branch>
+FROM NAMED <mydb:main>
+WHERE {
   ?s ?p ?o .
   FILTER NOT EXISTS {
     SERVICE <fluree:ledger:mydb:main> { ?s ?p ?o }

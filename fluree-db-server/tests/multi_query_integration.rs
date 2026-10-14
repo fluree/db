@@ -444,8 +444,177 @@ async fn multi_query_sub_query_min_t_covers_every_ledger_it_reads() {
     );
 }
 
-/// A sub-query that does not parse is reported under its alias, in either
-/// language, and its siblings still run.
+/// A JSON-LD sub-query's `min-t` covers every ledger its body reads, one its
+/// `opts` or its `fromNamed` names included, and the envelope lists that
+/// ledger in its snapshot.
+#[tokio::test]
+async fn multi_query_jsonld_min_t_covers_every_ledger_the_body_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:j1").await;
+    create_ledger(&app, "mq:j2").await;
+    insert_one(&app, "mq:j1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:j1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:j2", "ex:c", "B").await;
+
+    // mq:j1 is at t=2, mq:j2 (named only in the body's `opts`, or only in
+    // its `fromNamed`) at t=1.
+    for (shape, names_j2) in [
+        (
+            "opts.from",
+            json!({ "opts": { "from": ["mq:j1", "mq:j2"] } }),
+        ),
+        (
+            "fromNamed",
+            json!({ "fromNamed": { "j": { "@id": "mq:j2" } } }),
+        ),
+    ] {
+        let envelope = |min_t: i64| {
+            let mut query = json!({
+                "@context": { "ex": "http://example.org/" },
+                "from": "mq:j1",
+                "opts": { "min-t": min_t },
+                "select": ["?name"],
+                "where": { "@id": "?s", "ex:name": "?name" }
+            });
+            for (k, v) in names_j2.as_object().into_iter().flatten() {
+                match (k.as_str(), v) {
+                    ("opts", JsonValue::Object(o)) => {
+                        for (ok, ov) in o {
+                            query["opts"][ok] = ov.clone();
+                        }
+                    }
+                    _ => query[k] = v.clone(),
+                }
+            }
+            json!({ "queries": { "both": { "language": "jsonld", "query": query } } })
+        };
+        let (status, body) = post_envelope(&app, &envelope(1)).await;
+        assert_eq!(status, StatusCode::OK, "{shape}: control, got body: {body}");
+        assert_eq!(
+            body["snapshot"]["ledgers"]["mq:j2"], 1,
+            "{shape}: got body: {body}"
+        );
+
+        let (status, body) = post_envelope(&app, &envelope(2)).await;
+        assert_eq!(
+            status,
+            StatusCode::REQUEST_TIMEOUT,
+            "{shape}: got body: {body}"
+        );
+        assert!(
+            body.to_string().contains("current t=1"),
+            "{shape}: the wait must be on mq:j2, got: {body}"
+        );
+    }
+}
+
+/// The server reads a JSON-LD sibling's dataset after merging the envelope's
+/// and the alias's `opts` into it, as the sibling runs: a ledger those `opts`
+/// add is listed in the snapshot and covered by the alias's `min-t`, and
+/// `opts` that would change the default graph the body names are a 400,
+/// before the route waits on `min-t` or refreshes anything.
+#[tokio::test]
+async fn multi_query_reads_a_sibling_with_its_outer_opts_merged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:o1").await;
+    create_ledger(&app, "mq:o2").await;
+    insert_one(&app, "mq:o1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:o1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:o2", "ex:c", "B").await;
+
+    // mq:o1 is at t=2; mq:o2, named only in the outer `opts`, at t=1.
+    let envelope = |envelope_opts: JsonValue, alias_opts: JsonValue| {
+        json!({
+            "opts": envelope_opts,
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:o1",
+                        "select": ["?name"],
+                        "where": [["graph", "o2", { "@id": "?s", "ex:name": "?name" }]]
+                    },
+                    "opts": alias_opts
+                }
+            }
+        })
+    };
+    let named = json!({ "fromNamed": { "o2": { "@id": "mq:o2" } } });
+    for (layer, envelope_opts, alias_opts) in [
+        ("envelope", named.clone(), json!({ "min-t": 2 })),
+        (
+            "alias",
+            json!({}),
+            json!({ "fromNamed": named["fromNamed"], "min-t": 2 }),
+        ),
+    ] {
+        let mut control = envelope(envelope_opts.clone(), alias_opts.clone());
+        control["queries"]["a"]["opts"]["min-t"] = json!(1);
+        let (status, body) = post_envelope(&app, &control).await;
+        assert_eq!(status, StatusCode::OK, "{layer} control, got body: {body}");
+        assert_eq!(body["snapshot"]["ledgers"]["mq:o2"], 1, "{layer}: {body}");
+        assert!(body.to_string().contains("\"B\""), "{layer}: {body}");
+
+        let (status, body) = post_envelope(&app, &envelope(envelope_opts, alias_opts)).await;
+        assert_eq!(
+            status,
+            StatusCode::REQUEST_TIMEOUT,
+            "{layer}, got body: {body}"
+        );
+        assert!(
+            body.to_string().contains("current t=1"),
+            "{layer}: the wait must be on mq:o2, got: {body}"
+        );
+    }
+
+    // Outer `opts` that change the default graph the body names are refused
+    // before any wait: with `min-t: 2` (mq:o2 is at t=1) the answer is the
+    // 400, not a read of mq:o2 at t=1 and not a wait.
+    for (layer, envelope_opts, alias_opts) in [
+        (
+            "envelope",
+            json!({ "from": ["mq:o1", "mq:o2"], "min-t": 2 }),
+            json!({}),
+        ),
+        ("alias", json!({}), json!({ "from": "mq:o2", "min-t": 2 })),
+        (
+            "envelope, no min-t",
+            json!({ "from": ["mq:o1", "mq:o2"] }),
+            json!({}),
+        ),
+    ] {
+        let (status, body) = post_envelope(&app, &envelope(envelope_opts, alias_opts)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{layer}, got body: {body}");
+        assert!(
+            body.to_string().contains("names its default graphs"),
+            "{layer}: {body}"
+        );
+    }
+}
+
+/// A SPARQL sub-query that does not parse refuses the whole envelope with the
+/// parser's error.
 #[tokio::test]
 async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias() {
     let (_tmp, state) = test_state().await;

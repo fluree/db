@@ -289,7 +289,7 @@ impl FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
         match record {
             Some(record) if record.retracted => Err(graph_source_not_found(graph_source_id)),
             record => Ok(record),
@@ -477,7 +477,7 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
 
         Ok(record.is_some() && record.map(|r| !r.retracted).unwrap_or(false))
     }
@@ -491,7 +491,7 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
         else {
             return Ok(None);
         };

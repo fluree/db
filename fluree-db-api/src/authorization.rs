@@ -194,7 +194,7 @@ mod tests {
             .default_graphs
             .iter()
             .chain(spec.named_graphs.iter())
-            .all(|s| s.policy_override.is_none()));
+            .all(|s| s.policy_override().is_none()));
         assert_eq!(
             opts.identity.as_deref(),
             Some("http://example.org/employee")

@@ -34,24 +34,41 @@ use std::sync::Arc;
 
 /// Named graphs a JSON-LD transaction writes to, interned so the templates
 /// of one graph share its IRI.
-struct WriteGraphs(HashMap<String, Arc<str>>);
+struct WriteGraphs {
+    iris: HashMap<String, Arc<str>>,
+    /// See [`Txn::address_graph_names`].
+    address_names: BTreeSet<String>,
+}
 
 impl WriteGraphs {
     fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            iris: HashMap::new(),
+            address_names: BTreeSet::new(),
+        }
     }
 
     fn get_or_assign(&mut self, iri: &str) -> Arc<str> {
-        if let Some(iri) = self.0.get(iri) {
+        if let Some(iri) = self.iris.get(iri) {
             return Arc::clone(iri);
         }
         let interned: Arc<str> = Arc::from(iri);
-        self.0.insert(iri.to_string(), Arc::clone(&interned));
+        self.iris.insert(iri.to_string(), Arc::clone(&interned));
         interned
     }
 
     fn iris(&self) -> BTreeSet<String> {
-        self.0.keys().cloned().collect()
+        self.iris.keys().cloned().collect()
+    }
+
+    /// Note a graph name kept as written because it reads as a ledger
+    /// address that strict expansion refuses.
+    fn note_address_name(&mut self, name: &str) {
+        self.address_names.insert(name.to_string());
+    }
+
+    fn address_names(&self) -> BTreeSet<String> {
+        self.address_names.clone()
     }
 }
 
@@ -305,6 +322,7 @@ fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_opts(opts)
         .with_txn_meta(txn_meta);
     txn.write_graphs = write_graphs.iris();
+    txn.address_graph_names = write_graphs.address_names();
     Ok(txn)
 }
 
@@ -361,6 +379,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_opts(opts)
         .with_txn_meta(txn_meta);
     txn.write_graphs = write_graphs.iris();
+    txn.address_graph_names = write_graphs.address_names();
     Ok(txn)
 }
 
@@ -412,7 +431,6 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     let where_named_graphs = parse_update_where_named_graphs(
         obj.get("fromNamed").or_else(|| obj.get("from-named")),
         &context,
-        strict,
     )?;
     let from_named_aliases: HashMap<String, String> = where_named_graphs
         .as_ref()
@@ -435,18 +453,14 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         strict,
     )?;
 
-    let where_default_graph_iris = parse_update_where_default_graph_iris(
-        obj.get("from"),
-        &context,
-        &from_named_aliases,
-        strict,
-    )?
-    .unwrap_or_else(|| {
-        template_default_graph
-            .as_ref()
-            .map(|(_, iri)| vec![iri.clone()])
-            .unwrap_or_default()
-    });
+    let where_default_graph_iris =
+        parse_update_where_default_graph_iris(obj.get("from"), &context, &from_named_aliases)?
+            .unwrap_or_else(|| {
+                template_default_graph
+                    .as_ref()
+                    .map(|(_, iri)| vec![iri.clone()])
+                    .unwrap_or_default()
+            });
 
     let has_where = obj.get("where").is_some();
     let has_values = obj.get("values").is_some();
@@ -495,7 +509,6 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
-        ctx.default_graph_is_template_default = template_default_graph.is_some();
         ctx.ill_typed_as_stored = true;
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
@@ -543,7 +556,6 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
                 .map(|(graph, _)| Arc::clone(graph)),
             &from_named_aliases,
         );
-        ctx.default_graph_is_template_default = template_default_graph.is_some();
         let templates = parse_update_templates_with_ctx(insert_val, &mut ctx)?;
         if templates.is_empty() {
             return Err(TransactError::Parse(
@@ -564,7 +576,7 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .with_opts(opts)
         .with_txn_meta(txn_meta);
     txn.write_graphs = write_graphs.iris();
-    txn.template_default_graph = template_default_graph.map(|(_, iri)| iri);
+    txn.address_graph_names = write_graphs.address_names();
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
 
@@ -587,8 +599,9 @@ fn parse_update_template_default_graph(
         return Ok(None);
     };
 
-    // Allow `"graph": "default"` as a no-op.
-    if matches!(v, Value::String(s) if s == "default") {
+    // Allow `"graph": "default"` (or `urn:default`) as a no-op.
+    if matches!(v, Value::String(s) if fluree_db_core::GraphSel::keyword(s) == Some(fluree_db_core::GraphSel::Default))
+    {
         return Ok(None);
     }
 
@@ -607,7 +620,6 @@ fn parse_update_where_default_graph_iris(
     from_val: Option<&Value>,
     context: &ParsedContext,
     from_named_aliases: &HashMap<String, String>,
-    strict: bool,
 ) -> Result<Option<Vec<String>>> {
     let Some(v) = from_val else {
         return Ok(None);
@@ -624,7 +636,10 @@ fn parse_update_where_default_graph_iris(
                 "from: \"txn-meta\" is not currently supported as a default graph selector in updates"
                     .to_string(),
             )),
-            _ => Ok(Some(expand_update_graph_iri(&resolved, context, strict)?)),
+            // A dataset reference, not a node id: a prefix the context defines
+            // expands, and anything else is kept as written for the update to
+            // resolve (`"from": "mydb:main"` names the ledger's default graph).
+            _ => Ok(Some(expand_update_graph_iri(&resolved, context, false)?)),
         }
     };
 
@@ -647,7 +662,7 @@ fn parse_update_where_default_graph_iris(
         // Object form: allow {"graph": ...} and ignore other dataset fields.
         Value::Object(obj) => {
             if let Some(graph) = obj.get("graph") {
-                parse_update_where_default_graph_iris(Some(graph), context, from_named_aliases, strict)
+                parse_update_where_default_graph_iris(Some(graph), context, from_named_aliases)
             } else {
                 Ok(None)
             }
@@ -675,7 +690,6 @@ fn resolve_graph_selector_value_for_update(
 fn parse_update_where_named_graphs(
     from_named_val: Option<&Value>,
     context: &ParsedContext,
-    strict: bool,
 ) -> Result<Option<Vec<crate::ir::UpdateNamedGraph>>> {
     let Some(v) = from_named_val else {
         return Ok(None);
@@ -706,7 +720,7 @@ fn parse_update_where_named_graphs(
                     // This makes `fromNamed: ["ex:g2"]` usable as `["graph", "ex:g2", ...]`
                     // in WHERE patterns even though GRAPH names are not expanded via @context.
                     let implicit_alias = graph_val.as_str().map(std::string::ToString::to_string);
-                    let iri = expand_update_graph_iri(graph_val, context, strict)?;
+                    let iri = expand_update_graph_iri(graph_val, context, false)?;
                     out.push(crate::ir::UpdateNamedGraph {
                         iri,
                         alias: explicit_alias.or(implicit_alias),
@@ -714,7 +728,7 @@ fn parse_update_where_named_graphs(
                 } else {
                     // String shorthand (or other selector shape): treat as graph IRI
                     let implicit_alias = item.as_str().map(std::string::ToString::to_string);
-                    let iri = expand_update_graph_iri(&item, context, strict)?;
+                    let iri = expand_update_graph_iri(&item, context, false)?;
                     out.push(crate::ir::UpdateNamedGraph {
                         iri,
                         alias: implicit_alias,
@@ -832,7 +846,15 @@ fn parse_update_default_graph(
         }
     };
 
-    let expanded = expand_with_context_policy(&selector, context, strict)?;
+    // A ledger address that strict expansion refuses is kept as written, as
+    // a `from` source is, for staging to accept only as this ledger's own.
+    let (expanded, kept_as_address) = match expand_with_context_policy(&selector, context, strict) {
+        Ok(expanded) => (expanded, false),
+        Err(_) if strict && v.as_str().is_some_and(reads_as_ledger_address) => {
+            (expand_with_context_policy(&selector, context, false)?, true)
+        }
+        Err(refused) => return Err(refused.into()),
+    };
     let iri = match &expanded {
         Value::Array(arr) => arr
             .first()
@@ -847,6 +869,9 @@ fn parse_update_default_graph(
         _ => None,
     }
     .ok_or_else(|| TransactError::Parse("graph must expand to an @id IRI".to_string()))?;
+    if kept_as_address {
+        write_graphs.note_address_name(&iri);
+    }
 
     let graph = write_graphs.get_or_assign(&iri);
     Ok(Some((graph, iri)))
@@ -860,10 +885,6 @@ struct TemplateParseCtx<'a> {
     strict_compact_iri: bool,
     write_graphs: &'a mut WriteGraphs,
     default_graph: Option<Arc<str>>,
-    /// Whether `default_graph` is the update's top-level `graph` (the
-    /// template default, [`Txn::template_default_graph`]) rather than the
-    /// graph of an enclosing `["graph", <iri>, …]` wrapper.
-    default_graph_is_template_default: bool,
     from_named_aliases: &'a HashMap<String, String>,
     blank_counter: usize,
     /// Delete templates keep an ill-typed literal's lexical form as stored
@@ -891,24 +912,26 @@ impl<'a> TemplateParseCtx<'a> {
             strict_compact_iri,
             write_graphs,
             default_graph,
-            default_graph_is_template_default: false,
             from_named_aliases,
             blank_counter: 0,
             ill_typed_as_stored: false,
         }
     }
 
-    /// Expand a predicate or @type value (uses @vocab), respecting strict policy.
-    fn expand_vocab(
-        &self,
-        s: &str,
-    ) -> std::result::Result<(String, Option<fluree_graph_json_ld::ContextEntry>), TransactError>
-    {
-        Ok(fluree_graph_json_ld::details_with_policy(
-            s,
-            self.context,
-            self.strict_compact_iri,
-        )?)
+    /// Expand a template's graph name (uses @vocab), respecting strict
+    /// policy, except that a ledger address strict expansion refuses is kept
+    /// as written and noted for staging ([`Txn::address_graph_names`]).
+    fn expand_graph_name(&mut self, s: &str) -> Result<String> {
+        match fluree_graph_json_ld::details_with_policy(s, self.context, self.strict_compact_iri) {
+            Ok((expanded, _)) => Ok(expanded),
+            Err(_) if self.strict_compact_iri && reads_as_ledger_address(s) => {
+                let (expanded, _) =
+                    fluree_graph_json_ld::details_with_policy(s, self.context, false)?;
+                self.write_graphs.note_address_name(&expanded);
+                Ok(expanded)
+            }
+            Err(refused) => Err(refused.into()),
+        }
     }
 
     /// Expand a subject @id (uses @base), respecting strict policy.
@@ -979,12 +1002,8 @@ fn parse_update_templates_with_ctx(
                     })?;
                     let expanded = ctx.expand_document(&arr[2])?;
                     let prev_default = ctx.default_graph.replace(graph.0);
-                    // The wrapper names its graph: not the template default.
-                    let prev_is_template_default =
-                        std::mem::replace(&mut ctx.default_graph_is_template_default, false);
                     let templates = parse_expanded_triples_with_ctx(&expanded, ctx)?;
                     ctx.default_graph = prev_default;
-                    ctx.default_graph_is_template_default = prev_is_template_default;
                     out.extend(templates);
                     continue;
                 }
@@ -1399,15 +1418,9 @@ fn parse_expanded_object_with_ctx(
     // A node with no `@graph` of its own takes the default: the update's
     // template default (top-level `graph`), an enclosing wrapper's graph, or
     // the graph of the node it is nested in.
-    let graph_from_template_default = node_graph.is_none()
-        && ctx.default_graph.is_some()
-        && ctx.default_graph_is_template_default;
     let own_graph = node_graph.clone();
     let node_graph = node_graph.or_else(|| ctx.default_graph.clone());
     let place = |t: TripleTemplate| match &node_graph {
-        Some(graph) if graph_from_template_default => {
-            t.in_template_default_graph(Arc::clone(graph))
-        }
         Some(graph) => t.in_graph(Arc::clone(graph)),
         None => t,
     };
@@ -1424,16 +1437,10 @@ fn parse_expanded_object_with_ctx(
 
     // Nodes nested in this one belong to its graph, as an embedded node object
     // does in JSON-LD.
-    let outer = own_graph.map(|graph| {
-        (
-            ctx.default_graph.replace(graph),
-            std::mem::replace(&mut ctx.default_graph_is_template_default, false),
-        )
-    });
+    let outer = own_graph.map(|graph| ctx.default_graph.replace(graph));
     let parsed = parse_node_properties(obj, &subject, &place, ctx, &mut templates);
-    if let Some((default_graph, is_template_default)) = outer {
+    if let Some(default_graph) = outer {
         ctx.default_graph = default_graph;
-        ctx.default_graph_is_template_default = is_template_default;
     }
     parsed?;
 
@@ -1523,13 +1530,22 @@ fn parse_node_properties(
 
 fn resolve_graph_selector_str_for_templates(
     raw: &str,
-    ctx: &TemplateParseCtx<'_>,
+    ctx: &mut TemplateParseCtx<'_>,
 ) -> Result<String> {
     if let Some(iri) = ctx.from_named_aliases.get(raw) {
         return Ok(iri.clone());
     }
-    let (expanded, _) = ctx.expand_vocab(raw)?;
-    Ok(expanded)
+    ctx.expand_graph_name(raw)
+}
+
+/// Whether a graph value reads as a ledger address (`mydb`, `mydb:main`,
+/// `urn:fluree:mydb:main#<g>`). Under strict compact-IRI checking such a
+/// value, when the `@context` defines no prefix for its name, is kept as
+/// written the way a `from` source is, and staging accepts it only as the
+/// ledger's own address ([`Txn::address_graph_names`]). A prefix the
+/// `@context` does define still expands.
+fn reads_as_ledger_address(value: &str) -> bool {
+    fluree_db_core::MemberRef::parse(value).is_ok_and(|member| member.address().is_some())
 }
 
 /// Parse an expanded @id value

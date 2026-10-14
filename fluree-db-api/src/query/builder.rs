@@ -816,6 +816,11 @@ impl<'a> FromQueryBuilder<'a> {
         // Resolve the single target ledger from the query's own dataset spec. A
         // crawl over a federated multi-source dataset must not collapse to one
         // source, so bail unless exactly one graph is specified.
+        //
+        // This parse ignores `execution.ledger_times` (a multi-query envelope's
+        // snapshot): a crawl runs only on a graph source, and an envelope
+        // resolves every member as a ledger before it dispatches, so a crawl
+        // never runs under one.
         let (spec, opts) = parse_dataset_spec(json)?;
         if spec.default_graphs.len() + spec.named_graphs.len() != 1 {
             return Ok(None);
@@ -1123,7 +1128,17 @@ impl<'a> FromQueryBuilder<'a> {
     ///
     /// Uses `.format()` config if set, otherwise defaults based on input type
     /// (JSON-LD for `.jsonld()`, SPARQL JSON for `.sparql()`).
-    pub async fn execute_formatted(mut self) -> Result<JsonValue> {
+    pub async fn execute_formatted(self) -> Result<JsonValue> {
+        self.execute_formatted_with_advisories()
+            .await
+            .map(|(json, _)| json)
+    }
+
+    /// [`Self::execute_formatted`], with the query's advisories
+    /// ([`crate::QueryAdvisory`]) alongside the formatted result.
+    pub async fn execute_formatted_with_advisories(
+        mut self,
+    ) -> Result<(JsonValue, Vec<crate::QueryAdvisory>)> {
         let errs = self.core.validate();
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
@@ -1153,7 +1168,7 @@ impl<'a> FromQueryBuilder<'a> {
                 .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
                 .await?
             {
-                return Ok(expanded);
+                return Ok((expanded, Vec::new()));
             }
         }
         // SPARQL policy via connection opts (multi-query aliases) — see
@@ -1170,19 +1185,19 @@ impl<'a> FromQueryBuilder<'a> {
                 )
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
-            let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+            let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
             return if let Some(alias) = spec
                 .default_graphs
                 .first()
                 .or_else(|| spec.named_graphs.first())
             {
-                let view = self
-                    .fluree
-                    .db_or_graph_source(alias.identifier.as_str())
-                    .await?;
-                Ok(result
-                    .format_async(view.as_graph_db_ref(), &format_config)
-                    .await?)
+                let view = self.fluree.db_or_graph_source_for(alias).await?;
+                Ok((
+                    result
+                        .format_async(view.as_graph_db_ref(), &format_config)
+                        .await?,
+                    result.advisories.clone(),
+                ))
             } else {
                 Err(ApiError::query("No graph specified for formatting"))
             };
@@ -1203,27 +1218,31 @@ impl<'a> FromQueryBuilder<'a> {
                 match target {
                     // Multi-ledger: format hydration per home-ledger view so
                     // cross-graph IRIs/properties decode correctly (issue #1259).
-                    FormatTarget::Dataset(dataset) => {
-                        Ok(crate::format::format_results_async_dataset(
+                    FormatTarget::Dataset(dataset) => Ok((
+                        crate::format::format_results_async_dataset(
                             &result,
                             &result.context,
                             &dataset,
                             &format_config,
                             None,
                         )
-                        .await?)
-                    }
+                        .await?,
+                        result.advisories.clone(),
+                    )),
                     // Single-ledger: the view the query ran on, so hydration is
                     // filtered by the policy that filtered the rows.
-                    FormatTarget::Single(view) => Ok(crate::format::format_results_async(
-                        &result,
-                        &result.context,
-                        view.as_graph_db_ref(),
-                        &format_config,
-                        view.policy(),
-                        None,
-                    )
-                    .await?),
+                    FormatTarget::Single(view) => Ok((
+                        crate::format::format_results_async(
+                            &result,
+                            &result.context,
+                            view.as_graph_db_ref(),
+                            &format_config,
+                            view.policy(),
+                            None,
+                        )
+                        .await?,
+                        result.advisories.clone(),
+                    )),
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1269,19 +1288,19 @@ impl<'a> FromQueryBuilder<'a> {
                     },
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
-                let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+                let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
                 if let Some(alias) = spec
                     .default_graphs
                     .first()
                     .or_else(|| spec.named_graphs.first())
                 {
-                    let view = self
-                        .fluree
-                        .db_or_graph_source(alias.identifier.as_str())
-                        .await?;
-                    Ok(result
-                        .format_async(view.as_graph_db_ref(), &format_config)
-                        .await?)
+                    let view = self.fluree.db_or_graph_source_for(alias).await?;
+                    Ok((
+                        result
+                            .format_async(view.as_graph_db_ref(), &format_config)
+                            .await?,
+                        result.advisories.clone(),
+                    ))
                 } else {
                     Err(ApiError::query("No graph specified for formatting"))
                 }
@@ -1340,16 +1359,13 @@ impl<'a> FromQueryBuilder<'a> {
                 )
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
-            let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+            let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
             return if let Some(alias) = spec
                 .default_graphs
                 .first()
                 .or_else(|| spec.named_graphs.first())
             {
-                let view = self
-                    .fluree
-                    .db_or_graph_source(alias.identifier.as_str())
-                    .await?;
+                let view = self.fluree.db_or_graph_source_for(alias).await?;
                 crate::format::format_results_string_async(
                     &result,
                     &result.context,
@@ -1445,16 +1461,13 @@ impl<'a> FromQueryBuilder<'a> {
                     },
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
-                let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+                let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
                 if let Some(alias) = spec
                     .default_graphs
                     .first()
                     .or_else(|| spec.named_graphs.first())
                 {
-                    let view = self
-                        .fluree
-                        .db_or_graph_source(alias.identifier.as_str())
-                        .await?;
+                    let view = self.fluree.db_or_graph_source_for(alias).await?;
                     crate::format::format_results_string_async(
                         &result,
                         &result.context,

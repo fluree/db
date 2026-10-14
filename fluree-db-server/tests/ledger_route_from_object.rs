@@ -1,7 +1,8 @@
-//! On the ledger-scoped JSON-LD routes, a single `from` object names one
-//! source, by `@id` or else `id`. Every spelling of the route's ledger is
-//! accepted, no spelling of another ledger is, and an object that names no
-//! source is refused in every execution lane.
+//! On the ledger-scoped JSON-LD routes, a single `from` string, or an object
+//! naming one source by `@id` or else `id`, is read in the route's ledger.
+//! Every spelling of the route's ledger is accepted, no spelling of another
+//! ledger is, and an object that names no source is refused in every
+//! execution lane.
 
 use axum::body::Body;
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
@@ -133,6 +134,11 @@ fn cases() -> Vec<(JsonValue, Expect)> {
         (json!({}), Own),
         (json!({ "from": "own:main" }), Own),
         (json!({ "from": "other:main" }), Mismatch),
+        // Strings: every spelling of a ledger, as for an object.
+        (json!({ "from": "own" }), Own),
+        (json!({ "from": "urn:fluree:own:main" }), Own),
+        (json!({ "from": "other" }), Mismatch),
+        (json!({ "from": "urn:fluree:other:main" }), Mismatch),
         // `@id`: every spelling of the route's ledger reads it.
         (json!({ "from": { "@id": "own:main" } }), Own),
         (json!({ "from": { "@id": "own" } }), Own),
