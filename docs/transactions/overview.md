@@ -290,10 +290,12 @@ Each commit includes rich metadata:
 - `flakes_retracted`: Number of retractions
 
 **Provenance (in `txn-meta` graph, under the commit subject):**
-- `f:identity`: Authenticated identity acting on the transaction. System-controlled — verified DID for signed requests, otherwise from `opts.identity` / `CommitOpts::identity`. Any user-supplied `f:identity` in the body is overridden.
-- `f:author`: Optional author claim. Pure user txn-meta — supply `f:author` as a top-level property in the envelope-form transaction body.
-- `f:message`: Optional commit message. Pure user txn-meta — supply `f:message` as a top-level property in the envelope-form transaction body.
+- `f:identity`: Authenticated identity acting on the transaction. System-controlled — verified DID for signed requests, otherwise from `opts.identity` / `CommitOpts::identity`. A transaction can't set it: `f:identity` in its txn-meta is refused.
+- `f:author`: Optional author claim. Pure user txn-meta — supply `f:author` as a top-level property in the envelope-form transaction body, or in a TriG `<#txn-meta>` block.
+- `f:message`: Optional commit message. Pure user txn-meta — supply `f:message` as a top-level property in the envelope-form transaction body, or in a TriG `<#txn-meta>` block.
 - `previous_commit_id`: ContentId of previous commit (in the commit envelope).
+
+`f:author` and `f:message` are the only predicates in Fluree's namespaces a transaction's txn-meta may carry. Any other, such as `f:t`, `f:identity` or `f:reverts`, is refused, because the commit's own provenance lives on the same subject.
 
 See [Commit Receipts](commit-receipts.md) for details.
 

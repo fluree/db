@@ -1928,6 +1928,66 @@ pub mod db {
     pub const REIFIES_LIST_INDEX: &str = "reifiesListIndex";
 }
 
+/// Which predicates a commit's txn-meta may carry.
+///
+/// A commit's subject in `#txn-meta` holds Fluree's provenance and the user's
+/// claims side by side, so predicates in Fluree's own namespaces are reserved:
+/// a transaction may set only [`db::TXN_META_USER`], and txn-meta holds only
+/// [`db::TXN_META`] from those namespaces. Every reader of user txn-meta and
+/// the index resolver decide through [`user_may_set`] and [`may_hold`].
+pub mod txn_meta {
+    use crate::db::{TXN_META, TXN_META_USER};
+    use crate::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
+
+    /// Namespaces whose predicates are Fluree provenance.
+    pub const RESERVED_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
+
+    /// Whether a transaction may set this predicate in its txn-meta.
+    pub fn user_may_set(ns: u16, name: &str) -> bool {
+        outside_reserved_or_in(ns, name, TXN_META_USER)
+    }
+
+    /// Whether a commit's txn-meta may hold this predicate, from the user or
+    /// the system.
+    pub fn may_hold(ns: u16, name: &str) -> bool {
+        outside_reserved_or_in(ns, name, TXN_META)
+    }
+
+    fn outside_reserved_or_in(ns: u16, name: &str, fluree_db_names: &[&str]) -> bool {
+        !RESERVED_NAMESPACES.contains(&ns) || (ns == FLUREE_DB && fluree_db_names.contains(&name))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::db;
+
+        #[test]
+        fn txn_meta_holds_every_name_a_user_may_set() {
+            for name in TXN_META_USER {
+                assert!(TXN_META.contains(name), "db::TXN_META lacks {name}");
+            }
+        }
+
+        #[test]
+        fn users_set_only_their_claims_in_reserved_namespaces() {
+            assert!(user_may_set(FLUREE_DB, db::MESSAGE));
+            assert!(user_may_set(FLUREE_DB, db::AUTHOR));
+            assert!(!user_may_set(FLUREE_DB, db::IDENTITY));
+            assert!(!user_may_set(FLUREE_DB, db::REVERTS));
+            assert!(!user_may_set(FLUREE_DB, db::T));
+            assert!(!user_may_set(FLUREE_COMMIT, db::MESSAGE));
+            assert!(!user_may_set(FLUREE_URN, "x"));
+            assert!(user_may_set(crate::namespaces::USER_START, db::T));
+
+            assert!(may_hold(FLUREE_DB, db::IDENTITY));
+            assert!(may_hold(FLUREE_DB, db::REVERTS));
+            assert!(!may_hold(FLUREE_DB, db::T));
+            assert!(!may_hold(FLUREE_COMMIT, db::IDENTITY));
+        }
+    }
+}
+
 /// Edge-annotation system predicate IRIs (`https://ns.flur.ee/db#reifies*`).
 ///
 /// Convenience full IRIs for query/parser code that needs to compare against
