@@ -259,11 +259,11 @@ impl BatchDeduper {
             return Ok(Batch::empty_schema_with_len(1));
         }
         let num_cols = batch.schema().len();
-        let (store, gv) = EqualityNorm::parts(&self.norm);
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
         for row_idx in 0..batch.len() {
             let signature: Vec<Binding> = (0..num_cols)
-                .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
+                .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), dicts, gv))
                 .collect();
             let mut h = FxHasher::default();
             signature.hash(&mut h);

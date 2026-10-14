@@ -1445,3 +1445,68 @@ async fn a_dropped_graph_source_no_longer_answers() {
         .unwrap_err();
     assert!(err.is_not_found(), "graph query after drop: {err}");
 }
+
+/// `ORDER BY ... LIMIT k` hands `k = LIMIT + OFFSET` to the scan-side top-k,
+/// whose heap starts at a capped capacity: a `LIMIT` far beyond the table's
+/// rows answers from the rows there are, on SPARQL and JSON-LD.
+#[tokio::test]
+async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("topk-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    const LIMIT: u64 = 9_223_372_036_854_775_807;
+    // erin, person/5, holds the top score; an IRI may come back compacted.
+    let is_top = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.ends_with("person/5"));
+    for (offset, rows) in [(0u64, 5usize), (1, 4)] {
+        let sparql = format!(
+            "SELECT ?s ?score FROM <topk-people:main> \
+             WHERE {{ ?s <http://example.org/score> ?score }} \
+             ORDER BY DESC(?score) LIMIT {LIMIT} OFFSET {offset}"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL OFFSET {offset}: {e}"));
+        let bindings = result["results"]["bindings"]
+            .as_array()
+            .expect("bindings array");
+        assert_eq!(bindings.len(), rows, "SPARQL OFFSET {offset}: {result}");
+        assert_eq!(
+            is_top(&bindings[0]["s"]["value"]),
+            offset == 0,
+            "SPARQL OFFSET {offset}: {result}"
+        );
+
+        let jsonld = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "topk-people:main",
+            "select": ["?s", "?score"],
+            "where": {"@id": "?s", "ex:score": "?score"},
+            "orderBy": "(desc ?score)",
+            "limit": LIMIT,
+            "offset": offset,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD OFFSET {offset}: {e}"));
+        let rows_out = result.as_array().expect("array result");
+        assert_eq!(rows_out.len(), rows, "JSON-LD OFFSET {offset}: {result}");
+        assert_eq!(
+            is_top(&rows_out[0][0]),
+            offset == 0,
+            "JSON-LD OFFSET {offset}: {result}"
+        );
+    }
+}

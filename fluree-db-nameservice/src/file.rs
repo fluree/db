@@ -353,26 +353,27 @@ impl FileNameService {
         format!("fluree:file://{NS_VERSION}/{ledger_name}/{branch}.index.json")
     }
 
-    /// Get the filesystem path for the main ns record (for directory walking).
-    fn ns_path(&self, ledger_name: &str, branch: &str) -> PathBuf {
-        self.storage
-            .base_path()
-            .join(NS_VERSION)
-            .join(ledger_name)
-            .join(format!("{branch}.json"))
+    /// Build a `fluree:file://` address for the append-only commit-CID index.
+    fn commits_address(ledger_name: &str, branch: &str) -> String {
+        format!("fluree:file://{NS_VERSION}/{ledger_name}/{branch}.commits.jsonl")
     }
 
-    /// Get the filesystem path for the append-only commit-CID index.
+    /// The file the main ns record's address names.
+    fn ns_path(&self, ledger_name: &str, branch: &str) -> Result<PathBuf> {
+        Ok(self
+            .storage
+            .path_of(&Self::ns_address(ledger_name, branch))?)
+    }
+
+    /// The file of the append-only commit-CID index.
     ///
     /// One JSON line per advanced commit head (`{"t":<t>,"cid":"<cid>"}`).
     /// Append-only on the write path; full-rewrite only on prune. Readers
     /// dedup by `t` (last-wins), so re-appending the same `t` is harmless.
-    fn commits_path(&self, ledger_name: &str, branch: &str) -> PathBuf {
-        self.storage
-            .base_path()
-            .join(NS_VERSION)
-            .join(ledger_name)
-            .join(format!("{branch}.commits.jsonl"))
+    fn commits_path(&self, ledger_name: &str, branch: &str) -> Result<PathBuf> {
+        Ok(self
+            .storage
+            .path_of(&Self::commits_address(ledger_name, branch))?)
     }
 
     /// Append one `{"t","cid"}` line to the commit-CID index. Best-effort:
@@ -385,7 +386,9 @@ impl FileNameService {
         t: i64,
         cid_str: &str,
     ) -> std::io::Result<()> {
-        let path = self.commits_path(ledger_name, branch);
+        let path = self
+            .commits_path(ledger_name, branch)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         append_commit_index_line(&path, &commit_index_line(t, cid_str)).await
     }
 
@@ -551,7 +554,7 @@ impl FileNameService {
     /// Check if a record file is a graph source record (based on @type).
     /// Matches "f:IndexSource"/"f:MappedSource" compact prefixes and full IRIs.
     async fn is_graph_source_record(&self, name: &str, branch: &str) -> Result<bool> {
-        let main_path = self.ns_path(name, branch);
+        let main_path = self.ns_path(name, branch)?;
         if !main_path.exists() {
             return Ok(false);
         }
@@ -674,7 +677,9 @@ impl crate::NameServiceLookup for FileNameService {
     }
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        let ledger_dir = self.storage.base_path().join(NS_VERSION).join(ledger_name);
+        let ledger_dir = self
+            .storage
+            .path_of(&format!("fluree:file://{NS_VERSION}/{ledger_name}"))?;
         let mut records = Vec::new();
 
         for relative in Self::walk_ns_json_files(&ledger_dir).await? {
@@ -992,7 +997,7 @@ impl crate::BranchLifecycle for FileNameService {
         since_t: i64,
     ) -> Result<Option<Vec<(i64, ContentId)>>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let path = self.commits_path(&ledger_name, &branch);
+        let path = self.commits_path(&ledger_name, &branch)?;
 
         // No file = old ledger predating the index; signal fallback to the walk.
         let content = match tokio::fs::read_to_string(&path).await {
@@ -1036,7 +1041,7 @@ impl crate::BranchLifecycle for FileNameService {
 
     async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let path = self.commits_path(&ledger_name, &branch);
+        let path = self.commits_path(&ledger_name, &branch)?;
 
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
@@ -1408,7 +1413,7 @@ impl GraphSourceLookup for FileNameService {
 
     async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
         let (name, branch) = split_ledger_id(resource_id)?;
-        let main_path = self.ns_path(&name, &branch);
+        let main_path = self.ns_path(&name, &branch)?;
 
         if !main_path.exists() {
             return Ok(NsLookupResult::NotFound);
@@ -1606,15 +1611,19 @@ impl RefPublisher for FileNameService {
                         // discovery accelerator whose reader sorts by `t`
                         // and falls back to the chain walk for any gap, so
                         // neither ordering nor timing is load-bearing.
-                        let path = self.commits_path(&ledger_name, &branch);
                         let line = commit_index_line(new.t, &cid.to_string());
                         let ledger_id = ledger_id.to_string();
                         let t = new.t;
-                        spawn_detached(async move {
-                            if let Err(e) = append_commit_index_line(&path, &line).await {
-                                tracing::debug!(error = %e, ledger_id, t, "commit-index append failed (non-fatal)");
+                        match self.commits_path(&ledger_name, &branch) {
+                            Ok(path) => spawn_detached(async move {
+                                if let Err(e) = append_commit_index_line(&path, &line).await {
+                                    tracing::debug!(error = %e, ledger_id, t, "commit-index append failed (non-fatal)");
+                                }
+                            }),
+                            Err(e) => {
+                                tracing::debug!(error = %e, ledger_id, t, "commit-index append skipped (non-fatal)");
                             }
-                        });
+                        }
                     }
                 }
 
@@ -2367,6 +2376,73 @@ mod tests {
         let record = ns.lookup("tenant/customers:main").await.unwrap().unwrap();
         assert_eq!(record.name, "tenant/customers");
         assert_eq!(record.branch, "main");
+    }
+
+    /// Each file the nameservice names for a ledger is the file its storage
+    /// address names, under the data directory. A name or branch with a `..`
+    /// component names no file.
+    #[tokio::test]
+    async fn record_paths_stay_inside_the_data_directory() {
+        let (temp, ns) = setup().await;
+        let root = temp.path();
+        for (name, branch) in [
+            ("mydb", "main"),
+            ("tenant/db", "dev"),
+            ("mydb", "/x/b"),
+            ("http", "//example.org/g"),
+        ] {
+            let paths = [
+                ns.ns_path(name, branch).unwrap(),
+                ns.commits_path(name, branch).unwrap(),
+            ];
+            for path in &paths {
+                assert!(
+                    path.starts_with(root),
+                    "{name}:{branch}: {}",
+                    path.display()
+                );
+            }
+            let address = FileNameService::ns_address(name, branch);
+            assert_eq!(paths[0], ns.storage.path_of(&address).unwrap());
+        }
+        for (name, branch) in [("../beside", "main"), ("mydb", "../../beside")] {
+            assert!(ns.ns_path(name, branch).is_err(), "{name}:{branch}");
+            assert!(ns.commits_path(name, branch).is_err(), "{name}:{branch}");
+        }
+        assert!(ns.list_branches("../beside").await.is_err());
+    }
+
+    /// A branch whose name begins with `/` keeps its record under the
+    /// ledger's directory, and dropping the branch drops that record.
+    #[tokio::test]
+    async fn a_branch_beginning_with_a_slash_drops_its_own_record() {
+        let (temp, ns) = setup().await;
+        // Rooted in this test's directory, so the name stays inside it however
+        // it is read.
+        let branch = format!("{}/legacy", temp.path().display());
+        assert!(branch.starts_with('/'));
+        let ledger_id = format!("lg:{branch}");
+        crate::testing::create(&ns, "lg:main").await.unwrap();
+        crate::testing::create(&ns, &ledger_id).await.unwrap();
+        ns.publish_commit(&ledger_id, 1, &test_cid("commit-1"))
+            .await
+            .unwrap();
+        let record = ns.ns_path("lg", &branch).unwrap();
+        assert!(record.starts_with(temp.path().join(NS_VERSION).join("lg")));
+        assert!(record.exists());
+
+        let name = fluree_db_core::LedgerName::parse("lg").unwrap();
+        let crate::lifecycle::BranchDrop::Purge(dropped) =
+            crate::lifecycle::begin_drop_branch(&ns, &name, &branch)
+                .await
+                .unwrap()
+        else {
+            panic!("a branch with no children is purged");
+        };
+        crate::lifecycle::finish_drop_branch(&ns, &name, &dropped)
+            .await
+            .unwrap();
+        assert!(ns.lookup(&ledger_id).await.unwrap().is_none());
     }
 
     // ========== Graph Source Tests ==========

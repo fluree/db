@@ -640,7 +640,7 @@ impl TermComponentsOperator {
             match &row[pos] {
                 Binding::Unbound | Binding::Poisoned => row[pos] = computed,
                 existing => {
-                    if !crate::object_binding::bind_unifies(existing, &computed, Some(ctx)) {
+                    if !crate::object_binding::same_term_in(existing, &computed, Some(ctx))? {
                         return Ok(false);
                     }
                 }
