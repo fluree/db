@@ -2919,6 +2919,15 @@ mod tests {
                 key: "../beside".into(),
                 bytes: b"x".to_vec(),
             },
+            OwnedOp::Insert {
+                key: "../beside".into(),
+                bytes: b"x".to_vec(),
+            },
+            OwnedOp::Cas {
+                key: "../beside".into(),
+                expected: None,
+                new: b"x".to_vec(),
+            },
             OwnedOp::Delete {
                 key: "../beside".into(),
             },
