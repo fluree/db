@@ -388,8 +388,8 @@ jobs:
               sub(/^class [A-Za-z0-9]+/, "&Beta") { renamed = 1 }
               /^  desc "/ { sub(/"$/, " (including pre-releases)\"") }
               { print }
-              /^  license / { print "  keg_only \"it installs the same commands as the stable formula\"" }
-              END { exit !renamed }
+              /^  license / { print "  keg_only \"it installs the same commands as the stable formula\""; keg = 1 }
+              END { exit !(renamed && keg) }
             ' "$ARTIFACTS/$filename" > "$STAGED/$name-beta.rb"
             echo "$name-beta $version" >> "$STAGED/manifest"
           done
