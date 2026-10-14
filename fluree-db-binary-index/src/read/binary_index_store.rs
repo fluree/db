@@ -6076,11 +6076,12 @@ pub(crate) mod tests {
                 let Some(bytes) = self.inner.get_local(id)? else {
                     return Ok(None);
                 };
-                let opened = self.opens.fetch_add(1, AtomicOrdering::SeqCst);
+                self.opens.fetch_add(1, AtomicOrdering::SeqCst);
                 let source = Arc::new(RecordingSource {
                     bytes: bytes.to_vec(),
                     unit: self.unit,
-                    identity: opened as u128,
+                    // One object of one store, as an envelope's identity is.
+                    identity: xxhash_rust::xxh3::xxh3_128(&id.to_bytes()),
                     reads: Mutex::new(Vec::new()),
                 });
                 self.sources.lock().unwrap().push(Arc::clone(&source));

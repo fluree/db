@@ -522,6 +522,9 @@ pub struct LeafletCache {
     /// Query planner `StatsView`s, in a pool of their own. See
     /// [`stats_view_pool`].
     stats_views: Cache<u128, Arc<StatsView>>,
+    /// What forward dictionary packs may hold decrypted whole, shared by
+    /// every reader of this cache.
+    dictionary_allowance: Arc<crate::dict::allowance::DictionaryAllowance>,
 }
 
 impl std::fmt::Debug for LeafletCache {
@@ -531,6 +534,7 @@ impl std::fmt::Debug for LeafletCache {
             .field("bytes", &self.weighted_size_bytes())
             .field("stats_views", &self.stats_views.entry_count())
             .field("stats_view_bytes", &self.stats_views.weighted_size())
+            .field("dictionary_allowance", &self.dictionary_allowance)
             .finish()
     }
 }
@@ -655,7 +659,22 @@ impl LeafletCache {
         Self {
             inner,
             stats_views: stats_view_pool(max_bytes),
+            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::new(
+                crate::dict::allowance::allowance_from_env(),
+            ),
         }
+    }
+
+    /// Replace the dictionary allowance (tests).
+    #[cfg(test)]
+    pub(crate) fn with_dictionary_allowance(mut self, bytes: u64) -> Self {
+        self.dictionary_allowance = crate::dict::allowance::DictionaryAllowance::new(bytes);
+        self
+    }
+
+    /// What forward dictionary packs may hold decrypted whole.
+    pub fn dictionary_allowance(&self) -> &Arc<crate::dict::allowance::DictionaryAllowance> {
+        &self.dictionary_allowance
     }
 
     /// Create a new cache with the given maximum megabyte budget.
