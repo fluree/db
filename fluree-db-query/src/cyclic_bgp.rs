@@ -561,6 +561,10 @@ struct EncodedSquareWedgeState {
     current: Option<EncodedProbeWedgeCursor>,
 }
 
+/// Routing stamp of the cyclic-join lane, recorded at open: `proceed` when the
+/// lane answers, a fallback when the generic join plan does.
+pub(crate) const CYCLIC_BGP_SITE: &str = "cyclic_bgp";
+
 pub(crate) struct CyclicBgpOperator {
     plan: CyclicBgpPlan,
     join_mode: CyclicJoinMode,
@@ -2554,7 +2558,18 @@ impl Operator for CyclicBgpOperator {
                 "CyclicBgpOperator::open() called in invalid state".into(),
             ));
         }
-        if self.open_fast_path(ctx)? {
+        let fast = self.open_fast_path(ctx)?;
+        crate::fast_path_outcome::stamp_fast_path(
+            CYCLIC_BGP_SITE,
+            if fast {
+                crate::fast_path_outcome::FastPathOutcome::Proceed
+            } else {
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                )
+            },
+        );
+        if fast {
             self.state = OperatorState::Open;
             return Ok(());
         }

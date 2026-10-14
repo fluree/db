@@ -261,9 +261,7 @@ impl Fluree {
         let db_ref = db.as_graph_db_ref();
         let union = super::union_default_dataset(db, executable);
         let mut prepare_config = PrepareConfig::current(db.binary_store.as_ref());
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
             db_ref,
             executable,

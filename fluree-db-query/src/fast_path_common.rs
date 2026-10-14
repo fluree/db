@@ -2708,6 +2708,10 @@ pub(crate) fn probe_lane_admission(
     if ctx.is_history_range() {
         return Some(ProbeLanePlan::Decline);
     }
+    // The lanes read one graph's index (`binary_g_id`'s).
+    if !ctx.reads_exactly_one_graph() {
+        return Some(ProbeLanePlan::Decline);
+    }
     // Every predicate the lane reads must clear; an empty set has nothing to
     // clear and declines under any non-root policy. `Allow` keeps the lane,
     // anything else declines it (the lanes have no empty result to
@@ -3791,13 +3795,15 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
     fast_path_eligible_no_policy(ctx) && ctx.allow_unfiltered()
 }
 
-/// The non-policy half of [`allow_fast_path`]: single-ledger, no `from_t`, no
+/// The non-policy half of [`allow_fast_path`]: one graph read, no `from_t`, no
 /// uncommitted overlay.
 ///
-/// Fast paths rely on a single binary index + single-ledger semantics for
-/// encoded IDs; dataset (multi-ledger) execution can span multiple
-/// ledgers/graphs, so they are disabled there. History mode is filtered at the
-/// planner level, so this runtime gate doesn't repeat that check.
+/// Fast paths read one graph's binary index (`binary_g_id`'s). A dataset can
+/// span several ledgers, or several graphs of one ledger whose
+/// `binary_g_id` names one member, so they are disabled unless the scope
+/// reads exactly one graph ([`ExecutionContext::reads_exactly_one_graph`]).
+/// History mode is filtered at the planner level, so this runtime gate
+/// doesn't repeat that check.
 ///
 /// Split out so single-predicate O1 callers can reuse the structural conditions
 /// after discharging the view policy themselves via
@@ -3805,7 +3811,7 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
 /// unfiltered).
 #[inline]
 fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
+    ctx.reads_exactly_one_graph() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
 }
 
 /// True when the overlay can still contribute flakes.
@@ -3862,12 +3868,13 @@ pub fn fast_path_store_policy_cleared<'a>(
 /// Unlike [`allow_fast_path`], this does **not** reject uncommitted overlay or
 /// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
 /// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
-/// in and honors `to_t`, so those cases stay correct. It still requires
-/// single-ledger, no `from_t`, and root (or no) policy; History mode is filtered
-/// at the planner level.
+/// in and honors `to_t`, so those cases stay correct. It still requires one
+/// graph read ([`ExecutionContext::reads_exactly_one_graph`]: the cursor reads
+/// `binary_g_id`'s graph), no `from_t`, and root (or no) policy; History mode
+/// is filtered at the planner level.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered()
+    ctx.reads_exactly_one_graph() && !ctx.is_history_range() && ctx.allow_unfiltered()
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned
@@ -3896,8 +3903,9 @@ pub enum PredicateFastPath {
 ///   uncovered + default-allow).
 /// - [`PredicateFastPath::Empty`] — uncovered + default-deny: emit the empty
 ///   result for this predicate without scanning.
-/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the query is
-///   multi-ledger / historical: take the filtered fallback.
+/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the scope
+///   reads more than one graph ([`ExecutionContext::reads_exactly_one_graph`])
+///   or is historical: take the filtered fallback.
 ///
 /// Only valid for an operator that scans exactly one ground predicate; multi- or
 /// wildcard-predicate fast paths must keep using [`allow_cursor_fast_path`]
@@ -3907,7 +3915,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.is_history_range() {
+    if !ctx.reads_exactly_one_graph() || ctx.is_history_range() {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.

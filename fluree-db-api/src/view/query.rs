@@ -1864,9 +1864,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
@@ -1942,9 +1940,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;

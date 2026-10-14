@@ -1248,30 +1248,43 @@ impl<'a> ExecutionContext<'a> {
         fn overlay_free(overlay: &dyn OverlayProvider) -> bool {
             overlay.epoch() == 0 || overlay.is_effectively_empty()
         }
+        if !self.reads_exactly_one_graph() {
+            return false;
+        }
         match self.active_graphs() {
             ActiveGraphs::Single => overlay_free(self.overlay()),
-            ActiveGraphs::Many(graphs) => match graphs.as_slice() {
-                [g] => overlay_free(g.overlay),
-                _ => false,
-            },
+            ActiveGraphs::Many(graphs) => graphs.first().is_some_and(|g| overlay_free(g.overlay)),
         }
     }
 
-    /// Check whether the binary index fast path is available.
+    /// Whether this scope reads exactly one graph: no dataset, or a dataset
+    /// whose active graph is one graph (a named graph, or a default graph of
+    /// one). A default graph of several graphs, of one ledger or of several,
+    /// reads several; `FROM NAMED` alone, a default graph of none, reads
+    /// none. Defined once, by [`ActiveGraph::reads_one_graph`], which the
+    /// planner's [`PlanningContext::one_graph`] answers too.
     ///
-    /// Returns `true` when a binary store is present and the query is in
-    /// single-ledger mode. Individual call sites may layer additional
-    /// conditions (e.g. `to_t >= base_t`).
+    /// [`PlanningContext::one_graph`]: crate::temporal_mode::PlanningContext::one_graph
+    ///
+    /// Every single-graph lane gates on this: the binary-index fast paths
+    /// (through `fast_path_store` and `allow_cursor_fast_path`), the batched
+    /// probe lanes, the cyclic-join lane, the EXISTS semijoin cache and the
+    /// partitioned GROUP BY. They read one graph's index, `binary_g_id`'s,
+    /// which a default graph of several graphs does not have; it sets
+    /// `binary_g_id` to one member, so a lane that ran there would read that
+    /// member alone.
+    pub fn reads_exactly_one_graph(&self) -> bool {
+        self.active_graph.reads_one_graph(self.dataset)
+    }
+
+    /// Whether this scope reads exactly one graph through its binary index:
+    /// [`ActiveGraph::reads_one_graph_index`] (a store attached,
+    /// [`Self::reads_exactly_one_graph`], and a dataset that does not span
+    /// ledgers), which the planner answers too. Individual call sites may
+    /// layer additional conditions (e.g. `to_t >= base_t`).
     pub fn has_binary_store(&self) -> bool {
-        if self.is_multi_ledger() || self.binary_store.is_none() {
-            return false;
-        }
-        // Binary scan fast paths only support a single active graph.
-        match (&self.dataset, &self.active_graph) {
-            (None, _) => true,
-            (Some(ds), ActiveGraph::Default) => ds.default_graphs().len() == 1,
-            (Some(ds), ActiveGraph::Named(iri)) => ds.named_graph(iri).is_some(),
-        }
+        self.active_graph
+            .reads_one_graph_index(self.dataset, self.binary_store.is_some())
     }
 
     /// Return a `BinaryGraphView` for the current graph, combining the binary store
