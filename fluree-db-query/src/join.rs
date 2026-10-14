@@ -113,7 +113,7 @@ impl GroupedCountDrain {
 pub(crate) struct LeafScan {
     pub(crate) leaf_bytes: fluree_db_core::ContentBytes,
     pub(crate) header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
-    pub(crate) dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
+    pub(crate) dir: Arc<fluree_db_binary_index::format::leaf::DecodedLeafDirV3>,
     pub(crate) leaf_id: u128,
     /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
     /// leaflet alone is authoritative); always fetched when `need_replay`
@@ -273,9 +273,15 @@ pub(crate) fn prepare_leaf_for_scan(
     };
     let header = decode_leaf_header_v3(&leaf_bytes)
         .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
-    let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
-        .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
     let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+    // Shared with every other reader of this leaf; a directory decode is
+    // O(leaflets) and this runs once per leaf per probe.
+    let decode = || decode_leaf_dir_v3_with_base(&leaf_bytes, &header).map(Arc::new);
+    let dir = match store.leaflet_cache() {
+        Some(cache) => cache.try_get_or_load_leaf_dir(leaf_id, decode),
+        None => decode(),
+    }
+    .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
 
     Ok(LeafScan {
         leaf_bytes,
@@ -284,38 +290,6 @@ pub(crate) fn prepare_leaf_for_scan(
         leaf_id,
         sidecar_bytes,
     })
-}
-
-/// Binary search for the first row in `batch.s_id[start..end]` where `s_id >= target`.
-#[inline]
-/// Whether a PSOT leaflet's current rows can hold one of `s_ids` (sorted)
-/// under `p_id`, read from its directory keys alone, so a scattered probe set
-/// decodes only the leaflets it touches. Keys order by `(p_id, s_id)`: an
-/// end key bounds the predicate's subjects only where it carries `p_id`.
-/// Rows a history replay restores can lie outside these keys.
-fn psot_leaflet_may_hold(
-    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
-    p_id: u32,
-    s_ids: &[u64],
-) -> bool {
-    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-    use fluree_db_binary_index::RunSortOrder;
-    let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
-    let last = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key);
-    if first.p_id > p_id || last.p_id < p_id {
-        return false;
-    }
-    let lo = if first.p_id == p_id {
-        first.s_id.as_u64()
-    } else {
-        0
-    };
-    let hi = if last.p_id == p_id {
-        last.s_id.as_u64()
-    } else {
-        u64::MAX
-    };
-    s_ids.partition_point(|&x| x < lo) < s_ids.partition_point(|&x| x <= hi)
 }
 
 /// The row range of `p_id` in a PSOT leaflet; the whole leaflet when it holds
@@ -339,44 +313,56 @@ fn psot_predicate_run(
     (p_start, p_end)
 }
 
-fn lower_bound_s_id(
-    batch: &fluree_db_binary_index::ColumnBatch,
-    start: usize,
+/// Successive subject runs within the subject-sorted rows `[start, end)` of a
+/// PSOT batch. Targets must ascend: each search gallops forward from where the
+/// previous run ended, so dense wanted sets cost O(1) per subject and sparse
+/// ones O(log gap), instead of two searches over the whole range per subject.
+struct SubjectRuns<'a> {
+    s_id: &'a fluree_db_binary_index::read::column_types::ColumnData<u64>,
+    pos: usize,
     end: usize,
-    target: u64,
-) -> usize {
-    let mut lo = start;
-    let mut hi = end;
-    while lo < hi {
-        let mid = usize::midpoint(lo, hi);
-        if batch.s_id.get(mid) < target {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
-/// Binary search for the first row in `batch.s_id[start..end]` where `s_id > target`.
-#[inline]
-fn upper_bound_s_id(
-    batch: &fluree_db_binary_index::ColumnBatch,
-    start: usize,
-    end: usize,
-    target: u64,
-) -> usize {
-    let mut lo = start;
-    let mut hi = end;
-    while lo < hi {
-        let mid = usize::midpoint(lo, hi);
-        if batch.s_id.get(mid) <= target {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+impl<'a> SubjectRuns<'a> {
+    fn new(batch: &'a fluree_db_binary_index::ColumnBatch, start: usize, end: usize) -> Self {
+        Self {
+            s_id: &batch.s_id,
+            pos: start,
+            end,
         }
     }
-    lo
+
+    /// Rows holding `target`; empty when absent.
+    fn next_run(&mut self, target: u64) -> std::ops::Range<usize> {
+        let start = self.gallop(self.pos, |s| s < target);
+        let end = self.gallop(start, |s| s <= target);
+        self.pos = end;
+        start..end
+    }
+
+    /// First row in `[from, end)` where `before` fails; `before` must hold on
+    /// a prefix of the rows.
+    #[inline]
+    fn gallop(&self, from: usize, before: impl Fn(u64) -> bool) -> usize {
+        let mut lo = from;
+        let mut hi = from;
+        let mut step = 1;
+        while hi < self.end && before(self.s_id.get(hi)) {
+            lo = hi + 1;
+            hi = lo + step;
+            step *= 2;
+        }
+        let mut hi = hi.min(self.end);
+        while lo < hi {
+            let mid = usize::midpoint(lo, hi);
+            if before(self.s_id.get(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2376,7 +2362,13 @@ impl NestedLoopJoinOperator {
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
-                if !needs_history_replay && !psot_leaflet_may_hold(entry, p_id, unique_s_ids) {
+                if !needs_history_replay
+                    && !entry.may_hold_keys(
+                        fluree_db_binary_index::RunSortOrder::Psot,
+                        Some(p_id),
+                        unique_s_ids,
+                    )
+                {
                     continue;
                 }
 
@@ -2399,13 +2391,13 @@ impl NestedLoopJoinOperator {
                 // Stream matched rows straight into the object-decode + on_match
                 // path in PSOT `(p_id, s_id, ...)` order — no per-leaflet `matches`
                 // Vec to allocate, grow, and replay.
+                let mut runs = SubjectRuns::new(&batch, p_start, p_end);
                 for &s_id in &unique_s_ids[subj_start..subj_end] {
                     let Some(accum_indices) = s_id_to_accum.get(&s_id) else {
                         continue;
                     };
-                    let row_start = lower_bound_s_id(&batch, p_start, p_end, s_id);
-                    let row_end = upper_bound_s_id(&batch, p_start, p_end, s_id);
-                    if row_start == row_end {
+                    let rows = runs.next_run(s_id);
+                    if rows.is_empty() {
                         continue;
                     }
                     // One window of this subject's novelty ops per (leaflet,
@@ -2415,7 +2407,7 @@ impl NestedLoopJoinOperator {
                         .as_ref()
                         .map(|p| p.subject_window(s_id))
                         .filter(|w| !w.is_empty());
-                    for row in row_start..row_end {
+                    for row in rows {
                         matched_rows += 1;
                         let o_type_val = entry
                             .o_type_const
@@ -3627,7 +3619,9 @@ fn batched_subject_probe_binary_uncharged(
                 continue;
             }
 
-            if !needs_history_replay && !psot_leaflet_may_hold(entry, p_id, &unique_s_ids) {
+            if !needs_history_replay
+                && !entry.may_hold_keys(RunSortOrder::Psot, Some(p_id), &unique_s_ids)
+            {
                 continue;
             }
 
@@ -3647,10 +3641,10 @@ fn batched_subject_probe_binary_uncharged(
                 continue;
             }
 
+            let mut runs = SubjectRuns::new(&batch, p_start, p_end);
             for &s_id in &unique_s_ids[subj_start..subj_end] {
-                let row_start = lower_bound_s_id(&batch, p_start, p_end, s_id);
-                let row_end = upper_bound_s_id(&batch, p_start, p_end, s_id);
-                if row_start == row_end {
+                let rows = runs.next_run(s_id);
+                if rows.is_empty() {
                     continue;
                 }
                 let probe_window = probe_ops
@@ -3658,7 +3652,7 @@ fn batched_subject_probe_binary_uncharged(
                     .map(|p| p.subject_window(s_id))
                     .filter(|w| !w.is_empty());
 
-                for row in row_start..row_end {
+                for row in rows {
                     let o_type_val = entry
                         .o_type_const
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
@@ -3798,9 +3792,7 @@ fn batched_subject_star_spot_uncharged(
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{
-        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
-    };
+    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
     if subject_ids.is_empty() || predicates.is_empty() {
@@ -3878,14 +3870,11 @@ fn batched_subject_star_spot_uncharged(
             }
             // Without replay the directory keys bound the leaflet's rows, so a
             // leaflet holding none of the probed subjects is skipped unread.
-            if !needs_history_replay {
-                let first_s = read_ordered_key_v2(RunSortOrder::Spot, &entry.first_key).s_id;
-                let last_s = read_ordered_key_v2(RunSortOrder::Spot, &entry.last_key).s_id;
-                let next = unique_s_ids.partition_point(|&s| s < first_s.as_u64());
-                if unique_s_ids.get(next).is_none_or(|&s| s > last_s.as_u64()) {
-                    leaflets_skipped += 1;
-                    continue;
-                }
+            if !needs_history_replay
+                && !entry.may_hold_keys(RunSortOrder::Spot, None, &unique_s_ids)
+            {
+                leaflets_skipped += 1;
+                continue;
             }
             leaflets_read += 1;
             leaflets_replayed += u64::from(needs_history_replay);
@@ -3905,10 +3894,10 @@ fn batched_subject_star_spot_uncharged(
                 continue;
             }
 
+            let mut runs = SubjectRuns::new(&batch, 0, row_count);
             for &s_id in &unique_s_ids[subj_start..subj_end] {
-                let row_start = lower_bound_s_id(&batch, 0, row_count, s_id);
-                let row_end = upper_bound_s_id(&batch, row_start, row_count, s_id);
-                if row_start == row_end {
+                let rows = runs.next_run(s_id);
+                if rows.is_empty() {
                     continue;
                 }
                 let probe_window = probe_ops
@@ -3916,7 +3905,7 @@ fn batched_subject_star_spot_uncharged(
                     .map(|p| p.subject_window(s_id))
                     .filter(|w| !w.is_empty());
 
-                for row in row_start..row_end {
+                for row in rows {
                     let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
                     let Some(predicate) = predicates_by_id.get(&p_id).copied() else {
                         continue;
@@ -4047,6 +4036,57 @@ fn batched_subject_star_spot_uncharged(
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+
+    fn subject_batch(s_ids: Vec<u64>) -> fluree_db_binary_index::ColumnBatch {
+        let mut batch = fluree_db_binary_index::ColumnBatch::empty();
+        batch.row_count = s_ids.len();
+        batch.s_id = fluree_db_binary_index::read::column_types::ColumnData::Block(s_ids.into());
+        batch
+    }
+
+    #[test]
+    fn subject_runs_match_full_searches() {
+        // Runs of 1..=5 rows with gaps of 1..=4 between subjects.
+        let mut rows = Vec::new();
+        let mut s = 10u64;
+        let mut x = 7u64;
+        for _ in 0..400 {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            rows.extend(std::iter::repeat_n(s, (x >> 61) as usize % 5 + 1));
+            s += (x >> 33) % 4 + 1;
+        }
+        let max = s;
+        let batch = subject_batch(rows.clone());
+        // Slices off both ends so runs start mid-batch, as after a p-run cut.
+        let (start, end) = (3, rows.len() - 2);
+        for stride in [1u64, 2, 3, 7, 50, 400] {
+            let wanted: Vec<u64> = (0..max + 5).step_by(stride as usize).collect();
+            let mut runs = SubjectRuns::new(&batch, start, end);
+            for &target in &wanted {
+                let expect_lo = start + rows[start..end].partition_point(|&r| r < target);
+                let expect_hi = start + rows[start..end].partition_point(|&r| r <= target);
+                let got = runs.next_run(target);
+                if expect_lo == expect_hi {
+                    assert!(got.is_empty(), "stride {stride} target {target}: {got:?}");
+                } else {
+                    assert_eq!(got, expect_lo..expect_hi, "stride {stride} target {target}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn subject_runs_on_const_column() {
+        let mut batch = fluree_db_binary_index::ColumnBatch::empty();
+        batch.row_count = 6;
+        batch.s_id = fluree_db_binary_index::read::column_types::ColumnData::Const(42);
+        let mut runs = SubjectRuns::new(&batch, 0, 6);
+        assert!(runs.next_run(41).is_empty());
+        assert_eq!(runs.next_run(42), 0..6);
+        assert!(runs.next_run(43).is_empty());
+    }
 
     fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
@@ -4274,67 +4314,6 @@ mod tests {
             assert!(join.grouped_count.is_none());
             join.close();
         }
-    }
-
-    /// A leaflet is skipped only when no probed subject of the predicate can
-    /// lie between its directory keys, including where the leaflet spans
-    /// other predicates on either side.
-    #[test]
-    fn psot_leaflet_skip_reads_subject_bounds_per_predicate() {
-        use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
-        use fluree_db_binary_index::format::run_record_v2::{
-            write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
-        };
-        use fluree_db_binary_index::RunSortOrder;
-        let key = |p_id: u32, s_id: u64| {
-            let mut buf = [0u8; ORDERED_KEY_V2_SIZE];
-            let rec = RunRecordV2 {
-                s_id: SubjectId(s_id),
-                o_key: 0,
-                p_id,
-                t: 0,
-                o_i: 0,
-                o_type: 0,
-                g_id: 0,
-            };
-            write_ordered_key_v2(RunSortOrder::Psot, &rec, &mut buf);
-            buf
-        };
-        let entry = |first: (u32, u64), last: (u32, u64)| LeafletDirEntryV3 {
-            row_count: 1,
-            lead_group_count: 0,
-            first_key: key(first.0, first.1),
-            last_key: key(last.0, last.1),
-            p_const: None,
-            o_type_const: None,
-            flags: 0,
-            payload_offset: 0,
-            payload_len: 0,
-            column_refs: Vec::new(),
-            history_offset: 0,
-            history_len: 0,
-            history_min_t: 0,
-            history_max_t: 0,
-        };
-        // One predicate: subjects 100..=200.
-        let only = entry((7, 100), (7, 200));
-        assert!(psot_leaflet_may_hold(&only, 7, &[150]));
-        assert!(psot_leaflet_may_hold(&only, 7, &[100, 900]));
-        assert!(!psot_leaflet_may_hold(&only, 7, &[50, 250]));
-        assert!(!psot_leaflet_may_hold(&only, 8, &[150]));
-        // Starts in an earlier predicate: p=7 rows run from subject 0 to 40.
-        let starts_before = entry((5, 900), (7, 40));
-        assert!(psot_leaflet_may_hold(&starts_before, 7, &[3]));
-        assert!(!psot_leaflet_may_hold(&starts_before, 7, &[41]));
-        // Ends in a later predicate: p=7 rows run from subject 60 upward.
-        let ends_after = entry((7, 60), (9, 2));
-        assert!(psot_leaflet_may_hold(&ends_after, 7, &[10_000]));
-        assert!(!psot_leaflet_may_hold(&ends_after, 7, &[59]));
-        // Spans p=7 entirely: any subject.
-        let spans = entry((5, 900), (9, 2));
-        assert!(psot_leaflet_may_hold(&spans, 7, &[1]));
-        assert!(!psot_leaflet_may_hold(&spans, 4, &[1]));
-        assert!(!psot_leaflet_may_hold(&spans, 10, &[1]));
     }
 
     #[test]

@@ -212,6 +212,7 @@ pub fn batched_lookup_predicate_refs(
             projection,
         );
         cursor.set_to_t(to_t);
+        cursor.set_wanted_keys(Arc::from(*chunk));
 
         // The cursor's p_id filter pins PSOT's leading key, so s_id is
         // non-decreasing across the returned rows — gallop the chunk's
@@ -466,7 +467,7 @@ pub struct BatchedWildcardCursor {
     to_t: i64,
     direction: WildcardDirection,
     projection: ColumnProjection,
-    chunks: Vec<Vec<u64>>,
+    chunks: Vec<Arc<[u64]>>,
     chunk_idx: usize,
     cursor: Option<BinaryCursor>,
 }
@@ -483,9 +484,9 @@ impl BatchedWildcardCursor {
         let mut sorted = keys.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        let chunks: Vec<Vec<u64>> = chunk_subjects(&sorted, 100_000, 1000)
+        let chunks: Vec<Arc<[u64]>> = chunk_subjects(&sorted, 100_000, 1000)
             .into_iter()
-            .map(<[u64]>::to_vec)
+            .map(Arc::from)
             .collect();
         let branch = store.branch_for_order(g_id, direction.order()).cloned();
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -567,6 +568,7 @@ impl BatchedWildcardCursor {
                     self.projection,
                 );
                 cursor.set_to_t(self.to_t);
+                cursor.set_wanted_keys(Arc::clone(chunk));
                 self.cursor = Some(cursor);
             }
             if let Some(batch) = self.cursor.as_mut().unwrap().next_batch()? {
