@@ -178,7 +178,11 @@ pub use schema_hierarchy::{
 };
 pub use sid::{Sid, SidInterner};
 pub use stats_view::{PropertyStatData, StatsView};
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
+pub use storage::CachedBackend;
 pub use storage::EncryptionAdmin;
+#[cfg(not(target_arch = "wasm32"))]
+pub use storage::DEFAULT_MMAP_MIN_BYTES;
 pub use storage::{
     bridge_content_store,
     content_address,
@@ -190,6 +194,7 @@ pub use storage::{
     CasAction,
     CasOutcome,
     ContentAddressedWrite,
+    ContentBytes,
     ContentStore,
     ContentWriteResult,
     Durability,

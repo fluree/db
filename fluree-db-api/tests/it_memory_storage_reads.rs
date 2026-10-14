@@ -79,7 +79,7 @@ fn by_kind(reads: &[String]) -> BTreeMap<String, usize> {
 async fn warm_queries_over_memory_storage_read_nothing_from_the_store() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let indexer_config = IndexerConfig::small().with_data_dir(tmp.path().join("data"));
-    let cache_dir = indexer_config.artifact_cache_dir();
+    let cache_dir = tmp.path().join("cache");
     let storage = HookedStorage::new(CountReads::default());
     let nameservice = MemoryNameService::new();
     let mut fluree: Fluree = FlureeBuilder::memory()

@@ -495,7 +495,7 @@ async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
             .await
             .unwrap()
             .expect("record");
-        shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)], None)
+        shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)])
             .await
             .unwrap()
     }

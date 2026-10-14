@@ -40,22 +40,10 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
 /// `fluree index` and by commands that write in bulk and should not leave
 /// every later invocation replaying their commits.
 pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOutcome> {
-    // Attach the api-side full-text config provider so each incremental
-    // build picks up `f:fullTextDefaults` changes — otherwise configured
-    // plain-string values written since the last reindex wouldn't flow
-    // into BM25 arenas.
-    let config = fluree_db_indexer::IndexerConfig::default()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
-
-    let cs = fluree
-        .branched_content_store(ledger_id)
+    let result = fluree
+        .build_index(ledger_id)
         .await
         .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
-
-    let result =
-        fluree_db_indexer::build_index_for_ledger(cs, fluree.nameservice(), ledger_id, config)
-            .await
-            .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
 
     // Publish the new index
     fluree

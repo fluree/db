@@ -1080,7 +1080,7 @@ mod tests {
             .sidecar_path
             .as_ref()
             .map(|p| std::fs::read(p).unwrap());
-        let handle = FullBlobLeafHandle::new(leaf_bytes, sidecar_bytes, 0).unwrap();
+        let handle = FullBlobLeafHandle::new(leaf_bytes, sidecar_bytes.map(Into::into), 0).unwrap();
         (0..handle.dir().entries.len())
             .flat_map(|i| handle.load_sidecar_segment(i).unwrap())
             .collect()

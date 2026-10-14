@@ -9,7 +9,7 @@
 //! spatial provider map stays empty (spatial search unsupported on wasm).
 
 /// Drop-in stand-in for the `memmap2` crate: mapping always fails, pushing
-/// callers onto the `SharedLeafBytes::Owned` / CAS-fetch path.
+/// callers onto the CAS-fetch path.
 #[cfg(target_arch = "wasm32")]
 pub mod memmap2 {
     pub struct Mmap(Vec<u8>);

@@ -63,10 +63,10 @@ async fn read_commits(
 ) -> Vec<Base64Bytes> {
     let mut out = Vec::with_capacity(cids.len());
     for cid in cids {
-        let bytes = store.get(cid).await.unwrap();
+        let bytes = store.get(cid).await.unwrap().into_vec();
         let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
         if let Some(txn_cid) = &commit.txn {
-            let txn_bytes = store.get(txn_cid).await.unwrap();
+            let txn_bytes = store.get(txn_cid).await.unwrap().into_vec();
             blobs.insert(txn_cid.to_string(), Base64Bytes(txn_bytes));
         }
         out.push(Base64Bytes(bytes));

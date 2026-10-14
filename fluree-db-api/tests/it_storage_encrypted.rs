@@ -305,9 +305,9 @@ async fn seed_index_and_query(
 }
 
 /// `build_client()` on file storage with `AES256Key` in JSON-LD: every
-/// commit and index blob at rest carries the encryption envelope, and
-/// neither the reader's nor the indexer's disk cache holds a plaintext
-/// copy of any of them.
+/// commit and index blob at rest carries the encryption envelope, and the
+/// disk cache the reader and the indexer share holds no plaintext copy of
+/// any of them.
 #[tokio::test]
 async fn build_client_file_honours_key_and_spills_no_plaintext() {
     let data = tempfile::TempDir::new().expect("tempdir");
@@ -327,7 +327,6 @@ async fn build_client_file_honours_key_and_spills_no_plaintext() {
 
     seed_index_and_query(&fluree, "enc-file", data.path()).await;
 
-    let indexer_cache = data.path().join("binary_artifact_cache");
     let mut blobs = 0;
     for path in regular_files_under(data.path()) {
         let rel = path.strip_prefix(data.path()).unwrap();
@@ -337,9 +336,9 @@ async fn build_client_file_honours_key_and_spills_no_plaintext() {
             .unwrap()
             .as_os_str()
             .to_string_lossy();
-        // The file nameservice is documented plaintext; the WAL and the
-        // indexer's cache are not content blobs.
-        if first.starts_with("ns@") || first.starts_with('.') || path.starts_with(&indexer_cache) {
+        // The file nameservice is documented plaintext; the WAL is not a
+        // content blob.
+        if first.starts_with("ns@") || first.starts_with('.') {
             continue;
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -354,14 +353,46 @@ async fn build_client_file_honours_key_and_spills_no_plaintext() {
 
     assert!(
         regular_files_under(cache.path()).is_empty(),
-        "reader disk cache holds artifacts: {:?}",
+        "disk cache holds artifacts: {:?}",
         regular_files_under(cache.path())
     );
-    assert!(
-        regular_files_under(&indexer_cache).is_empty(),
-        "indexer artifact cache holds artifacts: {:?}",
-        regular_files_under(&indexer_cache)
-    );
+}
+
+/// An index build with no `data_dir` stages plaintext runs in the system temp
+/// directory. Over encrypted storage, `Fluree::build_index` (the path
+/// `fluree index` takes) says so; over plain storage it stays quiet.
+#[tokio::test(flavor = "current_thread")]
+async fn build_index_warns_when_encrypted_storage_stages_in_temp() {
+    async fn warned(key: Option<&str>) -> bool {
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let cache = tempfile::TempDir::new().expect("tempdir");
+        let mut storage = json!({"@type": "Storage", "filePath": data.path().to_string_lossy()});
+        if let Some(key) = key {
+            storage["AES256Key"] = json!(key);
+        }
+        let fluree = FlureeBuilder::from_json_ld(&jsonld_storage_config(storage))
+            .expect("config")
+            .with_ledger_cache_config(cache_config(cache.path()))
+            .build_client()
+            .await
+            .expect("build_client");
+        let ledger = fluree.create_ledger("enc-warn").await.expect("create");
+        let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:p": 1});
+        fluree.insert(ledger, &tx).await.expect("insert");
+
+        let (store, _guard) = support::span_capture::init_test_tracing();
+        fluree
+            .build_index("enc-warn:main")
+            .await
+            .expect("index build");
+        store.all_events().iter().any(|e| {
+            e.message()
+                .starts_with("encrypted storage: index build staging")
+        })
+    }
+
+    assert!(warned(Some(KEY_B64)).await, "encrypted storage must warn");
+    assert!(!warned(None).await, "plain storage must not warn");
 }
 
 /// Memory storage is never disk-cached, encrypted or not, and the key is still
@@ -385,11 +416,7 @@ async fn build_client_memory_honours_key_and_writes_no_disk_cache() {
             .await
             .expect("build_client");
         seed_index_and_query(&fluree, "enc-mem", data.path()).await;
-        let mut files = regular_files_under(cache.path());
-        files.extend(regular_files_under(
-            &data.path().join("binary_artifact_cache"),
-        ));
-        files
+        regular_files_under(cache.path())
     }
 
     for key in [None, Some(KEY_B64)] {

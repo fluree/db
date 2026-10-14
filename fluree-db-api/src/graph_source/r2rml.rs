@@ -2521,11 +2521,14 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
                 .fluree
                 .graph_source_store(graph_source_id)
                 .map_err(|e| QueryError::Internal(e.to_string()))?;
-            cs.get(&cid).await.map_err(|e| {
-                QueryError::InvalidQuery(format!(
-                    "Failed to load R2RML mapping (CID {mapping_source}): {e}"
-                ))
-            })?
+            cs.get(&cid)
+                .await
+                .map_err(|e| {
+                    QueryError::InvalidQuery(format!(
+                        "Failed to load R2RML mapping (CID {mapping_source}): {e}"
+                    ))
+                })?
+                .into_vec()
         } else {
             let storage = self.fluree.admin_storage().ok_or_else(|| {
                 QueryError::InvalidQuery(format!(

@@ -27,10 +27,8 @@
 
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_compat::memmap2;
 use fluree_db_core::subject_id::SubjectIdColumn;
-use fluree_db_core::{Flake, ListIndex, Sid, StatsView};
+use fluree_db_core::{ContentBytes, Flake, ListIndex, Sid, StatsView};
 // moka's eviction clock reads std::time::Instant at cache construction, which
 // aborts on wasm32-unknown-unknown; shadow-import core's clock-free LRU
 // stand-in there (same API subset, exact-LRU instead of TinyLFU).
@@ -209,11 +207,12 @@ enum CacheKey {
     /// xxh3_128(leaf CID bytes) — content-addressed → immutable,
     /// no epoch/time dimension needed.
     LeafDir(u128),
-    /// Shared leaf-file memory mapping. Key = xxh3_128(leaf CID bytes) —
-    /// content-addressed → immutable. Caching the mapping saves the
-    /// open+mmap+munmap syscall cycle every cursor otherwise pays per leaf
-    /// access (the dominant fixed cost of an indexed point lookup).
-    LeafMmap(u128),
+    /// A local leaf's bytes: its file mapping, or heap bytes for a small or
+    /// decrypted leaf. Key = xxh3_128(leaf CID bytes) — content-addressed →
+    /// immutable. Caching the mapping saves the open+mmap+munmap syscall
+    /// cycle every cursor otherwise pays per leaf access (the dominant fixed
+    /// cost of an indexed point lookup).
+    LeafBytes(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -418,7 +417,7 @@ enum CachedEntry {
     R2(CachedRegion2),
     DictLeaf(Arc<[u8]>),
     LeafDir(Arc<DecodedLeafDirV3>),
-    LeafMmap(Arc<memmap2::Mmap>),
+    LeafBytes(ContentBytes),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -436,11 +435,9 @@ impl CachedEntry {
             CachedEntry::R2(r2) => r2.byte_size(),
             CachedEntry::DictLeaf(bytes) => bytes.len(),
             CachedEntry::LeafDir(dir) => dir.byte_size(),
-            // A mapping is file-backed (reclaimable page cache), not heap:
-            // weigh it far below its length so it doesn't crowd out decoded
-            // batches, but keep it length-proportional so total mapped
-            // address space stays bounded by the cache budget (× 64).
-            CachedEntry::LeafMmap(mmap) => (mmap.len() / 64).max(16 * 1024),
+            // A mapping is file-backed (reclaimable page cache), not heap, so
+            // it weighs far less than its length; heap bytes weigh in full.
+            CachedEntry::LeafBytes(bytes) => bytes.cache_weight(),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -697,43 +694,64 @@ impl LeafletCache {
         }
     }
 
-    /// Check if a leaf's shared memory mapping is cached (read-only, no
-    /// insertion). Key is `xxh3_128(leaf_cid.to_bytes())`, as for
-    /// [`try_get_or_load_leaf_mmap`](Self::try_get_or_load_leaf_mmap).
-    pub fn get_leaf_mmap(&self, key: u128) -> Option<Arc<memmap2::Mmap>> {
-        match self.inner.get(&CacheKey::LeafMmap(key)) {
-            Some(CachedEntry::LeafMmap(mmap)) => Some(mmap),
+    /// A local leaf's cached bytes (read-only, no insertion). Key is
+    /// `xxh3_128(leaf_cid.to_bytes())`.
+    pub fn get_leaf_bytes(&self, key: u128) -> Option<ContentBytes> {
+        match self.inner.get(&CacheKey::LeafBytes(key)) {
+            Some(CachedEntry::LeafBytes(bytes)) => Some(bytes),
             _ => None,
         }
     }
 
-    /// Get or load the shared memory mapping of a leaf file with
-    /// single-flight and error propagation. Key should be
-    /// `xxh3_128(leaf_cid.to_bytes())` — content-addressed, so entries are
-    /// immutable and self-invalidating on leaf rewrite. NotFound from the
-    /// loader is NOT cached (moka only caches `Ok` values), so a
-    /// remote-promotion cache-miss probe stays a cheap error path.
-    pub fn try_get_or_load_leaf_mmap<F>(
+    /// Cache a local leaf's bytes, returning the entry that ends up cached:
+    /// `bytes`, or what a concurrent opener of the same leaf inserted first.
+    /// The caller has already done the I/O, so there is nothing to wait on
+    /// and no blocking region.
+    pub fn get_or_insert_leaf_bytes(&self, key: u128, bytes: ContentBytes) -> ContentBytes {
+        match self
+            .inner
+            .get_with(CacheKey::LeafBytes(key), || CachedEntry::LeafBytes(bytes))
+        {
+            CachedEntry::LeafBytes(bytes) => bytes,
+            _ => unreachable!("LeafBytes key always maps to LeafBytes entry"),
+        }
+    }
+
+    /// A local leaf's bytes, read by `load` at most once however many
+    /// openers race on the leaf, inside a blocking region — for a store whose
+    /// local reads are costly (decryption). `Ok(None)` when the store does
+    /// not hold the leaf; neither that nor an error is cached.
+    pub fn try_get_or_load_leaf_bytes<F>(
         &self,
         key: u128,
-        load_fn: F,
-    ) -> io::Result<Arc<memmap2::Mmap>>
+        load: F,
+    ) -> io::Result<Option<ContentBytes>>
     where
-        F: FnOnce() -> io::Result<Arc<memmap2::Mmap>>,
+        F: FnOnce() -> io::Result<Option<ContentBytes>>,
     {
+        enum Miss {
+            Absent,
+            Failed(io::Error),
+        }
         // Fast path: a plain hit must not pay the block_in_place cost.
-        if let Some(mmap) = self.get_leaf_mmap(key) {
-            return Ok(mmap);
+        if let Some(bytes) = self.get_leaf_bytes(key) {
+            return Ok(Some(bytes));
         }
         let result = in_blocking_region(|| {
-            self.inner.try_get_with(CacheKey::LeafMmap(key), || {
-                load_fn().map(CachedEntry::LeafMmap)
-            })
+            self.inner
+                .try_get_with(CacheKey::LeafBytes(key), || match load() {
+                    Ok(Some(bytes)) => Ok(CachedEntry::LeafBytes(bytes)),
+                    Ok(None) => Err(Miss::Absent),
+                    Err(err) => Err(Miss::Failed(err)),
+                })
         });
         match result {
-            Ok(CachedEntry::LeafMmap(mmap)) => Ok(mmap),
-            Ok(_) => unreachable!("LeafMmap key always maps to LeafMmap entry"),
-            Err(arc_err) => Err(arc_io_error(arc_err)),
+            Ok(CachedEntry::LeafBytes(bytes)) => Ok(Some(bytes)),
+            Ok(_) => unreachable!("LeafBytes key always maps to LeafBytes entry"),
+            Err(miss) => match miss.as_ref() {
+                Miss::Absent => Ok(None),
+                Miss::Failed(err) => Err(io::Error::new(err.kind(), err.to_string())),
+            },
         }
     }
 

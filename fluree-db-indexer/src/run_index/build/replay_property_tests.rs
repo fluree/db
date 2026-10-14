@@ -184,9 +184,12 @@ struct LeafView {
 
 impl LeafView {
     fn decode(leaf_bytes: &[u8], sidecar_bytes: Option<&[u8]>) -> Self {
-        let handle =
-            FullBlobLeafHandle::new(leaf_bytes.to_vec(), sidecar_bytes.map(<[u8]>::to_vec), 0)
-                .expect("leaf handle");
+        let handle = FullBlobLeafHandle::new(
+            leaf_bytes.to_vec(),
+            sidecar_bytes.map(|b| b.to_vec().into()),
+            0,
+        )
+        .expect("leaf handle");
         assert_eq!(handle.dir().entries.len(), 1, "cases fit one leaflet");
         let batch = handle
             .load_columns(0, &ColumnProjection::all(), RunSortOrder::Spot)

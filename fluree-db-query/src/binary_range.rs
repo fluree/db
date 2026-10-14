@@ -2174,7 +2174,7 @@ mod tests {
             flakes: sorted_raw(),
             yielded: std::sync::atomic::AtomicUsize::new(0),
         };
-        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let store = Arc::new(BinaryIndexStore::empty());
         let opts = RangeOptions {
             to_t: Some(10),
             ..Default::default()
@@ -2220,7 +2220,7 @@ mod tests {
     /// with eight slots a few commits evicted a live query's translation.
     #[test]
     fn an_empty_overlay_probe_leaves_the_translation_lru_alone() {
-        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let store = Arc::new(BinaryIndexStore::empty());
         let dict_novelty = Arc::new(DictNovelty::new_uninitialized());
         let small_dicts = Arc::new(RuntimeSmallDicts::new());
         let probe = RangeMatch::subject_predicate(s("a"), s("weight"));

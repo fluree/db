@@ -445,11 +445,15 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
         probe
     } else {
         // Oversized envelope — rare path. Fetch the full blob.
-        store.get(id).await.map_err(|e| {
-            Error::storage(format!(
-                "Failed to read oversized commit envelope {id}: {e}"
-            ))
-        })?
+        store
+            .get(id)
+            .await
+            .map_err(|e| {
+                Error::storage(format!(
+                    "Failed to read oversized commit envelope {id}: {e}"
+                ))
+            })?
+            .into_vec()
     };
 
     // Sync decode — span guard lives only for the non-await block so callers

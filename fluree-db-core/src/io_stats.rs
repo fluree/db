@@ -3,8 +3,9 @@
 //! Every artifact read records its kind, where the bytes came from and the
 //! byte count. Remote fetches are counted once, at the storage bridge
 //! (`store`: a whole-object get, `store-range`: a ranged get), with dictionary
-//! blobs told apart by format; readers count what a local path (`local`,
-//! `local-range`) or the disk artifact cache (`cache`, `cache-range`) served.
+//! blobs told apart by format. The bridge also counts what the storage
+//! served from this machine (`local`), and the disk-cache wrapper what its
+//! entries served (`cache`, `cache-range`).
 //! `FLUREE_FORCE_REMOTE_READS` makes a local store report what S3 would be
 //! asked for. Off, every hook is one relaxed atomic load and builds no label.
 

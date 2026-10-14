@@ -110,7 +110,7 @@ pub struct BranchUpdateMeta {
 /// Leaves are processed sequentially. The caller is responsible for prefetching
 /// touched leaves if parallelism is desired.
 #[allow(clippy::too_many_arguments)]
-pub fn update_branch<F, G>(
+pub fn update_branch<B, F, G>(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
@@ -121,8 +121,9 @@ pub fn update_branch<F, G>(
     fetch_sidecar: &G,
 ) -> io::Result<BranchUpdateResult>
 where
-    F: Fn(&ContentId) -> io::Result<Vec<u8>>,
-    G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
+    B: AsRef<[u8]> + Send,
+    F: Fn(&ContentId) -> io::Result<B>,
+    G: Fn(&ContentId) -> io::Result<Option<B>>,
 {
     // Non-streaming convenience wrapper: collect the emitted blobs into a Vec.
     // The byte-for-byte output is identical to the streaming core, so CIDs and
@@ -162,7 +163,7 @@ where
 /// The leaf *encoding* is identical to [`update_branch`] — only when bytes are
 /// released differs — so the resulting branch/root CIDs are bit-identical.
 #[allow(clippy::too_many_arguments)]
-pub fn update_branch_streaming<F, G, S>(
+pub fn update_branch_streaming<B, F, G, S>(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
@@ -174,8 +175,9 @@ pub fn update_branch_streaming<F, G, S>(
     sink: &mut S,
 ) -> io::Result<BranchUpdateMeta>
 where
-    F: Fn(&ContentId) -> io::Result<Vec<u8>>,
-    G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
+    B: AsRef<[u8]> + Send,
+    F: Fn(&ContentId) -> io::Result<B>,
+    G: Fn(&ContentId) -> io::Result<Option<B>>,
     S: FnMut(NewLeafBlob) -> io::Result<()>,
 {
     let order = config.order;
@@ -271,7 +273,7 @@ enum DrainMode {
 /// shared `BranchAcc` in ascending manifest index, so the branch bytes/CID are
 /// independent of the mode.
 #[allow(clippy::too_many_arguments)]
-fn drain_branch<F, G, S>(
+fn drain_branch<B, F, G, S>(
     manifest: &BranchManifest,
     leaf_slices: &[StreamSlices<'_>],
     config: &BranchUpdateConfig,
@@ -281,8 +283,9 @@ fn drain_branch<F, G, S>(
     sink: &mut S,
 ) -> io::Result<BranchUpdateMeta>
 where
-    F: Fn(&ContentId) -> io::Result<Vec<u8>>,
-    G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
+    B: AsRef<[u8]> + Send,
+    F: Fn(&ContentId) -> io::Result<B>,
+    G: Fn(&ContentId) -> io::Result<Option<B>>,
     S: FnMut(NewLeafBlob) -> io::Result<()>,
 {
     let mut acc = BranchAcc::with_capacity(manifest.leaves.len() + 4, config.collect_matched);
@@ -463,7 +466,7 @@ where
 /// Serial per-leaf CoW: the original loop. Untouched leaves carry forward; touched
 /// leaves are fetched, updated, and drained in manifest order.
 #[allow(clippy::too_many_arguments)]
-fn update_branch_serial<F, G, S>(
+fn update_branch_serial<B, F, G, S>(
     manifest: &BranchManifest,
     leaf_slices: &[StreamSlices<'_>],
     config: &BranchUpdateConfig,
@@ -473,8 +476,9 @@ fn update_branch_serial<F, G, S>(
     sink: &mut S,
 ) -> io::Result<()>
 where
-    F: Fn(&ContentId) -> io::Result<Vec<u8>>,
-    G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
+    B: AsRef<[u8]> + Send,
+    F: Fn(&ContentId) -> io::Result<B>,
+    G: Fn(&ContentId) -> io::Result<Option<B>>,
     S: FnMut(NewLeafBlob) -> io::Result<()>,
 {
     for (i, slices) in leaf_slices.iter().enumerate() {
@@ -489,7 +493,12 @@ where
             Some(cid) => fetch_sidecar(cid)?,
             None => None,
         };
-        let input = make_leaf_update_input(&leaf_bytes, sidecar_bytes.as_deref(), *slices, config)?;
+        let input = make_leaf_update_input(
+            leaf_bytes.as_ref(),
+            sidecar_bytes.as_ref().map(AsRef::as_ref),
+            *slices,
+            config,
+        )?;
         let output = update_leaf(&input)?;
         drain_touched_output(config.order, existing, output, acc, sink)?;
     }
@@ -499,10 +508,10 @@ where
 /// A touched-leaf work unit: owns the prefetched leaf/sidecar bytes so the rayon
 /// closure can build a `LeafUpdateInput` over read-only data and call `update_leaf`
 /// off-thread. `manifest_index` keeps the result reassemblable in branch order.
-struct LeafWorkUnit<'a> {
+struct LeafWorkUnit<'a, B> {
     manifest_index: usize,
-    leaf_bytes: Vec<u8>,
-    sidecar_bytes: Option<Vec<u8>>,
+    leaf_bytes: B,
+    sidecar_bytes: Option<B>,
     slices: StreamSlices<'a>,
 }
 
@@ -524,7 +533,7 @@ struct LeafWorkUnit<'a> {
 ///   to available_parallelism and shared across all branch tasks, so the four
 ///   concurrent Phase 2 tasks cannot collectively exceed ~ncpu busy threads.
 #[allow(clippy::too_many_arguments)]
-fn update_branch_parallel<F, G, S>(
+fn update_branch_parallel<B, F, G, S>(
     manifest: &BranchManifest,
     leaf_slices: &[StreamSlices<'_>],
     config: &BranchUpdateConfig,
@@ -535,8 +544,9 @@ fn update_branch_parallel<F, G, S>(
     sink: &mut S,
 ) -> io::Result<()>
 where
-    F: Fn(&ContentId) -> io::Result<Vec<u8>>,
-    G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
+    B: AsRef<[u8]> + Send,
+    F: Fn(&ContentId) -> io::Result<B>,
+    G: Fn(&ContentId) -> io::Result<Option<B>>,
     S: FnMut(NewLeafBlob) -> io::Result<()>,
 {
     let window = window.max(1);
@@ -551,7 +561,7 @@ where
         // for each touched leaf in this window. Fetches read the in-memory maps
         // only. Untouched leaves are handled in the post-pass to keep a single
         // ascending push order.
-        let mut units: Vec<LeafWorkUnit<'_>> = Vec::with_capacity(window_end - i);
+        let mut units: Vec<LeafWorkUnit<'_, B>> = Vec::with_capacity(window_end - i);
         for (offset, (slices, existing)) in leaf_slices[i..window_end]
             .iter()
             .zip(&manifest.leaves[i..window_end])
@@ -581,8 +591,8 @@ where
             .map(|unit| {
                 let _guard = span.enter();
                 let input = make_leaf_update_input(
-                    &unit.leaf_bytes,
-                    unit.sidecar_bytes.as_deref(),
+                    unit.leaf_bytes.as_ref(),
+                    unit.sidecar_bytes.as_ref().map(AsRef::as_ref),
                     unit.slices,
                     config,
                 )?;

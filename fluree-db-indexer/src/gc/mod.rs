@@ -147,7 +147,6 @@ pub use sweep::{
 use crate::error::Result;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// What the collector does with a manifest entry that names a blob in the
 /// ledger-wide `@shared/dicts/` namespace. See the module docs.
@@ -206,8 +205,6 @@ pub struct CleanGarbageConfig {
     /// varies widely between ledgers, so derive it from observed per-version
     /// disk use.
     pub hard_max_old_indexes: Option<u32>,
-    /// Optional disk artifact cache for root and garbage-record reads.
-    pub artifact_cache_dir: Option<PathBuf>,
     /// What to do with dictionary blobs the manifests name. Defaults to
     /// [`SharedBlobPolicy::Defer`].
     pub shared_blobs: SharedBlobPolicy,

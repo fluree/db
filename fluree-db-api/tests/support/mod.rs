@@ -869,7 +869,7 @@ pub async fn run_collector_and_fork_drop_scenario(
             .await
             .expect("lookup")
             .expect("record");
-        let refs = shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)], None)
+        let refs = shared_refs_of_branches(fluree.backend(), &[BranchIndexHead::of(&record)])
             .await
             .expect("walk chain");
         assert!(

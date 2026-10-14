@@ -56,8 +56,12 @@ fn history_entries_straddle_psot_segment_boundary() {
     assert_eq!(infos.len(), 1, "one leaf");
     let info = &infos[0];
 
-    let handle =
-        FullBlobLeafHandle::new(info.leaf_bytes.clone(), info.sidecar_bytes.clone(), 0).unwrap();
+    let handle = FullBlobLeafHandle::new(
+        info.leaf_bytes.clone(),
+        info.sidecar_bytes.clone().map(Into::into),
+        0,
+    )
+    .unwrap();
     let n_leaflets = handle.dir().entries.len();
     eprintln!("leaflets: {n_leaflets}");
     for i in 0..n_leaflets {
@@ -108,8 +112,12 @@ fn history_survives_leaf_split_at_psot_segment_boundary() {
     assert_eq!(infos[1].last_key.p_id, 2);
 
     let info = &infos[1];
-    let handle =
-        FullBlobLeafHandle::new(info.leaf_bytes.clone(), info.sidecar_bytes.clone(), 0).unwrap();
+    let handle = FullBlobLeafHandle::new(
+        info.leaf_bytes.clone(),
+        info.sidecar_bytes.clone().map(Into::into),
+        0,
+    )
+    .unwrap();
     assert_eq!(handle.dir().entries.len(), 1);
 
     let batch = handle

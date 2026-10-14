@@ -25,7 +25,6 @@ impl Fluree {
             self.backend(),
             self.nameservice(),
             state,
-            &self.binary_store_cache_dir(),
             Some(Arc::clone(self.leaflet_cache())),
             None,
             root,

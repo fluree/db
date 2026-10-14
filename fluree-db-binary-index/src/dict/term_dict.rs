@@ -22,7 +22,6 @@ use fluree_db_core::triple_term::{term_handle, term_handle_p_id, term_handle_seq
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictKind};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 /// The pack header's `ns_code` slot is 16 bits; the low half of the inner
@@ -60,7 +59,6 @@ impl TermDictReader {
     /// for packs and leaves whose CIDs are unchanged.
     pub async fn from_refs_reusing(
         cs: Arc<dyn ContentStore>,
-        cache_dir: &Path,
         refs: &TermDictRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
         prev: Option<&TermDictReader>,
@@ -69,7 +67,6 @@ impl TermDictReader {
         for (p_id, packs) in &refs.forward_packs {
             let reader = ForwardPackReader::from_pack_refs_reusing(
                 Arc::clone(&cs),
-                cache_dir,
                 packs,
                 KIND_TERM_FWD,
                 pack_ns_code(*p_id),
@@ -83,7 +80,6 @@ impl TermDictReader {
                 &cs,
                 &refs.reverse,
                 leaflet_cache,
-                Some(cache_dir),
                 prev.and_then(|p| p.reverse.as_ref()),
             )
             .await?,
@@ -94,7 +90,6 @@ impl TermDictReader {
                     &cs,
                     tree,
                     leaflet_cache,
-                    Some(cache_dir),
                     prev.and_then(|p| p.object_reverse.as_ref()),
                 )
                 .await?,

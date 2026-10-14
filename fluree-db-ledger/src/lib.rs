@@ -302,7 +302,7 @@ impl LedgerState {
     ) -> Result<(Self, Option<DecodedIndexRoot<R>>)> {
         let (snapshot, root) = match &record.index_head_id {
             Some(id) => {
-                let (snapshot, kept) = decode(store.get(id).await?)?;
+                let (snapshot, kept) = decode(store.get(id).await?.into_vec())?;
                 (Some(snapshot), Some((id.clone(), kept)))
             }
             None => (None, None),

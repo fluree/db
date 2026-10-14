@@ -460,9 +460,9 @@ async fn line_commits(fluree: &MemoryFluree, ledger_id: &str) -> Vec<PushedCommi
         .expect("a full line");
     let mut out = Vec::new();
     for cid in &plan.lineage {
-        let bytes = store.get(cid).await.unwrap();
+        let bytes = store.get(cid).await.unwrap().into_vec();
         let txn_blob = match read_commit(&bytes).unwrap().txn {
-            Some(txn) => Some((txn.to_string(), store.get(&txn).await.unwrap())),
+            Some(txn) => Some((txn.to_string(), store.get(&txn).await.unwrap().into_vec())),
             None => None,
         };
         out.push(PushedCommit { bytes, txn_blob });
