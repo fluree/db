@@ -455,9 +455,10 @@ async fn an_attached_index_older_than_the_ledgers_refuses_a_vector() {
         .unwrap();
     let older = rebuild(&fluree, id).await;
     let older_store = older.binary_store.clone();
+    let older_provider = older.snapshot.range_provider.clone();
     assert!(
-        older_store.is_some(),
-        "a loaded index has its store attached"
+        older_store.is_some() && older_provider.is_some(),
+        "a loaded index has its store and range provider attached"
     );
 
     // `ex:other` first gets a length in the next index, not the older one.
@@ -468,9 +469,12 @@ async fn an_attached_index_older_than_the_ledgers_refuses_a_vector() {
     assert!(ledger.index_t() > older.index_t());
     assert!(ledger.novelty.is_empty());
 
-    // The newer index installed, but the older store left attached.
+    // The newer index installed, but the older store and its range provider
+    // left attached. Both stay consistent with each other, so reads through
+    // the provider (SHACL staging, for one) still work, and only the vector
+    // check can tell the store is older than the ledger's index.
     ledger.binary_store = older_store;
-    std::sync::Arc::make_mut(&mut ledger.snapshot).range_provider = None;
+    std::sync::Arc::make_mut(&mut ledger.snapshot).range_provider = older_provider;
     match insert_state(&fluree, ledger, vec![node("c", "other", 5)]).await {
         Err(ApiError::Transact(TransactError::Core(e))) => {
             assert!(e.to_string().contains("older than the ledger's"), "{e}");
