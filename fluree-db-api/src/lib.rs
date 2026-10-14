@@ -909,6 +909,18 @@ where
         }
     }
 
+    fn get_local_ranged(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<Arc<dyn fluree_db_core::RangeSource>>, fluree_db_core::Error>
+    {
+        if Self::route_to_commit(address) {
+            self.commit.get_local_ranged(address)
+        } else {
+            self.index.get_local_ranged(address)
+        }
+    }
+
     fn permits_plaintext_cache(&self) -> bool {
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
     }
@@ -1172,6 +1184,14 @@ impl StorageRead for AddressIdentifierResolverStorage {
         address: &str,
     ) -> std::result::Result<Option<fluree_db_core::ContentBytes>, fluree_db_core::Error> {
         self.route(address).get_local(address)
+    }
+
+    fn get_local_ranged(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<Arc<dyn fluree_db_core::RangeSource>>, fluree_db_core::Error>
+    {
+        self.route(address).get_local_ranged(address)
     }
 
     fn permits_plaintext_cache(&self) -> bool {

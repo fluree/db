@@ -8,6 +8,10 @@
 //! entries served (`cache`, `cache-range`).
 //! `FLUREE_FORCE_REMOTE_READS` makes a local store report what S3 would be
 //! asked for. Off, every hook is one relaxed atomic load and builds no label.
+//!
+//! A second table counts work done on bytes after they are read: decryption
+//! (whole objects and segments) and what readers keep loaded. It is reported
+//! apart from reads so neither total mixes the two.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +22,8 @@ static INIT: OnceLock<()> = OnceLock::new();
 /// `(kind, source)` → `(count, bytes)`.
 type Table = BTreeMap<(String, &'static str), (u64, u64)>;
 static TABLE: Mutex<Table> = Mutex::new(BTreeMap::new());
+/// `kind` → `(count, bytes)`.
+static WORK: Mutex<BTreeMap<&'static str, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
 /// Whether accounting is on (`FLUREE_IO_STATS` set to anything but `0`).
 #[inline]
@@ -43,11 +49,28 @@ pub fn record<K: Into<String>>(kind: impl FnOnce() -> K, source: &'static str, b
     entry.1 += bytes as u64;
 }
 
+/// Record one unit of `kind` work over `bytes` bytes, such as one segment
+/// decrypted.
+pub fn record_work(kind: &'static str, bytes: usize) {
+    if !enabled() {
+        return;
+    }
+    let mut work = WORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = work.entry(kind).or_insert((0, 0));
+    entry.0 += 1;
+    entry.1 += bytes as u64;
+}
+
 /// Forget everything recorded so far.
 pub fn reset() {
     if enabled() {
         TABLE
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        WORK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
@@ -62,7 +85,10 @@ pub fn report() -> Option<String> {
     let table = TABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if table.is_empty() {
+    let work = WORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if table.is_empty() && work.is_empty() {
         return None;
     }
     let mut out = String::from("io reads (kind, source, count, bytes):\n");
@@ -76,5 +102,11 @@ pub fn report() -> Option<String> {
         "  {:<10} {:<12} {count:>8} {bytes:>14}",
         "total", ""
     ));
+    if !work.is_empty() {
+        out.push_str("\nwork (kind, count, bytes):");
+        for (kind, (n, b)) in work.iter() {
+            out.push_str(&format!("\n  {kind:<23} {n:>8} {b:>14}"));
+        }
+    }
     Some(out)
 }
