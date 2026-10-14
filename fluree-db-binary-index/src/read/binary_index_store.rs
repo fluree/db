@@ -5512,8 +5512,7 @@ pub(crate) mod tests {
             (namespaces::OVERFLOW, "https://example.org/zed"),
         ];
 
-        let cache_dir = temp_cache_dir();
-        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()));
         store.set_ns_split_mode(NsSplitMode::MostGranular);
         // Full-IRI namespaces have no prefix, as in a real store.
         store.dicts.namespace_codes = Arc::new(HashMap::from([
@@ -5568,7 +5567,6 @@ pub(crate) mod tests {
                 assert!(lookups > 0, "{suffix} takes the reverse lookup");
             }
         }
-        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
