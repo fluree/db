@@ -605,7 +605,9 @@ impl ProjectionState {
                 self.saw_star = true;
                 return Ok(());
             }
-            if item.alias.is_none() {
+            // `x AS x` is `x`; a `Bind` onto an already-bound variable is an
+            // equality check, not a projection.
+            if item.alias.as_ref().is_none_or(|alias| alias.name == v.name) {
                 let id = ctx.intern_var(&v.name);
                 self.vars.push(id);
                 self.group_keys.push(id);

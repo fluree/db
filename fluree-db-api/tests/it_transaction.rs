@@ -535,6 +535,70 @@ async fn a_policy_configured_while_open_applies_to_the_commit() {
     assert!(people(&fluree, &head(&fluree).await).await.is_empty());
 }
 
+/// Every kind of operation a transaction stages is checked against the
+/// policy the transaction is under, whichever staging lane it takes.
+#[tokio::test]
+async fn every_kind_of_operation_is_checked_against_the_policy() {
+    let fluree = fluree().await;
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <urn:fluree:{LEDGER}#config> {{
+                 <urn:config:main> a f:LedgerConfig ;
+                     f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow false .
+             }}"
+        ))
+        .commit()
+        .await
+        .unwrap();
+    let t = head(&fluree).await.t;
+
+    let turtle = "@prefix ex: <http://example.org/> . ex:bob ex:name \"Bob\" .";
+    let bob = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:bob", "ex:name": "Bob",
+    });
+    let operations = [
+        ("insert", TxnOperation::Insert(bob.clone())),
+        ("upsert", TxnOperation::Upsert(bob.clone())),
+        ("update", TxnOperation::Update(json!({ "insert": bob }))),
+        (
+            "insert turtle",
+            TxnOperation::InsertTurtle(turtle.to_string()),
+        ),
+        (
+            "upsert turtle",
+            TxnOperation::UpsertTurtle(turtle.to_string()),
+        ),
+        (
+            "sparql update",
+            TxnOperation::SparqlUpdate(
+                format!("{PREFIX}INSERT DATA {{ ex:bob ex:name \"Bob\" }}"),
+                None,
+            ),
+        ),
+    ];
+    for (kind, operation) in operations {
+        let mut txn = begin(&fluree).await;
+        let err = match txn.stage(operation).await {
+            Err(err) => err,
+            Ok(()) => txn
+                .commit(CommitOpts::default())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{kind}: committed under a deny-all policy")),
+        };
+        assert!(
+            err.to_string().contains("Policy enforcement"),
+            "{kind}: {err}"
+        );
+        assert_eq!(head(&fluree).await.t, t, "{kind}");
+    }
+}
+
 /// A rollback stages the operations before the savepoint again, and their
 /// blank nodes keep the identities the caller already read.
 #[tokio::test]

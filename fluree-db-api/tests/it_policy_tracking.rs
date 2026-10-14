@@ -105,6 +105,7 @@ async fn transact_policy_denied_includes_policy_and_fuel_tracking() {
         err.error,
         "User can only create a wishlist linked to their own identity."
     );
+    assert_eq!(err.status, 403, "a write its policy denies, as untracked");
 
     let policy_stats = err.policy.expect("policy stats should be present");
     assert_eq!(
