@@ -1297,7 +1297,7 @@ mod tests {
     fn wanted_keys_skip_leaflets_without_a_wanted_subject() {
         use crate::format::branch::{BranchManifest, LeafEntry};
         use crate::format::leaf::LeafWriter;
-        use crate::read::binary_index_store::tests::{empty_store, temp_cache_dir};
+        use crate::read::binary_index_store::tests::empty_store;
         use crate::read::column_types::{BinaryFilter, ColumnProjection};
         use fluree_db_core::content_kind::ContentKind;
         use fluree_db_core::{ContentStore, MemoryContentStore};
@@ -1322,7 +1322,7 @@ mod tests {
         })
         .unwrap();
         let cs: Arc<dyn ContentStore> = Arc::new(mem);
-        let store = Arc::new(empty_store(cs, temp_cache_dir()));
+        let store = Arc::new(empty_store(cs));
         let branch = Arc::new(BranchManifest {
             leaves: vec![LeafEntry {
                 first_key: leaf.first_key,
