@@ -197,15 +197,15 @@ impl Operator for DistinctOperator {
             // allocation; only rows that survive are copied into an owned key.
             let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
 
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             for row_idx in 0..batch.len() {
                 if self.norm.is_some() {
-                    let (store, gv) = EqualityNorm::parts(&self.norm);
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
                     // bindings pass through untouched, borrowed).
                     scratch.clear();
                     scratch.extend((0..num_cols).map(|col| {
-                        normalize_for_key_cow(batch.get_by_col(row_idx, col), store, gv)
+                        normalize_for_key_cow(batch.get_by_col(row_idx, col), dicts, gv)
                     }));
                     // `Cow` hashes as the binding it wraps, so this equals the
                     // stored `Vec<Binding>` hash the map recomputes on rehash.

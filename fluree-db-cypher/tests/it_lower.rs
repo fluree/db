@@ -912,6 +912,44 @@ fn with_limit_skip_pushdown() {
 }
 
 #[test]
+fn with_self_alias_projects_without_bind() {
+    // `a AS a` is `a`: a `Bind` onto the already-bound `a` would be an
+    // equality check, not a projection.
+    for (src, binds_allowed) in [
+        ("MATCH (a:Person) WITH a AS a RETURN a.name", false),
+        ("MATCH (a:Person) WITH a AS a, a.name AS n RETURN n", true),
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+        let ast = out.ast.expect("ast");
+        let mut vars = VarRegistry::new();
+        let q = lower_cypher(&ast, &NoEncoder, &mut vars).expect("lower");
+        let sq = q
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Subquery(sq) => Some(sq),
+                _ => None,
+            })
+            .expect("subquery");
+        let binds: Vec<&str> = sq
+            .patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Bind { var, .. } => Some(vars.name(*var)),
+                _ => None,
+            })
+            .collect();
+        assert!(!binds.contains(&"a"), "{src}: `a AS a` emitted a Bind");
+        assert!(binds_allowed || binds.is_empty(), "{src}: binds {binds:?}");
+        assert!(
+            sq.select.iter().any(|v| vars.name(*v) == "a"),
+            "{src}: `a` must still be projected"
+        );
+    }
+}
+
+#[test]
 fn nested_with_boundaries_nest_subqueries() {
     let q = lower("MATCH (n:Person) WITH n WITH n MATCH (n)-[:KNOWS]->(b:Person) RETURN n, b");
     // The outer pattern list should have one Subquery containing
