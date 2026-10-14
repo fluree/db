@@ -407,10 +407,14 @@ fn served(store: &span_capture::SpanStore, before: usize, site: &str) -> bool {
 }
 
 /// A query no fast path may answer runs the generic pipeline, whose only
-/// stamp is the fused chain it passed through (a sibling fast path, such as
-/// the count planner, would add its own).
+/// stamps are the fused chain it passed through and, for a GROUP BY over
+/// input sorted by its key, the GROUP BY operator's own partitioned mode,
+/// which aggregates the rows the pipeline hands it (a sibling fast path, such
+/// as the count planner, would add its own).
 fn generic_only(sites: &[String]) -> bool {
-    sites.iter().all(|s| s == "fused_chain")
+    sites
+        .iter()
+        .all(|s| s == "fused_chain" || s == "partitioned_group_by")
 }
 
 #[tokio::test]
