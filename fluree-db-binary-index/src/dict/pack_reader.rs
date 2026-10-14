@@ -14,9 +14,13 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use super::forward_pack::{lookup_in_pack, parse_pack_meta, ParsedPackMeta};
+use super::forward_pack::{
+    find_page_in_dir, lookup_in_pack, page_dir_range, parse_pack_meta, parse_pack_meta_parts,
+    ForwardPage, PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
+};
 use crate::format::wire_helpers::PackBranchEntry;
-use fluree_db_core::{ContentBytes, ContentId, ContentStore};
+use crate::read::leaflet_cache::{ForwardPageKey, LeafletCache};
+use fluree_db_core::{ContentBytes, ContentId, ContentStore, RangeSource};
 
 // ============================================================================
 // PackHandle — owns routing info + backing store for a single pack
@@ -37,7 +41,7 @@ enum PackInner {
     /// Pack is fully loaded: metadata parsed, backing bytes available.
     Loaded {
         meta: ParsedPackMeta,
-        backing: ContentBytes,
+        backing: PackBacking,
     },
     /// Pack deferred: resolve locally or fetch from CAS on first lookup.
     Lazy {
@@ -48,13 +52,66 @@ enum PackInner {
 
 struct LazyLoaded {
     meta: ParsedPackMeta,
-    backing: ContentBytes,
+    backing: PackBacking,
+}
+
+/// Where a loaded pack's pages come from.
+enum PackBacking {
+    /// The whole pack: mapped, shared from the store, or on the heap.
+    Whole(ContentBytes),
+    /// A local pack whose store decrypts on read, read by range: a page is
+    /// decrypted on first use into the leaflet cache, and the pack is never
+    /// held decrypted whole.
+    Paged {
+        source: Arc<dyn RangeSource>,
+        /// `xxh3_128(pack CID bytes)`, the pack half of a page's cache key.
+        pack_key: u128,
+    },
+}
+
+impl PackBacking {
+    /// Append `id`'s value bytes to `out`; `false` when the pack lacks it.
+    fn lookup_into(
+        &self,
+        meta: &ParsedPackMeta,
+        ctx: Option<&LoadContext>,
+        id: u64,
+        out: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        match self {
+            PackBacking::Whole(bytes) => Ok(match lookup_in_pack(bytes, meta, id) {
+                Some(value) => {
+                    out.extend_from_slice(value);
+                    true
+                }
+                None => false,
+            }),
+            PackBacking::Paged { source, pack_key } => {
+                if id < meta.first_id || id > meta.last_id {
+                    return Ok(false);
+                }
+                let Some(page_idx) = find_page_in_dir(&meta.directory, id) else {
+                    return Ok(false);
+                };
+                let dir = &meta.directory[page_idx];
+                let page = load_page(source, *pack_key, page_idx, dir, ctx)?;
+                Ok(
+                    ForwardPage::from_bytes_unchecked(&page, dir.page_first_id)
+                        .lookup_into(id, out),
+                )
+            }
+        }
+    }
 }
 
 impl PackHandle {
-    /// Get pre-parsed metadata and raw bytes. For lazy packs, triggers
-    /// fetch + cache + load + parse on first call (subsequent calls return cached).
-    fn ensure_loaded(&self, ctx: Option<&LoadContext>) -> io::Result<(&ParsedPackMeta, &[u8])> {
+    /// Get pre-parsed metadata and the pack's backing. For lazy packs,
+    /// triggers fetch + load + parse on first call (subsequent calls return
+    /// cached).
+    fn ensure_loaded(
+        &self,
+        ctx: Option<&LoadContext>,
+    ) -> io::Result<(&ParsedPackMeta, &PackBacking)> {
         match &self.inner {
             PackInner::Loaded { meta, backing } => Ok((meta, backing)),
             PackInner::Lazy { pack_cid, loaded } => {
@@ -73,6 +130,9 @@ struct LoadContext {
     cs: Arc<dyn ContentStore>,
     expected_kind: u8,
     expected_ns_code: u16,
+    /// Where pages of paged packs are kept; without one, each lookup reads
+    /// its page again.
+    page_cache: Option<Arc<LeafletCache>>,
 }
 
 // ============================================================================
@@ -153,6 +213,7 @@ impl ForwardPackReader {
                         cs,
                         expected_kind,
                         expected_ns_code,
+                        page_cache: None,
                     }),
                 });
             }
@@ -213,8 +274,18 @@ impl ForwardPackReader {
                 cs,
                 expected_kind,
                 expected_ns_code,
+                page_cache: None,
             }),
         })
+    }
+
+    /// Keep pages of packs read by range (encrypted local packs) in `cache`,
+    /// within its budget. Without it a lookup reads its page every time.
+    pub fn with_page_cache(mut self, cache: Option<Arc<LeafletCache>>) -> Self {
+        if let Some(ctx) = &mut self.load_ctx {
+            ctx.page_cache = cache;
+        }
+        self
     }
 
     /// Create from pre-built in-memory pack bytes (for testing).
@@ -229,7 +300,7 @@ impl ForwardPackReader {
                 last_id: meta.last_id,
                 inner: PackInner::Loaded {
                     meta,
-                    backing: ContentBytes::Shared(bytes),
+                    backing: PackBacking::Whole(ContentBytes::Shared(bytes)),
                 },
             }));
         }
@@ -289,7 +360,13 @@ impl ForwardPackReader {
                 break;
             }
             let bytes = match pack.ensure_loaded(self.load_ctx.as_ref()) {
-                Ok((_meta, bytes)) => bytes,
+                Ok((_, PackBacking::Whole(bytes))) => bytes,
+                // Pages decrypt on use; opening read the header and
+                // directory, which is what counts against the budget.
+                Ok((meta, PackBacking::Paged { .. })) => {
+                    warmed += (PACK_HEADER_SIZE + meta.directory.len() * 20) as u64;
+                    continue;
+                }
                 Err(error) => {
                     failed += 1;
                     first_failure.get_or_insert((
@@ -328,14 +405,8 @@ impl ForwardPackReader {
         let Some(handle) = self.find_pack(id) else {
             return Ok(false);
         };
-        let (meta, bytes) = handle.ensure_loaded(self.load_ctx.as_ref())?;
-        match lookup_in_pack(bytes, meta, id) {
-            Some(value) => {
-                out.extend_from_slice(value);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        let (meta, backing) = handle.ensure_loaded(self.load_ctx.as_ref())?;
+        backing.lookup_into(meta, self.load_ctx.as_ref(), id, out)
     }
 
     /// Convenience: look up and return as a `String`.
@@ -343,15 +414,14 @@ impl ForwardPackReader {
         let Some(handle) = self.find_pack(id) else {
             return Ok(None);
         };
-        let (meta, bytes) = handle.ensure_loaded(self.load_ctx.as_ref())?;
-        match lookup_in_pack(bytes, meta, id) {
-            Some(value) => {
-                let s = std::str::from_utf8(value)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(s.to_string()))
-            }
-            None => Ok(None),
+        let (meta, backing) = handle.ensure_loaded(self.load_ctx.as_ref())?;
+        let mut value = Vec::new();
+        if !backing.lookup_into(meta, self.load_ctx.as_ref(), id, &mut value)? {
+            return Ok(None);
         }
+        String::from_utf8(value)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Binary search packs by ID to find the one containing `id`.
@@ -437,6 +507,15 @@ fn fetch_and_load(
         return loaded(backing, expected_first_id, expected_last_id, ctx);
     }
 
+    if ctx.cs.costly_local_reads() && paged_packs_enabled() {
+        if let Some(source) = ctx
+            .cs
+            .get_local_ranged(pack_cid)
+            .map_err(|e| io::Error::other(format!("forward pack {pack_cid}: {e}")))?
+        {
+            return loaded_paged(source, pack_cid, expected_first_id, expected_last_id, ctx);
+        }
+    }
     if let Some(backing) = ctx
         .cs
         .get_local(pack_cid)
@@ -497,7 +576,101 @@ fn loaded(
 ) -> io::Result<LazyLoaded> {
     let meta = parse_pack_meta(&backing)?;
     validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-    Ok(LazyLoaded { meta, backing })
+    fluree_db_core::io_stats::record_work(
+        match backing {
+            ContentBytes::Owned(_) => "pack held whole (heap)",
+            ContentBytes::Shared(_) => "pack held whole (shared)",
+            #[cfg(not(target_arch = "wasm32"))]
+            ContentBytes::Mapped(_) => "pack held whole (mapped)",
+        },
+        backing.len(),
+    );
+    Ok(LazyLoaded {
+        meta,
+        backing: PackBacking::Whole(backing),
+    })
+}
+
+/// Experiment control for the segmented-envelope A/B, not a supported
+/// configuration: `FLUREE_ENCRYPTED_PAGED_PACKS=0` holds encrypted local
+/// packs whole even when they can be read by range.
+fn paged_packs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLUREE_ENCRYPTED_PAGED_PACKS").map_or(true, |v| v != "0"))
+}
+
+/// Open a pack read by range: its header and page directory are read and
+/// validated now, its pages on use.
+fn loaded_paged(
+    source: Arc<dyn RangeSource>,
+    pack_cid: &ContentId,
+    expected_first_id: u64,
+    expected_last_id: u64,
+    ctx: &LoadContext,
+) -> io::Result<LazyLoaded> {
+    let read = |range: std::ops::Range<u64>| {
+        source
+            .read_range(range)
+            .map_err(|e| io::Error::other(format!("forward pack {pack_cid}: {e}")))
+    };
+    let header_bytes = read(0..PACK_HEADER_SIZE as u64)?;
+    let header = PackHeader::decode(&header_bytes)?;
+    let dir_bytes = read(page_dir_range(&header, source.len())?)?;
+    let meta = parse_pack_meta_parts(&header, &dir_bytes, source.len())?;
+    validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
+    fluree_db_core::io_stats::record_work(
+        "pack opened paged",
+        header_bytes.len() + dir_bytes.len(),
+    );
+    Ok(LazyLoaded {
+        meta,
+        backing: PackBacking::Paged {
+            source,
+            pack_key: xxhash_rust::xxh3::xxh3_128(pack_cid.to_bytes().as_ref()),
+        },
+    })
+}
+
+/// A paged pack's page, from the cache or read and validated: a page that
+/// fails validation is an error and is not cached.
+fn load_page(
+    source: &Arc<dyn RangeSource>,
+    pack_key: u128,
+    page_idx: usize,
+    dir: &PageDirEntry,
+    ctx: Option<&LoadContext>,
+) -> io::Result<Arc<[u8]>> {
+    let read = || -> io::Result<Arc<[u8]>> {
+        let start = u64::from(dir.page_offset);
+        let bytes = source
+            .read_range(start..start + u64::from(dir.page_len))
+            .map_err(|e| io::Error::other(format!("forward pack page: {e}")))?;
+        if bytes.len() != dir.page_len as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forward pack page: shorter than its directory entry",
+            ));
+        }
+        let page = ForwardPage::from_bytes(&bytes, dir.page_first_id)?;
+        if page.entry_count() != dir.entry_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forward pack page: entry count does not match its directory entry",
+            ));
+        }
+        fluree_db_core::io_stats::record_work("pack page decoded", bytes.len());
+        Ok(Arc::from(bytes))
+    };
+    match ctx.and_then(|ctx| ctx.page_cache.as_ref()) {
+        Some(cache) => cache.try_get_or_load_forward_page(
+            ForwardPageKey {
+                pack: pack_key,
+                page: u32::try_from(page_idx).map_err(|_| io::Error::other("page index"))?,
+            },
+            read,
+        ),
+        None => read(),
+    }
 }
 
 /// Validate a loaded pack against the expected range and dictionary stream.
@@ -1157,7 +1330,8 @@ mod tests {
                 PackInner::Lazy { loaded, .. }
                     if matches!(
                         loaded.get(),
-                        Some(LazyLoaded { backing, .. }) if backing.ptr_eq(&resident)
+                        Some(LazyLoaded { backing: PackBacking::Whole(backing), .. })
+                            if backing.ptr_eq(&resident)
                     )
             ),
             "the loaded pack must be the store's own allocation"
@@ -1314,6 +1488,165 @@ mod tests {
                 first.as_micros(),
                 all.as_micros()
             );
+        }
+    }
+
+    /// Packs of a store whose whole local reads decrypt everything: pages
+    /// are read by range on use and kept in the leaflet cache.
+    mod paged {
+        use super::*;
+        use crate::read::binary_index_store::tests::ranged_local::SegmentedContentStore;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        const FIRST: u64 = 1_000;
+        const COUNT: usize = 2_000;
+
+        fn value(id: u64) -> Vec<u8> {
+            format!("value-{id:08}").into_bytes()
+        }
+
+        /// A pack of many small pages.
+        fn many_page_pack() -> Vec<u8> {
+            let entries: Vec<(u64, Vec<u8>)> = (0..COUNT as u64)
+                .map(|i| (FIRST + i, value(FIRST + i)))
+                .collect();
+            let refs: Vec<(u64, &[u8])> =
+                entries.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+            encode_forward_pack(&refs, KIND_STRING_FWD, 0, 512).unwrap()
+        }
+
+        fn reader(
+            cs: &SegmentedContentStore,
+            pack: &[u8],
+            cache: Option<Arc<LeafletCache>>,
+        ) -> ForwardPackReader {
+            let pack_cid = cs.put_sync(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                pack,
+            );
+            let refs = vec![PackBranchEntry {
+                first_id: FIRST,
+                last_id: FIRST + COUNT as u64 - 1,
+                pack_cid,
+            }];
+            let cs: Arc<dyn ContentStore> = Arc::new(cs.clone());
+            crate::read::binary_index_store::run_sync_on_runtime(async move {
+                ForwardPackReader::from_pack_refs(cs, &refs, KIND_STRING_FWD, 0).await
+            })
+            .unwrap()
+            .with_page_cache(cache)
+        }
+
+        fn lookup(reader: &ForwardPackReader, id: u64) -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            reader
+                .forward_lookup_into(id, &mut out)
+                .unwrap()
+                .then_some(out)
+        }
+
+        #[test]
+        fn lookups_read_the_page_they_need_once() {
+            let cs = SegmentedContentStore::new(true);
+            let pack = many_page_pack();
+            let cache = Arc::new(LeafletCache::with_max_mb(16));
+            let reader = reader(&cs, &pack, Some(Arc::clone(&cache)));
+
+            assert_eq!(lookup(&reader, FIRST + 7), Some(value(FIRST + 7)));
+            let opened = cs.reads();
+            assert_eq!(
+                opened.len(),
+                3,
+                "header, directory and one page: {opened:?}"
+            );
+            let page_bytes = opened[2].end - opened[2].start;
+            assert!(page_bytes < pack.len() as u64 / 20);
+
+            assert_eq!(lookup(&reader, FIRST + 8), Some(value(FIRST + 8)));
+            assert_eq!(cs.reads().len(), 3, "the page is cached");
+            let last = FIRST + COUNT as u64 - 1;
+            assert_eq!(lookup(&reader, last), Some(value(last)));
+            assert_eq!(cs.reads().len(), 4, "another page is one more read");
+            assert_eq!(
+                reader.forward_lookup_str(FIRST + 9).unwrap(),
+                Some(String::from_utf8(value(FIRST + 9)).unwrap())
+            );
+            assert_eq!(lookup(&reader, FIRST + COUNT as u64), None);
+            assert_eq!(lookup(&reader, FIRST - 1), None);
+            assert_eq!(
+                cs.whole_reads.load(AtomicOrdering::SeqCst),
+                0,
+                "never whole"
+            );
+
+            let pages = cache
+                .occupancy()
+                .into_iter()
+                .find(|(kind, _, _)| *kind == "forward-page")
+                .expect("pages are in the leaflet cache");
+            assert_eq!(pages.1, 2);
+        }
+
+        #[test]
+        fn every_value_reads_back_through_pages() {
+            let cs = SegmentedContentStore::new(true);
+            let reader = reader(
+                &cs,
+                &many_page_pack(),
+                Some(Arc::new(LeafletCache::with_max_mb(16))),
+            );
+            for id in FIRST..FIRST + COUNT as u64 {
+                assert_eq!(lookup(&reader, id), Some(value(id)), "id {id}");
+            }
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        /// A page that fails validation is an error every time it is read,
+        /// never a cached success.
+        #[test]
+        fn a_corrupt_page_errors_and_is_not_cached() {
+            let mut pack = many_page_pack();
+            let meta = parse_pack_meta(&pack).unwrap();
+            let page = &meta.directory[0];
+            // Offsets must not decrease: make the second one smaller than the first.
+            let offsets = page.page_offset as usize + 4;
+            pack[offsets..offsets + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let cs = SegmentedContentStore::new(true);
+            let reader = reader(&cs, &pack, Some(Arc::new(LeafletCache::with_max_mb(16))));
+            let mut out = Vec::new();
+            assert!(reader.forward_lookup_into(FIRST, &mut out).is_err());
+            assert!(reader.forward_lookup_into(FIRST, &mut out).is_err());
+            let last = FIRST + COUNT as u64 - 1;
+            assert_eq!(lookup(&reader, last), Some(value(last)), "other pages read");
+        }
+
+        /// Warming a paged pack opens it and decrypts no page.
+        #[test]
+        fn prewarm_reads_no_pages() {
+            let cs = SegmentedContentStore::new(true);
+            let reader = reader(
+                &cs,
+                &many_page_pack(),
+                Some(Arc::new(LeafletCache::with_max_mb(16))),
+            );
+            assert!(reader.prewarm(u64::MAX) > 0);
+            assert_eq!(cs.reads().len(), 2, "header and directory only");
+        }
+
+        /// Without a ranged source the pack is held whole, as before.
+        #[test]
+        fn a_pack_without_a_ranged_source_is_held_whole() {
+            let cs = SegmentedContentStore::new(false);
+            let reader = reader(
+                &cs,
+                &many_page_pack(),
+                Some(Arc::new(LeafletCache::with_max_mb(16))),
+            );
+            assert_eq!(lookup(&reader, FIRST + 3), Some(value(FIRST + 3)));
+            assert_eq!(lookup(&reader, FIRST + 1_500), Some(value(FIRST + 1_500)));
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 1);
         }
     }
 }

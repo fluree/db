@@ -28,7 +28,7 @@
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
 use fluree_db_core::subject_id::SubjectIdColumn;
-use fluree_db_core::{ContentBytes, Flake, ListIndex, Sid, StatsView};
+use fluree_db_core::{ContentBytes, Flake, ListIndex, RangeSource, Sid, StatsView};
 // moka's eviction clock reads std::time::Instant at cache construction, which
 // aborts on wasm32-unknown-unknown; shadow-import core's clock-free LRU
 // stand-in there (same API subset, exact-LRU instead of TinyLFU).
@@ -213,6 +213,12 @@ enum CacheKey {
     /// cycle every cursor otherwise pays per leaf access (the dominant fixed
     /// cost of an indexed point lookup).
     LeafBytes(u128),
+    /// A local leaf read by range, for a store whose whole-leaf local read
+    /// decrypts it all. Key = xxh3_128(leaf CID bytes), as for `LeafBytes`.
+    RangedLeaf(u128),
+    /// One decrypted page of a forward dictionary pack read by range.
+    /// Content-addressed through the pack's CID.
+    ForwardPage(ForwardPageKey),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -254,6 +260,13 @@ pub struct V3BatchCacheKey {
     /// covers is served projected, and a wider one decodes only the missing
     /// columns and widens the entry.
     pub columns: u16,
+}
+
+/// A forward pack page: `pack` is `xxh3_128(pack CID bytes)`.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct ForwardPageKey {
+    pub pack: u128,
+    pub page: u32,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -418,6 +431,8 @@ enum CachedEntry {
     DictLeaf(Arc<[u8]>),
     LeafDir(Arc<DecodedLeafDirV3>),
     LeafBytes(ContentBytes),
+    RangedLeaf(Arc<dyn RangeSource>),
+    ForwardPage(Arc<[u8]>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -428,6 +443,28 @@ enum CachedEntry {
 }
 
 impl CachedEntry {
+    /// The entry's type, for [`LeafletCache::occupancy`].
+    #[cfg(not(target_arch = "wasm32"))]
+    fn kind(&self) -> &'static str {
+        match self {
+            CachedEntry::R1(_) => "region1",
+            CachedEntry::R2(_) => "region2",
+            CachedEntry::DictLeaf(_) => "dict-leaf",
+            CachedEntry::LeafDir(_) => "leaf-dir",
+            CachedEntry::LeafBytes(ContentBytes::Owned(_)) => "leaf-bytes-heap",
+            CachedEntry::LeafBytes(ContentBytes::Shared(_)) => "leaf-bytes-shared",
+            #[cfg(not(target_arch = "wasm32"))]
+            CachedEntry::LeafBytes(ContentBytes::Mapped(_)) => "leaf-bytes-mapped",
+            CachedEntry::RangedLeaf(_) => "ranged-leaf",
+            CachedEntry::ForwardPage(_) => "forward-page",
+            CachedEntry::Bm25Leaflet(_) => "bm25-leaflet",
+            CachedEntry::VectorShard(_) => "vector-shard",
+            CachedEntry::LedgerInfo(_) => "ledger-info",
+            CachedEntry::V3Batch(_) => "v3-batch",
+            CachedEntry::SegmentOps(_) => "segment-ops",
+        }
+    }
+
     /// Approximate byte size for the moka weigher.
     fn byte_size(&self) -> usize {
         match self {
@@ -438,6 +475,8 @@ impl CachedEntry {
             // A mapping is file-backed (reclaimable page cache), not heap, so
             // it weighs far less than its length; heap bytes weigh in full.
             CachedEntry::LeafBytes(bytes) => bytes.cache_weight(),
+            CachedEntry::RangedLeaf(source) => source.cache_weight(),
+            CachedEntry::ForwardPage(page) => page.len(),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -753,6 +792,73 @@ impl LeafletCache {
                 Miss::Failed(err) => Err(io::Error::new(err.kind(), err.to_string())),
             },
         }
+    }
+
+    /// A leaf's cached range source (read-only, no insertion). Key is
+    /// `xxh3_128(leaf_cid.to_bytes())`.
+    pub fn get_ranged_leaf(&self, key: u128) -> Option<Arc<dyn RangeSource>> {
+        match self.inner.get(&CacheKey::RangedLeaf(key)) {
+            Some(CachedEntry::RangedLeaf(source)) => Some(source),
+            _ => None,
+        }
+    }
+
+    /// Cache a leaf's range source, returning the one that ends up cached:
+    /// `source`, or what a concurrent opener inserted first. Opening a
+    /// source decrypts nothing, so there is nothing to coalesce.
+    pub fn get_or_insert_ranged_leaf(
+        &self,
+        key: u128,
+        source: Arc<dyn RangeSource>,
+    ) -> Arc<dyn RangeSource> {
+        match self.inner.get_with(CacheKey::RangedLeaf(key), || {
+            CachedEntry::RangedLeaf(source)
+        }) {
+            CachedEntry::RangedLeaf(source) => source,
+            _ => unreachable!("RangedLeaf key always maps to RangedLeaf entry"),
+        }
+    }
+
+    /// A forward pack page, read by `load` at most once however many
+    /// lookups race on it. A failed load is not cached.
+    pub fn try_get_or_load_forward_page<F>(
+        &self,
+        key: ForwardPageKey,
+        load: F,
+    ) -> io::Result<Arc<[u8]>>
+    where
+        F: FnOnce() -> io::Result<Arc<[u8]>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(CachedEntry::ForwardPage(page)) = self.inner.get(&CacheKey::ForwardPage(key)) {
+            return Ok(page);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::ForwardPage(key), || {
+                load().map(CachedEntry::ForwardPage)
+            })
+        });
+        match result {
+            Ok(CachedEntry::ForwardPage(page)) => Ok(page),
+            Ok(_) => unreachable!("ForwardPage key always maps to ForwardPage entry"),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
+        }
+    }
+
+    /// Entry count and weighed bytes per entry type, heaviest first. Walks
+    /// every entry: a diagnostic, not for hot paths.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn occupancy(&self) -> Vec<(&'static str, u64, u64)> {
+        let mut by_kind: std::collections::BTreeMap<&'static str, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for (_, entry) in &self.inner {
+            let slot = by_kind.entry(entry.kind()).or_insert((0, 0));
+            slot.0 += 1;
+            slot.1 += entry.byte_size() as u64;
+        }
+        let mut out: Vec<_> = by_kind.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+        out
     }
 
     /// Get or load a decoded leaf directory with single-flight and error

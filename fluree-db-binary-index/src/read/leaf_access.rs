@@ -190,7 +190,7 @@ pub trait RangeReadFetcher: Send + Sync {
 /// would be wasteful when only 1-2 columns are needed.
 pub struct RangeReadLeafHandle {
     leaf_cid: ContentId,
-    dir: DecodedLeafDirV3,
+    dir: Arc<DecodedLeafDirV3>,
     /// Absolute byte offset of the payload section in the leaf blob.
     payload_base: u64,
     leaf_id: u128,
@@ -199,6 +199,11 @@ pub struct RangeReadLeafHandle {
     sidecar_cid: Option<ContentId>,
     /// Leaflet loads served by range reads so far.
     range_loads: AtomicUsize,
+    /// Whether a scan promotes to one whole-leaf read: worth it against a
+    /// remote store's per-request latency, not against a local source.
+    promote_scans: bool,
+    /// Requests closer than this are merged into one read.
+    coalesce_gap: u64,
     /// The whole leaf, once this handle has seen a scan.
     whole: OnceLock<Vec<u8>>,
 }
@@ -221,7 +226,7 @@ impl RangeReadLeafHandle {
     /// [`fetch_header_and_directory`] for this).
     pub fn new(
         leaf_cid: ContentId,
-        dir: DecodedLeafDirV3,
+        dir: impl Into<Arc<DecodedLeafDirV3>>,
         payload_base: u64,
         leaf_id: u128,
         fetcher: Arc<dyn RangeReadFetcher>,
@@ -229,13 +234,35 @@ impl RangeReadLeafHandle {
     ) -> Self {
         Self {
             leaf_cid,
-            dir,
+            dir: dir.into(),
             payload_base,
             leaf_id,
             fetcher,
             sidecar_cid,
             range_loads: AtomicUsize::new(0),
+            promote_scans: true,
+            coalesce_gap: COALESCE_GAP,
             whole: OnceLock::new(),
+        }
+    }
+
+    /// A handle over a local source whose reads cost in units of
+    /// `read_unit` bytes (decrypted segments). Scans never promote to a
+    /// whole-leaf read, so a leaf is never held whole, and requests within
+    /// one unit of each other merge: the unit is paid for either way.
+    pub fn over_local_source(
+        leaf_cid: ContentId,
+        dir: Arc<DecodedLeafDirV3>,
+        leaf_id: u128,
+        fetcher: Arc<dyn RangeReadFetcher>,
+        sidecar_cid: Option<ContentId>,
+        read_unit: u64,
+    ) -> Self {
+        let payload_base = dir.payload_base as u64;
+        Self {
+            promote_scans: false,
+            coalesce_gap: read_unit.max(COALESCE_GAP),
+            ..Self::new(leaf_cid, dir, payload_base, leaf_id, fetcher, sidecar_cid)
         }
     }
 
@@ -245,6 +272,9 @@ impl RangeReadLeafHandle {
     fn whole_for_scan(&self, leaflet_idx: usize) -> io::Result<Option<&[u8]>> {
         if let Some(bytes) = self.whole.get() {
             return Ok(Some(bytes));
+        }
+        if !self.promote_scans {
+            return Ok(None);
         }
         let loads = self.range_loads.fetch_add(1, Ordering::Relaxed) + 1;
         if loads <= SCAN_WHOLE_LEAF_AFTER || leaflet_idx + 1 >= self.dir.entries.len() {
@@ -297,7 +327,7 @@ impl RangeReadLeafHandle {
         for (col_id, block_ref, range) in blocks {
             let merged = if let Some(last) = result.last_mut() {
                 // Coalesce if the gap is within threshold.
-                if range.start <= last.fetch_range.end + COALESCE_GAP {
+                if range.start <= last.fetch_range.end + self.coalesce_gap {
                     last.fetch_range.end = last.fetch_range.end.max(range.end);
                     last.columns.push(CoalescedColumn {
                         col_id,

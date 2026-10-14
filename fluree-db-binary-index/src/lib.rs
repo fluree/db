@@ -27,7 +27,9 @@ pub use read::leaflet_cache::{
     CachedOverlaySegment, LeafletCache, LeafletCacheKey, V3BatchCacheKey,
 };
 pub use read::need_fetch::{resident_or_need_fetch, FetchKind, NeedFetch};
-pub use read::replay::{batch_has_rows_above_t, replay_leaflet, replay_leaflet_at_t};
+pub use read::replay::{
+    batch_has_rows_above_t, replay_leaflet, replay_leaflet_at_t, replay_leaflet_at_t_with,
+};
 
 // ── Format types ────────────────────────────────────────────────────────────
 pub use format::branch::{BranchManifest, LeafEntry};
