@@ -304,6 +304,49 @@ fn memory() -> Value {
         "anon_kb": anon,
         "file_kb": rss.zip(anon).map(|(r, a)| r.saturating_sub(a)),
         "hwm_kb": read_kb("/proc/self/status", "VmHWM:"),
+        "cgroup": cgroup(),
+    })
+}
+
+/// The process's cgroup v2 memory accounting, which charges page cache the
+/// process faults in as well as its heap: current and peak usage, and the
+/// anon/file split and fault counts from `memory.stat`.
+fn cgroup() -> Value {
+    let Some(path) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
+        })
+    else {
+        return Value::Null;
+    };
+    let dir = format!("/sys/fs/cgroup{path}");
+    let num = |file: &str| -> Option<u64> {
+        std::fs::read_to_string(format!("{dir}/{file}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let stat = std::fs::read_to_string(format!("{dir}/memory.stat")).unwrap_or_default();
+    let stat_of = |key: &str| -> Option<u64> {
+        stat.lines().find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == key).then(|| v.trim().parse().ok()).flatten()
+        })
+    };
+    json!({
+        "path": path,
+        "current": num("memory.current"),
+        "peak": num("memory.peak"),
+        "max": std::fs::read_to_string(format!("{dir}/memory.max")).ok().map(|s| s.trim().to_string()),
+        "anon": stat_of("anon"),
+        "file": stat_of("file"),
+        "file_mapped": stat_of("file_mapped"),
+        "pgfault": stat_of("pgfault"),
+        "pgmajfault": stat_of("pgmajfault"),
+        "workingset_refault_file": stat_of("workingset_refault_file"),
     })
 }
 
@@ -314,6 +357,10 @@ async fn query(args: &[String]) {
     let reps: usize = arg(args, "--reps").map_or(3, |v| v.parse().unwrap());
     let cache_mb: Option<usize> = arg(args, "--cache-mb").map(|v| v.parse().unwrap());
     let state = arg(args, "--state").unwrap_or_else(|| "default".into());
+    // `pass` (default) snapshots memory and cache occupancy after each pass,
+    // `workload` after each workload too, `none` never: snapshots walk the
+    // page tables and the cache, which a profile should not see.
+    let snapshots = arg(args, "--snapshots").unwrap_or_else(|| "pass".into());
     let only: Option<Vec<String>> =
         arg(args, "--workloads").map(|v| v.split(',').map(str::to_string).collect());
     let out_path = PathBuf::from(arg(args, "--out").expect("--out"));
@@ -364,11 +411,20 @@ async fn query(args: &[String]) {
                     "before": before, "after": work(),
                 }));
             }
+            if snapshots == "workload" {
+                emit(json!({
+                    "type": "workload_snapshot", "variant": variant, "state": state,
+                    "pass": pass, "workload": w.name,
+                    "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
+                }));
+            }
         }
-        emit(json!({
-            "type": "snapshot", "variant": variant, "state": state, "pass": pass,
-            "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
-        }));
+        if snapshots != "none" {
+            emit(json!({
+                "type": "snapshot", "variant": variant, "state": state, "pass": pass,
+                "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
+            }));
+        }
     }
 }
 
