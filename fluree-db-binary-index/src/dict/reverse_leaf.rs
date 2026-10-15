@@ -43,6 +43,21 @@ pub struct ReverseEntry {
     pub id: u64,
 }
 
+/// The first entry starting in one `unit`-byte stretch of a leaf.
+pub struct Fence {
+    pub key: Box<[u8]>,
+    pub index: u32,
+    pub offset: u32,
+}
+
+/// The fence a key falls after, and the entry index where the next fence
+/// starts; `None` when the key sorts before the first fence.
+fn fenced(fences: &[Fence], key: &[u8], entry_count: u32) -> Option<(usize, u32)> {
+    let after = fences.partition_point(|f| f.key.as_ref() <= key);
+    let start = after.checked_sub(1)?;
+    Some((start, fences.get(after).map_or(entry_count, |f| f.index)))
+}
+
 /// Build a subject reverse key from (ns_code, suffix).
 ///
 /// Encodes ns_code as big-endian u16 prefix so lexicographic byte
@@ -225,6 +240,91 @@ impl<'a> ReverseLeaf<'a> {
         None
     }
 
+    /// A sparse index of the leaf for lookups that read it by range: for
+    /// each `unit`-byte stretch of the leaf in which an entry starts, the
+    /// first entry starting there.
+    pub fn fences(&self, unit: usize) -> Vec<Fence> {
+        let mut fences: Vec<Fence> = Vec::new();
+        for index in 0..self.entry_count as usize {
+            let offset = self.entry_offset(index);
+            if fences
+                .last()
+                .is_none_or(|f| f.offset as usize / unit != offset / unit)
+            {
+                fences.push(Fence {
+                    key: self.key_at(index).into(),
+                    index: index as u32,
+                    offset: offset as u32,
+                });
+            }
+        }
+        fences
+    }
+
+    /// [`Self::lookup`] narrowed by `fences` to the entries from the last
+    /// fence at or before the key to the next fence, read forward from that
+    /// fence's entry through the data section alone. Reports each byte range
+    /// it reads.
+    pub fn lookup_scanning(
+        &self,
+        fences: &[Fence],
+        target_key: &[u8],
+        read: &mut impl FnMut(std::ops::Range<usize>),
+    ) -> Option<u64> {
+        let (start, end) = fenced(fences, target_key, self.entry_count)?;
+        let mut offset = fences[start].offset as usize;
+        for _ in fences[start].index..end {
+            let key_len =
+                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as usize;
+            read(offset..offset + 4 + key_len);
+            let key = &self.data[offset + 4..offset + 4 + key_len];
+            match key.cmp(target_key) {
+                std::cmp::Ordering::Less => offset += ENTRY_OVERHEAD + key_len,
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Equal => {
+                    read(offset + 4 + key_len..offset + ENTRY_OVERHEAD + key_len);
+                    return Some(u64::from_le_bytes(
+                        self.data[offset + 4 + key_len..offset + ENTRY_OVERHEAD + key_len]
+                            .try_into()
+                            .unwrap(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// [`Self::lookup`] narrowed by `fences`, binary-searching only the
+    /// fenced entries through their slice of the offset table. Reports each
+    /// byte range it reads.
+    pub fn lookup_in_slice(
+        &self,
+        fences: &[Fence],
+        target_key: &[u8],
+        read: &mut impl FnMut(std::ops::Range<usize>),
+    ) -> Option<u64> {
+        let (start, end) = fenced(fences, target_key, self.entry_count)?;
+        let (mut lo, mut hi) = (fences[start].index as usize, end as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let table_pos = self.offset_table_start + mid * 4;
+            read(table_pos..table_pos + 4);
+            let offset = self.entry_offset(mid);
+            let key_len =
+                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as usize;
+            read(offset..offset + 4 + key_len);
+            match self.key_at(mid).cmp(target_key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    read(offset + 4 + key_len..offset + ENTRY_OVERHEAD + key_len);
+                    return Some(self.id_at(mid));
+                }
+            }
+        }
+        None
+    }
+
     /// Return the first key in this leaf (for branch boundary keys).
     pub fn first_key(&self) -> Option<&'a [u8]> {
         if self.entry_count > 0 {
@@ -309,6 +409,86 @@ impl<'a> Iterator for ReverseLeafIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fenced lookups find exactly what a full lookup finds — present and
+    /// absent keys, keys before, between and after the entries, long keys
+    /// and keys sharing long prefixes — for fences at several unit sizes.
+    #[test]
+    fn fenced_lookups_agree_with_the_full_lookup() {
+        let prefix = "p".repeat(300);
+        let mut entries: Vec<ReverseEntry> = (0..3_000u64)
+            .map(|i| ReverseEntry {
+                key: match i % 3 {
+                    0 => format!("{prefix}{:06}", i * 2),
+                    1 => format!("k{:06}", i * 2),
+                    _ => format!("long-{:06}-{}", i * 2, "z".repeat((i % 700) as usize)),
+                }
+                .into_bytes(),
+                id: i,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let blob = encode_reverse_leaf(&entries);
+        let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
+        let mut probes: Vec<Vec<u8>> = entries.iter().map(|e| e.key.clone()).collect();
+        for e in &entries {
+            let mut absent = e.key.clone();
+            absent.push(b'!');
+            probes.push(absent);
+            probes.push(e.key[..e.key.len() - 1].to_vec());
+        }
+        probes.extend([
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"zzzz".to_vec(),
+            prefix.clone().into_bytes(),
+        ]);
+        let keys: Vec<&[u8]> = entries.iter().map(|e| e.key.as_slice()).collect();
+        let entry_end = |i: usize| leaf.entry_offset(i) + ENTRY_OVERHEAD + keys[i].len();
+        for unit in [512usize, 4096, 65536] {
+            let fences = leaf.fences(unit);
+            assert!(fences.windows(2).all(|w| w[0].key < w[1].key));
+            assert!(
+                fences.len() as u64 >= blob.len().div_ceil(unit) as u64 / 2,
+                "{unit}"
+            );
+            for key in &probes {
+                let want = leaf.lookup(key);
+                let mut scanned = Vec::new();
+                let scan = leaf.lookup_scanning(&fences, key, &mut |r| scanned.push(r));
+                let mut sliced = Vec::new();
+                let slice = leaf.lookup_in_slice(&fences, key, &mut |r| sliced.push(r));
+                assert_eq!((scan, slice), (want, want), "{unit}");
+                // Reads stay in the key's fenced stretch: a scan from its
+                // fence to the first entry at or past the key, a slice
+                // within the fenced entries and their offsets.
+                let Some(at) = fences
+                    .iter()
+                    .rposition(|f| f.key.as_ref() <= key.as_slice())
+                else {
+                    assert!(scanned.is_empty() && sliced.is_empty());
+                    continue;
+                };
+                let end = fences.get(at + 1).map_or(keys.len(), |f| f.index as usize);
+                let first = fences[at].index as usize;
+                let stop = keys.partition_point(|k| *k < key.as_slice()).min(end - 1);
+                let (lo, hi) = (leaf.entry_offset(first), entry_end(stop));
+                assert!(
+                    scanned.iter().all(|r| r.start >= lo && r.end <= hi),
+                    "scan {unit}"
+                );
+                let table = leaf.offset_table_start + first * 4..leaf.offset_table_start + end * 4;
+                let data = lo..entry_end(end - 1);
+                assert!(
+                    sliced
+                        .iter()
+                        .all(|r| (r.start >= table.start && r.end <= table.end)
+                            || (r.start >= data.start && r.end <= data.end)),
+                    "slice {unit}"
+                );
+            }
+        }
+    }
 
     /// The ranges a lookup reports are all it reads: over a copy of the leaf
     /// with every other byte zeroed it finds the same ids, hits and misses.

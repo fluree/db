@@ -565,6 +565,11 @@ async fn probe(args: &[String]) {
     let fluree = open(&dir.join("db"), encrypted, Some(256)).await;
     let snapshot = fluree.graph(ALIAS).load().await.expect("load");
     let store = snapshot.db().binary_store().expect("indexed").clone();
+    let fence_unit: usize = arg(args, "--unit").map_or(65_536, |v| v.parse().unwrap());
+    if flag(args, "--fences") {
+        fence_probe(&store, n, ordered, fence_unit);
+        return;
+    }
     for w in workloads(n, ordered) {
         if !matches!(w.name, "sub_a" | "sub_b" | "scatter") {
             continue;
@@ -598,6 +603,72 @@ async fn probe(args: &[String]) {
                    "units": units_touched(&store, &parts)})
         );
     }
+}
+
+/// Fenced reverse lookups at `unit`: per `VALUES` query of each working-set
+/// workload and over its whole pass, the distinct units each lookup method
+/// reads (whole leaves, the leaf's binary search, fenced scan, fenced slice),
+/// for the subjects as named and for absent neighbours of them; and the
+/// whole tree's fence memory.
+#[cfg(not(no_counters))]
+fn fence_probe(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    n: u64,
+    ordered: bool,
+    unit: usize,
+) {
+    for w in workloads(n, ordered) {
+        if !matches!(w.name, "sub_a" | "scatter") {
+            continue;
+        }
+        for absent in [false, true] {
+            let mut all: Vec<(u16, String)> = Vec::new();
+            for (qi, sparql) in w.queries.iter().enumerate() {
+                let parts: Vec<(u16, String)> = sparql
+                    .split_whitespace()
+                    .filter_map(|t| t.strip_prefix("p:").filter(|local| !local.is_empty()))
+                    .map(|local| {
+                        let local = if absent {
+                            format!("{local}x")
+                        } else {
+                            local.to_string()
+                        };
+                        let sid = store.encode_iri(&format!("{EX}person/{local}"));
+                        (sid.namespace_code, sid.name.to_string())
+                    })
+                    .collect();
+                if qi < 3 {
+                    emit_fence(store, w.name, &qi.to_string(), absent, &parts, unit);
+                }
+                all.extend(parts);
+            }
+            emit_fence(store, w.name, "pass", absent, &all, unit);
+        }
+    }
+}
+
+#[cfg(not(no_counters))]
+fn emit_fence(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    workload: &str,
+    q: &str,
+    absent: bool,
+    parts: &[(u16, String)],
+    unit: usize,
+) {
+    let parts: Vec<(u16, &str)> = parts.iter().map(|(ns, s)| (*ns, s.as_str())).collect();
+    let (p, (fences, fence_bytes)) = store
+        .subject_reverse_fence_probe(&parts, unit)
+        .unwrap()
+        .expect("subject reverse tree");
+    println!(
+        "{}",
+        json!({"workload": workload, "q": q, "absent": absent, "unit": unit, "keys": p.keys,
+               "found": p.found, "leaves": p.leaves, "units_whole": p.units_whole,
+               "units_binary": p.units_binary, "units_scan": p.units_scan,
+               "units_slice": p.units_slice, "disagreements": p.disagreements,
+               "tree_fences": fences, "tree_fence_bytes": fence_bytes})
+    );
 }
 
 /// Per 64 KiB unit size: units the lookups of `parts` read across the
