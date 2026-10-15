@@ -6,6 +6,7 @@
 //! round. Both must derive the same facts for repeatable rules; the body-run
 //! count proves which schedule actually ran.
 
+use crate::it_datalog_semi_naive::derived;
 use crate::support::{genesis_ledger, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::Sid;
@@ -235,13 +236,44 @@ async fn the_fact_budget_stops_a_body_that_matches_far_more_rows() {
     );
 }
 
+/// A rule whose sequence path reads another rule's facts at a later step runs
+/// after that rule, even when it is listed first.
+#[tokio::test]
+async fn a_sequence_path_reads_each_of_its_steps() {
+    let ledger = ledger_with(
+        "datalog/schedule-sequence-path:main",
+        json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+            {"@id": "ex:a", "ex:owns": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:likes": {"@id": "ex:c"}},
+            {"@id": "ex:c", "ex:owns": {"@id": "ex:d"}},
+            {"@id": "ex:d", "ex:likes": {"@id": "ex:e"}}
+        ]}),
+    )
+    .await;
+    let rules = sparql_rules(
+        &ledger,
+        &[
+            "CONSTRUCT { ?x ex:q ?y } WHERE { ?x (ex:owns/ex:watched)+ ?y }".to_string(),
+            "CONSTRUCT { ?x ex:watched ?y } WHERE { ?x ex:likes ?y }".to_string(),
+        ],
+    );
+    let scheduled = run(&ledger, &rules, RuleSchedule::Dependencies).await;
+    let reference = run(&ledger, &rules, RuleSchedule::WholeProgram).await;
+    assert_eq!(fact_set(&scheduled), fact_set(&reference));
+    let pair = |s: &str, o: &str| (s.to_string(), o.to_string());
+    assert_eq!(
+        derived(&scheduled, &ledger, "q"),
+        vec![pair("a", "c"), pair("a", "e"), pair("c", "e")]
+    );
+}
+
 /// Random positive programs over a small graph with one literal-valued fact:
 /// chains of joins (often transitive closures, linear or not, once their
-/// predicates are derived), class reads and writes,
-/// variable predicates, repeated variables and constant subjects, reads
-/// nested in UNION and EXISTS, one-or-more and zero-length paths, and heads
-/// that introduce fresh terms. Every rule is repeatable, so both schedules
-/// must derive exactly the same facts.
+/// predicates are derived), class reads and writes, variable predicates,
+/// repeated variables and constant subjects, reads nested in UNION and
+/// EXISTS, one-or-more paths over a predicate or a sequence, zero-length
+/// paths, and heads that introduce fresh terms. Every rule is repeatable, so
+/// both schedules must derive exactly the same facts.
 #[tokio::test]
 async fn random_programs_derive_the_same_facts_under_both_schedules() {
     const PREDICATES: usize = 4;
@@ -300,7 +332,7 @@ async fn random_programs_derive_the_same_facts_under_both_schedules() {
 fn random_rule(rng: &mut StdRng, predicates: usize, classes: usize) -> String {
     let p = |rng: &mut StdRng| format!("ex:p{}", rng.gen_range(0..predicates));
     let class = |rng: &mut StdRng| format!("ex:C{}", rng.gen_range(0..classes));
-    let body = match rng.gen_range(0..13) {
+    let body = match rng.gen_range(0..14) {
         0 => format!("?x {} ?y", p(rng)),
         1 => format!("?x {} ?m . ?m {} ?y", p(rng), p(rng)),
         2 => format!("?x {} ?y . ?y a {}", p(rng), class(rng)),
@@ -313,6 +345,7 @@ fn random_rule(rng: &mut StdRng, predicates: usize, classes: usize) -> String {
         9 => format!("ex:n0 {} ?x . ?x {} ?y", p(rng), p(rng)),
         10 => format!("{{ ?x {} ?y }} UNION {{ ?y {} ?x }}", p(rng), p(rng)),
         11 => format!("?x {} ?y . FILTER EXISTS {{ ?y {} ?w }}", p(rng), p(rng)),
+        12 => format!("?x ({}/{})+ ?y", p(rng), p(rng)),
         _ => format!("?y {} ?x", p(rng)),
     };
     // A constant head object introduces a term no asserted triple mentions,

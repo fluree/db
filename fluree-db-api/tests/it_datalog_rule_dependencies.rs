@@ -9,9 +9,10 @@ use crate::it_datalog_program_reachability;
 use crate::support::{genesis_ledger, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use fluree_db_query::datalog_rules::{
-    parse_query_time_rule, DatalogRuleSet, PredicateFootprint, RuleDependencies,
+    parse_query_time_rule, Access, DatalogRuleSet, GraphScope, PredicateFootprint, RuleDependencies,
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 /// A ledger whose snapshot knows the `ex:` namespace, so rule IRIs encode.
 async fn ledger() -> MemoryLedger {
@@ -206,7 +207,8 @@ async fn class_reads_depend_only_on_matching_or_generic_type_writes() {
 }
 
 /// Shapes whose reads a constant-predicate collector does not see: a variable
-/// predicate, a property path, and an EXISTS nested inside a FILTER
+/// predicate, a property path and the steps of a sequence inside one, a
+/// GRAPH scope, an edge annotation, and an EXISTS nested inside a FILTER
 /// expression. A variable-predicate head is likewise a write of anything.
 #[tokio::test]
 async fn variable_predicates_paths_and_nested_exists_are_read() {
@@ -244,6 +246,21 @@ async fn variable_predicates_paths_and_nested_exists_are_read() {
                 ),
             ),
             (
+                "ex:readsSequence",
+                sparql("CONSTRUCT { ?x ex:q ?y } WHERE { ?x (ex:owns/ex:watched)+ ?y }"),
+            ),
+            (
+                "ex:readsGraph",
+                sparql(
+                    "CONSTRUCT { ?x ex:g true } WHERE { \
+                       GRAPH <http://example.org/g> { ?x ex:watched ?y } }",
+                ),
+            ),
+            (
+                "ex:readsAnnotation",
+                sparql("CONSTRUCT { ?x ex:a true } WHERE { ?x ex:watched ?y {| ex:since ?d |} }"),
+            ),
+            (
                 "ex:readsVariablePredicate",
                 sparql("CONSTRUCT { ?s ex:touched true } WHERE { ?s ?p ?o }"),
             ),
@@ -272,6 +289,13 @@ async fn variable_predicates_paths_and_nested_exists_are_read() {
         program.producers_of("ex:readsNestedExists"),
         all_writers(&["ex:writesWatched"])
     );
+    for reader in ["ex:readsSequence", "ex:readsGraph", "ex:readsAnnotation"] {
+        assert_eq!(
+            program.producers_of(reader),
+            all_writers(&["ex:writesWatched"]),
+            "{reader}"
+        );
+    }
     let every_rule: Vec<String> = {
         let mut list: Vec<String> = (0..program.rules.len()).map(|i| program.name(i)).collect();
         list.sort();
@@ -293,6 +317,45 @@ async fn variable_predicates_paths_and_nested_exists_are_read() {
     assert!(path_reads
         .iter()
         .any(|read| read.predicate == PredicateFootprint::Exact(controls.clone())));
+
+    let reads = |name| {
+        program
+            .dependencies
+            .footprint(program.index(name))
+            .reads
+            .clone()
+    };
+    let exact = |local: &str| {
+        PredicateFootprint::Exact(
+            ledger
+                .snapshot
+                .encode_iri(&format!("http://example.org/{local}"))
+                .expect("encodes"),
+        )
+    };
+    // A named graph's IRI may denote the default graph, so the producers
+    // above cannot tell a scoped read from an unscoped one.
+    assert_eq!(
+        reads("ex:readsGraph"),
+        vec![Access {
+            graph: GraphScope::Named(Arc::from("http://example.org/g")),
+            predicate: exact("watched"),
+        }]
+    );
+    let annotation_reads = reads("ex:readsAnnotation");
+    for predicate in [
+        exact("watched"),
+        PredicateFootprint::Reifier,
+        exact("since"),
+    ] {
+        assert!(
+            annotation_reads.contains(&Access {
+                graph: GraphScope::Default,
+                predicate: predicate.clone(),
+            }),
+            "the annotated read must cover {predicate}: {annotation_reads:?}"
+        );
+    }
 }
 
 #[tokio::test]
