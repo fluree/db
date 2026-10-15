@@ -541,10 +541,11 @@ This means:
   maximum memory estimate for the derived facts, and a maximum wall-clock
   time, the same budget OWL2-RL uses. The fact ceiling is checked before each
   derived fact is kept, so a run returns at most that many and a single pass
-  cannot overshoot. The budget bounds the derived facts, not a rule body's
-  intermediate binding rows: each body is evaluated in full before its heads
-  are instantiated, so a body matching far more rows than it derives facts can
-  exceed the memory estimate while running. Hitting the budget stops early and
+  cannot overshoot. A rule's heads are instantiated as its body's rows
+  arrive, so reaching the budget also stops the body that reached it. Work an
+  operator does before it returns its first row (a sort, a grouping, or a
+  property path with both ends free) runs in full and is not counted against
+  the memory estimate. Hitting the budget stops early and
   marks the result `capped` in the tracked response's `reasoning` block; which
   partial facts a capped run keeps depends on evaluation order. The block's
   `iterations` field counts passes across all groups.
@@ -587,7 +588,9 @@ When both OWL 2 RL and Datalog are enabled:
   written in reverse (`?y ex:parent ?x`). The body must be exactly those two
   patterns. A path follows only IRI-valued objects, so the
   `?x ex:ancestor ?y . ?y ex:parent ?z` shape iterates instead while
-  `ex:parent` has a literal object.
+  `ex:parent` has a literal object. A path that would compute more pairs than
+  the budget still has room for also iterates instead, so the budget bounds
+  these rules like any other.
 - **Budget limits apply.** The same time / fact / memory budgets as OWL 2 RL
   materialization apply to Datalog execution (default: 30s and 1M derived
   facts, with a memory ceiling derived from the fact ceiling).

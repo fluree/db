@@ -11,7 +11,9 @@ use super::{
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::execute::{execute_prepared, prepare_execution_with_config, PrepareConfig};
+use crate::execute::{
+    execute_prepared_streaming, prepare_execution_with_config, BatchSink, PrepareConfig,
+};
 use crate::ir::reasoning::ReasoningConfig;
 use crate::ir::Query;
 use crate::parse::IriEncoder;
@@ -170,12 +172,14 @@ pub async fn run_fixpoint(
 /// recursive group's rules are seeded with the facts the group derived in
 /// its previous pass wherever their bodies allow it; a one-rule transitive
 /// closure finishes in its first pass. `max_iterations` bounds
-/// the passes of each stage. The fact and memory budgets are checked before
-/// every new fact is kept, so a pass cannot overshoot them. The deadline is
-/// checked before each rule, after its body runs, and periodically while its
-/// heads are instantiated; a body already running is not interrupted. A rule
-/// that finishes deriving has derived everything it can, so a run whose last
-/// rule completes after the deadline still reports a completed fixpoint.
+/// the passes of each stage. A rule's heads are instantiated as its body's
+/// rows arrive. The fact and memory budgets are checked before every new
+/// fact is kept, so a pass cannot overshoot them; the deadline is checked
+/// before each rule and as the rows arrive. Either stops the body, apart
+/// from work an operator does before returning its first row (a sort, a
+/// grouping, a property path with both ends free). A rule that finishes
+/// deriving has derived everything it can, so a run whose last rule
+/// completes after the deadline still reports a completed fixpoint.
 pub async fn run_fixpoint_with_schedule(
     db: GraphDbRef<'_>,
     rule_set: &DatalogRuleSet,
@@ -530,8 +534,9 @@ impl Derivation<'_> {
 
     /// Derive `rule`'s whole closure in one run of its path body. `None` when
     /// the path cannot stand in for the recursion here — the path's predicate
-    /// has a literal object, or the traversal hit the path operator's
-    /// visited-node limit — and the group should iterate instead.
+    /// has a literal object, the path computed more pairs than the budget has
+    /// room for, or the traversal hit the path operator's visited-node limit —
+    /// and the group should iterate instead.
     async fn apply_closure(
         &mut self,
         db: GraphDbRef<'_>,
@@ -549,8 +554,22 @@ impl Derivation<'_> {
                 return Ok(None);
             }
         }
+        // A path with both ends free computes every pair before it returns a
+        // row. Past what the budget still has room for, iterating does less
+        // work: the budget stops it fact by fact.
+        let fact_room = self.budget.max_facts.saturating_sub(self.derived.len());
+        let memory_room =
+            self.budget.max_memory_bytes.saturating_sub(self.bytes) / std::mem::size_of::<Flake>();
+        let pair_limit = fact_room.min(memory_room).saturating_add(1);
         match self
-            .apply(db, rule, closure.body.clone(), env, dict_novelty)
+            .apply_with_pair_limit(
+                db,
+                rule,
+                closure.body.clone(),
+                env,
+                dict_novelty,
+                Some(pair_limit),
+            )
             .await
         {
             Ok(outcome) => Ok(Some(outcome)),
@@ -576,52 +595,53 @@ impl Derivation<'_> {
         env: RuleExecutionEnv<'_>,
         dict_novelty: Option<Arc<DictNovelty>>,
     ) -> Result<RuleOutcome> {
-        // Rows between deadline checks while instantiating heads.
-        const DEADLINE_CHECK_ROWS: usize = 1024;
+        self.apply_with_pair_limit(db, rule, body, env, dict_novelty, None)
+            .await
+    }
 
+    /// [`Self::apply`], with the body's property paths limited to
+    /// `path_pair_limit` pairs before their first row.
+    async fn apply_with_pair_limit(
+        &mut self,
+        db: GraphDbRef<'_>,
+        rule: &DatalogRule,
+        body: Query,
+        env: RuleExecutionEnv<'_>,
+        dict_novelty: Option<Arc<DictNovelty>>,
+        path_pair_limit: Option<usize>,
+    ) -> Result<RuleOutcome> {
         self.rule_body_runs += 1;
-        let batches = run_body(db, rule, body, env, dict_novelty).await?;
-        self.body_rows += batches.iter().map(Batch::len).sum::<usize>();
-        // The body cannot be interrupted, but a rule that ran past the
-        // deadline must not go on to derive, and must not let a final pass
-        // report a completed fixpoint.
-        if self.past_deadline() {
-            return Ok(RuleOutcome::Capped("time"));
+        let mut heads = HeadSink {
+            state: self,
+            rule,
+            matched_rows: 0,
+            instantiated: 0,
+            capped: None,
+        };
+        let run = run_body(
+            db,
+            rule,
+            body,
+            env,
+            dict_novelty,
+            path_pair_limit,
+            &mut heads,
+        )
+        .await;
+        let HeadSink {
+            matched_rows,
+            instantiated,
+            capped,
+            ..
+        } = heads;
+        if let Some(reason) = capped {
+            return Ok(RuleOutcome::Capped(reason));
         }
-
-        let mut matched_rows = 0usize;
-        let mut instantiated = 0usize;
-        for batch in &batches {
-            for row in 0..batch.len() {
-                matched_rows += 1;
-                if matched_rows.is_multiple_of(DEADLINE_CHECK_ROWS) && self.past_deadline() {
-                    return Ok(RuleOutcome::Capped("time"));
-                }
-                for head in &rule.heads {
-                    let Some(flake) = instantiate(head, batch, row, self.snapshot, self.derived_t)
-                    else {
-                        continue;
-                    };
-                    instantiated += 1;
-                    if !self.seen.insert(fact_key(&flake)) {
-                        continue;
-                    }
-                    // Check before pushing. Pushing first and testing
-                    // `len() > max_facts` let one fact past the ceiling
-                    // through, and nothing trimmed it afterwards, so a budget
-                    // of N returned N+1 facts. Checking first also stops
-                    // charging `bytes` for a fact never kept.
-                    if self.derived.len() >= self.budget.max_facts {
-                        return Ok(RuleOutcome::Capped("facts"));
-                    }
-                    self.bytes += approx_flake_bytes(&flake);
-                    self.diagnostics.record_rule_fired(&rule.name);
-                    self.derived.push(flake);
-                    if self.bytes > self.budget.max_memory_bytes {
-                        return Ok(RuleOutcome::Capped("memory"));
-                    }
-                }
-            }
+        run?;
+        // A rule that ran past the deadline must not let a final pass report
+        // a completed fixpoint.
+        if matched_rows == 0 && self.past_deadline() {
+            return Ok(RuleOutcome::Capped("time"));
         }
 
         // "The where clause matched but the insert could not instantiate" is
@@ -643,14 +663,86 @@ impl Derivation<'_> {
     }
 }
 
-/// Run one rule body through the executor and collect its rows.
+/// Instantiates a rule's heads from its body's rows as the executor produces
+/// them, so the budget stops a body that would derive past it instead of
+/// letting it buffer every row first.
+struct HeadSink<'s, 'a> {
+    state: &'s mut Derivation<'a>,
+    rule: &'s DatalogRule,
+    matched_rows: usize,
+    instantiated: usize,
+    /// Why the budget stopped the body, if it did.
+    capped: Option<&'static str>,
+}
+
+impl HeadSink<'_, '_> {
+    fn derive(&mut self, batch: &Batch) -> Option<&'static str> {
+        // Rows between deadline checks while instantiating heads.
+        const DEADLINE_CHECK_ROWS: usize = 1024;
+
+        let state = &mut *self.state;
+        state.body_rows += batch.len();
+        if state.past_deadline() {
+            return Some("time");
+        }
+        for row in 0..batch.len() {
+            self.matched_rows += 1;
+            if self.matched_rows.is_multiple_of(DEADLINE_CHECK_ROWS) && state.past_deadline() {
+                return Some("time");
+            }
+            for head in &self.rule.heads {
+                let Some(flake) = instantiate(head, batch, row, state.snapshot, state.derived_t)
+                else {
+                    continue;
+                };
+                self.instantiated += 1;
+                if !state.seen.insert(fact_key(&flake)) {
+                    continue;
+                }
+                // Check before pushing. Pushing first and testing
+                // `len() > max_facts` let one fact past the ceiling through,
+                // and nothing trimmed it afterwards, so a budget of N
+                // returned N+1 facts. Checking first also stops charging
+                // `bytes` for a fact never kept.
+                if state.derived.len() >= state.budget.max_facts {
+                    return Some("facts");
+                }
+                state.bytes += approx_flake_bytes(&flake);
+                state.diagnostics.record_rule_fired(&self.rule.name);
+                state.derived.push(flake);
+                if state.bytes > state.budget.max_memory_bytes {
+                    return Some("memory");
+                }
+            }
+        }
+        None
+    }
+}
+
+impl BatchSink for HeadSink<'_, '_> {
+    async fn push(&mut self, batch: Batch) -> Result<()> {
+        match self.derive(&batch) {
+            None => Ok(()),
+            Some(reason) => {
+                self.capped = Some(reason);
+                Err(QueryError::ResourceLimit(format!(
+                    "datalog rule stopped at the reasoning {reason} budget"
+                )))
+            }
+        }
+    }
+}
+
+/// Run one rule body through the executor, handing its rows to `sink`.
 async fn run_body(
     db: GraphDbRef<'_>,
     rule: &DatalogRule,
     body: Query,
     env: RuleExecutionEnv<'_>,
     dict_novelty: Option<Arc<DictNovelty>>,
-) -> Result<Vec<Batch>> {
+    path_pair_limit: Option<usize>,
+    sink: &mut impl BatchSink,
+) -> Result<()> {
     // Reasoning is off for the body itself: derived facts arrive through the
     // overlay, and nested materialization would recurse.
     let executable = ExecutableQuery::new(body, ReasoningConfig::default());
@@ -668,9 +760,10 @@ async fn run_body(
         binary_store: env.binary_store.cloned(),
         binary_g_id: db.g_id,
         dict_novelty,
+        path_pair_limit,
         ..Default::default()
     };
-    execute_prepared(db, &rule.body.vars, prepared, config).await
+    execute_prepared_streaming(db, &rule.body.vars, prepared, config, sink).await
 }
 
 /// Instantiate one head against one result row. `None` when a position

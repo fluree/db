@@ -155,8 +155,8 @@ async fn a_non_recursive_volatile_rule_runs_once() {
 }
 
 /// A single non-recursive rule gets one pass, so the deadline must be
-/// checked once its body has run, not only before it starts: otherwise a
-/// body that outlasts the budget reports a completed fixpoint.
+/// checked while its body runs, not only before it starts: otherwise a body
+/// that outlasts the budget reports a completed fixpoint.
 #[tokio::test]
 async fn the_time_budget_caps_a_rule_that_outlasts_it() {
     const NODES: usize = 200;
@@ -192,6 +192,47 @@ async fn the_time_budget_caps_a_rule_that_outlasts_it() {
         result.derived_flakes.len()
     );
     assert!(result.derived_flakes.len() < NODES * NODES);
+}
+
+/// A rule's heads are instantiated as its body's rows arrive, so a body
+/// matching far more rows than the fact budget allows stops when the budget
+/// is reached instead of producing every row first.
+#[tokio::test]
+async fn the_fact_budget_stops_a_body_that_matches_far_more_rows() {
+    const NODES: usize = 300;
+    const MAX_FACTS: usize = 100;
+    let graph: Vec<Value> = (0..NODES)
+        .map(|i| json!({"@id": format!("ex:a{i}"), "ex:kind": {"@id": "ex:k"}}))
+        .collect();
+    let ledger = ledger_with(
+        "datalog/schedule-fact-budget:main",
+        json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}),
+    )
+    .await;
+    let rules = sparql_rules(
+        &ledger,
+        &["CONSTRUCT { ?x ex:sameKind ?y } WHERE { ?x ex:kind ?k . ?y ex:kind ?k }".to_string()],
+    );
+    let budget = ReasoningBudget::new(Duration::from_secs(600), MAX_FACTS, usize::MAX);
+
+    let result = run_fixpoint_with_schedule(
+        ledger.as_graph_db_ref(0),
+        &rules,
+        MAX_ITERATIONS,
+        &budget,
+        RuleExecutionEnv::default(),
+        RuleSchedule::Dependencies,
+    )
+    .await
+    .expect("fixpoint");
+    assert_eq!(result.diagnostics.capped_reason.as_deref(), Some("facts"));
+    assert_eq!(result.derived_flakes.len(), MAX_FACTS);
+    assert!(
+        result.body_rows < NODES * NODES / 4,
+        "the body produced {} of its {} rows for a budget of {MAX_FACTS} facts",
+        result.body_rows,
+        NODES * NODES
+    );
 }
 
 /// Random positive programs over a small graph with one literal-valued fact:

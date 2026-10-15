@@ -41,8 +41,8 @@ DatalogRule {
 ```
 
 Rule bodies are executed by the planned query executor
-(`prepare_execution_with_config` + `execute_prepared`) against the same
-`GraphDbRef` the query runs on, with the base overlay wrapped in a
+(`prepare_execution_with_config` + `execute_prepared_streaming`) against the
+same `GraphDbRef` the query runs on, with the base overlay wrapped in a
 `ReasoningOverlay` carrying the facts derived so far. Every construct the
 executor supports is therefore available in a rule body, subject to the
 monotonicity rule below: edge annotations (`@annotation`, `{| |}`, `~ ?r`),
@@ -79,12 +79,13 @@ for stage in stages (producers first):
                    = [rule.body with atom seeded      otherwise
                       by group.delta, for each recursive atom]
             for body in bodies:
-                rows = execute(body over overlay)
-                for row in rows, head in rule.heads:
-                    flake = instantiate(head, row)  (skip rows that cannot instantiate)
-                    if seen.insert(key(flake)):     (HashSet, O(1))
-                        derived.push(flake)
-                        budget check (facts, memory)
+                for row in execute(body over overlay):   (streamed)
+                    budget check (time, every 1024 rows)
+                    for head in rule.heads:
+                        flake = instantiate(head, row)  (skip rows that cannot instantiate)
+                        if seen.insert(key(flake)):     (HashSet, O(1))
+                            derived.push(flake)
+                            budget check (facts, memory)
         active = recursive groups that derived something this pass,
                  each with delta = what it derived
         rebuild the derived overlay if anything was derived and work remains
@@ -130,8 +131,12 @@ derives. The path operator follows only IRI-valued objects. In the first and
 third rows every node on the path is the subject of a fact; in the second the
 path ends at the head's object, so that shape compiles only after a scan
 finds no literal object of `T`'s predicate (which the group cannot write).
-A traversal that hits the path operator's visited-node limit falls back to
-iteration, which the reasoning budget then bounds.
+A path with both ends free computes all its pairs before it returns a row,
+so the closure body runs with a pair limit of one more than the facts the
+budget still has room for (or the memory left, at `size_of::<Flake>()` a
+fact, if smaller). A path that exceeds it, or a traversal that hits the path
+operator's visited-node limit, falls back to iteration, which the budget
+bounds fact by fact. The wasted work is about one budget's worth of pairs.
 
 `RuleSchedule::WholeProgram` treats the whole program as one recursive group
 and runs every rule's whole body every round, the evaluation used before
@@ -261,7 +266,7 @@ ids, which would make derived provenance durable and diffable across commits.
 Materialization happens while the query is *prepared*, before its execution
 context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
 materialization always has. A rule body is therefore bounded by the reasoning
-budget (facts, memory, time — checked between rules and rounds) but cannot be
+budget (facts, memory, time — checked as its rows arrive) but cannot be
 cancelled mid-body by the query's cancellation token, and its scans are not
 charged as query fuel. Threading the tracker and cancellation into
 prepare-time materialization is the follow-up that closes this for both

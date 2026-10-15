@@ -8,12 +8,16 @@
 //! must not see. Rules one step away from a closure keep iterating, and so
 //! does a left-linear closure while its path predicate has a literal object.
 
-use crate::it_datalog_rule_schedule::{fact_set, jsonld_rules, run};
+use crate::it_datalog_rule_schedule::{
+    chain_data, fact_set, jsonld_rules, ledger_with, run, sparql_rules,
+};
 use crate::it_datalog_semi_naive::{both_schedules, derived};
 use crate::support::{genesis_ledger, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
-use fluree_db_query::datalog_rules::RuleSchedule;
+use fluree_db_query::datalog_rules::{run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule};
+use fluree_db_query::reasoning::ReasoningBudget;
 use serde_json::json;
+use std::time::Duration;
 
 const BASE: &str = "CONSTRUCT { ?x ex:reach ?y } WHERE { ?x ex:next ?y }";
 
@@ -83,6 +87,59 @@ async fn a_closure_path_keeps_cycles_self_loops_and_graph_scope() {
         !has("e", "a") && !has("f", "g"),
         "edges in the named graph are not part of the default graph"
     );
+}
+
+/// A closure far larger than the budget stops at the budget instead of
+/// producing its whole closure first. (A path with both ends free, which
+/// computes all its pairs before returning a row, iterates instead once it
+/// passes what the budget has room for; the path operator's tests cover that
+/// limit.)
+#[tokio::test]
+async fn a_closure_larger_than_the_budget_stops_at_it() {
+    const LEN: usize = 400;
+    const MAX_FACTS: usize = 2_000;
+    let shapes = [
+        ("right-linear", "?x ex:parent ?y . ?y ex:ancestor ?z"),
+        ("nonlinear", "?x ex:ancestor ?y . ?y ex:ancestor ?z"),
+        ("left-linear", "?x ex:ancestor ?y . ?y ex:parent ?z"),
+    ];
+    for (shape, body) in shapes {
+        let ledger = ledger_with(
+            &format!("datalog/closure-budget-{shape}:main"),
+            chain_data(LEN),
+        )
+        .await;
+        let rules = sparql_rules(
+            &ledger,
+            &[
+                "CONSTRUCT { ?x ex:ancestor ?y } WHERE { ?x ex:parent ?y }".to_string(),
+                format!("CONSTRUCT {{ ?x ex:ancestor ?z }} WHERE {{ {body} }}"),
+            ],
+        );
+        let result = run_fixpoint_with_schedule(
+            ledger.as_graph_db_ref(0),
+            &rules,
+            100,
+            &ReasoningBudget::new(Duration::from_secs(600), MAX_FACTS, usize::MAX),
+            RuleExecutionEnv::default(),
+            RuleSchedule::Dependencies,
+        )
+        .await
+        .expect("fixpoint");
+
+        assert_eq!(
+            result.diagnostics.capped_reason.as_deref(),
+            Some("facts"),
+            "{shape}"
+        );
+        assert_eq!(result.derived_flakes.len(), MAX_FACTS, "{shape}");
+        assert!(
+            result.body_rows < 4 * MAX_FACTS,
+            "{shape}: {} body rows of a {}-pair closure for a budget of {MAX_FACTS} facts",
+            result.body_rows,
+            LEN * (LEN - 1) / 2
+        );
+    }
 }
 
 /// The left-linear path ends at the head's object, and a path follows only
