@@ -1011,6 +1011,27 @@ impl BatchSink for HeadSink<'_, '_> {
     }
 }
 
+/// Run one rule body through the executor under `config` and collect its
+/// rows.
+pub(super) async fn collect_body<'a>(
+    db: GraphDbRef<'a>,
+    rule: &DatalogRule,
+    body: Query,
+    env: RuleExecutionEnv<'_>,
+    config: ContextConfig<'a, '_>,
+) -> Result<Vec<Batch>> {
+    struct Collect(Vec<Batch>);
+    impl BatchSink for Collect {
+        async fn push(&mut self, batch: Batch) -> Result<()> {
+            self.0.push(batch);
+            Ok(())
+        }
+    }
+    let mut rows = Collect(Vec::new());
+    run_body(db, rule, body, env, config, &mut rows).await?;
+    Ok(rows.0)
+}
+
 /// Run one rule body through the executor under `config`, handing its rows
 /// to `sink`.
 async fn run_body<'a>(
@@ -1046,7 +1067,7 @@ async fn run_body<'a>(
 /// Instantiate one head against one result row. `None` when a position
 /// cannot be filled (an unbound variable, or a literal where a node is
 /// required); the caller counts those.
-fn instantiate(
+pub(super) fn instantiate(
     head: &super::RuleHead,
     batch: &Batch,
     row: usize,

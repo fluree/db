@@ -568,3 +568,65 @@ pub async fn compute_derived_facts(
         diagnostics,
     })
 }
+
+/// Explain the derived facts `target` names. Materializes as a query with
+/// these reasoning modes would (served from the reasoning cache when it can),
+/// then re-runs each rule that can derive the facts over the result and
+/// reports the rows that do.
+///
+/// The explanation exposes every premise, whatever a policy would hide, so
+/// callers must only offer it to unrestricted readers.
+pub async fn explain_derived_facts(
+    base_db: GraphDbRef<'_>,
+    reasoning: &ReasoningModes,
+    rules_source_g_id: Option<GraphId>,
+    binary_store: Option<&Arc<BinaryIndexStore>>,
+    request: QueryRequest<'_>,
+    target: &crate::datalog_rules::ExplainTarget,
+) -> crate::error::Result<crate::datalog_rules::Explanation> {
+    use crate::datalog_rules::{explain_facts, load_rule_set, Explanation, RuleExecutionEnv};
+
+    if !reasoning.datalog {
+        return Err(crate::error::QueryError::InvalidQuery(
+            "explaining derived facts needs datalog reasoning: set \"reasoning\" to \
+             include \"datalog\""
+                .to_string(),
+        ));
+    }
+    let outcome =
+        compute_derived_facts(base_db, reasoning, rules_source_g_id, binary_store, request).await?;
+    let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
+    let diagnostics = outcome.diagnostics.unwrap_or_default();
+    let evaluation_time = diagnostics
+        .evaluation_time
+        .as_deref()
+        .map(fluree_db_core::temporal::DateTime::parse)
+        .transpose()
+        .map_err(crate::error::QueryError::Internal)?;
+
+    let combined = outcome
+        .overlay
+        .map(|derived| ReasoningOverlay::new(base_db.overlay, derived));
+    let mut view = GraphDbRef::new(
+        base_db.snapshot,
+        base_db.g_id,
+        combined.as_ref().map_or(base_db.overlay, |o| {
+            o as &dyn fluree_db_core::OverlayProvider
+        }),
+        base_db.t,
+    );
+    view.eager = true;
+    let env = RuleExecutionEnv {
+        binary_store,
+        evaluation_time: evaluation_time.as_ref(),
+        request,
+    };
+    let facts = explain_facts(view, base_db, &rule_set, env, target).await?;
+    Ok(Explanation {
+        t: base_db.t,
+        rule_set: format!("{:016x}", rule_set.content_hash()),
+        evaluation_time: diagnostics.evaluation_time,
+        complete: !diagnostics.capped,
+        facts,
+    })
+}

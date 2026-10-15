@@ -349,6 +349,20 @@ A materialization is cached and shared, so its cost lands on the query that
 computes it; queries that reuse it pay nothing for it. A run that is
 cancelled or runs out of fuel returns an error and caches nothing.
 
+## Explanations
+
+`explain_derived_facts` (behind `Fluree::explain_derived`) materializes as a
+query with the same reasoning modes would, from the reasoning cache when it
+can, then re-runs the body of every rule whose head can produce the target
+over asserted plus derived facts and keeps the rows whose head instantiates
+to it (`datalog_rules::explain`). Each row becomes a derivation: the body's
+top-level triple patterns instantiated as premises (looked up in the
+asserted facts to mark them derived or not), its `NOT EXISTS` patterns
+instantiated as absences with their graph scope, and, for a grouped
+subquery, the subquery's patterns re-run without grouping and filtered to the
+row's group key. Explanations are one step and are not cached. They expose
+premises regardless of policy, so the API refuses a non-root view.
+
 ## Why not keep the old matcher and extend it
 
 The matcher's cost was its own bookkeeping, and extending its pattern language
