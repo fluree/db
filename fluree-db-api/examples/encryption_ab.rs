@@ -276,6 +276,11 @@ fn workloads(n: u64, ordered: bool) -> Vec<Workload> {
             name: "scatter",
             queries: values_queries(&prefix, 0..n, 13, ordered),
         },
+        // As scatter, but drawing new subjects every pass (see `query`).
+        Workload {
+            name: "scatter_drift",
+            queries: Vec::new(),
+        },
         Workload {
             name: "dense",
             queries: vec![q("SELECT ?s ?b WHERE { ?s ex:age 3 ; ex:bio ?b }".into())],
@@ -517,10 +522,18 @@ async fn query(args: &[String]) {
             })
             .collect(),
     };
+    let prefix = format!("PREFIX ex: <{EX}> PREFIX p: <{EX}person/> ");
     for (pass, workloads) in passes {
         let phase = if pass == 0 { "first" } else { "repeat" };
         for w in workloads {
-            for (qi, sparql) in w.queries.iter().enumerate() {
+            let drift;
+            let queries = if w.name == "scatter_drift" {
+                drift = values_queries(&prefix, 0..n, 1_000 + pass as u64, ordered);
+                &drift
+            } else {
+                &w.queries
+            };
+            for (qi, sparql) in queries.iter().enumerate() {
                 let before = work();
                 let t = Instant::now();
                 let formatted = snapshot
