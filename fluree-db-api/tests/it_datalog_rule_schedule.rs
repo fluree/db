@@ -7,7 +7,7 @@
 //! count proves which schedule actually ran.
 
 use crate::it_datalog_semi_naive::derived;
-use crate::support::{genesis_ledger, MemoryLedger};
+use crate::support::{genesis_ledger, normalize_rows, query_jsonld, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::Sid;
 use fluree_db_query::datalog_rules::{
@@ -236,6 +236,84 @@ async fn the_fact_budget_stops_a_body_that_matches_far_more_rows() {
     );
 }
 
+/// Derived facts carry the query's `t`. At the `t` of a commit that retracted
+/// the stored copy of a fact the rules derive again, the retraction must not
+/// hide the derived fact: not from rule bodies that read it while the
+/// fixpoint runs, and not from the query.
+#[tokio::test]
+async fn a_fact_retracted_at_the_query_t_is_still_derived() {
+    const NODES: usize = 7;
+    let shapes = [
+        ("right-linear", "?x ex:next ?y . ?y ex:reach ?z"),
+        ("left-linear", "?x ex:reach ?y . ?y ex:next ?z"),
+        ("nonlinear", "?x ex:reach ?y . ?y ex:reach ?z"),
+    ];
+    for (shape, body) in shapes {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = genesis_ledger(&fluree, &format!("datalog/retracted-at-t-{shape}:main"));
+        let mut graph: Vec<Value> = (0..NODES - 1)
+            .map(|i| json!({"@id": format!("ex:n{i}"), "ex:next": {"@id": format!("ex:n{}", i + 1)}}))
+            .collect();
+        let asserted = [("ex:n0", "ex:n2"), ("ex:n1", "ex:n3")];
+        for (s, o) in asserted {
+            graph.push(json!({"@id": s, "ex:reach": {"@id": o}}));
+        }
+        let ctx = json!({"ex": "http://example.org/"});
+        let ledger = fluree
+            .insert(ledger, &json!({"@context": ctx, "@graph": graph}))
+            .await
+            .expect("seed")
+            .ledger;
+        let retract: Vec<Value> = asserted
+            .iter()
+            .map(|(s, o)| json!({"@id": s, "ex:reach": {"@id": o}}))
+            .collect();
+        let ledger = fluree
+            .update(ledger, &json!({"@context": ctx, "delete": retract}))
+            .await
+            .expect("retract")
+            .ledger;
+
+        let rules = [
+            "CONSTRUCT { ?x ex:reach ?y } WHERE { ?x ex:next ?y }".to_string(),
+            format!("CONSTRUCT {{ ?x ex:reach ?z }} WHERE {{ {body} }}"),
+        ];
+        let rule_set = sparql_rules(&ledger, &rules);
+        let scheduled = run(&ledger, &rule_set, RuleSchedule::Dependencies).await;
+        let reference = run(&ledger, &rule_set, RuleSchedule::WholeProgram).await;
+        let closure = NODES * (NODES - 1) / 2;
+        assert_eq!(scheduled.derived_flakes.len(), closure, "{shape}");
+        assert_eq!(
+            fact_set(&scheduled),
+            fact_set(&reference),
+            "{shape}: the schedules disagree"
+        );
+
+        let query = json!({
+            "@context": ctx,
+            "select": ["?x", "?y"],
+            "where": {"@id": "?x", "ex:reach": "?y"},
+            "rules": rules.iter().map(|rule| json!({
+                "@type": "https://ns.flur.ee/db#sparql",
+                "@value": format!("PREFIX ex: <http://example.org/>\n{rule}")
+            })).collect::<Vec<_>>()
+        });
+        let rows = query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("rows");
+        let rows = normalize_rows(&rows);
+        assert_eq!(rows.len(), closure, "{shape}: {rows:?}");
+        for (s, o) in asserted {
+            assert!(
+                rows.contains(&json!([s, o])),
+                "{shape}: {s} {o} missing from {rows:?}"
+            );
+        }
+    }
+}
+
 /// A rule whose sequence path reads another rule's facts at a later step runs
 /// after that rule, even when it is listed first.
 #[tokio::test]
@@ -267,13 +345,14 @@ async fn a_sequence_path_reads_each_of_its_steps() {
     );
 }
 
-/// Random positive programs over a small graph with one literal-valued fact:
-/// chains of joins (often transitive closures, linear or not, once their
-/// predicates are derived), class reads and writes, variable predicates,
-/// repeated variables and constant subjects, reads nested in UNION and
-/// EXISTS, one-or-more paths over a predicate or a sequence, zero-length
-/// paths, and heads that introduce fresh terms. Every rule is repeatable, so
-/// both schedules must derive exactly the same facts.
+/// Random positive programs over a small graph with one literal-valued fact
+/// and a few facts retracted in the latest commit: chains of joins (often
+/// transitive closures, linear or not, once their predicates are derived),
+/// class reads and writes, variable predicates, repeated variables and
+/// constant subjects, reads nested in UNION and EXISTS, one-or-more paths
+/// over a predicate or a sequence, zero-length paths, and heads that
+/// introduce fresh terms. Every rule is repeatable, so both schedules must
+/// derive exactly the same facts.
 #[tokio::test]
 async fn random_programs_derive_the_same_facts_under_both_schedules() {
     const PREDICATES: usize = 4;
@@ -281,7 +360,7 @@ async fn random_programs_derive_the_same_facts_under_both_schedules() {
     const NODES: usize = 7;
 
     let mut rng = StdRng::seed_from_u64(0x00da_7a10);
-    for program in 0..60 {
+    for program in 0..120 {
         let mut graph = Vec::new();
         for _ in 0..12 {
             let p = rng.gen_range(0..PREDICATES);
@@ -302,12 +381,25 @@ async fn random_programs_derive_the_same_facts_under_both_schedules() {
             "@id": format!("ex:n{}", rng.gen_range(0..NODES)),
             format!("ex:p{p}"): "end"
         }));
-        let ledger_id = format!("datalog/schedule-random-{program}:main");
-        let ledger = ledger_with(
-            &ledger_id,
-            json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}),
-        )
-        .await;
+        // Retracting asserted facts in the latest commit puts a retraction
+        // at the query's `t`, which a fact the rules derive again must
+        // survive.
+        let retract: Vec<Value> = (0..4)
+            .map(|_| graph[rng.gen_range(0..12)].clone())
+            .collect();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = genesis_ledger(&fluree, &format!("datalog/schedule-random-{program}:main"));
+        let ctx = json!({"ex": "http://example.org/"});
+        let ledger = fluree
+            .insert(ledger, &json!({"@context": ctx, "@graph": graph}))
+            .await
+            .expect("seed")
+            .ledger;
+        let ledger = fluree
+            .update(ledger, &json!({"@context": ctx, "delete": retract}))
+            .await
+            .expect("retract")
+            .ledger;
 
         let rule_count = rng.gen_range(2..7);
         let rules: Vec<String> = (0..rule_count)

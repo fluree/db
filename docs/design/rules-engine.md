@@ -43,7 +43,11 @@ DatalogRule {
 Rule bodies are executed by the planned query executor
 (`prepare_execution_with_config` + `execute_prepared_streaming`) against the
 same `GraphDbRef` the query runs on, with the base overlay wrapped in a
-`ReasoningOverlay` carrying the facts derived so far. Every construct the
+`ReasoningOverlay` carrying the facts derived so far. Derived facts carry
+the query's `t`, and at equal `t` a retraction wins the tie, so the overlay
+drops a stored retraction at the query's `t` that a derived fact restates:
+when the latest commit retracted the stored copy of a fact the rules derive
+again, the fact still holds. Every construct the
 executor supports is therefore available in a rule body, subject to the
 monotonicity rule below: edge annotations (`@annotation`, `{| |}`, `~ ?r`),
 claim-first patterns (`@reifies`, `rdf:reifies <<( … )>>`), full FILTER
