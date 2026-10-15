@@ -33,8 +33,10 @@ pub(super) fn validate_body(
     if query.grouping.is_some() {
         return Err(reject(
             rule,
-            "the body uses GROUP BY / aggregates, which are not allowed in a rule body \
-             (a fixpoint cannot evaluate them monotonically)",
+            "the body uses GROUP BY / aggregates at its top level, where the head could \
+             only read the group keys. Aggregate in a subquery instead (SPARQL \
+             `{ SELECT ?k (COUNT(?x) AS ?n) WHERE { … } GROUP BY ?k }`, JSON-LD \
+             `[\"query\", {…}]`) and use its outputs in the head",
         ));
     }
     // Same reasoning as the subquery arm below, for the rule's own body:
@@ -246,20 +248,18 @@ fn walk_patterns(
             Pattern::GeoSearch(_) => return Err(non_local(rule, "a geo search")),
             Pattern::S2Search(_) => return Err(non_local(rule, "an S2 cell search")),
             Pattern::Subquery(sub) => {
-                // A subquery carries its own modifiers, and two of them break a
-                // fixpoint. GROUP BY / aggregates are non-monotonic for the
-                // same reason the top-level check rejects them. LIMIT and
-                // OFFSET are worse than unsupported: which solutions survive a
-                // slice depends on how much has been derived so far, so the
-                // rule's output changes with round order and the result is then
+                // A subquery carries its own modifiers. GROUP BY / aggregates
+                // are allowed: their reads count as aggregated, and
+                // stratification runs the rule only once they are complete.
+                // LIMIT and OFFSET are not: which solutions survive a slice
+                // depends on how much has been derived so far, so the rule's
+                // output changes with round order and the result is then
                 // cached. DISTINCT and ORDER BY are safe — neither changes the
                 // solution SET as derivation grows, and heads dedup anyway.
-                if sub.grouping.is_some() {
-                    return Err(reject(
-                        rule,
-                        "a subquery in the body uses GROUP BY / aggregates, which are not \
-                         allowed in a rule body (a fixpoint cannot evaluate them monotonically)",
-                    ));
+                if let Some(grouping) = &sub.grouping {
+                    for expr in super::dependency::grouping_expressions(grouping) {
+                        check_expr(expr, snapshot, rule, ExprPos::Opaque, origin)?;
+                    }
                 }
                 if let Some(what) = sub
                     .limit

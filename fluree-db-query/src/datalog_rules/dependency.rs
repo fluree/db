@@ -13,7 +13,9 @@
 
 use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
 use crate::eval::function_supported_for_bool_cache as function_is_repeatable;
-use crate::ir::{Expression, Function, GraphName, Pattern, Query, Ref, Term, TriplePattern};
+use crate::ir::{
+    Expression, Function, GraphName, Grouping, Pattern, Query, Ref, Term, TriplePattern,
+};
 use crate::parse::IriEncoder;
 use fluree_db_core::{is_rdf_type, is_reserved_reifies_predicate, Sid};
 use std::collections::{HashMap, VecDeque};
@@ -123,6 +125,10 @@ pub struct RuleFootprint {
     /// also in `reads`. A rule may negate only facts that are complete
     /// before it runs, so none of these may observe its own group's writes.
     pub negated_reads: Vec<Access>,
+    /// The reads made inside a grouped or aggregating subquery. Each is also
+    /// in `reads`, and none may observe its own group's writes: a count over
+    /// facts still being derived would change as they arrive.
+    pub aggregated_reads: Vec<Access>,
 }
 
 impl RuleFootprint {
@@ -144,10 +150,21 @@ impl RuleFootprint {
         walker.footprint
     }
 
-    /// The rule negates facts, so its conclusions are only meaningful once
-    /// everything it negates is complete.
+    /// The rule negates or aggregates facts, so its conclusions are only
+    /// meaningful once everything it reads that way is complete.
     pub fn is_non_monotone(&self) -> bool {
-        !self.negated_reads.is_empty()
+        self.non_monotone_construct().is_some()
+    }
+
+    /// What makes the rule non-monotone, for messages.
+    pub fn non_monotone_construct(&self) -> Option<&'static str> {
+        if !self.negated_reads.is_empty() {
+            Some("negation")
+        } else if !self.aggregated_reads.is_empty() {
+            Some("an aggregate")
+        } else {
+            None
+        }
     }
 
     /// Whether some read of `self` may observe some write of `producer`.
@@ -156,6 +173,17 @@ impl RuleFootprint {
             .iter()
             .any(|read| producer.writes.iter().any(|write| read.may_observe(write)))
     }
+}
+
+/// The expressions a grouping phase evaluates: its HAVING and per-group
+/// binds.
+pub(super) fn grouping_expressions(grouping: &Grouping) -> impl Iterator<Item = &Expression> {
+    let (having, binds) = match grouping {
+        Grouping::Implicit { having, binds, .. } | Grouping::Explicit { having, binds, .. } => {
+            (having, binds)
+        }
+    };
+    having.iter().chain(binds.iter().map(|(_, expr)| expr))
 }
 
 /// What `patterns` may read in the default graph.
@@ -182,6 +210,8 @@ struct FootprintWalker<'e, E: ?Sized> {
     /// Inside a negation, at any depth. Double negation counts as negated
     /// too: the stratification check stays conservative.
     negated: bool,
+    /// Inside a grouped or aggregating subquery, at any depth.
+    aggregated: bool,
 }
 
 impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
@@ -193,7 +223,15 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                 ..Default::default()
             },
             negated: false,
+            aggregated: false,
         }
+    }
+
+    /// Walk `f` with every read it makes counted as aggregated.
+    fn under_aggregation(&mut self, f: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.aggregated, true);
+        f(self);
+        self.aggregated = outer;
     }
 
     /// Walk `f` with every read it makes counted as negated.
@@ -220,6 +258,9 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
         let access = Access::new(graph, predicate);
         if self.negated && !self.footprint.negated_reads.contains(&access) {
             self.footprint.negated_reads.push(access.clone());
+        }
+        if self.aggregated && !self.footprint.aggregated_reads.contains(&access) {
+            self.footprint.aggregated_reads.push(access.clone());
         }
         if !self.footprint.reads.contains(&access) {
             self.footprint.reads.push(access);
@@ -298,9 +339,21 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                     self.read(graph, predicate);
                 }
                 Pattern::Subquery(sub) => {
-                    self.read_patterns(&sub.patterns, graph);
-                    for (_, expr) in &sub.order_binds {
-                        self.read_expression(expr, graph);
+                    let read_subquery = |w: &mut Self| {
+                        w.read_patterns(&sub.patterns, graph);
+                        for (_, expr) in &sub.order_binds {
+                            w.read_expression(expr, graph);
+                        }
+                        if let Some(grouping) = &sub.grouping {
+                            for expr in grouping_expressions(grouping) {
+                                w.read_expression(expr, graph);
+                            }
+                        }
+                    };
+                    if sub.grouping.is_some() {
+                        self.under_aggregation(read_subquery);
+                    } else {
+                        read_subquery(self);
                     }
                 }
                 Pattern::Values { .. } => {}
@@ -490,17 +543,28 @@ impl RuleDependencies {
         stages
     }
 
-    /// Whether some rule negates facts its own recursive group derives. Such
-    /// a program has no stratification: the negated facts are not complete
-    /// before the rule reads them, so no evaluation order is sound. The error
-    /// names the cycle, the negating rule first:
-    /// `ex:a -not-> ex:b -> ex:a`, where each arrow reads facts from the rule
-    /// it points to.
-    pub fn unstratified_negation(&self, rule_set: &DatalogRuleSet) -> Option<String> {
+    /// Whether some rule negates or aggregates facts its own recursive group
+    /// derives. Such a program has no stratification: those facts are not
+    /// complete before the rule reads them, so no evaluation order is sound.
+    /// The error names the cycle, the offending rule first:
+    /// `ex:a -not-> ex:b -> ex:a` (or `-agg->`), where each arrow reads facts
+    /// from the rule it points to.
+    pub fn unstratified(&self, rule_set: &DatalogRuleSet) -> Option<String> {
         let name = |i: usize| rule_set.rules[i].name.as_str();
         for component in self.components.iter().filter(|c| c.recursive) {
             for &consumer in &component.rules {
-                for negated in &self.footprints[consumer].negated_reads {
+                let footprint = &self.footprints[consumer];
+                let non_monotone_reads = footprint
+                    .negated_reads
+                    .iter()
+                    .map(|read| (read, "not", "negates"))
+                    .chain(
+                        footprint
+                            .aggregated_reads
+                            .iter()
+                            .map(|read| (read, "agg", "aggregates")),
+                    );
+                for (negated, arrow, verb) in non_monotone_reads {
                     let Some(&producer) = component.rules.iter().find(|&&p| {
                         self.footprints[p]
                             .writes
@@ -520,15 +584,15 @@ impl RuleDependencies {
                         .enumerate()
                         .map(|(i, n)| match i {
                             0 => (*n).to_string(),
-                            1 => format!(" -not-> {n}"),
+                            1 => format!(" -{arrow}-> {n}"),
                             _ => format!(" -> {n}"),
                         })
                         .collect::<String>();
                     return Some(format!(
-                        "datalog rule {} negates facts that depend on its own conclusions \
+                        "datalog rule {} {verb} facts that depend on its own conclusions \
                          ({arrows}; each arrow reads facts from the rule it points to). \
-                         Negation needs the negated facts to be complete before the rule \
-                         runs, which a cycle through it prevents",
+                         Negation and aggregation need what they read to be complete before \
+                         the rule runs, which a cycle through them prevents",
                         name(consumer)
                     ));
                 }
