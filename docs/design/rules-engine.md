@@ -35,7 +35,8 @@ DatalogRule {
            with their VarRegistry,
     heads: Vec<RuleHead>  — (subject, predicate, object) terms that are either
            constants or VarIds bound by the body,
-    depends_on / generates — predicate Sids, for the ordering heuristic
+    footprint: graph-qualified predicates/classes the body may read and the
+           heads may write, plus whether re-running the body is repeatable
 }
 ```
 
@@ -56,25 +57,42 @@ budget bounds them).
 
 ### Fixpoint
 
+Rules are scheduled by dependency (`datalog_rules/dependency.rs`). Rule B
+depends on rule A when one of B's reads may observe one of A's writes. Reads
+and writes are qualified by graph and by predicate, and `rdf:type` by class.
+Anything the walk cannot pin down reads or writes everything: a variable
+predicate, a wildcard or zero-length path (a zero-hop match pairs every term
+in the graph with itself), a variable-predicate head, an unmodelled construct.
+Strongly connected components of the dependency graph are the recursive
+groups; each group's stage is one past the latest stage of any group it reads
+from.
+
 ```text
-loop:
-    budget check (time, facts, memory)
-    overlay = base ⊕ derived-so-far           (rebuilt only when derived grew)
-    for rule in rules (ordered by dependency count):
-        rows = execute(rule.body over overlay)
-        for row in rows, head in rule.heads:
-            flake = instantiate(head, row)      (skip rows that cannot instantiate)
-            if seen.insert(key(flake)):         (HashSet, O(1))
-                derived.push(flake); new += 1
-                budget check (facts, memory)    (inside the round)
-    if new == 0: fixpoint
+for stage in stages (producers first):
+    active = stage's groups
+    while active is non-empty:                   (≤ max_iterations passes)
+        budget check (time, facts, memory)
+        overlay = base ⊕ derived-so-far
+        for group in active, rule in group:
+            rows = execute(rule.body over overlay)
+            for row in rows, head in rule.heads:
+                flake = instantiate(head, row)  (skip rows that cannot instantiate)
+                if seen.insert(key(flake)):     (HashSet, O(1))
+                    derived.push(flake)
+                    budget check (facts, memory)
+        active = recursive groups that derived something this pass
+        rebuild the derived overlay if anything was derived and work remains
 ```
 
-Deduplication is a hash set keyed on `(s, p, o, dt, m)`. The derived overlay
-is rebuilt between rounds only when the round produced facts; most rule sets
-converge in two rounds. Semi-naive evaluation (restricting one body pattern to
-the previous round's delta) is a follow-up; it is straightforward to add as a
-VALUES seed on the delta once needed.
+A non-recursive group runs once, against the complete output of the stages
+before it. Groups in one stage never read each other's writes, so they share
+an overlay. Deduplication is a hash set keyed on `(s, p, o, dt, m)`.
+Semi-naive evaluation inside a recursive group (joining only against the
+previous pass's new facts) is a follow-up.
+
+`RuleSchedule::WholeProgram` treats the whole program as one recursive group:
+every rule every round, the evaluation used before dependency scheduling. It is
+kept as the reference differential tests compare against.
 
 ### Parsing
 
@@ -123,10 +141,10 @@ nothing, silently". And a stored `f:rule` value whose datatype is neither
 with the two accepted shapes spelled out, instead of being expanded as
 ordinary nodes.
 
-The fixpoint's round limit is reported like a budget cap: stopping at
-`max_iterations` while the last round still derived facts sets
-`capped_reason: "iterations"` and logs a warning, so a truncated closure is
-never indistinguishable from a converged one (#1559).
+The fixpoint's pass limit is reported like a budget cap: stopping at
+`max_iterations` passes in one stage while its last pass still derived facts
+sets `capped_reason: "iterations"` and logs a warning, so a truncated closure
+is never indistinguishable from a converged one (#1559).
 
 ### IRI operands in JSON-LD filters
 

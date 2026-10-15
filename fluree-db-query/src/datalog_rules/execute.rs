@@ -4,7 +4,7 @@
 
 use super::{
     extract_datalog_rules, parse_query_time_rule, DatalogExecutionResult, DatalogRule,
-    DatalogRuleSet, HeadTerm,
+    DatalogRuleSet, HeadTerm, RuleComponent, RuleDependencies,
 };
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -117,12 +117,20 @@ fn over_budget(
     }
 }
 
-/// Run the rules to a fixpoint.
-///
-/// Each round runs every rule body over the base data plus everything
-/// derived in earlier rounds, instantiates the heads, and stops when a round
-/// derives nothing new. The budget is checked between rounds, between rules,
-/// and after every new fact, so a single round cannot overshoot it.
+/// How the fixpoint orders rule evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuleSchedule {
+    /// Rules run in dependency order. A rule that cannot observe its own
+    /// conclusions runs once, after every rule it reads from has finished; a
+    /// recursive group iterates on its own until it stops deriving.
+    #[default]
+    Dependencies,
+    /// Every rule runs every round until a round derives nothing. Kept as the
+    /// reference the dependency schedule is tested against.
+    WholeProgram,
+}
+
+/// Run the rules to a fixpoint in dependency order.
 pub async fn run_fixpoint(
     db: GraphDbRef<'_>,
     rule_set: &DatalogRuleSet,
@@ -130,156 +138,310 @@ pub async fn run_fixpoint(
     budget: &ReasoningBudget,
     env: RuleExecutionEnv<'_>,
 ) -> Result<DatalogExecutionResult> {
+    run_fixpoint_with_schedule(
+        db,
+        rule_set,
+        max_iterations,
+        budget,
+        env,
+        RuleSchedule::Dependencies,
+    )
+    .await
+}
+
+/// Run the rules to a fixpoint under `schedule`.
+///
+/// Work proceeds in stages; every group in a stage reads only facts derived
+/// by earlier stages or by itself. Each pass over a stage evaluates its
+/// still-active groups against one overlay of everything derived so far. A
+/// non-recursive group is done after one pass; a recursive group stays
+/// active until a pass derives nothing new for it. `max_iterations` bounds
+/// the passes of each stage. The fact and memory budgets are checked before
+/// every new fact is kept, so a pass cannot overshoot them. The deadline is
+/// checked before each rule, after its body runs, and periodically while its
+/// heads are instantiated; a body already running is not interrupted. A rule
+/// that finishes deriving has derived everything it can, so a run whose last
+/// rule completes after the deadline still reports a completed fixpoint.
+pub async fn run_fixpoint_with_schedule(
+    db: GraphDbRef<'_>,
+    rule_set: &DatalogRuleSet,
+    max_iterations: usize,
+    budget: &ReasoningBudget,
+    env: RuleExecutionEnv<'_>,
+    schedule: RuleSchedule,
+) -> Result<DatalogExecutionResult> {
     if rule_set.is_empty() {
         return Ok(DatalogExecutionResult {
             derived_flakes: Vec::new(),
             diagnostics: ReasoningDiagnostics::completed(0, 0, std::time::Duration::ZERO),
+            rule_body_runs: 0,
         });
     }
 
-    tracing::debug!(rule_count = rule_set.len(), "executing datalog rules");
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let dependencies = rule_set.dependencies();
-        tracing::debug!(
-            groups = %dependencies.describe(rule_set),
-            "datalog rule groups, producers first; * marks a recursive group"
-        );
+    let dependencies = rule_set.dependencies();
+    let whole_program = RuleComponent {
+        rules: (0..rule_set.len()).collect(),
+        recursive: true,
+    };
+    let stages: Vec<Vec<&RuleComponent>> = match schedule {
+        RuleSchedule::Dependencies => dependencies.stages(),
+        RuleSchedule::WholeProgram => vec![vec![&whole_program]],
+    };
+    tracing::debug!(
+        rule_count = rule_set.len(),
+        ?schedule,
+        groups = %dependencies.describe(rule_set),
+        "executing datalog rules; groups producers first, * marks a recursive group"
+    );
+    if schedule == RuleSchedule::Dependencies {
+        warn_on_volatile_recursion(rule_set, &dependencies);
     }
 
-    let start = Instant::now();
     // Derived facts carry the query's `t` so the overlay's `t <= to_t` filter
     // keeps them visible (same convention as OWL2-RL).
-    let derived_t = db.t;
+    let mut state = Derivation {
+        snapshot: db.snapshot,
+        derived_t: db.t,
+        budget,
+        start: Instant::now(),
+        derived: Vec::new(),
+        seen: HashSet::new(),
+        bytes: 0,
+        diagnostics: ReasoningDiagnostics::default(),
+        warned_barren: HashSet::new(),
+        rule_body_runs: 0,
+    };
     let dict_novelty = ExecutionContext::extract_dict_novelty(db.snapshot);
-
-    let mut derived: Vec<Flake> = Vec::new();
-    let mut seen: HashSet<FactKey> = HashSet::new();
-    let mut bytes: usize = 0;
     let mut derived_overlay: Arc<DerivedFactsOverlay> = Arc::new(DerivedFactsOverlay::empty());
-    let mut iterations = 0usize;
+    let mut passes = 0usize;
     let mut capped: Option<&'static str> = None;
-    let mut diagnostics = ReasoningDiagnostics::default();
-    // Rules already flagged for "matched, but instantiated nothing" (#1560):
-    // the fixpoint re-runs every rule each round, so warn once per rule.
-    let mut warned_barren: HashSet<Sid> = HashSet::new();
 
-    'rounds: loop {
-        if let Some(reason) = over_budget(budget, &start, derived.len(), bytes) {
-            capped = Some(reason);
-            break;
-        }
-        if iterations >= max_iterations {
-            // The previous round still derived something, so the closure may
-            // be incomplete: surface it like any other budget cap instead of
-            // returning as if the fixpoint had converged (#1559).
-            tracing::warn!(
-                iterations,
-                derived = derived.len(),
-                "datalog fixpoint stopped at the iteration cap before converging; \
-                 results may be missing derived facts"
-            );
-            capped = Some("iterations");
-            break;
-        }
-        iterations += 1;
-        let mut new_this_round = 0usize;
+    'stages: for (stage_index, stage) in stages.iter().enumerate() {
+        let is_last_stage = stage_index + 1 == stages.len();
+        let mut active: Vec<&RuleComponent> = stage.clone();
+        let mut stage_passes = 0usize;
 
-        // Base data plus everything derived so far.
-        let effective = ReasoningOverlay::new(db.overlay, derived_overlay.clone());
-        let mut iter_db = GraphDbRef::new(db.snapshot, db.g_id, &effective, db.t);
-        iter_db.runtime_small_dicts = db.runtime_small_dicts;
-        // Derived facts live in the overlay as decoded `Sid`s; eager
-        // materialization keeps base rows comparable with them on join keys
-        // and hands head instantiation decoded bindings.
-        iter_db.eager = true;
-
-        for rule in rule_set.iter_in_order() {
-            if let Some(reason) = over_budget(budget, &start, derived.len(), bytes) {
+        while !active.is_empty() {
+            if let Some(reason) = state.over_budget() {
                 capped = Some(reason);
-                break 'rounds;
+                break 'stages;
             }
-            let batches = run_body(iter_db, rule, env, dict_novelty.clone()).await?;
+            if stage_passes >= max_iterations {
+                // The previous pass still derived something, so the closure
+                // may be incomplete: surface it like any other budget cap
+                // instead of returning as if the fixpoint had converged
+                // (#1559).
+                tracing::warn!(
+                    stage_passes,
+                    derived = state.derived.len(),
+                    "datalog fixpoint stopped at the iteration cap before a recursive \
+                     rule group converged; results may be missing derived facts"
+                );
+                capped = Some("iterations");
+                break 'stages;
+            }
+            stage_passes += 1;
+            passes += 1;
 
-            let mut matched_rows = 0usize;
-            let mut instantiated = 0usize;
-            for batch in &batches {
-                for row in 0..batch.len() {
-                    matched_rows += 1;
-                    for head in &rule.heads {
-                        let Some(flake) = instantiate(head, batch, row, db.snapshot, derived_t)
-                        else {
-                            continue;
-                        };
-                        instantiated += 1;
-                        if !seen.insert(fact_key(&flake)) {
-                            continue;
-                        }
-                        // Check before pushing. Pushing first and testing
-                        // `len() > max_facts` let one fact past the ceiling
-                        // through, and nothing trimmed it afterwards, so a
-                        // budget of N returned N+1 facts. Checking first also
-                        // stops charging `bytes` for a fact never kept.
-                        if derived.len() >= budget.max_facts {
-                            capped = Some("facts");
-                            break 'rounds;
-                        }
-                        bytes += approx_flake_bytes(&flake);
-                        diagnostics.record_rule_fired(&rule.name);
-                        derived.push(flake);
-                        new_this_round += 1;
-                        if bytes > budget.max_memory_bytes {
-                            capped = Some("memory");
-                            break 'rounds;
+            // Base data plus everything derived so far.
+            let effective = ReasoningOverlay::new(db.overlay, derived_overlay.clone());
+            let mut pass_db = GraphDbRef::new(db.snapshot, db.g_id, &effective, db.t);
+            pass_db.runtime_small_dicts = db.runtime_small_dicts;
+            // Derived facts live in the overlay as decoded `Sid`s; eager
+            // materialization keeps base rows comparable with them on join
+            // keys and hands head instantiation decoded bindings.
+            pass_db.eager = true;
+
+            let mut new_this_pass = 0usize;
+            let mut still_deriving: Vec<&RuleComponent> = Vec::new();
+            for group in active {
+                let mut new_in_group = 0usize;
+                for &index in &group.rules {
+                    if let Some(reason) = state.over_budget() {
+                        capped = Some(reason);
+                        break 'stages;
+                    }
+                    let rule = &rule_set.rules[index];
+                    match state
+                        .apply(pass_db, rule, env, dict_novelty.clone())
+                        .await?
+                    {
+                        RuleOutcome::Derived(new) => new_in_group += new,
+                        RuleOutcome::Capped(reason) => {
+                            capped = Some(reason);
+                            break 'stages;
                         }
                     }
                 }
+                new_this_pass += new_in_group;
+                if group.recursive && new_in_group > 0 {
+                    still_deriving.push(group);
+                }
             }
 
-            // "The where clause matched but the insert could not instantiate"
-            // is almost always an authoring bug and is invisible otherwise:
-            // the rule appears to run and the fixpoint completes normally
-            // (#1560). Catches what parse-time range restriction cannot see —
-            // a head variable bound to a literal in subject or predicate
-            // position, or bound in no row of a UNION branch.
-            if matched_rows > 0 && instantiated == 0 && warned_barren.insert(rule.id.clone()) {
+            tracing::debug!(
+                stage = stage_index,
+                pass = stage_passes,
+                new_facts = new_this_pass,
+                total_derived = state.derived.len(),
+                "datalog fixpoint pass"
+            );
+
+            let more_passes_follow = !still_deriving.is_empty() || !is_last_stage;
+            if new_this_pass > 0 && more_passes_follow {
+                let mut builder = DerivedFactsBuilder::with_capacity(state.derived.len());
+                builder.extend(state.derived.iter().cloned());
+                derived_overlay =
+                    Arc::new(builder.build(FrozenSameAs::empty(), db.overlay.epoch()));
+            }
+            active = still_deriving;
+        }
+    }
+
+    let facts = state.derived.len();
+    let elapsed = state.start.elapsed();
+    let mut diagnostics = state.diagnostics;
+    match capped {
+        Some(reason) => diagnostics.mark_capped(reason, passes, facts, elapsed),
+        None => diagnostics.mark_completed(passes, facts, elapsed),
+    }
+    tracing::debug!(
+        passes,
+        rule_body_runs = state.rule_body_runs,
+        derived = facts,
+        capped = capped.unwrap_or("no"),
+        "datalog fixpoint finished"
+    );
+
+    Ok(DatalogExecutionResult {
+        derived_flakes: state.derived,
+        diagnostics,
+        rule_body_runs: state.rule_body_runs,
+    })
+}
+
+/// A recursive group re-evaluates its rules every pass, so a rule whose body
+/// gives different rows each time (`NOW()`, `STRUUID()`, …) can derive new
+/// facts forever and run to the budget.
+fn warn_on_volatile_recursion(rule_set: &DatalogRuleSet, dependencies: &RuleDependencies) {
+    for group in dependencies.components().iter().filter(|g| g.recursive) {
+        for &index in &group.rules {
+            if !dependencies.footprint(index).repeatable {
                 tracing::warn!(
-                    rule = %rule.name,
-                    matched_rows,
-                    "datalog rule matched binding rows but derived no facts: every row \
-                     failed to instantiate its insert pattern — a head variable is bound \
-                     to a literal in subject/predicate position, or is unbound in every row"
+                    rule = %rule_set.rules[index].name,
+                    "datalog rule is part of a recursive group but calls a function whose \
+                     result changes between calls, or uses a shortest path; it may keep \
+                     deriving new facts until the reasoning budget stops it"
                 );
             }
         }
+    }
+}
 
-        tracing::debug!(
-            iteration = iterations,
-            new_facts = new_this_round,
-            total_derived = derived.len(),
-            "datalog fixpoint iteration"
-        );
+enum RuleOutcome {
+    Derived(usize),
+    Capped(&'static str),
+}
 
-        if new_this_round == 0 {
-            break;
+/// Everything a fixpoint run accumulates across passes.
+struct Derivation<'a> {
+    snapshot: &'a LedgerSnapshot,
+    derived_t: i64,
+    budget: &'a ReasoningBudget,
+    start: Instant,
+    derived: Vec<Flake>,
+    seen: HashSet<FactKey>,
+    bytes: usize,
+    diagnostics: ReasoningDiagnostics,
+    /// Rules already flagged for "matched, but instantiated nothing" (#1560):
+    /// recursive groups re-run their rules every pass, so warn once per rule.
+    warned_barren: HashSet<Sid>,
+    rule_body_runs: usize,
+}
+
+impl Derivation<'_> {
+    fn over_budget(&self) -> Option<&'static str> {
+        over_budget(self.budget, &self.start, self.derived.len(), self.bytes)
+    }
+
+    fn past_deadline(&self) -> bool {
+        self.start.elapsed() > self.budget.max_duration
+    }
+
+    /// Evaluate one rule over `db` and keep the facts it derives that are new.
+    async fn apply(
+        &mut self,
+        db: GraphDbRef<'_>,
+        rule: &DatalogRule,
+        env: RuleExecutionEnv<'_>,
+        dict_novelty: Option<Arc<DictNovelty>>,
+    ) -> Result<RuleOutcome> {
+        // Rows between deadline checks while instantiating heads.
+        const DEADLINE_CHECK_ROWS: usize = 1024;
+
+        self.rule_body_runs += 1;
+        let batches = run_body(db, rule, env, dict_novelty).await?;
+        // The body cannot be interrupted, but a rule that ran past the
+        // deadline must not go on to derive, and must not let a final pass
+        // report a completed fixpoint.
+        if self.past_deadline() {
+            return Ok(RuleOutcome::Capped("time"));
         }
 
-        // Rebuild the derived overlay for the next round.
-        let mut builder = DerivedFactsBuilder::with_capacity(derived.len());
-        builder.extend(derived.iter().cloned());
-        derived_overlay = Arc::new(builder.build(FrozenSameAs::empty(), db.overlay.epoch()));
-    }
+        let mut new = 0usize;
+        let mut matched_rows = 0usize;
+        let mut instantiated = 0usize;
+        for batch in &batches {
+            for row in 0..batch.len() {
+                matched_rows += 1;
+                if matched_rows.is_multiple_of(DEADLINE_CHECK_ROWS) && self.past_deadline() {
+                    return Ok(RuleOutcome::Capped("time"));
+                }
+                for head in &rule.heads {
+                    let Some(flake) = instantiate(head, batch, row, self.snapshot, self.derived_t)
+                    else {
+                        continue;
+                    };
+                    instantiated += 1;
+                    if !self.seen.insert(fact_key(&flake)) {
+                        continue;
+                    }
+                    // Check before pushing. Pushing first and testing
+                    // `len() > max_facts` let one fact past the ceiling
+                    // through, and nothing trimmed it afterwards, so a budget
+                    // of N returned N+1 facts. Checking first also stops
+                    // charging `bytes` for a fact never kept.
+                    if self.derived.len() >= self.budget.max_facts {
+                        return Ok(RuleOutcome::Capped("facts"));
+                    }
+                    self.bytes += approx_flake_bytes(&flake);
+                    self.diagnostics.record_rule_fired(&rule.name);
+                    self.derived.push(flake);
+                    new += 1;
+                    if self.bytes > self.budget.max_memory_bytes {
+                        return Ok(RuleOutcome::Capped("memory"));
+                    }
+                }
+            }
+        }
 
-    let facts = derived.len();
-    let elapsed = start.elapsed();
-    match capped {
-        Some(reason) => diagnostics.mark_capped(reason, iterations, facts, elapsed),
-        None => diagnostics.mark_completed(iterations, facts, elapsed),
+        // "The where clause matched but the insert could not instantiate" is
+        // almost always an authoring bug and is invisible otherwise: the rule
+        // appears to run and the fixpoint completes normally (#1560). Catches
+        // what parse-time range restriction cannot see — a head variable
+        // bound to a literal in subject or predicate position, or bound in no
+        // row of a UNION branch.
+        if matched_rows > 0 && instantiated == 0 && self.warned_barren.insert(rule.id.clone()) {
+            tracing::warn!(
+                rule = %rule.name,
+                matched_rows,
+                "datalog rule matched binding rows but derived no facts: every row \
+                 failed to instantiate its insert pattern — a head variable is bound \
+                 to a literal in subject/predicate position, or is unbound in every row"
+            );
+        }
+        Ok(RuleOutcome::Derived(new))
     }
-
-    Ok(DatalogExecutionResult {
-        derived_flakes: derived,
-        diagnostics,
-    })
 }
 
 /// Run one rule body through the executor and collect its rows.

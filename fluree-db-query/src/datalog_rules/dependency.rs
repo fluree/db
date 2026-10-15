@@ -380,6 +380,40 @@ impl RuleDependencies {
         &self.components
     }
 
+    /// Groups batched into stages. A group's stage is one past the latest
+    /// stage of any group it reads from, so no group reads what another
+    /// group in its own stage writes, and every stage can run against one
+    /// overlay built from the stages before it.
+    pub fn stages(&self) -> Vec<Vec<&RuleComponent>> {
+        let mut component_of = vec![0; self.footprints.len()];
+        for (c, component) in self.components.iter().enumerate() {
+            for &rule in &component.rules {
+                component_of[rule] = c;
+            }
+        }
+        let mut stage_of = vec![0usize; self.components.len()];
+        for (c, component) in self.components.iter().enumerate() {
+            stage_of[c] = component
+                .rules
+                .iter()
+                .flat_map(|&rule| &self.depends_on[rule])
+                .map(|&producer| component_of[producer])
+                .filter(|&producer_component| producer_component != c)
+                .map(|producer_component| {
+                    debug_assert!(producer_component < c, "components are producers first");
+                    stage_of[producer_component] + 1
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        let stage_count = stage_of.iter().max().map_or(0, |last| last + 1);
+        let mut stages: Vec<Vec<&RuleComponent>> = vec![Vec::new(); stage_count];
+        for (c, component) in self.components.iter().enumerate() {
+            stages[stage_of[c]].push(component);
+        }
+        stages
+    }
+
     /// One line naming each group in order, recursive groups starred, for
     /// diagnostics: `[ex:base ex:step]* -> [ex:flag]`.
     pub fn describe(&self, rule_set: &DatalogRuleSet) -> String {
@@ -581,6 +615,39 @@ mod tests {
         assert!(position(1) < position(2));
         assert!(position(2) < position(3));
         assert_eq!(deps.producers_of(2), &[0, 1]);
+    }
+
+    #[test]
+    fn stages_batch_groups_that_do_not_read_each_other() {
+        // 0: base -> a; 1: a -> a (recursive); 2,3: a -> x / a -> y;
+        // 4: x -> z; 5: unrelated -> w
+        let deps = RuleDependencies::from_footprints(vec![
+            rule(vec![exact("base")], vec![exact("a")]),
+            rule(vec![exact("a")], vec![exact("a")]),
+            rule(vec![exact("a")], vec![exact("x")]),
+            rule(vec![exact("a")], vec![exact("y")]),
+            rule(vec![exact("x")], vec![exact("z")]),
+            rule(vec![exact("unrelated")], vec![exact("w")]),
+        ]);
+        let stages: Vec<Vec<Vec<usize>>> = deps
+            .stages()
+            .iter()
+            .map(|stage| {
+                let mut groups: Vec<Vec<usize>> =
+                    stage.iter().map(|group| group.rules.clone()).collect();
+                groups.sort();
+                groups
+            })
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                vec![vec![0], vec![5]],
+                vec![vec![1]],
+                vec![vec![2], vec![3]],
+                vec![vec![4]],
+            ]
+        );
     }
 
     #[test]

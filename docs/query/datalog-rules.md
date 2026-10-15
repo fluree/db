@@ -504,40 +504,51 @@ find items liked by mutual friends.
 
 ### Fixpoint evaluation
 
-Rules execute in a **fixpoint loop**:
+Before evaluating, Fluree works out which rules can see which other rules'
+conclusions. A rule depends on another when its `WHERE` clause can match a
+fact the other rule's head derives. Rules that depend on each other, directly
+or through a cycle, form a **recursive group**; every other rule stands alone.
 
-1. Every rule body is evaluated by the query engine against the current data
-   (base + previously derived facts).
-2. The heads are instantiated for each solution; new facts are collected.
-3. If any new facts were produced, go back to step 1 with the expanded fact set.
-4. When no new facts are produced (fixpoint reached), the loop terminates.
+Evaluation then proceeds in dependency order:
+
+1. A rule that cannot see its own conclusions runs **once**, after every rule
+   it reads from has finished.
+2. A recursive group runs its rules repeatedly, each pass over the base data
+   plus everything derived so far, until a pass derives nothing new.
+3. Groups that do not read each other's conclusions are evaluated together.
 
 This means:
 - **Recursive rules work.** A rule can produce facts that trigger itself again.
 - **Rule chaining works.** Rule A can produce facts that trigger Rule B, and
-  vice versa.
-- **Termination is guaranteed** by a maximum fixpoint-iteration bound and by
-  the shared reasoning budget — a maximum derived-fact count, a maximum
-  memory estimate for the derived facts, and a maximum wall-clock time, the
-  same budget OWL2-RL uses. The fact ceiling is checked before each derived
-  fact is kept, so a run returns at most that many and a single round cannot
-  overshoot. The budget bounds the derived facts, not a rule body's
+  vice versa; the order rules are written or stored in does not matter.
+- **Rules downstream of a recursion see its complete result.** A rule that
+  reads a recursive relation runs once, after that relation stops growing,
+  instead of re-running every pass.
+- **Volatile functions run once per materialization in a non-recursive rule.**
+  A rule calling `NOW()`, `RAND()`, `UUID()` / `STRUUID()` or `BNODE()`
+  derives from a single evaluation. Inside a recursive group such a rule is
+  re-evaluated every pass and can keep deriving new values until the budget
+  stops it; Fluree logs a warning naming the rule.
+- **The dependency analysis is conservative.** A variable predicate
+  (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`) or a variable-predicate
+  head counts as reading or writing every predicate, which can merge rules
+  into a larger recursive group. That costs speed, never correctness.
+- **Termination is guaranteed** by a maximum number of passes per group of
+  rules and by the shared reasoning budget — a maximum derived-fact count, a
+  maximum memory estimate for the derived facts, and a maximum wall-clock
+  time, the same budget OWL2-RL uses. The fact ceiling is checked before each
+  derived fact is kept, so a run returns at most that many and a single pass
+  cannot overshoot. The budget bounds the derived facts, not a rule body's
   intermediate binding rows: each body is evaluated in full before its heads
   are instantiated, so a body matching far more rows than it derives facts can
   exceed the memory estimate while running. Hitting the budget stops early and
-  marks the result `capped` in the tracked response's `reasoning` block.
+  marks the result `capped` in the tracked response's `reasoning` block; which
+  partial facts a capped run keeps depends on evaluation order. The block's
+  `iterations` field counts passes across all groups.
   Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
   `f:reasoningMaxMemoryMb` (ledger
   config), `"reasoningBudget"` (query), or `FLUREE_REASONING_MAX_FACTS` /
   `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB` (server).
-
-### Execution order
-
-Rules are ordered before the fixpoint by a lightweight heuristic (fewest
-predicate dependencies first). Because the fixpoint re-runs every rule each
-iteration until no new facts are produced, this ordering only affects how
-quickly the fixpoint converges — never the final set of derived facts. Rule
-chaining (rule A's output feeding rule B) works regardless of the order.
 
 ### Interaction with OWL 2 RL
 
