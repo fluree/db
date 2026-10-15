@@ -25,7 +25,7 @@ pub use read::binary_index_store::{BinaryGraphView, BinaryIndexStore, RemoteLeaf
 pub use read::cached_units::{unit_memo_hits, UnitMemoScope};
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 pub use read::leaflet_cache::{
-    CachedOverlaySegment, LeafletCache, LeafletCacheKey, V3BatchCacheKey,
+    CachedOverlaySegment, FencedLeafMemory, LeafletCache, LeafletCacheKey, V3BatchCacheKey,
 };
 pub use read::need_fetch::{resident_or_need_fetch, FetchKind, NeedFetch};
 pub use read::replay::{

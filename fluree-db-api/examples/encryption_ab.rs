@@ -361,6 +361,20 @@ fn occupancy(_fluree: &fluree_db_api::Fluree) -> Value {
     Value::Null
 }
 
+/// The fenced-leaf pool: fence index bytes apart from the sources' mapping
+/// charge.
+#[cfg(not(no_counters))]
+fn fences(fluree: &fluree_db_api::Fluree) -> Value {
+    let m = fluree.leaflet_cache().fenced_leaf_memory();
+    json!({"leaves": m.leaves, "charged": m.charged, "fence_bytes": m.fence_bytes,
+           "source_charge": m.source_charge})
+}
+
+#[cfg(no_counters)]
+fn fences(_fluree: &fluree_db_api::Fluree) -> Value {
+    Value::Null
+}
+
 #[cfg(not(no_counters))]
 fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
     let s = fluree.leaflet_cache().dictionary_allowance().stats();
@@ -559,7 +573,7 @@ async fn query(args: &[String]) {
                 emit(json!({
                     "type": "workload_snapshot", "variant": variant, "state": state,
                     "pass": pass, "workload": w.name,
-                    "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
+                    "memory": memory(), "occupancy": occupancy(&fluree), "fences": fences(&fluree), "work": work(),
                     "allowance": allowance(&fluree),
                 }));
             }
@@ -567,7 +581,7 @@ async fn query(args: &[String]) {
         if snapshots != "none" {
             emit(json!({
                 "type": "snapshot", "variant": variant, "state": state, "pass": pass,
-                "memory": memory(), "occupancy": occupancy(&fluree), "work": work(),
+                "memory": memory(), "occupancy": occupancy(&fluree), "fences": fences(&fluree), "work": work(),
                 "allowance": allowance(&fluree),
             }));
         }

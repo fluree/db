@@ -96,7 +96,17 @@ impl FencedLeaf {
 
     /// What holding it costs: the fences and the source handle.
     pub(crate) fn cache_weight(&self) -> usize {
-        std::mem::size_of::<Self>() + self.fences.heap_bytes() + self.source.cache_weight()
+        std::mem::size_of::<Self>() + self.fence_bytes() + self.source_charge()
+    }
+
+    pub(crate) fn fence_bytes(&self) -> usize {
+        self.fences.heap_bytes()
+    }
+
+    /// The source handle's charge: for a mapped envelope, a fraction of the
+    /// mapping's length, as for any mapped leaf.
+    pub(crate) fn source_charge(&self) -> usize {
+        self.source.cache_weight()
     }
 
     fn invalid(what: &str) -> io::Error {
@@ -1708,6 +1718,35 @@ mod tests {
             assert_eq!(opening(&cs), opened, "no leaf fenced again");
         }
 
+        /// A fenced leaf heavier than the fence pool takes is never cached
+        /// there charged at less than it holds: its leaf is read whole, once,
+        /// through the leaflet pool.
+        #[test]
+        fn a_leaf_too_heavy_for_the_fence_pool_is_read_whole() {
+            let entries = entries();
+            let cs = SegmentedContentStore::new(true);
+            let (leaves, branch) = built(entries.clone());
+            let leaf_count = branch.leaves.len();
+            // A 128 KiB budget: a 4 KiB fence pool, taking leaves up to 2 KiB,
+            // short of a test leaf's fences and 1 KiB source charge.
+            let cache = Arc::new(LeafletCache::with_max_bytes(128 * 1024));
+            let reader = reader_over(&cs, leaves, branch, FencedLookup::Scan, Arc::clone(&cache))
+                .with_fence_spacing(256);
+            for _ in 0..3 {
+                for e in entries.iter().step_by(25) {
+                    assert_eq!(reader.reverse_lookup(&e.key).unwrap(), Some(e.id));
+                }
+            }
+            let memory = cache.fenced_leaf_memory();
+            assert_eq!((memory.fence_bytes, memory.source_charge), (0, 0));
+            let opened = cs
+                .reads()
+                .iter()
+                .filter(|r| r.start == 0 && r.end - r.start > 4096)
+                .count();
+            assert_eq!(opened, leaf_count, "each leaf fenced once, then read whole");
+        }
+
         /// The cache weighs a fenced leaf with its fences: closer fences
         /// weigh more, by exactly what their index holds.
         #[cfg(not(target_arch = "wasm32"))]
@@ -1732,6 +1771,13 @@ mod tests {
                 )
                 .with_fence_spacing(spacing);
                 reader.reverse_lookup(&entries[7].key).unwrap();
+                let memory = cache.fenced_leaf_memory();
+                assert_eq!(memory.leaves, 1);
+                assert_eq!(
+                    memory.fence_bytes,
+                    leaf.fences(spacing as usize).heap_bytes() as u64
+                );
+                assert_eq!(memory.source_charge, 1024, "the test source's charge");
                 cache
                     .occupancy()
                     .into_iter()

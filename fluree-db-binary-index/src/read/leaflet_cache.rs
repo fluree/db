@@ -526,6 +526,8 @@ pub struct LeafletCache {
     /// Reverse dictionary leaves fenced for range reads, or `None` to read
     /// one whole, keyed by xxh3_128(leaf CID bytes). See [`fenced_leaf_pool`].
     fenced_leaves: Cache<u128, Option<Arc<FencedLeaf>>>,
+    /// The heaviest fenced leaf the pool takes.
+    fenced_leaf_max: usize,
     /// What forward dictionary packs may hold decrypted whole, shared by
     /// every reader of this cache.
     dictionary_allowance: Arc<crate::dict::allowance::DictionaryAllowance>,
@@ -571,17 +573,31 @@ fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
 /// Share of the leaflet budget for fenced reverse leaves.
 const FENCED_LEAF_BUDGET_DIVISOR: u64 = 32;
 
-/// The pool for fenced reverse leaves.
+/// See [`LeafletCache::fenced_leaf_memory`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FencedLeafMemory {
+    pub leaves: u64,
+    pub charged: u64,
+    pub fence_bytes: u64,
+    pub source_charge: u64,
+}
+
+/// The fenced-leaf pool's share of a leaflet budget, taken out of it.
+fn fenced_leaf_budget(leaflet_budget_bytes: u64) -> u64 {
+    (leaflet_budget_bytes / FENCED_LEAF_BUDGET_DIVISOR).max(1)
+}
+
+/// The pool for fenced reverse leaves, `budget` bytes.
 ///
 /// Separate from leaflets so scan pressure cannot evict a fence index: one
 /// weighs a few percent of its leaf, but rebuilding it decrypts the whole
 /// leaf. LRU, since a new snapshot's leaves are the ones lookups want.
-fn fenced_leaf_pool(leaflet_budget_bytes: u64) -> Cache<u128, Option<Arc<FencedLeaf>>> {
-    let budget = (leaflet_budget_bytes / FENCED_LEAF_BUDGET_DIVISOR).max(1);
-    let max_weight = (budget / 2).clamp(1, u64::from(u32::MAX)) as usize;
+/// Entries are weighed in full; one heavier than half the pool is never
+/// cached here (see [`LeafletCache::try_get_or_load_fenced_leaf`]).
+fn fenced_leaf_pool(budget: u64) -> Cache<u128, Option<Arc<FencedLeaf>>> {
     let builder = Cache::builder()
-        .weigher(move |_key: &u128, leaf: &Option<Arc<FencedLeaf>>| {
-            fenced_leaf_weight(leaf).min(max_weight) as u32
+        .weigher(|_key: &u128, leaf: &Option<Arc<FencedLeaf>>| {
+            u32::try_from(fenced_leaf_weight(leaf)).unwrap_or(u32::MAX)
         })
         .max_capacity(budget);
     #[cfg(not(target_arch = "wasm32"))]
@@ -681,17 +697,19 @@ impl LeafletCache {
     /// planner stats views get a separate LRU pool sized from the same budget;
     /// see [`stats_view_pool`].
     pub fn with_max_bytes(max_bytes: u64) -> Self {
+        let fenced_budget = fenced_leaf_budget(max_bytes);
         let inner = Cache::builder()
             .weigher(|_key: &CacheKey, val: &CachedEntry| {
                 val.byte_size().min(u32::MAX as usize) as u32
             })
-            .max_capacity(max_bytes)
+            .max_capacity(max_bytes.saturating_sub(fenced_budget))
             .build();
 
         Self {
             inner,
             stats_views: stats_view_pool(max_bytes),
-            fenced_leaves: fenced_leaf_pool(max_bytes),
+            fenced_leaves: fenced_leaf_pool(fenced_budget),
+            fenced_leaf_max: (fenced_budget / 2) as usize,
             dictionary_allowance: crate::dict::allowance::DictionaryAllowance::with_backing(
                 crate::dict::allowance::allowance_from_env(),
                 crate::dict::allowance::mapped_from_env(),
@@ -732,9 +750,28 @@ impl LeafletCache {
         Self::with_max_bytes(mb.saturating_mul(1024 * 1024))
     }
 
-    /// Approximate total size of entries in bytes (moka weighted size).
+    /// Approximate total size of entries in bytes (moka weighted size),
+    /// fenced leaves included.
     pub fn weighted_size_bytes(&self) -> u64 {
-        self.inner.weighted_size()
+        self.inner.weighted_size() + self.fenced_leaves.weighted_size()
+    }
+
+    /// What the fenced-leaf pool holds: leaves, the bytes of their fence
+    /// indexes, and the charge for their sources' mappings, which are
+    /// reclaimable page cache rather than heap. Walks every entry: a
+    /// diagnostic.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn fenced_leaf_memory(&self) -> FencedLeafMemory {
+        let mut memory = FencedLeafMemory::default();
+        for (_, leaf) in &self.fenced_leaves {
+            memory.leaves += 1;
+            memory.charged += fenced_leaf_weight(&leaf) as u64;
+            if let Some(leaf) = &leaf {
+                memory.fence_bytes += leaf.fence_bytes() as u64;
+                memory.source_charge += leaf.source_charge() as u64;
+            }
+        }
+        memory
     }
 
     /// Number of cached entries across all entry types.
@@ -970,6 +1007,20 @@ impl LeafletCache {
         if let Some(leaf) = self.fenced_leaves.get(&key) {
             return Ok(leaf);
         }
+        // A leaf too heavy for the pool is read whole, through the leaflet
+        // pool, rather than charged less than it holds.
+        let open = || {
+            Ok(open()?.filter(|leaf| {
+                let fits = leaf.cache_weight() <= self.fenced_leaf_max;
+                if !fits {
+                    fluree_db_core::io_stats::record_work(
+                        "fenced leaf too heavy",
+                        leaf.cache_weight(),
+                    );
+                }
+                fits
+            }))
+        };
         in_blocking_region(|| self.fenced_leaves.try_get_with(key, open)).map_err(arc_io_error)
     }
 
@@ -1335,6 +1386,19 @@ impl LeafletCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fenced-leaf pool is carved out of the leaflet budget, not added
+    /// beside it.
+    #[test]
+    fn the_fence_pool_shares_the_leaflet_budget() {
+        for budget in [1u64 << 20, 256 << 20, 3_000_017] {
+            let cache = LeafletCache::with_max_bytes(budget);
+            let leaflets = cache.inner.policy().max_capacity().unwrap();
+            let fences = cache.fenced_leaves.policy().max_capacity().unwrap();
+            assert_eq!(leaflets + fences, budget);
+            assert_eq!(fences, budget / 32);
+        }
+    }
 
     fn make_key(leaf_id: u128, leaflet_index: u32, to_t: i64, epoch: u64) -> LeafletCacheKey {
         LeafletCacheKey {
