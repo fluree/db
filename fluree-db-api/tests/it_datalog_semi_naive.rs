@@ -4,7 +4,8 @@
 //! derived in the previous pass, once per top-level triple pattern that reads
 //! the group's facts. These tests pin that the work shrinks, that every
 //! recursive pattern of a nonlinear rule is seeded, that a rule reading its
-//! group's facts anywhere else re-runs its whole body, and that patterns the
+//! group's facts anywhere else re-runs its whole body, as does a rule whose
+//! rows can change between runs over the same facts, and that patterns the
 //! seed cannot stand in for still match exactly. The whole-program schedule,
 //! which always runs whole bodies, is the reference.
 //!
@@ -12,9 +13,14 @@
 //! `it_datalog_closure_paths`); the recursive rules here carry a FILTER that
 //! is always true on their data to keep them iterating.
 
-use crate::it_datalog_rule_schedule::{chain_data, fact_set, ledger_with, run, sparql_rules};
+use crate::it_datalog_rule_schedule::{
+    chain_data, fact_set, jsonld_rules, ledger_with, run, sparql_rules,
+};
 use fluree_db_core::Sid;
-use fluree_db_query::datalog_rules::{DatalogExecutionResult, RuleSchedule};
+use fluree_db_query::datalog_rules::{
+    run_fixpoint_with_schedule, DatalogExecutionResult, RuleExecutionEnv, RuleSchedule,
+};
+use fluree_db_query::reasoning::ReasoningBudget;
 use serde_json::{json, Value};
 
 fn graph(nodes: Vec<Value>) -> Value {
@@ -233,4 +239,78 @@ async fn a_repeated_variable_in_a_recursive_pattern_binds_only_agreeing_facts() 
         .map(|(s, _)| s)
         .collect();
     assert_eq!(self_reaching, ["c0", "c1", "c2", "d0", "d1"]);
+}
+
+/// `t(?z)` reads the transaction metadata of the fact that bound `?z`. A
+/// seed carries none, so seeding the recursive pattern would drop every
+/// match after the first pass; the rule re-runs its whole body instead.
+#[tokio::test]
+async fn a_recursive_rule_reading_transaction_metadata_reruns_whole() {
+    const LEN: usize = 5;
+    let ledger = ledger_with("datalog/semi-naive-metadata:main", chain_data(LEN)).await;
+    let ctx = json!({"ex": "http://example.org/"});
+    let rules = jsonld_rules(
+        &ledger,
+        vec![
+            json!({
+                "@context": ctx,
+                "where": {"@id": "?x", "ex:parent": "?y"},
+                "insert": {"@id": "?x", "ex:ancestor": {"@id": "?y"}}
+            }),
+            json!({
+                "@context": ctx,
+                "where": [
+                    {"@id": "?x", "ex:parent": "?y"},
+                    {"@id": "?y", "ex:ancestor": "?z"},
+                    ["filter", "(> (t ?z) 0)"]
+                ],
+                "insert": {"@id": "?x", "ex:ancestor": {"@id": "?z"}}
+            }),
+        ],
+    );
+    let scheduled = run(&ledger, &rules, RuleSchedule::Dependencies).await;
+    let reference = run(&ledger, &rules, RuleSchedule::WholeProgram).await;
+    assert!(!scheduled.diagnostics.capped);
+    assert_eq!(fact_set(&scheduled), fact_set(&reference));
+    assert_eq!(scheduled.derived_flakes.len(), LEN * (LEN - 1) / 2);
+}
+
+/// `STRUUID()` gives a new value every run, so re-running the recursive
+/// rule over old matches keeps deriving fresh ids and never converges.
+/// Re-reading only new facts would stop once the chain ends and report a
+/// completed fixpoint the reference never reaches; the rule re-runs its
+/// whole body and hits the pass limit like the reference.
+#[tokio::test]
+async fn a_recursive_rule_calling_a_volatile_function_reruns_whole() {
+    const MAX_PASSES: usize = 10;
+    let ledger = ledger_with("datalog/semi-naive-volatile:main", chain_data(4)).await;
+    let rules = sparql_rules(
+        &ledger,
+        &[
+            "CONSTRUCT { ?x ex:caseId ?id } WHERE { ?x a ex:Root BIND(STRUUID() AS ?id) }"
+                .to_string(),
+            "CONSTRUCT { ?x ex:caseId ?id } WHERE { ?x ex:parent ?y . ?y ex:caseId ?c \
+             BIND(STRUUID() AS ?id) }"
+                .to_string(),
+        ],
+    );
+    for schedule in [RuleSchedule::Dependencies, RuleSchedule::WholeProgram] {
+        let result = run_fixpoint_with_schedule(
+            ledger.as_graph_db_ref(0),
+            &rules,
+            MAX_PASSES,
+            &ReasoningBudget::unlimited(),
+            RuleExecutionEnv::default(),
+            schedule,
+        )
+        .await
+        .expect("fixpoint");
+        assert_eq!(
+            result.diagnostics.capped_reason.as_deref(),
+            Some("iterations"),
+            "{schedule:?}: completed after {} passes and {} facts",
+            result.diagnostics.iterations,
+            result.derived_flakes.len()
+        );
+    }
 }

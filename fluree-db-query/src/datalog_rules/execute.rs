@@ -417,6 +417,13 @@ fn plan_reevaluations(
             .flat_map(|&i| dependencies.footprint(i).writes.iter().cloned())
             .collect();
         for &index in &group.rules {
+            // Skipping old matches is only sound when re-running the body
+            // over them would give the same rows. A volatile function gives
+            // new ones every pass, and a seed carries no transaction
+            // metadata for `t`/`op` to read.
+            if !dependencies.footprint(index).repeatable {
+                continue;
+            }
             plans[index] = Reevaluation::plan(&rule_set.rules[index].body.query, &writes, snapshot);
             if matches!(plans[index], Reevaluation::Full) {
                 tracing::debug!(

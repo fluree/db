@@ -109,7 +109,9 @@ overlay, so a match using new facts in two positions is found twice and
 deduplicated; splitting old and new facts per position would need two
 overlays per pass. A rule that reads its group's writes anywhere else — a
 UNION branch, EXISTS, a subquery, a property path, the trailing VALUES block —
-re-runs its whole body every pass.
+re-runs its whole body every pass. So does a rule whose footprint is not
+repeatable: a volatile function gives new rows for old matches every pass,
+and a seed carries no transaction metadata for `t`/`op` to read.
 
 A recursive group of one rule shaped as a transitive closure skips
 iteration (`datalog_rules/closure.rs`). With `R₀` the `R` facts visible when

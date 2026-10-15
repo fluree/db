@@ -8,11 +8,11 @@
 //! must not see. Rules one step away from a closure keep iterating, and so
 //! does a left-linear closure while its path predicate has a literal object.
 
-use crate::it_datalog_rule_schedule::{fact_set, run};
+use crate::it_datalog_rule_schedule::{fact_set, jsonld_rules, run};
 use crate::it_datalog_semi_naive::{both_schedules, derived};
 use crate::support::{genesis_ledger, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
-use fluree_db_query::datalog_rules::{parse_query_time_rule, DatalogRuleSet, RuleSchedule};
+use fluree_db_query::datalog_rules::RuleSchedule;
 use serde_json::json;
 
 const BASE: &str = "CONSTRUCT { ?x ex:reach ?y } WHERE { ?x ex:next ?y }";
@@ -132,24 +132,21 @@ async fn near_closure_rules_iterate_and_match_iteration() {
 async fn a_nested_json_ld_closure_runs_as_one_path() {
     let ledger = trig_ledger("datalog/closure-jsonld:main", DATA).await;
     let ctx = json!({"ex": "http://example.org/"});
-    let rules = [
-        json!({
-            "@context": ctx,
-            "where": {"@id": "?x", "ex:next": "?y"},
-            "insert": {"@id": "?x", "ex:reach": {"@id": "?y"}}
-        }),
-        json!({
-            "@context": ctx,
-            "where": {"@id": "?x", "ex:reach": {"ex:reach": "?z"}},
-            "insert": {"@id": "?x", "ex:reach": {"@id": "?z"}}
-        }),
-    ];
-    let mut rule_set = DatalogRuleSet::new();
-    for (i, rule) in rules.into_iter().enumerate() {
-        let stored = json!({"@id": format!("ex:rule{i}"), "f:rule": rule});
-        let parsed = parse_query_time_rule(&stored, &ledger.snapshot, i).expect("rule parses");
-        rule_set.add_rule(parsed).expect("unique ids");
-    }
+    let rule_set = jsonld_rules(
+        &ledger,
+        vec![
+            json!({
+                "@context": ctx,
+                "where": {"@id": "?x", "ex:next": "?y"},
+                "insert": {"@id": "?x", "ex:reach": {"@id": "?y"}}
+            }),
+            json!({
+                "@context": ctx,
+                "where": {"@id": "?x", "ex:reach": {"ex:reach": "?z"}},
+                "insert": {"@id": "?x", "ex:reach": {"@id": "?z"}}
+            }),
+        ],
+    );
     let scheduled = run(&ledger, &rule_set, RuleSchedule::Dependencies).await;
     let reference = run(&ledger, &rule_set, RuleSchedule::WholeProgram).await;
     assert_eq!(fact_set(&scheduled), fact_set(&reference));

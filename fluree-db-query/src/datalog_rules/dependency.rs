@@ -108,9 +108,11 @@ pub struct RuleFootprint {
     pub writes: Vec<Access>,
     /// Re-running the body over the same facts yields the same rows, and more
     /// facts never remove a row. False when the body calls a function whose
-    /// result can change between calls (`NOW`, `RAND`, `UUID`, `BNODE`, …) or
-    /// uses a shortest path, whose chosen path can change as edges are added.
-    /// Only a repeatable rule may run once instead of every round.
+    /// result can change between calls (`NOW`, `RAND`, `UUID`, `BNODE`, …),
+    /// reads a match's transaction metadata (`t`, `op`), or uses a shortest
+    /// path, whose chosen path can change as edges are added.
+    /// Only a repeatable rule may run once instead of every round, or re-read
+    /// only new facts in a recursive group.
     pub repeatable: bool,
 }
 

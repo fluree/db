@@ -574,7 +574,9 @@ When both OWL 2 RL and Datalog are enabled:
   patterns (`?x ex:ancestor ?y . ?y ex:ancestor ?z`) runs twice per pass. A
   rule that reads its group's conclusions inside a `UNION`, `EXISTS`,
   subquery or property path re-runs its whole `WHERE` clause every pass
-  instead: it derives the same facts, more slowly.
+  instead: it derives the same facts, more slowly. So does a recursive rule
+  that calls a function whose result changes between calls (`NOW()`,
+  `STRUUID()`, …) or reads a value's transaction metadata (`t`, `op`).
 - **A transitive closure runs as one traversal.** A recursive rule that is
   alone in its group and has the shape of a transitive closure is evaluated
   in a single pass as a property path instead of iterating, and derives the

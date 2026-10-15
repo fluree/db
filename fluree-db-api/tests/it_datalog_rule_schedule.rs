@@ -45,6 +45,18 @@ pub(crate) fn sparql_rules(ledger: &MemoryLedger, rules: &[String]) -> DatalogRu
     set
 }
 
+/// JSON-LD rules (`where`/`insert`, with their own `@context`).
+pub(crate) fn jsonld_rules(ledger: &MemoryLedger, rules: Vec<Value>) -> DatalogRuleSet {
+    let mut set = DatalogRuleSet::new();
+    for (i, rule) in rules.into_iter().enumerate() {
+        let stored = json!({"@id": format!("ex:rule{i:02}"), "f:rule": rule});
+        let parsed = parse_query_time_rule(&stored, &ledger.snapshot, i)
+            .unwrap_or_else(|e| panic!("rule {i} failed to parse: {e}"));
+        set.add_rule(parsed).expect("unique ids");
+    }
+    set
+}
+
 pub(crate) async fn run(
     ledger: &MemoryLedger,
     rules: &DatalogRuleSet,
