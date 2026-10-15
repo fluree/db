@@ -45,6 +45,8 @@ pub struct DictionaryAllowance {
     evicted_bytes: AtomicU64,
     busy: AtomicU64,
     no_room: AtomicU64,
+    repromoted: AtomicU64,
+    repromoted_bytes: AtomicU64,
 }
 
 #[derive(Default)]
@@ -100,6 +102,11 @@ pub struct AllowanceStats {
     /// Promotions turned away: another in flight, or no room yet.
     pub busy: u64,
     pub no_room: u64,
+    /// Promotions of a pack promoted before, and so evicted since.
+    pub repromoted: u64,
+    pub repromoted_bytes: u64,
+    /// Bytes of evicted packs a reader still holds.
+    pub outstanding: u64,
 }
 
 /// A decrypted pack held within the allowance; dropping the last reference
@@ -195,6 +202,8 @@ impl DictionaryAllowance {
             evicted_bytes: AtomicU64::new(0),
             busy: AtomicU64::new(0),
             no_room: AtomicU64::new(0),
+            repromoted: AtomicU64::new(0),
+            repromoted_bytes: AtomicU64::new(0),
         })
     }
 
@@ -220,6 +229,12 @@ impl DictionaryAllowance {
         let meter = Arc::new(crate::read::cached_units::MissMeter::new(units));
         state.meters.insert(identity, Arc::downgrade(&meter));
         meter
+    }
+
+    /// Record that a pack promoted before, `len` bytes, was promoted again.
+    pub fn note_repromotion(&self, len: u64) {
+        self.repromoted.fetch_add(1, Ordering::Relaxed);
+        self.repromoted_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
     /// The pool's copy of `identity`, if it holds one.
@@ -430,6 +445,17 @@ impl DictionaryAllowance {
             evicted_bytes: load(&self.evicted_bytes),
             busy: load(&self.busy),
             no_room: load(&self.no_room),
+            repromoted: load(&self.repromoted),
+            repromoted_bytes: load(&self.repromoted_bytes),
+            outstanding: state.used.saturating_sub(
+                state.resident.values().map(|p| p.len() as u64).sum::<u64>()
+                    + state
+                        .held
+                        .values()
+                        .filter_map(Weak::upgrade)
+                        .map(|p| p.len() as u64)
+                        .sum::<u64>(),
+            ),
         }
     }
 }
@@ -559,9 +585,11 @@ mod tests {
             Promotion::NoRoom
         ));
         assert!(reader.is_evicted() && allowance.resident(1).is_none());
-        assert_eq!(allowance.stats().used, 60, "still charged");
+        let stats = allowance.stats();
+        assert_eq!((stats.used, stats.outstanding), (60, 60), "still charged");
         drop(reader);
-        assert_eq!(allowance.stats().used, 0);
+        let stats = allowance.stats();
+        assert_eq!((stats.used, stats.outstanding), (0, 0));
         promoted(allowance.promote(2, 60, 0, 1, || assembled(60)).unwrap());
         assert_eq!(allowance.stats().peak, 60);
     }

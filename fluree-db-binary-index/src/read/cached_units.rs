@@ -130,6 +130,8 @@ fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
 pub struct MissMeter {
     bytes: AtomicU64,
     units: Box<[AtomicU64]>,
+    /// Times the metered source has been promoted whole.
+    promotions: AtomicU64,
 }
 
 impl MissMeter {
@@ -137,6 +139,7 @@ impl MissMeter {
         Self {
             bytes: AtomicU64::new(0),
             units: (0..units.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            promotions: AtomicU64::new(0),
         }
     }
 
@@ -156,6 +159,11 @@ impl MissMeter {
             .iter()
             .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
             .sum()
+    }
+
+    /// Count a promotion of the source; returns how many came before it.
+    pub fn note_promotion(&self) -> u64 {
+        self.promotions.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn reset(&self) {

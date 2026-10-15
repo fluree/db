@@ -368,6 +368,8 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
         "rent_distinct_units": s.rent_distinct_units, "rent_units": s.rent_units,
         "evicted": s.evicted, "evicted_bytes": s.evicted_bytes,
         "busy": s.busy, "no_room": s.no_room,
+        "repromoted": s.repromoted, "repromoted_bytes": s.repromoted_bytes,
+        "outstanding": s.outstanding,
     })
 }
 

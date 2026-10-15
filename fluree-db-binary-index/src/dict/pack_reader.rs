@@ -179,6 +179,9 @@ impl AdaptivePack {
         )?;
         match promotion {
             Promotion::Promoted(pack) => {
+                if self.meter.note_promotion() > 0 {
+                    self.allowance.note_repromotion(pack.len() as u64);
+                }
                 self.adopt(&pack);
                 self.units.forget_cached();
                 fluree_db_core::io_stats::record_work("pack promoted whole", pack.len());
@@ -2334,8 +2337,21 @@ mod tests {
                 2,
                 "rent restarted"
             );
+            assert_eq!(cache.dictionary_allowance().stats().repromoted, 0);
+            read_ids(&a, FIRST, HALF..COUNT as u64);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!(
+                (stats.promoted, stats.repromoted, stats.repromoted_bytes),
+                (3, 1, len),
+                "promoted again once it rents its size again"
+            );
             read_all(&b, other);
-            assert_eq!(cache.dictionary_allowance().stats().evicted, 1);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!(
+                (stats.evicted, stats.repromoted),
+                (3, 2),
+                "b rents its size again and evicts a"
+            );
         }
 
         /// An evicted pack a reader still holds stays charged, so a promotion
