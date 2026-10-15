@@ -123,12 +123,47 @@ impl FencedLeaf {
         }
     }
 
-    /// Scan the fenced entries in place, each read from the unit holding it.
+    /// Scan the fenced entries in place: those wholly within a unit straight
+    /// from its bytes, one crossing into the next through the cursor.
     fn scan(units: &CachedUnits, key: &[u8], fenced: &Fenced) -> io::Result<Option<u64>> {
+        let size = units.unit_size();
         let mut cursor = UnitCursor::new(units);
         let mut pos = fenced.offset;
+        let mut remaining = fenced.end_index - fenced.index;
         let mut found = None;
-        for _ in fenced.index..fenced.end_index {
+        'units: while remaining > 0 {
+            let index = pos / size;
+            let base = index * size;
+            let unit = cursor.unit(index)?;
+            let limit = fenced.end_offset.min(base + unit.len() as u64) - base;
+            let bytes = &unit[..limit as usize];
+            let mut at = (pos - base) as usize;
+            while remaining > 0 {
+                let Some(len) = bytes.get(at..at + 4) else {
+                    break;
+                };
+                let key_len = u32::from_le_bytes(len.try_into().expect("four bytes")) as usize;
+                let id_end = at + 4 + key_len + 8;
+                let Some(entry) = bytes.get(at + 4..id_end) else {
+                    break;
+                };
+                remaining -= 1;
+                let (entry_key, id) = entry.split_at(key_len);
+                match entry_key.cmp(key) {
+                    std::cmp::Ordering::Less => at = id_end,
+                    std::cmp::Ordering::Greater => break 'units,
+                    std::cmp::Ordering::Equal => {
+                        found = Some(u64::from_le_bytes(id.try_into().expect("eight bytes")));
+                        break 'units;
+                    }
+                }
+            }
+            pos = base + at as u64;
+            if remaining == 0 {
+                break;
+            }
+            // The next entry runs out of this unit's bytes: across into the
+            // next unit, or past the stretch.
             let len_end = pos + 4;
             if len_end > fenced.end_offset {
                 return Err(Self::invalid("entry past its stretch"));
@@ -140,6 +175,7 @@ impl FencedLeaf {
             if id_end > fenced.end_offset {
                 return Err(Self::invalid("entry past its stretch"));
             }
+            remaining -= 1;
             let entry = cursor.read(len_end..id_end)?;
             let (entry_key, id) = entry.split_at(key_len as usize);
             match entry_key.cmp(key) {
@@ -1762,47 +1798,51 @@ mod tests {
             let entries: Vec<ReverseEntry> = entries().into_iter().take(2_000).collect();
             let blob = crate::dict::reverse_leaf::encode_reverse_leaf(&entries);
             let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
-            let fences = leaf.fences(4096);
-            let at = fences.offset(1) as usize;
-            let mut bad = blob.clone();
-            bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            // The last entry before fence 3 runs past its stretch but not
-            // past the leaf.
-            let last = fences.index(3) as usize - 1;
-            let last_at = fences.offset(3) as usize - (12 + entries[last].key.len());
-            let overrun = entries[last].key.len() as u32 + 16;
-            bad[last_at..last_at + 4].copy_from_slice(&overrun.to_le_bytes());
-            let cs = SegmentedContentStore::new(true);
-            let cid = cs.put_sync(
-                ContentKind::DictBlob {
-                    dict: DictKind::SubjectReverse,
-                },
-                &bad,
-            );
-            let source = cs.get_local_ranged(&cid).unwrap().unwrap();
-            let cache = Arc::new(LeafletCache::with_max_mb(4));
-            let fenced = FencedLeaf {
-                source,
-                fences,
-                entry_count: leaf.entry_count(),
-                len: blob.len() as u64,
-            };
-            // The corrupted entry's own key: every lookup must read it.
-            let key = &entries[fenced.fences.index(1) as usize].key;
-            for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
-                let err = fenced.lookup(key, mode, &cache).unwrap_err();
-                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{mode:?}");
-            }
-            for mode in [FencedLookup::Scan, FencedLookup::Copy] {
-                let err = fenced.lookup(&entries[last].key, mode, &cache).unwrap_err();
-                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{mode:?}");
-            }
-            let fine = &entries[fenced.fences.index(3) as usize].key;
-            for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
-                assert!(
-                    fenced.lookup(fine, mode, &cache).unwrap().is_some(),
-                    "{mode:?}"
+            // Fences at the 4 KiB read unit, and closer, so a stretch ends
+            // inside a unit.
+            for spacing in [4096usize, 512] {
+                let fences = leaf.fences(spacing);
+                let at = fences.offset(1) as usize;
+                let mut bad = blob.clone();
+                bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+                // The last entry before fence 3 runs past its stretch but not
+                // past the leaf.
+                let last = fences.index(3) as usize - 1;
+                let last_at = fences.offset(3) as usize - (12 + entries[last].key.len());
+                let overrun = entries[last].key.len() as u32 + 16;
+                bad[last_at..last_at + 4].copy_from_slice(&overrun.to_le_bytes());
+                let cs = SegmentedContentStore::new(true);
+                let cid = cs.put_sync(
+                    ContentKind::DictBlob {
+                        dict: DictKind::SubjectReverse,
+                    },
+                    &bad,
                 );
+                let source = cs.get_local_ranged(&cid).unwrap().unwrap();
+                let cache = Arc::new(LeafletCache::with_max_mb(4));
+                let fenced = FencedLeaf {
+                    source,
+                    fences,
+                    entry_count: leaf.entry_count(),
+                    len: blob.len() as u64,
+                };
+                // The corrupted entry's own key: every lookup must read it.
+                let key = &entries[fenced.fences.index(1) as usize].key;
+                for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
+                    let err = fenced.lookup(key, mode, &cache).unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{spacing} {mode:?}");
+                }
+                for mode in [FencedLookup::Scan, FencedLookup::Copy] {
+                    let err = fenced.lookup(&entries[last].key, mode, &cache).unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{spacing} {mode:?}");
+                }
+                let fine = &entries[fenced.fences.index(3) as usize].key;
+                for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
+                    assert!(
+                        fenced.lookup(fine, mode, &cache).unwrap().is_some(),
+                        "{spacing} {mode:?}"
+                    );
+                }
             }
         }
     }

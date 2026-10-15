@@ -243,6 +243,10 @@ impl CachedUnits {
         self.len == 0
     }
 
+    pub fn unit_size(&self) -> u64 {
+        self.unit_size
+    }
+
     /// The source's units: at least one, since even an empty source has
     /// an end to authenticate.
     pub fn unit_count(&self) -> u64 {
@@ -381,6 +385,14 @@ impl<'a> UnitCursor<'a> {
             held: None,
             spanning: Vec::new(),
         }
+    }
+
+    /// Unit `index`, held for later reads within it.
+    pub fn unit(&mut self, index: u64) -> io::Result<Arc<[u8]>> {
+        if self.held.as_ref().is_none_or(|(held, _)| *held != index) {
+            self.held = Some((index, self.units.unit(index)?));
+        }
+        Ok(Arc::clone(&self.held.as_ref().expect("held above").1))
     }
 
     /// Exactly the bytes of `range`, which must be non-empty and within the
