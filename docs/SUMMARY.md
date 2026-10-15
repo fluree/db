@@ -93,6 +93,7 @@
   - [SHACL validation](guides/cookbook-shacl.md)
   - [Edge annotations](guides/cookbook-edge-annotations.md)
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
+  - [Custom stages in Python](guides/custom-stages-python.md)
 
 - [Design](design/README.md)
   - [Performance architecture](design/performance.md)
