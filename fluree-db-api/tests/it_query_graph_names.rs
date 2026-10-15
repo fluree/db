@@ -114,3 +114,30 @@ async fn a_rule_body_names_its_graph_compactly() {
     });
     assert_eq!(names(&fluree, &ledger, &query).await, vec![json!("ex:bob")]);
 }
+
+/// An update's `where` names its graph the same way, so an update that reads
+/// and writes one graph by its compact name copies the value instead of
+/// matching nothing.
+#[tokio::test]
+async fn an_update_where_clause_names_its_graph_compactly() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger(&fluree, "graph-names/update:main").await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": [["graph", "ex:staff", {"@id": "ex:bob", "schema:name": "?n"}]],
+                "insert": [["graph", "ex:staff", {"@id": "ex:bob", "ex:copied": "?n"}]]
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    let copied = json!({
+        "@context": ctx(),
+        "select": "?n",
+        "where": [["graph", "http://example.org/ns/staff", {"@id": "ex:bob", "ex:copied": "?n"}]]
+    });
+    assert_eq!(names(&fluree, &ledger, &copied).await, vec![json!("Bob")]);
+}
