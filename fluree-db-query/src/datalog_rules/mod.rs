@@ -7,8 +7,9 @@
 //! executor supports is available to a rule: edge annotations (`@annotation`,
 //! `{| |}`, `~ ?r`), claim-first patterns (`@reifies`, `rdf:reifies`), full
 //! FILTER expressions, BIND, VALUES, UNION, property paths and subqueries.
-//! The only constructs a rule body may not use are the non-monotonic ones
-//! (OPTIONAL, MINUS, NOT EXISTS, aggregates, SERVICE), which a fixpoint cannot
+//! `NOT EXISTS` is supported when the program is stratified: no rule may
+//! negate facts that depend on its own conclusions. The constructs a rule
+//! body may not use (OPTIONAL, MINUS, aggregates, SERVICE) a fixpoint cannot
 //! evaluate soundly; those are rejected with an error naming the construct.
 //!
 //! Rules are stored as `f:rule` values (JSON with `where`/`insert`, or an
@@ -148,6 +149,16 @@ impl DatalogRuleSet {
 
     pub fn len(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Names of the rules that negate facts (see
+    /// [`RuleFootprint::is_non_monotone`]).
+    pub fn non_monotone_rules(&self) -> Vec<&str> {
+        self.rules
+            .iter()
+            .filter(|r| r.footprint.is_non_monotone())
+            .map(|r| r.name.as_str())
+            .collect()
     }
 
     /// Whether some rule calls `NOW()` or `TODAY()`, so the run needs an

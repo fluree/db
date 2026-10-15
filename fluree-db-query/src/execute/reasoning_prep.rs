@@ -366,6 +366,30 @@ pub async fn compute_derived_facts(
                 }
                 diagnostics = Some(result.diagnostics.clone());
 
+                // Datalog reads the OWL closure as a finished input. A rule
+                // that negates over it would treat entailments the cap cut
+                // off as absent and derive conclusions that are false, not
+                // merely missing.
+                if result.diagnostics.capped {
+                    if let Some(rule) = rule_set
+                        .as_ref()
+                        .and_then(|rules| rules.non_monotone_rules().first().copied())
+                    {
+                        return Err(crate::error::QueryError::ResourceLimit(format!(
+                            "OWL 2 RL materialization hit its budget ({}) before datalog rule \
+                             {rule}, which uses negation, could read a complete closure. \
+                             Raise the budget via f:reasoningMaxFacts / f:reasoningMaxSeconds / \
+                             f:reasoningMaxMemoryMb (ledger config) or \"reasoningBudget\" \
+                             (query)",
+                            result
+                                .diagnostics
+                                .capped_reason
+                                .as_deref()
+                                .unwrap_or("budget")
+                        )));
+                    }
+                }
+
                 // Without datalog there is nothing to combine: hand the
                 // prebuilt (cached, pre-sorted) overlay straight to
                 // execution instead of re-collecting and re-sorting its

@@ -203,6 +203,18 @@ pub async fn run_fixpoint_with_schedule(
     }
 
     let dependencies = rule_set.dependencies();
+    if let Some(cycle) = dependencies.unstratified_negation(rule_set) {
+        return Err(QueryError::InvalidQuery(cycle));
+    }
+    if schedule == RuleSchedule::WholeProgram {
+        if let Some(rule) = rule_set.non_monotone_rules().first() {
+            return Err(QueryError::InvalidQuery(format!(
+                "datalog rule {rule} uses negation, which the whole-program schedule cannot \
+                 evaluate: it runs every rule from the first round, before what the rule \
+                 negates is complete"
+            )));
+        }
+    }
     let whole_program = RuleComponent {
         rules: (0..rule_set.len()).collect(),
         recursive: true,
@@ -365,15 +377,38 @@ pub async fn run_fixpoint_with_schedule(
     diagnostics.evaluation_time = state.evaluation_time.as_ref().map(DateTime::canonical);
     match capped {
         Some(reason) => {
+            let pending: Vec<&RuleComponent> = stages
+                .iter()
+                .skip(capped_stage + 1)
+                .flatten()
+                .copied()
+                .collect();
+            let unfinished = cut_short
+                .iter()
+                .chain(&pending)
+                .flat_map(|g| g.rules.iter().map(|&i| &rule_set.rules[i]));
+            if let Some(rule) = unfinished
+                .into_iter()
+                .find(|r| r.footprint.is_non_monotone())
+            {
+                return Err(QueryError::ResourceLimit(format!(
+                    "the reasoning budget ({reason}) ran out before datalog rule {} could \
+                     finish. It uses negation, so its conclusions are only meaningful over \
+                     complete inputs, and the query fails rather than answer from a partial \
+                     run. Raise the budget via f:reasoningMaxFacts / f:reasoningMaxSeconds / \
+                     f:reasoningMaxMemoryMb (ledger config) or \"reasoningBudget\" (query)",
+                    rule.name
+                )));
+            }
             diagnostics.mark_capped(reason, passes, facts, elapsed);
-            let names = |groups: &mut dyn Iterator<Item = &RuleComponent>| -> Vec<String> {
+            let names = |groups: &[&RuleComponent]| -> Vec<String> {
                 groups
+                    .iter()
                     .flat_map(|g| g.rules.iter().map(|&i| rule_set.rules[i].name.clone()))
                     .collect()
             };
-            diagnostics.capped_rules = names(&mut cut_short.into_iter());
-            diagnostics.pending_rules =
-                names(&mut stages.iter().skip(capped_stage + 1).flatten().copied());
+            diagnostics.capped_rules = names(&cut_short);
+            diagnostics.pending_rules = names(&pending);
         }
         None => diagnostics.mark_completed(passes, facts, elapsed),
     }

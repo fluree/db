@@ -261,6 +261,7 @@ fn build_rule(
     validate::validate_body(&query, snapshot, &label, origin)?;
     let body_vars = validate::body_vars(&query);
     validate::check_range_restriction(&heads, &body_vars, &vars, &label)?;
+    validate::check_negation_safety(&query.patterns, &vars, &label)?;
     validate::warn_iri_vs_literal(&query, &vars, &label);
 
     // The body projects every variable it binds; a rule has no modifiers of
