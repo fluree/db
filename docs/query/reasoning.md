@@ -330,6 +330,10 @@ just logged:
 - `rules_fired` breaks the tally down per rule. It counts derived **facts**
   per rule, not rule applications: a rule that matches a thousand rows and
   derives one new fact from them counts once.
+- When datalog rules are capped, `capped_rules` names the rules that were
+  running when the cap fired and `pending_rules` the rules it kept from
+  running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
+  time they returned (see [Datalog rules](datalog-rules.md)).
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):

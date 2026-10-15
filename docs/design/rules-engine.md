@@ -56,8 +56,9 @@ expressions, BIND, VALUES, UNION, property paths, and subqueries.
 Rule bodies run with reasoning disabled (no re-entrant materialization), as
 root (derived facts are policy-filtered after materialization, exactly as
 before), with eager materialization so every binding is a decoded `Sid` or
-literal, and without fuel or cancellation limits of their own (the reasoning
-budget bounds them).
+literal, and without fuel limits of their own. Each body runs under a
+cancellation handle that times out at the reasoning budget's deadline, so a
+long body stops at its next checkpoint instead of running to completion.
 
 ### Fixpoint
 
@@ -199,6 +200,24 @@ The fixpoint's pass limit is reported like a budget cap: stopping at
 sets `capped_reason: "iterations"` and logs a warning, so a truncated closure
 is never indistinguishable from a converged one (#1559).
 
+### Run contract
+
+- **Evaluation time.** `NOW()` and `TODAY()` read
+  `ExecutionContext::evaluation_time` when it is set, and rule bodies always
+  set it. A run's time is the query's `reasoningTime` /
+  `# PRAGMA reasoning-time:`, else the commit time (`db:time` in the
+  txn-meta graph) of the commit at the queried `t`. A snapshot with no commit
+  at that `t` fails a program whose footprint `reads_clock`, rather than
+  falling back to the wall clock. With one time per run, both functions are
+  repeatable for scheduling and semi-naive purposes. A requested time is part
+  of the cache key; a defaulted one is already pinned by `to_t`.
+- **Deadline.** The reasoning budget's deadline becomes the body's
+  `QueryCancellation::with_deadline`; a cancelled body caps the run on time.
+- **Attribution.** A capped run records `capped_rules` (the groups still
+  running when the cap fired) and `pending_rules` (the stages after it), and
+  both reach the tracked response. The Raft-recorded tally mirror does not
+  carry them, so its positional wire form is unchanged.
+
 ### IRI operands in JSON-LD filters
 
 The JSON-LD query filter language could not compare a variable to an IRI:
@@ -270,8 +289,9 @@ ids, which would make derived provenance durable and diffable across commits.
 Materialization happens while the query is *prepared*, before its execution
 context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
 materialization always has. A rule body is therefore bounded by the reasoning
-budget (facts, memory, time — checked as its rows arrive) but cannot be
-cancelled mid-body by the query's cancellation token, and its scans are not
+budget (facts, memory, and time — checked as its rows arrive, and time also
+at a running body's checkpoints) but cannot be cancelled by the query's own
+cancellation token, such as a client disconnect, and its scans are not
 charged as query fuel. Threading the tracker and cancellation into
 prepare-time materialization is the follow-up that closes this for both
 engines.
@@ -283,6 +303,6 @@ to annotations would have meant re-implementing the planner's annotation
 expansion (`expand_edge_annotation_patterns`), the three annotation read lanes,
 and join ordering, inside a second engine. Two real costs of the executor
 approach were weighed and accepted: per-rule planning overhead of a few
-milliseconds per round, and the loss of a cheap semi-naive delta restriction
-(the old engine did not have one either; it re-ran every rule against the full
-overlay each round).
+milliseconds per pass, and a delta restriction that seeds a body with a
+`VALUES` block (see Fixpoint) rather than living inside a dedicated join
+operator.

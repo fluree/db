@@ -289,8 +289,11 @@ pub async fn compute_derived_facts(
         let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
         let key = overlay.content_version().map(|overlay_version| {
             let mut h = DefaultHasher::new();
-            "datalog-v2".hash(&mut h);
+            "datalog-v3".hash(&mut h);
             budget.config_hash().hash(&mut h);
+            // A defaulted evaluation time is the commit time at `to_t`, which
+            // the key already pins; a requested one is part of the key.
+            reasoning.evaluation_time.hash(&mut h);
             reasoning.owl2rl.hash(&mut h);
             g_id.hash(&mut h);
             rules_source_g_id.hash(&mut h);
@@ -413,7 +416,10 @@ pub async fn compute_derived_facts(
             "executing user-defined datalog rules"
         );
         const MAX_DATALOG_ITERATIONS: usize = 100;
-        let env = RuleExecutionEnv { binary_store };
+        let env = RuleExecutionEnv {
+            binary_store,
+            evaluation_time: reasoning.evaluation_time.as_ref(),
+        };
 
         // If OWL2-RL produced derived facts, run the rules over base + OWL
         // entailments so datalog can chain off them.
@@ -470,6 +476,9 @@ pub async fn compute_derived_facts(
                     }
                     fired
                 },
+                capped_rules: dl_diag.capped_rules,
+                pending_rules: dl_diag.pending_rules,
+                evaluation_time: dl_diag.evaluation_time,
             },
         });
         all_flakes.extend(datalog_result.derived_flakes);
