@@ -346,3 +346,75 @@ async fn a_tracked_query_reports_which_rules_did_not_finish() {
     assert_eq!(reasoning.capped_rules, vec!["ex:base"]);
     assert_eq!(reasoning.pending_rules, vec!["ex:downstream"]);
 }
+
+/// A query of an earlier snapshot evaluates at that snapshot's commit time,
+/// not the latest commit's, so asking about the past answers as of then.
+#[tokio::test]
+async fn a_historical_query_evaluates_at_its_own_commit_time() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "datalog/contract-historical-time:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let before = chrono::Utc::now();
+    let ledger = fluree
+        .insert(ledger, &chain_data(3))
+        .await
+        .expect("seed")
+        .ledger;
+    let after = chrono::Utc::now();
+    std::thread::sleep(Duration::from_millis(20));
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:later", "ex:p": 1}),
+        )
+        .await
+        .expect("second commit");
+
+    let stamped = |from: String| {
+        let fluree = &fluree;
+        async move {
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": from,
+                "select": "?t",
+                "where": {"@id": "?x", "ex:stampedAt": "?t"},
+                "reasoning": "datalog",
+                "rules": [{
+                    "@context": {"ex": "http://example.org/"},
+                    "where": [{"@id": "?x", "@type": "ex:Root"}, ["bind", "?t", "(now)"]],
+                    "insert": {"@id": "?x", "ex:stampedAt": "?t"}
+                }]
+            });
+            let resp = fluree
+                .query_from()
+                .jsonld(&query)
+                .track_all()
+                .execute_tracked()
+                .await
+                .expect("execute_tracked");
+            let time = resp
+                .reasoning
+                .and_then(|r| r.evaluation_time)
+                .expect("an evaluation time");
+            (time, resp.result)
+        }
+    };
+    let instant = |time: &str| DateTime::parse(time).unwrap().instant();
+
+    let (historical, rows) = stamped(format!("{ledger_id}@t:1")).await;
+    assert_eq!(
+        rows,
+        json!([{"@value": historical, "@type": "http://www.w3.org/2001/XMLSchema#dateTime"}]),
+        "NOW() in the rule body is the evaluation time"
+    );
+    assert!(
+        instant(&historical) >= before - chrono::Duration::milliseconds(1)
+            && instant(&historical) <= after,
+        "{historical} is outside the first commit's window {before}..{after}"
+    );
+    let (latest, _) = stamped(ledger_id.to_string()).await;
+    assert!(
+        instant(&latest) > after,
+        "{latest} is not the second commit's time"
+    );
+}

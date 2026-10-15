@@ -411,8 +411,9 @@ negate facts its recursion does not derive.
 that depend on its own conclusions has no order in which the negated facts
 are complete — accepting a candidate unless it is rejected, while rejecting
 candidates that conflict with accepted ones, is the classic case. Fluree
-refuses such a program and names the cycle, for example
-`ex:accept -not-> ex:reject -> ex:accept`, where each arrow reads facts from
+refuses such a program and names the facts negated and the cycle, for
+example `ex:accept negates rdf:type http://example.org/Rejected facts …
+(ex:accept -not-> ex:reject -> ex:accept)`, where each arrow reads facts from
 the rule it points to.
 
 **Bind what you negate on.** A variable a negation shares with the rest of
@@ -423,7 +424,7 @@ inside one and something else elsewhere, so the rule is rejected. Variables
 used only inside the negation (`?p` here) are local to it.
 
 **Budgets.** If the reasoning budget runs out before a negating rule
-finishes, or OWL 2 RL is capped before a negating rule reads its
+finishes, or OWL 2 RL is capped (or fails) before a negating rule reads its
 entailments, the query fails with an error naming the rule. A positive
 program answers capped instead; a negation over incomplete facts can turn
 a missing fact into a false conclusion.
@@ -459,8 +460,8 @@ after every rule that can derive what it reads has finished, so a count over
 a recursive relation counts the finished closure. A rule may not aggregate
 facts that depend on its own conclusions; the program is rejected with the
 cycle named (`ex:a -agg-> ex:b -> ex:a`). If the reasoning budget runs out
-before an aggregating rule finishes, or OWL 2 RL is capped before it runs,
-the query fails rather than derive a count over part of its input.
+before an aggregating rule finishes, or OWL 2 RL is capped or fails before
+it runs, the query fails rather than derive a count over part of its input.
 
 **Groups.** A group exists only when some solution falls in it, so an
 account with no transactions gets no `ex:txnCount` fact, not a zero. Without
@@ -650,6 +651,46 @@ business logic:
 If `ex:friend` is declared as a `owl:SymmetricProperty`, OWL 2 RL
 materializes the reverse friendship links, and then the Datalog rule can
 find items liked by mutual friends.
+
+### Recent activity, unless excepted
+
+Recursion, a count over the clock and a negation combine in one program. An
+account is a candidate for review when it has at least three transactions in
+the 30 days before the evaluation time, and neither its holder nor any owner
+above the holder has an exception. Each `CONSTRUCT` is one stored rule (see
+[SPARQL rules](#sparql-rules)), with the `ex:` and `xsd:` prefixes declared:
+
+```sparql
+# Every owner above an entity.
+CONSTRUCT { ?e ex:within ?p } WHERE { ?e ex:ownedBy ?p }
+CONSTRUCT { ?e ex:within ?q } WHERE { ?e ex:within ?p . ?p ex:ownedBy ?q }
+
+# An exception at the holder, or above it.
+CONSTRUCT { ?a ex:coveredBy ?x } WHERE { ?a ex:holder ?h . ?h ex:exception ?x }
+CONSTRUCT { ?a ex:coveredBy ?x } WHERE {
+  ?a ex:holder ?h . ?h ex:within ?p . ?p ex:exception ?x
+}
+
+# Transactions inside the window.
+CONSTRUCT { ?a ex:recentCount ?n } WHERE {
+  { SELECT ?a (COUNT(?t) AS ?n) WHERE {
+      ?t ex:account ?a ; ex:at ?when
+      FILTER(?when > NOW() - "P30D"^^xsd:dayTimeDuration)
+    } GROUP BY ?a }
+}
+
+CONSTRUCT { ?a a ex:Candidate } WHERE {
+  ?a ex:recentCount ?n FILTER(?n >= 3)
+  FILTER NOT EXISTS { ?a ex:coveredBy ?x }
+}
+```
+
+The count and the negation run only after the rules they read have
+finished. Committing an exception anywhere above a holder removes the
+candidate from the next query, and retracting it restores the candidate. A
+query with a later `reasoningTime` moves the window with nothing committed.
+If the budget stops the run before the count or the negation can run, the
+query fails rather than report a candidate whose exception it never reached.
 
 ## Execution model
 

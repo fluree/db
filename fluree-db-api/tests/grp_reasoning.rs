@@ -9,6 +9,8 @@ mod it_datalog_closure_paths;
 mod it_datalog_named_graphs;
 #[path = "it_datalog_negation.rs"]
 mod it_datalog_negation;
+#[path = "it_datalog_program_assessment.rs"]
+mod it_datalog_program_assessment;
 #[path = "it_datalog_program_reachability.rs"]
 mod it_datalog_program_reachability;
 #[path = "it_datalog_rule_dependencies.rs"]

@@ -419,6 +419,18 @@ pub async fn compute_derived_facts(
                 owl_overlay = Some(result.overlay.clone());
             }
             Err(e) => {
+                // A positive program over a missing closure only derives
+                // less; one that negates or counts would read the missing
+                // entailments as absent.
+                if let Some((rule, construct)) = rule_set
+                    .as_ref()
+                    .and_then(|rules| rules.non_monotone_rules().first().copied())
+                {
+                    return Err(crate::error::QueryError::Internal(format!(
+                        "OWL 2 RL materialization failed ({e}), and datalog rule {rule} uses \
+                         {construct}, which needs a complete closure"
+                    )));
+                }
                 tracing::warn!(error = %e, "OWL2-RL reasoning failed, continuing without OWL derived facts");
                 // The combined entry is keyed as owl2rl+datalog. Caching a
                 // datalog-only overlay under it would serve every later

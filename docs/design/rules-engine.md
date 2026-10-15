@@ -209,7 +209,8 @@ edges like any other read: a negating or aggregating rule's stage comes after
 every rule that can write what it reads. `RuleDependencies::unstratified`
 rejects a program in which such a read may observe a write of the reading
 rule's own recursive group, reporting a cycle found by a breadth-first search
-inside that group (`-not->` or `-agg->` on the first arrow). Double negation counts as negated, which keeps the check
+inside that group (`-not->` or `-agg->` on the first arrow) and the facts
+the offending read names, with IRIs spelled out. Double negation counts as negated, which keeps the check
 conservative. The validator requires every variable a negation shares with
 its group to be bound by a positive pattern of that group (or of the group the
 negation is nested in).
@@ -217,8 +218,9 @@ negation is nested in).
 Because a cap stops all later stages, a negating or aggregating rule never
 runs over incomplete inputs within datalog. A capped run that leaves such a
 rule unfinished fails with `ResourceLimit` instead of returning partial
-conclusions, and so does an OWL 2 RL cap ahead of such a program, since the
-OWL closure is datalog's input. `RuleSchedule::WholeProgram` refuses these
+conclusions, and so does an OWL 2 RL cap or failure ahead of such a program,
+since the OWL closure is datalog's input (a positive program still runs over
+what OWL produced, or without it). `RuleSchedule::WholeProgram` refuses these
 programs: it runs every rule from the first round. A subquery's solutions are
 a bag, as in queries, and `owl:sameAs` aliases are counted as stated.
 

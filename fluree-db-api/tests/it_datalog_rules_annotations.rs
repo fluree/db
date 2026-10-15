@@ -364,7 +364,9 @@ async fn bang_exists_negates_like_not_exists() {
     )
     .await;
     assert!(
-        message.contains("negates facts that depend on its own conclusions"),
+        message.contains(
+            "negates http://example.org/trustedKnows facts, which depend on its own conclusions"
+        ),
         "unexpected rejection message: {message}"
     );
 }
@@ -534,7 +536,9 @@ async fn subquery_aggregate_over_its_own_conclusions_is_rejected() {
     )
     .await;
     assert!(
-        message.contains("aggregates facts that depend on its own conclusions"),
+        message.contains(
+            "aggregates http://example.org/trustedKnows facts, which depend on its own conclusions"
+        ),
         "unexpected rejection message: {message}"
     );
 }

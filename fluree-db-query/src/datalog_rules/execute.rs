@@ -211,7 +211,7 @@ pub async fn run_fixpoint_with_schedule(
     }
 
     let dependencies = rule_set.dependencies();
-    if let Some(cycle) = dependencies.unstratified(rule_set) {
+    if let Some(cycle) = dependencies.unstratified(rule_set, |sid| db.snapshot.decode_sid(sid)) {
         return Err(QueryError::InvalidQuery(cycle));
     }
     if schedule == RuleSchedule::WholeProgram {

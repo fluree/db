@@ -98,6 +98,22 @@ impl Access {
         }
     }
 
+    /// The facts this access touches, for diagnostics, with IRIs spelled out.
+    fn describe(&self, iri: &impl Fn(&Sid) -> Option<String>) -> String {
+        let name = |sid: &Sid| iri(sid).unwrap_or_else(|| sid.to_string());
+        let facts = match &self.predicate {
+            PredicateFootprint::Exact(p) => format!("{} facts", name(p)),
+            PredicateFootprint::Class(c) => format!("rdf:type {} facts", name(c)),
+            PredicateFootprint::Reifier => "edge annotations".to_string(),
+            PredicateFootprint::Any => "facts of any predicate".to_string(),
+        };
+        match &self.graph {
+            GraphScope::Default => facts,
+            GraphScope::Named(g) => format!("{facts} in graph {g}"),
+            GraphScope::AnyNamed => format!("{facts} in any named graph"),
+        }
+    }
+
     /// Whether a read with this footprint may match a fact written by `write`.
     pub fn may_observe(&self, write: &Access) -> bool {
         self.graph.may_overlap(&write.graph) && self.predicate.may_overlap(&write.predicate)
@@ -551,10 +567,15 @@ impl RuleDependencies {
     /// Whether some rule negates or aggregates facts its own recursive group
     /// derives. Such a program has no stratification: those facts are not
     /// complete before the rule reads them, so no evaluation order is sound.
-    /// The error names the cycle, the offending rule first:
-    /// `ex:a -not-> ex:b -> ex:a` (or `-agg->`), where each arrow reads facts
-    /// from the rule it points to.
-    pub fn unstratified(&self, rule_set: &DatalogRuleSet) -> Option<String> {
+    /// The error names the facts read and the cycle, the offending rule
+    /// first: `ex:a -not-> ex:b -> ex:a` (or `-agg->`), where each arrow reads
+    /// facts from the rule it points to. `iri` spells out predicates and
+    /// classes.
+    pub fn unstratified(
+        &self,
+        rule_set: &DatalogRuleSet,
+        iri: impl Fn(&Sid) -> Option<String>,
+    ) -> Option<String> {
         let name = |i: usize| rule_set.rules[i].name.as_str();
         for component in self.components.iter().filter(|c| c.recursive) {
             for &consumer in &component.rules {
@@ -570,13 +591,18 @@ impl RuleDependencies {
                             .map(|read| (read, "agg", "aggregates")),
                     );
                 for (negated, arrow, verb) in non_monotone_reads {
-                    let Some(&producer) = component.rules.iter().find(|&&p| {
+                    let Some((producer, write)) = component.rules.iter().find_map(|&p| {
                         self.footprints[p]
                             .writes
                             .iter()
-                            .any(|write| negated.may_observe(write))
+                            .find(|write| negated.may_observe(write))
+                            .map(|write| (p, write))
                     }) else {
                         continue;
+                    };
+                    let facts = match negated.predicate {
+                        PredicateFootprint::Any => write.describe(&iri),
+                        _ => negated.describe(&iri),
                     };
                     let mut cycle = vec![name(consumer)];
                     cycle.extend(
@@ -594,7 +620,7 @@ impl RuleDependencies {
                         })
                         .collect::<String>();
                     return Some(format!(
-                        "datalog rule {} {verb} facts that depend on its own conclusions \
+                        "datalog rule {} {verb} {facts}, which depend on its own conclusions \
                          ({arrows}; each arrow reads facts from the rule it points to). \
                          Negation and aggregation need what they read to be complete before \
                          the rule runs, which a cycle through them prevents",
