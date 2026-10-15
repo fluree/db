@@ -353,14 +353,18 @@ cancelled or runs out of fuel returns an error and caches nothing.
 
 `explain_derived_facts` (behind `Fluree::explain_derived`) materializes as a
 query with the same reasoning modes would, from the reasoning cache when it
-can, then re-runs the body of every rule whose head can produce the target
-over asserted plus derived facts and keeps the rows whose head instantiates
-to it (`datalog_rules::explain`). Each row becomes a derivation: the body's
+can, and takes the facts matching the target from the derived facts. It then
+re-runs the body of every repeatable rule whose head can produce the target,
+over asserted plus derived facts, and keeps the rows whose head instantiates
+to one of those facts, compared by full term identity (value, datatype,
+language tag) (`datalog_rules::explain`). Rules that are not repeatable are
+reported, not replayed. Each row becomes a derivation: the body's
 top-level triple patterns instantiated as premises (looked up in the
 asserted facts to mark them derived or not), its `NOT EXISTS` patterns
 instantiated as absences with their graph scope, and, for a grouped
-subquery, the subquery's patterns re-run without grouping and filtered to the
-row's group key. Explanations are one step and are not cached. They expose
+subquery, the subquery's patterns re-run without grouping, inside the
+`GRAPH` block that encloses the subquery, and filtered to the row's group
+key. Explanations are one step and are not cached. They expose
 premises regardless of policy, so the API refuses a non-root view.
 
 ## Why not keep the old matcher and extend it

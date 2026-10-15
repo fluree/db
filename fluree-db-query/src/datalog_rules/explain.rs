@@ -4,6 +4,11 @@
 //!
 //! An explanation is one step. A premise derived by reasoning is marked so;
 //! explaining it in turn walks the derivation back to asserted facts.
+//!
+//! Only facts the run materialized are explained: a replayed row counts only
+//! when its conclusion is one of them, so a capped run never explains a
+//! conclusion it did not reach. A rule whose body gives different rows on
+//! every run cannot be replayed and is named instead.
 
 use super::execute::{collect_body, instantiate, RuleExecutionEnv};
 use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
@@ -16,7 +21,7 @@ use crate::ContextConfig;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid};
+use fluree_db_core::{Flake, GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid};
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
@@ -48,6 +53,11 @@ pub struct Explanation {
     /// conclusions.
     pub complete: bool,
     pub facts: Vec<ExplainedFact>,
+    /// Rules that may derive these facts but whose bodies cannot be replayed
+    /// to the same rows: they call `RAND`, `UUID`, `STRUUID` or `BNODE`, or
+    /// read transaction metadata. Their derivations are not reconstructed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_replayed: Vec<String>,
 }
 
 /// One derived fact and every way the rules derived it.
@@ -60,6 +70,8 @@ pub struct ExplainedFact {
     pub graph: Option<String>,
     /// The fact is also asserted; the derivations are additional support.
     pub asserted: bool,
+    /// Empty when OWL 2 RL entailed the fact, or only a rule in
+    /// [`Explanation::not_replayed`] derived it.
     pub derivations: Vec<Derivation>,
 }
 
@@ -108,19 +120,74 @@ pub struct Absence {
 pub struct GroupInputs {
     /// The grouping variables' values; empty for the implicit group.
     pub key: BTreeMap<String, JsonValue>,
+    /// The graph the subquery read; `None` for the graph the rules ran
+    /// against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
     pub inputs: Vec<BTreeMap<String, JsonValue>>,
 }
 
-/// Explain the facts `target` names. `view` reads asserted and derived facts
-/// together; `base` reads asserted facts only.
+/// The materialized facts `target` names, from the derived facts of the
+/// graph it names (the rules' graph `default_g_id` when it names none).
+pub(crate) fn materialized_facts(
+    derived: &dyn OverlayProvider,
+    snapshot: &LedgerSnapshot,
+    default_g_id: GraphId,
+    target: &ExplainTarget,
+) -> Vec<Flake> {
+    let g_id = match &target.graph {
+        None => default_g_id,
+        Some(iri) => match snapshot.graph_registry.graph_id_for_iri(iri) {
+            Some(g_id) => g_id,
+            None => return Vec::new(),
+        },
+    };
+    let mut facts = Vec::new();
+    derived.for_each_overlay_flake(
+        g_id,
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |f| {
+            if f.op && matches_target(f, target) {
+                facts.push(f.clone());
+            }
+        },
+    );
+    facts
+}
+
+/// Explain `materialized`, the facts `target` names that the run derived.
+/// `view` reads asserted and derived facts together; `base` reads asserted
+/// facts only. Returns the facts and the rules that could not be replayed.
 pub(crate) async fn explain_facts(
     view: GraphDbRef<'_>,
     base: GraphDbRef<'_>,
     rule_set: &DatalogRuleSet,
     env: RuleExecutionEnv<'_>,
     target: &ExplainTarget,
-) -> Result<Vec<ExplainedFact>> {
-    let mut facts: Vec<(Flake, ExplainedFact)> = Vec::new();
+    materialized: &[Flake],
+) -> Result<(Vec<ExplainedFact>, Vec<String>)> {
+    let graph = target.graph.as_deref();
+    let mut facts: Vec<(&Flake, ExplainedFact)> = Vec::new();
+    for flake in materialized {
+        if facts.iter().any(|(f, _)| same_fact(f, flake)) {
+            continue;
+        }
+        let fact = ExplainedFact {
+            subject: iri(&flake.s, view.snapshot),
+            predicate: iri(&flake.p, view.snapshot),
+            object: value(&flake.o, Some(&flake.dt), lang(flake), view.snapshot),
+            graph: graph.map(str::to_string),
+            asserted: asserted(base, graph, &flake.s, &flake.p, &ObjectId::of(flake)).await?,
+            derivations: Vec::new(),
+        };
+        facts.push((flake, fact));
+    }
+
+    let mut not_replayed = Vec::new();
     for rule in rule_set.iter_in_order() {
         let heads: Vec<&RuleHead> = rule
             .heads
@@ -130,6 +197,10 @@ pub(crate) async fn explain_facts(
         if heads.is_empty() {
             continue;
         }
+        if !rule.footprint.repeatable {
+            not_replayed.push(rule.name.clone());
+            continue;
+        }
         let batches = body_rows(view, rule, rule.body.query.clone(), env).await?;
         for batch in &batches {
             for row in 0..batch.len() {
@@ -137,36 +208,20 @@ pub(crate) async fn explain_facts(
                     let Some(flake) = instantiate(head, batch, row, view.snapshot, view.t) else {
                         continue;
                     };
-                    if !matches_target(&flake, target) {
+                    let Some((_, fact)) = facts.iter_mut().find(|(f, _)| same_fact(f, &flake))
+                    else {
                         continue;
-                    }
-                    let derivation = derivation(view, base, rule, env, batch, row).await?;
-                    match facts.iter_mut().find(|(f, _)| same_fact(f, &flake)) {
-                        Some((_, fact)) => fact.derivations.push(derivation),
-                        None => {
-                            let graph = head.graph.as_deref();
-                            let fact = ExplainedFact {
-                                subject: iri(&flake.s, view.snapshot),
-                                predicate: iri(&flake.p, view.snapshot),
-                                object: value(
-                                    &flake.o,
-                                    Some(&flake.dt),
-                                    lang(&flake),
-                                    view.snapshot,
-                                ),
-                                graph: graph.map(str::to_string),
-                                asserted: asserted(base, graph, &flake.s, &flake.p, &flake.o)
-                                    .await?,
-                                derivations: vec![derivation],
-                            };
-                            facts.push((flake, fact));
-                        }
-                    }
+                    };
+                    fact.derivations
+                        .push(derivation(view, base, rule, env, batch, row).await?);
                 }
             }
         }
     }
-    Ok(facts.into_iter().map(|(_, fact)| fact).collect())
+    Ok((
+        facts.into_iter().map(|(_, fact)| fact).collect(),
+        not_replayed,
+    ))
 }
 
 fn may_derive(head: &RuleHead, target: &ExplainTarget) -> bool {
@@ -186,8 +241,36 @@ fn matches_target(flake: &Flake, target: &ExplainTarget) -> bool {
         && target.object.as_ref().is_none_or(|o| *o == flake.o)
 }
 
+/// Whether two facts in the same graph are the same RDF triple: subject,
+/// predicate, value, datatype and language tag.
 fn same_fact(a: &Flake, b: &Flake) -> bool {
-    a.s == b.s && a.p == b.p && a.o == b.o && a.dt == b.dt
+    a.s == b.s && a.p == b.p && a.o == b.o && a.dt == b.dt && lang(a) == lang(b)
+}
+
+/// An object as a fact or pattern pins it: its value, its datatype when
+/// known, and its language tag.
+struct ObjectId {
+    value: FlakeValue,
+    datatype: Option<Sid>,
+    lang: Option<String>,
+}
+
+impl ObjectId {
+    fn of(flake: &Flake) -> Self {
+        Self {
+            value: flake.o.clone(),
+            datatype: Some(flake.dt.clone()),
+            lang: lang(flake).map(str::to_string),
+        }
+    }
+
+    /// Whether `flake`'s object is this one. A language-tagged object is
+    /// matched by its tag; any other by its datatype, when known.
+    fn matches(&self, flake: &Flake) -> bool {
+        flake.o == self.value
+            && lang(flake) == self.lang.as_deref()
+            && (self.lang.is_some() || self.datatype.as_ref().is_none_or(|dt| *dt == flake.dt))
+    }
 }
 
 fn lang(flake: &Flake) -> Option<&str> {
@@ -236,7 +319,7 @@ async fn derivation(
             }
             Pattern::Subquery(sq) => {
                 if let Some(grouping) = &sq.grouping {
-                    grouped.push((sq.patterns.clone(), group_keys(grouping)));
+                    grouped.push((sq.patterns.clone(), group_keys(grouping), graph));
                 }
             }
             _ => {}
@@ -250,7 +333,7 @@ async fn derivation(
         let derived = match (
             node(&tp.s, batch, row),
             node(&tp.p, batch, row),
-            object_value(&tp.o, batch, row),
+            object_id(&tp.o, tp.dtc.as_ref(), batch, row),
         ) {
             (Some(s), Some(p), Some(o)) => !asserted(base, graph.as_deref(), &s, &p, &o).await?,
             _ => false,
@@ -283,8 +366,8 @@ async fn derivation(
         .collect();
 
     let mut groups = Vec::with_capacity(grouped.len());
-    for (patterns, keys) in grouped {
-        groups.push(group_inputs(view, rule, env, &patterns, &keys, batch, row).await?);
+    for (patterns, keys, graph) in grouped {
+        groups.push(group_inputs(view, rule, env, &patterns, &keys, graph, batch, row).await?);
     }
 
     Ok(Derivation {
@@ -343,13 +426,15 @@ fn group_keys(grouping: &Grouping) -> Vec<VarId> {
 }
 
 /// The solutions of a grouped subquery's patterns that fall in the row's
-/// group.
+/// group, read from `graph` when the subquery sits in a `GRAPH` block.
+#[allow(clippy::too_many_arguments)]
 async fn group_inputs(
     view: GraphDbRef<'_>,
     rule: &DatalogRule,
     env: RuleExecutionEnv<'_>,
     patterns: &[Pattern],
     keys: &[VarId],
+    graph: Option<Arc<str>>,
     batch: &Batch,
     row: usize,
 ) -> Result<GroupInputs> {
@@ -360,7 +445,13 @@ async fn group_inputs(
     let mut inner_vars: Vec<VarId> = produced_vars_of(patterns).into_iter().collect();
     inner_vars.sort_unstable();
     let mut query = rule.body.query.clone();
-    query.patterns = patterns.to_vec();
+    query.patterns = match &graph {
+        Some(iri) => vec![Pattern::Graph {
+            name: GraphName::Iri(iri.clone()),
+            patterns: patterns.to_vec(),
+        }],
+        None => patterns.to_vec(),
+    };
     query.grouping = None;
     query.output = QueryOutput::select_all(inner_vars.clone());
     let inputs = body_rows(view, rule, query, env).await?;
@@ -380,6 +471,7 @@ async fn group_inputs(
             .iter()
             .filter_map(|(v, value)| Some((name(vars, *v), binding(value.as_ref()?, snapshot)?)))
             .collect(),
+        graph: graph.map(|g| g.to_string()),
         inputs: rows,
     })
 }
@@ -465,14 +557,29 @@ fn node(r: &Ref, batch: &Batch, row: usize) -> Option<Sid> {
     }
 }
 
-fn object_value(t: &Term, batch: &Batch, row: usize) -> Option<FlakeValue> {
+fn object_id(
+    t: &Term,
+    dtc: Option<&fluree_db_core::DatatypeConstraint>,
+    batch: &Batch,
+    row: usize,
+) -> Option<ObjectId> {
+    let node = |sid: &Sid| ObjectId {
+        value: FlakeValue::Ref(sid.clone()),
+        datatype: None,
+        lang: None,
+    };
+    let literal = |value: &FlakeValue, dtc: Option<&fluree_db_core::DatatypeConstraint>| ObjectId {
+        value: value.clone(),
+        datatype: dtc.map(|c| c.datatype().clone()),
+        lang: dtc.and_then(|c| c.lang_tag()).map(str::to_string),
+    };
     match t {
-        Term::Sid(sid) => Some(FlakeValue::Ref(sid.clone())),
-        Term::Value(v) => Some(v.clone()),
+        Term::Sid(sid) => Some(node(sid)),
+        Term::Value(v) => Some(literal(v, dtc)),
         Term::Var(v) => match batch.get(row, *v)? {
-            Binding::Sid { sid, .. } => Some(FlakeValue::Ref(sid.clone())),
-            Binding::IriMatch { primary_sid, .. } => Some(FlakeValue::Ref(primary_sid.clone())),
-            Binding::Lit { val, .. } => Some(val.clone()),
+            Binding::Sid { sid, .. } => Some(node(sid)),
+            Binding::IriMatch { primary_sid, .. } => Some(node(primary_sid)),
+            Binding::Lit { val, dtc, .. } => Some(literal(val, Some(dtc))),
             _ => None,
         },
         Term::Iri(_) => None,
@@ -485,7 +592,7 @@ async fn asserted(
     graph: Option<&str>,
     s: &Sid,
     p: &Sid,
-    o: &FlakeValue,
+    o: &ObjectId,
 ) -> Result<bool> {
     let db = match graph {
         None => base,
@@ -506,7 +613,7 @@ async fn asserted(
         )
         .await
         .map_err(|e| QueryError::Internal(format!("failed to look up a premise: {e}")))?;
-    Ok(facts.iter().any(|f| f.op && f.o == *o))
+    Ok(facts.iter().any(|f| f.op && o.matches(f)))
 }
 
 fn iri(sid: &Sid, snapshot: &LedgerSnapshot) -> JsonValue {

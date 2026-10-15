@@ -541,12 +541,19 @@ rule, the row's bindings, and:
 - **absences**: each negated pattern the row passed, with the row
   substituted and its open variables left as variables, and the graph it
   searched;
-- **groups**: for an aggregating subquery, the group's key and the solutions
-  it counted.
+- **groups**: for an aggregating subquery, the group's key, the graph it
+  read when the subquery sits in a `GRAPH` block, and the solutions it
+  counted.
 
-The explanation also records the snapshot `t`, a hash of the rule set, the
-evaluation time `NOW()` returned, and whether the run was complete; a capped
-run's conclusions may be missing facts. Premises appear whatever a policy
+Only facts the run materialized are explained, so a capped run never
+explains a conclusion it did not reach. A rule whose body gives different
+rows each time it runs (it calls `RAND`, `UUID`, `STRUUID` or `BNODE`, or
+reads transaction metadata) cannot be replayed: the explanation names it in
+`not_replayed`, and a fact only it derived appears without derivations, as
+does a fact OWL 2 RL entailed. The explanation also records the snapshot
+`t`, a hash of the rule set, the evaluation time `NOW()` returned, and
+whether the run was complete; a capped run's conclusions may be missing
+facts. Premises appear whatever a policy
 would hide, so a view under a non-root policy is refused. The shape of the
 result is experimental.
 

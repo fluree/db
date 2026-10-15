@@ -234,3 +234,218 @@ async fn a_restricted_view_cannot_ask_for_an_explanation() {
         .expect_err("refused");
     assert!(err.to_string().contains("unrestricted"), "{err}");
 }
+
+async fn ledger_with(fluree: &MemoryFluree, ledger_id: &str, data: Value) -> MemoryLedger {
+    let ledger = crate::support::genesis_ledger(fluree, ledger_id);
+    fluree.insert(ledger, &data).await.expect("seed").ledger
+}
+
+async fn explain_with(fluree: &MemoryFluree, ledger: &MemoryLedger, request: Value) -> Explanation {
+    fluree
+        .explain_derived(&graphdb_from_ledger(ledger), &request)
+        .await
+        .expect("explain")
+}
+
+fn ex_ctx() -> Value {
+    json!({"ex": EX})
+}
+
+/// A capped run explains only what it reached: the stage it derived, not
+/// the conclusion a replay of the next rule would produce.
+#[tokio::test]
+async fn a_conclusion_the_run_did_not_reach_is_not_explained() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "datalog/explain-capped:main",
+        json!({"@context": ex_ctx(), "@id": "ex:x", "@type": "ex:Seed"}),
+    )
+    .await;
+    let request = |explain: Value| {
+        json!({
+            "@context": ex_ctx(),
+            "reasoning": "datalog",
+            "reasoningBudget": {"maxFacts": 1},
+            "rules": [
+                {"@context": ex_ctx(), "@id": "ex:stage",
+                 "where": {"@id": "?x", "@type": "ex:Seed"},
+                 "insert": {"@id": "?x", "@type": "ex:Stage"}},
+                {"@context": ex_ctx(), "@id": "ex:conclude",
+                 "where": {"@id": "?x", "@type": "ex:Stage"},
+                 "insert": {"@id": "?x", "@type": "ex:Conclusion"}}
+            ],
+            "explain": explain
+        })
+    };
+
+    let conclusion = explain_with(
+        &fluree,
+        &ledger,
+        request(json!({"@id": "ex:x", "@type": "ex:Conclusion"})),
+    )
+    .await;
+    assert!(!conclusion.complete);
+    assert!(conclusion.facts.is_empty(), "{:?}", conclusion.facts);
+
+    let stage = explain_with(
+        &fluree,
+        &ledger,
+        request(json!({"@id": "ex:x", "@type": "ex:Stage"})),
+    )
+    .await;
+    assert_eq!(stage.facts.len(), 1);
+    assert_eq!(stage.facts[0].derivations.len(), 1);
+}
+
+/// A rule whose body mints a new value on every run cannot be replayed to
+/// the row that derived a fact; the fact is listed and the rule named.
+#[tokio::test]
+async fn a_rule_that_cannot_be_replayed_is_named() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "datalog/explain-volatile:main",
+        json!({"@context": ex_ctx(), "@id": "ex:x", "@type": "ex:Seed"}),
+    )
+    .await;
+    let explanation = explain_with(
+        &fluree,
+        &ledger,
+        json!({
+            "@context": ex_ctx(),
+            "reasoning": "datalog",
+            "rules": [{
+                "@context": ex_ctx(), "@id": "ex:mint",
+                "where": [{"@id": "?x", "@type": "ex:Seed"}, ["bind", "?u", "(struuid)"]],
+                "insert": {"@id": "?x", "ex:token": "?u"}
+            }],
+            "explain": {"@id": "ex:x", "ex:token": "?u"}
+        }),
+    )
+    .await;
+    assert_eq!(explanation.facts.len(), 1);
+    assert!(explanation.facts[0].derivations.is_empty());
+    assert_eq!(explanation.not_replayed, vec!["ex:mint".to_string()]);
+}
+
+/// A count taken inside a named graph is explained by the solutions in that
+/// graph, not by matches in the default graph.
+#[tokio::test]
+async fn an_aggregate_in_a_named_graph_is_explained_from_that_graph() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .stage_owned(crate::support::genesis_ledger(
+            &fluree,
+            "datalog/explain-graph-count:main",
+        ))
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:i3 a ex:Item .\n\
+             GRAPH ex:g { ex:i1 a ex:Item . ex:i2 a ex:Item . }\n",
+        )
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": format!("{EX}countItems"),
+                "f:rule": {"@type": "f:sparql", "@value":
+                    "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT { ex:box ex:count ?n } WHERE { GRAPH ex:g { \
+                     { SELECT (COUNT(?i) AS ?n) WHERE { ?i a ex:Item } } } }"}
+            }),
+        )
+        .await
+        .expect("rule")
+        .ledger;
+    let explanation = explain_with(
+        &fluree,
+        &ledger,
+        json!({
+            "@context": ex_ctx(),
+            "reasoning": "datalog",
+            "explain": {"@id": "ex:box", "ex:count": "?n"}
+        }),
+    )
+    .await;
+    assert_eq!(explanation.facts.len(), 1);
+    assert_eq!(explanation.facts[0].object, json!(2));
+    let group = &explanation.facts[0].derivations[0].groups[0];
+    assert_eq!(group.graph.as_deref(), Some(format!("{EX}g").as_str()));
+    let mut items: Vec<Value> = group.inputs.iter().map(|row| row["?i"].clone()).collect();
+    items.sort_by_key(ToString::to_string);
+    assert_eq!(items, vec![iri("i1"), iri("i2")]);
+}
+
+/// Facts that differ only in language tag are distinct facts, each with its
+/// own derivation, and an asserted twin in another language does not make
+/// one asserted.
+#[tokio::test]
+async fn language_tagged_facts_stay_distinct() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "datalog/explain-lang:main",
+        json!({
+            "@context": ex_ctx(),
+            "@id": "ex:x",
+            "ex:labelFr": {"@value": "chat", "@language": "fr"},
+            "ex:labelEn": {"@value": "chat", "@language": "en"},
+            "ex:label": {"@value": "chat", "@language": "en"}
+        }),
+    )
+    .await;
+    let explanation = explain_with(
+        &fluree,
+        &ledger,
+        json!({
+            "@context": ex_ctx(),
+            "reasoning": "datalog",
+            "rules": [
+                {"@context": ex_ctx(), "@id": "ex:fromFr",
+                 "where": {"@id": "?x", "ex:labelFr": "?l"},
+                 "insert": {"@id": "?x", "ex:label": "?l"}},
+                {"@context": ex_ctx(), "@id": "ex:fromEn",
+                 "where": {"@id": "?x", "ex:labelEn": "?l"},
+                 "insert": {"@id": "?x", "ex:label": "?l"}}
+            ],
+            "explain": {"@id": "ex:x", "ex:label": "?l"}
+        }),
+    )
+    .await;
+    let mut facts: Vec<(Value, bool, Vec<String>, bool)> = explanation
+        .facts
+        .iter()
+        .map(|f| {
+            (
+                f.object.clone(),
+                f.asserted,
+                f.derivations.iter().map(|d| d.rule.clone()).collect(),
+                f.derivations[0].premises[0].derived,
+            )
+        })
+        .collect();
+    facts.sort_by_key(|f| f.0.to_string());
+    assert_eq!(
+        facts,
+        vec![
+            (
+                json!({"@value": "chat", "@language": "en"}),
+                true,
+                vec!["ex:fromEn".to_string()],
+                false
+            ),
+            (
+                json!({"@value": "chat", "@language": "fr"}),
+                false,
+                vec!["ex:fromFr".to_string()],
+                false
+            ),
+        ]
+    );
+}

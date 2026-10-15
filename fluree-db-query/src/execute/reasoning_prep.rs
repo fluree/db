@@ -584,7 +584,9 @@ pub async fn explain_derived_facts(
     request: QueryRequest<'_>,
     target: &crate::datalog_rules::ExplainTarget,
 ) -> crate::error::Result<crate::datalog_rules::Explanation> {
-    use crate::datalog_rules::{explain_facts, load_rule_set, Explanation, RuleExecutionEnv};
+    use crate::datalog_rules::{
+        explain_facts, load_rule_set, materialized_facts, Explanation, RuleExecutionEnv,
+    };
 
     if !reasoning.datalog {
         return Err(crate::error::QueryError::InvalidQuery(
@@ -604,6 +606,9 @@ pub async fn explain_derived_facts(
         .transpose()
         .map_err(crate::error::QueryError::Internal)?;
 
+    let materialized = outcome.overlay.as_deref().map_or_else(Vec::new, |derived| {
+        materialized_facts(derived, base_db.snapshot, base_db.g_id, target)
+    });
     let combined = outcome
         .overlay
         .map(|derived| ReasoningOverlay::new(base_db.overlay, derived));
@@ -621,12 +626,14 @@ pub async fn explain_derived_facts(
         evaluation_time: evaluation_time.as_ref(),
         request,
     };
-    let facts = explain_facts(view, base_db, &rule_set, env, target).await?;
+    let (facts, not_replayed) =
+        explain_facts(view, base_db, &rule_set, env, target, &materialized).await?;
     Ok(Explanation {
         t: base_db.t,
         rule_set: format!("{:016x}", rule_set.content_hash()),
         evaluation_time: diagnostics.evaluation_time,
         complete: !diagnostics.capped,
         facts,
+        not_replayed,
     })
 }
