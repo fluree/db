@@ -379,6 +379,10 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
         "busy": s.busy, "no_room": s.no_room,
         "repromoted": s.repromoted, "repromoted_bytes": s.repromoted_bytes,
         "outstanding": s.outstanding,
+        // Per live pack: [kind, bytes, rent, covered, promotions, held].
+        "packs": fluree.leaflet_cache().dictionary_allowance().pack_report().iter()
+            .map(|p| json!([p.kind, p.len, p.rent, p.covered, p.promotions, p.resident]))
+            .collect::<Vec<_>>(),
     })
 }
 

@@ -181,6 +181,10 @@ impl MissMeter {
         self.bytes() >= threshold && !self.crossed.swap(true, Ordering::Relaxed)
     }
 
+    pub fn promotions(&self) -> u64 {
+        self.promotions.load(Ordering::Relaxed)
+    }
+
     /// Count a promotion of the source; returns how many came before it.
     pub fn note_promotion(&self) -> u64 {
         self.promotions.fetch_add(1, Ordering::Relaxed)

@@ -139,8 +139,28 @@ struct State {
     /// Rent meters by pack, shared by every reader of it; an entry lives as
     /// long as some reader holds its meter, and dead ones are pruned
     /// whenever the table doubles.
-    meters: HashMap<u128, Weak<crate::read::cached_units::MissMeter>>,
+    meters: HashMap<u128, MeterEntry>,
     meters_pruned_at: usize,
+}
+
+/// A pack's rent meter, held weakly, with what a report names it by.
+struct MeterEntry {
+    meter: Weak<crate::read::cached_units::MissMeter>,
+    len: u64,
+    kind: u8,
+}
+
+/// One live pack's rental, for diagnostics.
+#[derive(Clone, Copy, Debug)]
+pub struct PackReport {
+    /// The pack's dictionary kind (`KIND_*_FWD`).
+    pub kind: u8,
+    pub len: u64,
+    /// Bytes missed, and bytes of distinct units missed, this rental.
+    pub rent: u64,
+    pub covered: u64,
+    pub promotions: u64,
+    pub resident: bool,
 }
 
 impl State {
@@ -323,20 +343,53 @@ impl DictionaryAllowance {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// The rent meter of the pack `identity`, of `units` units, shared by
-    /// all its readers.
-    pub fn meter(&self, identity: u128, units: u64) -> Arc<crate::read::cached_units::MissMeter> {
+    /// The rent meter of the pack `identity` — `len` bytes in `units`
+    /// units, of dictionary `kind` — shared by all its readers.
+    pub fn meter(
+        &self,
+        identity: u128,
+        units: u64,
+        len: u64,
+        kind: u8,
+    ) -> Arc<crate::read::cached_units::MissMeter> {
         let mut state = self.lock();
-        if let Some(meter) = state.meters.get(&identity).and_then(Weak::upgrade) {
+        if let Some(meter) = state.meters.get(&identity).and_then(|e| e.meter.upgrade()) {
             return meter;
         }
         if state.meters.len() >= 2 * state.meters_pruned_at.max(32) {
-            state.meters.retain(|_, w| w.strong_count() > 0);
+            state.meters.retain(|_, e| e.meter.strong_count() > 0);
             state.meters_pruned_at = state.meters.len();
         }
         let meter = Arc::new(crate::read::cached_units::MissMeter::new(units));
-        state.meters.insert(identity, Arc::downgrade(&meter));
+        state.meters.insert(
+            identity,
+            MeterEntry {
+                meter: Arc::downgrade(&meter),
+                len,
+                kind,
+            },
+        );
         meter
+    }
+
+    /// Every live pack's rental and whether the pool holds it.
+    pub fn pack_report(&self) -> Vec<PackReport> {
+        let state = self.lock();
+        state
+            .meters
+            .iter()
+            .filter_map(|(identity, e)| {
+                let meter = e.meter.upgrade()?;
+                Some(PackReport {
+                    kind: e.kind,
+                    len: e.len,
+                    rent: meter.bytes(),
+                    covered: meter.covered(),
+                    promotions: meter.promotions(),
+                    resident: state.resident.contains_key(identity),
+                })
+            })
+            .collect()
     }
 
     /// Record a pack's rent first reaching its size `len` in a rental, with
@@ -712,15 +765,15 @@ mod tests {
     #[test]
     fn meters_are_shared_per_pack_and_pruned() {
         let allowance = DictionaryAllowance::new(100);
-        let a = allowance.meter(1, 4);
-        assert!(Arc::ptr_eq(&a, &allowance.meter(1, 4)));
+        let a = allowance.meter(1, 4, 0, 0);
+        assert!(Arc::ptr_eq(&a, &allowance.meter(1, 4, 0, 0)));
         for identity in 2..1_000u128 {
-            drop(allowance.meter(identity, 4));
+            drop(allowance.meter(identity, 4, 0, 0));
         }
         let live = allowance.lock().meters.len();
         assert!(live <= 64, "{live} entries");
         assert!(
-            Arc::ptr_eq(&a, &allowance.meter(1, 4)),
+            Arc::ptr_eq(&a, &allowance.meter(1, 4, 0, 0)),
             "a held meter survives"
         );
     }

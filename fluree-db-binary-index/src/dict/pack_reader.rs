@@ -110,8 +110,9 @@ impl AdaptivePack {
         checked: Box<[AtomicBool]>,
         allowance: Arc<DictionaryAllowance>,
         coverage: f64,
+        kind: u8,
     ) -> Self {
-        let meter = allowance.meter(units.identity(), units.unit_count());
+        let meter = allowance.meter(units.identity(), units.unit_count(), units.len(), kind);
         let min_covered = (units.len() as f64 * coverage.clamp(0.0, 1.0)).ceil() as u64;
         Self {
             units: units.with_meter(Arc::clone(&meter)),
@@ -1006,6 +1007,7 @@ fn loaded_paged(
                 checked(),
                 Arc::clone(cache.dictionary_allowance()),
                 ctx.promote_coverage,
+                ctx.expected_kind,
             )))
         }
         _ => PackBacking::Ranged {
@@ -2345,6 +2347,9 @@ mod tests {
             read_all(&reader, FIRST);
             assert_eq!(cs.reads().len(), reads, "served whole");
             assert!(!has_units(&cache), "its units are dropped");
+            let report = cache.dictionary_allowance().pack_report();
+            assert_eq!(report.len(), 1);
+            assert!(report[0].resident && report[0].promotions == 1 && report[0].rent == 0);
             assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
         }
 
@@ -2567,6 +2572,14 @@ mod tests {
             }
             let stats = cache.dictionary_allowance().stats();
             assert_eq!((stats.promoted, stats.used), (0, 0));
+            let report = cache.dictionary_allowance().pack_report();
+            assert_eq!(report.len(), 1);
+            let pack = report[0];
+            assert_eq!(
+                (pack.kind, pack.len, pack.resident),
+                (KIND_STRING_FWD, len, false)
+            );
+            assert!(pack.rent >= len && pack.covered <= len && pack.promotions == 0);
         }
 
         /// Without a ranged source the pack is held whole, as before.
