@@ -15,6 +15,8 @@ mod it_datalog_rules;
 mod it_datalog_rules_annotations;
 #[path = "it_datalog_rules_sparql.rs"]
 mod it_datalog_rules_sparql;
+#[path = "it_datalog_run_contract.rs"]
+mod it_datalog_run_contract;
 #[path = "it_datalog_semi_naive.rs"]
 mod it_datalog_semi_naive;
 #[path = "it_reasoning_budget.rs"]

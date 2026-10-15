@@ -53,16 +53,17 @@ pub fn parse_query_time_rule(
     snapshot: &LedgerSnapshot,
     index: usize,
 ) -> Result<DatalogRule> {
-    let synthetic_id = || Sid::new(0, format!("_:query_rule_{index}"));
+    // The rule's `@id` names it in diagnostics; an unnamed rule gets its
+    // position.
+    let rule_id = match json.get("@id").and_then(|v| v.as_str()) {
+        Some(id_str) => Sid::new(0, id_str),
+        None => Sid::new(0, format!("_:query_rule_{index}")),
+    };
 
     if let Some(f_rule) = json
         .get("f:rule")
         .or_else(|| json.get(fluree_vocab::fluree::RULE))
     {
-        let rule_id = match json.get("@id").and_then(|v| v.as_str()) {
-            Some(id_str) => Sid::new(0, id_str),
-            None => synthetic_id(),
-        };
         if let Some(source) = as_sparql_typed_value(f_rule) {
             return parse_sparql_rule(&rule_id, source, snapshot, RuleOrigin::QueryTime);
         }
@@ -76,7 +77,6 @@ pub fn parse_query_time_rule(
         );
     }
 
-    let rule_id = synthetic_id();
     if let Some(source) = as_sparql_typed_value(json) {
         return parse_sparql_rule(&rule_id, source, snapshot, RuleOrigin::QueryTime);
     }

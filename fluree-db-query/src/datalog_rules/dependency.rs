@@ -13,7 +13,7 @@
 
 use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
 use crate::eval::function_supported_for_bool_cache as function_is_repeatable;
-use crate::ir::{Expression, GraphName, Pattern, Query, Ref, Term, TriplePattern};
+use crate::ir::{Expression, Function, GraphName, Pattern, Query, Ref, Term, TriplePattern};
 use crate::parse::IriEncoder;
 use fluree_db_core::{is_rdf_type, is_reserved_reifies_predicate, Sid};
 use std::fmt;
@@ -112,8 +112,12 @@ pub struct RuleFootprint {
     /// reads a match's transaction metadata (`t`, `op`), or uses a shortest
     /// path, whose chosen path can change as edges are added.
     /// Only a repeatable rule may run once instead of every round, or re-read
-    /// only new facts in a recursive group.
+    /// only new facts in a recursive group. `NOW()` and `TODAY()` are
+    /// repeatable here: every rule body in a run sees one evaluation time.
     pub repeatable: bool,
+    /// The body calls `NOW()` or `TODAY()`, so the run needs an evaluation
+    /// time.
+    pub reads_clock: bool,
 }
 
 impl RuleFootprint {
@@ -290,7 +294,9 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
         match expr {
             Expression::Exists { patterns, .. } => self.read_patterns(patterns, graph),
             Expression::Call { func, args } => {
-                if !function_is_repeatable(func) {
+                if matches!(func, Function::Now | Function::Today) {
+                    self.footprint.reads_clock = true;
+                } else if !function_is_repeatable(func) {
                     self.footprint.repeatable = false;
                 }
                 for arg in args {
@@ -564,6 +570,7 @@ mod tests {
             reads: reads.into_iter().map(default).collect(),
             writes: writes.into_iter().map(default).collect(),
             repeatable: true,
+            reads_clock: false,
         }
     }
 

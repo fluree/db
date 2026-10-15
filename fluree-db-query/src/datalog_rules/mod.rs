@@ -150,6 +150,12 @@ impl DatalogRuleSet {
         self.rules.len()
     }
 
+    /// Whether some rule calls `NOW()` or `TODAY()`, so the run needs an
+    /// evaluation time.
+    pub fn reads_clock(&self) -> bool {
+        self.rules.iter().any(|r| r.footprint.reads_clock)
+    }
+
     /// Read/write footprints and recursive groups, indexed by execution order.
     pub fn dependencies(&self) -> RuleDependencies {
         RuleDependencies::analyze(&self.rules)

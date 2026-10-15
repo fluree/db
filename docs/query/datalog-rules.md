@@ -527,11 +527,22 @@ This means:
 - **Rules downstream of a recursion see its complete result.** A rule that
   reads a recursive relation runs once, after that relation stops growing,
   instead of re-running every pass.
-- **Volatile functions run once per materialization in a non-recursive rule.**
-  A rule calling `NOW()`, `RAND()`, `UUID()` / `STRUUID()` or `BNODE()`
-  derives from a single evaluation. Inside a recursive group such a rule is
-  re-evaluated every pass and can keep deriving new values until the budget
-  stops it; Fluree logs a warning naming the rule.
+- **`NOW()` and `TODAY()` read one evaluation time per run.** Every rule
+  body in a materialization sees the same time: the commit time of the
+  snapshot being queried, so a query `asOf` an earlier commit evaluates at
+  that commit's time. Set it explicitly with `"reasoningTime":
+  "2026-06-01T00:00:00Z"` (JSON-LD) or `# PRAGMA reasoning-time:
+  2026-06-01T00:00:00Z` (SPARQL), for example to ask what was overdue on a
+  given day. A snapshot with no commit of its own (an empty ledger, or
+  uncommitted changes) has no time to default to, so a program that calls
+  either function fails there unless the query sets one. The time used is
+  reported as `evaluation_time` in the tracked response's `reasoning` block,
+  and materializations at different requested times are cached apart.
+- **Value-generating functions run once per materialization in a
+  non-recursive rule.** A rule calling `RAND()`, `UUID()` / `STRUUID()` or
+  `BNODE()` derives from a single evaluation. Inside a recursive group such a
+  rule is re-evaluated every pass and can keep deriving new values until the
+  budget stops it; Fluree logs a warning naming the rule.
 - **The dependency analysis is conservative.** A variable predicate
   (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`) or a variable-predicate
   head counts as reading or writing every predicate, which can merge rules
@@ -541,13 +552,18 @@ This means:
   maximum memory estimate for the derived facts, and a maximum wall-clock
   time, the same budget OWL2-RL uses. The fact ceiling is checked before each
   derived fact is kept, so a run returns at most that many and a single pass
-  cannot overshoot. The budget bounds the derived facts, not a rule body's
-  intermediate binding rows: each body is evaluated in full before its heads
-  are instantiated, so a body matching far more rows than it derives facts can
-  exceed the memory estimate while running. Hitting the budget stops early and
-  marks the result `capped` in the tracked response's `reasoning` block; which
-  partial facts a capped run keeps depends on evaluation order. The block's
-  `iterations` field counts passes across all groups.
+  cannot overshoot. The time limit also stops a rule body that is still
+  running when it passes. The budget bounds the derived facts, not a rule
+  body's intermediate binding rows: each body is evaluated in full before its
+  heads are instantiated, so a body matching far more rows than it derives
+  facts can exceed the memory estimate while running. Hitting the budget stops
+  early and marks the result `capped` in the tracked response's `reasoning`
+  block, which names the rules the cap cut short (`capped_rules`) and the
+  rules it kept from running (`pending_rules`); their conclusions may be
+  missing. Which partial facts a capped run keeps depends on evaluation
+  order. The block's `iterations` field counts passes across all groups. A
+  query-time rule is named by its `@id`, or by its position when it has
+  none.
   Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
   `f:reasoningMaxMemoryMb` (ledger
   config), `"reasoningBudget"` (query), or `FLUREE_REASONING_MAX_FACTS` /

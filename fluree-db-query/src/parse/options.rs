@@ -532,7 +532,13 @@ pub fn parse_reasoning(
 
 /// Keys [`crate::ir::ReasoningModes::from_query_json`] consumes. Canonical at
 /// the top level of the query object; also accepted inside `opts`.
-const REASONING_KEYS: &[&str] = &["reasoning", "rules", "ontology", "reasoningBudget"];
+const REASONING_KEYS: &[&str] = &[
+    "reasoning",
+    "rules",
+    "ontology",
+    "reasoningBudget",
+    "reasoningTime",
+];
 
 fn reasoning_from(
     obj: &serde_json::Map<String, JsonValue>,
