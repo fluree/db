@@ -69,30 +69,52 @@ from.
 
 ```text
 for stage in stages (producers first):
-    active = stage's groups
+    active = stage's groups, each with delta = none
     while active is non-empty:                   (≤ max_iterations passes)
         budget check (time, facts, memory)
         overlay = base ⊕ derived-so-far
         for group in active, rule in group:
-            rows = execute(rule.body over overlay)
-            for row in rows, head in rule.heads:
-                flake = instantiate(head, row)  (skip rows that cannot instantiate)
-                if seen.insert(key(flake)):     (HashSet, O(1))
-                    derived.push(flake)
-                    budget check (facts, memory)
-        active = recursive groups that derived something this pass
+            bodies = [rule.body]                      if group.delta is none
+                                                      or the rule re-runs whole
+                   = [rule.body with atom seeded      otherwise
+                      by group.delta, for each recursive atom]
+            for body in bodies:
+                rows = execute(body over overlay)
+                for row in rows, head in rule.heads:
+                    flake = instantiate(head, row)  (skip rows that cannot instantiate)
+                    if seen.insert(key(flake)):     (HashSet, O(1))
+                        derived.push(flake)
+                        budget check (facts, memory)
+        active = recursive groups that derived something this pass,
+                 each with delta = what it derived
         rebuild the derived overlay if anything was derived and work remains
 ```
 
 A non-recursive group runs once, against the complete output of the stages
 before it. Groups in one stage never read each other's writes, so they share
 an overlay. Deduplication is a hash set keyed on `(s, p, o, dt, m)`.
-Semi-naive evaluation inside a recursive group (joining only against the
-previous pass's new facts) is a follow-up.
 
-`RuleSchedule::WholeProgram` treats the whole program as one recursive group:
-every rule every round, the evaluation used before dependency scheduling. It is
-kept as the reference differential tests compare against.
+Inside a recursive group, evaluation is semi-naive (`datalog_rules/delta.rs`).
+A match a rule finds in pass k+1 but not in pass k uses at least one fact the
+group derived in pass k: nothing else changes while the group iterates, since
+no group in the same stage writes what it reads. A rule's *recursive atoms*
+are its top-level triple patterns whose read may observe one of the group's
+writes. After the group's first pass, the rule runs once per recursive atom,
+with a `VALUES` seed in front of the atom binding its variables to the
+distinct matches among the previous pass's facts. The seed replaces the
+pattern when it matches exactly as a scan would (variables and SID constants,
+a constant predicate, no datatype constraint); otherwise the pattern stays
+behind the seed to do the matching. The rule's other atoms read the full
+overlay, so a match using new facts in two positions is found twice and
+deduplicated; splitting old and new facts per position would need two
+overlays per pass. A rule that reads its group's writes anywhere else — a
+UNION branch, EXISTS, a subquery, a property path, the trailing VALUES block —
+re-runs its whole body every pass.
+
+`RuleSchedule::WholeProgram` treats the whole program as one recursive group
+and runs every rule's whole body every round, the evaluation used before
+dependency scheduling. It is kept as the reference differential tests compare
+against.
 
 ### Parsing
 

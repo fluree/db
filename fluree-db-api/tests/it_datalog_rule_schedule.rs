@@ -22,13 +22,13 @@ use std::time::Duration;
 
 const MAX_ITERATIONS: usize = 100;
 
-async fn ledger_with(ledger_id: &str, data: Value) -> MemoryLedger {
+pub(crate) async fn ledger_with(ledger_id: &str, data: Value) -> MemoryLedger {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = genesis_ledger(&fluree, ledger_id);
     fluree.insert(ledger, &data).await.expect("seed").ledger
 }
 
-fn sparql_rules(ledger: &MemoryLedger, rules: &[String]) -> DatalogRuleSet {
+pub(crate) fn sparql_rules(ledger: &MemoryLedger, rules: &[String]) -> DatalogRuleSet {
     let mut set = DatalogRuleSet::new();
     for (i, construct) in rules.iter().enumerate() {
         let rule = json!({
@@ -45,7 +45,7 @@ fn sparql_rules(ledger: &MemoryLedger, rules: &[String]) -> DatalogRuleSet {
     set
 }
 
-async fn run(
+pub(crate) async fn run(
     ledger: &MemoryLedger,
     rules: &DatalogRuleSet,
     schedule: RuleSchedule,
@@ -62,7 +62,7 @@ async fn run(
     .expect("fixpoint")
 }
 
-fn fact_set(result: &DatalogExecutionResult) -> BTreeSet<(Sid, Sid, String)> {
+pub(crate) fn fact_set(result: &DatalogExecutionResult) -> BTreeSet<(Sid, Sid, String)> {
     result
         .derived_flakes
         .iter()
@@ -70,7 +70,7 @@ fn fact_set(result: &DatalogExecutionResult) -> BTreeSet<(Sid, Sid, String)> {
         .collect()
 }
 
-fn chain_data(len: usize) -> Value {
+pub(crate) fn chain_data(len: usize) -> Value {
     let graph: Vec<Value> = (0..len - 1)
         .map(|i| json!({"@id": format!("ex:n{i}"), "ex:parent": {"@id": format!("ex:n{}", i + 1)}}))
         .chain(std::iter::once(
@@ -182,10 +182,12 @@ async fn the_time_budget_caps_a_rule_that_outlasts_it() {
     assert!(result.derived_flakes.len() < NODES * NODES);
 }
 
-/// Random positive programs over a small graph: chains of joins, class reads
-/// and writes, one-or-more and zero-length paths, and heads that introduce
-/// fresh terms. Every rule is
-/// repeatable, so both schedules must derive exactly the same facts.
+/// Random positive programs over a small graph: chains of joins (often
+/// nonlinear once their predicates are derived), class reads and writes,
+/// variable predicates, repeated variables and constant subjects, reads
+/// nested in UNION and EXISTS, one-or-more and zero-length paths, and heads
+/// that introduce fresh terms. Every rule is repeatable, so both schedules
+/// must derive exactly the same facts.
 #[tokio::test]
 async fn random_programs_derive_the_same_facts_under_both_schedules() {
     const PREDICATES: usize = 4;
@@ -193,7 +195,7 @@ async fn random_programs_derive_the_same_facts_under_both_schedules() {
     const NODES: usize = 7;
 
     let mut rng = StdRng::seed_from_u64(0x00da_7a10);
-    for program in 0..40 {
+    for program in 0..60 {
         let mut graph = Vec::new();
         for _ in 0..12 {
             let p = rng.gen_range(0..PREDICATES);
@@ -238,13 +240,19 @@ async fn random_programs_derive_the_same_facts_under_both_schedules() {
 fn random_rule(rng: &mut StdRng, predicates: usize, classes: usize) -> String {
     let p = |rng: &mut StdRng| format!("ex:p{}", rng.gen_range(0..predicates));
     let class = |rng: &mut StdRng| format!("ex:C{}", rng.gen_range(0..classes));
-    let body = match rng.gen_range(0..7) {
+    let body = match rng.gen_range(0..13) {
         0 => format!("?x {} ?y", p(rng)),
         1 => format!("?x {} ?m . ?m {} ?y", p(rng), p(rng)),
         2 => format!("?x {} ?y . ?y a {}", p(rng), class(rng)),
         3 => format!("?x {}+ ?y", p(rng)),
         4 => format!("?x {}* ?y . ?x a {}", p(rng), class(rng)),
         5 => format!("?x {}* ?y", p(rng)),
+        6 => format!("?x {} ?m . ?m {} ?n . ?n {} ?y", p(rng), p(rng), p(rng)),
+        7 => format!("?x ?q ?y . ?y a {}", class(rng)),
+        8 => format!("?x {} ?x . ?x {} ?y", p(rng), p(rng)),
+        9 => format!("ex:n0 {} ?x . ?x {} ?y", p(rng), p(rng)),
+        10 => format!("{{ ?x {} ?y }} UNION {{ ?y {} ?x }}", p(rng), p(rng)),
+        11 => format!("?x {} ?y . FILTER EXISTS {{ ?y {} ?w }}", p(rng), p(rng)),
         _ => format!("?y {} ?x", p(rng)),
     };
     // A constant head object introduces a term no asserted triple mentions,

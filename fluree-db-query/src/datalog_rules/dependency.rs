@@ -10,9 +10,6 @@
 //! graph scopes are kept apart only when both name different graphs. Extra
 //! edges merge components and cost speed; a missing edge would let a rule run
 //! before the facts it needs exist.
-//!
-//! Nothing here changes evaluation yet: the fixpoint still runs every rule
-//! every round.
 
 use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
 use crate::eval::function_supported_for_bool_cache as function_is_repeatable;
@@ -127,17 +124,9 @@ impl RuleFootprint {
         heads: &[RuleHead],
         encoder: &E,
     ) -> Self {
-        let mut walker = FootprintWalker {
-            encoder,
-            footprint: RuleFootprint {
-                repeatable: true,
-                ..Default::default()
-            },
-        };
+        let mut walker = FootprintWalker::new(encoder);
         walker.read_patterns(&query.patterns, &GraphScope::Default);
-        for (_, expr) in &query.order_binds {
-            walker.read_expression(expr, &GraphScope::Default);
-        }
+        walker.read_query_tail(query);
         for head in heads {
             walker.write_head(head);
         }
@@ -152,12 +141,49 @@ impl RuleFootprint {
     }
 }
 
+/// What `patterns` may read in the default graph.
+pub(super) fn pattern_reads<E: IriEncoder + ?Sized>(
+    patterns: &[Pattern],
+    encoder: &E,
+) -> Vec<Access> {
+    let mut walker = FootprintWalker::new(encoder);
+    walker.read_patterns(patterns, &GraphScope::Default);
+    walker.footprint.reads
+}
+
+/// What the parts of a body outside its `WHERE` patterns may read: the
+/// trailing `VALUES` block and its binds, and `ORDER BY` expressions.
+pub(super) fn query_tail_reads<E: IriEncoder + ?Sized>(query: &Query, encoder: &E) -> Vec<Access> {
+    let mut walker = FootprintWalker::new(encoder);
+    walker.read_query_tail(query);
+    walker.footprint.reads
+}
+
 struct FootprintWalker<'e, E: ?Sized> {
     encoder: &'e E,
     footprint: RuleFootprint,
 }
 
-impl<E: IriEncoder + ?Sized> FootprintWalker<'_, E> {
+impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
+    fn new(encoder: &'e E) -> Self {
+        Self {
+            encoder,
+            footprint: RuleFootprint {
+                repeatable: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn read_query_tail(&mut self, query: &Query) {
+        if let Some(values) = &query.post_values {
+            self.read_patterns(&values.to_patterns(), &GraphScope::Default);
+        }
+        for (_, expr) in &query.order_binds {
+            self.read_expression(expr, &GraphScope::Default);
+        }
+    }
+
     fn encode(&self, iri: &str) -> Option<Sid> {
         self.encoder.encode_iri(iri)
     }

@@ -17,6 +17,7 @@
 //!
 //! Design record: `docs/design/rules-engine.md`.
 
+mod delta;
 mod dependency;
 mod execute;
 mod parse;
@@ -180,8 +181,11 @@ pub struct DatalogExecutionResult {
     pub derived_flakes: Vec<Flake>,
     /// Fixpoint diagnostics — iterations, fact count, budget capping.
     pub diagnostics: ReasoningDiagnostics,
-    /// Rule bodies evaluated across all passes.
+    /// Rule bodies evaluated across all passes, counting each seeded run of
+    /// a recursive rule separately.
     pub rule_body_runs: usize,
+    /// Rows those bodies returned. Re-deriving known facts shows up here.
+    pub body_rows: usize,
 }
 
 /// Human-readable IRI for a rule id, for diagnostics.

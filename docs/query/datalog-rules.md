@@ -514,7 +514,10 @@ Evaluation then proceeds in dependency order:
 1. A rule that cannot see its own conclusions runs **once**, after every rule
    it reads from has finished.
 2. A recursive group runs its rules repeatedly, each pass over the base data
-   plus everything derived so far, until a pass derives nothing new.
+   plus everything derived so far, until a pass derives nothing new. After
+   the first pass, a rule re-reads only what its group derived in the
+   previous pass wherever its `WHERE` clause allows it (see
+   [Performance considerations](#performance-considerations)).
 3. Groups that do not read each other's conclusions are evaluated together.
 
 This means:
@@ -563,6 +566,15 @@ When both OWL 2 RL and Datalog are enabled:
 - **Rule bodies are planned queries.** They take the same index lanes and join
   ordering as any query, so the usual query advice applies: put a selective
   pattern in the body, and prefer bound predicates.
+- **Write recursive reads as plain triple patterns.** After a recursive
+  group's first pass, a rule runs once for each top-level triple pattern that
+  can match its group's conclusions, with that pattern limited to the facts
+  the group derived in the previous pass. Each pass then costs roughly what
+  it derives, not the size of everything derived so far. A rule with two such
+  patterns (`?x ex:ancestor ?y . ?y ex:ancestor ?z`) runs twice per pass. A
+  rule that reads its group's conclusions inside a `UNION`, `EXISTS`,
+  subquery or property path re-runs its whole `WHERE` clause every pass
+  instead: it derives the same facts, more slowly.
 - **Budget limits apply.** The same time / fact / memory budgets as OWL 2 RL
   materialization apply to Datalog execution (default: 30s and 1M derived
   facts, with a memory ceiling derived from the fact ceiling).

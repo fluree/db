@@ -2,6 +2,7 @@
 //! over the base data plus the facts derived so far; heads are instantiated
 //! from the result rows.
 
+use super::delta::{DeltaAtom, Reevaluation};
 use super::{
     extract_datalog_rules, parse_query_time_rule, DatalogExecutionResult, DatalogRule,
     DatalogRuleSet, HeadTerm, RuleComponent, RuleDependencies,
@@ -11,6 +12,7 @@ use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::{execute_prepared, prepare_execution_with_config, PrepareConfig};
 use crate::ir::reasoning::ReasoningConfig;
+use crate::ir::Query;
 use crate::parse::IriEncoder;
 use crate::reasoning::ReasoningOverlay;
 use crate::{ContextConfig, ExecutableQuery};
@@ -26,6 +28,7 @@ use fluree_db_reasoner::{
     ReasoningDiagnostics,
 };
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Execution resources rule bodies should use — the same binary index store
@@ -122,11 +125,14 @@ fn over_budget(
 pub enum RuleSchedule {
     /// Rules run in dependency order. A rule that cannot observe its own
     /// conclusions runs once, after every rule it reads from has finished; a
-    /// recursive group iterates on its own until it stops deriving.
+    /// recursive group iterates on its own until it stops deriving, and after
+    /// its first pass re-reads only what its previous pass derived where the
+    /// rule body allows it (see the `delta` module).
     #[default]
     Dependencies,
-    /// Every rule runs every round until a round derives nothing. Kept as the
-    /// reference the dependency schedule is tested against.
+    /// Every rule runs its whole body every round until a round derives
+    /// nothing. Kept as the reference the dependency schedule is tested
+    /// against.
     WholeProgram,
 }
 
@@ -155,7 +161,9 @@ pub async fn run_fixpoint(
 /// by earlier stages or by itself. Each pass over a stage evaluates its
 /// still-active groups against one overlay of everything derived so far. A
 /// non-recursive group is done after one pass; a recursive group stays
-/// active until a pass derives nothing new for it. `max_iterations` bounds
+/// active until a pass derives nothing new for it. After its first pass, a
+/// recursive group's rules are seeded with the facts the group derived in
+/// its previous pass wherever their bodies allow it. `max_iterations` bounds
 /// the passes of each stage. The fact and memory budgets are checked before
 /// every new fact is kept, so a pass cannot overshoot them. The deadline is
 /// checked before each rule, after its body runs, and periodically while its
@@ -175,6 +183,7 @@ pub async fn run_fixpoint_with_schedule(
             derived_flakes: Vec::new(),
             diagnostics: ReasoningDiagnostics::completed(0, 0, std::time::Duration::ZERO),
             rule_body_runs: 0,
+            body_rows: 0,
         });
     }
 
@@ -193,9 +202,13 @@ pub async fn run_fixpoint_with_schedule(
         groups = %dependencies.describe(rule_set),
         "executing datalog rules; groups producers first, * marks a recursive group"
     );
-    if schedule == RuleSchedule::Dependencies {
-        warn_on_volatile_recursion(rule_set, &dependencies);
-    }
+    let reevaluations = match schedule {
+        RuleSchedule::Dependencies => {
+            warn_on_volatile_recursion(rule_set, &dependencies);
+            plan_reevaluations(rule_set, &dependencies, db.snapshot)
+        }
+        RuleSchedule::WholeProgram => vec![Reevaluation::Full; rule_set.len()],
+    };
 
     // Derived facts carry the query's `t` so the overlay's `t <= to_t` filter
     // keeps them visible (same convention as OWL2-RL).
@@ -210,6 +223,7 @@ pub async fn run_fixpoint_with_schedule(
         diagnostics: ReasoningDiagnostics::default(),
         warned_barren: HashSet::new(),
         rule_body_runs: 0,
+        body_rows: 0,
     };
     let dict_novelty = ExecutionContext::extract_dict_novelty(db.snapshot);
     let mut derived_overlay: Arc<DerivedFactsOverlay> = Arc::new(DerivedFactsOverlay::empty());
@@ -218,7 +232,10 @@ pub async fn run_fixpoint_with_schedule(
 
     'stages: for (stage_index, stage) in stages.iter().enumerate() {
         let is_last_stage = stage_index + 1 == stages.len();
-        let mut active: Vec<&RuleComponent> = stage.clone();
+        let mut active: Vec<ActiveGroup> = stage
+            .iter()
+            .map(|&group| ActiveGroup { group, delta: None })
+            .collect();
         let mut stage_passes = 0usize;
 
         while !active.is_empty() {
@@ -253,29 +270,51 @@ pub async fn run_fixpoint_with_schedule(
             pass_db.eager = true;
 
             let mut new_this_pass = 0usize;
-            let mut still_deriving: Vec<&RuleComponent> = Vec::new();
-            for group in active {
-                let mut new_in_group = 0usize;
+            let mut still_deriving: Vec<ActiveGroup> = Vec::new();
+            for ActiveGroup { group, delta } in active {
+                let first_new = state.derived.len();
                 for &index in &group.rules {
-                    if let Some(reason) = state.over_budget() {
-                        capped = Some(reason);
-                        break 'stages;
-                    }
                     let rule = &rule_set.rules[index];
-                    match state
-                        .apply(pass_db, rule, env, dict_novelty.clone())
-                        .await?
-                    {
-                        RuleOutcome::Derived(new) => new_in_group += new,
-                        RuleOutcome::Capped(reason) => {
+                    // A group's first pass runs every whole body; nothing it
+                    // reads has been seen before.
+                    let seeds: Vec<Option<(&DeltaAtom, Range<usize>)>> =
+                        match (&delta, &reevaluations[index]) {
+                            (Some(delta), Reevaluation::Delta(atoms)) => atoms
+                                .iter()
+                                .map(|atom| Some((atom, delta.clone())))
+                                .collect(),
+                            _ => vec![None],
+                        };
+                    for seed in seeds {
+                        if let Some(reason) = state.over_budget() {
+                            capped = Some(reason);
+                            break 'stages;
+                        }
+                        let body = match seed {
+                            None => rule.body.query.clone(),
+                            Some((atom, delta)) => {
+                                match atom.seeded(&rule.body.query, &state.derived[delta]) {
+                                    Some(body) => body,
+                                    None => continue,
+                                }
+                            }
+                        };
+                        if let RuleOutcome::Capped(reason) = state
+                            .apply(pass_db, rule, body, env, dict_novelty.clone())
+                            .await?
+                        {
                             capped = Some(reason);
                             break 'stages;
                         }
                     }
                 }
-                new_this_pass += new_in_group;
-                if group.recursive && new_in_group > 0 {
-                    still_deriving.push(group);
+                let derived = first_new..state.derived.len();
+                new_this_pass += derived.len();
+                if group.recursive && !derived.is_empty() {
+                    still_deriving.push(ActiveGroup {
+                        group,
+                        delta: Some(derived),
+                    });
                 }
             }
 
@@ -317,7 +356,45 @@ pub async fn run_fixpoint_with_schedule(
         derived_flakes: state.derived,
         diagnostics,
         rule_body_runs: state.rule_body_runs,
+        body_rows: state.body_rows,
     })
+}
+
+/// A group still iterating in the current stage.
+struct ActiveGroup<'g> {
+    group: &'g RuleComponent,
+    /// What the group derived in its previous pass, as a range of
+    /// [`Derivation::derived`]; `None` before its first pass.
+    delta: Option<Range<usize>>,
+}
+
+/// How each rule re-runs after its group's first pass. Only a recursive
+/// group has later passes, and only its own facts change while it iterates:
+/// a group in the same stage never writes what it reads.
+fn plan_reevaluations(
+    rule_set: &DatalogRuleSet,
+    dependencies: &RuleDependencies,
+    snapshot: &LedgerSnapshot,
+) -> Vec<Reevaluation> {
+    let mut plans = vec![Reevaluation::Full; rule_set.len()];
+    for group in dependencies.components().iter().filter(|g| g.recursive) {
+        let writes: Vec<_> = group
+            .rules
+            .iter()
+            .flat_map(|&i| dependencies.footprint(i).writes.iter().cloned())
+            .collect();
+        for &index in &group.rules {
+            plans[index] = Reevaluation::plan(&rule_set.rules[index].body.query, &writes, snapshot);
+            if matches!(plans[index], Reevaluation::Full) {
+                tracing::debug!(
+                    rule = %rule_set.rules[index].name,
+                    "recursive datalog rule reads its group's facts outside a top-level \
+                     triple pattern; it re-runs its whole body every pass"
+                );
+            }
+        }
+    }
+    plans
 }
 
 /// A recursive group re-evaluates its rules every pass, so a rule whose body
@@ -339,7 +416,7 @@ fn warn_on_volatile_recursion(rule_set: &DatalogRuleSet, dependencies: &RuleDepe
 }
 
 enum RuleOutcome {
-    Derived(usize),
+    Finished,
     Capped(&'static str),
 }
 
@@ -357,6 +434,7 @@ struct Derivation<'a> {
     /// recursive groups re-run their rules every pass, so warn once per rule.
     warned_barren: HashSet<Sid>,
     rule_body_runs: usize,
+    body_rows: usize,
 }
 
 impl Derivation<'_> {
@@ -368,11 +446,13 @@ impl Derivation<'_> {
         self.start.elapsed() > self.budget.max_duration
     }
 
-    /// Evaluate one rule over `db` and keep the facts it derives that are new.
+    /// Evaluate `body` (the rule's own body or a seeded copy of it) over
+    /// `db` and keep the facts the rule's heads derive that are new.
     async fn apply(
         &mut self,
         db: GraphDbRef<'_>,
         rule: &DatalogRule,
+        body: Query,
         env: RuleExecutionEnv<'_>,
         dict_novelty: Option<Arc<DictNovelty>>,
     ) -> Result<RuleOutcome> {
@@ -380,7 +460,8 @@ impl Derivation<'_> {
         const DEADLINE_CHECK_ROWS: usize = 1024;
 
         self.rule_body_runs += 1;
-        let batches = run_body(db, rule, env, dict_novelty).await?;
+        let batches = run_body(db, rule, body, env, dict_novelty).await?;
+        self.body_rows += batches.iter().map(Batch::len).sum::<usize>();
         // The body cannot be interrupted, but a rule that ran past the
         // deadline must not go on to derive, and must not let a final pass
         // report a completed fixpoint.
@@ -388,7 +469,6 @@ impl Derivation<'_> {
             return Ok(RuleOutcome::Capped("time"));
         }
 
-        let mut new = 0usize;
         let mut matched_rows = 0usize;
         let mut instantiated = 0usize;
         for batch in &batches {
@@ -417,7 +497,6 @@ impl Derivation<'_> {
                     self.bytes += approx_flake_bytes(&flake);
                     self.diagnostics.record_rule_fired(&rule.name);
                     self.derived.push(flake);
-                    new += 1;
                     if self.bytes > self.budget.max_memory_bytes {
                         return Ok(RuleOutcome::Capped("memory"));
                     }
@@ -440,7 +519,7 @@ impl Derivation<'_> {
                  to a literal in subject/predicate position, or is unbound in every row"
             );
         }
-        Ok(RuleOutcome::Derived(new))
+        Ok(RuleOutcome::Finished)
     }
 }
 
@@ -448,12 +527,13 @@ impl Derivation<'_> {
 async fn run_body(
     db: GraphDbRef<'_>,
     rule: &DatalogRule,
+    body: Query,
     env: RuleExecutionEnv<'_>,
     dict_novelty: Option<Arc<DictNovelty>>,
 ) -> Result<Vec<Batch>> {
     // Reasoning is off for the body itself: derived facts arrive through the
     // overlay, and nested materialization would recurse.
-    let executable = ExecutableQuery::new(rule.body.query.clone(), ReasoningConfig::default());
+    let executable = ExecutableQuery::new(body, ReasoningConfig::default());
     // Boxed: the executor's prepare step is where reasoning prep lives, so
     // the future type would otherwise recurse (prepare → derived facts →
     // fixpoint → body → prepare). Rule bodies run with reasoning off, so the
