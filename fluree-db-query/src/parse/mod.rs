@@ -213,7 +213,8 @@ fn parse_query_ast_internal(
     // compact IRIs inside @path expressions honor `opts.strictCompactIri`.
     let parse_policy = policy::resolve_parse_policy(strict_override, obj);
     let path_aliases = extract_path_aliases(context_val, &context, parse_policy)?;
-    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy);
+    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy)
+        .with_dataset_names(dataset_names(obj));
 
     let mut query = UnresolvedQuery::new(context.clone());
 
@@ -605,6 +606,38 @@ fn parse_top_level_values(
         }
     }
     Ok(())
+}
+
+/// Every string in the query's `fromNamed` (or legacy `from-named`), at the
+/// top level or under `opts`: aliases, ledger and graph source names, and
+/// graph selectors. A `graph` clause naming one of them as written means
+/// it, even where it reads as a compact IRI.
+fn dataset_names(obj: &serde_json::Map<String, JsonValue>) -> std::collections::HashSet<String> {
+    fn collect(value: &JsonValue, names: &mut std::collections::HashSet<String>) {
+        match value {
+            JsonValue::String(s) => {
+                names.insert(s.clone());
+            }
+            JsonValue::Array(items) => items.iter().for_each(|v| collect(v, names)),
+            JsonValue::Object(map) => {
+                for (key, v) in map {
+                    names.insert(key.clone());
+                    collect(v, names);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    let opts = obj.get("opts").and_then(JsonValue::as_object);
+    for scope in std::iter::once(obj).chain(opts) {
+        for key in ["fromNamed", "from-named"] {
+            if let Some(value) = scope.get(key) {
+                collect(value, &mut names);
+            }
+        }
+    }
+    names
 }
 
 /// Parse a CONSTRUCT template (explicit form)
