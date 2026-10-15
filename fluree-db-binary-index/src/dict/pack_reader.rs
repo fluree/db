@@ -14,13 +14,13 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use super::allowance::HeldPack;
+use super::allowance::{Assembled, DictionaryAllowance, HeldPack, Promotion};
 use super::forward_pack::{
     find_page_in_dir, lookup_in_pack, page_dir_range, parse_pack_meta, parse_pack_meta_parts,
     ForwardPage, PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
 };
 use crate::format::wire_helpers::PackBranchEntry;
-use crate::read::cached_units::CachedUnits;
+use crate::read::cached_units::{CachedUnits, MissMeter};
 use crate::read::leaflet_cache::{ForwardPageKey, LeafletCache};
 use fluree_db_core::{ContentBytes, ContentId, ContentStore, RangeSource};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,37 +82,118 @@ enum PackBacking {
         /// checked against its directory entry.
         checked: Box<[AtomicBool]>,
     },
+    /// A local pack whose store decrypts on read, whole while the cache's
+    /// dictionary allowance holds it and ranged otherwise.
+    Adaptive(Box<AdaptivePack>),
 }
 
-/// How a ranged pack's bytes are read: through the leaflet cache's kept
-/// units, or straight from the source when the reader has no cache.
-enum PackUnits {
-    Cached(CachedUnits),
-    Direct(Arc<dyn RangeSource>),
+/// A pack read by range until its ranged reads have decrypted, on cache
+/// misses since it was last whole, as many bytes as it holds; then it is
+/// promoted into the dictionary allowance, which may later evict it.
+struct AdaptivePack {
+    units: CachedUnits,
+    checked: Box<[AtomicBool]>,
+    allowance: Arc<DictionaryAllowance>,
+    meter: Arc<MissMeter>,
+    /// The allowance's copy as last seen, used while it lives and is not
+    /// evicted. Readers hold it only for a lookup.
+    seen: parking_lot::RwLock<std::sync::Weak<HeldPack>>,
+    /// The allowance generation at which this pack was last found absent.
+    absent_at: std::sync::atomic::AtomicU64,
 }
 
-impl PackUnits {
-    /// Append exactly the bytes of `range`, which must lie in the pack.
-    fn extend_into(&self, range: std::ops::Range<u64>, out: &mut Vec<u8>) -> io::Result<()> {
-        let want = (range.end - range.start) as usize;
-        let mark = out.len();
-        match self {
-            PackUnits::Cached(units) => units.extend_into(range, out)?,
-            PackUnits::Direct(source) => out.extend_from_slice(
-                &source
-                    .read_range(range)
-                    .map_err(|e| io::Error::other(format!("forward pack: {e}")))?,
-            ),
+impl AdaptivePack {
+    fn new(
+        units: CachedUnits,
+        checked: Box<[AtomicBool]>,
+        allowance: Arc<DictionaryAllowance>,
+    ) -> Self {
+        let meter = allowance.meter(units.identity(), units.unit_count());
+        Self {
+            units: units.with_meter(Arc::clone(&meter)),
+            checked,
+            allowance,
+            meter,
+            seen: parking_lot::RwLock::new(std::sync::Weak::new()),
+            absent_at: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
-        if out.len() - mark != want {
-            out.truncate(mark);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "forward pack: read past the end of the pack",
-            ));
+    }
+
+    fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
+        if let Some(whole) = self.whole() {
+            return Ok(lookup_whole(&whole, meta, id, out));
+        }
+        if id < meta.first_id || id > meta.last_id {
+            return Ok(false);
+        }
+        let Some(page_idx) = find_page_in_dir(&meta.directory, id) else {
+            return Ok(false);
+        };
+        let found = ranged_lookup(
+            &self.units,
+            &self.checked[page_idx],
+            &meta.directory[page_idx],
+            id,
+            out,
+        )?;
+        if self.meter.bytes() >= self.units.len() && self.units.len() <= self.allowance.capacity() {
+            self.promote()?;
+        }
+        Ok(found)
+    }
+
+    /// The allowance's copy, if it holds one.
+    fn whole(&self) -> Option<Arc<HeldPack>> {
+        if let Some(pack) = self.seen.read().upgrade() {
+            if !pack.is_evicted() {
+                pack.mark_used();
+                return Some(pack);
+            }
+        }
+        let generation = self.allowance.generation();
+        if self.absent_at.swap(generation, Ordering::Relaxed) == generation {
+            return None;
+        }
+        let pack = self.allowance.resident(self.units.identity())?;
+        self.adopt(&pack);
+        pack.mark_used();
+        Some(pack)
+    }
+
+    /// Use `pack` from now on; rent starts again from nothing.
+    fn adopt(&self, pack: &Arc<HeldPack>) {
+        *self.seen.write() = Arc::downgrade(pack);
+        self.meter.reset();
+    }
+
+    fn promote(&self) -> io::Result<()> {
+        let promotion = self.allowance.promote(
+            self.units.identity(),
+            self.units.len(),
+            self.meter.distinct_units(),
+            self.units.unit_count(),
+            || {
+                let (bytes, decrypted) = self.units.assemble()?;
+                Ok(Assembled { bytes, decrypted })
+            },
+        )?;
+        match promotion {
+            Promotion::Promoted(pack) => {
+                self.adopt(&pack);
+                self.units.forget_cached();
+                fluree_db_core::io_stats::record_work("pack promoted whole", pack.len());
+            }
+            Promotion::Resident(pack) => self.adopt(&pack),
+            Promotion::Busy | Promotion::NoRoom | Promotion::TooLarge => {}
         }
         Ok(())
     }
+}
+
+/// Exact byte ranges of a ranged pack.
+trait UnitRead {
+    /// Append exactly the bytes of `range`, which must lie in the pack.
+    fn extend_into(&self, range: std::ops::Range<u64>, out: &mut Vec<u8>) -> io::Result<()>;
 
     /// The `n` little-endian u32s at `at`, read through `scratch`.
     fn u32s<const N: usize>(&self, at: u64, scratch: &mut Vec<u8>) -> io::Result<[u32; N]> {
@@ -128,12 +209,54 @@ impl PackUnits {
     }
 }
 
+/// Fail a read that came back short of `want` bytes appended since `mark`.
+fn exact(out: &mut Vec<u8>, mark: usize, want: usize) -> io::Result<()> {
+    if out.len() - mark != want {
+        out.truncate(mark);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "forward pack: read past the end of the pack",
+        ));
+    }
+    Ok(())
+}
+
+impl UnitRead for CachedUnits {
+    fn extend_into(&self, range: std::ops::Range<u64>, out: &mut Vec<u8>) -> io::Result<()> {
+        let (want, mark) = ((range.end - range.start) as usize, out.len());
+        CachedUnits::extend_into(self, range, out)?;
+        exact(out, mark, want)
+    }
+}
+
+/// How a ranged pack's bytes are read: through the leaflet cache's kept
+/// units, or straight from the source when the reader has no cache.
+enum PackUnits {
+    Cached(CachedUnits),
+    Direct(Arc<dyn RangeSource>),
+}
+
+impl UnitRead for PackUnits {
+    fn extend_into(&self, range: std::ops::Range<u64>, out: &mut Vec<u8>) -> io::Result<()> {
+        let (want, mark) = ((range.end - range.start) as usize, out.len());
+        match self {
+            PackUnits::Cached(units) => units.extend_into(range, out)?,
+            PackUnits::Direct(source) => out.extend_from_slice(
+                &source
+                    .read_range(range)
+                    .map_err(|e| io::Error::other(format!("forward pack: {e}")))?,
+            ),
+        }
+        exact(out, mark, want)
+    }
+}
+
 /// Look `id` up in page `dir` of a ranged pack, appending its value to
 /// `out`. Reads the page's two offsets for `id` and then the value; on the
 /// page's first visit also its entry count and final offset, which must
 /// agree with the directory. Offsets are bounds-checked on every lookup.
 fn ranged_lookup(
-    units: &PackUnits,
+    units: &impl UnitRead,
     checked: &AtomicBool,
     dir: &PageDirEntry,
     id: u64,
@@ -207,6 +330,7 @@ impl PackBacking {
                         .lookup_into(id, out),
                 )
             }
+            PackBacking::Adaptive(pack) => pack.lookup_into(meta, id, out),
             PackBacking::Ranged { units, checked } => {
                 if id < meta.first_id || id > meta.last_id {
                     return Ok(false);
@@ -273,6 +397,9 @@ enum EncryptedPacks {
     /// Decrypted whole when the cache's dictionary allowance can hold it,
     /// otherwise ranged.
     Bounded,
+    /// Ranged, promoted whole into the dictionary allowance once ranged
+    /// misses have decrypted its size; evictable.
+    Adaptive,
 }
 
 impl EncryptedPacks {
@@ -283,6 +410,7 @@ impl EncryptedPacks {
                 Ok("whole") => EncryptedPacks::Whole,
                 Ok("pages") => EncryptedPacks::Pages,
                 Ok("bounded") => EncryptedPacks::Bounded,
+                Ok("adaptive") => EncryptedPacks::Adaptive,
                 _ => EncryptedPacks::Ranged,
             },
         )
@@ -528,7 +656,12 @@ impl ForwardPackReader {
                 Ok((_, PackBacking::Held(bytes))) => bytes,
                 // Pages decrypt on use; opening read the header and
                 // directory, which is what counts against the budget.
-                Ok((meta, PackBacking::Paged { .. } | PackBacking::Ranged { .. })) => {
+                Ok((
+                    meta,
+                    PackBacking::Paged { .. }
+                    | PackBacking::Ranged { .. }
+                    | PackBacking::Adaptive(_),
+                )) => {
                     warmed += (PACK_HEADER_SIZE + meta.directory.len() * 20) as u64;
                     continue;
                 }
@@ -817,17 +950,26 @@ fn loaded_paged(
         "pack opened paged",
         header_bytes.len() + dir_bytes.len(),
     );
-    let backing = match ctx.encrypted_packs {
-        EncryptedPacks::Pages => PackBacking::Paged {
+    let checked = || {
+        meta.directory
+            .iter()
+            .map(|_| AtomicBool::new(false))
+            .collect()
+    };
+    let backing = match (ctx.encrypted_packs, &ctx.page_cache) {
+        (EncryptedPacks::Pages, _) => PackBacking::Paged {
             source,
             pack_key: xxhash_rust::xxh3::xxh3_128(pack_cid.to_bytes().as_ref()),
         },
+        (EncryptedPacks::Adaptive, Some(cache)) if crate::read::cached_units::enabled() => {
+            PackBacking::Adaptive(Box::new(AdaptivePack::new(
+                CachedUnits::new(source, Arc::clone(cache)),
+                checked(),
+                Arc::clone(cache.dictionary_allowance()),
+            )))
+        }
         _ => PackBacking::Ranged {
-            checked: meta
-                .directory
-                .iter()
-                .map(|_| AtomicBool::new(false))
-                .collect(),
+            checked: checked(),
             units: match &ctx.page_cache {
                 Some(cache) if crate::read::cached_units::enabled() => {
                     PackUnits::Cached(CachedUnits::new(source, Arc::clone(cache)))
@@ -1984,6 +2126,16 @@ mod tests {
             cache: &Arc<LeafletCache>,
             kind: u8,
         ) -> ForwardPackReader {
+            reader_over(cs, first, cache, kind, EncryptedPacks::Bounded)
+        }
+
+        fn reader_over(
+            cs: &SegmentedContentStore,
+            first: u64,
+            cache: &Arc<LeafletCache>,
+            kind: u8,
+            mode: EncryptedPacks,
+        ) -> ForwardPackReader {
             let pack_cid = cs.put_sync(
                 ContentKind::DictBlob {
                     dict: DictKind::StringForward,
@@ -2001,7 +2153,7 @@ mod tests {
             })
             .unwrap()
             .with_page_cache(Some(Arc::clone(cache)))
-            .with_encrypted_packs(EncryptedPacks::Bounded)
+            .with_encrypted_packs(mode)
         }
 
         fn allowance_cache(bytes: u64) -> Arc<LeafletCache> {
@@ -2096,6 +2248,166 @@ mod tests {
             assert!(err.to_string().contains("pack kind"), "{err}");
             let stats = cache.dictionary_allowance().stats();
             assert_eq!((stats.used, stats.admitted, stats.released), (0, 1, 1));
+        }
+
+        fn adaptive(
+            cs: &SegmentedContentStore,
+            first: u64,
+            cache: &Arc<LeafletCache>,
+        ) -> ForwardPackReader {
+            reader_over(cs, first, cache, KIND_STRING_FWD, EncryptedPacks::Adaptive)
+        }
+
+        /// Read the values of the pack at `first` in `ids` (offsets from
+        /// it), checking each.
+        fn read_ids(reader: &ForwardPackReader, first: u64, ids: std::ops::Range<u64>) {
+            for id in first + ids.start..first + ids.end {
+                assert_eq!(lookup(reader, id), Some(value(id)), "id {id}");
+            }
+        }
+
+        fn read_all(reader: &ForwardPackReader, first: u64) {
+            read_ids(reader, first, 0..COUNT as u64);
+        }
+
+        const HALF: u64 = COUNT as u64 / 2;
+
+        /// A pack is read by range until its cache misses have decrypted as
+        /// many bytes as it holds — cache hits do not count — then it is
+        /// promoted whole, reusing its cached units, its units are dropped
+        /// from the cache, and lookups read nothing more.
+        #[test]
+        fn adaptive_packs_promote_once_misses_rent_their_size() {
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(2 * len);
+            let reader = adaptive(&cs, FIRST, &cache);
+            read_ids(&reader, FIRST, 0..HALF);
+            read_ids(&reader, FIRST, 0..HALF);
+            read_ids(&reader, FIRST, 0..HALF);
+            assert_eq!(
+                cache.dictionary_allowance().stats().promoted,
+                0,
+                "hits are free"
+            );
+            assert!(has_units(&cache));
+            read_ids(&reader, FIRST, HALF..COUNT as u64);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!((stats.promoted, stats.resident_bytes), (1, len));
+            assert_eq!(stats.assembly_decrypted + stats.assembly_reused, len);
+            assert!(stats.assembly_reused > 0, "cached units are reused");
+            assert_eq!(
+                stats.rent_distinct_units, stats.rent_units,
+                "every unit missed once"
+            );
+            let reads = cs.reads().len();
+            read_all(&reader, FIRST);
+            assert_eq!(cs.reads().len(), reads, "served whole");
+            assert!(!has_units(&cache), "its units are dropped");
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        /// Promoting a pack that needs the room evicts the other; the evicted
+        /// pack reads by range again and rents from nothing, so reading half
+        /// of it does not promote it straight back.
+        #[test]
+        fn an_evicted_pack_reads_by_range_and_rents_again() {
+            let len = pack_from(FIRST).len() as u64;
+            let other = FIRST + 10 * COUNT as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(len + len / 2);
+            let a = adaptive(&cs, FIRST, &cache);
+            let b = adaptive(&cs, other, &cache);
+            read_all(&a, FIRST);
+            read_ids(&a, FIRST, 0..HALF);
+            read_all(&b, other);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!(
+                (stats.promoted, stats.evicted, stats.resident_bytes),
+                (2, 1, len)
+            );
+            let reads = cs.reads().len();
+            read_ids(&a, FIRST, 0..HALF);
+            assert!(cs.reads().len() > reads, "the evicted pack reads by range");
+            assert_eq!(
+                cache.dictionary_allowance().stats().promoted,
+                2,
+                "rent restarted"
+            );
+            read_all(&b, other);
+            assert_eq!(cache.dictionary_allowance().stats().evicted, 1);
+        }
+
+        /// An evicted pack a reader still holds stays charged, so a promotion
+        /// needing its bytes waits; the pack's own handle stops using it at
+        /// once and reads by range.
+        #[test]
+        fn an_evicted_pack_is_charged_until_released_and_used_no_more() {
+            let len = pack_from(FIRST).len() as u64;
+            let other = FIRST + 10 * COUNT as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(len + len / 2);
+            let a = adaptive(&cs, FIRST, &cache);
+            let b = adaptive(&cs, other, &cache);
+            read_all(&a, FIRST);
+            let cid = cs.put_sync(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                &pack_from(FIRST),
+            );
+            let allowance = Arc::clone(cache.dictionary_allowance());
+            let pin = allowance
+                .resident(xxhash_rust::xxh3::xxh3_128(&cid.to_bytes()))
+                .expect("promoted");
+            read_all(&b, other);
+            let stats = allowance.stats();
+            assert_eq!((stats.promoted, stats.evicted, stats.used), (1, 1, len));
+            assert!(stats.no_room > 0, "b waits for the pinned bytes");
+            let reads = cs.reads().len();
+            assert_eq!(lookup(&a, FIRST + 1), Some(value(FIRST + 1)));
+            assert!(cs.reads().len() > reads, "the evicted copy is not used");
+            drop(pin);
+            assert_eq!(allowance.stats().used, 0);
+            assert_eq!(lookup(&b, other + 1), Some(value(other + 1)));
+            assert_eq!(
+                allowance.stats().promoted,
+                2,
+                "b is promoted once there is room"
+            );
+        }
+
+        /// Readers of the same pack share its promotion: the other reader
+        /// adopts the allowance's copy without reading.
+        #[test]
+        fn adaptive_readers_share_a_promotion() {
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(len);
+            let first = adaptive(&cs, FIRST, &cache);
+            let second = adaptive(&cs, FIRST, &cache);
+            assert_eq!(lookup(&second, FIRST), Some(value(FIRST)));
+            read_all(&first, FIRST);
+            let reads = cs.reads().len();
+            read_all(&second, FIRST);
+            assert_eq!(cs.reads().len(), reads, "adopted, not read");
+            assert_eq!(cache.dictionary_allowance().stats().promoted, 1);
+        }
+
+        /// A pack larger than the whole allowance stays ranged however much
+        /// it rents.
+        #[test]
+        fn an_adaptive_pack_larger_than_the_allowance_stays_ranged() {
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(len - 1);
+            let reader = adaptive(&cs, FIRST, &cache);
+            for _ in 0..3 {
+                read_all(&reader, FIRST);
+                cache.invalidate_all();
+            }
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!((stats.promoted, stats.used), (0, 0));
         }
 
         /// Without a ranged source the pack is held whole, as before.

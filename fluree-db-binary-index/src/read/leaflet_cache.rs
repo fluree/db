@@ -905,6 +905,18 @@ impl LeafletCache {
         }
     }
 
+    /// A ranged source's read unit, if cached; never loads.
+    pub fn peek_source_unit(&self, key: SourceUnitKey) -> Option<Arc<[u8]>> {
+        match self.inner.get(&CacheKey::SourceUnit(key)) {
+            Some(CachedEntry::SourceUnit(unit)) => Some(unit),
+            _ => None,
+        }
+    }
+
+    pub fn invalidate_source_unit(&self, key: SourceUnitKey) {
+        self.inner.invalidate(&CacheKey::SourceUnit(key));
+    }
+
     /// Entry count and weighed bytes per entry type, heaviest first. Walks
     /// every entry: a diagnostic, not for hot paths.
     #[cfg(not(target_arch = "wasm32"))]

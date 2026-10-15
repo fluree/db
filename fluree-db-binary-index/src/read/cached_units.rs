@@ -13,6 +13,7 @@ use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fluree_db_core::RangeSource;
@@ -123,6 +124,48 @@ fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
     });
 }
 
+/// What reading a source cost on cache misses since the meter was last
+/// reset: bytes read from the source, and the distinct units they covered.
+/// Units served from the cache or a scope's memo are not counted.
+pub struct MissMeter {
+    bytes: AtomicU64,
+    units: Box<[AtomicU64]>,
+}
+
+impl MissMeter {
+    pub fn new(units: u64) -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            units: (0..units.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, unit: u64, bytes: usize) {
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Some(word) = self.units.get((unit / 64) as usize) {
+            word.fetch_or(1 << (unit % 64), Ordering::Relaxed);
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn distinct_units(&self) -> u64 {
+        self.units
+            .iter()
+            .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
+            .sum()
+    }
+
+    pub fn reset(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+        for word in &*self.units {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// `source` with its read units kept in `cache`, keyed by the source's
 /// identity, so only readers of the same storage and the same envelope
 /// share them.
@@ -133,6 +176,7 @@ pub struct CachedUnits {
     identity: u128,
     unit_size: u64,
     len: u64,
+    meter: Option<Arc<MissMeter>>,
 }
 
 impl CachedUnits {
@@ -143,6 +187,74 @@ impl CachedUnits {
             len: source.len(),
             source,
             cache,
+            meter: None,
+        }
+    }
+
+    /// Count what this reader's cache misses read from the source.
+    pub fn with_meter(mut self, meter: Arc<MissMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    pub fn identity(&self) -> u128 {
+        self.identity
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The source's units: at least one, since even an empty source has
+    /// an end to authenticate.
+    pub fn unit_count(&self) -> u64 {
+        self.len.div_ceil(self.unit_size).max(1)
+    }
+
+    /// The whole source: cached units copied, the rest read from the source
+    /// without caching them. Returns the bytes and how many were read.
+    pub fn assemble(&self) -> io::Result<(Vec<u8>, u64)> {
+        let mut out = Vec::with_capacity(self.len as usize);
+        let mut read = 0u64;
+        for unit in 0..self.unit_count() {
+            let key = SourceUnitKey {
+                source: self.identity,
+                unit,
+            };
+            let start = unit * self.unit_size;
+            let expected = self.unit_size.min(self.len.saturating_sub(start)) as usize;
+            match self.cache.peek_source_unit(key) {
+                Some(bytes) if bytes.len() == expected => out.extend_from_slice(&bytes),
+                _ => {
+                    let bytes = self
+                        .source
+                        .read_range(start..start + self.unit_size)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    if bytes.len() != expected {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "read unit shorter than the source declares",
+                        ));
+                    }
+                    read += bytes.len() as u64;
+                    out.extend_from_slice(&bytes);
+                }
+            }
+        }
+        Ok((out, read))
+    }
+
+    /// Drop this source's units from the cache.
+    pub fn forget_cached(&self) {
+        for unit in 0..self.unit_count() {
+            self.cache.invalidate_source_unit(SourceUnitKey {
+                source: self.identity,
+                unit,
+            });
         }
     }
 
@@ -177,6 +289,9 @@ impl CachedUnits {
                 ));
             }
             fluree_db_core::io_stats::record_work("source unit cached", bytes.len());
+            if let Some(meter) = &self.meter {
+                meter.record(key.unit, bytes.len());
+            }
             Ok(Arc::from(bytes))
         })
     }
@@ -447,6 +562,61 @@ mod tests {
             other.reads(),
             1,
             "another identity is not served from the memo"
+        );
+    }
+
+    /// The meter counts what cache misses read, once per miss: not cache
+    /// hits, not memo hits, and a unit read again after eviction again.
+    #[test]
+    fn the_meter_counts_cache_misses_only() {
+        let cache = Arc::new(LeafletCache::with_max_mb(4));
+        let source = Source::new(4_500, 1);
+        let meter = Arc::new(MissMeter::new(5));
+        let units = cached(&source, &cache).with_meter(Arc::clone(&meter));
+        units.read_range(0..10).unwrap();
+        units.read_range(5..2_500).unwrap();
+        assert_eq!((meter.bytes(), meter.distinct_units()), (3_000, 3));
+        {
+            let _scope = UnitMemoScope::enter();
+            units.read_range(4_100..4_200).unwrap();
+            cache.invalidate_all();
+            units.read_range(4_100..4_200).unwrap();
+        }
+        assert_eq!(
+            (meter.bytes(), meter.distinct_units()),
+            (3_500, 4),
+            "memo hit"
+        );
+        units.read_range(0..10).unwrap();
+        assert_eq!(
+            (meter.bytes(), meter.distinct_units()),
+            (4_500, 4),
+            "re-read"
+        );
+        meter.reset();
+        assert_eq!((meter.bytes(), meter.distinct_units()), (0, 0));
+    }
+
+    /// Assembly copies the units the cache holds and reads only the rest;
+    /// forgetting drops every unit from the cache.
+    #[test]
+    fn assembly_reuses_cached_units() {
+        let cache = Arc::new(LeafletCache::with_max_mb(4));
+        let source = Source::new(4_500, 1);
+        let units = cached(&source, &cache);
+        units.read_range(1_000..3_000).unwrap();
+        let reads = source.reads();
+        let (bytes, read) = units.assemble().unwrap();
+        assert_eq!(bytes, source.bytes);
+        assert_eq!(read, 2_500, "units 0, 3 and 4");
+        assert_eq!(source.reads(), reads + 3);
+        units.forget_cached();
+        let (_, read) = units.assemble().unwrap();
+        assert_eq!(read, 4_500, "nothing left cached");
+        source.fail.store(true, Ordering::SeqCst);
+        assert!(
+            units.assemble().is_err(),
+            "a unit failing to authenticate fails it"
         );
     }
 

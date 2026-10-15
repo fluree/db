@@ -16,8 +16,8 @@
 //!
 //! The envelope new writes use, how encrypted packs are held and the
 //! dictionary allowance come from the experiment environment
-//! (`FLUREE_ENCRYPTION_ENVELOPE`, `FLUREE_ENCRYPTED_PACKS`,
-//! `FLUREE_DICT_ALLOWANCE_MB`). Builds without the counter API (the
+//! (`FLUREE_ENCRYPTION_ENVELOPE`, `FLUREE_ENCRYPTED_PACKS`
+//! `=whole|pages|ranged|bounded|adaptive`, `FLUREE_DICT_ALLOWANCE_MB`). Builds without the counter API (the
 //! baseline branch) compile with `--cfg no_counters`.
 
 #![allow(unexpected_cfgs)]
@@ -360,8 +360,14 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
     let s = fluree.leaflet_cache().dictionary_allowance().stats();
     json!({
         "capacity": (s.capacity != u64::MAX).then_some(s.capacity), "used": s.used,
-        "packs": s.packs, "admitted": s.admitted, "declined": s.declined,
+        "peak": s.peak, "packs": s.packs, "admitted": s.admitted, "declined": s.declined,
         "shared": s.shared, "released": s.released,
+        "resident_packs": s.resident_packs, "resident_bytes": s.resident_bytes,
+        "promoted": s.promoted, "promoted_bytes": s.promoted_bytes,
+        "assembly_decrypted": s.assembly_decrypted, "assembly_reused": s.assembly_reused,
+        "rent_distinct_units": s.rent_distinct_units, "rent_units": s.rent_units,
+        "evicted": s.evicted, "evicted_bytes": s.evicted_bytes,
+        "busy": s.busy, "no_room": s.no_room,
     })
 }
 
