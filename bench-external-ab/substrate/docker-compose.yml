@@ -1,0 +1,46 @@
+# Substrate B: local engine-pure Iceberg substrate both engines read.
+# MinIO (S3 storage) + Apache iceberg-rest-fixture (lightweight REST catalog).
+# Wave-1 layout: pyiceberg writes the 16 SF0.1 tables UNPARTITIONED (one file/table),
+# deliberately sidestepping the many-small-files fan-out that broke substrate A.
+# Bring up:  docker compose -f docker-compose.yml up -d
+# Endpoints: MinIO S3 http://localhost:9000 (console :9001), REST catalog http://localhost:8181
+services:
+  minio:
+    image: minio/minio
+    container_name: sb-minio
+    ports: ["9000:9000", "9001:9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Create the warehouse bucket, then exit.
+  mc-init:
+    image: minio/mc
+    container_name: sb-mc-init
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb -p local/warehouse;
+      mc ls local;
+      "
+
+  rest:
+    image: apache/iceberg-rest-fixture
+    container_name: sb-rest
+    ports: ["8181:8181"]
+    depends_on: [minio]
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1

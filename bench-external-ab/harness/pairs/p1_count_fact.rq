@@ -1,0 +1,4 @@
+# p1_count_fact — Fluree/SPARQL side. Verbatim corpus member q036_count_orders.
+# Run via: vbench exec-one --query q036 --target virtual-sf01
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n) WHERE { ?s a edw:Order . }

@@ -1,0 +1,6 @@
+# crt_highcard_groupby — shape-equivalent (no verbatim corpus member). High-card GROUP BY
+# on WebEvent->customer over the 1M-row fact; large result fully materialized+sorted.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?c (COUNT(?e) AS ?n)
+WHERE { ?e a edw:WebEvent ; edw:customer ?c . }
+GROUP BY ?c ORDER BY ?c
