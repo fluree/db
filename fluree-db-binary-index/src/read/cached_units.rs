@@ -124,9 +124,99 @@ fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
     });
 }
 
+/// The read unit of a default segmented envelope.
+pub const DEFAULT_UNIT: u64 = 64 * 1024;
+
+/// An epoch that advances each time `period` units of something have been
+/// counted: bytes missed, or lookups.
+pub struct Epochs {
+    epoch: AtomicU64,
+    since: AtomicU64,
+    period: u64,
+}
+
+impl Epochs {
+    pub fn new(period: u64) -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            since: AtomicU64::new(0),
+            period: period.max(1),
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    pub fn count(&self, n: u64) {
+        if self.since.fetch_add(n, Ordering::Relaxed) + n < self.period {
+            return;
+        }
+        let period = self.period;
+        while self
+            .since
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                s.checked_sub(period)
+            })
+            .is_ok()
+        {
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The clocks recent demand ages by, shared by every meter of an allowance:
+/// rent halves for each `rent` epoch (bytes missed across all its packs),
+/// lookups for each `lookups` epoch.
+pub struct DemandClocks {
+    pub rent: Epochs,
+    pub lookups: Epochs,
+}
+
+/// A count that halves for each epoch of its clock it ages through.
+struct Aging {
+    value: AtomicU64,
+    epoch: AtomicU64,
+}
+
+impl Aging {
+    fn new() -> Self {
+        Self {
+            value: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+        }
+    }
+
+    fn age(&self, now: u64) {
+        let seen = self.epoch.load(Ordering::Relaxed);
+        if seen < now
+            && self
+                .epoch
+                .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let shift = (now - seen).min(63);
+            let _ = self
+                .value
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> shift));
+        }
+    }
+
+    fn add(&self, now: u64, n: u64) {
+        self.age(now);
+        self.value.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn get(&self, now: u64) -> u64 {
+        self.age(now);
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
 /// What reading a source cost on cache misses since the meter was last
 /// reset: bytes read from the source, and the distinct units they covered.
-/// Units served from the cache or a scope's memo are not counted.
+/// Units served from the cache or a scope's memo are not counted. With
+/// clocks, also its recent demand: lookups, and bytes missed, each aging.
 pub struct MissMeter {
     bytes: AtomicU64,
     units: Box<[AtomicU64]>,
@@ -136,6 +226,13 @@ pub struct MissMeter {
     crossed: std::sync::atomic::AtomicBool,
     /// Times the metered source has been promoted whole.
     promotions: AtomicU64,
+    clocks: Option<Arc<DemandClocks>>,
+    recent_rent: Aging,
+    recent_lookups: Aging,
+    /// Why the source was last not promoted, for diagnostics.
+    reason: std::sync::atomic::AtomicU8,
+    /// The lookup epoch it was last weighed for admission in, plus one.
+    weighed_at: AtomicU64,
 }
 
 impl MissMeter {
@@ -146,7 +243,18 @@ impl MissMeter {
             covered: AtomicU64::new(0),
             crossed: std::sync::atomic::AtomicBool::new(false),
             promotions: AtomicU64::new(0),
+            clocks: None,
+            recent_rent: Aging::new(),
+            recent_lookups: Aging::new(),
+            reason: std::sync::atomic::AtomicU8::new(0),
+            weighed_at: AtomicU64::new(0),
         }
+    }
+
+    /// Track recent demand by `clocks`.
+    pub fn with_clocks(mut self, clocks: Arc<DemandClocks>) -> Self {
+        self.clocks = Some(clocks);
+        self
     }
 
     fn record(&self, unit: u64, bytes: usize) {
@@ -157,6 +265,49 @@ impl MissMeter {
                 self.covered.fetch_add(bytes as u64, Ordering::Relaxed);
             }
         }
+        if let Some(clocks) = &self.clocks {
+            self.recent_rent.add(clocks.rent.epoch(), bytes as u64);
+            clocks.rent.count(bytes as u64);
+        }
+    }
+
+    /// Count a lookup, whether served whole or by range.
+    pub fn note_lookup(&self) {
+        if let Some(clocks) = &self.clocks {
+            self.recent_lookups.add(clocks.lookups.epoch(), 1);
+            clocks.lookups.count(1);
+        }
+    }
+
+    /// Bytes missed recently: halved for each rent epoch since.
+    pub fn recent_rent(&self) -> u64 {
+        self.clocks
+            .as_ref()
+            .map_or(0, |c| self.recent_rent.get(c.rent.epoch()))
+    }
+
+    /// Lookups recently: halved for each lookup epoch since.
+    pub fn recent_lookups(&self) -> u64 {
+        self.clocks
+            .as_ref()
+            .map_or(0, |c| self.recent_lookups.get(c.lookups.epoch()))
+    }
+
+    pub fn reason(&self) -> u8 {
+        self.reason.load(Ordering::Relaxed)
+    }
+
+    pub fn set_reason(&self, reason: u8) {
+        if self.reason.load(Ordering::Relaxed) != reason {
+            self.reason.store(reason, Ordering::Relaxed);
+        }
+    }
+
+    /// `true` at most once per lookup epoch: whether to weigh the source
+    /// for admission now.
+    pub fn weigh_now(&self) -> bool {
+        let now = self.clocks.as_ref().map_or(0, |c| c.lookups.epoch()) + 1;
+        self.weighed_at.swap(now, Ordering::Relaxed) != now
     }
 
     pub fn bytes(&self) -> u64 {
@@ -190,7 +341,11 @@ impl MissMeter {
         self.promotions.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Start a new rental: the rent so far, recent rent included, is
+    /// spent. Recent lookups carry on.
     pub fn reset(&self) {
+        self.recent_rent.value.store(0, Ordering::Relaxed);
+        self.weighed_at.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
         self.covered.store(0, Ordering::Relaxed);
         self.crossed.store(false, Ordering::Relaxed);

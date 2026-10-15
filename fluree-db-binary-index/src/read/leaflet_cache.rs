@@ -710,9 +710,11 @@ impl LeafletCache {
             stats_views: stats_view_pool(max_bytes),
             fenced_leaves: fenced_leaf_pool(fenced_budget),
             fenced_leaf_max: (fenced_budget / 2) as usize,
-            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::with_backing(
+            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::with_policy(
                 crate::dict::allowance::allowance_from_env(),
                 crate::dict::allowance::mapped_from_env(),
+                crate::dict::allowance::admission_from_env(),
+                crate::dict::allowance::demand_period_from_env(),
             ),
         }
     }
@@ -728,6 +730,19 @@ impl LeafletCache {
     #[cfg(test)]
     pub(crate) fn with_dictionary_allowance(mut self, bytes: u64) -> Self {
         self.dictionary_allowance = crate::dict::allowance::DictionaryAllowance::new(bytes);
+        self
+    }
+
+    /// Replace the dictionary allowance with one admitting by demand, its
+    /// lookups halving every `period` lookups (tests).
+    #[cfg(test)]
+    pub(crate) fn with_demand_allowance(mut self, bytes: u64, period: u64) -> Self {
+        self.dictionary_allowance = crate::dict::allowance::DictionaryAllowance::with_policy(
+            bytes,
+            false,
+            crate::dict::allowance::Admission::Demand,
+            Some(period),
+        );
         self
     }
 

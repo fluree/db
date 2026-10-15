@@ -390,12 +390,15 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
         "evicted_served_lookups": s.evicted_served_lookups,
         "evicted_served_bytes": s.evicted_served_bytes, "evicted_served": s.evicted_served,
         "evicted": s.evicted, "evicted_bytes": s.evicted_bytes,
-        "busy": s.busy, "no_room": s.no_room,
+        "busy": s.busy, "no_room": s.no_room, "outweighed": s.outweighed,
+        "too_large": s.too_large, "rent_epoch": s.rent_epoch, "lookup_epoch": s.lookup_epoch,
         "repromoted": s.repromoted, "repromoted_bytes": s.repromoted_bytes,
         "outstanding": s.outstanding,
-        // Per live pack: [kind, bytes, rent, covered, promotions, held].
+        // Per live pack: [kind, bytes, rent, covered, promotions, held,
+        // recent lookups, recent rent, why last not promoted].
         "packs": fluree.leaflet_cache().dictionary_allowance().pack_report().iter()
-            .map(|p| json!([p.kind, p.len, p.rent, p.covered, p.promotions, p.resident]))
+            .map(|p| json!([p.kind, p.len, p.rent, p.covered, p.promotions, p.resident,
+                            p.recent_lookups, p.recent_rent, p.reason]))
             .collect::<Vec<_>>(),
     })
 }
