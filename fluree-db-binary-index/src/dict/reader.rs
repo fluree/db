@@ -62,8 +62,8 @@ fn fence_spacing_from_env() -> Option<u64> {
 
 /// A reverse leaf read by range: the first entry starting in each
 /// `spacing`-byte stretch of it, found by reading it whole once. Held in the
-/// leaflet cache, keyed by the leaf's CID and weighed with its fences, so
-/// every reader of that leaf shares it.
+/// leaflet cache's fence pool, keyed by the leaf's CID and weighed with its
+/// fences, so every reader of that leaf shares it.
 pub(crate) struct FencedLeaf {
     source: Arc<dyn RangeSource>,
     fences: Fences,
@@ -1675,6 +1675,37 @@ mod tests {
             );
             elsewhere.reverse_lookup(&entries[0].key).unwrap();
             assert_eq!(opening(&cs), opened + 1);
+        }
+
+        /// Fences live in a pool of their own: filling the leaflet pool past
+        /// its budget leaves them in place, so no leaf is read whole again.
+        #[test]
+        fn fences_outlast_pressure_on_the_leaflet_pool() {
+            let entries = entries();
+            let cs = SegmentedContentStore::new(true);
+            let (leaves, branch) = built(entries.clone());
+            let cache = Arc::new(LeafletCache::with_max_mb(2));
+            let reader = reader_over(&cs, leaves, branch, FencedLookup::Scan, Arc::clone(&cache));
+            let opening = |cs: &SegmentedContentStore| {
+                cs.reads()
+                    .iter()
+                    .filter(|r| r.start == 0 && r.end - r.start > 4096)
+                    .count()
+            };
+            for e in entries.iter().step_by(50) {
+                assert_eq!(reader.reverse_lookup(&e.key).unwrap(), Some(e.id));
+            }
+            let opened = opening(&cs);
+            for i in 0..200u128 {
+                cache.insert_dict_leaf(i, Arc::from(vec![0u8; 64 * 1024]));
+                cache.get_dict_leaf(i);
+            }
+            cache.run_pending_tasks();
+            assert!(cache.weighted_size_bytes() <= 2 * 1024 * 1024);
+            for e in entries.iter().step_by(50) {
+                assert_eq!(reader.reverse_lookup(&e.key).unwrap(), Some(e.id));
+            }
+            assert_eq!(opening(&cs), opened, "no leaf fenced again");
         }
 
         /// The cache weighs a fenced leaf with its fences: closer fences

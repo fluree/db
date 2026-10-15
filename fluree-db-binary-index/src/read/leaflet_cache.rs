@@ -25,6 +25,7 @@
 //! - `DictLeaf`: keyed by `xxh3_128(cas_address)`. Content-addressed and
 //!   immutable — no epoch/time dimension needed.
 
+use crate::dict::reader::FencedLeaf;
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
 use fluree_db_core::subject_id::SubjectIdColumn;
@@ -223,9 +224,6 @@ enum CacheKey {
     /// by the source's identity, which is scoped to the storage instance and
     /// to the object's envelope.
     SourceUnit(SourceUnitKey),
-    /// A reverse dictionary leaf's fences and source, or that it is read
-    /// whole. Key = xxh3_128(leaf CID bytes).
-    FencedLeaf(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -449,7 +447,6 @@ enum CachedEntry {
     RangedLeaf(Arc<dyn RangeSource>),
     ForwardPage(Arc<[u8]>),
     SourceUnit(Arc<[u8]>),
-    FencedLeaf(Option<Arc<crate::dict::reader::FencedLeaf>>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -475,7 +472,6 @@ impl CachedEntry {
             CachedEntry::RangedLeaf(_) => "ranged-leaf",
             CachedEntry::ForwardPage(_) => "forward-page",
             CachedEntry::SourceUnit(_) => "source-unit",
-            CachedEntry::FencedLeaf(_) => "fenced-leaf",
             CachedEntry::Bm25Leaflet(_) => "bm25-leaflet",
             CachedEntry::VectorShard(_) => "vector-shard",
             CachedEntry::LedgerInfo(_) => "ledger-info",
@@ -497,9 +493,6 @@ impl CachedEntry {
             CachedEntry::RangedLeaf(source) => source.cache_weight(),
             CachedEntry::ForwardPage(page) => page.len(),
             CachedEntry::SourceUnit(unit) => unit.len(),
-            CachedEntry::FencedLeaf(leaf) => leaf
-                .as_ref()
-                .map_or(std::mem::size_of::<Self>(), |leaf| leaf.cache_weight()),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -530,6 +523,9 @@ pub struct LeafletCache {
     /// Query planner `StatsView`s, in a pool of their own. See
     /// [`stats_view_pool`].
     stats_views: Cache<u128, Arc<StatsView>>,
+    /// Reverse dictionary leaves fenced for range reads, or `None` to read
+    /// one whole, keyed by xxh3_128(leaf CID bytes). See [`fenced_leaf_pool`].
+    fenced_leaves: Cache<u128, Option<Arc<FencedLeaf>>>,
     /// What forward dictionary packs may hold decrypted whole, shared by
     /// every reader of this cache.
     dictionary_allowance: Arc<crate::dict::allowance::DictionaryAllowance>,
@@ -570,6 +566,34 @@ fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
     #[cfg(not(target_arch = "wasm32"))]
     let builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
     builder.build()
+}
+
+/// Share of the leaflet budget for fenced reverse leaves.
+const FENCED_LEAF_BUDGET_DIVISOR: u64 = 32;
+
+/// The pool for fenced reverse leaves.
+///
+/// Separate from leaflets so scan pressure cannot evict a fence index: one
+/// weighs a few percent of its leaf, but rebuilding it decrypts the whole
+/// leaf. LRU, since a new snapshot's leaves are the ones lookups want.
+fn fenced_leaf_pool(leaflet_budget_bytes: u64) -> Cache<u128, Option<Arc<FencedLeaf>>> {
+    let budget = (leaflet_budget_bytes / FENCED_LEAF_BUDGET_DIVISOR).max(1);
+    let max_weight = (budget / 2).clamp(1, u64::from(u32::MAX)) as usize;
+    let builder = Cache::builder()
+        .weigher(move |_key: &u128, leaf: &Option<Arc<FencedLeaf>>| {
+            fenced_leaf_weight(leaf).min(max_weight) as u32
+        })
+        .max_capacity(budget);
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
+    builder.build()
+}
+
+fn fenced_leaf_weight(leaf: &Option<Arc<FencedLeaf>>) -> usize {
+    leaf.as_ref()
+        .map_or(std::mem::size_of::<Option<Arc<FencedLeaf>>>(), |leaf| {
+            leaf.cache_weight()
+        })
 }
 
 /// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
@@ -667,11 +691,19 @@ impl LeafletCache {
         Self {
             inner,
             stats_views: stats_view_pool(max_bytes),
+            fenced_leaves: fenced_leaf_pool(max_bytes),
             dictionary_allowance: crate::dict::allowance::DictionaryAllowance::with_backing(
                 crate::dict::allowance::allowance_from_env(),
                 crate::dict::allowance::mapped_from_env(),
             ),
         }
+    }
+
+    /// Apply pending evictions in every pool (tests).
+    #[cfg(test)]
+    pub(crate) fn run_pending_tasks(&self) {
+        self.inner.run_pending_tasks();
+        self.fenced_leaves.run_pending_tasks();
     }
 
     /// Replace the dictionary allowance (tests).
@@ -930,24 +962,15 @@ impl LeafletCache {
         &self,
         key: u128,
         open: F,
-    ) -> io::Result<Option<Arc<crate::dict::reader::FencedLeaf>>>
+    ) -> io::Result<Option<Arc<FencedLeaf>>>
     where
-        F: FnOnce() -> io::Result<Option<Arc<crate::dict::reader::FencedLeaf>>>,
+        F: FnOnce() -> io::Result<Option<Arc<FencedLeaf>>>,
     {
         // Fast path: a plain hit must not pay the block_in_place cost.
-        if let Some(CachedEntry::FencedLeaf(leaf)) = self.inner.get(&CacheKey::FencedLeaf(key)) {
+        if let Some(leaf) = self.fenced_leaves.get(&key) {
             return Ok(leaf);
         }
-        let result = in_blocking_region(|| {
-            self.inner.try_get_with(CacheKey::FencedLeaf(key), || {
-                open().map(CachedEntry::FencedLeaf)
-            })
-        });
-        match result {
-            Ok(CachedEntry::FencedLeaf(leaf)) => Ok(leaf),
-            Ok(_) => unreachable!("FencedLeaf key always maps to FencedLeaf entry"),
-            Err(arc_err) => Err(arc_io_error(arc_err)),
-        }
+        in_blocking_region(|| self.fenced_leaves.try_get_with(key, open)).map_err(arc_io_error)
     }
 
     /// A ranged source's read unit, if cached; never loads.
@@ -972,6 +995,11 @@ impl LeafletCache {
             let slot = by_kind.entry(entry.kind()).or_insert((0, 0));
             slot.0 += 1;
             slot.1 += entry.byte_size() as u64;
+        }
+        for (_, leaf) in &self.fenced_leaves {
+            let slot = by_kind.entry("fenced-leaf").or_insert((0, 0));
+            slot.0 += 1;
+            slot.1 += fenced_leaf_weight(&leaf) as u64;
         }
         let mut out: Vec<_> = by_kind.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
         out.sort_by_key(|entry| std::cmp::Reverse(entry.2));
@@ -1293,6 +1321,7 @@ impl LeafletCache {
     pub fn invalidate_all(&self) {
         self.inner.invalidate_all();
         self.stats_views.invalidate_all();
+        self.fenced_leaves.invalidate_all();
     }
 
     // Note: `entry_count()` is provided near cache construction for reuse in
