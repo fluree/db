@@ -1,6 +1,6 @@
 # Upsert
 
-Upsert operations **replace the values of the predicates you supply** for an entity (matched by `@id`). Repeating an upsert is idempotent, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
+Upsert operations **replace the values of the predicates you supply** for an entity (matched by `@id`). Repeating an upsert is idempotent (see [Idempotency](#idempotency)).
 
 ## What is Upsert?
 
@@ -8,7 +8,7 @@ Upsert operations **replace the values of the predicates you supply** for an ent
 - If the entity exists: for each predicate present in your payload, retract existing values for that predicate and assert the new value(s)
 - If the entity doesn’t exist: create it with the supplied triples
 
-This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates, with one exception for values stored with less detail than they were written (see [Idempotency](#idempotency)).
+This makes upserts safe to retry: sending the same upsert repeatedly produces the same current-state values for those predicates.
 
 ## HTTP Endpoint
 
@@ -114,9 +114,9 @@ current value is retracted exactly as it is stored.
 - **Language tags.** All languages of a predicate are replaced together. An
   upsert of `{"schema:name": {"@value": "Alicia", "@language": "es"}}` over
   `"Alice"@en` and `"Alice"@fr` leaves only `"Alicia"@es`. To change one
-  language and keep the others, use
-  [WHERE/DELETE/INSERT](update-where-delete-insert.md) with a `FILTER` on
-  `lang(?v)`, or include every language in the payload.
+  language and keep the others, include every language in the payload, or
+  replace that language with an update
+  ([Replacing One Language](#replacing-one-language)).
 - **Lists.** A `@list` value is replaced as a whole: every stored position is
   retracted, including repeated values, and positions the new list restates
   cancel. Replacing a list with plain values (or the reverse) works the same
@@ -128,18 +128,35 @@ current value is retracted exactly as it is stored.
   document mints new blank nodes; the old ones stay (see
   [Stable blank-node ids](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids)
   for editing a stored blank node in place). For Turtle and TriG the
-  identity comes from the parsed statements, not their order: IRIs written
-  in full or as prefixed names, and strings in single or double quotes,
-  give the same identity. Other differences in how the statements are
-  written give a new one, and so new blank nodes: a number or boolean
-  written bare or as a typed literal (`1` vs `"1"^^xsd:integer`), a
-  language tag's case (`@en-US` vs `@en-us`), a repeated statement, or a
-  renamed blank-node label (`_:b` vs `_:c`). See
+  identity comes from the parsed statements as they are stored: their order
+  does not count, nor how a term is spelled (a prefixed or full IRI, `1` or
+  `"1"^^xsd:integer`, `true` or `"true"^^xsd:boolean`, a language tag in
+  any case), and a statement written twice counts once. Blank-node labels
+  do count: renaming `_:b` to `_:c` gives new nodes. See
   [How RDF text is read](turtle.md#how-rdf-text-is-read) for the details
   and a query that lists blank nodes nothing references.
 - **Named graphs.** The graph is part of the unit: an upsert into a named
   graph replaces that graph's values and leaves the same predicate's values
   in other graphs alone.
+
+### Replacing One Language
+
+A client that writes one language at a time, such as one `prefLabel` per
+language, cannot use upsert for it: each upsert replaces every language of
+the predicate. It replaces the one language with an update instead, which
+deletes the stored values in that language and inserts the new one. Over
+`"Alice"@en` and `"Alice"@fr`, this leaves `"Alice"@en` and `"Alicia"@fr`:
+
+```sparql
+PREFIX schema: <http://schema.org/>
+PREFIX ex: <http://example.org/ns/>
+
+DELETE { ex:alice schema:name ?o }
+INSERT { ex:alice schema:name "Alicia"@fr }
+WHERE  { OPTIONAL { ex:alice schema:name ?o FILTER(lang(?o) = "fr") } }
+```
+
+The `OPTIONAL` keeps the insert when no French name is stored yet.
 
 ## Idempotency
 
@@ -159,15 +176,13 @@ Result: nothing is committed. Each value's retraction and re-assertion cancel,
 so the transaction stages no flakes and the ledger stays at t=1. This holds
 for language-tagged values, lists, and the payload's blank nodes too.
 
-This makes upserts safe to retry, with one exception. A value stored with
-less detail than it was written is not re-upserted as a no-op: an integer too
-large for 64 bits written with an XSD subtype such as `xsd:nonNegativeInteger`
-(the index keeps no subtype), or a `dateTime` or `time` with digits past the
-microsecond (storage keeps six). Re-upserting such a value as written commits
-a retraction and an assertion of the same stored fact, and the value can be
-lost. Write these values at the precision they are stored with: `xsd:integer`
-for big integers, and at most six fractional digits for temporals. Graph sync
-behaves the same way.
+This makes upserts safe to retry, including for a value stored with less
+detail than it was written: an integer too large for 64 bits written with an
+XSD subtype such as `xsd:nonNegativeInteger` (the index keeps no subtype). The
+upsert retracts such a value as stored and asserts it as written, and storage
+holds the two as one fact, so they cancel as an unchanged value does. Graph
+sync behaves the same way. (A `dateTime` or `time` keeps six fractional digits
+from the moment it is written; see [Datatypes](../concepts/datatypes.md).)
 
 ## Comparison: Insert vs Update vs Upsert
 
@@ -216,7 +231,7 @@ POST /upsert?ledger=mydb:main
 **Behavior:**
 - Replaces values **for the predicates you supply** (per subject)
 - Leaves other predicates unchanged
-- Retry-safe/idempotent for the supplied predicates, except for values stored with less detail than they were written (see [Idempotency](#idempotency))
+- Retry-safe/idempotent for the supplied predicates
 
 ## Use Cases
 

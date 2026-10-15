@@ -24,14 +24,25 @@
 //!   so that 1:1 cancellation pairs collapse but surplus assertions or
 //!   retractions survive (RDF set semantics: 4 retracts + 1 assert collapses
 //!   to 1 surviving retract, not 0).
+//!
+//! ## Fact identity
+//!
+//! A retraction and an assertion cancel when they are one fact to storage
+//! ([`FactIdentity`]): by term, except that a value whose index key can merge
+//! terms is one fact per key and list position. A DELETE retracts the term
+//! the index stores, and an INSERT of the same value as written may carry
+//! more than that (a big integer's XSD subtype); told apart by term, both
+//! would commit at one `t`, which storage resolves as the retraction.
+//! Without an identity
+//! ([`FlakeAccumulator::with_identity`]) facts are told apart by term.
 
-use crate::current_facts::Retraction;
-use fluree_db_core::{Flake, IndexType, Sid};
+use crate::current_facts::{FactIdentity, MergeKey, Retraction};
+use fluree_db_core::{Flake, GraphId, IndexType, Sid};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 /// Accumulates flakes from one or more sources and produces a deterministic,
 /// deduplicated survivor set. See [module docs](self) for design notes.
-pub struct FlakeAccumulator {
+pub struct FlakeAccumulator<'l> {
     inner: AccInner,
     input_count: u64,
     capacity_hint: usize,
@@ -39,6 +50,9 @@ pub struct FlakeAccumulator {
     /// that states the same fact twice cannot out-vote one retraction of it.
     /// See [`FlakeAccumulator::mixed_set_assertions`].
     set_assertions: bool,
+    /// Mixed mode only: the identity facts are told apart by (see the
+    /// [module docs](self)); by term without one.
+    identity: Option<FactIdentity<'l>>,
 }
 
 /// Dedup is keyed by **(graph, fact)**, not fact alone.
@@ -54,7 +68,20 @@ enum AccInner {
     /// Pure-DELETE: retractions deduplicated by fact identity, per graph.
     PureRetract(FxHashMap<Option<Sid>, FxHashSet<Flake>>),
     /// Mixed assertions + retractions with 1:1 per-fact cancellation, per graph.
-    Mixed(FxHashMap<Option<Sid>, FxHashMap<Flake, FlakeBucket>>),
+    Mixed(FxHashMap<Option<Sid>, MixedGraph>),
+}
+
+/// One graph's mixed-mode buckets.
+#[derive(Default)]
+struct MixedGraph {
+    /// The graph's id in the ledger, which index keys are computed in;
+    /// `None` without an identity or for a graph the ledger does not have
+    /// (which holds nothing indexed).
+    g_id: Option<GraphId>,
+    /// Facts told apart by term.
+    by_term: FxHashMap<Flake, FlakeBucket>,
+    /// Facts told apart by key: `(s, p, (key, list position))`.
+    by_key: FxHashMap<(Sid, Sid, MergeKey), FlakeBucket>,
 }
 
 #[derive(Default)]
@@ -67,7 +94,7 @@ struct FlakeBucket {
     retraction: Option<Flake>,
 }
 
-impl FlakeAccumulator {
+impl<'l> FlakeAccumulator<'l> {
     /// Pure-DELETE accumulator: drops the assertion bookkeeping side entirely.
     /// Use only when the transaction has no INSERT templates and is not Upsert.
     pub fn pure_delete(capacity_hint: usize) -> Self {
@@ -76,6 +103,7 @@ impl FlakeAccumulator {
             input_count: 0,
             capacity_hint,
             set_assertions: false,
+            identity: None,
         }
     }
 
@@ -86,7 +114,16 @@ impl FlakeAccumulator {
             input_count: 0,
             capacity_hint,
             set_assertions: false,
+            identity: None,
         }
+    }
+
+    /// Tell a mixed accumulator's facts apart by `identity` rather than by
+    /// term (see the [module docs](self)). Needed only when the operation
+    /// both retracts and asserts.
+    pub fn with_identity(mut self, identity: FactIdentity<'l>) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Mixed accumulator whose assertion side has set semantics: pushing the
@@ -142,10 +179,8 @@ impl FlakeAccumulator {
                 for f in flakes {
                     debug_assert!(!f.op, "push_retractions received an assertion (op=true)");
                     self.input_count += 1;
-                    let inner = graphs.entry(f.g.clone()).or_insert_with(|| {
-                        FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher)
-                    });
-                    push_into_mixed(self.set_assertions, inner, f);
+                    let graph = mixed_graph(graphs, self.identity.as_ref(), hint, &f.g);
+                    push_into_mixed(self.set_assertions, self.identity.as_ref(), graph, f);
                 }
             }
         }
@@ -171,10 +206,8 @@ impl FlakeAccumulator {
                 for f in flakes {
                     debug_assert!(f.op, "push_assertions received a retraction (op=false)");
                     self.input_count += 1;
-                    let inner = graphs.entry(f.g.clone()).or_insert_with(|| {
-                        FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher)
-                    });
-                    push_into_mixed(self.set_assertions, inner, f);
+                    let graph = mixed_graph(graphs, self.identity.as_ref(), hint, &f.g);
+                    push_into_mixed(self.set_assertions, self.identity.as_ref(), graph, f);
                 }
             }
         }
@@ -204,9 +237,18 @@ impl FlakeAccumulator {
                 .flat_map(IntoIterator::into_iter)
                 .collect(),
             AccInner::Mixed(graphs) => {
-                let mut v = Vec::with_capacity(graphs.values().map(FxHashMap::len).sum());
-                for inner in graphs.into_values() {
-                    for (_key, b) in inner {
+                let mut v = Vec::with_capacity(
+                    graphs
+                        .values()
+                        .map(|g| g.by_term.len() + g.by_key.len())
+                        .sum(),
+                );
+                for graph in graphs.into_values() {
+                    let buckets = graph
+                        .by_term
+                        .into_values()
+                        .chain(graph.by_key.into_values());
+                    for b in buckets {
                         let cancel = b.assert_count.min(b.retract_count);
                         if keep_restated && cancel > 0 {
                             if let (Some(r), Some(a)) = (&b.retraction, &b.assertion) {
@@ -233,23 +275,62 @@ impl FlakeAccumulator {
     }
 }
 
-/// Insert a flake into the mixed-mode bucket map.
+/// `g`'s mixed-mode buckets, created on first use with the graph's id when
+/// there is an identity to key facts by.
+fn mixed_graph<'a>(
+    graphs: &'a mut FxHashMap<Option<Sid>, MixedGraph>,
+    identity: Option<&FactIdentity<'_>>,
+    hint: usize,
+    g: &Option<Sid>,
+) -> &'a mut MixedGraph {
+    graphs.entry(g.clone()).or_insert_with(|| MixedGraph {
+        g_id: identity.and_then(|ids| ids.graph_id(g)),
+        by_term: FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher),
+        by_key: FxHashMap::default(),
+    })
+}
+
+/// Count `flake` into its fact's bucket and make it the survivor candidate
+/// of its op.
+fn count_into(set_assertions: bool, bucket: &mut FlakeBucket, flake: Flake) {
+    if flake.op {
+        if !(set_assertions && bucket.assert_count > 0) {
+            bucket.assert_count = bucket.assert_count.saturating_add(1);
+        }
+        bucket.assertion = Some(flake);
+    } else {
+        bucket.retract_count = bucket.retract_count.saturating_add(1);
+        bucket.retraction = Some(flake);
+    }
+}
+
+/// Insert a flake into its graph's mixed-mode buckets: by index key when
+/// the identity tells its fact apart by key, else by term.
 ///
 /// First push for a given fact pays one `Flake::clone()` (one copy lives in
 /// the map's key, one copy lives in the bucket as the survivor candidate).
 /// Subsequent pushes for the same fact are clone-free: the bucket's survivor
 /// slot is overwritten via `Some(flake)` and the previous survivor is dropped.
-fn push_into_mixed(set_assertions: bool, map: &mut FxHashMap<Flake, FlakeBucket>, flake: Flake) {
-    if let Some(bucket) = map.get_mut(&flake) {
-        if flake.op {
-            if !(set_assertions && bucket.assert_count > 0) {
-                bucket.assert_count = bucket.assert_count.saturating_add(1);
-            }
-            bucket.assertion = Some(flake);
-        } else {
-            bucket.retract_count = bucket.retract_count.saturating_add(1);
-            bucket.retraction = Some(flake);
+/// A fact keyed by index key clones its subject and predicate `Sid`s instead.
+fn push_into_mixed(
+    set_assertions: bool,
+    identity: Option<&FactIdentity<'_>>,
+    graph: &mut MixedGraph,
+    flake: Flake,
+) {
+    if let Some(ids) = identity {
+        if let Some(key) = ids.key(graph.g_id, &flake) {
+            let bucket = graph
+                .by_key
+                .entry((flake.s.clone(), flake.p.clone(), key))
+                .or_default();
+            count_into(set_assertions, bucket, flake);
+            return;
         }
+    }
+    let map = &mut graph.by_term;
+    if let Some(bucket) = map.get_mut(&flake) {
+        count_into(set_assertions, bucket, flake);
     } else {
         let bucket = if flake.op {
             FlakeBucket {

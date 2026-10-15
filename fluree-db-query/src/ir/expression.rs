@@ -1186,9 +1186,59 @@ pub enum Function {
     Custom(String),
 }
 
+impl Function {
+    /// This comparison, with an operand that is a `dateTime` or `time`
+    /// constant whose lexical form had digits past the microsecond
+    /// (`left_past` or `right_past`;
+    /// [`fluree_db_core::temporal::digits_past_micros`]). The constant holds
+    /// the value rounded down to the microsecond, as every value is held.
+    ///
+    /// Equality keeps the rounded constant: it matches the value written with
+    /// that lexical form. An ordering counts every digit, which against values
+    /// held to the microsecond is an ordering against the rounded constant: a
+    /// value below the lexical is at most the rounded value, and one above it
+    /// is past the rounded value. So `x < c` compares as `x <= ⌊c⌋` and
+    /// `x >= c` as `x > ⌊c⌋` (`<=` and `>` are unchanged), and the same with
+    /// the constant on the left. Two such constants are compared rounded.
+    pub fn against_digits_past_micros(self, left_past: bool, right_past: bool) -> Self {
+        match (self, left_past, right_past) {
+            // `x < c` is `x <= ⌊c⌋`, and `x >= c` is `x > ⌊c⌋`.
+            (Function::Lt, false, true) => Function::Le,
+            (Function::Ge, false, true) => Function::Gt,
+            // `c > x` is `⌊c⌋ >= x`, and `c <= x` is `⌊c⌋ < x`.
+            (Function::Gt, true, false) => Function::Ge,
+            (Function::Le, true, false) => Function::Lt,
+            (func, _, _) => func,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ordering against a constant past the microsecond, on either side,
+    /// is the ordering against the rounded constant that keeps its answer
+    /// for every value held to the microsecond; equality, and a comparison
+    /// of two such constants, is unchanged.
+    #[test]
+    fn an_ordering_against_a_constant_past_the_microsecond() {
+        use Function::*;
+        let cases = [
+            (Lt, Le, Lt),
+            (Le, Le, Lt),
+            (Gt, Gt, Ge),
+            (Ge, Gt, Ge),
+            (Eq, Eq, Eq),
+            (Ne, Ne, Ne),
+        ];
+        for (func, right, left) in cases {
+            assert_eq!(func.clone().against_digits_past_micros(false, true), right);
+            assert_eq!(func.clone().against_digits_past_micros(true, false), left);
+            assert_eq!(func.clone().against_digits_past_micros(true, true), func);
+            assert_eq!(func.clone().against_digits_past_micros(false, false), func);
+        }
+    }
 
     #[test]
     fn test_filter_expr_is_range_safe() {

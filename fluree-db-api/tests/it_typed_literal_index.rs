@@ -388,37 +388,56 @@ async fn ill_typed_literals_keep_their_lexical_form() {
     );
 }
 
-/// INSERT DATA refuses an ill-typed literal, naming the datatype. DELETE DATA
-/// names one as stored (a Turtle write keeps one as its lexical form with the
-/// declared datatype), so one that is not stored retracts nothing.
 #[tokio::test]
-async fn sparql_insert_data_rejects_an_ill_typed_literal() {
+async fn sparql_update_rejects_ill_typed_literal() {
     let fluree = memory_fluree();
     let ledger_id = "typed-literal-index:reject";
     fluree.create_ledger(ledger_id).await.expect("create");
-    let quad = format!("<{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date>");
-    let err = fluree
-        .graph(ledger_id)
-        .transact()
-        .sparql_update(&format!("INSERT DATA {{ {quad} }}"))
-        .commit()
-        .await
-        .expect_err("an ill-typed xsd:date must not lower in INSERT DATA");
-    assert!(
-        err.to_string().contains("xsd:date"),
-        "error should name the datatype: {err}"
-    );
-    let r = fluree
-        .graph(ledger_id)
-        .transact()
-        .sparql_update(&format!("DELETE DATA {{ {quad} }}"))
-        .commit()
-        .await
-        .expect("DELETE DATA names the term as stored");
-    assert_eq!(
-        r.receipt.flake_count, 0,
-        "nothing is stored, nothing is retracted"
-    );
+    for op in ["INSERT DATA", "DELETE DATA"] {
+        let sparql = format!("{op} {{ <{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date> }}");
+        let err = fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&sparql)
+            .commit()
+            .await
+            .expect_err("an ill-typed xsd:date must not lower");
+        assert!(
+            err.to_string().contains("xsd:date"),
+            "{op}: error should name the datatype: {err}"
+        );
+    }
+}
+
+/// `datatypes.md`: a stored ill-typed literal, which a DELETE cannot name as
+/// a constant, is replaced by an upsert of its property, over novelty and
+/// once indexed. The upsert retracts it as stored.
+#[tokio::test]
+async fn an_upsert_replaces_a_stored_ill_typed_literal() {
+    let fluree = memory_fluree();
+    let upsert = json!({"@id": format!("{EX}a"), format!("{EX}int"): 5});
+    let expected = vec![("int".to_string(), "5".to_string(), "integer".to_string())];
+    for indexed in [false, true] {
+        let ledger_id = format!("typed-literal-index:ill-typed-upsert-{indexed}");
+        let ledger = fluree.create_ledger(&ledger_id).await.expect("create");
+        let mut ledger = fluree
+            .insert_turtle(
+                ledger,
+                &format!("<{EX}a> <{EX}int> \"abc\"^^<{XSD}integer> ."),
+            )
+            .await
+            .expect("Turtle keeps the ill-typed literal")
+            .ledger;
+        if indexed {
+            ledger = reindexed(&fluree, &ledger_id).await;
+        }
+        let ledger = fluree.upsert(ledger, &upsert).await.expect("upsert").ledger;
+        assert_eq!(
+            objects_of(&fluree, &ledger, "a").await,
+            expected,
+            "indexed={indexed}"
+        );
+    }
 }
 
 /// Commits written before the fix hold these literals as strings. They read

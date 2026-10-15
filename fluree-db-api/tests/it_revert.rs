@@ -605,6 +605,64 @@ async fn revert_records_reverted_commit_ids_in_txn_meta() {
     }
 }
 
+/// Every `?p ?o` of `id`'s txn-meta graph, rendered as JSON.
+async fn txn_meta_rows(fluree: &fluree_db_api::Fluree, id: &str) -> Vec<String> {
+    let query = json!({
+        "from": format!("{id}#txn-meta"),
+        "select": ["?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let results = fluree.query_connection(&query).await.expect("query");
+    let ledger = fluree.ledger(id).await.expect("load");
+    let rows = results.to_jsonld(&ledger.snapshot).expect("jsonld");
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// An index build over a ledger holding a revert commit keeps the revert's
+/// `f:reverts` entry, queryable in the txn-meta graph.
+#[tokio::test]
+async fn an_index_build_keeps_a_reverts_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("file fluree");
+    let id = "it/revert-reindex:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
+    let r2 = fluree
+        .insert(r1.ledger, &doc("ex:bob", "Bob"))
+        .await
+        .unwrap();
+    let bob_cid = r2.receipt.commit_id.clone();
+    drop(r2);
+    fluree
+        .revert_commit(
+            "it/revert-reindex",
+            "main",
+            CommitRef::Exact(bob_cid.clone()),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("revert");
+
+    support::rebuild_and_publish_index(&fluree, id).await;
+
+    let rows = txn_meta_rows(&fluree, id).await;
+    let bob_cid = bob_cid.to_string();
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("https://ns.flur.ee/db#reverts") && r.contains(&bob_cid)),
+        "{rows:#?}"
+    );
+}
+
 /// Reverting a range folds every inverted commit into ONE commit at ONE `t`.
 /// A value the range replaced and then restored must net to "unchanged",
 /// not to a same-`t` assert+retract pair that resolves to "gone".

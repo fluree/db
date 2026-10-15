@@ -73,23 +73,32 @@ pub struct RdfTextParts {
     pub write_graphs: BTreeSet<String>,
     /// The `<#txn-meta>` block's entries.
     pub txn_meta: Vec<TxnMetaEntry>,
-    /// Order-insensitive hash of the document's data statements (see
-    /// [`TemplateSink`]).
-    pub content_id: u128,
+    /// Order-insensitive hash of the document's data statements, when the
+    /// sink was asked for it and the document has blank nodes for it to
+    /// scope (see [`TemplateSink`]).
+    pub content_id: Option<u128>,
 }
 
 /// A `GraphSink` that builds [`TripleTemplate`]s.
 ///
 /// # Content identity
 ///
-/// `content_id` is the wrapping sum of a 128-bit hash of every data
-/// statement — graph, subject, predicate, object (lexical form, datatype
-/// and language for literals; IRI or label for nodes) and list position —
-/// and of every reifier attachment. A sum is commutative, so the id does
-/// not depend on statement order, and it is computed in one pass with O(1)
-/// memory. Upsert derives its blank-node skolem scope from it, so the same
-/// document upserted again addresses the same blank nodes. `<#txn-meta>`
-/// entries are commit metadata and do not contribute.
+/// `content_id` is the wrapping sum of a 128-bit hash of every distinct
+/// data statement — graph, subject, predicate, object and list position —
+/// and of every distinct reifier attachment. A literal object is hashed as
+/// it is stored: its value, datatype and language tag, the tag
+/// lowercased ([`literal_hash`]), so `1` and `"1"^^xsd:integer` are one
+/// object. An IRI is hashed in full, however it was written; a blank node
+/// by its label. A statement written twice counts once, as a graph holds it
+/// once. A sum is commutative, so the id does not depend on statement order.
+/// Upsert derives its blank-node skolem scope from it, so the same document
+/// upserted again addresses the same blank nodes. `<#txn-meta>` entries are
+/// commit metadata and do not contribute.
+///
+/// The identity is computed only by a sink made with
+/// [`Self::with_content_identity`], and only for a document with a blank
+/// node, the one thing it scopes. A sink made with [`Self::new`] hashes
+/// nothing, since no other lane uses it.
 pub struct TemplateSink<'a> {
     ns: &'a mut NamespaceRegistry,
     terms: Vec<SinkTerm>,
@@ -101,7 +110,13 @@ pub struct TemplateSink<'a> {
     templates: Vec<TripleTemplate>,
     write_graphs: BTreeSet<String>,
     txn_meta: Vec<TxnMetaEntry>,
-    content_id: u128,
+    /// The hash of each data statement and reifier attachment, for
+    /// `content_id`; `None` when the identity is not asked for, and then no
+    /// term or statement is hashed.
+    statement_hashes: Option<Vec<u128>>,
+    /// Whether the document holds a blank node: the identity scopes blank
+    /// nodes, so a document with none has no identity to compute.
+    blank_nodes: bool,
     /// Data statements accepted so far (not `<#txn-meta>` entries, not
     /// annotation bundles).
     statements: usize,
@@ -121,10 +136,23 @@ impl<'a> TemplateSink<'a> {
             templates: Vec::new(),
             write_graphs: BTreeSet::new(),
             txn_meta: Vec::new(),
-            content_id: 0,
+            statement_hashes: None,
+            blank_nodes: false,
             statements: 0,
             error: None,
         }
+    }
+
+    /// A sink that also computes the document's content identity.
+    pub fn with_content_identity(ns: &'a mut NamespaceRegistry) -> Self {
+        let mut sink = Self::new(ns);
+        sink.statement_hashes = Some(Vec::new());
+        sink
+    }
+
+    /// Whether this sink computes the content identity.
+    fn identity(&self) -> bool {
+        self.statement_hashes.is_some()
     }
 
     /// Set the graph the next statements belong to. A named graph is
@@ -143,16 +171,25 @@ impl<'a> TemplateSink<'a> {
 
     /// The templates, graphs, txn-meta and content id, or the first error
     /// the document raised.
-    pub fn into_parts(self) -> Result<RdfTextParts, TransactError> {
+    pub fn into_parts(mut self) -> Result<RdfTextParts, TransactError> {
         if let Some(e) = self.error {
             return Err(e);
         }
         crate::parse::trig_meta::validate_limits(&self.txn_meta)?;
+        // Each distinct statement once; nothing to scope without a blank node.
+        let content_id = match self.statement_hashes.take() {
+            Some(mut hashes) if self.blank_nodes => {
+                hashes.sort_unstable();
+                hashes.dedup();
+                Some(hashes.iter().fold(0u128, |id, h| id.wrapping_add(*h)))
+            }
+            _ => None,
+        };
         Ok(RdfTextParts {
             templates: self.templates,
             write_graphs: self.write_graphs,
             txn_meta: self.txn_meta,
-            content_id: self.content_id,
+            content_id,
         })
     }
 
@@ -205,7 +242,9 @@ impl<'a> TemplateSink<'a> {
     }
 
     fn record(&mut self, parts: &[&[u8]]) {
-        self.content_id = self.content_id.wrapping_add(hash_parts(b"S", parts));
+        if let Some(hashes) = &mut self.statement_hashes {
+            hashes.push(hash_parts(b"S", parts));
+        }
     }
 
     /// Emit `template` in the current scope: the stand-in for `GraphScope::emit`.
@@ -269,18 +308,20 @@ impl<'a> TemplateSink<'a> {
                 return;
             }
         }
-        let (gh, sh, ph, oh) = (self.graph_hash(), self.hash(s), self.hash(p), self.hash(o));
-        let index = list_index.map_or([0u8; 5], |i| {
-            let b = i.to_le_bytes();
-            [1, b[0], b[1], b[2], b[3]]
-        });
-        self.record(&[
-            &gh.to_le_bytes(),
-            &sh.to_le_bytes(),
-            &ph.to_le_bytes(),
-            &oh.to_le_bytes(),
-            &index,
-        ]);
+        if self.identity() {
+            let (gh, sh, ph, oh) = (self.graph_hash(), self.hash(s), self.hash(p), self.hash(o));
+            let index = list_index.map_or([0u8; 5], |i| {
+                let b = i.to_le_bytes();
+                [1, b[0], b[1], b[2], b[3]]
+            });
+            self.record(&[
+                &gh.to_le_bytes(),
+                &sh.to_le_bytes(),
+                &ph.to_le_bytes(),
+                &oh.to_le_bytes(),
+                &index,
+            ]);
+        }
 
         let mut template = TripleTemplate::new(subject, TemplateTerm::Sid(predicate), object);
         if let Some(dtc) = dtc {
@@ -405,6 +446,64 @@ fn is_commit_this_iri(iri: &str) -> bool {
     iri == fluree_vocab::fluree::COMMIT_THIS_HTTP || iri == fluree_vocab::fluree::COMMIT_THIS_SCHEME
 }
 
+/// A literal's part of a statement hash: the value it is stored as, its
+/// datatype, and its language tag lowercased, as tags compare. So the
+/// spellings of one stored literal — `1` and `"1"^^xsd:integer`, `true` and
+/// `"true"^^xsd:boolean`, `1.0` and `1.00`, `@en-US` and `@en-us` — hash
+/// alike. Text is hashed as is, a decimal by its normalized form, any other
+/// value by `FlakeValue::canonical_hash`, whose bytes are fixed.
+fn literal_hash(value: &FlakeValue, dt_iri: &str, language: Option<&str>) -> u128 {
+    let lowered;
+    let lang: &[u8] = match language {
+        None => b"",
+        Some(tag) if tag.bytes().any(|b| b.is_ascii_uppercase()) => {
+            lowered = tag.to_ascii_lowercase();
+            lowered.as_bytes()
+        }
+        Some(tag) => tag.as_bytes(),
+    };
+    let dt = dt_iri.as_bytes();
+    match value {
+        FlakeValue::String(text) | FlakeValue::Json(text) => {
+            hash_parts(b"L", &[b"s", text.as_bytes(), dt, lang])
+        }
+        FlakeValue::Decimal(d) => decimal_hash(d, dt, lang),
+        other => hash_parts(
+            b"L",
+            &[b"h", &other.canonical_hash().to_le_bytes(), dt, lang],
+        ),
+    }
+}
+
+/// [`literal_hash`] of a decimal, by value: its mantissa with no trailing
+/// zero, and its scale, so `1.0` and `1.00` are one decimal. A mantissa that
+/// fits an `i64`, the common case, is hashed as its eight little-endian
+/// bytes with no allocation; a larger one is normalized and hashed as its
+/// signed bytes, which are never eight long.
+fn decimal_hash(d: &bigdecimal::BigDecimal, dt: &[u8], lang: &[u8]) -> u128 {
+    use bigdecimal::ToPrimitive;
+    let hash = |mantissa: &[u8], scale: i64| {
+        hash_parts(b"L", &[b"d", mantissa, &scale.to_le_bytes(), dt, lang])
+    };
+    let (int_val, mut scale) = d.as_bigint_and_scale();
+    if let Some(mut m) = int_val.to_i64() {
+        if m == 0 {
+            return hash(&0i64.to_le_bytes(), 0);
+        }
+        while m % 10 == 0 {
+            m /= 10;
+            scale -= 1;
+        }
+        return hash(&m.to_le_bytes(), scale);
+    }
+    let normal = d.normalized();
+    let (int_val, scale) = normal.as_bigint_and_scale();
+    match int_val.to_i64() {
+        Some(m) => hash(&m.to_le_bytes(), scale),
+        None => hash(&int_val.to_signed_bytes_le(), scale),
+    }
+}
+
 /// A 128-bit hash of a tagged sequence of parts. Stable across builds and
 /// platforms: it hashes bytes, never a `Debug` rendering or a `Hash` impl.
 fn hash_parts(tag: &[u8], parts: &[&[u8]]) -> u128 {
@@ -430,7 +529,11 @@ impl GraphSink for TemplateSink<'_> {
 
     fn term_iri(&mut self, iri: &str) -> TermId {
         let sid = self.ns.sid_for_iri(iri);
-        let hash = hash_parts(b"I", &[iri.as_bytes()]);
+        let hash = if self.identity() {
+            hash_parts(b"I", &[iri.as_bytes()])
+        } else {
+            0
+        };
         self.add(SinkTerm::Node {
             term: TemplateTerm::Sid(sid),
             iri: Some(Arc::from(iri)),
@@ -439,6 +542,7 @@ impl GraphSink for TemplateSink<'_> {
     }
 
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
+        self.blank_nodes = true;
         // A blank node in the txn-meta block fails where it is used, with a
         // message naming the position (subject or object).
         match label {
@@ -450,7 +554,11 @@ impl GraphSink for TemplateSink<'_> {
                 // node; other labels skolemize at staging.
                 let term = crate::namespace::stable_blank_node_sid_from_label(l)
                     .map_or_else(|| TemplateTerm::BlankNode(l.to_string()), TemplateTerm::Sid);
-                let hash = hash_parts(b"B", &[l.as_bytes()]);
+                let hash = if self.identity() {
+                    hash_parts(b"B", &[l.as_bytes()])
+                } else {
+                    0
+                };
                 let id = self.add(SinkTerm::Node {
                     term,
                     iri: None,
@@ -464,7 +572,11 @@ impl GraphSink for TemplateSink<'_> {
                 // user-writable BLANK_NODE_LABEL space (see FlakeSink).
                 self.anon += 1;
                 let label = format!("-b{}", self.anon);
-                let hash = hash_parts(b"B", &[label.as_bytes()]);
+                let hash = if self.identity() {
+                    hash_parts(b"B", &[label.as_bytes()])
+                } else {
+                    0
+                };
                 self.add(SinkTerm::Node {
                     term: TemplateTerm::BlankNode(label),
                     iri: None,
@@ -482,14 +594,11 @@ impl GraphSink for TemplateSink<'_> {
             Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang)),
             None => DatatypeConstraint::Explicit(dt_sid),
         };
-        let hash = hash_parts(
-            b"L",
-            &[
-                value.as_bytes(),
-                dt_iri.as_bytes(),
-                language.unwrap_or("").as_bytes(),
-            ],
-        );
+        let hash = if self.identity() {
+            literal_hash(&flake_value, dt_iri, language)
+        } else {
+            0
+        };
         let meta = matches!(self.scope, Scope::TxnMeta)
             .then(|| Ok(self.meta_literal(value, dt_iri, language)));
         self.add(SinkTerm::Literal {
@@ -507,14 +616,11 @@ impl GraphSink for TemplateSink<'_> {
         } else {
             infer_datatype(&flake_value)
         };
-        let (kind, text): (&[u8], String) = match &value {
-            LiteralValue::Integer(i) => (b"i", i.to_string()),
-            LiteralValue::Double(d) => (b"d", format!("{:016x}", d.to_bits())),
-            LiteralValue::Boolean(b) => (b"b", b.to_string()),
-            LiteralValue::String(s) => (b"s", s.to_string()),
-            LiteralValue::Json(s) => (b"j", s.to_string()),
+        let hash = if self.identity() {
+            literal_hash(&flake_value, datatype.as_iri(), None)
+        } else {
+            0
         };
-        let hash = hash_parts(b"N", &[kind, text.as_bytes(), datatype.as_iri().as_bytes()]);
         let meta = matches!(self.scope, Scope::TxnMeta).then(|| match &value {
             LiteralValue::Integer(i) => Ok(TxnMetaValue::Long(*i)),
             LiteralValue::Double(d) if d.is_finite() => Ok(TxnMetaValue::Double(*d)),
@@ -607,23 +713,28 @@ impl GraphSink for TemplateSink<'_> {
             return Ok(());
         };
         let (o, dtc) = self.object(object);
-        let (gh, sh, ph, oh, rh) = (
-            self.graph_hash(),
-            self.hash(subject),
-            self.hash(predicate),
-            self.hash(object),
-            self.hash(reifier),
-        );
-        self.content_id = self.content_id.wrapping_add(hash_parts(
-            b"R",
-            &[
-                &gh.to_le_bytes(),
-                &sh.to_le_bytes(),
-                &ph.to_le_bytes(),
-                &oh.to_le_bytes(),
-                &rh.to_le_bytes(),
-            ],
-        ));
+        if self.identity() {
+            let (gh, sh, ph, oh, rh) = (
+                self.graph_hash(),
+                self.hash(subject),
+                self.hash(predicate),
+                self.hash(object),
+                self.hash(reifier),
+            );
+            let hash = hash_parts(
+                b"R",
+                &[
+                    &gh.to_le_bytes(),
+                    &sh.to_le_bytes(),
+                    &ph.to_le_bytes(),
+                    &oh.to_le_bytes(),
+                    &rh.to_le_bytes(),
+                ],
+            );
+            if let Some(hashes) = &mut self.statement_hashes {
+                hashes.push(hash);
+            }
+        }
         for template in bundle_templates(s, p, o, dtc, ann) {
             self.emit(template);
         }

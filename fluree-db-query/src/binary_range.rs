@@ -327,15 +327,34 @@ impl BinaryRangeProvider {
     /// it.
     ///
     /// The index keeps less than some values carry — a big integer keeps no
-    /// XSD subtype, a `dateTime` or `time` keeps microseconds — so distinct
-    /// terms can share a key. Terms that share one are one stored fact.
+    /// XSD subtype — so distinct terms can share a key. Terms that share one
+    /// are one stored fact.
     ///
     /// `None` when no persisted row can hold the object: its predicate,
     /// string, subject, language tag, datatype or big number is not in the
     /// persisted dictionaries, or it is a vector (keyed by fact, not by
     /// value).
     pub fn persisted_object_key(&self, g_id: GraphId, flake: &Flake) -> Option<(u16, u64)> {
-        let p_id = self.store.sid_to_p_id(&flake.p)?;
+        let p_id = self.persisted_p_id(&flake.p)?;
+        self.persisted_object_key_in(g_id, Some(p_id), flake)
+    }
+
+    /// The persisted id of predicate `p`: `None` when no persisted row has it.
+    pub fn persisted_p_id(&self, p: &Sid) -> Option<u32> {
+        self.store.sid_to_p_id(p)
+    }
+
+    /// [`Self::persisted_object_key`] for a flake whose predicate has the
+    /// persisted id `p_id`, so a caller keying many objects of one predicate
+    /// resolves it once. With no persisted predicate (`None`) only a big
+    /// number has no key: the others' keys do not depend on the predicate,
+    /// and queries over novelty key them under a runtime predicate id.
+    pub fn persisted_object_key_in(
+        &self,
+        g_id: GraphId,
+        p_id: Option<u32>,
+        flake: &Flake,
+    ) -> Option<(u16, u64)> {
         let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
         crate::binary_scan::value_to_otype_okey(
             &flake.o,
@@ -343,7 +362,7 @@ impl BinaryRangeProvider {
             lang,
             &self.store,
             None,
-            Some((g_id, p_id)),
+            p_id.map(|p_id| (g_id, p_id)),
         )
         .ok()
         .map(|(o_type, o_key)| (o_type.as_u16(), o_key))
