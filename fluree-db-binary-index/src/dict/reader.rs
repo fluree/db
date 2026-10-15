@@ -1676,6 +1676,11 @@ mod tests {
                 assert_eq!(next.reverse_lookup(&e.key).unwrap(), Some(e.id));
             }
             assert_eq!(opening(&cs), opened, "fences found in the cache");
+            assert_eq!(
+                cache.dictionary_allowance().stats().rent_counted,
+                0,
+                "reverse reads run no rent clock"
+            );
             let elsewhere = reader_over(
                 &cs,
                 leaves,

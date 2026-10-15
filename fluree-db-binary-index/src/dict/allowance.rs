@@ -32,12 +32,18 @@ pub(crate) fn mapped_from_env() -> bool {
 }
 
 /// How the adaptive pool admits packs. Experiment control:
-/// `FLUREE_DICT_ADMISSION=demand`; coverage otherwise.
+/// `FLUREE_DICT_ADMISSION=recent|recent-compare|demand`; coverage otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
     /// A pack whose rent since it was last whole has reached its size, and
     /// whose misses have covered enough of it, evicting in clock order.
     Coverage,
+    /// As `Coverage`, with the rent recent: halving each time all packs
+    /// together have missed the allowance's size.
+    Recent,
+    /// As `Recent`, evicting the clock's victims only when the candidate's
+    /// recent lookups are at least [`OUTWEIGH`] times theirs together.
+    RecentCompared,
     /// A pack whose recent rent has reached its size, evicting the least
     /// recently demanded packs, and only when its recent lookups clearly
     /// outweigh theirs.
@@ -46,6 +52,8 @@ pub enum Admission {
 
 pub(crate) fn admission_from_env() -> Admission {
     match std::env::var("FLUREE_DICT_ADMISSION").as_deref() {
+        Ok("recent") => Admission::Recent,
+        Ok("recent-compare") => Admission::RecentCompared,
         Ok("demand") => Admission::Demand,
         _ => Admission::Coverage,
     }
@@ -260,9 +268,10 @@ pub struct AllowanceStats {
     pub no_room: u64,
     pub outweighed: u64,
     pub too_large: u64,
-    /// The demand clocks' epochs.
+    /// The demand clocks' epochs, and the bytes the rent clock has counted.
     pub rent_epoch: u64,
     pub lookup_epoch: u64,
+    pub rent_counted: u64,
     /// Promotions of a pack promoted before, and so evicted since.
     pub repromoted: u64,
     pub repromoted_bytes: u64,
@@ -442,6 +451,15 @@ impl DictionaryAllowance {
         self.admission
     }
 
+    /// Whether admission weighs packs' recent lookups, which then need
+    /// counting.
+    pub fn counts_lookups(&self) -> bool {
+        matches!(
+            self.admission,
+            Admission::RecentCompared | Admission::Demand
+        )
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -528,6 +546,32 @@ impl DictionaryAllowance {
         covered: u64,
         assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
     ) -> io::Result<Promotion> {
+        self.promote_weighed(identity, len, covered, None, assemble)
+    }
+
+    /// [`Self::promote`], but the packs the clock picks to make room are
+    /// evicted only if `candidate`'s recent lookups are at least
+    /// [`OUTWEIGH`] times theirs together; otherwise they stay, the hand
+    /// having passed.
+    pub fn promote_compared(
+        self: &Arc<Self>,
+        identity: u128,
+        len: u64,
+        covered: u64,
+        candidate: &crate::read::cached_units::MissMeter,
+        assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
+    ) -> io::Result<Promotion> {
+        self.promote_weighed(identity, len, covered, Some(candidate), assemble)
+    }
+
+    fn promote_weighed(
+        self: &Arc<Self>,
+        identity: u128,
+        len: u64,
+        covered: u64,
+        candidate: Option<&crate::read::cached_units::MissMeter>,
+        assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
+    ) -> io::Result<Promotion> {
         let victims = {
             let mut state = self.lock();
             if let Some(pack) = state.resident.get(&identity) {
@@ -539,7 +583,20 @@ impl DictionaryAllowance {
             if state.in_flight.contains(&identity) {
                 return Ok(self.turned_away(Promotion::Busy));
             }
-            self.evict_for(&mut state, len)
+            let chosen = self.clock_victims(&mut state, len);
+            if let Some(candidate) = candidate.filter(|_| !chosen.is_empty()) {
+                let demand: u64 = chosen
+                    .iter()
+                    .map(|id| Self::recent_lookups(&state, *id))
+                    .sum();
+                if candidate.recent_lookups() < demand.saturating_mul(OUTWEIGH) {
+                    for id in chosen.into_iter().rev() {
+                        state.clock.push_front(id);
+                    }
+                    return Ok(self.turned_away(Promotion::Outweighed));
+                }
+            }
+            self.evict_all(&mut state, chosen)
         };
         // Dropped outside the lock: a victim no reader holds returns its
         // bytes now, which takes the lock.
@@ -686,12 +743,12 @@ impl DictionaryAllowance {
         Ok(Promotion::Promoted(pack))
     }
 
-    /// Take packs out of the pool in clock order until `len` more bytes
-    /// would fit, giving each referenced pack a second chance. The caller
-    /// drops the returned packs once the lock is released.
-    fn evict_for(&self, state: &mut State, len: u64) -> Vec<Arc<HeldPack>> {
+    /// The packs the clock would take out of the pool for `len` more bytes
+    /// to fit, giving each referenced pack a second chance; they leave the
+    /// clock but stay resident.
+    fn clock_victims(&self, state: &mut State, len: u64) -> Vec<u128> {
         let mut need = (state.used + len).saturating_sub(self.capacity);
-        let mut victims = Vec::new();
+        let mut chosen = Vec::new();
         let mut turns = 2 * state.clock.len();
         while need > 0 && turns > 0 {
             turns -= 1;
@@ -705,10 +762,16 @@ impl DictionaryAllowance {
                 state.clock.push_back(identity);
                 continue;
             }
-            let pack = self.evict(state, identity);
             need = need.saturating_sub(pack.len() as u64);
-            victims.push(pack);
+            chosen.push(identity);
         }
+        chosen
+    }
+
+    /// Evict `chosen`; the caller drops the returned packs once the lock is
+    /// released.
+    fn evict_all(&self, state: &mut State, chosen: Vec<u128>) -> Vec<Arc<HeldPack>> {
+        let victims: Vec<_> = chosen.into_iter().map(|id| self.evict(state, id)).collect();
         if !victims.is_empty() {
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -828,6 +891,7 @@ impl DictionaryAllowance {
             too_large: load(&self.too_large),
             rent_epoch: self.clocks.rent.epoch(),
             lookup_epoch: self.clocks.lookups.epoch(),
+            rent_counted: self.clocks.rent.counted(),
             repromoted: load(&self.repromoted),
             repromoted_bytes: load(&self.repromoted_bytes),
             outstanding: state.used.saturating_sub(
@@ -1125,6 +1189,49 @@ mod tests {
             drop(promoted(admit(&allowance, &b, 2, 80)));
             assert!(allowance.resident(1).is_none());
         }
+    }
+
+    /// Compared, the clock still picks the victims; the candidate's recent
+    /// lookups must outweigh theirs, or they stay and keep their place.
+    #[test]
+    fn comparison_weighs_the_clocks_victims() {
+        let allowance =
+            DictionaryAllowance::with_policy(80, false, Admission::RecentCompared, Some(1 << 40));
+        let busy = allowance.meter(1, 1, 0, 0);
+        let quiet = allowance.meter(2, 1, 0, 0);
+        for _ in 0..100 {
+            busy.note_lookup();
+        }
+        for _ in 0..10 {
+            quiet.note_lookup();
+        }
+        drop(promoted(allowance.promote(1, 40, 40, fill).unwrap()));
+        drop(promoted(allowance.promote(2, 40, 40, fill).unwrap()));
+        let candidate = allowance.meter(3, 1, 0, 0);
+        for _ in 0..199 {
+            candidate.note_lookup();
+        }
+        // The clock picks 1, first in its order, though 2 is looked up less.
+        assert!(matches!(
+            allowance
+                .promote_compared(3, 40, 40, &candidate, |_| panic!("outweighed"))
+                .unwrap(),
+            Promotion::Outweighed
+        ));
+        assert!(allowance.resident(1).is_some() && allowance.resident(2).is_some());
+        candidate.note_lookup();
+        drop(promoted(
+            allowance
+                .promote_compared(3, 40, 40, &candidate, fill)
+                .unwrap(),
+        ));
+        assert!(
+            allowance.resident(1).is_none(),
+            "the clock's victim, still first"
+        );
+        assert!(allowance.resident(2).is_some());
+        let stats = allowance.stats();
+        assert_eq!((stats.outweighed, stats.evicted), (1, 1));
     }
 
     #[test]

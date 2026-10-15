@@ -392,6 +392,7 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
         "evicted": s.evicted, "evicted_bytes": s.evicted_bytes,
         "busy": s.busy, "no_room": s.no_room, "outweighed": s.outweighed,
         "too_large": s.too_large, "rent_epoch": s.rent_epoch, "lookup_epoch": s.lookup_epoch,
+        "rent_counted": s.rent_counted,
         "repromoted": s.repromoted, "repromoted_bytes": s.repromoted_bytes,
         "outstanding": s.outstanding,
         // Per live pack: [kind, bytes, rent, covered, promotions, held,

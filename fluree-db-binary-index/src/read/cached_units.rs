@@ -132,6 +132,7 @@ pub const DEFAULT_UNIT: u64 = 64 * 1024;
 pub struct Epochs {
     epoch: AtomicU64,
     since: AtomicU64,
+    counted: AtomicU64,
     period: u64,
 }
 
@@ -140,6 +141,7 @@ impl Epochs {
         Self {
             epoch: AtomicU64::new(0),
             since: AtomicU64::new(0),
+            counted: AtomicU64::new(0),
             period: period.max(1),
         }
     }
@@ -148,7 +150,13 @@ impl Epochs {
         self.epoch.load(Ordering::Relaxed)
     }
 
+    /// Everything counted so far.
+    pub fn counted(&self) -> u64 {
+        self.counted.load(Ordering::Relaxed)
+    }
+
     pub fn count(&self, n: u64) {
+        self.counted.fetch_add(n, Ordering::Relaxed);
         if self.since.fetch_add(n, Ordering::Relaxed) + n < self.period {
             return;
         }

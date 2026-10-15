@@ -126,7 +126,9 @@ impl AdaptivePack {
     }
 
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
-        self.meter.note_lookup();
+        if self.allowance.counts_lookups() {
+            self.meter.note_lookup();
+        }
         if let Some(whole) = self.whole() {
             let mark = out.len();
             let found = lookup_whole(&whole, meta, id, out);
@@ -147,19 +149,24 @@ impl AdaptivePack {
             out,
         )?;
         match self.allowance.admission() {
-            Admission::Coverage => self.by_coverage()?,
             Admission::Demand => self.by_demand()?,
+            _ => self.by_coverage()?,
         }
         Ok(found)
     }
 
-    /// Promote once its rent since it was last whole reaches its size and
-    /// has covered enough of it.
+    /// Promote once its rent — since it was last whole, or recent — reaches
+    /// its size and has covered enough of it.
     fn by_coverage(&self) -> io::Result<()> {
         let len = self.units.len();
+        let admission = self.allowance.admission();
+        let rent = match admission {
+            Admission::Coverage => self.meter.bytes(),
+            _ => self.meter.recent_rent(),
+        };
         if len > self.allowance.capacity() {
             self.meter.set_reason(reject::TOO_LARGE);
-        } else if self.meter.bytes() < len {
+        } else if rent < len {
             self.meter.set_reason(reject::RENT);
         } else {
             let covered = self.meter.covered();
@@ -169,11 +176,19 @@ impl AdaptivePack {
             if covered < self.min_covered {
                 self.meter.set_reason(reject::COVERAGE);
             } else {
-                let promotion =
-                    self.allowance
-                        .promote(self.units.identity(), len, covered, |buf| {
-                            self.units.assemble_into(buf)
-                        })?;
+                let identity = self.units.identity();
+                let assemble = |buf: &mut [u8]| self.units.assemble_into(buf);
+                let promotion = if admission == Admission::RecentCompared {
+                    self.allowance.promote_compared(
+                        identity,
+                        len,
+                        covered,
+                        &self.meter,
+                        assemble,
+                    )?
+                } else {
+                    self.allowance.promote(identity, len, covered, assemble)?
+                };
                 self.settle(promotion);
             }
         }
@@ -2514,8 +2529,12 @@ mod tests {
             }
         }
 
-        fn demand_cache(bytes: u64) -> Arc<LeafletCache> {
-            Arc::new(LeafletCache::with_max_mb(16).with_demand_allowance(bytes, 2 * COUNT as u64))
+        fn policy_cache(bytes: u64, admission: Admission) -> Arc<LeafletCache> {
+            Arc::new(LeafletCache::with_max_mb(16).with_admission(
+                bytes,
+                admission,
+                2 * COUNT as u64,
+            ))
         }
 
         fn reason_of(cache: &LeafletCache) -> u8 {
@@ -2526,30 +2545,31 @@ mod tests {
 
         /// A pack whose misses keep landing on the same small region — its
         /// units falling out of the cache — rents its size without covering
-        /// it: the coverage guard turns it away for that, while demand
-        /// admission buys it.
+        /// it: the coverage guard turns it away for that, whether its rent is
+        /// cumulative or recent; demand admission, without the guard, buys it.
         #[test]
-        fn a_narrow_hot_pack_is_refused_by_coverage_and_bought_by_demand() {
+        fn a_narrow_hot_pack_is_refused_by_the_coverage_guard() {
             let len = pack_from(FIRST).len() as u64;
-            for demand in [false, true] {
+            for (admission, bought) in [
+                (Admission::Coverage, false),
+                (Admission::Recent, false),
+                (Admission::RecentCompared, false),
+                (Admission::Demand, true),
+            ] {
                 let cs = SegmentedContentStore::new(true);
-                let cache = if demand {
-                    demand_cache(2 * len)
-                } else {
-                    allowance_cache(2 * len)
-                };
+                let cache = policy_cache(2 * len, admission);
                 let reader = guarded(&cs, &cache, 0.5);
                 for _ in 0..12 {
                     read_ids(&reader, FIRST, 0..COUNT as u64 / 10);
                     cache.invalidate_all();
                 }
                 let stats = cache.dictionary_allowance().stats();
-                if demand {
-                    assert_eq!(stats.promoted, 1);
+                if bought {
+                    assert_eq!(stats.promoted, 1, "{admission:?}");
                     assert_eq!(reason_of(&cache), reject::NONE);
                 } else {
-                    assert_eq!(stats.promoted, 0);
-                    assert_eq!(reason_of(&cache), reject::COVERAGE);
+                    assert_eq!(stats.promoted, 0, "{admission:?}");
+                    assert_eq!(reason_of(&cache), reject::COVERAGE, "{admission:?}");
                 }
                 read_all(&reader, FIRST);
             }
@@ -2557,19 +2577,21 @@ mod tests {
 
         /// Under drifting misses — each pack missed a little at a time while
         /// the others' misses run the rent clock — recent rent never reaches
-        /// a pack's size, so demand admission buys nothing and leaves the
-        /// room unused; cumulative rent buys the first pack it fills.
+        /// a pack's size, so admission by recent rent buys nothing and leaves
+        /// the room unused; cumulative rent buys the first pack it fills.
         #[test]
-        fn drifting_misses_buy_nothing_by_demand() {
+        fn drifting_misses_buy_nothing_by_recent_rent() {
             let len = pack_from(FIRST).len() as u64;
             let others: Vec<u64> = (1..=8).map(|k| FIRST + 10 * k * COUNT as u64).collect();
-            for demand in [true, false] {
+            for admission in [
+                Admission::Demand,
+                Admission::Recent,
+                Admission::RecentCompared,
+                Admission::Coverage,
+            ] {
+                let recent = admission != Admission::Coverage;
                 let cs = SegmentedContentStore::new(true);
-                let cache = if demand {
-                    demand_cache(len + len / 4)
-                } else {
-                    allowance_cache(len + len / 4)
-                };
+                let cache = policy_cache(len + len / 4, admission);
                 let a = adaptive(&cs, FIRST, &cache);
                 let rest: Vec<_> = others.iter().map(|&f| adaptive(&cs, f, &cache)).collect();
                 for round in 0..40 {
@@ -2579,8 +2601,12 @@ mod tests {
                     cache.invalidate_all();
                 }
                 let stats = cache.dictionary_allowance().stats();
-                if demand {
-                    assert_eq!((stats.promoted, stats.used), (0, 0), "room left unused");
+                if recent {
+                    assert_eq!(
+                        (stats.promoted, stats.used),
+                        (0, 0),
+                        "{admission:?}: room left unused"
+                    );
                     assert!(stats.rent_epoch >= 8, "{} rent epochs", stats.rent_epoch);
                     let report = cache.dictionary_allowance().pack_report();
                     assert!(report
@@ -2592,15 +2618,21 @@ mod tests {
             }
         }
 
-        /// With the room taken by a pack the workload has left, a pack now
-        /// in use is outweighed at first; as the old pack's lookups age and
-        /// the new one's grow, the new one replaces it.
+        /// Weighing lookups, with the room taken by a pack the workload has
+        /// left, a pack now in use is outweighed at first; as the old pack's
+        /// lookups age and the new one's grow, the new one replaces it.
         #[test]
-        fn demand_admission_follows_a_switch() {
+        fn weighed_admission_follows_a_switch_once_demand_shifts() {
+            for admission in [Admission::Demand, Admission::RecentCompared] {
+                weighed_switch(admission);
+            }
+        }
+
+        fn weighed_switch(admission: Admission) {
             let len = pack_from(FIRST).len() as u64;
             let other = FIRST + 10 * COUNT as u64;
             let cs = SegmentedContentStore::new(true);
-            let cache = demand_cache(len + len / 2);
+            let cache = policy_cache(len + len / 2, admission);
             let a = adaptive(&cs, FIRST, &cache);
             let b = adaptive(&cs, other, &cache);
             for _ in 0..3 {
@@ -2622,6 +2654,75 @@ mod tests {
             let reads = cs.reads().len();
             read_all(&b, other);
             assert_eq!(cs.reads().len(), reads, "b served whole");
+        }
+
+        /// By recent rent and the clock alone, a pack now in use replaces
+        /// one the workload has left as soon as its recent rent reaches its
+        /// size: no demand to wait out. (With room for one and a half packs,
+        /// rent halves every pack and a half missed, so that takes b two
+        /// passes.)
+        #[test]
+        fn recent_rent_follows_a_switch_at_once() {
+            let len = pack_from(FIRST).len() as u64;
+            let other = FIRST + 10 * COUNT as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = policy_cache(len + len / 2, Admission::Recent);
+            let a = adaptive(&cs, FIRST, &cache);
+            let b = adaptive(&cs, other, &cache);
+            for _ in 0..3 {
+                read_all(&a, FIRST);
+            }
+            read_all(&b, other);
+            assert_eq!(cache.dictionary_allowance().stats().promoted, 1);
+            cache.invalidate_all();
+            read_all(&b, other);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!((stats.promoted, stats.evicted), (2, 1), "b replaces a");
+            assert_eq!(stats.outweighed, 0);
+            let reads = cs.reads().len();
+            read_all(&b, other);
+            assert_eq!(cs.reads().len(), reads, "b served whole");
+        }
+
+        /// The rent clock counts the bytes forward-pack lookups miss, and
+        /// nothing else: not cache hits, and not what a promotion decrypts
+        /// to assemble the pack.
+        #[test]
+        fn the_rent_clock_counts_only_range_misses() {
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = policy_cache(2 * len, Admission::Recent);
+            let reader = adaptive(&cs, FIRST, &cache);
+            // Unit reads: misses and assembly, not the pack's opening reads.
+            let read_bytes = |cs: &SegmentedContentStore| -> u64 {
+                cs.reads()
+                    .iter()
+                    .filter(|r| r.start % 4096 == 0 && r.end - r.start == 4096)
+                    .map(|r| r.end.min(len) - r.start)
+                    .sum()
+            };
+            read_ids(&reader, FIRST, 0..HALF);
+            let missed = read_bytes(&cs);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!(stats.rent_counted, missed);
+            read_ids(&reader, FIRST, 0..HALF);
+            assert_eq!(
+                cache.dictionary_allowance().stats().rent_counted,
+                missed,
+                "hits"
+            );
+            cache.invalidate_all();
+            read_ids(&reader, FIRST, HALF..COUNT as u64);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!(stats.promoted, 1);
+            assert!(
+                stats.assembly_decrypted > 0,
+                "the first half decrypted again"
+            );
+            assert_eq!(
+                stats.rent_counted,
+                read_bytes(&cs) - stats.assembly_decrypted
+            );
         }
 
         /// Lookups a whole pack serves are counted, and recorded with their

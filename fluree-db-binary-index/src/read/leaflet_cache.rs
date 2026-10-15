@@ -733,14 +733,19 @@ impl LeafletCache {
         self
     }
 
-    /// Replace the dictionary allowance with one admitting by demand, its
-    /// lookups halving every `period` lookups (tests).
+    /// Replace the dictionary allowance with one admitting by `admission`,
+    /// recent lookups halving every `period` lookups (tests).
     #[cfg(test)]
-    pub(crate) fn with_demand_allowance(mut self, bytes: u64, period: u64) -> Self {
+    pub(crate) fn with_admission(
+        mut self,
+        bytes: u64,
+        admission: crate::dict::allowance::Admission,
+        period: u64,
+    ) -> Self {
         self.dictionary_allowance = crate::dict::allowance::DictionaryAllowance::with_policy(
             bytes,
             false,
-            crate::dict::allowance::Admission::Demand,
+            admission,
             Some(period),
         );
         self
