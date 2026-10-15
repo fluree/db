@@ -514,10 +514,11 @@ async fn double_negated_exists_stays_allowed() {
 }
 
 #[tokio::test]
-async fn subquery_aggregate_in_a_rule_body_is_rejected() {
-    // The docs promise "subqueries without aggregates"; the walk recursed into
-    // a subquery's patterns but never looked at its own GROUP BY, so an
-    // aggregating sub-SELECT computed counts inside the fixpoint.
+async fn subquery_aggregate_over_its_own_conclusions_is_rejected() {
+    // An aggregating sub-SELECT used to compute counts inside the fixpoint,
+    // over facts still being derived. Aggregates are now stratified: a rule
+    // may count only what is complete before it runs, so counting its own
+    // head predicate is refused, naming the cycle.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = claims_ledger(&fluree, "rules/reject/subquery-group-by").await;
     let message = rejection(
@@ -527,13 +528,13 @@ async fn subquery_aggregate_in_a_rule_body_is_rejected() {
             "@type": "f:sparql",
             "@value": "PREFIX ex: <http://example.org/> \
                        CONSTRUCT { ?a ex:trustedKnows ?b } \
-                       WHERE { { SELECT ?a (COUNT(?b) AS ?n) WHERE { ?a ex:knows ?b } \
+                       WHERE { { SELECT ?a (COUNT(?b) AS ?n) WHERE { ?a ex:trustedKnows ?b } \
                                  GROUP BY ?a } ?a ex:knows ?b }"
         }]),
     )
     .await;
     assert!(
-        message.contains("GROUP BY") && message.contains("subquery"),
+        message.contains("aggregates facts that depend on its own conclusions"),
         "unexpected rejection message: {message}"
     );
 }

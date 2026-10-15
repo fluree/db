@@ -9,10 +9,11 @@ together and recurse.
 Rule bodies are evaluated by the same query engine as any other query, so a
 rule can use everything a `where` clause can: edge annotations (claims and
 other relationship metadata), the full FILTER expression language, BIND,
-VALUES, UNION, property paths, subqueries, and negation with `not-exists` /
-`NOT EXISTS` (see [Negation](#negation)). The constructs a rule body may not
-use — OPTIONAL, MINUS, aggregates and SERVICE — are rejected with an error
-naming the construct (see [Validation](#validation-a-rule-that-cannot-run-is-an-error)).
+VALUES, UNION, property paths, subqueries, negation with `not-exists` /
+`NOT EXISTS` (see [Negation](#negation)), and grouped aggregates in a
+subquery (see [Aggregates](#aggregates)). The constructs a rule body may not
+use — OPTIONAL, MINUS, top-level GROUP BY and SERVICE — are rejected with an
+error naming the construct (see [Validation](#validation-a-rule-that-cannot-run-is-an-error)).
 
 For background concepts see [Reasoning and inference](../concepts/reasoning.md);
 for enabling reasoning in queries see
@@ -315,11 +316,13 @@ over an incomplete rule set would be silently wrong, which is worse.
 
 Rejected:
 
-- **Constructs a fixpoint cannot evaluate**: OPTIONAL (`["optional", …]`),
-  GROUP BY / aggregates, SERVICE. MINUS is rejected too, with a pointer to
-  NOT EXISTS, which rules support.
-- **Negation that cannot be stratified**: a program in which a rule negates
-  facts that depend on its own conclusions (see [Negation](#negation)).
+- **Constructs a fixpoint cannot evaluate**: OPTIONAL (`["optional", …]`) and
+  SERVICE. MINUS is rejected too, with a pointer to NOT EXISTS, which rules
+  support, and GROUP BY / aggregates at the top of a body with a pointer to
+  the subquery form.
+- **Negation or aggregation that cannot be stratified**: a program in which a
+  rule negates or aggregates facts that depend on its own conclusions (see
+  [Negation](#negation) and [Aggregates](#aggregates)).
 - **A variable a negation shares with the rest of the body that no positive
   pattern binds** (see [Negation](#negation)).
 - **A head variable the body never binds** (range restriction). A variable the
@@ -344,10 +347,9 @@ Rejected:
   that is not a string or array expression.
 
 Positive existence checks (`["exists", …]`), UNION, BIND, VALUES, property
-paths and subqueries are all allowed. A subquery may use `DISTINCT` and
-`ORDER BY` — neither changes which solutions exist as the fixpoint grows — but
-not `GROUP BY`, aggregates, `LIMIT` or `OFFSET`, which are rejected by name
-like any other non-monotonic construct.
+paths and subqueries are all allowed. A subquery may use `DISTINCT`,
+`ORDER BY`, `GROUP BY` and aggregates, but not `LIMIT` or `OFFSET`: which
+solutions a slice keeps depends on how much the fixpoint has derived so far.
 
 An `EXISTS` or `NOT EXISTS` is allowed only where its truth value is read
 directly: as the filter condition itself, or under `AND` / `OR` / `!` in such
@@ -419,6 +421,58 @@ finishes, or OWL 2 RL is capped before a negating rule reads its
 entailments, the query fails with an error naming the rule. A positive
 program answers capped instead; a negation over incomplete facts can turn
 a missing fact into a false conclusion.
+
+## Aggregates
+
+A rule aggregates in a subquery of its body and uses the subquery's outputs
+in its head. Counting each account's transactions:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "where": [["query", {
+    "@context": {"ex": "http://example.org/"},
+    "select": ["?acct", "(as (count ?t) ?n)"],
+    "where": {"@id": "?t", "ex:account": "?acct"},
+    "groupBy": ["?acct"]
+  }]],
+  "insert": {"@id": "?acct", "ex:txnCount": "?n"}
+}
+```
+
+```sparql
+PREFIX ex: <http://example.org/>
+CONSTRUCT { ?acct ex:txnCount ?n }
+WHERE {
+  { SELECT ?acct (COUNT(?t) AS ?n) WHERE { ?t ex:account ?acct } GROUP BY ?acct }
+}
+```
+
+**Aggregates read complete facts.** Like a negation, an aggregate runs only
+after every rule that can derive what it reads has finished, so a count over
+a recursive relation counts the finished closure. A rule may not aggregate
+facts that depend on its own conclusions; the program is rejected with the
+cycle named (`ex:a -agg-> ex:b -> ex:a`). If the reasoning budget runs out
+before an aggregating rule finishes, or OWL 2 RL is capped before it runs,
+the query fails rather than derive a count over part of its input.
+
+**Groups.** A group exists only when some solution falls in it, so an
+account with no transactions gets no `ex:txnCount` fact, not a zero. Without
+`GROUP BY`, all solutions form one group, and a count over none of them is
+`0`.
+
+**Solutions, not facts.** A subquery's solutions are a bag, as in any query:
+a transaction reached through two of a person's accounts counts twice in
+`COUNT(?t)`. Write `COUNT(DISTINCT ?t)` (JSON-LD `count-distinct`) to count
+transactions or entities rather than join paths. Derived facts themselves are
+a set — a fact that is both asserted and derived is one fact, and counts once.
+
+**Identity.** An aggregate counts IRIs as stated. Aliases declared with
+`owl:sameAs` are not merged: each counts the facts stated about it, and
+nothing is counted twice.
+
+The other aggregate functions (`SUM`, `AVG`, `MIN`, `MAX`, `SAMPLE`,
+`GROUP_CONCAT`, …) and `HAVING` work as they do in queries.
 
 ## Examples
 

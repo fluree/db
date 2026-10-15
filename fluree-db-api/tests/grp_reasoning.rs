@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_datalog_aggregates.rs"]
+mod it_datalog_aggregates;
 #[path = "it_datalog_closure_paths.rs"]
 mod it_datalog_closure_paths;
 #[path = "it_datalog_negation.rs"]

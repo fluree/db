@@ -7,10 +7,11 @@
 //! executor supports is available to a rule: edge annotations (`@annotation`,
 //! `{| |}`, `~ ?r`), claim-first patterns (`@reifies`, `rdf:reifies`), full
 //! FILTER expressions, BIND, VALUES, UNION, property paths and subqueries.
-//! `NOT EXISTS` is supported when the program is stratified: no rule may
-//! negate facts that depend on its own conclusions. The constructs a rule
-//! body may not use (OPTIONAL, MINUS, aggregates, SERVICE) a fixpoint cannot
-//! evaluate soundly; those are rejected with an error naming the construct.
+//! `NOT EXISTS` and grouped aggregate subqueries are supported when the
+//! program is stratified: no rule may negate or aggregate facts that depend
+//! on its own conclusions. The constructs a rule body may not use (OPTIONAL,
+//! MINUS, top-level aggregates, SERVICE) are rejected with an error naming
+//! the construct.
 //!
 //! Rules are stored as `f:rule` values (JSON with `where`/`insert`, or an
 //! `f:sparql`-typed `CONSTRUCT … WHERE …` string) or supplied per query in the
@@ -151,13 +152,16 @@ impl DatalogRuleSet {
         self.rules.len()
     }
 
-    /// Names of the rules that negate facts (see
-    /// [`RuleFootprint::is_non_monotone`]).
-    pub fn non_monotone_rules(&self) -> Vec<&str> {
+    /// The rules that negate or aggregate facts, each with what makes it so
+    /// (see [`RuleFootprint::non_monotone_construct`]).
+    pub fn non_monotone_rules(&self) -> Vec<(&str, &'static str)> {
         self.rules
             .iter()
-            .filter(|r| r.footprint.is_non_monotone())
-            .map(|r| r.name.as_str())
+            .filter_map(|r| {
+                r.footprint
+                    .non_monotone_construct()
+                    .map(|construct| (r.name.as_str(), construct))
+            })
             .collect()
     }
 

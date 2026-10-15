@@ -203,15 +203,15 @@ pub async fn run_fixpoint_with_schedule(
     }
 
     let dependencies = rule_set.dependencies();
-    if let Some(cycle) = dependencies.unstratified_negation(rule_set) {
+    if let Some(cycle) = dependencies.unstratified(rule_set) {
         return Err(QueryError::InvalidQuery(cycle));
     }
     if schedule == RuleSchedule::WholeProgram {
-        if let Some(rule) = rule_set.non_monotone_rules().first() {
+        if let Some((rule, construct)) = rule_set.non_monotone_rules().first() {
             return Err(QueryError::InvalidQuery(format!(
-                "datalog rule {rule} uses negation, which the whole-program schedule cannot \
-                 evaluate: it runs every rule from the first round, before what the rule \
-                 negates is complete"
+                "datalog rule {rule} uses {construct}, which the whole-program schedule \
+                 cannot evaluate: it runs every rule from the first round, before what the \
+                 rule reads is complete"
             )));
         }
     }
@@ -387,13 +387,14 @@ pub async fn run_fixpoint_with_schedule(
                 .iter()
                 .chain(&pending)
                 .flat_map(|g| g.rules.iter().map(|&i| &rule_set.rules[i]));
-            if let Some(rule) = unfinished
-                .into_iter()
-                .find(|r| r.footprint.is_non_monotone())
-            {
+            if let Some((rule, construct)) = unfinished.into_iter().find_map(|r| {
+                r.footprint
+                    .non_monotone_construct()
+                    .map(|construct| (r, construct))
+            }) {
                 return Err(QueryError::ResourceLimit(format!(
                     "the reasoning budget ({reason}) ran out before datalog rule {} could \
-                     finish. It uses negation, so its conclusions are only meaningful over \
+                     finish. It uses {construct}, so its conclusions are only meaningful over \
                      complete inputs, and the query fails rather than answer from a partial \
                      run. Raise the budget via f:reasoningMaxFacts / f:reasoningMaxSeconds / \
                      f:reasoningMaxMemoryMb (ledger config) or \"reasoningBudget\" (query)",
