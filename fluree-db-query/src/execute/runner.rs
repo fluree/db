@@ -807,15 +807,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
 
     // Dataset execution scans through per-graph `GraphRef`s, not the
     // top-level context overlay — splice the derived-facts overlay into
-    // every ref matching the primary execution view, or datalog / OWL2-RL
-    // derived facts are invisible to dataset queries.
+    // every ref matching the primary execution view, and every named graph
+    // of the same ledger a rule derived into, or datalog / OWL2-RL derived
+    // facts are invisible to dataset queries.
     let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
-        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
-            db.snapshot.ledger_id.as_str(),
-            db.g_id,
-            db.t,
-            effective_overlay,
-        )),
+        (Some(ds), Some(reasoning)) => {
+            let mut graphs = vec![db.g_id];
+            graphs.extend(reasoning.derived().graph_ids().filter(|g| *g != db.g_id));
+            Some(ds.with_overlay_for_graphs(
+                db.snapshot.ledger_id.as_str(),
+                &graphs,
+                db.t,
+                effective_overlay,
+            ))
+        }
         _ => None,
     };
 

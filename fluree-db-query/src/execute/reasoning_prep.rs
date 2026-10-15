@@ -512,7 +512,13 @@ pub async fn compute_derived_facts(
     // cache it so the next identical query is served from the LRU.
     let mut builder = DerivedFactsBuilder::with_capacity(all_flakes.len());
     builder.extend(all_flakes);
-    let derived_overlay = Arc::new(builder.build(same_as, overlay.epoch()));
+    // A rule can derive into a named graph; everything else belongs to the
+    // graph the reasoning ran against.
+    let derived_overlay = Arc::new(builder.build_routed(
+        same_as,
+        overlay.epoch(),
+        crate::datalog_rules::derived_fact_graph(snapshot, g_id),
+    ));
     // A time cap depends on machine load — a GC pause, a noisy neighbour, a
     // cold cache — not on the inputs, so the same query could be served a
     // different closure depending on what else the box was doing when it first

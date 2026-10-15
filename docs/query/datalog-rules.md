@@ -160,6 +160,10 @@ body.
   strings use `{"@value": "chat", "@language": "fr"}`.
 - `@type` derives `rdf:type` triples; an array of objects (or an `@graph`)
   derives several heads from one rule.
+- `"@graph": "ex:inferred"` on a node derives its triples into that named
+  graph, as in a transaction; a named graph object
+  `{"@id": "ex:inferred", "@graph": [ … ]}` does the same for its nodes (see
+  [Named graphs](#named-graphs)).
 - **Every variable used in `insert` must also appear in `where`.** A head that
   references a variable the body never binds rejects the whole rule with an
   error naming the variable (a `where`/`insert` typo is the usual cause):
@@ -304,7 +308,9 @@ WHERE { ?claim rdf:reifies <<( ?a ex:knows ?b )>> ; ex:confidence ?c FILTER(?c >
 Include `PREFIX` declarations in the rule text; the request `@context` is not
 applied to rule sources. A CONSTRUCT template may not contain blank nodes (a
 head cannot mint fresh nodes — every round would mint new ones) and, like a
-JSON-LD head, may not carry an annotation tail yet.
+JSON-LD head, may not carry an annotation tail yet. A `GRAPH <iri> { … }`
+block in the template derives into that named graph (see
+[Named graphs](#named-graphs)).
 
 ## Validation: a rule that cannot run is an error
 
@@ -473,6 +479,38 @@ nothing is counted twice.
 
 The other aggregate functions (`SUM`, `AVG`, `MIN`, `MAX`, `SAMPLE`,
 `GROUP_CONCAT`, …) and `HAVING` work as they do in queries.
+
+## Named graphs
+
+By default a rule derives into the graph the rules run against. A head can
+name a graph instead:
+
+```sparql
+PREFIX ex: <http://example.org/>
+CONSTRUCT { GRAPH ex:inferred { ?x ex:grandparent ?z } }
+WHERE { ?x ex:parent ?y . ?y ex:parent ?z }
+```
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "where": [{"@id": "?x", "ex:parent": "?y"}, {"@id": "?y", "ex:parent": "?z"}],
+  "insert": {"@id": "?x", "@graph": "ex:inferred", "ex:grandparent": {"@id": "?z"}}
+}
+```
+
+The derived facts are visible in that graph and nowhere else: to a query's
+`GRAPH ex:inferred { … }` patterns, to a dataset that names the graph, and to
+other rules that read it. A rule reading `GRAPH ex:inferred { … }` runs after
+the rules that derive into it, so a program can stage results in one graph
+and build on them in another, and a recursive rule can reach its closure
+inside a named graph. The same triple derived into two graphs is two facts.
+
+The graph is fixed: a variable graph is rejected. It must be a user named
+graph the ledger already has — transact data into it to create it — and not
+the default graph (`urn:default`; leave the graph out instead) or a system
+graph such as the transaction metadata graph. A rule naming any other graph
+fails the query with an error naming the graph.
 
 ## Examples
 
