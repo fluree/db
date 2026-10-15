@@ -31,7 +31,7 @@ fn context() -> Value {
     json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"})
 }
 
-fn rules() -> Vec<Value> {
+pub(crate) fn rules() -> Vec<Value> {
     vec![
         json!({
             "where": {"@id": "?x", "ex:controls": "?y"},

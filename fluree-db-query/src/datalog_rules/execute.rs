@@ -138,6 +138,13 @@ pub async fn run_fixpoint(
     }
 
     tracing::debug!(rule_count = rule_set.len(), "executing datalog rules");
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let dependencies = rule_set.dependencies();
+        tracing::debug!(
+            groups = %dependencies.describe(rule_set),
+            "datalog rule groups, producers first; * marks a recursive group"
+        );
+    }
 
     let start = Instant::now();
     // Derived facts carry the query's `t` so the overlay's `t <= to_t` filter

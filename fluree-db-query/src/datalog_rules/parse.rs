@@ -4,7 +4,7 @@
 //! The body goes through the same parser and lowering as a query's `WHERE`
 //! clause; the heads are parsed here. See docs/design/rules-engine.md.
 
-use super::{rule_iri, validate, DatalogRule, HeadTerm, RuleBody, RuleHead};
+use super::{rule_iri, validate, DatalogRule, HeadTerm, RuleBody, RuleFootprint, RuleHead};
 use crate::error::{QueryError, Result};
 use crate::ir::reasoning::ReasoningConfig;
 use crate::ir::{Pattern, Query, QueryOutput, Ref, Term, TriplePattern};
@@ -283,6 +283,7 @@ fn build_rule(
         })
         .collect();
 
+    let footprint = RuleFootprint::of(&query, &heads, snapshot);
     Ok(DatalogRule {
         id,
         name: label,
@@ -290,6 +291,7 @@ fn build_rule(
         heads,
         depends_on,
         generates,
+        footprint,
         source: Arc::from(source),
     })
 }

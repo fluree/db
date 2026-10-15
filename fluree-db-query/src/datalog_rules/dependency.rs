@@ -1,0 +1,617 @@
+//! Which rules can observe which other rules' conclusions.
+//!
+//! Each rule gets a footprint: the graph-qualified predicates and classes its
+//! body may read and its heads may write. A rule depends on another when one
+//! of its reads may observe one of the other's writes. Strongly connected
+//! components of that graph are the rule program's recursive groups.
+//!
+//! The analysis over-approximates. A variable predicate, a wildcard path or a
+//! construct the walk does not model reads (or writes) everything, and two
+//! graph scopes are kept apart only when both name different graphs. Extra
+//! edges merge components and cost speed; a missing edge would let a rule run
+//! before the facts it needs exist.
+//!
+//! Nothing here changes evaluation yet: the fixpoint still runs every rule
+//! every round.
+
+use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
+use crate::eval::function_supported_for_bool_cache as function_is_repeatable;
+use crate::ir::{Expression, GraphName, Pattern, Query, Ref, Term, TriplePattern};
+use crate::parse::IriEncoder;
+use fluree_db_core::{is_rdf_type, is_reserved_reifies_predicate, Sid};
+use std::fmt;
+use std::sync::Arc;
+
+/// The graph a read or write touches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphScope {
+    /// The graph the rule program runs against.
+    Default,
+    /// `GRAPH <iri> { … }`.
+    Named(Arc<str>),
+    /// `GRAPH ?g { … }`: every named graph.
+    AnyNamed,
+}
+
+impl GraphScope {
+    fn may_overlap(&self, other: &GraphScope) -> bool {
+        match (self, other) {
+            (GraphScope::Named(a), GraphScope::Named(b)) => a == b,
+            // A named-graph IRI can denote the default graph, so only two
+            // distinct names are provably disjoint.
+            _ => true,
+        }
+    }
+}
+
+/// The facts a read or write touches within a graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredicateFootprint {
+    /// Facts with this predicate. For `rdf:type`, every class.
+    Exact(Sid),
+    /// `rdf:type` facts naming this class.
+    Class(Sid),
+    /// The reserved `f:reifies*` predicates an edge annotation is stored as.
+    Reifier,
+    /// Any fact: a variable predicate, a wildcard path, or a construct the
+    /// analysis does not model.
+    Any,
+}
+
+impl PredicateFootprint {
+    fn may_overlap(&self, other: &PredicateFootprint) -> bool {
+        use PredicateFootprint::{Any, Class, Exact, Reifier};
+        match (self, other) {
+            (Any, _) | (_, Any) => true,
+            (Exact(a), Exact(b)) | (Class(a), Class(b)) => a == b,
+            (Exact(p), Class(_)) | (Class(_), Exact(p)) => is_rdf_type(p),
+            (Exact(p), Reifier) | (Reifier, Exact(p)) => is_reserved_reifies_predicate(p),
+            (Reifier, Reifier) => true,
+            (Class(_), Reifier) | (Reifier, Class(_)) => false,
+        }
+    }
+}
+
+impl fmt::Display for PredicateFootprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PredicateFootprint::Exact(p) => write!(f, "{p}"),
+            PredicateFootprint::Class(c) => write!(f, "rdf:type {c}"),
+            PredicateFootprint::Reifier => f.write_str("f:reifies*"),
+            PredicateFootprint::Any => f.write_str("*"),
+        }
+    }
+}
+
+/// One graph-qualified read or write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+    pub graph: GraphScope,
+    pub predicate: PredicateFootprint,
+}
+
+impl Access {
+    fn new(graph: &GraphScope, predicate: PredicateFootprint) -> Self {
+        Self {
+            graph: graph.clone(),
+            predicate,
+        }
+    }
+
+    /// Whether a read with this footprint may match a fact written by `write`.
+    pub fn may_observe(&self, write: &Access) -> bool {
+        self.graph.may_overlap(&write.graph) && self.predicate.may_overlap(&write.predicate)
+    }
+}
+
+/// Everything one rule may read and write.
+#[derive(Debug, Clone, Default)]
+pub struct RuleFootprint {
+    pub reads: Vec<Access>,
+    pub writes: Vec<Access>,
+    /// Re-running the body over the same facts yields the same rows, and more
+    /// facts never remove a row. False when the body calls a function whose
+    /// result can change between calls (`NOW`, `RAND`, `UUID`, `BNODE`, …) or
+    /// uses a shortest path, whose chosen path can change as edges are added.
+    /// Only a repeatable rule may run once instead of every round.
+    pub repeatable: bool,
+}
+
+impl RuleFootprint {
+    /// Footprint of a parsed body and its heads. Body IRIs are encoded with
+    /// the same encoder the heads were, so a class or predicate written by
+    /// one rule compares equal to the same constant read by another, whether
+    /// the body lowered it to a SID or kept the IRI for scan-time encoding.
+    pub(super) fn of<E: IriEncoder + ?Sized>(
+        query: &Query,
+        heads: &[RuleHead],
+        encoder: &E,
+    ) -> Self {
+        let mut walker = FootprintWalker {
+            encoder,
+            footprint: RuleFootprint {
+                repeatable: true,
+                ..Default::default()
+            },
+        };
+        walker.read_patterns(&query.patterns, &GraphScope::Default);
+        for (_, expr) in &query.order_binds {
+            walker.read_expression(expr, &GraphScope::Default);
+        }
+        for head in heads {
+            walker.write_head(head);
+        }
+        walker.footprint
+    }
+
+    /// Whether some read of `self` may observe some write of `producer`.
+    pub fn depends_on(&self, producer: &RuleFootprint) -> bool {
+        self.reads
+            .iter()
+            .any(|read| producer.writes.iter().any(|write| read.may_observe(write)))
+    }
+}
+
+struct FootprintWalker<'e, E: ?Sized> {
+    encoder: &'e E,
+    footprint: RuleFootprint,
+}
+
+impl<E: IriEncoder + ?Sized> FootprintWalker<'_, E> {
+    fn encode(&self, iri: &str) -> Option<Sid> {
+        self.encoder.encode_iri(iri)
+    }
+
+    fn read(&mut self, graph: &GraphScope, predicate: PredicateFootprint) {
+        let access = Access::new(graph, predicate);
+        if !self.footprint.reads.contains(&access) {
+            self.footprint.reads.push(access);
+        }
+    }
+
+    fn read_triple(&mut self, triple: &TriplePattern, graph: &GraphScope) {
+        let predicate = match &triple.p {
+            Ref::Sid(p) => Some(p.clone()),
+            Ref::Iri(iri) => self.encode(iri),
+            Ref::Var(_) => None,
+        };
+        let object = match &triple.o {
+            Term::Sid(o) => Some(o.clone()),
+            Term::Iri(iri) => self.encode(iri),
+            Term::Var(_) | Term::Value(_) => None,
+        };
+        let footprint = match (predicate, object) {
+            (Some(p), Some(class)) if is_rdf_type(&p) => PredicateFootprint::Class(class),
+            (Some(p), _) => PredicateFootprint::Exact(p),
+            (None, _) => PredicateFootprint::Any,
+        };
+        self.read(graph, footprint);
+    }
+
+    fn read_patterns(&mut self, patterns: &[Pattern], graph: &GraphScope) {
+        for pattern in patterns {
+            match pattern {
+                Pattern::Triple(triple) => self.read_triple(triple, graph),
+                Pattern::Filter(expr)
+                | Pattern::Bind { expr, .. }
+                | Pattern::Unwind { list: expr, .. } => self.read_expression(expr, graph),
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner)
+                | Pattern::DefaultGraphSource { patterns: inner } => {
+                    self.read_patterns(inner, graph);
+                }
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        self.read_patterns(branch, graph);
+                    }
+                }
+                Pattern::Graph { name, patterns } => {
+                    let scope = match name {
+                        GraphName::Iri(iri) => GraphScope::Named(iri.clone()),
+                        GraphName::Var(_) => GraphScope::AnyNamed,
+                    };
+                    self.read_patterns(patterns, &scope);
+                }
+                Pattern::EdgeAnnotation { edge, body, .. }
+                | Pattern::AnnotationTarget { edge, body, .. } => {
+                    self.read_triple(edge, graph);
+                    self.read(graph, PredicateFootprint::Reifier);
+                    self.read_patterns(body, graph);
+                }
+                Pattern::PropertyPath(path) => {
+                    // A zero-hop match pairs every term in the graph with
+                    // itself, so a new term under any predicate adds a match.
+                    if path.wildcard || path.effective_min_hops() == 0 {
+                        self.read(graph, PredicateFootprint::Any);
+                    }
+                    let steps = path.sequence_steps.iter().flat_map(|s| &s.predicates);
+                    for p in path.predicates.iter().chain(steps) {
+                        self.read(graph, PredicateFootprint::Exact(p.clone()));
+                    }
+                }
+                Pattern::ShortestPath(path) => {
+                    self.footprint.repeatable = false;
+                    let predicate = match &path.predicate {
+                        Some(p) => PredicateFootprint::Exact(p.clone()),
+                        None => PredicateFootprint::Any,
+                    };
+                    self.read(graph, predicate);
+                }
+                Pattern::Subquery(sub) => {
+                    self.read_patterns(&sub.patterns, graph);
+                    for (_, expr) in &sub.order_binds {
+                        self.read_expression(expr, graph);
+                    }
+                }
+                Pattern::Values { .. } => {}
+                // Rejected in rule bodies; read as everything if one ever
+                // gets through.
+                Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_)
+                | Pattern::Service(_) => self.read(graph, PredicateFootprint::Any),
+            }
+        }
+    }
+
+    fn read_expression(&mut self, expr: &Expression, graph: &GraphScope) {
+        match expr {
+            Expression::Exists { patterns, .. } => self.read_patterns(patterns, graph),
+            Expression::Call { func, args } => {
+                if !function_is_repeatable(func) {
+                    self.footprint.repeatable = false;
+                }
+                for arg in args {
+                    self.read_expression(arg, graph);
+                }
+            }
+            Expression::PatternComprehension { .. } => {
+                self.read(graph, PredicateFootprint::Any);
+            }
+            Expression::Map(entries) => {
+                for (_, value) in entries {
+                    self.read_expression(value, graph);
+                }
+            }
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                self.read_expression(list, graph);
+                for part in [filter, map].into_iter().flatten() {
+                    self.read_expression(part, graph);
+                }
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                for part in [init, list, body] {
+                    self.read_expression(part, graph);
+                }
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => {
+                self.read_expression(list, graph);
+                self.read_expression(predicate, graph);
+            }
+            Expression::Member { target, .. } => self.read_expression(target, graph),
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => {}
+        }
+    }
+
+    /// Derived facts always land in the default graph.
+    fn write_head(&mut self, head: &RuleHead) {
+        let predicate = match (&head.predicate, &head.object) {
+            (HeadTerm::Sid(p), HeadTerm::Sid(class)) if is_rdf_type(p) => {
+                PredicateFootprint::Class(class.clone())
+            }
+            (HeadTerm::Sid(p), _) => PredicateFootprint::Exact(p.clone()),
+            (HeadTerm::Var(_) | HeadTerm::Literal { .. }, _) => PredicateFootprint::Any,
+        };
+        let access = Access::new(&GraphScope::Default, predicate);
+        if !self.footprint.writes.contains(&access) {
+            self.footprint.writes.push(access);
+        }
+    }
+}
+
+/// A strongly connected group of rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleComponent {
+    /// Indexes into the rule set's execution order, ascending.
+    pub rules: Vec<usize>,
+    /// A rule in the group may observe a fact the group itself derives, so the
+    /// group must iterate to a fixpoint. A non-recursive group's rules need
+    /// only the facts of the groups before it.
+    pub recursive: bool,
+}
+
+/// The rule program's footprints and recursive groups.
+#[derive(Debug, Clone)]
+pub struct RuleDependencies {
+    footprints: Vec<RuleFootprint>,
+    /// `depends_on[consumer]` lists every producer it may observe.
+    depends_on: Vec<Vec<usize>>,
+    /// Producers before consumers.
+    components: Vec<RuleComponent>,
+}
+
+impl RuleDependencies {
+    pub fn analyze(rules: &[DatalogRule]) -> Self {
+        Self::from_footprints(rules.iter().map(|r| r.footprint.clone()).collect())
+    }
+
+    pub fn from_footprints(footprints: Vec<RuleFootprint>) -> Self {
+        let depends_on: Vec<Vec<usize>> = footprints
+            .iter()
+            .map(|consumer| {
+                footprints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, producer)| consumer.depends_on(producer))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
+        let components = strongly_connected_components(&depends_on);
+        Self {
+            footprints,
+            depends_on,
+            components,
+        }
+    }
+
+    pub fn footprint(&self, rule: usize) -> &RuleFootprint {
+        &self.footprints[rule]
+    }
+
+    /// Producers `rule` may observe, ascending.
+    pub fn producers_of(&self, rule: usize) -> &[usize] {
+        &self.depends_on[rule]
+    }
+
+    /// Recursive groups in dependency order: every group comes after each
+    /// group it depends on.
+    pub fn components(&self) -> &[RuleComponent] {
+        &self.components
+    }
+
+    /// One line naming each group in order, recursive groups starred, for
+    /// diagnostics: `[ex:base ex:step]* -> [ex:flag]`.
+    pub fn describe(&self, rule_set: &DatalogRuleSet) -> String {
+        self.components
+            .iter()
+            .map(|component| {
+                let names: Vec<&str> = component
+                    .rules
+                    .iter()
+                    .map(|&i| rule_set.rules[i].name.as_str())
+                    .collect();
+                let star = if component.recursive { "*" } else { "" };
+                format!("[{}]{star}", names.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+}
+
+/// Tarjan's algorithm over `depends_on` (consumer → producers). Tarjan emits
+/// a component only after every component reachable from it, and the edges
+/// point at producers, so emission order is already producers first.
+fn strongly_connected_components(depends_on: &[Vec<usize>]) -> Vec<RuleComponent> {
+    struct Tarjan<'a> {
+        edges: &'a [Vec<usize>],
+        index: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        next_index: usize,
+        components: Vec<RuleComponent>,
+    }
+
+    impl Tarjan<'_> {
+        fn visit(&mut self, v: usize) {
+            self.index[v] = Some(self.next_index);
+            self.lowlink[v] = self.next_index;
+            self.next_index += 1;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+
+            for &w in &self.edges[v] {
+                match self.index[w] {
+                    None => {
+                        self.visit(w);
+                        self.lowlink[v] = self.lowlink[v].min(self.lowlink[w]);
+                    }
+                    Some(w_index) if self.on_stack[w] => {
+                        self.lowlink[v] = self.lowlink[v].min(w_index);
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            if Some(self.lowlink[v]) == self.index[v] {
+                let mut rules = Vec::new();
+                loop {
+                    let w = self.stack.pop().expect("v is on the stack");
+                    self.on_stack[w] = false;
+                    rules.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                rules.sort_unstable();
+                let recursive = rules.len() > 1 || self.edges[v].contains(&v);
+                self.components.push(RuleComponent { rules, recursive });
+            }
+        }
+    }
+
+    let n = depends_on.len();
+    let mut tarjan = Tarjan {
+        edges: depends_on,
+        index: vec![None; n],
+        lowlink: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        next_index: 0,
+        components: Vec::new(),
+    };
+    for v in 0..n {
+        if tarjan.index[v].is_none() {
+            tarjan.visit(v);
+        }
+    }
+    tarjan.components
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_vocab::namespaces::{FLUREE_DB, RDF};
+
+    fn ex(name: &str) -> Sid {
+        Sid::new(100, name)
+    }
+
+    fn rdf_type() -> Sid {
+        Sid::new(RDF, "type")
+    }
+
+    fn exact(name: &str) -> PredicateFootprint {
+        PredicateFootprint::Exact(ex(name))
+    }
+
+    fn class(name: &str) -> PredicateFootprint {
+        PredicateFootprint::Class(ex(name))
+    }
+
+    fn default(predicate: PredicateFootprint) -> Access {
+        Access {
+            graph: GraphScope::Default,
+            predicate,
+        }
+    }
+
+    fn rule(reads: Vec<PredicateFootprint>, writes: Vec<PredicateFootprint>) -> RuleFootprint {
+        RuleFootprint {
+            reads: reads.into_iter().map(default).collect(),
+            writes: writes.into_iter().map(default).collect(),
+            repeatable: true,
+        }
+    }
+
+    #[test]
+    fn class_reads_observe_only_matching_or_generic_type_writes() {
+        let reads_a = default(class("A"));
+        assert!(reads_a.may_observe(&default(class("A"))));
+        assert!(!reads_a.may_observe(&default(class("B"))));
+        assert!(reads_a.may_observe(&default(PredicateFootprint::Exact(rdf_type()))));
+        assert!(!reads_a.may_observe(&default(exact("A"))));
+
+        let reads_any_type = default(PredicateFootprint::Exact(rdf_type()));
+        assert!(reads_any_type.may_observe(&default(class("B"))));
+    }
+
+    #[test]
+    fn wildcards_observe_everything() {
+        let any = default(PredicateFootprint::Any);
+        for write in [exact("p"), class("A"), PredicateFootprint::Reifier] {
+            assert!(any.may_observe(&default(write.clone())));
+            assert!(default(write).may_observe(&any));
+        }
+    }
+
+    #[test]
+    fn reifier_reads_observe_only_reserved_predicates() {
+        let reifier = default(PredicateFootprint::Reifier);
+        let reifies_subject = PredicateFootprint::Exact(Sid::new(FLUREE_DB, "reifiesSubject"));
+        assert!(reifier.may_observe(&default(reifies_subject)));
+        assert!(!reifier.may_observe(&default(exact("p"))));
+        assert!(!reifier.may_observe(&default(class("A"))));
+    }
+
+    #[test]
+    fn distinct_named_graphs_are_disjoint_and_everything_else_overlaps() {
+        let named = |iri: &str| Access {
+            graph: GraphScope::Named(Arc::from(iri)),
+            predicate: exact("p"),
+        };
+        let any_named = Access {
+            graph: GraphScope::AnyNamed,
+            predicate: exact("p"),
+        };
+        assert!(!named("urn:g1").may_observe(&named("urn:g2")));
+        assert!(named("urn:g1").may_observe(&named("urn:g1")));
+        assert!(named("urn:g1").may_observe(&default(exact("p"))));
+        assert!(any_named.may_observe(&named("urn:g2")));
+        assert!(any_named.may_observe(&default(exact("p"))));
+    }
+
+    #[test]
+    fn components_are_producers_first_with_recursion_flagged() {
+        // 0: parent -> ancestor        (base)
+        // 1: ancestor -> ancestor      (recursive)
+        // 2: ancestor -> flagged       (downstream)
+        // 3: flagged -> reported       (downstream of 2)
+        // 4: unrelated -> other        (independent)
+        let deps = RuleDependencies::from_footprints(vec![
+            rule(vec![exact("parent")], vec![exact("ancestor")]),
+            rule(vec![exact("ancestor")], vec![exact("ancestor")]),
+            rule(vec![exact("ancestor")], vec![exact("flagged")]),
+            rule(vec![exact("flagged")], vec![exact("reported")]),
+            rule(vec![exact("unrelated")], vec![exact("other")]),
+        ]);
+
+        let position = |rule: usize| {
+            deps.components()
+                .iter()
+                .position(|c| c.rules.contains(&rule))
+                .unwrap()
+        };
+        assert_eq!(deps.components().len(), 5);
+        assert!(!deps.components()[position(0)].recursive);
+        assert!(deps.components()[position(1)].recursive);
+        assert!(!deps.components()[position(2)].recursive);
+        assert!(position(0) < position(1));
+        assert!(position(1) < position(2));
+        assert!(position(2) < position(3));
+        assert_eq!(deps.producers_of(2), &[0, 1]);
+    }
+
+    #[test]
+    fn mutual_recursion_forms_one_component() {
+        let deps = RuleDependencies::from_footprints(vec![
+            rule(vec![exact("p")], vec![exact("q")]),
+            rule(vec![exact("q")], vec![exact("p")]),
+            rule(vec![exact("q")], vec![exact("r")]),
+        ]);
+        assert_eq!(
+            deps.components(),
+            &[
+                RuleComponent {
+                    rules: vec![0, 1],
+                    recursive: true
+                },
+                RuleComponent {
+                    rules: vec![2],
+                    recursive: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_head_feeds_every_rule() {
+        let deps = RuleDependencies::from_footprints(vec![
+            rule(vec![exact("p")], vec![PredicateFootprint::Any]),
+            rule(vec![exact("q")], vec![exact("r")]),
+        ]);
+        assert!(deps.components()[0].recursive, "it can feed itself");
+        assert_eq!(deps.producers_of(1), &[0]);
+    }
+}

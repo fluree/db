@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_datalog_program_reachability.rs"]
 mod it_datalog_program_reachability;
+#[path = "it_datalog_rule_dependencies.rs"]
+mod it_datalog_rule_dependencies;
 #[path = "it_datalog_rules.rs"]
 mod it_datalog_rules;
 #[path = "it_datalog_rules_annotations.rs"]

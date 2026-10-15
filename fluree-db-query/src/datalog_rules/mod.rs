@@ -17,10 +17,14 @@
 //!
 //! Design record: `docs/design/rules-engine.md`.
 
+mod dependency;
 mod execute;
 mod parse;
 mod validate;
 
+pub use dependency::{
+    Access, GraphScope, PredicateFootprint, RuleComponent, RuleDependencies, RuleFootprint,
+};
 pub use execute::{
     execute_datalog_rules, execute_datalog_rules_with_query_rules, load_rule_set, run_fixpoint,
     RuleExecutionEnv,
@@ -87,6 +91,9 @@ pub struct DatalogRule {
     pub depends_on: Vec<Sid>,
     /// Predicates the heads write.
     pub generates: Vec<Sid>,
+    /// What the body may read and the heads may write, for dependency
+    /// analysis.
+    pub footprint: RuleFootprint,
     /// The rule's source text (JSON or SPARQL). Hashed into the reasoning
     /// cache key so a changed rule never serves a stale materialization.
     pub source: Arc<str>,
@@ -146,6 +153,11 @@ impl DatalogRuleSet {
 
     pub fn len(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Read/write footprints and recursive groups, indexed by execution order.
+    pub fn dependencies(&self) -> RuleDependencies {
+        RuleDependencies::analyze(&self.rules)
     }
 
     /// Order-independent hash of every rule's id and source text, for the
