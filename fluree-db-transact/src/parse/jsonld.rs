@@ -464,7 +464,10 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         let parse_policy = JsonLdParsePolicy {
             strict_compact_iri: strict,
         };
-        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy);
+        // A `["graph", …]` name the update's `fromNamed` spells is that alias,
+        // even where it reads as a compact IRI; any other compact IRI expands.
+        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
+            .with_dataset_names(from_named_aliases.keys().cloned().collect());
         parse_where_with_counters(
             where_val,
             &ctx,

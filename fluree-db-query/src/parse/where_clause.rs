@@ -603,9 +603,10 @@ pub fn parse_where_array_element(
                 nested_counter,
                 object_var_parsing,
             )?;
-            query
-                .patterns
-                .push(UnresolvedPattern::graph(graph_name, graph_patterns));
+            query.patterns.push(UnresolvedPattern::graph(
+                ctx.graph_name(graph_name),
+                graph_patterns,
+            ));
             Ok(())
         }
         _ => Err(ParseError::InvalidWhere(format!(

@@ -34,7 +34,8 @@ use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
 use crate::restrictions::{extract_restrictions, RestrictionIndex};
 use crate::same_as::SameAsTracker;
-use crate::{FrozenSameAs, ReasoningDiagnostics, ReasoningOptions, Result};
+use crate::{FrozenSameAs, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result};
+use fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL;
 
 /// Run OWL2-RL reasoning to fixpoint
 ///
@@ -152,6 +153,10 @@ pub async fn run_fixpoint(
 
     // Semi-naive fixpoint loop
     while !delta.is_empty() || same_as_changed_carry {
+        interrupted(opts)?;
+        opts.tracker
+            .consume_fuel(delta.len() as u64 * PER_ROW_MICRO_FUEL)?;
+
         // Check budget
         if start.elapsed() > budget.max_duration {
             diagnostics.mark_capped("time", iterations, derived.derived_len(), start.elapsed());
@@ -282,6 +287,9 @@ pub async fn run_fixpoint(
                 in_round_cap = Some(reason);
                 break;
             }
+            if ticks.is_multiple_of(CLOCK_SAMPLE_INTERVAL) {
+                interrupted(opts)?;
+            }
         }
 
         if in_round_cap.is_none() {
@@ -360,6 +368,15 @@ pub async fn run_fixpoint(
     }
 
     Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
+}
+
+/// Fails the run once the request it serves has been cancelled. A cancelled
+/// run is not capped: it ends the request, and nothing it derived is kept.
+fn interrupted(opts: &ReasoningOptions) -> Result<()> {
+    match opts.cancellation.reason() {
+        Some(reason) => Err(ReasonerError::Cancelled(reason)),
+        None => Ok(()),
+    }
 }
 
 /// How many per-fact checks pass between clock samples.

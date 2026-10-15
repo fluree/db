@@ -5,6 +5,8 @@ mod support;
 mod it_datalog_aggregates;
 #[path = "it_datalog_closure_paths.rs"]
 mod it_datalog_closure_paths;
+#[path = "it_datalog_explain.rs"]
+mod it_datalog_explain;
 #[path = "it_datalog_named_graphs.rs"]
 mod it_datalog_named_graphs;
 #[path = "it_datalog_negation.rs"]
@@ -35,6 +37,8 @@ mod it_reasoning_imports;
 mod it_reasoning_join_repro;
 #[path = "it_reasoning_policy_contract.rs"]
 mod it_reasoning_policy_contract;
+#[path = "it_reasoning_request_limits.rs"]
+mod it_reasoning_request_limits;
 #[path = "it_rules_cross_ledger.rs"]
 mod it_rules_cross_ledger;
 #[path = "it_rules_source.rs"]

@@ -513,6 +513,50 @@ the default graph (`urn:default`; leave the graph out instead) or a system
 graph such as the transaction metadata graph. A rule naming any other graph
 fails the query with an error naming the graph.
 
+## Explaining a derived fact
+
+The Rust API's `Fluree::explain_derived` reports why the rules concluded a
+fact. The request carries the query's `@context` and reasoning keys, which
+merge with the ledger's reasoning settings as a query's do, and an `explain`
+node map naming the facts by subject and one predicate, with an optional
+object (a variable or no object explains every value) and `@graph`:
+
+```rust
+let explanation = fluree
+    .explain_derived(&db, &json!({
+        "@context": {"ex": "http://example.org/"},
+        "reasoning": "datalog",
+        "explain": {"@id": "ex:acct2", "@type": "ex:Candidate"}
+    }))
+    .await?;
+```
+
+For each rule body row that derives the fact, the explanation gives the
+rule, the row's bindings, and:
+
+- **premises**: the body's triple patterns with the row substituted — the
+  facts it matched — each marked `derived` when reasoning produced it, so
+  explaining that premise in turn walks the derivation back to asserted
+  facts;
+- **absences**: each negated pattern the row passed, with the row
+  substituted and its open variables left as variables, and the graph it
+  searched;
+- **groups**: for an aggregating subquery, the group's key, the graph it
+  read when the subquery sits in a `GRAPH` block, and the solutions it
+  counted.
+
+Only facts the run materialized are explained, so a capped run never
+explains a conclusion it did not reach. A rule whose body gives different
+rows each time it runs (it calls `RAND`, `UUID`, `STRUUID` or `BNODE`, or
+reads transaction metadata) cannot be replayed: the explanation names it in
+`not_replayed`, and a fact only it derived appears without derivations, as
+does a fact OWL 2 RL entailed. The explanation also records the snapshot
+`t`, a hash of the rule set, the evaluation time `NOW()` returned, and
+whether the run was complete; a capped run's conclusions may be missing
+facts. Premises appear whatever a policy
+would hide, so a view under a non-root policy is refused. The shape of the
+result is experimental.
+
 ## Examples
 
 ### Sibling inference

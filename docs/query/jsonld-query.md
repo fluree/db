@@ -600,7 +600,7 @@ Scope patterns to a named graph:
 
 Notes:
 - `fromNamed` is an object whose keys are dataset-local aliases. Each value is an object with `@id` (ledger reference) and optional `@graph` (graph selector IRI).
-- The second element of `["graph", ...]` can be a dataset-local alias (recommended) or a graph IRI.
+- The second element of `["graph", ...]` can be a dataset-local alias (recommended), a graph IRI, or a variable. A compact IRI whose prefix the query's `@context` defines is expanded, as SPARQL expands `GRAPH ex:products`: with `"ex": "http://example.org/ns/"`, `"ex:products"` names `http://example.org/ns/products`. A name that is not an IRI is an alias and is kept as written, and so is any name the query's own `fromNamed` spells exactly that way.
 - The legacy `"from-named": [...]` array format is still accepted for backward compatibility.
 - For dataset and named-graph configuration details, see `docs/query/datasets.md`.
 

@@ -268,6 +268,14 @@ struct TrackerInner {
 #[derive(Clone, Default)]
 pub struct Tracker(Option<Arc<TrackerInner>>);
 
+impl std::fmt::Debug for Tracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tracker")
+            .field("enabled", &self.is_enabled())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Tracker {
     /// Create a tracker from options. Returns a disabled tracker if no tracking is enabled.
     pub fn new(options: TrackingOptions) -> Self {
