@@ -363,3 +363,89 @@ async fn one_triple_can_be_derived_into_two_graphs() {
         expected
     );
 }
+
+/// Over a published index, and then with a later commit in novelty, rules
+/// derive into and read from named graphs as they do over novelty alone.
+#[tokio::test]
+async fn named_graph_rules_work_over_an_index() {
+    use crate::support::{instances_sharing_storage, rebuild_and_publish_index};
+
+    let ledger_id = "datalog/graphs-indexed:main";
+    let (writer, reader) = instances_sharing_storage();
+    let ledger = writer
+        .stage_owned(genesis_ledger(&writer, ledger_id))
+        .upsert_turtle(DATA)
+        .execute()
+        .await
+        .expect("seed")
+        .ledger;
+    let rules = [
+        (
+            "grandparent",
+            "CONSTRUCT { GRAPH ex:inferred { ?x ex:grandparent ?z } } \
+             WHERE { ?x ex:parent ?y . ?y ex:parent ?z }",
+        ),
+        (
+            "lineageBase",
+            "CONSTRUCT { GRAPH ex:stage { ?x ex:lineage ?y } } WHERE { ?x ex:parent ?y }",
+        ),
+        (
+            "lineageStep",
+            "CONSTRUCT { GRAPH ex:stage { ?x ex:lineage ?z } } \
+             WHERE { ?x ex:parent ?y GRAPH ex:stage { ?y ex:lineage ?z } }",
+        ),
+        (
+            "lineageReader",
+            "CONSTRUCT { ?x ex:hasLineage true } WHERE { GRAPH ex:stage { ?x ex:lineage ?y } }",
+        ),
+    ];
+    let mut ledger = ledger;
+    for (id, construct) in rules {
+        ledger = store_sparql_rule(&writer, ledger, id, construct).await;
+    }
+    rebuild_and_publish_index(&writer, ledger_id).await;
+    let ledger = reader.ledger(ledger_id).await.expect("reader load");
+    assert!(ledger.index_t() > 0, "the reader loads the published index");
+
+    let grandparents_in_graph = "SELECT ?x ?z WHERE { GRAPH ex:inferred { ?x ex:grandparent ?z } }";
+    let with_lineage = "SELECT ?x WHERE { ?x ex:hasLineage true }";
+    assert_eq!(
+        sparql_rows(&reader, &ledger, grandparents_in_graph).await,
+        grandparents()
+    );
+    assert!(sparql_rows(
+        &reader,
+        &ledger,
+        "SELECT ?x ?z WHERE { ?x ex:grandparent ?z }"
+    )
+    .await
+    .is_empty());
+    assert_eq!(
+        sparql_rows(&reader, &ledger, with_lineage).await,
+        vec![json!(["ex:a"]), json!(["ex:b"]), json!(["ex:c"])]
+    );
+
+    let ledger = reader
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:d", "ex:parent": {"@id": "ex:e"}}),
+        )
+        .await
+        .expect("a commit into novelty")
+        .ledger;
+    let mut extended = grandparents();
+    extended.push(json!(["ex:c", "ex:e"]));
+    assert_eq!(
+        sparql_rows(&reader, &ledger, grandparents_in_graph).await,
+        extended
+    );
+    assert_eq!(
+        sparql_rows(&reader, &ledger, with_lineage).await,
+        vec![
+            json!(["ex:a"]),
+            json!(["ex:b"]),
+            json!(["ex:c"]),
+            json!(["ex:d"])
+        ]
+    );
+}

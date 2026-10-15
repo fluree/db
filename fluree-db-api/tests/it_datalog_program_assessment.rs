@@ -626,3 +626,90 @@ async fn an_exemption_that_negates_candidacy_is_a_negative_cycle() {
         );
     }
 }
+
+/// Stored rules are data: a new instance over the same storage concludes the
+/// same, and so does a ledger whose index was rebuilt from its commits. The
+/// reasoning cache is process-wide and keyed by the requested time, so the
+/// reopened ledger is asked about a time the first instance never was, which
+/// makes it load the rules from storage.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn stored_rules_survive_a_restart_and_a_reindex() {
+    use fluree_db_api::ReindexOptions;
+
+    let ledger_id = "datalog/assessment-restart:main";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let open = || {
+        fluree_db_api::FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build")
+    };
+    let expected = || {
+        Assessment::expected(
+            &[
+                ("ex:acct1", 3),
+                ("ex:acct2", 3),
+                ("ex:acct3", 5),
+                ("ex:acct4", 1),
+            ],
+            &["ex:acct1", "ex:acct2", "ex:acct3"],
+        )
+    };
+
+    {
+        let fluree = open();
+        let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+        let mut graph = data();
+        graph.extend(stored_rules(Surface::Sparql));
+        let ledger = fluree
+            .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+            .await
+            .expect("seed")
+            .ledger;
+        assert_assessment(
+            &fluree,
+            &ledger,
+            Surface::Sparql,
+            T0,
+            expected(),
+            "first process",
+        )
+        .await;
+    }
+
+    let fluree = open();
+    let ledger = fluree.ledger(ledger_id).await.expect("reopen");
+    assert_assessment(
+        &fluree,
+        &ledger,
+        Surface::Sparql,
+        T1,
+        Assessment::expected(
+            &[
+                ("ex:acct1", 3),
+                ("ex:acct2", 2),
+                ("ex:acct3", 5),
+                ("ex:acct4", 1),
+            ],
+            &["ex:acct1", "ex:acct3"],
+        ),
+        "after restart",
+    )
+    .await;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(ledger.index_t() > 0, "the reindex published an index");
+    assert_assessment(
+        &fluree,
+        &ledger,
+        Surface::Sparql,
+        T0,
+        expected(),
+        "after reindex",
+    )
+    .await;
+}

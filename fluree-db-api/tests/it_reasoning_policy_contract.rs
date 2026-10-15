@@ -341,3 +341,123 @@ async fn rewriting_and_materialization_lanes_differ_under_policy() {
         );
     }
 }
+
+/// Invoices with three stored rules: a negation (`ex:unpaid` when no
+/// payment exists), an aggregate (`ex:invoiceCount` per customer) and a head
+/// that derives into the `ex:audit` named graph (`ex:flagged` over 1,000).
+fn invoices_with_rules() -> Value {
+    let rule_ctx = json!({"ex": "http://example.org/"});
+    json!({
+        "@context": context(),
+        "@graph": [
+            stored_rule("ex:unpaidRule", json!({
+                "@context": rule_ctx,
+                "where": [
+                    {"@id": "?i", "@type": "ex:Invoice"},
+                    ["not-exists", {"@id": "?i", "ex:paidBy": "?p"}]
+                ],
+                "insert": {"@id": "?i", "ex:unpaid": true}
+            })),
+            stored_rule("ex:invoiceCountRule", json!({
+                "@context": rule_ctx,
+                "where": [["query", {
+                    "@context": rule_ctx,
+                    "select": ["?c", "(as (count ?i) ?n)"],
+                    "where": {"@id": "?i", "ex:customer": "?c"},
+                    "groupBy": ["?c"]
+                }]],
+                "insert": {"@id": "?c", "ex:invoiceCount": "?n"}
+            })),
+            stored_rule("ex:flagRule", json!({
+                "@context": rule_ctx,
+                "where": [{"@id": "?i", "ex:amount": "?a"}, ["filter", "(> ?a 1000)"]],
+                "insert": {"@id": "?i", "@graph": AUDIT, "ex:flagged": true}
+            })),
+            {"@id": "ex:auditLog", "@graph": AUDIT, "ex:note": "audit trail"},
+            {"@id": "ex:inv1", "@type": "ex:Invoice", "ex:customer": {"@id": "ex:acme"},
+             "ex:paidBy": {"@id": "ex:pay1"}, "ex:amount": 5000},
+            {"@id": "ex:inv2", "@type": "ex:Invoice", "ex:customer": {"@id": "ex:acme"},
+             "ex:amount": 200},
+            {"@id": "ex:inv3", "@type": "ex:Invoice", "ex:customer": {"@id": "ex:globex"},
+             "ex:amount": 1500}
+        ]
+    })
+}
+
+const AUDIT: &str = "http://example.org/audit";
+
+async fn sorted_rows(fluree: &MemoryFluree, query: &Value) -> Vec<Value> {
+    let mut rows = rows(fluree, query).await;
+    rows.sort_by_key(ToString::to_string);
+    rows
+}
+
+/// For a derived predicate computed by negation, aggregation or into a named
+/// graph: a reader who cannot see a premise still gets the conclusions
+/// computed from all the data, and a reader denied the derived predicate gets
+/// nothing. The restricted reader queries first, so it is the one that
+/// materializes; a closure computed from its view would call a paid invoice
+/// unpaid and undercount.
+#[tokio::test]
+async fn negation_aggregation_and_named_graph_heads_follow_the_contract() {
+    for storage in STORAGE {
+        let cases = [
+            (
+                "negation",
+                json!(["?i"]),
+                json!({"@id": "?i", "ex:unpaid": true}),
+                "http://example.org/paidBy",
+                "http://example.org/unpaid",
+                vec![json!(["ex:inv2"]), json!(["ex:inv3"])],
+            ),
+            (
+                "aggregate",
+                json!(["?c", "?n"]),
+                json!({"@id": "?c", "ex:invoiceCount": "?n"}),
+                "http://example.org/customer",
+                "http://example.org/invoiceCount",
+                vec![json!(["ex:acme", 2]), json!(["ex:globex", 1])],
+            ),
+            (
+                "named-graph",
+                json!(["?i"]),
+                json!([["graph", AUDIT, {"@id": "?i", "ex:flagged": true}]]),
+                "http://example.org/amount",
+                "http://example.org/flagged",
+                vec![json!(["ex:inv1"]), json!(["ex:inv3"])],
+            ),
+        ];
+        for (shape, select, where_, premise, head, expected) in cases {
+            let ledger_id = format!("reasoning-policy/{shape}-{storage:?}:main").to_lowercase();
+            let fluree = seeded_reader(&ledger_id, &invoices_with_rules(), storage).await;
+            let q = query(&ledger_id, select, where_, "datalog");
+            let premise_rows = query(
+                &ledger_id,
+                json!(["?s", "?o"]),
+                json!({"@id": "?s", premise: "?o"}),
+                "datalog",
+            );
+            assert!(
+                sorted_rows(&fluree, &restricted(&premise_rows, premise))
+                    .await
+                    .is_empty(),
+                "{storage:?}/{shape}: the reader cannot see the premise itself"
+            );
+            assert_eq!(
+                sorted_rows(&fluree, &restricted(&q, premise)).await,
+                expected,
+                "{storage:?}/{shape}: hiding a premise from the reader must not change \
+                 what the shared closure concludes"
+            );
+            assert_eq!(
+                sorted_rows(&fluree, &q).await,
+                expected,
+                "{storage:?}/{shape}: root"
+            );
+            assert!(
+                sorted_rows(&fluree, &restricted(&q, head)).await.is_empty(),
+                "{storage:?}/{shape}: a reader denied the derived predicate sees none of it"
+            );
+        }
+    }
+}
