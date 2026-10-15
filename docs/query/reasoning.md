@@ -373,6 +373,8 @@ Reasoning composes with view policy, but mind the contract when both are on:
 - **OWL 2 QL** and **RDFS** rewrite the query and execute under your identity, so they are filtered like any normal query.
 - **OWL 2 RL** and **datalog** materialize derived facts into the query overlay; those facts are filtered by the **same per-flake view policy as base data**. A derived flake you may not view is dropped.
 - The engine filters a derived fact by its own `(subject, predicate, object)` — **not** by the base facts it was derived from. A rule or ontology axiom can therefore re-express hidden data under a viewable predicate (e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule deriving `ex:isHighEarner` from a hidden `ex:salary`) and the derived value will surface.
+- Materialized facts are computed once over all of the ledger's data and shared by every caller; the policy applies when rows are read, not while facts are derived.
+- The two approaches can therefore answer the same query differently under the same policy. With `ex:ssn rdfs:subPropertyOf ex:identifier` and `ex:ssn` hidden, a query for `ex:identifier` returns nothing under `"rdfs"`, because the rewritten query scans the hidden `ex:ssn`. Under `"owl2rl"` it returns the value, because the derived `ex:identifier` fact is itself viewable.
 
 **If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden.
 

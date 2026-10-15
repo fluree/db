@@ -35,14 +35,19 @@ DatalogRule {
            with their VarRegistry,
     heads: Vec<RuleHead>  — (subject, predicate, object) terms that are either
            constants or VarIds bound by the body,
-    depends_on / generates — predicate Sids, for the ordering heuristic
+    footprint: graph-qualified predicates/classes the body may read and the
+           heads may write, plus whether re-running the body is repeatable
 }
 ```
 
 Rule bodies are executed by the planned query executor
-(`prepare_execution_with_config` + `execute_prepared`) against the same
-`GraphDbRef` the query runs on, with the base overlay wrapped in a
-`ReasoningOverlay` carrying the facts derived so far. Every construct the
+(`prepare_execution_with_config` + `execute_prepared_streaming`) against the
+same `GraphDbRef` the query runs on, with the base overlay wrapped in a
+`ReasoningOverlay` carrying the facts derived so far. Derived facts carry
+the query's `t`, and at equal `t` a retraction wins the tie, so the overlay
+drops a stored retraction at the query's `t` that a derived fact restates:
+when the latest commit retracted the stored copy of a fact the rules derive
+again, the fact still holds. Every construct the
 executor supports is therefore available in a rule body, subject to the
 monotonicity rule below: edge annotations (`@annotation`, `{| |}`, `~ ?r`),
 claim-first patterns (`@reifies`, `rdf:reifies <<( … )>>`), full FILTER
@@ -56,25 +61,91 @@ budget bounds them).
 
 ### Fixpoint
 
+Rules are scheduled by dependency (`datalog_rules/dependency.rs`). Rule B
+depends on rule A when one of B's reads may observe one of A's writes. Reads
+and writes are qualified by graph and by predicate, and `rdf:type` by class.
+Anything the walk cannot pin down reads or writes everything: a variable
+predicate, a wildcard or zero-length path (a zero-hop match pairs every term
+in the graph with itself), a variable-predicate head, an unmodelled construct.
+Strongly connected components of the dependency graph are the recursive
+groups; each group's stage is one past the latest stage of any group it reads
+from.
+
 ```text
-loop:
-    budget check (time, facts, memory)
-    overlay = base ⊕ derived-so-far           (rebuilt only when derived grew)
-    for rule in rules (ordered by dependency count):
-        rows = execute(rule.body over overlay)
-        for row in rows, head in rule.heads:
-            flake = instantiate(head, row)      (skip rows that cannot instantiate)
-            if seen.insert(key(flake)):         (HashSet, O(1))
-                derived.push(flake); new += 1
-                budget check (facts, memory)    (inside the round)
-    if new == 0: fixpoint
+for stage in stages (producers first):
+    active = stage's groups, each with delta = none
+    while active is non-empty:                   (≤ max_iterations passes)
+        budget check (time, facts, memory)
+        overlay = base ⊕ derived-so-far
+        for group in active, rule in group:
+            bodies = [rule.body]                      if group.delta is none
+                                                      or the rule re-runs whole
+                   = [rule.body with atom seeded      otherwise
+                      by group.delta, for each recursive atom]
+            for body in bodies:
+                for row in execute(body over overlay):   (streamed)
+                    budget check (time, every 1024 rows)
+                    for head in rule.heads:
+                        flake = instantiate(head, row)  (skip rows that cannot instantiate)
+                        if seen.insert(key(flake)):     (HashSet, O(1))
+                            derived.push(flake)
+                            budget check (facts, memory)
+        active = recursive groups that derived something this pass,
+                 each with delta = what it derived
+        rebuild the derived overlay if anything was derived and work remains
 ```
 
-Deduplication is a hash set keyed on `(s, p, o, dt, m)`. The derived overlay
-is rebuilt between rounds only when the round produced facts; most rule sets
-converge in two rounds. Semi-naive evaluation (restricting one body pattern to
-the previous round's delta) is a follow-up; it is straightforward to add as a
-VALUES seed on the delta once needed.
+A non-recursive group runs once, against the complete output of the stages
+before it. Groups in one stage never read each other's writes, so they share
+an overlay. Deduplication is a hash set keyed on `(s, p, o, dt, m)`.
+
+Inside a recursive group, evaluation is semi-naive (`datalog_rules/delta.rs`).
+A match a rule finds in pass k+1 but not in pass k uses at least one fact the
+group derived in pass k: nothing else changes while the group iterates, since
+no group in the same stage writes what it reads. A rule's *recursive atoms*
+are its top-level triple patterns whose read may observe one of the group's
+writes. After the group's first pass, the rule runs once per recursive atom,
+with a `VALUES` seed in front of the atom binding its variables to the
+distinct matches among the previous pass's facts. The seed replaces the
+pattern when it matches exactly as a scan would (variables and SID constants,
+a constant predicate, no datatype constraint); otherwise the pattern stays
+behind the seed to do the matching. The rule's other atoms read the full
+overlay, so a match using new facts in two positions is found twice and
+deduplicated; splitting old and new facts per position would need two
+overlays per pass. A rule that reads its group's writes anywhere else — a
+UNION branch, EXISTS, a subquery, a property path, the trailing VALUES block —
+re-runs its whole body every pass. So does a rule whose footprint is not
+repeatable: a volatile function gives new rows for old matches every pass,
+and a seed carries no transaction metadata for `t`/`op` to read.
+
+A recursive group of one rule shaped as a transitive closure skips
+iteration (`datalog_rules/closure.rs`). With `R₀` the `R` facts visible when
+the group starts and `T` a triple pattern with another constant predicate,
+in either direction, the rule's fixpoint derives exactly:
+
+| Rule | Derives | Run once as |
+|---|---|---|
+| `T(x,y) . R(y,z) → R(x,z)` | `T⁺ ∘ R₀` | `T+(x,y) . R(y,z)` |
+| `R(x,y) . T(y,z) → R(x,z)` | `R₀ ∘ T⁺` | `R(x,y) . T+(y,z)` |
+| `R(x,y) . R(y,z) → R(x,z)` | pairs ≥ 2 hops apart in `R₀` | `R+(x,y) . R(y,z)` |
+
+The nonlinear row keeps its last hop as a triple pattern: `R+(x,z)` would
+also emit the one-hop pairs, re-deriving asserted facts the rule never
+derives. The path operator follows only IRI-valued objects. In the first and
+third rows every node on the path is the subject of a fact; in the second the
+path ends at the head's object, so that shape compiles only after a scan
+finds no literal object of `T`'s predicate (which the group cannot write).
+A path with both ends free computes all its pairs before it returns a row,
+so the closure body runs with a pair limit of one more than the facts the
+budget still has room for (or the memory left, at `size_of::<Flake>()` a
+fact, if smaller). A path that exceeds it, or a traversal that hits the path
+operator's visited-node limit, falls back to iteration, which the budget
+bounds fact by fact. The wasted work is about one budget's worth of pairs.
+
+`RuleSchedule::WholeProgram` treats the whole program as one recursive group
+and runs every rule's whole body every round, the evaluation used before
+dependency scheduling. It is kept as the reference differential tests compare
+against.
 
 ### Parsing
 
@@ -123,10 +194,10 @@ nothing, silently". And a stored `f:rule` value whose datatype is neither
 with the two accepted shapes spelled out, instead of being expanded as
 ordinary nodes.
 
-The fixpoint's round limit is reported like a budget cap: stopping at
-`max_iterations` while the last round still derived facts sets
-`capped_reason: "iterations"` and logs a warning, so a truncated closure is
-never indistinguishable from a converged one (#1559).
+The fixpoint's pass limit is reported like a budget cap: stopping at
+`max_iterations` passes in one stage while its last pass still derived facts
+sets `capped_reason: "iterations"` and logs a warning, so a truncated closure
+is never indistinguishable from a converged one (#1559).
 
 ### IRI operands in JSON-LD filters
 
@@ -199,7 +270,7 @@ ids, which would make derived provenance durable and diffable across commits.
 Materialization happens while the query is *prepared*, before its execution
 context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
 materialization always has. A rule body is therefore bounded by the reasoning
-budget (facts, memory, time — checked between rules and rounds) but cannot be
+budget (facts, memory, time — checked as its rows arrive) but cannot be
 cancelled mid-body by the query's cancellation token, and its scans are not
 charged as query fuel. Threading the tracker and cancellation into
 prepare-time materialization is the follow-up that closes this for both
