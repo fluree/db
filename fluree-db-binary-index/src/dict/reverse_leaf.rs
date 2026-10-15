@@ -240,6 +240,32 @@ impl<'a> ReverseLeaf<'a> {
         None
     }
 
+    /// Whether every entry starts where the one before it ends, with keys
+    /// strictly ascending: the layout a fenced scan reads.
+    pub fn is_sequential(&self) -> bool {
+        let mut expected = self.data_section_start;
+        let mut prev: Option<&[u8]> = None;
+        for index in 0..self.entry_count as usize {
+            let offset = self.entry_offset(index);
+            if offset != expected || offset + 4 > self.data.len() {
+                return false;
+            }
+            let key_len =
+                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as usize;
+            let end = offset + ENTRY_OVERHEAD + key_len;
+            if end > self.data.len() {
+                return false;
+            }
+            let key = &self.data[offset + 4..offset + 4 + key_len];
+            if prev.is_some_and(|p| p >= key) {
+                return false;
+            }
+            prev = Some(key);
+            expected = end;
+        }
+        expected == self.data.len()
+    }
+
     /// A sparse index of the leaf for lookups that read it by range: for
     /// each `unit`-byte stretch of the leaf in which an entry starts, the
     /// first entry starting there.
