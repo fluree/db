@@ -169,8 +169,12 @@ impl DeltaAtom {
     }
 
     /// The variable bindings `fact` gives this pattern, or `None` when it
-    /// cannot match.
+    /// cannot match. A top-level pattern reads the graph the rules run
+    /// against, so a fact derived into a named graph never matches it.
     fn row(&self, fact: &Flake) -> Option<Vec<Binding>> {
+        if fact.g.is_some() {
+            return None;
+        }
         let values = [
             Binding::sid(fact.s.clone()),
             Binding::sid(fact.p.clone()),

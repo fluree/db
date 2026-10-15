@@ -240,14 +240,23 @@ async fn sparql_rule_literal_bound_predicate_variable_does_not_abort_other_rules
     );
 }
 
-/// A rule head is inferred into the default graph as plain triples: a SPARQL
-/// rule whose CONSTRUCT template annotates an edge or writes into a named
-/// graph is rejected by name, not run with those parts dropped.
+/// A CONSTRUCT template that annotates an edge is rejected by name, not run
+/// with the annotation dropped. One that writes into a named graph runs, and
+/// a graph the ledger does not have is an error naming it rather than a
+/// silent write into the default graph.
 #[tokio::test]
-async fn sparql_rule_head_with_annotation_or_graph_rejected() {
-    for (name, template) in [
-        ("annotatedHead", "?x ex:derived ?y ~ ?r"),
-        ("graphHead", "GRAPH ex:inferred { ?x ex:derived ?y }"),
+async fn sparql_rule_head_with_annotation_or_missing_graph_rejected() {
+    for (name, template, expected) in [
+        (
+            "annotatedHead",
+            "?x ex:derived ?y ~ ?r",
+            "annotates an edge",
+        ),
+        (
+            "graphHead",
+            "GRAPH ex:inferred { ?x ex:derived ?y }",
+            "<http://example.org/inferred>, which this ledger does not have",
+        ),
     ] {
         let fluree = FlureeBuilder::memory().build_memory();
         let ledger0 = genesis_ledger(&fluree, &format!("datalog/sparql-head-{name}"));
@@ -280,7 +289,7 @@ async fn sparql_rule_head_with_annotation_or_graph_rejected() {
             .expect_err("the rule must be rejected, not run without its annotation or graph");
         let message = err.to_string();
         assert!(
-            message.contains(name) && message.contains("named graph or annotates"),
+            message.contains(name) && message.contains(expected),
             "{name}: {message}"
         );
     }

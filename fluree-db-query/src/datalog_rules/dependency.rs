@@ -432,7 +432,8 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
         }
     }
 
-    /// Derived facts always land in the default graph.
+    /// A head writes into its named graph, else into the graph the rules run
+    /// against.
     fn write_head(&mut self, head: &RuleHead) {
         let predicate = match (&head.predicate, &head.object) {
             (HeadTerm::Sid(p), HeadTerm::Sid(class)) if is_rdf_type(p) => {
@@ -441,7 +442,11 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
             (HeadTerm::Sid(p), _) => PredicateFootprint::Exact(p.clone()),
             (HeadTerm::Var(_) | HeadTerm::Literal { .. }, _) => PredicateFootprint::Any,
         };
-        let access = Access::new(&GraphScope::Default, predicate);
+        let graph = match &head.graph {
+            Some(iri) => GraphScope::Named(iri.clone()),
+            None => GraphScope::Default,
+        };
+        let access = Access::new(&graph, predicate);
         if !self.footprint.writes.contains(&access) {
             self.footprint.writes.push(access);
         }

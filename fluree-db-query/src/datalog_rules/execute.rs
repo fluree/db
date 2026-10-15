@@ -24,6 +24,7 @@ use fluree_db_core::clock::Instant;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::edge::id_datatype_sid;
 use fluree_db_core::flake::FlakeMeta;
+use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
 use fluree_db_core::temporal::DateTime;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{
@@ -35,7 +36,7 @@ use fluree_db_reasoner::{
     ReasoningDiagnostics,
 };
 use fluree_vocab::namespaces::FLUREE_DB;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -101,12 +102,14 @@ pub async fn execute_datalog_rules_with_query_rules(
     run_fixpoint(db, &rule_set, max_iterations, budget, env).await
 }
 
-/// Dedup key: RDF term identity plus datatype and metadata (language tag,
-/// list index), so `"chat"@fr` and `"chat"@en` stay distinct facts.
-type FactKey = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
+/// Dedup key: the graph, RDF term identity, and datatype and metadata
+/// (language tag, list index), so `"chat"@fr` and `"chat"@en` stay distinct
+/// facts, as do one triple in two graphs.
+type FactKey = (Option<Sid>, Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
 
 fn fact_key(flake: &Flake) -> FactKey {
     (
+        flake.g.clone(),
         flake.s.clone(),
         flake.p.clone(),
         flake.o.clone(),
@@ -248,6 +251,7 @@ pub async fn run_fixpoint_with_schedule(
         ),
     };
 
+    let head_graphs = HeadGraphs::resolve(rule_set, db)?;
     let evaluation_time = if rule_set.reads_clock() {
         Some(resolve_evaluation_time(db, env.evaluation_time).await?)
     } else {
@@ -264,6 +268,7 @@ pub async fn run_fixpoint_with_schedule(
         start,
         deadline: start.checked_add(budget.max_duration),
         evaluation_time,
+        head_graphs: &head_graphs,
         derived: Vec::new(),
         seen: HashSet::new(),
         bytes: 0,
@@ -369,8 +374,11 @@ pub async fn run_fixpoint_with_schedule(
             if new_this_pass > 0 && more_passes_follow {
                 let mut builder = DerivedFactsBuilder::with_capacity(state.derived.len());
                 builder.extend(state.derived.iter().cloned());
-                derived_overlay =
-                    Arc::new(builder.build(FrozenSameAs::empty(), db.overlay.epoch()));
+                derived_overlay = Arc::new(builder.build_routed(
+                    FrozenSameAs::empty(),
+                    db.overlay.epoch(),
+                    |flake| head_graphs.route(flake, db.g_id),
+                ));
             }
             active = still_deriving;
         }
@@ -472,6 +480,87 @@ async fn resolve_evaluation_time(
                 db.t
             ))
         })
+}
+
+/// The named graphs rule heads derive into: the SID a derived fact carries
+/// for each, and the graph its facts are routed to.
+#[derive(Default)]
+struct HeadGraphs {
+    sids: HashMap<Arc<str>, Sid>,
+    ids: HashMap<Sid, GraphId>,
+}
+
+impl HeadGraphs {
+    /// Resolve every head graph against the ledger. A head may derive only
+    /// into a user named graph that exists: the overlay can serve facts only
+    /// for a graph the ledger can address, and the system graphs hold
+    /// metadata rather than data.
+    fn resolve(rule_set: &DatalogRuleSet, db: GraphDbRef<'_>) -> Result<Self> {
+        let mut graphs = Self::default();
+        for rule in rule_set.iter_in_order() {
+            for iri in rule.heads.iter().filter_map(|h| h.graph.as_ref()) {
+                if graphs.sids.contains_key(iri) {
+                    continue;
+                }
+                let refuse = |why: &str| {
+                    QueryError::InvalidQuery(format!(
+                        "datalog rule {} derives into graph <{iri}>, {why}",
+                        rule.name
+                    ))
+                };
+                let g_id = db
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .ok_or_else(|| {
+                        refuse(
+                            "which this ledger does not have. A rule derives only into an \
+                         existing named graph; transact data into the graph to create it",
+                        )
+                    })?;
+                if g_id < FIRST_USER_GRAPH_ID {
+                    return Err(refuse("a system graph, which rules cannot write"));
+                }
+                if g_id == db.g_id {
+                    return Err(refuse(
+                        "the graph the rules run against; leave the graph out to derive \
+                         into it",
+                    ));
+                }
+                let sid = IriEncoder::encode_iri(db.snapshot, iri)
+                    .ok_or_else(|| refuse("whose IRI cannot be encoded"))?;
+                graphs.ids.insert(sid.clone(), g_id);
+                graphs.sids.insert(iri.clone(), sid);
+            }
+        }
+        Ok(graphs)
+    }
+
+    /// The graph a derived fact belongs to: its head's named graph, else
+    /// the graph the rules run against.
+    fn route(&self, flake: &Flake, default: GraphId) -> GraphId {
+        flake
+            .g
+            .as_ref()
+            .and_then(|g| self.ids.get(g).copied())
+            .unwrap_or(default)
+    }
+}
+
+/// The graph a fact derived over `snapshot` belongs to: the named graph its
+/// `g` names, else `default`, the graph the rules ran against.
+pub fn derived_fact_graph(
+    snapshot: &LedgerSnapshot,
+    default: GraphId,
+) -> impl Fn(&Flake) -> GraphId + '_ {
+    move |flake| {
+        flake
+            .g
+            .as_ref()
+            .and_then(|g| snapshot.decode_sid(g))
+            .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+            .unwrap_or(default)
+    }
 }
 
 /// What every group of a run shares.
@@ -610,6 +699,7 @@ struct Derivation<'a> {
     /// `start` plus the time budget; `None` when the budget is unbounded.
     deadline: Option<Instant>,
     evaluation_time: Option<DateTime>,
+    head_graphs: &'a HeadGraphs,
     derived: Vec<Flake>,
     seen: HashSet<FactKey>,
     bytes: usize,
@@ -854,10 +944,14 @@ impl HeadSink<'_, '_> {
                 return Some("time");
             }
             for head in &self.rule.heads {
-                let Some(flake) = instantiate(head, batch, row, state.snapshot, state.derived_t)
+                let Some(mut flake) =
+                    instantiate(head, batch, row, state.snapshot, state.derived_t)
                 else {
                     continue;
                 };
+                if let Some(graph) = &head.graph {
+                    flake.g = state.head_graphs.sids.get(graph).cloned();
+                }
                 self.instantiated += 1;
                 if !state.seen.insert(fact_key(&flake)) {
                     continue;

@@ -5,6 +5,8 @@ mod support;
 mod it_datalog_aggregates;
 #[path = "it_datalog_closure_paths.rs"]
 mod it_datalog_closure_paths;
+#[path = "it_datalog_named_graphs.rs"]
+mod it_datalog_named_graphs;
 #[path = "it_datalog_negation.rs"]
 mod it_datalog_negation;
 #[path = "it_datalog_program_reachability.rs"]

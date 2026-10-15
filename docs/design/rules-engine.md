@@ -222,6 +222,27 @@ OWL closure is datalog's input. `RuleSchedule::WholeProgram` refuses these
 programs: it runs every rule from the first round. A subquery's solutions are
 a bag, as in queries, and `owl:sameAs` aliases are counted as stated.
 
+### Named graphs
+
+`RuleHead::graph` holds a head's expanded graph IRI: from a CONSTRUCT
+template's `GRAPH <iri>` block, or a JSON-LD insert node's `"@graph": "<iri>"`
+(a named graph object `{"@id": <iri>, "@graph": [ … ]}` assigns its nodes).
+The footprint writes such a head into `GraphScope::Named`. At run start
+`HeadGraphs::resolve` maps each IRI to a graph id through the ledger's graph
+registry, refusing a graph the ledger lacks, a system graph, or the graph the
+rules run against. A derived flake carries its graph's SID in `g`, so the
+dedup key and routing both see it.
+
+`DerivedFactsOverlay` partitions facts by graph id (`new_routed` /
+`DerivedFactsBuilder::build_routed`); a flake with no `g` belongs to the
+graph the rules ran against, and OWL 2 RL facts stay in the default graph.
+The executor splices the reasoning overlay into every dataset graph of the
+ledger that holds derived facts, not only the primary view. A semi-naive
+seed holds only facts without `g`, since a seeded pattern is a top-level
+pattern of the graph the rules run against; named-graph reads sit inside
+`GRAPH` and re-run whole. A transitive closure head with a graph does not
+compile to a path.
+
 ### Run contract
 
 - **Evaluation time.** `NOW()` and `TODAY()` read

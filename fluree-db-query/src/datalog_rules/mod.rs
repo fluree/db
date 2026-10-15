@@ -30,8 +30,8 @@ pub use dependency::{
     Access, GraphScope, PredicateFootprint, RuleComponent, RuleDependencies, RuleFootprint,
 };
 pub use execute::{
-    execute_datalog_rules, execute_datalog_rules_with_query_rules, load_rule_set, run_fixpoint,
-    run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule,
+    derived_fact_graph, execute_datalog_rules, execute_datalog_rules_with_query_rules,
+    load_rule_set, run_fixpoint, run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule,
 };
 pub use parse::parse_query_time_rule;
 
@@ -72,6 +72,9 @@ pub struct RuleHead {
     pub subject: HeadTerm,
     pub predicate: HeadTerm,
     pub object: HeadTerm,
+    /// The named graph the triple is derived into, as an expanded IRI.
+    /// `None`: the graph the rules run against.
+    pub graph: Option<Arc<str>>,
 }
 
 /// The rule body: a lowered query whose `output` projects every variable the
