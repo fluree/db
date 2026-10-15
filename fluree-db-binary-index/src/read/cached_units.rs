@@ -130,6 +130,10 @@ fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
 pub struct MissMeter {
     bytes: AtomicU64,
     units: Box<[AtomicU64]>,
+    /// Bytes of the distinct units missed: the source's coverage.
+    covered: AtomicU64,
+    /// Whether the bytes missed have reached a threshold this rental.
+    crossed: std::sync::atomic::AtomicBool,
     /// Times the metered source has been promoted whole.
     promotions: AtomicU64,
 }
@@ -139,6 +143,8 @@ impl MissMeter {
         Self {
             bytes: AtomicU64::new(0),
             units: (0..units.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            covered: AtomicU64::new(0),
+            crossed: std::sync::atomic::AtomicBool::new(false),
             promotions: AtomicU64::new(0),
         }
     }
@@ -146,7 +152,10 @@ impl MissMeter {
     fn record(&self, unit: u64, bytes: usize) {
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         if let Some(word) = self.units.get((unit / 64) as usize) {
-            word.fetch_or(1 << (unit % 64), Ordering::Relaxed);
+            let bit = 1 << (unit % 64);
+            if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                self.covered.fetch_add(bytes as u64, Ordering::Relaxed);
+            }
         }
     }
 
@@ -161,6 +170,17 @@ impl MissMeter {
             .sum()
     }
 
+    /// Bytes of the distinct units missed, each counted at its actual size.
+    pub fn covered(&self) -> u64 {
+        self.covered.load(Ordering::Relaxed)
+    }
+
+    /// `true` once per rental: the first call after the bytes missed have
+    /// reached `threshold`.
+    pub fn first_crossing(&self, threshold: u64) -> bool {
+        self.bytes() >= threshold && !self.crossed.swap(true, Ordering::Relaxed)
+    }
+
     /// Count a promotion of the source; returns how many came before it.
     pub fn note_promotion(&self) -> u64 {
         self.promotions.fetch_add(1, Ordering::Relaxed)
@@ -168,6 +188,8 @@ impl MissMeter {
 
     pub fn reset(&self) {
         self.bytes.store(0, Ordering::Relaxed);
+        self.covered.store(0, Ordering::Relaxed);
+        self.crossed.store(false, Ordering::Relaxed);
         for word in &*self.units {
             word.store(0, Ordering::Relaxed);
         }
@@ -223,10 +245,15 @@ impl CachedUnits {
         self.len.div_ceil(self.unit_size).max(1)
     }
 
-    /// The whole source: cached units copied, the rest read from the source
-    /// without caching them. Returns the bytes and how many were read.
-    pub fn assemble(&self) -> io::Result<(Vec<u8>, u64)> {
-        let mut out = Vec::with_capacity(self.len as usize);
+    /// The whole source into `out`, which must be exactly its length:
+    /// cached units copied, the rest read from the source without caching
+    /// them. Returns how many bytes were read.
+    pub fn assemble_into(&self, out: &mut [u8]) -> io::Result<u64> {
+        if out.len() as u64 != self.len {
+            return Err(io::Error::other(
+                "assembly buffer is not the source's length",
+            ));
+        }
         let mut read = 0u64;
         for unit in 0..self.unit_count() {
             let key = SourceUnitKey {
@@ -235,8 +262,9 @@ impl CachedUnits {
             };
             let start = unit * self.unit_size;
             let expected = self.unit_size.min(self.len.saturating_sub(start)) as usize;
+            let slot = &mut out[start as usize..start as usize + expected];
             match self.cache.peek_source_unit(key) {
-                Some(bytes) if bytes.len() == expected => out.extend_from_slice(&bytes),
+                Some(bytes) if bytes.len() == expected => slot.copy_from_slice(&bytes),
                 _ => {
                     let bytes = self
                         .source
@@ -249,11 +277,11 @@ impl CachedUnits {
                         ));
                     }
                     read += bytes.len() as u64;
-                    out.extend_from_slice(&bytes);
+                    slot.copy_from_slice(&bytes);
                 }
             }
         }
-        Ok((out, read))
+        Ok(read)
     }
 
     /// Drop this source's units from the cache.
@@ -601,8 +629,16 @@ mod tests {
             (4_500, 4),
             "re-read"
         );
+        assert_eq!(meter.covered(), 3_500, "unit 4 counts its 500 bytes, once");
+        assert!(!meter.first_crossing(4_501));
+        assert!(meter.first_crossing(4_500));
+        assert!(!meter.first_crossing(4_500), "once per rental");
         meter.reset();
-        assert_eq!((meter.bytes(), meter.distinct_units()), (0, 0));
+        assert_eq!(
+            (meter.bytes(), meter.distinct_units(), meter.covered()),
+            (0, 0, 0)
+        );
+        assert!(meter.first_crossing(0), "a new rental");
     }
 
     /// Assembly copies the units the cache holds and reads only the rest;
@@ -614,16 +650,21 @@ mod tests {
         let units = cached(&source, &cache);
         units.read_range(1_000..3_000).unwrap();
         let reads = source.reads();
-        let (bytes, read) = units.assemble().unwrap();
+        let mut bytes = vec![0u8; 4_500];
+        let read = units.assemble_into(&mut bytes).unwrap();
         assert_eq!(bytes, source.bytes);
         assert_eq!(read, 2_500, "units 0, 3 and 4");
         assert_eq!(source.reads(), reads + 3);
         units.forget_cached();
-        let (_, read) = units.assemble().unwrap();
-        assert_eq!(read, 4_500, "nothing left cached");
+        assert_eq!(
+            units.assemble_into(&mut bytes).unwrap(),
+            4_500,
+            "nothing left cached"
+        );
+        assert!(units.assemble_into(&mut [0u8; 10]).is_err(), "wrong length");
         source.fail.store(true, Ordering::SeqCst);
         assert!(
-            units.assemble().is_err(),
+            units.assemble_into(&mut bytes).is_err(),
             "a unit failing to authenticate fails it"
         );
     }

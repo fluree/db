@@ -659,8 +659,9 @@ impl LeafletCache {
         Self {
             inner,
             stats_views: stats_view_pool(max_bytes),
-            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::new(
+            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::with_backing(
                 crate::dict::allowance::allowance_from_env(),
+                crate::dict::allowance::mapped_from_env(),
             ),
         }
     }
@@ -669,6 +670,15 @@ impl LeafletCache {
     #[cfg(test)]
     pub(crate) fn with_dictionary_allowance(mut self, bytes: u64) -> Self {
         self.dictionary_allowance = crate::dict::allowance::DictionaryAllowance::new(bytes);
+        self
+    }
+
+    /// Replace the dictionary allowance with one backing promoted packs in
+    /// anonymous mappings (tests).
+    #[cfg(test)]
+    pub(crate) fn with_mapped_dictionary_allowance(mut self, bytes: u64) -> Self {
+        self.dictionary_allowance =
+            crate::dict::allowance::DictionaryAllowance::with_backing(bytes, true);
         self
     }
 

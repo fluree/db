@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use super::allowance::{Assembled, DictionaryAllowance, HeldPack, Promotion};
+use super::allowance::{DictionaryAllowance, HeldPack, Promotion};
 use super::forward_pack::{
     find_page_in_dir, lookup_in_pack, page_dir_range, parse_pack_meta, parse_pack_meta_parts,
     ForwardPage, PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
@@ -100,6 +100,8 @@ struct AdaptivePack {
     seen: parking_lot::RwLock<std::sync::Weak<HeldPack>>,
     /// The allowance generation at which this pack was last found absent.
     absent_at: std::sync::atomic::AtomicU64,
+    /// Bytes of distinct units a rental must cover before promotion.
+    min_covered: u64,
 }
 
 impl AdaptivePack {
@@ -107,8 +109,10 @@ impl AdaptivePack {
         units: CachedUnits,
         checked: Box<[AtomicBool]>,
         allowance: Arc<DictionaryAllowance>,
+        coverage: f64,
     ) -> Self {
         let meter = allowance.meter(units.identity(), units.unit_count());
+        let min_covered = (units.len() as f64 * coverage.clamp(0.0, 1.0)).ceil() as u64;
         Self {
             units: units.with_meter(Arc::clone(&meter)),
             checked,
@@ -116,12 +120,16 @@ impl AdaptivePack {
             meter,
             seen: parking_lot::RwLock::new(std::sync::Weak::new()),
             absent_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            min_covered,
         }
     }
 
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
         if let Some(whole) = self.whole() {
-            return Ok(lookup_whole(&whole, meta, id, out));
+            let mark = out.len();
+            let found = lookup_whole(&whole, meta, id, out);
+            whole.note_served(out.len() - mark);
+            return Ok(found);
         }
         if id < meta.first_id || id > meta.last_id {
             return Ok(false);
@@ -136,8 +144,15 @@ impl AdaptivePack {
             id,
             out,
         )?;
-        if self.meter.bytes() >= self.units.len() && self.units.len() <= self.allowance.capacity() {
-            self.promote()?;
+        let len = self.units.len();
+        if self.meter.bytes() >= len && len <= self.allowance.capacity() {
+            let covered = self.meter.covered();
+            if self.meter.first_crossing(len) {
+                self.allowance.note_rent_reached(covered, len);
+            }
+            if covered >= self.min_covered {
+                self.promote()?;
+            }
         }
         Ok(found)
     }
@@ -170,12 +185,8 @@ impl AdaptivePack {
         let promotion = self.allowance.promote(
             self.units.identity(),
             self.units.len(),
-            self.meter.distinct_units(),
-            self.units.unit_count(),
-            || {
-                let (bytes, decrypted) = self.units.assemble()?;
-                Ok(Assembled { bytes, decrypted })
-            },
+            self.meter.covered(),
+            |buf| self.units.assemble_into(buf),
         )?;
         match promotion {
             Promotion::Promoted(pack) => {
@@ -384,6 +395,21 @@ struct LoadContext {
     page_cache: Option<Arc<LeafletCache>>,
     /// How packs a store reads by range are held.
     encrypted_packs: EncryptedPacks,
+    /// Adaptive mode: the share of a pack its ranged misses must have
+    /// covered, besides renting its size, before it is promoted.
+    promote_coverage: f64,
+}
+
+/// Experiment control: `FLUREE_DICT_PROMOTE_COVERAGE`, a fraction; off (0)
+/// when unset.
+fn promote_coverage_from_env() -> f64 {
+    static COVERAGE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *COVERAGE.get_or_init(|| {
+        std::env::var("FLUREE_DICT_PROMOTE_COVERAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    })
 }
 
 /// How a local pack whose store decrypts on read is held. Experiment
@@ -500,6 +526,7 @@ impl ForwardPackReader {
                         expected_ns_code,
                         page_cache: None,
                         encrypted_packs: EncryptedPacks::from_env(),
+                        promote_coverage: promote_coverage_from_env(),
                     }),
                 });
             }
@@ -562,6 +589,7 @@ impl ForwardPackReader {
                 expected_ns_code,
                 page_cache: None,
                 encrypted_packs: EncryptedPacks::from_env(),
+                promote_coverage: promote_coverage_from_env(),
             }),
         })
     }
@@ -570,6 +598,14 @@ impl ForwardPackReader {
     fn with_encrypted_packs(mut self, mode: EncryptedPacks) -> Self {
         if let Some(ctx) = &mut self.load_ctx {
             ctx.encrypted_packs = mode;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_promote_coverage(mut self, coverage: f64) -> Self {
+        if let Some(ctx) = &mut self.load_ctx {
+            ctx.promote_coverage = coverage;
         }
         self
     }
@@ -969,6 +1005,7 @@ fn loaded_paged(
                 CachedUnits::new(source, Arc::clone(cache)),
                 checked(),
                 Arc::clone(cache.dictionary_allowance()),
+                ctx.promote_coverage,
             )))
         }
         _ => PackBacking::Ranged {
@@ -2299,9 +2336,10 @@ mod tests {
             assert_eq!((stats.promoted, stats.resident_bytes), (1, len));
             assert_eq!(stats.assembly_decrypted + stats.assembly_reused, len);
             assert!(stats.assembly_reused > 0, "cached units are reused");
+            assert_eq!(stats.rent_covered_bytes, len, "every unit missed once");
             assert_eq!(
-                stats.rent_distinct_units, stats.rent_units,
-                "every unit missed once"
+                (stats.crossing_coverage[9], stats.promotion_coverage[9]),
+                (1, 1)
             );
             let reads = cs.reads().len();
             read_all(&reader, FIRST);
@@ -2391,6 +2429,111 @@ mod tests {
                 2,
                 "b is promoted once there is room"
             );
+        }
+
+        fn guarded(
+            cs: &SegmentedContentStore,
+            cache: &Arc<LeafletCache>,
+            coverage: f64,
+        ) -> ForwardPackReader {
+            adaptive(cs, FIRST, cache).with_promote_coverage(coverage)
+        }
+
+        /// With the coverage guard, re-missing the same small region rents
+        /// the pack's size without promoting it; covering half of it does.
+        /// Without the guard the same rental promotes.
+        #[test]
+        fn the_coverage_guard_waits_for_a_rental_to_cover_the_pack() {
+            let len = pack_from(FIRST).len() as u64;
+            for coverage in [0.5, 0.0] {
+                let cs = SegmentedContentStore::new(true);
+                let cache = allowance_cache(2 * len);
+                let reader = guarded(&cs, &cache, coverage);
+                for _ in 0..12 {
+                    read_ids(&reader, FIRST, 0..COUNT as u64 / 10);
+                    cache.invalidate_all();
+                }
+                let stats = cache.dictionary_allowance().stats();
+                if coverage > 0.0 {
+                    assert_eq!(stats.promoted, 0, "a small region re-missed");
+                    assert_eq!(
+                        stats.crossing_coverage.iter().sum::<u64>(),
+                        1,
+                        "rent reached once"
+                    );
+                    assert!(
+                        stats.crossing_coverage[..5].iter().sum::<u64>() == 1,
+                        "below half"
+                    );
+                    read_ids(&reader, FIRST, COUNT as u64 / 10..COUNT as u64 * 6 / 10);
+                    let stats = cache.dictionary_allowance().stats();
+                    assert_eq!(stats.promoted, 1, "half covered");
+                    assert!(stats.rent_covered_bytes * 2 >= len);
+                } else {
+                    assert_eq!(stats.promoted, 1, "no guard");
+                }
+                read_all(&reader, FIRST);
+            }
+        }
+
+        /// Lookups a whole pack serves are counted, and recorded with their
+        /// value bytes when it is evicted.
+        #[test]
+        fn lookups_served_whole_are_recorded_at_eviction() {
+            let len = pack_from(FIRST).len() as u64;
+            let other = FIRST + 10 * COUNT as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(len + len / 2);
+            let a = adaptive(&cs, FIRST, &cache);
+            read_all(&a, FIRST);
+            let cid = cs.put_sync(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                &pack_from(FIRST),
+            );
+            let (before, before_bytes) = cache
+                .dictionary_allowance()
+                .resident(xxhash_rust::xxh3::xxh3_128(&cid.to_bytes()))
+                .expect("promoted")
+                .served();
+            read_ids(&a, FIRST, 0..100);
+            let served: u64 = (0..100).map(|i| value(FIRST + i).len() as u64).sum();
+            read_all(&adaptive(&cs, other, &cache), other);
+            let stats = cache.dictionary_allowance().stats();
+            assert_eq!(stats.evicted, 1);
+            assert_eq!(
+                (stats.evicted_served_lookups, stats.evicted_served_bytes),
+                (before + 100, before_bytes + served)
+            );
+            assert_eq!(stats.evicted_served.iter().sum::<u64>(), 1);
+        }
+
+        /// Packs promoted into anonymous mappings serve the same values, and
+        /// return their charge when dropped.
+        #[test]
+        fn mapped_promotions_serve_the_same_values() {
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache =
+                Arc::new(LeafletCache::with_max_mb(16).with_mapped_dictionary_allowance(len));
+            let reader = adaptive(&cs, FIRST, &cache);
+            read_all(&reader, FIRST);
+            let reads = cs.reads().len();
+            read_all(&reader, FIRST);
+            assert_eq!(cs.reads().len(), reads, "served whole");
+            let cid = cs.put_sync(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                &pack_from(FIRST),
+            );
+            let pack = cache
+                .dictionary_allowance()
+                .resident(xxhash_rust::xxh3::xxh3_128(&cid.to_bytes()))
+                .expect("promoted");
+            assert!(pack.is_mapped());
+            assert_eq!(pack.len() as u64, len);
         }
 
         /// Readers of the same pack share its promotion: the other reader
