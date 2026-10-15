@@ -24,7 +24,10 @@ use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentId, ContentKind, ContentStore, DictNovelty, Flake, GraphId, LedgerSnapshot, Sid,
+    TXN_META_GRAPH_ID,
+};
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{
@@ -557,6 +560,17 @@ pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>>
         })
 }
 
+/// The id of each graph `snapshot` holds, by its IRI's Sid, the txn-meta
+/// graph included: how a commit's flakes are routed into novelty.
+pub(crate) fn graph_ids(snapshot: &LedgerSnapshot) -> Result<HashMap<Sid, GraphId>> {
+    let mut graph_ids = snapshot.build_reverse_graph()?;
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(snapshot.ledger_id.as_str());
+    if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
+        graph_ids.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
+    }
+    Ok(graph_ids)
+}
+
 /// Commit a staged transaction
 ///
 /// This function:
@@ -695,6 +709,24 @@ pub async fn build_commit(
     // 4b. Datatype dictionary limit. Not subject to `skip_backpressure`:
     //     draining novelty never frees a datatype ID.
     crate::datatype_limit::check_commit(&base, &flakes, &txn_meta)?;
+
+    // 4c. Vectors the index can store. Not subject to `skip_backpressure`
+    //     either: no later index build could store them.
+    crate::vector_dims::check_commit(
+        &base,
+        &flakes,
+        || graph_ids(&base.snapshot),
+        |sid| {
+            base.snapshot
+                .decode_sid(sid)
+                .or_else(|| {
+                    ns_registry
+                        .get_prefix(sid.namespace_code)
+                        .map(|prefix| format!("{prefix}{}", sid.name))
+                })
+                .unwrap_or_else(|| sid.to_string())
+        },
+    )?;
 
     // 5. Build commit record
     //    (sequencing verification + nameservice lookup are the
@@ -1073,10 +1105,6 @@ fn finalize_state_with_base(
     let mut all_flakes = std::mem::take(&mut commit_record.flakes);
     all_flakes.extend(commit_metadata_flakes);
 
-    // Capture the ledger id before moving novelty fields out of `base`: after a
-    // partial move we can no longer call `&self` methods on `base`.
-    let base_ledger_id = base.ledger_id().to_string();
-
     // Move the snapshot out of `base` up front so we can DETACH its range
     // provider *before* mutating the dictionaries below. A `BinaryRangeProvider`
     // owns `Arc::clone`s of `dict_novelty` / `runtime_small_dicts`; if it stays
@@ -1141,11 +1169,7 @@ fn finalize_state_with_base(
     {
         let span = tracing::debug_span!("commit_apply_to_novelty");
         let _g = span.enter();
-        let mut reverse_graph = snapshot.build_reverse_graph()?;
-        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(&base_ledger_id);
-        if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
-            reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
-        }
+        let reverse_graph = graph_ids(&snapshot)?;
         Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
     }
 

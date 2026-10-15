@@ -137,6 +137,13 @@ pub enum TransactError {
         max: usize,
     },
 
+    /// An `f:embeddingVector` value the ledger cannot store: empty, longer
+    /// than 65,535 elements, holding a non-finite element, or of a length
+    /// other than the property's other vectors in the same graph
+    /// ([`fluree_db_core::vector`]).
+    #[error("Invalid vector: {0}")]
+    InvalidVector(String),
+
     /// Whole-graph scan larger than the memory backstop
     #[error(
         "whole-graph operation would materialize more than {limit} currently-asserted flakes; \

@@ -50,6 +50,7 @@ pub mod stage;
 pub mod staged_dicts;
 pub mod template_sink;
 pub mod value_convert;
+pub mod vector_dims;
 
 #[cfg(feature = "import")]
 pub mod import;

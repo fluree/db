@@ -797,6 +797,30 @@ mod tests {
         }
     }
 
+    /// A vector the index cannot store is a permanent refusal: 422 +
+    /// `err:db/InvalidTransaction` with no `Retry-After`, as the typed error
+    /// and as the committer flattens it (`Http { status }` from
+    /// `ApiError::status_code`).
+    #[test]
+    fn invalid_vector_is_422_invalid_transaction_without_retry_after() {
+        let typed = ApiError::Transact(fluree_db_api::TransactError::InvalidVector(
+            "vector dims mismatch: expected 3, got 2".into(),
+        ));
+        let flattened = ApiError::Http {
+            status: typed.status_code(),
+            message: typed.to_string(),
+        };
+        for se in [ServerError::Api(typed), ServerError::Api(flattened)] {
+            assert_eq!(se.status_code(), StatusCode::UNPROCESSABLE_ENTITY, "{se}");
+            assert_eq!(se.error_type(), errors::INVALID_TRANSACTION, "{se}");
+            let resp = se.into_response();
+            assert!(resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none());
+        }
+    }
+
     /// The datatype limit is a permanent refusal: 422 +
     /// `err:db/DatatypeLimitExceeded` with no `Retry-After`, in both the
     /// raw-variant and consensus-flattened shapes.

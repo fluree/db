@@ -386,8 +386,15 @@ mod inner {
         /// Uses the same encoders as `CommitResolver` in the indexer for inline
         /// types. For subjects and strings, assigns chunk-local IDs (remapped
         /// during merge). For BigInt/Decimal/Vector, uses shared global pools.
-        fn resolve_object_value(&mut self, value: &FlakeValue, p_id: u32) -> Option<(u8, u64)> {
-            Some(match value {
+        ///
+        /// Fails when the shared vector pool cannot store a vector, which stops
+        /// the import.
+        fn resolve_object_value(
+            &mut self,
+            value: &FlakeValue,
+            p_id: u32,
+        ) -> Result<(u8, u64), CommitCodecError> {
+            Ok(match value {
                 FlakeValue::Ref(sid) => {
                     let local_id = self.assign_subject_id(sid);
                     (ObjKind::REF_ID.as_u8(), local_id)
@@ -485,16 +492,14 @@ mod inner {
                 }
                 FlakeValue::Vector(v) => {
                     // Use shared vector pool for global handle.
-                    match self.vector_pool.insert_f64(self.g_id, p_id, v) {
-                        Ok(handle) => (
-                            ObjKind::VECTOR_ID.as_u8(),
-                            ObjKey::encode_u32_id(handle).as_u64(),
-                        ),
-                        Err(e) => {
-                            tracing::error!("SpoolContext: vector insert failed: {}", e);
-                            return None;
-                        }
-                    }
+                    let handle = self
+                        .vector_pool
+                        .insert_f64(self.g_id, p_id, v)
+                        .map_err(|e| CommitCodecError::InvalidOp(format!("invalid vector: {e}")))?;
+                    (
+                        ObjKind::VECTOR_ID.as_u8(),
+                        ObjKey::encode_u32_id(handle).as_u64(),
+                    )
                 }
             })
         }
@@ -515,9 +520,7 @@ mod inner {
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
             let dt_id = self.assign_datatype_id(dt)?;
-            let Some((o_kind, o_key)) = self.resolve_object_value(o, p_id) else {
-                return Ok(()); // skip spool record on unresolvable value (e.g. bad vector)
-            };
+            let (o_kind, o_key) = self.resolve_object_value(o, p_id)?;
             let lang_id = lang.map(|l| self.assign_lang_id(l)).unwrap_or(0);
             let i = list_index
                 .map(|idx| {
@@ -781,7 +784,10 @@ mod inner {
             // loudly rather than silently dropping/storing bad records.
             if let Err(e) = crate::generate::flakes::validate_value_dt_pair(&o, &dt) {
                 if self.encode_error.is_none() {
-                    let msg = format!("invariant violation: {e}");
+                    let msg = match e {
+                        TransactError::InvalidVector(_) => e.to_string(),
+                        _ => format!("invariant violation: {e}"),
+                    };
                     tracing::error!("ImportSink: {msg}");
                     self.encode_error = Some(CommitCodecError::InvalidOp(msg));
                 }

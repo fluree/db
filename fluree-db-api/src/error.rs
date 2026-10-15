@@ -742,8 +742,11 @@ impl ApiError {
                 ..
             }) if delta_bytes >= max_bytes => 413,
             ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
-            // Permanent: datatype IDs are never released.
-            ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => 422,
+            // Well-formed, but a value breaks a constraint the ledger holds:
+            // no room for its new datatypes (datatype IDs are never
+            // released), or a vector the index cannot store beside the
+            // property's others. Permanent either way.
+            ApiError::Transact(TE::DatatypeLimitExceeded { .. } | TE::InvalidVector(_)) => 422,
             ApiError::Transact(_) => 400,
 
             ApiError::Indexer(e) => {
@@ -900,6 +903,8 @@ impl ApiError {
                 errors::NOVELTY_AT_MAX
             }
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            // The generic code, the one its flattened 422 carries.
+            ApiError::Transact(TE::InvalidVector(_)) => errors::INVALID_TRANSACTION,
             ApiError::Transact(_) => errors::INVALID_TRANSACTION,
 
             ApiError::InvalidLedgerId(_)
@@ -1265,6 +1270,11 @@ mod tests {
                 }),
                 422,
                 DATATYPE_LIMIT_EXCEEDED,
+            ),
+            (
+                ApiError::Transact(TE::InvalidVector("x".into())),
+                422,
+                INVALID_TRANSACTION,
             ),
             (
                 ApiError::Connection(ConnectionError::InvalidConfig("x".into())),
