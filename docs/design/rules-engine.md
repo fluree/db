@@ -170,10 +170,9 @@ to stored rules too: a ledger whose rule set contains a broken rule fails its
 reasoning queries until the rule is fixed, rather than silently answering over
 an incomplete derivation.
 
-Rejected constructs are the non-monotonic ones, which a fixpoint cannot
-evaluate soundly without stratification: OPTIONAL, MINUS, NOT EXISTS
-(`["not-exists", …]`), aggregates and GROUP BY, and SERVICE. Everything else the
-executor accepts is allowed.
+Rejected constructs: OPTIONAL, MINUS (NOT EXISTS is the supported negation),
+aggregates and GROUP BY, and SERVICE. Everything else the executor accepts is
+allowed, including stratified negation (below).
 
 Range restriction is enforced per rule: every head variable must be bound by
 the body. A head that references an unbound variable now rejects the rule (it
@@ -199,6 +198,26 @@ The fixpoint's pass limit is reported like a budget cap: stopping at
 `max_iterations` passes in one stage while its last pass still derived facts
 sets `capped_reason: "iterations"` and logs a warning, so a truncated closure
 is never indistinguishable from a converged one (#1559).
+
+### Stratified negation
+
+Reads under `NOT EXISTS` or `!` are recorded as `negated_reads` in the
+footprint, as well as ordinary reads, so they create dependency edges like
+any other read: a negating rule's stage comes after every rule that can
+write what it negates. `RuleDependencies::unstratified_negation` rejects a
+program in which a negated read may observe a write of the reading rule's own
+recursive group, reporting a cycle found by a breadth-first search inside
+that group. Double negation counts as negated, which keeps the check
+conservative. The validator requires every variable a negation shares with
+its group to be bound by a positive pattern of that group (or of the group the
+negation is nested in).
+
+Because a cap stops all later stages, a negating rule never runs over
+incomplete inputs within datalog. A capped run that leaves a negating rule
+unfinished fails with `ResourceLimit` instead of returning partial
+conclusions, and so does an OWL 2 RL cap ahead of a program with negation,
+since the OWL closure is datalog's input. `RuleSchedule::WholeProgram`
+refuses programs with negation: it runs every rule from the first round.
 
 ### Run contract
 

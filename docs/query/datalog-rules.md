@@ -9,10 +9,10 @@ together and recurse.
 Rule bodies are evaluated by the same query engine as any other query, so a
 rule can use everything a `where` clause can: edge annotations (claims and
 other relationship metadata), the full FILTER expression language, BIND,
-VALUES, UNION, property paths and subqueries. The only constructs a rule
-body may not use are the non-monotonic ones — OPTIONAL, MINUS, `not-exists`,
-aggregates and SERVICE — which a fixpoint cannot evaluate soundly; those are
-rejected with an error naming the construct (see [Validation](#validation-a-rule-that-cannot-run-is-an-error)).
+VALUES, UNION, property paths, subqueries, and negation with `not-exists` /
+`NOT EXISTS` (see [Negation](#negation)). The constructs a rule body may not
+use — OPTIONAL, MINUS, aggregates and SERVICE — are rejected with an error
+naming the construct (see [Validation](#validation-a-rule-that-cannot-run-is-an-error)).
 
 For background concepts see [Reasoning and inference](../concepts/reasoning.md);
 for enabling reasoning in queries see
@@ -315,10 +315,13 @@ over an incomplete rule set would be silently wrong, which is worse.
 
 Rejected:
 
-- **Non-monotonic constructs in the body**: OPTIONAL (`["optional", …]`),
-  MINUS, NOT EXISTS (`["not-exists", …]`), GROUP BY / aggregates, SERVICE.
-  A fixpoint cannot evaluate negation or left joins soundly without
-  stratification.
+- **Constructs a fixpoint cannot evaluate**: OPTIONAL (`["optional", …]`),
+  GROUP BY / aggregates, SERVICE. MINUS is rejected too, with a pointer to
+  NOT EXISTS, which rules support.
+- **Negation that cannot be stratified**: a program in which a rule negates
+  facts that depend on its own conclusions (see [Negation](#negation)).
+- **A variable a negation shares with the rest of the body that no positive
+  pattern binds** (see [Negation](#negation)).
 - **A head variable the body never binds** (range restriction). A variable the
   body only *reads* — a filter operand, or a variable bound inside an
   `exists` block — does not count as bound, because a matched row carries no
@@ -346,20 +349,76 @@ paths and subqueries are all allowed. A subquery may use `DISTINCT` and
 not `GROUP BY`, aggregates, `LIMIT` or `OFFSET`, which are rejected by name
 like any other non-monotonic construct.
 
-Negation is rejected in every spelling, and the rule is positional rather than
-a list of negating operators. An `EXISTS` is allowed only where its truth value
-is read directly and positively: as the filter condition itself, or under `AND`
-/ `OR` in such a position. Anywhere else it is rejected — as a comparison
-operand (`FILTER(EXISTS { … } = false)`), as an `IF` branch, as a function
-argument, or bound to a variable (`BIND(EXISTS { … } AS ?e)`), because each of
-those can negate it and a fixpoint cannot evaluate negation soundly without
-stratification. `FILTER(NOT EXISTS { … })`, `["not-exists", …]` and
-`FILTER(!EXISTS { … })` are all the same construct to the engine; an even
-number of `!` is not negation, so `FILTER(!(!EXISTS { … }))` still runs.
+An `EXISTS` or `NOT EXISTS` is allowed only where its truth value is read
+directly: as the filter condition itself, or under `AND` / `OR` / `!` in such
+a position. Anywhere else it is rejected — as a comparison operand
+(`FILTER(EXISTS { … } = false)`), as an `IF` branch, as a function argument,
+or bound to a variable (`BIND(EXISTS { … } AS ?e)`) — because each of those
+can negate it where the stratification check cannot see it.
+`FILTER(NOT EXISTS { … })`, `["not-exists", …]` and `FILTER(!EXISTS { … })`
+are all the same construct to the engine. The check is deliberately
+conservative: `FILTER(EXISTS { … } = true)` is positive and is still refused.
 
-The rule is deliberately conservative: `FILTER(EXISTS { … } = true)` is
-monotone and is still refused, because the check cannot tell it from its
-negated twin. It fails toward a named error rather than a wrong answer.
+## Negation
+
+A rule may require that something is absent with `not-exists` (JSON-LD) or
+`FILTER NOT EXISTS` (SPARQL). An invoice with neither a payment nor a waiver
+is open:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "where": [
+    {"@id": "?i", "@type": "ex:Invoice"},
+    ["not-exists", {"@id": "?i", "ex:paidBy": "?p"}],
+    ["not-exists", {"@id": "?i", "ex:waivedBy": "?w"}]
+  ],
+  "insert": {"@id": "?i", "@type": "ex:Open"}
+}
+```
+
+```sparql
+PREFIX ex: <http://example.org/>
+CONSTRUCT { ?i a ex:Open }
+WHERE {
+  ?i a ex:Invoice
+  FILTER NOT EXISTS { ?i ex:paidBy ?p }
+  FILTER NOT EXISTS { ?i ex:waivedBy ?w }
+}
+```
+
+**What absence means.** A negation matches when nothing matches it in the
+data the rules run over: the queried snapshot's default graph, OWL 2 RL
+entailments when that mode is on, and the conclusions of other rules. It is
+a statement about that data, not about the world.
+
+**Negated facts are complete first.** Fluree runs a rule that negates
+something only after every rule that can derive what it negates has
+finished, so a negation never sees a partial result. Negation can stack:
+staff are employees who are not managers, and a team with no staff is all
+managers, even when managers are themselves derived. A recursive rule may
+negate facts its recursion does not derive.
+
+**Cycles through negation are rejected.** A program whose rule negates facts
+that depend on its own conclusions has no order in which the negated facts
+are complete — accepting a candidate unless it is rejected, while rejecting
+candidates that conflict with accepted ones, is the classic case. Fluree
+refuses such a program and names the cycle, for example
+`ex:accept -not-> ex:reject -> ex:accept`, where each arrow reads facts from
+the rule it points to.
+
+**Bind what you negate on.** A variable a negation shares with the rest of
+the body must be bound by a positive pattern in the same group.
+`?i a ex:Invoice FILTER NOT EXISTS { ?i ex:paidBy ?p }` tests each bound
+invoice; a variable mentioned only inside negations would mean "any value"
+inside one and something else elsewhere, so the rule is rejected. Variables
+used only inside the negation (`?p` here) are local to it.
+
+**Budgets.** If the reasoning budget runs out before a negating rule
+finishes, or OWL 2 RL is capped before a negating rule reads its
+entailments, the query fails with an error naming the rule. A positive
+program answers capped instead; a negation over incomplete facts can turn
+a missing fact into a false conclusion.
 
 ## Examples
 

@@ -16,6 +16,7 @@ use crate::eval::function_supported_for_bool_cache as function_is_repeatable;
 use crate::ir::{Expression, Function, GraphName, Pattern, Query, Ref, Term, TriplePattern};
 use crate::parse::IriEncoder;
 use fluree_db_core::{is_rdf_type, is_reserved_reifies_predicate, Sid};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -118,6 +119,10 @@ pub struct RuleFootprint {
     /// The body calls `NOW()` or `TODAY()`, so the run needs an evaluation
     /// time.
     pub reads_clock: bool,
+    /// The reads made under a negation (`NOT EXISTS`, `!EXISTS`). Each is
+    /// also in `reads`. A rule may negate only facts that are complete
+    /// before it runs, so none of these may observe its own group's writes.
+    pub negated_reads: Vec<Access>,
 }
 
 impl RuleFootprint {
@@ -137,6 +142,12 @@ impl RuleFootprint {
             walker.write_head(head);
         }
         walker.footprint
+    }
+
+    /// The rule negates facts, so its conclusions are only meaningful once
+    /// everything it negates is complete.
+    pub fn is_non_monotone(&self) -> bool {
+        !self.negated_reads.is_empty()
     }
 
     /// Whether some read of `self` may observe some write of `producer`.
@@ -168,6 +179,9 @@ pub(super) fn query_tail_reads<E: IriEncoder + ?Sized>(query: &Query, encoder: &
 struct FootprintWalker<'e, E: ?Sized> {
     encoder: &'e E,
     footprint: RuleFootprint,
+    /// Inside a negation, at any depth. Double negation counts as negated
+    /// too: the stratification check stays conservative.
+    negated: bool,
 }
 
 impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
@@ -178,7 +192,15 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                 repeatable: true,
                 ..Default::default()
             },
+            negated: false,
         }
+    }
+
+    /// Walk `f` with every read it makes counted as negated.
+    fn under_negation(&mut self, f: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.negated, true);
+        f(self);
+        self.negated = outer;
     }
 
     fn read_query_tail(&mut self, query: &Query) {
@@ -196,6 +218,9 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
 
     fn read(&mut self, graph: &GraphScope, predicate: PredicateFootprint) {
         let access = Access::new(graph, predicate);
+        if self.negated && !self.footprint.negated_reads.contains(&access) {
+            self.footprint.negated_reads.push(access.clone());
+        }
         if !self.footprint.reads.contains(&access) {
             self.footprint.reads.push(access);
         }
@@ -227,10 +252,11 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                 Pattern::Filter(expr)
                 | Pattern::Bind { expr, .. }
                 | Pattern::Unwind { list: expr, .. } => self.read_expression(expr, graph),
+                Pattern::Minus(inner) | Pattern::NotExists(inner) => {
+                    self.under_negation(|w| w.read_patterns(inner, graph));
+                }
                 Pattern::Optional(inner)
-                | Pattern::Minus(inner)
                 | Pattern::Exists(inner)
-                | Pattern::NotExists(inner)
                 | Pattern::DefaultGraphSource { patterns: inner } => {
                     self.read_patterns(inner, graph);
                 }
@@ -292,15 +318,31 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
 
     fn read_expression(&mut self, expr: &Expression, graph: &GraphScope) {
         match expr {
-            Expression::Exists { patterns, .. } => self.read_patterns(patterns, graph),
+            Expression::Exists { patterns, negated } => {
+                if *negated {
+                    self.under_negation(|w| w.read_patterns(patterns, graph));
+                } else {
+                    self.read_patterns(patterns, graph);
+                }
+            }
             Expression::Call { func, args } => {
                 if matches!(func, Function::Now | Function::Today) {
                     self.footprint.reads_clock = true;
                 } else if !function_is_repeatable(func) {
                     self.footprint.repeatable = false;
                 }
-                for arg in args {
-                    self.read_expression(arg, graph);
+                // Anything under `NOT` may be negated; the validator admits an
+                // `EXISTS` only where its polarity is readable.
+                if matches!(func, Function::Not) {
+                    self.under_negation(|w| {
+                        for arg in args {
+                            w.read_expression(arg, graph);
+                        }
+                    });
+                } else {
+                    for arg in args {
+                        self.read_expression(arg, graph);
+                    }
                 }
             }
             Expression::PatternComprehension { .. } => {
@@ -448,6 +490,81 @@ impl RuleDependencies {
         stages
     }
 
+    /// Whether some rule negates facts its own recursive group derives. Such
+    /// a program has no stratification: the negated facts are not complete
+    /// before the rule reads them, so no evaluation order is sound. The error
+    /// names the cycle, the negating rule first:
+    /// `ex:a -not-> ex:b -> ex:a`, where each arrow reads facts from the rule
+    /// it points to.
+    pub fn unstratified_negation(&self, rule_set: &DatalogRuleSet) -> Option<String> {
+        let name = |i: usize| rule_set.rules[i].name.as_str();
+        for component in self.components.iter().filter(|c| c.recursive) {
+            for &consumer in &component.rules {
+                for negated in &self.footprints[consumer].negated_reads {
+                    let Some(&producer) = component.rules.iter().find(|&&p| {
+                        self.footprints[p]
+                            .writes
+                            .iter()
+                            .any(|write| negated.may_observe(write))
+                    }) else {
+                        continue;
+                    };
+                    let mut cycle = vec![name(consumer)];
+                    cycle.extend(
+                        self.path_within(&component.rules, producer, consumer)
+                            .into_iter()
+                            .map(name),
+                    );
+                    let arrows = cycle
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| match i {
+                            0 => (*n).to_string(),
+                            1 => format!(" -not-> {n}"),
+                            _ => format!(" -> {n}"),
+                        })
+                        .collect::<String>();
+                    return Some(format!(
+                        "datalog rule {} negates facts that depend on its own conclusions \
+                         ({arrows}; each arrow reads facts from the rule it points to). \
+                         Negation needs the negated facts to be complete before the rule \
+                         runs, which a cycle through it prevents",
+                        name(consumer)
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Rules on a dependency path `from` → … → `to` inside one component,
+    /// following reads (each rule reads from the next), `from` and `to`
+    /// included. A component is strongly connected, so one exists.
+    fn path_within(&self, component: &[usize], from: usize, to: usize) -> Vec<usize> {
+        if from == to {
+            return vec![from];
+        }
+        let mut previous: HashMap<usize, usize> = HashMap::new();
+        let mut queue = VecDeque::from([from]);
+        'search: while let Some(rule) = queue.pop_front() {
+            for &next in &self.depends_on[rule] {
+                if next != from && component.contains(&next) && !previous.contains_key(&next) {
+                    previous.insert(next, rule);
+                    if next == to {
+                        break 'search;
+                    }
+                    queue.push_back(next);
+                }
+            }
+        }
+        let mut path = vec![to];
+        while let Some(&before) = path.last().and_then(|at| previous.get(at)) {
+            path.push(before);
+        }
+        path.reverse();
+        path
+    }
+
     /// One line naming each group in order, recursive groups starred, for
     /// diagnostics: `[ex:base ex:step]* -> [ex:flag]`.
     pub fn describe(&self, rule_set: &DatalogRuleSet) -> String {
@@ -570,7 +687,7 @@ mod tests {
             reads: reads.into_iter().map(default).collect(),
             writes: writes.into_iter().map(default).collect(),
             repeatable: true,
-            reads_clock: false,
+            ..Default::default()
         }
     }
 
