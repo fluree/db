@@ -223,6 +223,9 @@ enum CacheKey {
     /// by the source's identity, which is scoped to the storage instance and
     /// to the object's envelope.
     SourceUnit(SourceUnitKey),
+    /// A reverse dictionary leaf's fences and source, or that it is read
+    /// whole. Key = xxh3_128(leaf CID bytes).
+    FencedLeaf(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -446,6 +449,7 @@ enum CachedEntry {
     RangedLeaf(Arc<dyn RangeSource>),
     ForwardPage(Arc<[u8]>),
     SourceUnit(Arc<[u8]>),
+    FencedLeaf(Option<Arc<crate::dict::reader::FencedLeaf>>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -471,6 +475,7 @@ impl CachedEntry {
             CachedEntry::RangedLeaf(_) => "ranged-leaf",
             CachedEntry::ForwardPage(_) => "forward-page",
             CachedEntry::SourceUnit(_) => "source-unit",
+            CachedEntry::FencedLeaf(_) => "fenced-leaf",
             CachedEntry::Bm25Leaflet(_) => "bm25-leaflet",
             CachedEntry::VectorShard(_) => "vector-shard",
             CachedEntry::LedgerInfo(_) => "ledger-info",
@@ -492,6 +497,9 @@ impl CachedEntry {
             CachedEntry::RangedLeaf(source) => source.cache_weight(),
             CachedEntry::ForwardPage(page) => page.len(),
             CachedEntry::SourceUnit(unit) => unit.len(),
+            CachedEntry::FencedLeaf(leaf) => leaf
+                .as_ref()
+                .map_or(std::mem::size_of::<Self>(), |leaf| leaf.cache_weight()),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -911,6 +919,33 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::SourceUnit(unit)) => Ok(unit),
             Ok(_) => unreachable!("SourceUnit key always maps to SourceUnit entry"),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
+        }
+    }
+
+    /// A reverse leaf fenced for range reads, or `None` to read it whole,
+    /// opened by `open` at most once however many lookups race on it. A
+    /// failed open is not cached.
+    pub(crate) fn try_get_or_load_fenced_leaf<F>(
+        &self,
+        key: u128,
+        open: F,
+    ) -> io::Result<Option<Arc<crate::dict::reader::FencedLeaf>>>
+    where
+        F: FnOnce() -> io::Result<Option<Arc<crate::dict::reader::FencedLeaf>>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(CachedEntry::FencedLeaf(leaf)) = self.inner.get(&CacheKey::FencedLeaf(key)) {
+            return Ok(leaf);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::FencedLeaf(key), || {
+                open().map(CachedEntry::FencedLeaf)
+            })
+        });
+        match result {
+            Ok(CachedEntry::FencedLeaf(leaf)) => Ok(leaf),
+            Ok(_) => unreachable!("FencedLeaf key always maps to FencedLeaf entry"),
             Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }

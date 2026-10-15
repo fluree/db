@@ -43,19 +43,79 @@ pub struct ReverseEntry {
     pub id: u64,
 }
 
-/// The first entry starting in one `unit`-byte stretch of a leaf.
-pub struct Fence {
-    pub key: Box<[u8]>,
-    pub index: u32,
-    pub offset: u32,
+/// A sparse index of a leaf for lookups that read it by range: for each
+/// `spacing`-byte stretch of the leaf in which an entry starts, the first
+/// entry starting there. Keys are packed end to end.
+pub struct Fences {
+    keys: Box<[u8]>,
+    key_ends: Box<[u32]>,
+    /// Per fence: its entry's index and byte offset in the leaf.
+    entries: Box<[(u32, u32)]>,
 }
 
-/// The fence a key falls after, and the entry index where the next fence
-/// starts; `None` when the key sorts before the first fence.
-fn fenced(fences: &[Fence], key: &[u8], entry_count: u32) -> Option<(usize, u32)> {
-    let after = fences.partition_point(|f| f.key.as_ref() <= key);
-    let start = after.checked_sub(1)?;
-    Some((start, fences.get(after).map_or(entry_count, |f| f.index)))
+/// The entries a key can be among: from a fence's entry up to the next
+/// fence's, or to the end of the leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fenced {
+    pub index: u32,
+    pub offset: u64,
+    pub end_index: u32,
+    pub end_offset: u64,
+}
+
+impl Fences {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn key(&self, fence: usize) -> &[u8] {
+        let start = fence
+            .checked_sub(1)
+            .map_or(0, |i| self.key_ends[i] as usize);
+        &self.keys[start..self.key_ends[fence] as usize]
+    }
+
+    pub fn index(&self, fence: usize) -> u32 {
+        self.entries[fence].0
+    }
+
+    pub fn offset(&self, fence: usize) -> u32 {
+        self.entries[fence].1
+    }
+
+    /// Heap bytes held.
+    pub fn heap_bytes(&self) -> usize {
+        self.keys.len() + self.key_ends.len() * 4 + self.entries.len() * 8
+    }
+
+    /// The fenced entries `key` is among, in a leaf of `entry_count`
+    /// entries and `len` bytes; `None` when it sorts before the first.
+    pub fn locate(&self, key: &[u8], entry_count: u32, len: u64) -> Option<Fenced> {
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.key(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let fence = lo.checked_sub(1)?;
+        let (end_index, end_offset) = self
+            .entries
+            .get(lo)
+            .map_or((entry_count, len), |&(i, o)| (i, u64::from(o)));
+        Some(Fenced {
+            index: self.index(fence),
+            offset: u64::from(self.offset(fence)),
+            end_index,
+            end_offset,
+        })
+    }
 }
 
 /// Build a subject reverse key from (ns_code, suffix).
@@ -266,25 +326,24 @@ impl<'a> ReverseLeaf<'a> {
         expected == self.data.len()
     }
 
-    /// A sparse index of the leaf for lookups that read it by range: for
-    /// each `unit`-byte stretch of the leaf in which an entry starts, the
-    /// first entry starting there.
-    pub fn fences(&self, unit: usize) -> Vec<Fence> {
-        let mut fences: Vec<Fence> = Vec::new();
+    /// The leaf's [`Fences`] at `spacing` bytes.
+    pub fn fences(&self, spacing: usize) -> Fences {
+        let (mut keys, mut key_ends, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+        let mut last: Option<usize> = None;
         for index in 0..self.entry_count as usize {
             let offset = self.entry_offset(index);
-            if fences
-                .last()
-                .is_none_or(|f| f.offset as usize / unit != offset / unit)
-            {
-                fences.push(Fence {
-                    key: self.key_at(index).into(),
-                    index: index as u32,
-                    offset: offset as u32,
-                });
+            if last.is_none_or(|l| l / spacing != offset / spacing) {
+                keys.extend_from_slice(self.key_at(index));
+                key_ends.push(keys.len() as u32);
+                entries.push((index as u32, offset as u32));
+                last = Some(offset);
             }
         }
-        fences
+        Fences {
+            keys: keys.into(),
+            key_ends: key_ends.into(),
+            entries: entries.into(),
+        }
     }
 
     /// [`Self::lookup`] narrowed by `fences` to the entries from the last
@@ -293,13 +352,13 @@ impl<'a> ReverseLeaf<'a> {
     /// it reads.
     pub fn lookup_scanning(
         &self,
-        fences: &[Fence],
+        fences: &Fences,
         target_key: &[u8],
         read: &mut impl FnMut(std::ops::Range<usize>),
     ) -> Option<u64> {
-        let (start, end) = fenced(fences, target_key, self.entry_count)?;
-        let mut offset = fences[start].offset as usize;
-        for _ in fences[start].index..end {
+        let fenced = fences.locate(target_key, self.entry_count, self.data.len() as u64)?;
+        let mut offset = fenced.offset as usize;
+        for _ in fenced.index..fenced.end_index {
             let key_len =
                 u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as usize;
             read(offset..offset + 4 + key_len);
@@ -325,12 +384,12 @@ impl<'a> ReverseLeaf<'a> {
     /// byte range it reads.
     pub fn lookup_in_slice(
         &self,
-        fences: &[Fence],
+        fences: &Fences,
         target_key: &[u8],
         read: &mut impl FnMut(std::ops::Range<usize>),
     ) -> Option<u64> {
-        let (start, end) = fenced(fences, target_key, self.entry_count)?;
-        let (mut lo, mut hi) = (fences[start].index as usize, end as usize);
+        let fenced = fences.locate(target_key, self.entry_count, self.data.len() as u64)?;
+        let (mut lo, mut hi) = (fenced.index as usize, fenced.end_index as usize);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let table_pos = self.offset_table_start + mid * 4;
@@ -473,7 +532,11 @@ mod tests {
         let entry_end = |i: usize| leaf.entry_offset(i) + ENTRY_OVERHEAD + keys[i].len();
         for unit in [512usize, 4096, 65536] {
             let fences = leaf.fences(unit);
-            assert!(fences.windows(2).all(|w| w[0].key < w[1].key));
+            assert!((1..fences.len()).all(|i| fences.key(i - 1) < fences.key(i)));
+            assert!(
+                (0..fences.len()).all(|i| fences.key(i) == keys[fences.index(i) as usize]
+                    && leaf.entry_offset(fences.index(i) as usize) == fences.offset(i) as usize)
+            );
             assert!(
                 fences.len() as u64 >= blob.len().div_ceil(unit) as u64 / 2,
                 "{unit}"
@@ -488,15 +551,17 @@ mod tests {
                 // Reads stay in the key's fenced stretch: a scan from its
                 // fence to the first entry at or past the key, a slice
                 // within the fenced entries and their offsets.
-                let Some(at) = fences
-                    .iter()
-                    .rposition(|f| f.key.as_ref() <= key.as_slice())
+                let Some(at) = (0..fences.len()).rposition(|i| fences.key(i) <= key.as_slice())
                 else {
                     assert!(scanned.is_empty() && sliced.is_empty());
                     continue;
                 };
-                let end = fences.get(at + 1).map_or(keys.len(), |f| f.index as usize);
-                let first = fences[at].index as usize;
+                let end = if at + 1 < fences.len() {
+                    fences.index(at + 1) as usize
+                } else {
+                    keys.len()
+                };
+                let first = fences.index(at) as usize;
                 let stop = keys.partition_point(|k| *k < key.as_slice()).min(end - 1);
                 let (lo, hi) = (leaf.entry_offset(first), entry_end(stop));
                 assert!(

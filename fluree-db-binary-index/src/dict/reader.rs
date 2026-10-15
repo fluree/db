@@ -15,20 +15,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::branch::DictBranch;
-use super::reverse_leaf::{Fence, ReverseLeaf};
+use super::reverse_leaf::{Fenced, Fences, ReverseLeaf};
 
-use crate::read::cached_units::CachedUnits;
+use crate::read::cached_units::{CachedUnits, UnitCursor};
 use crate::read::leaflet_cache::LeafletCache;
 use fluree_db_core::{ContentBytes, ContentId, ContentStore, RangeSource};
-use once_cell::sync::OnceCell;
 
 /// How a single-key lookup reads a leaf of a store whose local reads
 /// decrypt everything. Experiment control: `FLUREE_REVERSE_FENCES=
-/// scan|slice|off`, default `scan`.
+/// scan|copy|slice|off`, default `scan`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FencedLookup {
-    /// Read the key's fenced stretch of the data section and scan it.
+    /// Scan the key's fenced stretch of the data section in place.
     Scan,
+    /// Copy the stretch out whole, then scan it.
+    Copy,
     /// Binary-search the stretch's slice of the offset table.
     Slice,
     /// Read the leaf whole.
@@ -40,17 +41,32 @@ impl FencedLookup {
         static MODE: std::sync::OnceLock<FencedLookup> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| match std::env::var("FLUREE_REVERSE_FENCES").as_deref() {
             Ok("off") => FencedLookup::Off,
+            Ok("copy") => FencedLookup::Copy,
             Ok("slice") => FencedLookup::Slice,
             _ => FencedLookup::Scan,
         })
     }
 }
 
-/// A leaf read by range: the first entry starting in each of its read
-/// units, found by reading it whole once, and its units.
-struct FencedLeaf {
-    units: CachedUnits,
-    fences: Box<[Fence]>,
+/// Bytes between fences; `None` for one fence per read unit. Experiment
+/// control: `FLUREE_REVERSE_FENCE_SPACING`.
+fn fence_spacing_from_env() -> Option<u64> {
+    static SPACING: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SPACING.get_or_init(|| {
+        std::env::var("FLUREE_REVERSE_FENCE_SPACING")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v > 0)
+    })
+}
+
+/// A reverse leaf read by range: the first entry starting in each
+/// `spacing`-byte stretch of it, found by reading it whole once. Held in the
+/// leaflet cache, keyed by the leaf's CID and weighed with its fences, so
+/// every reader of that leaf shares it.
+pub(crate) struct FencedLeaf {
+    source: Arc<dyn RangeSource>,
+    fences: Fences,
     entry_count: u32,
     len: u64,
 }
@@ -58,7 +74,7 @@ struct FencedLeaf {
 impl FencedLeaf {
     /// Read `source` whole once to fence it; `None` unless its entries lie
     /// one after another in key order, which a scan relies on.
-    fn open(source: Arc<dyn RangeSource>, cache: Arc<LeafletCache>) -> io::Result<Option<Self>> {
+    fn open(source: Arc<dyn RangeSource>, spacing: Option<u64>) -> io::Result<Option<Self>> {
         let len = source.len();
         let bytes = source
             .read_range(0..len)
@@ -67,57 +83,92 @@ impl FencedLeaf {
         if !leaf.is_sequential() {
             return Ok(None);
         }
-        let fences = leaf.fences(source.read_unit() as usize).into_boxed_slice();
+        let spacing = spacing.unwrap_or_else(|| source.read_unit()).max(1);
+        let fences = leaf.fences(spacing as usize);
         fluree_db_core::io_stats::record_work("reverse leaf fenced", bytes.len());
         Ok(Some(Self {
             entry_count: leaf.entry_count(),
-            units: CachedUnits::new(source, cache),
+            source,
             fences,
             len,
         }))
+    }
+
+    /// What holding it costs: the fences and the source handle.
+    pub(crate) fn cache_weight(&self) -> usize {
+        std::mem::size_of::<Self>() + self.fences.heap_bytes() + self.source.cache_weight()
     }
 
     fn invalid(what: &str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, format!("reverse leaf: {what}"))
     }
 
-    fn lookup(&self, key: &[u8], mode: FencedLookup) -> io::Result<Option<u64>> {
-        let after = self.fences.partition_point(|f| f.key.as_ref() <= key);
-        let Some(fence) = after.checked_sub(1).map(|i| &self.fences[i]) else {
+    fn lookup(
+        &self,
+        key: &[u8],
+        mode: FencedLookup,
+        cache: &Arc<LeafletCache>,
+    ) -> io::Result<Option<u64>> {
+        let Some(fenced) = self.fences.locate(key, self.entry_count, self.len) else {
             return Ok(None);
         };
-        let (end_index, end_offset) = self
-            .fences
-            .get(after)
-            .map_or((self.entry_count, self.len), |f| {
-                (f.index, u64::from(f.offset))
-            });
+        if fenced.end_offset < fenced.offset || fenced.end_offset > self.len {
+            return Err(Self::invalid("fence out of bounds"));
+        }
+        let units = CachedUnits::new(Arc::clone(&self.source), Arc::clone(cache));
         match mode {
-            FencedLookup::Slice => self.search_slice(key, fence, end_index),
-            _ => self.scan(key, fence, end_index, end_offset),
+            FencedLookup::Slice => self.search_slice(&units, key, &fenced),
+            FencedLookup::Copy => Self::scan_copied(&units, key, &fenced),
+            _ => Self::scan(&units, key, &fenced),
         }
     }
 
-    /// Scan the entries from `fence` to the next fence, read in one piece.
-    fn scan(
-        &self,
-        key: &[u8],
-        fence: &Fence,
-        end_index: u32,
-        end_offset: u64,
-    ) -> io::Result<Option<u64>> {
-        let start = u64::from(fence.offset);
-        if end_offset < start || end_offset > self.len {
-            return Err(Self::invalid("fence out of bounds"));
+    /// Scan the fenced entries in place, each read from the unit holding it.
+    fn scan(units: &CachedUnits, key: &[u8], fenced: &Fenced) -> io::Result<Option<u64>> {
+        let mut cursor = UnitCursor::new(units);
+        let mut pos = fenced.offset;
+        let mut found = None;
+        for _ in fenced.index..fenced.end_index {
+            let len_end = pos + 4;
+            if len_end > fenced.end_offset {
+                return Err(Self::invalid("entry past its stretch"));
+            }
+            let key_len = u64::from(u32::from_le_bytes(
+                cursor.read(pos..len_end)?.try_into().expect("four bytes"),
+            ));
+            let id_end = len_end + key_len + 8;
+            if id_end > fenced.end_offset {
+                return Err(Self::invalid("entry past its stretch"));
+            }
+            let entry = cursor.read(len_end..id_end)?;
+            let (entry_key, id) = entry.split_at(key_len as usize);
+            match entry_key.cmp(key) {
+                std::cmp::Ordering::Less => pos = id_end,
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {
+                    found = Some(u64::from_le_bytes(id.try_into().expect("eight bytes")));
+                    break;
+                }
+            }
         }
+        fluree_db_core::io_stats::record_work(
+            "reverse leaf scanned",
+            (pos - fenced.offset) as usize,
+        );
+        Ok(found)
+    }
+
+    /// Scan the fenced entries after copying them out in one piece.
+    fn scan_copied(units: &CachedUnits, key: &[u8], fenced: &Fenced) -> io::Result<Option<u64>> {
+        let (start, end_offset) = (fenced.offset, fenced.end_offset);
         let mut stretch = Vec::with_capacity((end_offset - start) as usize);
-        self.units.extend_into(start..end_offset, &mut stretch)?;
+        units.extend_into(start..end_offset, &mut stretch)?;
         if stretch.len() as u64 != end_offset - start {
             return Err(Self::invalid("stretch shorter than its fences"));
         }
         fluree_db_core::io_stats::record_work("reverse leaf stretch", stretch.len());
         let mut pos = 0usize;
-        for _ in fence.index..end_index {
+        for _ in fenced.index..fenced.end_index {
             let len_end = pos + 4;
             let key_len = stretch
                 .get(pos..len_end)
@@ -144,14 +195,20 @@ impl FencedLeaf {
 
     /// Binary-search the fenced entries through their slice of the offset
     /// table, reading each probed key.
-    fn search_slice(&self, key: &[u8], fence: &Fence, end_index: u32) -> io::Result<Option<u64>> {
+    fn search_slice(
+        &self,
+        units: &CachedUnits,
+        key: &[u8],
+        fenced: &Fenced,
+    ) -> io::Result<Option<u64>> {
+        let (index, end_index) = (fenced.index, fenced.end_index);
         let data_start = 8 + u64::from(self.entry_count) * 4;
         let mut offsets = Vec::new();
-        self.units.extend_into(
-            8 + u64::from(fence.index) * 4..8 + u64::from(end_index) * 4,
+        units.extend_into(
+            8 + u64::from(index) * 4..8 + u64::from(end_index) * 4,
             &mut offsets,
         )?;
-        if offsets.len() != (end_index - fence.index) as usize * 4 {
+        if offsets.len() != (end_index - index) as usize * 4 {
             return Err(Self::invalid("offset table shorter than its entries"));
         }
         let offset_at = |i: usize| {
@@ -161,12 +218,12 @@ impl FencedLeaf {
                 ))
         };
         let mut scratch = Vec::new();
-        let (mut lo, mut hi) = (0usize, (end_index - fence.index) as usize);
+        let (mut lo, mut hi) = (0usize, (end_index - index) as usize);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let at = offset_at(mid);
             scratch.clear();
-            self.units.extend_into(at..at + 4, &mut scratch)?;
+            units.extend_into(at..at + 4, &mut scratch)?;
             if scratch.len() != 4 {
                 return Err(Self::invalid("entry past the leaf"));
             }
@@ -175,8 +232,7 @@ impl FencedLeaf {
                 return Err(Self::invalid("entry past the leaf"));
             }
             scratch.clear();
-            self.units
-                .extend_into(at + 4..at + 4 + key_len + 8, &mut scratch)?;
+            units.extend_into(at + 4..at + 4 + key_len + 8, &mut scratch)?;
             let (entry_key, id) = scratch.split_at(key_len as usize);
             match entry_key.cmp(key) {
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -279,19 +335,11 @@ fn fetch_remote_leaf_bytes(cs: Arc<dyn ContentStore>, cid: ContentId) -> io::Res
 /// to avoid repeated disk reads. Dict tree leaves are content-addressed
 /// and immutable, so the CAS address hash has astronomically unlikely
 /// collisions with no epoch/staging dimension.
-/// Fence slots for a reader whose leaves come from a store that decrypts
-/// on local reads and that has a cache to keep their units in.
-fn fenced_slots(
-    branch: &DictBranch,
-    leaf_source: &LeafSource,
-    cached: bool,
-) -> Box<[OnceCell<Option<Arc<FencedLeaf>>>]> {
-    match leaf_source {
-        LeafSource::Cas { cs, .. } if cached && cs.costly_local_reads() => {
-            branch.leaves.iter().map(|_| OnceCell::new()).collect()
-        }
-        _ => Box::new([]),
-    }
+/// Whether a reader reads leaves by range through fences: when they come
+/// from a store that decrypts on local reads and it has a cache to keep
+/// their fences and units in.
+fn reads_fenced(leaf_source: &LeafSource, cached: bool) -> bool {
+    matches!(leaf_source, LeafSource::Cas { cs, .. } if cached && cs.costly_local_reads())
 }
 
 pub struct DictTreeReader {
@@ -304,11 +352,10 @@ pub struct DictTreeReader {
     /// use `xxh3_128(cas_address)` as the cache key — immutable, no
     /// epoch/time dimension needed.
     global_cache: Option<Arc<LeafletCache>>,
-    /// Per leaf, once a single-key lookup first needs it: the leaf fenced
-    /// and read by range, or `None` to read it whole. Empty unless the store
-    /// decrypts on local reads.
-    fenced: Box<[OnceCell<Option<Arc<FencedLeaf>>>]>,
+    /// Whether single-key lookups read leaves by range through fences.
+    fenced: bool,
     fenced_lookup: FencedLookup,
+    fence_spacing: Option<u64>,
     /// Performance counters (atomic for shared access).
     disk_reads: AtomicU64,
     local_file_reads: AtomicU64,
@@ -321,8 +368,9 @@ impl DictTreeReader {
     /// Create a reader from a decoded branch and leaf source.
     pub fn new(branch: DictBranch, leaf_source: LeafSource) -> Self {
         Self {
-            fenced: fenced_slots(&branch, &leaf_source, false),
+            fenced: reads_fenced(&leaf_source, false),
             fenced_lookup: FencedLookup::from_env(),
+            fence_spacing: fence_spacing_from_env(),
             branch,
             branch_cid: None,
             leaf_source,
@@ -346,8 +394,9 @@ impl DictTreeReader {
         cache: Arc<LeafletCache>,
     ) -> Self {
         Self {
-            fenced: fenced_slots(&branch, &leaf_source, true),
+            fenced: reads_fenced(&leaf_source, true),
             fenced_lookup: FencedLookup::from_env(),
+            fence_spacing: fence_spacing_from_env(),
             branch,
             branch_cid: None,
             leaf_source,
@@ -367,8 +416,9 @@ impl DictTreeReader {
             .map(|(k, v)| (k, Arc::from(v.into_boxed_slice())))
             .collect();
         Self {
-            fenced: Box::new([]),
+            fenced: false,
             fenced_lookup: FencedLookup::Off,
+            fence_spacing: None,
             branch,
             branch_cid: None,
             leaf_source: LeafSource::InMemory(arc_leaves),
@@ -449,7 +499,7 @@ impl DictTreeReader {
 
     /// Attach a global cache to this reader.
     pub fn set_cache(&mut self, cache: Option<Arc<LeafletCache>>) {
-        self.fenced = fenced_slots(&self.branch, &self.leaf_source, cache.is_some());
+        self.fenced = reads_fenced(&self.leaf_source, cache.is_some());
         self.global_cache = cache;
     }
 
@@ -459,36 +509,39 @@ impl DictTreeReader {
         self
     }
 
-    /// Leaf `leaf_idx` fenced for range reads, opening it on first use;
-    /// `None` when it is read whole.
-    fn fenced_leaf(&self, leaf_idx: usize) -> io::Result<Option<&Arc<FencedLeaf>>> {
-        if self.fenced_lookup == FencedLookup::Off {
+    #[cfg(test)]
+    fn with_fence_spacing(mut self, spacing: u64) -> Self {
+        self.fence_spacing = Some(spacing);
+        self
+    }
+
+    /// Leaf `leaf_idx` fenced for range reads, from the cache or opened
+    /// there; `None` when it is read whole.
+    fn fenced_leaf(&self, leaf_idx: usize) -> io::Result<Option<Arc<FencedLeaf>>> {
+        if !self.fenced || self.fenced_lookup == FencedLookup::Off {
             return Ok(None);
         }
-        let (Some(slot), LeafSource::Cas { cs, cids }, Some(cache)) = (
-            self.fenced.get(leaf_idx),
-            &self.leaf_source,
-            &self.global_cache,
-        ) else {
+        let (LeafSource::Cas { cs, cids }, Some(cache)) = (&self.leaf_source, &self.global_cache)
+        else {
             return Ok(None);
         };
-        slot.get_or_try_init(|| {
-            let address = &self.branch.leaves[leaf_idx].address;
-            let cid = cids.get(address).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("dict tree: no CID mapping for leaf {address}"),
-                )
-            })?;
+        let address = &self.branch.leaves[leaf_idx].address;
+        let cid = cids.get(address).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("dict tree: no CID mapping for leaf {address}"),
+            )
+        })?;
+        let key = LeafletCache::cid_cache_key(&cid.to_bytes());
+        cache.try_get_or_load_fenced_leaf(key, || {
             let Some(source) = cs
                 .get_local_ranged(cid)
                 .map_err(|e| io::Error::other(format!("dict leaf {cid}: {e}")))?
             else {
                 return Ok(None);
             };
-            Ok(FencedLeaf::open(source, Arc::clone(cache))?.map(Arc::new))
+            Ok(FencedLeaf::open(source, self.fence_spacing)?.map(Arc::new))
         })
-        .map(Option::as_ref)
     }
 
     /// The underlying branch manifest.
@@ -526,7 +579,11 @@ impl DictTreeReader {
         let find_leaf = clock.lap();
 
         if let Some(fenced) = self.fenced_leaf(leaf_idx)? {
-            return fenced.lookup(key, self.fenced_lookup);
+            let cache = self
+                .global_cache
+                .as_ref()
+                .expect("fenced leaves are cached");
+            return fenced.lookup(key, self.fenced_lookup, cache);
         }
 
         let address = &self.branch.leaves[leaf_idx].address;
@@ -737,17 +794,14 @@ impl DictTreeReader {
     }
 
     /// Fences at `unit` across every leaf of the tree: their count and the
-    /// bytes they would occupy (key bytes plus index, offset and box). Loads
-    /// every leaf; a diagnostic.
+    /// heap bytes they occupy. Loads every leaf; a diagnostic.
     pub fn fence_memory(&self, unit: usize) -> io::Result<(u64, u64)> {
         let (mut count, mut bytes) = (0u64, 0u64);
         for leaf in &self.branch.leaves {
             let leaf_data = self.load_leaf(&leaf.address)?;
-            for fence in ReverseLeaf::from_bytes(&leaf_data)?.fences(unit) {
-                count += 1;
-                bytes += (fence.key.len() + std::mem::size_of::<crate::dict::reverse_leaf::Fence>())
-                    as u64;
-            }
+            let fences = ReverseLeaf::from_bytes(&leaf_data)?.fences(unit);
+            count += fences.len() as u64;
+            bytes += fences.heap_bytes() as u64;
         }
         Ok((count, bytes))
     }
@@ -1453,6 +1507,22 @@ mod tests {
             branch: DictBranch,
             mode: FencedLookup,
         ) -> DictTreeReader {
+            reader_over(
+                cs,
+                leaves,
+                branch,
+                mode,
+                Arc::new(LeafletCache::with_max_mb(16)),
+            )
+        }
+
+        fn reader_over(
+            cs: &SegmentedContentStore,
+            leaves: Vec<(String, Vec<u8>)>,
+            branch: DictBranch,
+            mode: FencedLookup,
+            cache: Arc<LeafletCache>,
+        ) -> DictTreeReader {
             let cids = leaves
                 .into_iter()
                 .map(|(address, bytes)| {
@@ -1466,8 +1536,7 @@ mod tests {
                 cs: Arc::new(cs.clone()),
                 cids,
             };
-            DictTreeReader::with_cache(branch, source, Arc::new(LeafletCache::with_max_mb(16)))
-                .with_fenced_lookup(mode)
+            DictTreeReader::with_cache(branch, source, cache).with_fenced_lookup(mode)
         }
 
         fn built(entries: Vec<ReverseEntry>) -> (Vec<(String, Vec<u8>)>, DictBranch) {
@@ -1492,26 +1561,125 @@ mod tests {
             probes
         }
 
-        /// Both fenced lookups find exactly what a whole-leaf lookup finds.
+        /// Every fenced lookup finds exactly what a whole-leaf lookup finds,
+        /// with fences closer than, at, and wider than the 4 KiB read unit,
+        /// so entries spanning units are read across them.
         #[test]
         fn fenced_lookups_match_whole_leaf_lookups() {
             let entries = entries();
             let whole = build_reverse_reader(entries.clone());
-            for mode in [FencedLookup::Scan, FencedLookup::Slice] {
-                let cs = SegmentedContentStore::new(true);
-                let (leaves, branch) = built(entries.clone());
-                assert!(branch.leaves.len() > 3, "several leaves");
-                let reader = fenced_reader(&cs, leaves, branch, mode);
-                for key in probes(&entries) {
-                    assert_eq!(
-                        reader.reverse_lookup(&key).unwrap(),
-                        whole.reverse_lookup(&key).unwrap(),
-                        "{mode:?} {}",
-                        String::from_utf8_lossy(&key)
-                    );
+            for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
+                for spacing in [None, Some(512), Some(8192)] {
+                    let cs = SegmentedContentStore::new(true);
+                    let (leaves, branch) = built(entries.clone());
+                    assert!(branch.leaves.len() > 3, "several leaves");
+                    let mut reader = fenced_reader(&cs, leaves, branch, mode);
+                    if let Some(spacing) = spacing {
+                        reader = reader.with_fence_spacing(spacing);
+                    }
+                    for key in probes(&entries) {
+                        assert_eq!(
+                            reader.reverse_lookup(&key).unwrap(),
+                            whole.reverse_lookup(&key).unwrap(),
+                            "{mode:?} {spacing:?} {}",
+                            String::from_utf8_lossy(&key)
+                        );
+                    }
+                    assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0, "{mode:?}");
                 }
-                assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0, "{mode:?}");
             }
+        }
+
+        /// A leaf's fences live in the cache under its CID: a reader of
+        /// another snapshot sharing the leaf, over the same cache, uses them
+        /// without reading the leaf whole again; one over another cache
+        /// opens its own.
+        #[test]
+        fn fences_are_shared_through_the_cache_across_readers() {
+            let entries = entries();
+            let cs = SegmentedContentStore::new(true);
+            let (leaves, branch) = built(entries.clone());
+            let cache = Arc::new(LeafletCache::with_max_mb(16));
+            let opening = |cs: &SegmentedContentStore| {
+                cs.reads()
+                    .iter()
+                    .filter(|r| r.start == 0 && r.end - r.start > 4096)
+                    .count()
+            };
+            let first = reader_over(
+                &cs,
+                leaves.clone(),
+                branch.clone(),
+                FencedLookup::Scan,
+                Arc::clone(&cache),
+            );
+            for e in entries.iter().step_by(50) {
+                assert_eq!(first.reverse_lookup(&e.key).unwrap(), Some(e.id));
+            }
+            let opened = opening(&cs);
+            assert_eq!(opened, branch.leaves.len(), "each leaf opened once");
+            drop(first);
+            let next = reader_over(
+                &cs,
+                leaves.clone(),
+                branch.clone(),
+                FencedLookup::Scan,
+                Arc::clone(&cache),
+            );
+            for e in entries.iter().step_by(50) {
+                assert_eq!(next.reverse_lookup(&e.key).unwrap(), Some(e.id));
+            }
+            assert_eq!(opening(&cs), opened, "fences found in the cache");
+            let elsewhere = reader_over(
+                &cs,
+                leaves,
+                branch,
+                FencedLookup::Scan,
+                Arc::new(LeafletCache::with_max_mb(16)),
+            );
+            elsewhere.reverse_lookup(&entries[0].key).unwrap();
+            assert_eq!(opening(&cs), opened + 1);
+        }
+
+        /// The cache weighs a fenced leaf with its fences: closer fences
+        /// weigh more, by exactly what their index holds.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn fences_are_weighed_in_the_cache() {
+            let entries: Vec<ReverseEntry> = entries().into_iter().take(2_000).collect();
+            let blob = crate::dict::reverse_leaf::encode_reverse_leaf(&entries);
+            let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
+            let weigh = |spacing: u64| {
+                let branch = builder::build_reverse_tree(entries.clone(), usize::MAX)
+                    .unwrap()
+                    .branch;
+                let address = branch.leaves[0].address.clone();
+                let cs = SegmentedContentStore::new(true);
+                let cache = Arc::new(LeafletCache::with_max_mb(16));
+                let reader = reader_over(
+                    &cs,
+                    vec![(address, blob.clone())],
+                    branch,
+                    FencedLookup::Scan,
+                    Arc::clone(&cache),
+                )
+                .with_fence_spacing(spacing);
+                reader.reverse_lookup(&entries[7].key).unwrap();
+                cache
+                    .occupancy()
+                    .into_iter()
+                    .find(|(kind, ..)| *kind == "fenced-leaf")
+                    .map(|(_, _, bytes)| bytes)
+                    .expect("a fenced leaf cached")
+            };
+            let (wide, close) = (weigh(4096), weigh(256));
+            let (wide_index, close_index) = (
+                leaf.fences(4096).heap_bytes() as u64,
+                leaf.fences(256).heap_bytes() as u64,
+            );
+            assert!(close_index > 8 * wide_index);
+            assert!(wide > wide_index + 1024, "fences and source handle: {wide}");
+            assert_eq!(close - wide, close_index - wide_index);
         }
 
         /// A leaf is read whole once, to fence it; after that a scan reads
@@ -1595,9 +1763,15 @@ mod tests {
             let blob = crate::dict::reverse_leaf::encode_reverse_leaf(&entries);
             let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
             let fences = leaf.fences(4096);
-            let at = fences[1].offset as usize;
+            let at = fences.offset(1) as usize;
             let mut bad = blob.clone();
             bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            // The last entry before fence 3 runs past its stretch but not
+            // past the leaf.
+            let last = fences.index(3) as usize - 1;
+            let last_at = fences.offset(3) as usize - (12 + entries[last].key.len());
+            let overrun = entries[last].key.len() as u32 + 16;
+            bad[last_at..last_at + 4].copy_from_slice(&overrun.to_le_bytes());
             let cs = SegmentedContentStore::new(true);
             let cid = cs.put_sync(
                 ContentKind::DictBlob {
@@ -1606,20 +1780,30 @@ mod tests {
                 &bad,
             );
             let source = cs.get_local_ranged(&cid).unwrap().unwrap();
+            let cache = Arc::new(LeafletCache::with_max_mb(4));
             let fenced = FencedLeaf {
-                units: CachedUnits::new(source, Arc::new(LeafletCache::with_max_mb(4))),
-                fences: fences.into_boxed_slice(),
+                source,
+                fences,
                 entry_count: leaf.entry_count(),
                 len: blob.len() as u64,
             };
-            // The corrupted entry's own key: both lookups must read it.
-            let key = &entries[fenced.fences[1].index as usize].key;
-            for mode in [FencedLookup::Scan, FencedLookup::Slice] {
-                let err = fenced.lookup(key, mode).unwrap_err();
+            // The corrupted entry's own key: every lookup must read it.
+            let key = &entries[fenced.fences.index(1) as usize].key;
+            for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
+                let err = fenced.lookup(key, mode, &cache).unwrap_err();
                 assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{mode:?}");
             }
-            let fine = &entries[fenced.fences[3].index as usize].key;
-            assert!(fenced.lookup(fine, FencedLookup::Scan).unwrap().is_some());
+            for mode in [FencedLookup::Scan, FencedLookup::Copy] {
+                let err = fenced.lookup(&entries[last].key, mode, &cache).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{mode:?}");
+            }
+            let fine = &entries[fenced.fences.index(3) as usize].key;
+            for mode in [FencedLookup::Scan, FencedLookup::Copy, FencedLookup::Slice] {
+                assert!(
+                    fenced.lookup(fine, mode, &cache).unwrap().is_some(),
+                    "{mode:?}"
+                );
+            }
         }
     }
 }

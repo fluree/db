@@ -365,6 +365,53 @@ impl CachedUnits {
     }
 }
 
+/// Short ranges of a [`CachedUnits`] read in place: a range within one unit
+/// is borrowed from it, the unit held until a range needs another; only a
+/// range spanning units is copied.
+pub struct UnitCursor<'a> {
+    units: &'a CachedUnits,
+    held: Option<(u64, Arc<[u8]>)>,
+    spanning: Vec<u8>,
+}
+
+impl<'a> UnitCursor<'a> {
+    pub fn new(units: &'a CachedUnits) -> Self {
+        Self {
+            units,
+            held: None,
+            spanning: Vec::new(),
+        }
+    }
+
+    /// Exactly the bytes of `range`, which must be non-empty and within the
+    /// source.
+    pub fn read(&mut self, range: Range<u64>) -> io::Result<&[u8]> {
+        if range.start >= range.end || range.end > self.units.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "range outside the source",
+            ));
+        }
+        let size = self.units.unit_size;
+        let index = range.start / size;
+        if index != (range.end - 1) / size {
+            self.spanning.clear();
+            self.units.extend_into(range, &mut self.spanning)?;
+            fluree_db_core::io_stats::record_work("unit cursor spanned", self.spanning.len());
+            return Ok(&self.spanning);
+        }
+        if self.held.as_ref().is_none_or(|(held, _)| *held != index) {
+            self.held = Some((index, self.units.unit(index)?));
+        }
+        let (_, unit) = self.held.as_ref().expect("held above");
+        let base = index * size;
+        unit.get((range.start - base) as usize..(range.end - base) as usize)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "unit shorter than its range")
+            })
+    }
+}
+
 impl fmt::Debug for CachedUnits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CachedUnits")
@@ -509,6 +556,39 @@ mod tests {
             .unwrap()
             .iter()
             .all(|r| r.start % 1000 == 0));
+    }
+
+    /// A cursor serves a range within one unit from that unit, read once
+    /// while it reads within it, and a range across units by copying it;
+    /// a range outside the source is an error, not a short read.
+    #[test]
+    fn a_cursor_reads_in_place_within_a_unit() {
+        let source = Source::new(4_500, 1);
+        let cache = Arc::new(LeafletCache::with_max_mb(4));
+        let units = cached(&source, &cache);
+        let mut cursor = UnitCursor::new(&units);
+        for range in [10..20, 0..1000, 500..504, 999..1003, 1003..1010, 3990..4500] {
+            assert_eq!(
+                cursor.read(range.clone()).unwrap(),
+                &source.bytes[range.start as usize..range.end as usize],
+                "{range:?}"
+            );
+        }
+        assert_eq!(source.reads(), 4, "units 0, 1, 3 and 4, each once");
+        assert_eq!(
+            cursor.read(4_100..4_110).unwrap(),
+            &source.bytes[4_100..4_110]
+        );
+        cache.invalidate_source_unit(SourceUnitKey { source: 1, unit: 4 });
+        assert_eq!(
+            cursor.read(4_200..4_300).unwrap(),
+            &source.bytes[4_200..4_300]
+        );
+        assert_eq!(source.reads(), 4, "the held unit, not the cache");
+        for bad in [4_400..4_501, 7..7, 5_000..5_001] {
+            let err = cursor.read(bad.clone()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad:?}");
+        }
     }
 
     /// Units are keyed by source identity: another storage, or the same
