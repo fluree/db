@@ -85,6 +85,7 @@ Cost ladder (per event):
 | Row returned by a batched subject probe / SPOT star walk (charged in the primitive, so property-join and nested-loop-join callers pay alike) | 0.001 |
 | Row matched by a nested-loop join's own leaflet scan (subject-driven and object-driven lanes) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
+| Edge a property path reads while traversing, and row a property path emits | 0.001 each |
 | History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
 | Transaction commit baseline (once per commit, including each bulk-import chunk) | 10.000 |

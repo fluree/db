@@ -356,7 +356,8 @@ behalf, so cancelling the query — a client disconnect, or a query timeout —
 stops OWL 2 RL and datalog rule bodies mid-run, and the query fails with the
 cancellation rather than answering over a partial closure. The work counts
 toward the query's fuel: OWL 2 RL charges 0.001 fuel for each fact a round
-processes, and rule bodies are charged like any query's scans. Only the
+processes, and rule bodies are charged like any query, including the
+property paths a transitive-closure rule runs as. Only the
 query that computes a materialization pays for it; queries answered from the
 cached result do not, and a run that was cancelled or ran out of fuel caches
 nothing.

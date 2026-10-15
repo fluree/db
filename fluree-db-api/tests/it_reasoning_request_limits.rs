@@ -144,13 +144,24 @@ async fn fuel(fluree: &fluree_db_api::Fluree, ledger: &MemoryLedger, query: &Val
 /// same.) A fuel limit below the materialization's cost stops the
 /// query that would have to pay it.
 async fn fuel_covers_materialization(ledger_id: &str, data: Value, query: Value) {
+    fuel_covers_materialization_of(ledger_id, data, query, 0).await;
+}
+
+/// [`fuel_covers_materialization`], where materializing must cost at least
+/// one row of fuel for each of `derived` facts.
+async fn fuel_covers_materialization_of(
+    ledger_id: &str,
+    data: Value,
+    query: Value,
+    derived: usize,
+) {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = ledger_with(&fluree, ledger_id, data.clone()).await;
     let cold = fuel(&fluree, &ledger, &query).await;
     let warm = fuel(&fluree, &ledger, &query).await;
     assert!(
-        cold > warm,
-        "materializing cost {cold} fuel, reading the cached result {warm}"
+        cold > warm && cold - warm >= derived as f64 * 0.001,
+        "materializing {derived} facts cost {cold} fuel, reading the cached result {warm}"
     );
 
     let mut limited = query.clone();
@@ -216,6 +227,65 @@ async fn owl_materialization_is_charged_as_query_fuel() {
             "reasoning": "owl2rl",
             "opts": {"meta": true}
         }),
+    )
+    .await;
+}
+
+/// Pairs in the transitive closure of a 50-edge chain.
+const CLOSURE_OF_50: usize = 50 * 51 / 2;
+
+fn chain(len: usize) -> Vec<Value> {
+    (0..len)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:partOf": {"@id": format!("ex:n{}", i + 1)}}))
+        .collect()
+}
+
+fn within_query() -> Value {
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["(as (count ?y) ?n)"],
+        "where": {"@id": "ex:n0", "ex:within": "?y"},
+        "reasoning": "datalog",
+        "opts": {"meta": true}
+    })
+}
+
+/// A rule body that is a property path is charged for the edges its
+/// traversal reads and the rows it emits.
+#[tokio::test]
+async fn property_path_rule_bodies_are_charged_as_query_fuel() {
+    let mut graph = chain(50);
+    graph.push(json!({
+        "@id": "ex:withinRule",
+        "f:rule": {"@type": "f:sparql", "@value":
+            "PREFIX ex: <http://example.org/> CONSTRUCT { ?x ex:within ?y } WHERE { ?x ex:partOf+ ?y }"}
+    }));
+    fuel_covers_materialization_of(
+        "reasoning/fuel-path:main",
+        json!({"@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"}, "@graph": graph}),
+        within_query(),
+        CLOSURE_OF_50,
+    )
+    .await;
+}
+
+/// A recursive rule compiled to a property path is charged the same way.
+#[tokio::test]
+async fn compiled_closures_are_charged_as_query_fuel() {
+    let mut query = within_query();
+    query["rules"] = json!([
+        {"@context": {"ex": "http://example.org/"},
+         "where": {"@id": "?x", "ex:partOf": "?y"},
+         "insert": {"@id": "?x", "ex:within": {"@id": "?y"}}},
+        {"@context": {"ex": "http://example.org/"},
+         "where": [{"@id": "?x", "ex:partOf": "?y"}, {"@id": "?y", "ex:within": "?z"}],
+         "insert": {"@id": "?x", "ex:within": {"@id": "?z"}}}
+    ]);
+    fuel_covers_materialization_of(
+        "reasoning/fuel-closure:main",
+        json!({"@context": {"ex": "http://example.org/"}, "@graph": chain(50)}),
+        query,
+        CLOSURE_OF_50,
     )
     .await;
 }
