@@ -264,6 +264,8 @@ impl Fluree {
         prepare_config.planning = prepare_config
             .planning
             .with_multi_default_graph(union.is_some());
+        let prepare_config =
+            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
             db_ref,
             executable,

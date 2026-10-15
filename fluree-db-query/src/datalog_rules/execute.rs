@@ -13,6 +13,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::{
     execute_prepared_streaming, prepare_execution_with_config, BatchSink, PrepareConfig,
+    QueryRequest,
 };
 use crate::ir::reasoning::ReasoningConfig;
 use crate::ir::Query;
@@ -28,8 +29,8 @@ use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
 use fluree_db_core::temporal::DateTime;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{
-    range_with_overlay, Flake, GraphDbRef, GraphId, IndexType, LedgerSnapshot, QueryCancellation,
-    RangeMatch, RangeOptions, RangeTest, Sid, TXN_META_GRAPH_ID,
+    range_with_overlay, Flake, GraphDbRef, GraphId, IndexType, LedgerSnapshot, RangeMatch,
+    RangeOptions, RangeTest, Sid, TXN_META_GRAPH_ID,
 };
 use fluree_db_reasoner::{
     approx_flake_bytes, DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, ReasoningBudget,
@@ -49,6 +50,9 @@ pub struct RuleExecutionEnv<'a> {
     /// What `NOW()` and `TODAY()` return in rule bodies. `None` uses the
     /// commit time of the snapshot the rules run against.
     pub evaluation_time: Option<&'a DateTime>,
+    /// The query the rules run for: rule bodies charge its fuel, and its
+    /// cancellation ends the run with an error rather than a capped result.
+    pub request: QueryRequest<'a>,
 }
 
 /// Execute the stored rules of a graph with an unlimited budget.
@@ -856,20 +860,27 @@ impl Derivation<'_> {
         dict_novelty: Option<Arc<DictNovelty>>,
         path_pair_limit: Option<usize>,
     ) -> Result<RuleOutcome> {
+        if let Some(reason) = env.request.cancelled() {
+            return Err(QueryError::Cancelled { reason });
+        }
         self.rule_body_runs += 1;
         let config = ContextConfig {
             dict_novelty,
             path_pair_limit,
-            cancellation: Some(self.deadline.map_or_else(
-                QueryCancellation::disabled,
-                QueryCancellation::with_deadline,
-            )),
+            cancellation: Some(
+                env.request
+                    .cancellation
+                    .cloned()
+                    .unwrap_or_default()
+                    .with_deadline_inside(self.deadline),
+            ),
             evaluation_time: self.evaluation_time.clone(),
             ..Default::default()
         };
         let mut heads = HeadSink {
             state: self,
             rule,
+            request: env.request,
             matched_rows: 0,
             instantiated: 0,
             capped: None,
@@ -886,6 +897,9 @@ impl Derivation<'_> {
         }
         match run {
             Ok(()) => {}
+            Err(QueryError::Cancelled { reason }) if env.request.cancelled().is_some() => {
+                return Err(QueryError::Cancelled { reason });
+            }
             // The deadline passed while the body ran; it stopped at its next
             // checkpoint instead of running to completion.
             Err(QueryError::Cancelled { .. }) => return Ok(RuleOutcome::Capped("time")),
@@ -922,6 +936,7 @@ impl Derivation<'_> {
 struct HeadSink<'s, 'a> {
     state: &'s mut Derivation<'a>,
     rule: &'s DatalogRule,
+    request: QueryRequest<'s>,
     matched_rows: usize,
     instantiated: usize,
     /// Why the budget stopped the body, if it did.
@@ -929,19 +944,25 @@ struct HeadSink<'s, 'a> {
 }
 
 impl HeadSink<'_, '_> {
-    fn derive(&mut self, batch: &Batch) -> Option<&'static str> {
+    /// The budget the batch reached, if it reached one.
+    fn derive(&mut self, batch: &Batch) -> Result<Option<&'static str>> {
         // Rows between deadline checks while instantiating heads.
         const DEADLINE_CHECK_ROWS: usize = 1024;
 
         let state = &mut *self.state;
         state.body_rows += batch.len();
         if state.past_deadline() {
-            return Some("time");
+            return Ok(Some("time"));
         }
         for row in 0..batch.len() {
             self.matched_rows += 1;
-            if self.matched_rows.is_multiple_of(DEADLINE_CHECK_ROWS) && state.past_deadline() {
-                return Some("time");
+            if self.matched_rows.is_multiple_of(DEADLINE_CHECK_ROWS) {
+                if let Some(reason) = self.request.cancelled() {
+                    return Err(QueryError::Cancelled { reason });
+                }
+                if state.past_deadline() {
+                    return Ok(Some("time"));
+                }
             }
             for head in &self.rule.heads {
                 let Some(mut flake) =
@@ -962,23 +983,23 @@ impl HeadSink<'_, '_> {
                 // returned N+1 facts. Checking first also stops charging
                 // `bytes` for a fact never kept.
                 if state.derived.len() >= state.budget.max_facts {
-                    return Some("facts");
+                    return Ok(Some("facts"));
                 }
                 state.bytes += approx_flake_bytes(&flake);
                 state.diagnostics.record_rule_fired(&self.rule.name);
                 state.derived.push(flake);
                 if state.bytes > state.budget.max_memory_bytes {
-                    return Some("memory");
+                    return Ok(Some("memory"));
                 }
             }
         }
-        None
+        Ok(None)
     }
 }
 
 impl BatchSink for HeadSink<'_, '_> {
     async fn push(&mut self, batch: Batch) -> Result<()> {
-        match self.derive(&batch) {
+        match self.derive(&batch)? {
             None => Ok(()),
             Some(reason) => {
                 self.capped = Some(reason);
@@ -1014,6 +1035,7 @@ async fn run_body<'a>(
     ))
     .await?;
     let config = ContextConfig {
+        tracker: env.request.tracker,
         binary_store: env.binary_store.cloned(),
         binary_g_id: db.g_id,
         ..config

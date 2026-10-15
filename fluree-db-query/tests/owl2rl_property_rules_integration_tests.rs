@@ -496,3 +496,78 @@ async fn owl2rl_enabled_rules_filters_rule_families() {
         "all rules enabled: expected derived rdf:type facts"
     );
 }
+
+/// The closure runs on behalf of a request: a cancelled request stops it with
+/// an error, and its fuel limit counts the facts each round processes. Both
+/// end the run rather than cap it, and neither result is cached.
+#[tokio::test]
+async fn owl2rl_stops_for_its_request() {
+    use fluree_db_core::{QueryCancellation, QueryCancellationReason, Tracker, TrackingOptions};
+    use fluree_db_reasoner::ReasonerError;
+
+    let mut snapshot = LedgerSnapshot::genesis("test:request");
+    snapshot
+        .insert_namespace_code(6, "http://www.w3.org/2002/07/owl#".to_string())
+        .unwrap();
+    snapshot
+        .insert_namespace_code(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string())
+        .unwrap();
+    snapshot
+        .insert_namespace_code(100, "http://example.org/".to_string())
+        .unwrap();
+    let part_of = sid_ex("partOf");
+    let mut flakes = vec![flake_ref(
+        part_of.clone(),
+        sid_rdf("type"),
+        sid_owl("TransitiveProperty"),
+        1,
+    )];
+    flakes.extend((0..50).map(|i| {
+        flake_ref(
+            sid_ex(&format!("n{i}")),
+            part_of.clone(),
+            sid_ex(&format!("n{}", i + 1)),
+            1,
+        )
+    }));
+    let overlay = SortedOverlay::new(overlay_epoch_from_flakes(&flakes), flakes);
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let cache = ReasoningCache::with_default_capacity();
+
+    let cancelled = QueryCancellation::new();
+    cancelled.cancel_with(QueryCancellationReason::ClientDisconnected);
+    let opts = ReasoningOptions {
+        cancellation: cancelled,
+        ..Default::default()
+    };
+    match reason_owl2rl(db, &opts, &cache).await {
+        Err(ReasonerError::Cancelled(QueryCancellationReason::ClientDisconnected)) => {}
+        other => panic!(
+            "expected the cancellation, got {:?}",
+            other.map(|r| r.diagnostics.clone())
+        ),
+    }
+
+    let opts = ReasoningOptions {
+        tracker: Tracker::new(TrackingOptions {
+            track_fuel: true,
+            max_fuel: Some(20),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match reason_owl2rl(db, &opts, &cache).await {
+        Err(ReasonerError::FuelExceeded(_)) => {}
+        other => panic!(
+            "expected the fuel limit, got {:?}",
+            other.map(|r| r.diagnostics.clone())
+        ),
+    }
+
+    // Nothing was cached: an unlimited run computes the closure.
+    let complete = reason_owl2rl(db, &ReasoningOptions::default(), &cache)
+        .await
+        .expect("an unlimited run");
+    assert!(!complete.diagnostics.capped);
+    assert_eq!(complete.diagnostics.facts_derived, 51 * 50 / 2 - 50);
+}

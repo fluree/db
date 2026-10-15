@@ -97,6 +97,7 @@ Cost ladder (per event):
 | `geof:distance` | 0.001 |
 | Vector similarity (`DotProduct`, `CosineSimilarity`, `EuclideanDistance`) | 0.002 |
 | `Fulltext` (per-row BM25 scoring) | 0.005 |
+| Fact processed by an OWL 2 RL round, when the query materializes (a query served from the reasoning cache does not pay it) | 0.001 |
 
 Cheap operations (comparisons, arithmetic, type checks, simple string ops, datetime extraction, etc.) cost zero — instrumentation overhead would dwarf the actual cost.
 

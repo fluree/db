@@ -35,6 +35,8 @@ mod it_reasoning_imports;
 mod it_reasoning_join_repro;
 #[path = "it_reasoning_policy_contract.rs"]
 mod it_reasoning_policy_contract;
+#[path = "it_reasoning_request_limits.rs"]
+mod it_reasoning_request_limits;
 #[path = "it_rules_cross_ledger.rs"]
 mod it_rules_cross_ledger;
 #[path = "it_rules_source.rs"]

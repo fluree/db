@@ -3,6 +3,7 @@
 //! Handles schema hierarchy computation, effective reasoning mode determination,
 //! and derived facts computation for OWL2-RL and datalog rules.
 
+use super::runner::QueryRequest;
 use crate::ir::ReasoningModes;
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
 use crate::Result;
@@ -266,13 +267,11 @@ pub struct DerivedFactsOutcome {
 /// incomplete rule set answers silently wrong, which is worse than a query
 /// that fails naming the rule.
 pub async fn compute_derived_facts(
-    snapshot: &LedgerSnapshot,
-    g_id: GraphId,
-    overlay: &dyn fluree_db_core::OverlayProvider,
-    to_t: i64,
+    base_db: GraphDbRef<'_>,
     reasoning: &ReasoningModes,
     rules_source_g_id: Option<GraphId>,
     binary_store: Option<&Arc<BinaryIndexStore>>,
+    request: QueryRequest<'_>,
 ) -> crate::error::Result<DerivedFactsOutcome> {
     use crate::datalog_rules::{load_rule_set, run_fixpoint, RuleExecutionEnv};
     use std::collections::hash_map::DefaultHasher;
@@ -282,7 +281,13 @@ pub async fn compute_derived_facts(
     // standing up a second cap.
     let budget = reasoning_budget(reasoning);
     let cache = global_reasoning_cache();
-    let base_db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
+    let GraphDbRef {
+        snapshot,
+        g_id,
+        overlay,
+        t: to_t,
+        ..
+    } = base_db;
 
     // Datalog: load the rule set first so its content can key the cache.
     let (rule_set, datalog_key) = if reasoning.datalog {
@@ -336,6 +341,8 @@ pub async fn compute_derived_facts(
         tracing::debug!("computing OWL2-RL derived facts");
         let reasoning_opts = ReasoningOptions {
             budget: budget.clone(),
+            cancellation: request.cancellation.cloned().unwrap_or_default(),
+            tracker: request.tracker.cloned().unwrap_or_default(),
             ..Default::default()
         };
         match reason_owl2rl(base_db, &reasoning_opts, cache).await {
@@ -418,6 +425,13 @@ pub async fn compute_derived_facts(
                 same_as = result.overlay.same_as().clone();
                 owl_overlay = Some(result.overlay.clone());
             }
+            // The request ended: it was cancelled or ran out of fuel.
+            Err(fluree_db_reasoner::ReasonerError::Cancelled(reason)) => {
+                return Err(crate::error::QueryError::Cancelled { reason });
+            }
+            Err(fluree_db_reasoner::ReasonerError::FuelExceeded(e)) => {
+                return Err(crate::error::QueryError::FuelLimitExceeded(e));
+            }
             Err(e) => {
                 // A positive program over a missing closure only derives
                 // less; one that negates or counts would read the missing
@@ -455,6 +469,7 @@ pub async fn compute_derived_facts(
         let env = RuleExecutionEnv {
             binary_store,
             evaluation_time: reasoning.evaluation_time.as_ref(),
+            request,
         };
 
         // If OWL2-RL produced derived facts, run the rules over base + OWL

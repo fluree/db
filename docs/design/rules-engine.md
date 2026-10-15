@@ -329,17 +329,25 @@ Two things need deciding before B ships: whether minted reifiers count against
 materialization sidecar (if built) persists them with the same deterministic
 ids, which would make derived provenance durable and diffable across commits.
 
-## Known limit: rule bodies run under the budget, not the query's tracker
+## Rule bodies run on the query's behalf
 
 Materialization happens while the query is *prepared*, before its execution
-context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
-materialization always has. A rule body is therefore bounded by the reasoning
-budget (facts, memory, and time — checked as its rows arrive, and time also
-at a running body's checkpoints) but cannot be cancelled by the query's own
-cancellation token, such as a client disconnect, and its scans are not
-charged as query fuel. Threading the tracker and cancellation into
-prepare-time materialization is the follow-up that closes this for both
-engines.
+context exists, so preparation takes the request's tracker and cancellation
+handle (`PrepareConfig::for_request`, carried as `QueryRequest` into
+`compute_derived_facts` and `RuleExecutionEnv`). Each rule body runs under a
+handle from `QueryCancellation::with_deadline_inside`: it reports the query's
+cancellation (client disconnect, query timeout) and also times out at the
+reasoning budget's deadline without cancelling the query. A body stopped by
+the query's cancellation fails the run with `Cancelled`; one stopped by the
+deadline caps it, as before. Rule bodies' scans charge the query's tracker.
+OWL 2 RL takes the same handle and tracker in `ReasoningOptions`: it checks
+for cancellation at each round and every 1,024 facts within one, and charges
+one micro-fuel per fact a round processes. Its cancellation and fuel errors
+fail the query instead of letting it continue without OWL entailments.
+
+A materialization is cached and shared, so its cost lands on the query that
+computes it; queries that reuse it pay nothing for it. A run that is
+cancelled or runs out of fuel returns an error and caches nothing.
 
 ## Why not keep the old matcher and extend it
 

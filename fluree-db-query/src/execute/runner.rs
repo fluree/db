@@ -145,6 +145,22 @@ pub struct PreparedExecution {
     pub reasoning_active: bool,
 }
 
+/// The request a query is prepared for. Preparing a query that reasons
+/// materializes derived facts; with these, that work is charged to the
+/// request's fuel and stops when the request is cancelled.
+#[derive(Clone, Copy, Default)]
+pub struct QueryRequest<'a> {
+    pub tracker: Option<&'a Tracker>,
+    pub cancellation: Option<&'a QueryCancellation>,
+}
+
+impl QueryRequest<'_> {
+    /// Why the request was cancelled, if it was.
+    pub fn cancelled(&self) -> Option<fluree_db_core::QueryCancellationReason> {
+        self.cancellation.and_then(QueryCancellation::reason)
+    }
+}
+
 /// Inputs that the preparation phase needs to know up front.
 ///
 /// Lives here rather than as loose parameters so that future planner inputs
@@ -161,6 +177,8 @@ pub struct PrepareConfig<'a> {
     /// spans several ledgers runs without one, so nothing may be rewritten
     /// into an operator that reads it.
     pub binary_scans: bool,
+    /// The request being prepared for (see [`QueryRequest`]).
+    pub request: QueryRequest<'a>,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -175,6 +193,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current(),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -191,6 +210,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -205,6 +225,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::history(),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -212,6 +233,19 @@ impl<'a> PrepareConfig<'a> {
     /// [`Self::binary_scans`]).
     pub fn without_binary_scans(mut self) -> Self {
         self.binary_scans = false;
+        self
+    }
+
+    /// Prepare for a request with this tracker and cancellation handle.
+    pub fn for_request(
+        mut self,
+        tracker: Option<&'a Tracker>,
+        cancellation: Option<&'a QueryCancellation>,
+    ) -> Self {
+        self.request = QueryRequest {
+            tracker,
+            cancellation,
+        };
         self
     }
 }
@@ -321,13 +355,11 @@ pub async fn prepare_execution_with_config(
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
             let derived_outcome = compute_derived_facts(
-                db.snapshot,
-                db.g_id,
-                effective_overlay,
-                db.t,
+                GraphDbRef::new(db.snapshot, db.g_id, effective_overlay, db.t),
                 &reasoning,
                 query.reasoning.rules_source_g_id,
                 binary_store,
+                config.request,
             )
             .await?;
 
@@ -983,7 +1015,8 @@ pub async fn execute<'a>(
 ) -> Result<Vec<Batch>> {
     // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
     // the dataset paths do, so the members' scans deduplicate on full rows.
-    let mut prepare_config = PrepareConfig::default();
+    let mut prepare_config =
+        PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
     prepare_config.planning = prepare_config.planning.with_multi_default_graph(
         config
             .dataset
