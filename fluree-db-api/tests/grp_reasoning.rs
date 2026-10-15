@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_datalog_closure_paths.rs"]
+mod it_datalog_closure_paths;
 #[path = "it_datalog_program_reachability.rs"]
 mod it_datalog_program_reachability;
 #[path = "it_datalog_rule_dependencies.rs"]

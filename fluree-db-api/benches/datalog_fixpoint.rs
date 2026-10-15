@@ -4,18 +4,20 @@
 //! cache hit. Each sample therefore commits one unrelated fact (untimed) and
 //! then times a query that has to rematerialize the whole rule program.
 //!
-//! Three programs over the same chain graph (`n_chains` disjoint `ex:parent`
+//! Four programs over the same chain graph (`n_chains` disjoint `ex:parent`
 //! chains of `CHAIN_LEN` nodes):
 //!
 //! 1. **`linear_recursion`** — `ancestor(x,z) :- parent(x,y), ancestor(y,z)`.
-//!    Needs one round per chain hop, so it measures per-round re-evaluation
-//!    of the growing relation.
+//!    A transitive closure, evaluated as one property path.
 //! 2. **`nonlinear_recursion`** — `ancestor(x,z) :- ancestor(x,y),
-//!    ancestor(y,z)`. Fewer rounds, larger joins per round.
+//!    ancestor(y,z)`. Also a closure, evaluated as one path.
 //! 3. **`recursion_with_acyclic_rules`** — the linear program plus
-//!    `ACYCLIC_RULES` non-recursive rules reading its output. Those rules
-//!    need to run once, after the recursion converges; measures the cost of
-//!    re-running them every round.
+//!    `ACYCLIC_RULES` non-recursive rules reading its output, which run once
+//!    after the recursion converges.
+//! 4. **`iterated_linear_recursion`** — the linear step with a filter that
+//!    always holds on chains but keeps the rule from compiling to a path. It
+//!    iterates one pass per chain hop, each re-reading only the previous
+//!    pass's facts.
 //!
 //! Every query carries an explicit reasoning budget sized for its scale, so
 //! the default 30-second ceiling cannot truncate a larger run. Before timing,
@@ -27,9 +29,6 @@
 //!   inputs:    BenchScale → n_chains
 //!              (Tiny=10, Small=100, Medium=500, Large=2_000)
 //!   metric:    ns/query (criterion default)
-//!
-//! Under the current evaluator the mixed program takes minutes per sample at
-//! Large.
 //!
 //! ## Running
 //!
@@ -106,6 +105,17 @@ fn linear_step() -> Value {
     )
 }
 
+fn filtered_linear_step() -> Value {
+    rule(
+        json!([
+            {"@id": "?x", "ex:parent": "?y"},
+            {"@id": "?y", "ex:ancestor": "?z"},
+            ["filter", "(!= ?x ?z)"]
+        ]),
+        json!({"@id": "?x", "ex:ancestor": {"@id": "?z"}}),
+    )
+}
+
 fn programs() -> Vec<Program> {
     let pairs_per_chain = CHAIN_LEN * (CHAIN_LEN - 1) / 2;
     let ancestor = || ("ex:ancestor".to_string(), pairs_per_chain);
@@ -142,6 +152,11 @@ fn programs() -> Vec<Program> {
             name: "recursion_with_acyclic_rules",
             rules: with_acyclic,
             relations: with_acyclic_relations,
+        },
+        Program {
+            name: "iterated_linear_recursion",
+            rules: vec![ancestor_base(), filtered_linear_step()],
+            relations: vec![ancestor()],
         },
     ]
 }

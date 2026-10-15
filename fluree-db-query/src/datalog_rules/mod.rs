@@ -17,6 +17,7 @@
 //!
 //! Design record: `docs/design/rules-engine.md`.
 
+mod closure;
 mod delta;
 mod dependency;
 mod execute;

@@ -2,6 +2,7 @@
 //! over the base data plus the facts derived so far; heads are instantiated
 //! from the result rows.
 
+use super::closure::Closure;
 use super::delta::{DeltaAtom, Reevaluation};
 use super::{
     extract_datalog_rules, parse_query_time_rule, DatalogExecutionResult, DatalogRule,
@@ -9,7 +10,7 @@ use super::{
 };
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::execute::{execute_prepared, prepare_execution_with_config, PrepareConfig};
 use crate::ir::reasoning::ReasoningConfig;
 use crate::ir::Query;
@@ -22,7 +23,9 @@ use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::edge::id_datatype_sid;
 use fluree_db_core::flake::FlakeMeta;
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{Flake, GraphDbRef, GraphId, LedgerSnapshot, Sid};
+use fluree_db_core::{
+    Flake, GraphDbRef, GraphId, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid,
+};
 use fluree_db_reasoner::{
     approx_flake_bytes, DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, ReasoningBudget,
     ReasoningDiagnostics,
@@ -127,7 +130,9 @@ pub enum RuleSchedule {
     /// conclusions runs once, after every rule it reads from has finished; a
     /// recursive group iterates on its own until it stops deriving, and after
     /// its first pass re-reads only what its previous pass derived where the
-    /// rule body allows it (see the `delta` module).
+    /// rule body allows it (see the `delta` module). A recursive group of one
+    /// transitive-closure rule runs once, as a property path (see the
+    /// `closure` module).
     #[default]
     Dependencies,
     /// Every rule runs its whole body every round until a round derives
@@ -163,7 +168,8 @@ pub async fn run_fixpoint(
 /// non-recursive group is done after one pass; a recursive group stays
 /// active until a pass derives nothing new for it. After its first pass, a
 /// recursive group's rules are seeded with the facts the group derived in
-/// its previous pass wherever their bodies allow it. `max_iterations` bounds
+/// its previous pass wherever their bodies allow it; a one-rule transitive
+/// closure finishes in its first pass. `max_iterations` bounds
 /// the passes of each stage. The fact and memory budgets are checked before
 /// every new fact is kept, so a pass cannot overshoot them. The deadline is
 /// checked before each rule, after its body runs, and periodically while its
@@ -202,12 +208,18 @@ pub async fn run_fixpoint_with_schedule(
         groups = %dependencies.describe(rule_set),
         "executing datalog rules; groups producers first, * marks a recursive group"
     );
-    let reevaluations = match schedule {
+    let (reevaluations, closures) = match schedule {
         RuleSchedule::Dependencies => {
             warn_on_volatile_recursion(rule_set, &dependencies);
-            plan_reevaluations(rule_set, &dependencies, db.snapshot)
+            (
+                plan_reevaluations(rule_set, &dependencies, db.snapshot),
+                plan_closures(rule_set, &dependencies),
+            )
         }
-        RuleSchedule::WholeProgram => vec![Reevaluation::Full; rule_set.len()],
+        RuleSchedule::WholeProgram => (
+            vec![Reevaluation::Full; rule_set.len()],
+            vec![None; rule_set.len()],
+        ),
     };
 
     // Derived facts carry the query's `t` so the overlay's `t <= to_t` filter
@@ -273,8 +285,29 @@ pub async fn run_fixpoint_with_schedule(
             let mut still_deriving: Vec<ActiveGroup> = Vec::new();
             for ActiveGroup { group, delta } in active {
                 let first_new = state.derived.len();
+                let mut closed = false;
                 for &index in &group.rules {
                     let rule = &rule_set.rules[index];
+                    if let (None, Some(closure)) = (&delta, &closures[index]) {
+                        if let Some(reason) = state.over_budget() {
+                            capped = Some(reason);
+                            break 'stages;
+                        }
+                        match state
+                            .apply_closure(pass_db, rule, closure, env, dict_novelty.clone())
+                            .await?
+                        {
+                            Some(RuleOutcome::Finished) => {
+                                closed = true;
+                                continue;
+                            }
+                            Some(RuleOutcome::Capped(reason)) => {
+                                capped = Some(reason);
+                                break 'stages;
+                            }
+                            None => {}
+                        }
+                    }
                     // A group's first pass runs every whole body; nothing it
                     // reads has been seen before.
                     let seeds: Vec<Option<(&DeltaAtom, Range<usize>)>> =
@@ -310,7 +343,7 @@ pub async fn run_fixpoint_with_schedule(
                 }
                 let derived = first_new..state.derived.len();
                 new_this_pass += derived.len();
-                if group.recursive && !derived.is_empty() {
+                if group.recursive && !closed && !derived.is_empty() {
                     still_deriving.push(ActiveGroup {
                         group,
                         delta: Some(derived),
@@ -397,6 +430,48 @@ fn plan_reevaluations(
     plans
 }
 
+/// The closure form of each rule that is alone in a recursive group and
+/// computes a transitive closure (see the `closure` module).
+fn plan_closures(
+    rule_set: &DatalogRuleSet,
+    dependencies: &RuleDependencies,
+) -> Vec<Option<Closure>> {
+    let mut closures = vec![None; rule_set.len()];
+    for group in dependencies.components().iter().filter(|g| g.recursive) {
+        let &[index] = group.rules.as_slice() else {
+            continue;
+        };
+        closures[index] = Closure::compile(&rule_set.rules[index]);
+        if closures[index].is_some() {
+            tracing::debug!(
+                rule = %rule_set.rules[index].name,
+                "datalog rule computes a transitive closure; evaluating it as one property path"
+            );
+        }
+    }
+    closures
+}
+
+/// Whether a fact with predicate `p` visible in `db` has a literal object.
+async fn has_literal_object(db: GraphDbRef<'_>, p: &Sid) -> Result<bool> {
+    let facts = db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch {
+                p: Some(p.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| {
+            QueryError::Internal(format!("failed to scan a rule's path predicate: {e}"))
+        })?;
+    Ok(facts
+        .iter()
+        .any(|f| f.op && !matches!(f.o, FlakeValue::Ref(_))))
+}
+
 /// A recursive group re-evaluates its rules every pass, so a rule whose body
 /// gives different rows each time (`NOW()`, `STRUUID()`, …) can derive new
 /// facts forever and run to the budget.
@@ -444,6 +519,44 @@ impl Derivation<'_> {
 
     fn past_deadline(&self) -> bool {
         self.start.elapsed() > self.budget.max_duration
+    }
+
+    /// Derive `rule`'s whole closure in one run of its path body. `None` when
+    /// the path cannot stand in for the recursion here — the path's predicate
+    /// has a literal object, or the traversal hit the path operator's
+    /// visited-node limit — and the group should iterate instead.
+    async fn apply_closure(
+        &mut self,
+        db: GraphDbRef<'_>,
+        rule: &DatalogRule,
+        closure: &Closure,
+        env: RuleExecutionEnv<'_>,
+        dict_novelty: Option<Arc<DictNovelty>>,
+    ) -> Result<Option<RuleOutcome>> {
+        if let Some(p) = &closure.requires_node_objects {
+            if has_literal_object(db, p).await? {
+                tracing::debug!(
+                    rule = %rule.name,
+                    "datalog closure rule iterates instead: its path predicate has literal objects"
+                );
+                return Ok(None);
+            }
+        }
+        match self
+            .apply(db, rule, closure.body.clone(), env, dict_novelty)
+            .await
+        {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(QueryError::ResourceLimit(reason)) => {
+                tracing::debug!(
+                    rule = %rule.name,
+                    %reason,
+                    "datalog closure rule iterates instead: its path hit a traversal limit"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Evaluate `body` (the rule's own body or a seeded copy of it) over

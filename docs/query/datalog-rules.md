@@ -575,6 +575,17 @@ When both OWL 2 RL and Datalog are enabled:
   rule that reads its group's conclusions inside a `UNION`, `EXISTS`,
   subquery or property path re-runs its whole `WHERE` clause every pass
   instead: it derives the same facts, more slowly.
+- **A transitive closure runs as one traversal.** A recursive rule that is
+  alone in its group and has the shape of a transitive closure is evaluated
+  in a single pass as a property path instead of iterating, and derives the
+  same facts. With `ex:ancestor` in the head (`?x ex:ancestor ?z`), the
+  shapes are `?x ex:parent ?y . ?y ex:ancestor ?z`,
+  `?x ex:ancestor ?y . ?y ex:parent ?z` and
+  `?x ex:ancestor ?y . ?y ex:ancestor ?z`; the step pattern may also be
+  written in reverse (`?y ex:parent ?x`). The body must be exactly those two
+  patterns. A path follows only IRI-valued objects, so the
+  `?x ex:ancestor ?y . ?y ex:parent ?z` shape iterates instead while
+  `ex:parent` has a literal object.
 - **Budget limits apply.** The same time / fact / memory budgets as OWL 2 RL
   materialization apply to Datalog execution (default: 30s and 1M derived
   facts, with a memory ceiling derived from the fact ceiling).

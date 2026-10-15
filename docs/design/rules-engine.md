@@ -111,6 +111,26 @@ overlays per pass. A rule that reads its group's writes anywhere else — a
 UNION branch, EXISTS, a subquery, a property path, the trailing VALUES block —
 re-runs its whole body every pass.
 
+A recursive group of one rule shaped as a transitive closure skips
+iteration (`datalog_rules/closure.rs`). With `R₀` the `R` facts visible when
+the group starts and `T` a triple pattern with another constant predicate,
+in either direction, the rule's fixpoint derives exactly:
+
+| Rule | Derives | Run once as |
+|---|---|---|
+| `T(x,y) . R(y,z) → R(x,z)` | `T⁺ ∘ R₀` | `T+(x,y) . R(y,z)` |
+| `R(x,y) . T(y,z) → R(x,z)` | `R₀ ∘ T⁺` | `R(x,y) . T+(y,z)` |
+| `R(x,y) . R(y,z) → R(x,z)` | pairs ≥ 2 hops apart in `R₀` | `R+(x,y) . R(y,z)` |
+
+The nonlinear row keeps its last hop as a triple pattern: `R+(x,z)` would
+also emit the one-hop pairs, re-deriving asserted facts the rule never
+derives. The path operator follows only IRI-valued objects. In the first and
+third rows every node on the path is the subject of a fact; in the second the
+path ends at the head's object, so that shape compiles only after a scan
+finds no literal object of `T`'s predicate (which the group cannot write).
+A traversal that hits the path operator's visited-node limit falls back to
+iteration, which the reasoning budget then bounds.
+
 `RuleSchedule::WholeProgram` treats the whole program as one recursive group
 and runs every rule's whole body every round, the evaluation used before
 dependency scheduling. It is kept as the reference differential tests compare

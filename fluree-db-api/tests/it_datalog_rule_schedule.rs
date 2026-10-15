@@ -182,8 +182,9 @@ async fn the_time_budget_caps_a_rule_that_outlasts_it() {
     assert!(result.derived_flakes.len() < NODES * NODES);
 }
 
-/// Random positive programs over a small graph: chains of joins (often
-/// nonlinear once their predicates are derived), class reads and writes,
+/// Random positive programs over a small graph with one literal-valued fact:
+/// chains of joins (often transitive closures, linear or not, once their
+/// predicates are derived), class reads and writes,
 /// variable predicates, repeated variables and constant subjects, reads
 /// nested in UNION and EXISTS, one-or-more and zero-length paths, and heads
 /// that introduce fresh terms. Every rule is repeatable, so both schedules
@@ -210,6 +211,12 @@ async fn random_programs_derive_the_same_facts_under_both_schedules() {
                 "@type": format!("ex:C{}", rng.gen_range(0..CLASSES))
             }));
         }
+        // A literal object ends any chain through its predicate.
+        let p = rng.gen_range(0..PREDICATES);
+        graph.push(json!({
+            "@id": format!("ex:n{}", rng.gen_range(0..NODES)),
+            format!("ex:p{p}"): "end"
+        }));
         let ledger_id = format!("datalog/schedule-random-{program}:main");
         let ledger = ledger_with(
             &ledger_id,

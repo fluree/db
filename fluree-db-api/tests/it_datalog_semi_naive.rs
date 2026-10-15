@@ -7,6 +7,10 @@
 //! group's facts anywhere else re-runs its whole body, and that patterns the
 //! seed cannot stand in for still match exactly. The whole-program schedule,
 //! which always runs whole bodies, is the reference.
+//!
+//! A one-rule transitive closure runs as a property path instead (see
+//! `it_datalog_closure_paths`); the recursive rules here carry a FILTER that
+//! is always true on their data to keep them iterating.
 
 use crate::it_datalog_rule_schedule::{chain_data, fact_set, ledger_with, run, sparql_rules};
 use fluree_db_core::Sid;
@@ -25,7 +29,7 @@ fn edges(predicate: &str, pairs: &[(&str, &str)]) -> Vec<Value> {
 }
 
 /// Derived facts with `predicate`, as `(subject, object)` local names.
-fn derived(
+pub(crate) fn derived(
     result: &DatalogExecutionResult,
     ledger: &crate::support::MemoryLedger,
     predicate: &str,
@@ -54,7 +58,7 @@ fn derived(
     pairs
 }
 
-async fn both_schedules(
+pub(crate) async fn both_schedules(
     ledger: &crate::support::MemoryLedger,
     rules: &[String],
 ) -> (DatalogExecutionResult, DatalogExecutionResult) {
@@ -78,7 +82,8 @@ async fn a_linear_recursion_derives_each_fact_from_one_body_row() {
         &ledger,
         &[
             "CONSTRUCT { ?x ex:ancestor ?y } WHERE { ?x ex:parent ?y }".to_string(),
-            "CONSTRUCT { ?x ex:ancestor ?z } WHERE { ?x ex:parent ?y . ?y ex:ancestor ?z }"
+            "CONSTRUCT { ?x ex:ancestor ?z } WHERE { ?x ex:parent ?y . ?y ex:ancestor ?z \
+             FILTER(?x != ?z) }"
                 .to_string(),
         ],
     )
@@ -105,7 +110,8 @@ async fn a_nonlinear_rule_is_seeded_at_each_recursive_pattern() {
         &ledger,
         &[
             "CONSTRUCT { ?x ex:ancestor ?y } WHERE { ?x ex:parent ?y }".to_string(),
-            "CONSTRUCT { ?x ex:ancestor ?z } WHERE { ?x ex:ancestor ?y . ?y ex:ancestor ?z }"
+            "CONSTRUCT { ?x ex:ancestor ?z } WHERE { ?x ex:ancestor ?y . ?y ex:ancestor ?z \
+             FILTER(?x != ?z) }"
                 .to_string(),
         ],
     )
