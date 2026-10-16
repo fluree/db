@@ -248,10 +248,11 @@ fn fetch_remote_leaf_bytes(cs: Arc<dyn ContentStore>, cid: ContentId) -> io::Res
 /// and immutable, so the CAS address hash has astronomically unlikely
 /// collisions with no epoch/staging dimension.
 /// Whether a reader reads leaves by range through fences: when they come
-/// from a store that decrypts on local reads and it has a cache to keep
-/// their fences and units in.
-fn reads_fenced(leaf_source: &LeafSource, cached: bool) -> bool {
-    matches!(leaf_source, LeafSource::Cas { cs, .. } if cached && cs.costly_local_reads())
+/// from a store that decrypts on local reads and it has a cache that keeps
+/// their fences and units.
+fn reads_fenced(leaf_source: &LeafSource, cache: Option<&Arc<LeafletCache>>) -> bool {
+    matches!(leaf_source, LeafSource::Cas { cs, .. }
+        if cache.is_some_and(|c| c.holds_fences()) && cs.costly_local_reads())
 }
 
 pub struct DictTreeReader {
@@ -279,7 +280,7 @@ impl DictTreeReader {
     /// Create a reader from a decoded branch and leaf source.
     pub fn new(branch: DictBranch, leaf_source: LeafSource) -> Self {
         Self {
-            fenced: reads_fenced(&leaf_source, false),
+            fenced: reads_fenced(&leaf_source, None),
             fence_spacing: FENCE_SPACING,
             branch,
             branch_cid: None,
@@ -304,7 +305,7 @@ impl DictTreeReader {
         cache: Arc<LeafletCache>,
     ) -> Self {
         Self {
-            fenced: reads_fenced(&leaf_source, true),
+            fenced: reads_fenced(&leaf_source, Some(&cache)),
             fence_spacing: FENCE_SPACING,
             branch,
             branch_cid: None,
@@ -407,7 +408,7 @@ impl DictTreeReader {
 
     /// Attach a global cache to this reader.
     pub fn set_cache(&mut self, cache: Option<Arc<LeafletCache>>) {
-        self.fenced = reads_fenced(&self.leaf_source, cache.is_some());
+        self.fenced = reads_fenced(&self.leaf_source, cache.as_ref());
         self.global_cache = cache;
     }
 
@@ -1403,12 +1404,18 @@ mod tests {
             entries
         }
 
+        /// A cache as storage that decrypts on read gets, with no room for
+        /// dictionary packs.
+        fn fence_cache(bytes: u64) -> Arc<LeafletCache> {
+            Arc::new(LeafletCache::for_decrypting_storage(bytes, Some(0)))
+        }
+
         fn fenced_reader(
             cs: &SegmentedContentStore,
             leaves: Vec<(String, Vec<u8>)>,
             branch: DictBranch,
         ) -> DictTreeReader {
-            reader_over(cs, leaves, branch, Arc::new(LeafletCache::with_max_mb(16)))
+            reader_over(cs, leaves, branch, fence_cache(16 << 20))
         }
 
         fn reader_over(
@@ -1488,7 +1495,7 @@ mod tests {
             let entries = entries();
             let cs = SegmentedContentStore::new(true);
             let (leaves, branch) = built(entries.clone());
-            let cache = Arc::new(LeafletCache::with_max_mb(16));
+            let cache = fence_cache(16 << 20);
             let opening = |cs: &SegmentedContentStore| {
                 cs.reads()
                     .iter()
@@ -1512,8 +1519,7 @@ mod tests {
                 0,
                 "reverse reads run no rent clock"
             );
-            let elsewhere =
-                reader_over(&cs, leaves, branch, Arc::new(LeafletCache::with_max_mb(16)));
+            let elsewhere = reader_over(&cs, leaves, branch, fence_cache(16 << 20));
             elsewhere.reverse_lookup(&entries[0].key).unwrap();
             assert_eq!(opening(&cs), opened + 1);
         }
@@ -1525,7 +1531,7 @@ mod tests {
             let entries = entries();
             let cs = SegmentedContentStore::new(true);
             let (leaves, branch) = built(entries.clone());
-            let cache = Arc::new(LeafletCache::with_max_mb(2));
+            let cache = fence_cache(2 << 20);
             let reader = reader_over(&cs, leaves, branch, Arc::clone(&cache));
             let opening = |cs: &SegmentedContentStore| {
                 cs.reads()
@@ -1557,7 +1563,7 @@ mod tests {
             let cs = SegmentedContentStore::new(true);
             let (leaves, branch) = built(entries.clone());
             let leaf_count = branch.leaves.len();
-            let cache = Arc::new(LeafletCache::with_max_mb(16));
+            let cache = fence_cache(16 << 20);
             let reader = reader_over(&cs, leaves, branch, Arc::clone(&cache));
             let opening = |cs: &SegmentedContentStore| {
                 cs.reads()
@@ -1588,7 +1594,7 @@ mod tests {
             let leaf_count = branch.leaves.len();
             // A 128 KiB budget: a 4 KiB fence pool, taking leaves up to 2 KiB,
             // short of a test leaf's fences and 1 KiB source charge.
-            let cache = Arc::new(LeafletCache::with_max_bytes(128 * 1024));
+            let cache = fence_cache(128 * 1024);
             let reader =
                 reader_over(&cs, leaves, branch, Arc::clone(&cache)).with_fence_spacing(256);
             for _ in 0..3 {
@@ -1620,7 +1626,7 @@ mod tests {
                     .branch;
                 let address = branch.leaves[0].address.clone();
                 let cs = SegmentedContentStore::new(true);
-                let cache = Arc::new(LeafletCache::with_max_mb(16));
+                let cache = fence_cache(16 << 20);
                 let reader = reader_over(
                     &cs,
                     vec![(address, blob.clone())],
@@ -1754,7 +1760,7 @@ mod tests {
                     &bad,
                 );
                 let source = cs.get_local_ranged(&cid).unwrap().unwrap();
-                let cache = Arc::new(LeafletCache::with_max_mb(4));
+                let cache = fence_cache(4 << 20);
                 let fenced = FencedLeaf {
                     source,
                     fences,

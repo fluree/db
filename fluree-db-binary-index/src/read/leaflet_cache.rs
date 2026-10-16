@@ -682,30 +682,36 @@ macro_rules! region_cache_methods {
 }
 
 impl LeafletCache {
-    /// Create a new cache with the given maximum byte budget, holding no
-    /// dictionary pack whole.
+    /// Create a new cache with the given maximum byte budget, for storage
+    /// that does not decrypt on read: it holds no dictionary pack whole and
+    /// no fenced reverse leaf.
     ///
     /// One TinyLFU pool and budget for every leaflet-derived entry type. Query
     /// planner stats views get a separate LRU pool sized from the same budget;
     /// see [`stats_view_pool`].
     pub fn with_max_bytes(max_bytes: u64) -> Self {
-        Self::with_budgets(max_bytes, 0)
+        Self::with_budgets(max_bytes, 0, false)
     }
 
     /// A cache for storage that decrypts on read: `max_bytes` in all, of
     /// which `dictionary_bytes` (by default [`DEFAULT_DICTIONARY_PERCENT`])
-    /// is the dictionary allowance and the rest the leaflet budget.
+    /// is the dictionary allowance and the rest the leaflet budget, a share
+    /// of it the fenced-leaf pool.
     pub fn for_decrypting_storage(max_bytes: u64, dictionary_bytes: Option<u64>) -> Self {
         let dictionary = dictionary_bytes
             .unwrap_or(
                 (u128::from(max_bytes) * u128::from(DEFAULT_DICTIONARY_PERCENT) / 100) as u64,
             )
             .min(max_bytes);
-        Self::with_budgets(max_bytes - dictionary, dictionary)
+        Self::with_budgets(max_bytes - dictionary, dictionary, true)
     }
 
-    fn with_budgets(leaflet_bytes: u64, dictionary_bytes: u64) -> Self {
-        let fenced_budget = fenced_leaf_budget(leaflet_bytes);
+    fn with_budgets(leaflet_bytes: u64, dictionary_bytes: u64, fences: bool) -> Self {
+        let fenced_budget = if fences {
+            fenced_leaf_budget(leaflet_bytes)
+        } else {
+            0
+        };
         let inner = Cache::builder()
             .weigher(|_key: &CacheKey, val: &CachedEntry| {
                 val.byte_size().min(u32::MAX as usize) as u32
@@ -745,6 +751,12 @@ impl LeafletCache {
         self.dictionary_allowance =
             crate::dict::allowance::DictionaryAllowance::with_rent_period(bytes, u64::MAX);
         self
+    }
+
+    /// Whether it keeps fenced reverse leaves: only a cache for storage that
+    /// decrypts on read does.
+    pub(crate) fn holds_fences(&self) -> bool {
+        self.fenced_leaf_max > 0
     }
 
     /// What forward dictionary packs may hold decrypted whole.
@@ -1368,16 +1380,20 @@ impl LeafletCache {
 mod tests {
     use super::*;
 
-    /// The fenced-leaf pool is carved out of the leaflet budget, not added
-    /// beside it.
+    /// For storage that decrypts on read the fenced-leaf pool is carved out
+    /// of the leaflet budget, not added beside it; other storage has none.
     #[test]
     fn the_fence_pool_shares_the_leaflet_budget() {
         for budget in [1u64 << 20, 256 << 20, 3_000_017] {
-            let cache = LeafletCache::with_max_bytes(budget);
+            let cache = LeafletCache::for_decrypting_storage(budget, Some(0));
             let leaflets = cache.inner.policy().max_capacity().unwrap();
             let fences = cache.fenced_leaves.policy().max_capacity().unwrap();
             assert_eq!(leaflets + fences, budget);
             assert_eq!(fences, budget / 32);
+            assert!(cache.holds_fences());
+            let plain = LeafletCache::with_max_bytes(budget);
+            assert_eq!(plain.inner.policy().max_capacity(), Some(budget));
+            assert!(!plain.holds_fences());
         }
     }
 
