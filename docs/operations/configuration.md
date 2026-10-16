@@ -54,6 +54,7 @@ query_min_t_timeout_ms = 5000
 graphql_max_depth = 15         # GraphQL nesting depth; 0 disables
 graphql_max_complexity = 1000  # GraphQL fields per document; 0 disables
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_dictionary_max_mb = 2048  # encrypted storage only: part of cache_max_mb for whole dictionary packs; default: 60%
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
 # iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
 
