@@ -568,16 +568,21 @@ its session directory behind
   range. Only the 64 KiB segments a query touches are decrypted, and they are
   kept in the in-memory leaflet cache, so a leaf or dictionary is not decrypted
   whole to answer a lookup.
-- **Cache budget on encrypted storage**: `cacheMaxMb` is split. By default 60%
-  of it is a *dictionary allowance*: forward dictionary packs (up to 16 MiB
-  each) that queries keep missing are promoted into it and held decrypted
-  whole, and evicted in least-recently-used order when others need the room.
-  The rest is the leaflet cache, a thirty-second of it reserved for the indexes
-  that let reverse-dictionary lookups scan 4 KiB instead of a whole leaf. Set
-  the allowance with `cacheDictionaryMaxMb` (or
-  `FlureeBuilder::cache_dictionary_max_mb`); an allowance smaller than a pack
-  or two holds none. Unencrypted storage gives `cacheMaxMb` to the leaflet
-  cache, as before.
+- **Cache budget on encrypted storage**: by default 60% of `cacheMaxMb` is a
+  *dictionary allowance*: forward dictionary packs (up to 16 MiB each) that
+  queries keep missing are promoted into it and held decrypted whole, and
+  evicted in least-recently-used order when others need the room. A
+  thirty-second of the rest holds the indexes that let reverse-dictionary
+  lookups scan 4 KiB instead of a whole leaf. Data that cannot use them —
+  version 1 envelopes and remote reads, which are decrypted whole — gives
+  them back to the leaflet cache when it is first read: the allowance keeps
+  only enough for what it already holds and the packs read by range before.
+  What is given back stays with the leaflet cache for the life of the
+  connection, so after reindexing such data, restart to have the allowance
+  again. Set the allowance with `cacheDictionaryMaxMb` (or
+  `FlureeBuilder::cache_dictionary_max_mb`); one smaller than a pack or two
+  holds none. Unencrypted storage gives all of `cacheMaxMb` to the leaflet
+  cache.
 - **Warm-up**: a dictionary pack starts out read by range and is promoted only
   after its misses have decrypted about its own size, so the first passes over
   a working set are slower than later ones. After a workload moves away and
@@ -589,9 +594,10 @@ its session directory behind
   cache (`cacheMaxMb`) for the working set: decrypted leaves count against it
   in full.
 - **Data written by earlier releases**: version 1 envelopes are read whole, as
-  those releases read them. A reindex writes the index as version 2, and a key
-  rotation rewrites each blob it moves as version 2. Releases before this one
-  cannot read version 2.
+  those releases read them. A reindex writes a new index, its leaves and
+  dictionaries, as version 2; commits and other objects it does not rewrite
+  stay version 1. A key rotation rewrites each blob on the retiring key as
+  version 2. Releases before this one cannot read version 2.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 

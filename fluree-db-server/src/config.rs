@@ -555,8 +555,8 @@ pub struct ServerConfig {
     pub cache_max_mb: Option<usize>,
 
     /// On encrypted storage, the MB of the cache budget that forward
-    /// dictionary packs may hold decrypted whole (default: 60% of it).
-    /// Unencrypted storage gives the whole budget to the leaflet cache.
+    /// dictionary packs may hold decrypted whole (default: 60% of it), given
+    /// back to the leaflet cache if the data cannot use it.
     #[arg(long, env = "FLUREE_CACHE_DICTIONARY_MAX_MB")]
     pub cache_dictionary_max_mb: Option<usize>,
 

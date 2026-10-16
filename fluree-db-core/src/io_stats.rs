@@ -11,7 +11,14 @@
 //!
 //! A second table counts work done on bytes after they are read: decryption
 //! (whole objects and segments) and what readers keep loaded. It is reported
-//! apart from reads so neither total mixes the two.
+//! apart from reads so neither total mixes the two. Within it, a version 2
+//! envelope decrypted whole counts once as an object and again per segment:
+//! do not add `decrypt v2 object` to `decrypt v2 segment`.
+//!
+//! Labels are artifact kinds and fixed names, never addresses, content ids,
+//! plaintext or key material. On, every record takes a process-wide lock, so
+//! timings taken with accounting on are not comparable to timings without
+//! it. A diagnostic for investigations, not a metrics interface.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
