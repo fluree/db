@@ -17,13 +17,19 @@
 //!
 //! Design record: `docs/design/rules-engine.md`.
 
+mod closure;
+mod delta;
+mod dependency;
 mod execute;
 mod parse;
 mod validate;
 
+pub use dependency::{
+    Access, GraphScope, PredicateFootprint, RuleComponent, RuleDependencies, RuleFootprint,
+};
 pub use execute::{
     execute_datalog_rules, execute_datalog_rules_with_query_rules, load_rule_set, run_fixpoint,
-    RuleExecutionEnv,
+    run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule,
 };
 pub use parse::parse_query_time_rule;
 
@@ -83,20 +89,17 @@ pub struct DatalogRule {
     pub name: String,
     pub body: RuleBody,
     pub heads: Vec<RuleHead>,
-    /// Predicates the body reads (constant predicates of its triple patterns).
-    pub depends_on: Vec<Sid>,
-    /// Predicates the heads write.
-    pub generates: Vec<Sid>,
+    /// What the body may read and the heads may write, for dependency
+    /// analysis.
+    pub footprint: RuleFootprint,
     /// The rule's source text (JSON or SPARQL). Hashed into the reasoning
     /// cache key so a changed rule never serves a stale materialization.
     pub source: Arc<str>,
 }
 
-/// The rule set for one materialization, in execution order.
-///
-/// Rules with fewer predicate dependencies run first; the fixpoint re-runs
-/// every rule each round until nothing new derives, so the order affects only
-/// how quickly it converges, never the result.
+/// The rule set for one materialization, in the order rules were added. The
+/// fixpoint schedules them by [`DatalogRuleSet::dependencies`], not by this
+/// order.
 #[derive(Debug, Default)]
 pub struct DatalogRuleSet {
     rules: Vec<DatalogRule>,
@@ -132,7 +135,6 @@ impl DatalogRuleSet {
             )));
         }
         self.rules.push(rule);
-        self.rules.sort_by_key(|r| r.depends_on.len());
         Ok(())
     }
 
@@ -146,6 +148,11 @@ impl DatalogRuleSet {
 
     pub fn len(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Read/write footprints and recursive groups, indexed by execution order.
+    pub fn dependencies(&self) -> RuleDependencies {
+        RuleDependencies::analyze(&self.rules)
     }
 
     /// Order-independent hash of every rule's id and source text, for the
@@ -175,6 +182,11 @@ pub struct DatalogExecutionResult {
     pub derived_flakes: Vec<Flake>,
     /// Fixpoint diagnostics — iterations, fact count, budget capping.
     pub diagnostics: ReasoningDiagnostics,
+    /// Rule bodies evaluated across all passes, counting each seeded run of
+    /// a recursive rule separately.
+    pub rule_body_runs: usize,
+    /// Rows those bodies returned. Re-deriving known facts shows up here.
+    pub body_rows: usize,
 }
 
 /// Human-readable IRI for a rule id, for diagnostics.

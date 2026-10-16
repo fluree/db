@@ -74,6 +74,17 @@ pub fn path_max_visited() -> usize {
     })
 }
 
+/// Fails once a path has computed more pairs than the context allows before
+/// returning its first row (see [`ExecutionContext::path_pair_limit`]).
+fn check_pair_limit(ctx: &ExecutionContext<'_>, pairs: usize) -> Result<()> {
+    match ctx.path_pair_limit {
+        Some(limit) if pairs > limit => Err(QueryError::ResourceLimit(format!(
+            "Property path exceeded max result pairs ({limit})"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Predicates a wildcard (untyped) path must never traverse: `rdf:type` (its
 /// object is a class, not a node) and the `f:reifies*` reifier bundle (the
 /// edge-annotation sidecar, hidden from variable-predicate reads). Data
@@ -777,6 +788,7 @@ impl PropertyPathOperator {
                 for reachable in self.traverse_forward(ctx, start).await? {
                     out.push((Binding::sid(start.clone()), Binding::sid(reachable)));
                 }
+                check_pair_limit(ctx, out.len())?;
             }
             // For `*`/`?` the zero-length path pairs each term of the
             // zero-length universe with itself. `traverse_forward` already
@@ -865,6 +877,7 @@ impl PropertyPathOperator {
         // hop) — no closure.
         if self.pattern.modifier == PathModifier::ZeroOrOne {
             for n in &nodes {
+                check_pair_limit(ctx, out.len())?;
                 let mut seen: HashSet<Sid> = HashSet::from([n.clone()]);
                 if !spans_all_terms {
                     out.push((Binding::sid(n.clone()), Binding::sid(n.clone())));
@@ -886,6 +899,7 @@ impl PropertyPathOperator {
             // branch below would otherwise be uninterruptible (only the unbounded
             // branch polls per dequeue).
             crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            check_pair_limit(ctx, out.len())?;
             // Bounded path: layered (node, depth) BFS over the adjacency map, so
             // a node first reached below `min_hops` can still be reached on a
             // longer in-range path (matches `traverse_bounded`).
@@ -950,6 +964,7 @@ impl PropertyPathOperator {
             let mut added_self_via_cycle = false;
             while let Some((cur, depth)) = queue.pop_front() {
                 crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+                check_pair_limit(ctx, out.len())?;
                 if visited.len() >= self.max_visited {
                     return Err(QueryError::ResourceLimit(format!(
                         "Property path exceeded max visited nodes ({})",
@@ -1461,6 +1476,7 @@ impl PropertyPathOperator {
             }
         };
 
+        check_pair_limit(ctx, results.len())?;
         self.results_buffer = Some(results);
         self.results_idx = 0;
         Ok(())
@@ -2149,6 +2165,60 @@ mod tests {
                 .expect("rows");
             assert!(rows.is_empty(), "{modifier:?}: {rows:?}");
         }
+    }
+
+    /// A path with both ends free computes all its pairs before it returns
+    /// a row. Past the context's pair limit it fails instead of holding them.
+    #[test]
+    fn an_unseeded_path_stops_at_the_pair_limit() {
+        use fluree_db_reasoner::{DerivedFactsBuilder, FrozenSameAs};
+        const NODES: usize = 10;
+        let next = Sid::new(100, "next");
+        let node = |i: usize| Sid::new(100, format!("n{i}"));
+        let mut builder = DerivedFactsBuilder::with_capacity(NODES);
+        builder.extend((0..NODES - 1).map(|i| {
+            fluree_db_core::Flake::new(
+                node(i),
+                next.clone(),
+                FlakeValue::Ref(node(i + 1)),
+                fluree_db_core::edge::id_datatype_sid(),
+                1,
+                true,
+                None,
+            )
+        }));
+        let overlay = builder.build(FrozenSameAs::empty(), 1);
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let pairs = |limit: Option<usize>| -> Result<usize> {
+            let mut ctx =
+                ExecutionContext::with_time_and_overlay(&snapshot, &vars, 1, None, &overlay);
+            if let Some(limit) = limit {
+                ctx = ctx.with_path_pair_limit(limit);
+            }
+            let pattern = make_pattern(
+                Ref::Var(VarId(0)),
+                next.clone(),
+                PathModifier::OneOrMore,
+                Ref::Var(VarId(1)),
+            );
+            let mut op = PropertyPathOperator::with_defaults(None, pattern);
+            futures::executor::block_on(async {
+                op.open(&ctx).await?;
+                let mut rows = 0;
+                while let Some(batch) = op.next_batch(&ctx).await? {
+                    rows += batch.len();
+                }
+                Ok(rows)
+            })
+        };
+        let closure = NODES * (NODES - 1) / 2;
+        assert_eq!(pairs(None).expect("no limit"), closure);
+        assert_eq!(pairs(Some(closure)).expect("at the limit"), closure);
+        assert!(
+            matches!(pairs(Some(closure - 1)), Err(QueryError::ResourceLimit(_))),
+            "a closure one pair over the limit must fail"
+        );
     }
 
     #[test]

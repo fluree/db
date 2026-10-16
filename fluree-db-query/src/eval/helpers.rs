@@ -467,7 +467,7 @@ fn merge_var_usage(left: VarUsage, right: VarUsage) -> VarUsage {
     }
 }
 
-fn function_supported_for_bool_cache(func: &Function) -> bool {
+pub(crate) fn function_supported_for_bool_cache(func: &Function) -> bool {
     !matches!(
         func,
         Function::Rand

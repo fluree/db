@@ -773,6 +773,10 @@ harness = false
 required-features = ["credential"]
 
 [[bench]]
+name = "datalog_fixpoint"
+harness = false
+
+[[bench]]
 name = "annotation_varlength_probe"
 harness = false
 

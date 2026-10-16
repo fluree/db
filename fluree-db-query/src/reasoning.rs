@@ -95,13 +95,16 @@ impl OverlayProvider for ReasoningOverlay<'_> {
                 derived_flakes.push(f.clone());
             });
 
-        // Linear merge of two sorted sequences - O(n) instead of O(n log n)
-        //
-        // Note on duplicates: Derived facts use reasoning_t (to_t + 1) while base
-        // facts have their original t values. Since index comparators include t,
-        // true duplicates (Equal comparison) are unlikely. If they do occur (same
-        // SPO with identical t), we emit base first then derived - this is correct
-        // for overlay semantics where multiple versions may exist.
+        // Derived facts carry the query's `t`, and at equal `t` a retraction
+        // wins the tie. When the commit at that `t` retracted the stored copy
+        // of a fact the rules derive again, the retraction would hide a fact
+        // that holds: the rules derived it from the state after that commit.
+        if !derived_flakes.is_empty() && base_flakes.iter().any(|f| !f.op) {
+            base_flakes.retain(|f| f.op || !restated(&derived_flakes, f, index));
+        }
+
+        // Linear merge of two sorted sequences - O(n) instead of O(n log n).
+        // A base fact the rules also derive appears twice; readers keep one.
         let mut base_iter = base_flakes.iter().peekable();
         let mut derived_iter = derived_flakes.iter().peekable();
 
@@ -125,6 +128,16 @@ impl OverlayProvider for ReasoningOverlay<'_> {
             }
         }
     }
+}
+
+/// Whether `derived` (sorted in `index` order) asserts `retraction`'s fact at
+/// its `t`.
+fn restated(derived: &[Flake], retraction: &Flake, index: IndexType) -> bool {
+    let mut assertion = retraction.clone();
+    assertion.op = true;
+    derived
+        .binary_search_by(|f| index.compare(f, &assertion))
+        .is_ok()
 }
 
 /// Global reasoning cache for cross-query result reuse.
