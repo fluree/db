@@ -1549,6 +1549,34 @@ mod tests {
             assert_eq!(opening(&cs), opened, "no leaf fenced again");
         }
 
+        /// A fence index the pool lets go is rebuilt on next use, by reading
+        /// its leaf whole once more, with the same answers.
+        #[test]
+        fn an_evicted_fence_index_is_rebuilt() {
+            let entries = entries();
+            let cs = SegmentedContentStore::new(true);
+            let (leaves, branch) = built(entries.clone());
+            let leaf_count = branch.leaves.len();
+            let cache = Arc::new(LeafletCache::with_max_mb(16));
+            let reader = reader_over(&cs, leaves, branch, Arc::clone(&cache));
+            let opening = |cs: &SegmentedContentStore| {
+                cs.reads()
+                    .iter()
+                    .filter(|r| r.start == 0 && r.end - r.start > 4096)
+                    .count()
+            };
+            for e in entries.iter().step_by(50) {
+                assert_eq!(reader.reverse_lookup(&e.key).unwrap(), Some(e.id));
+            }
+            assert_eq!(opening(&cs), leaf_count);
+            cache.invalidate_all();
+            for e in entries.iter().step_by(50) {
+                assert_eq!(reader.reverse_lookup(&e.key).unwrap(), Some(e.id));
+            }
+            assert_eq!(opening(&cs), 2 * leaf_count, "each leaf fenced again");
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
         /// A fenced leaf heavier than the fence pool takes is never cached
         /// there charged at less than it holds: its leaf is read whole, once,
         /// through the leaflet pool.

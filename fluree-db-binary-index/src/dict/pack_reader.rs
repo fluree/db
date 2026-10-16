@@ -2257,6 +2257,132 @@ mod tests {
             assert!(pack.rent >= len && pack.covered <= len && pack.promotions == 0);
         }
 
+        /// Readers on many threads — some sharing a reader, some reading the
+        /// same packs through readers of their own — promote and evict packs
+        /// under one another while the leaflet cache is dropped beneath them:
+        /// every value reads back, charges never pass the allowance, and once
+        /// the readers stop nothing evicted is still held.
+        #[test]
+        fn concurrent_readers_promote_and_evict_within_the_allowance() {
+            let len = pack_from(FIRST).len() as u64;
+            let firsts: Vec<u64> = (0..4).map(|k| FIRST + 10 * k * COUNT as u64).collect();
+            let cs = SegmentedContentStore::new(true);
+            let cache = unaging_cache(len + len / 2);
+            let shared: Vec<_> = firsts.iter().map(|&f| adaptive(&cs, f, &cache)).collect();
+            std::thread::scope(|scope| {
+                for t in 0..8u64 {
+                    let (cs, cache, shared, firsts) = (&cs, &cache, &shared, &firsts);
+                    scope.spawn(move || {
+                        let own: Vec<_> = firsts.iter().map(|&f| adaptive(cs, f, cache)).collect();
+                        for round in 0..30u64 {
+                            let k = ((t + round) % 4) as usize;
+                            let reader = if t % 2 == 0 { &shared[k] } else { &own[k] };
+                            let start = (t * 131 + round * 17) % (COUNT as u64 - 300);
+                            read_ids(reader, firsts[k], start..start + 300);
+                            if round % 7 == t % 7 {
+                                cache.invalidate_all();
+                            }
+                            let stats = cache.dictionary_allowance().stats();
+                            assert!(stats.used <= stats.capacity, "{stats:?}");
+                        }
+                    });
+                }
+            });
+            let stats = cache.dictionary_allowance().stats();
+            assert!(
+                stats.promoted > 4 && stats.evicted > 0,
+                "churned: {stats:?}"
+            );
+            assert!(stats.peak <= stats.capacity);
+            assert_eq!(stats.outstanding, 0, "{stats:?}");
+            assert_eq!(stats.used, stats.resident_bytes);
+            for (reader, &first) in shared.iter().zip(&firsts) {
+                read_all(reader, first);
+            }
+        }
+
+        /// A reload over a root that keeps a pack carries its handle over:
+        /// the promoted copy serves the new reader with no read and no second
+        /// promotion, and outlives the old reader.
+        #[test]
+        fn a_reload_carries_a_promoted_pack_over() {
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = allowance_cache(2 * len);
+            let pack_cid = cs.put_sync(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                &pack_from(FIRST),
+            );
+            let refs = vec![PackBranchEntry {
+                first_id: FIRST,
+                last_id: FIRST + COUNT as u64 - 1,
+                pack_cid,
+            }];
+            let store: Arc<dyn ContentStore> = Arc::new(cs.clone());
+            let open = |prev: Option<&ForwardPackReader>| {
+                let (store, refs) = (Arc::clone(&store), refs.clone());
+                // An owned stand-in for `prev`, which the runtime cannot borrow.
+                let prev = prev.map(|p| ForwardPackReader {
+                    packs: p.packs.clone(),
+                    load_ctx: Some(LoadContext {
+                        cs: Arc::clone(&store),
+                        expected_kind: KIND_STRING_FWD,
+                        expected_ns_code: 0,
+                        page_cache: None,
+                        promote_coverage: PROMOTE_COVERAGE,
+                    }),
+                });
+                crate::read::binary_index_store::run_sync_on_runtime(async move {
+                    ForwardPackReader::from_pack_refs_reusing(
+                        store,
+                        &refs,
+                        KIND_STRING_FWD,
+                        0,
+                        prev.as_ref(),
+                    )
+                    .await
+                })
+                .unwrap()
+                .with_page_cache(Some(Arc::clone(&cache)))
+            };
+            let old = open(None);
+            read_all(&old, FIRST);
+            assert_eq!(cache.dictionary_allowance().stats().promoted, 1);
+            let new = open(Some(&old));
+            assert_eq!(new.packs_shared_with(&old), 1, "the handle carried over");
+            drop(old);
+            let reads = cs.reads().len();
+            read_all(&new, FIRST);
+            assert_eq!(cs.reads().len(), reads, "served whole");
+            assert_eq!(cache.dictionary_allowance().stats().promoted, 1);
+        }
+
+        /// Once no reader holds a pack, nothing keeps it described: its meter
+        /// leaves the report, and its promoted copy is given up to make room
+        /// for a pack in use, returning its charge.
+        #[test]
+        fn a_retired_pack_leaves_no_meter_and_gives_up_its_room() {
+            let len = pack_from(FIRST).len() as u64;
+            let other = FIRST + 10 * COUNT as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = unaging_cache(len + len / 2);
+            let retired = adaptive(&cs, FIRST, &cache);
+            read_all(&retired, FIRST);
+            drop(retired);
+            let allowance = Arc::clone(cache.dictionary_allowance());
+            assert!(allowance.pack_report().is_empty(), "no meter left");
+            assert_eq!(allowance.stats().resident_bytes, len);
+            let live = adaptive(&cs, other, &cache);
+            read_all(&live, other);
+            let stats = allowance.stats();
+            assert_eq!((stats.promoted, stats.evicted), (2, 1));
+            assert_eq!((stats.used, stats.outstanding), (len, 0));
+            assert!(allowance.resident(identity(&cs, other)).is_some());
+            assert!(allowance.resident(identity(&cs, FIRST)).is_none());
+        }
+
         /// A pack that fails validation is an error, and takes nothing from
         /// the allowance.
         #[test]
