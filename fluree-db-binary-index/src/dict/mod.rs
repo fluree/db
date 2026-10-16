@@ -31,6 +31,7 @@
 //! [magic: 4B][leaf_count: u32][offset_table: u32 × leaf_count][leaf_entries...]
 //! ```
 
+pub mod allowance;
 pub mod branch;
 pub mod builder;
 pub mod dict_io;

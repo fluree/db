@@ -431,6 +431,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # graphql_max_depth = {graphql_max_depth}                 # GraphQL nesting depth; 0 disables the limit
 # graphql_max_complexity = {graphql_max_complexity}         # GraphQL fields per document; 0 disables the limit
 # cache_max_mb = 4096                    # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_dictionary_max_mb = 2048         # encrypted storage: part of the cache budget for whole dictionary packs, given back if unusable; default: 60%
 
 # [server.query_refresh]
 # enabled = {query_refresh_enabled}            # opt-in nameservice refresh before current-head queries

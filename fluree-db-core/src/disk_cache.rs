@@ -993,6 +993,15 @@ impl ContentStore for CachedContentStore {
         Ok(bytes)
     }
 
+    /// Only the inner store reads by range: entries hold plaintext, which
+    /// `get_local` already maps.
+    fn get_local_ranged(
+        &self,
+        id: &ContentId,
+    ) -> crate::error::Result<Option<std::sync::Arc<dyn crate::storage::RangeSource>>> {
+        self.inner.get_local_ranged(id)
+    }
+
     async fn get_range(
         &self,
         id: &ContentId,

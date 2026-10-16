@@ -681,7 +681,7 @@ impl RangeSemiJoinOperator {
         for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
             ctx.check_cancelled()?;
             let leaf = prepare_leaf_for_scan(store, leaf_entry, false)?;
-            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+            for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
                 if entry.row_count == 0 || entry.p_const.is_some_and(|p| p != p_id) {
                     continue;
                 }

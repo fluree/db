@@ -40,10 +40,12 @@
 //! ```
 
 use crate::envelope::{
-    build_header, ciphertext_slice, header_slice, parse_header, HEADER_LEN, NONCE_LEN,
+    build_header, ciphertext_slice, envelope_version, header_slice, key_id_of_header, parse_header,
+    HEADER_LEN, NONCE_LEN,
 };
 use crate::error::{EncryptionError, Result};
 use crate::key::KeyProvider;
+use crate::segmented;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -85,6 +87,11 @@ use std::sync::Arc;
 pub struct EncryptedStorage<S, K> {
     inner: S,
     keys: Arc<K>,
+    /// Random per instance (shared by clones): scopes what a cache of
+    /// decrypted bytes may serve to readers of this storage.
+    context: [u8; 16],
+    /// The envelope new writes use.
+    write: WriteFormat,
 }
 
 impl<S, K> EncryptedStorage<S, K>
@@ -98,17 +105,29 @@ where
     /// * `inner` - The underlying storage to wrap
     /// * `keys` - Key provider for encryption/decryption
     pub fn new(inner: S, keys: K) -> Self {
-        Self {
-            inner,
-            keys: Arc::new(keys),
-        }
+        Self::with_arc_keys(inner, Arc::new(keys))
     }
 
     /// Create with an existing Arc'd key provider.
     ///
     /// Useful when sharing a key provider across multiple storage instances.
     pub fn with_arc_keys(inner: S, keys: Arc<K>) -> Self {
-        Self { inner, keys }
+        let mut context = [0u8; 16];
+        OsRng.fill_bytes(&mut context);
+        Self {
+            inner,
+            keys,
+            context,
+            write: WriteFormat::Segmented,
+        }
+    }
+
+    /// Write version 1 envelopes, as releases before version 2 did: for
+    /// tests of stores those releases wrote, not a supported configuration.
+    #[doc(hidden)]
+    pub fn writing_version_1_envelopes(mut self) -> Self {
+        self.write = WriteFormat::Whole;
+        self
     }
 
     /// Get a reference to the underlying storage.
@@ -118,12 +137,28 @@ where
 
     /// Encrypt plaintext and build the complete envelope.
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        Self::encrypt_with(&self.keys, plaintext)
+        Self::encrypt_with(&self.keys, self.write, plaintext)
     }
 
-    /// [`Self::encrypt`] with only the key provider, for callers that cannot
-    /// borrow the storage.
-    fn encrypt_with(keys: &K, plaintext: &[u8]) -> Result<Vec<u8>> {
+    /// [`Self::encrypt`] with only the key provider and format, for callers
+    /// that cannot borrow the storage.
+    fn encrypt_with(keys: &K, write: WriteFormat, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match write {
+            WriteFormat::Whole => Self::encrypt_whole(keys, plaintext),
+            WriteFormat::Segmented => {
+                let key = keys.current_key();
+                segmented::encrypt(
+                    key.expose_secret(),
+                    key.id(),
+                    segmented::DEFAULT_SEGMENT_LOG2,
+                    plaintext,
+                )
+            }
+        }
+    }
+
+    /// A version 1 envelope: one AES-GCM message over the whole object.
+    fn encrypt_whole(keys: &K, plaintext: &[u8]) -> Result<Vec<u8>> {
         let key = keys.current_key();
 
         // Create cipher from key
@@ -165,6 +200,26 @@ where
     /// [`Self::decrypt`] with only the key provider, for callers that cannot
     /// borrow the storage.
     fn decrypt_with(keys: &K, envelope: &[u8]) -> Result<Vec<u8>> {
+        if envelope_version(envelope)? == segmented::VERSION {
+            return Self::object_key(keys, envelope)?.decrypt(envelope);
+        }
+        let plaintext = Self::decrypt_whole(keys, envelope)?;
+        crate::stats::v1_object_decrypted(plaintext.len());
+        Ok(plaintext)
+    }
+
+    /// A segmented envelope's object key, under the master key its header
+    /// names.
+    fn object_key(keys: &K, envelope: &[u8]) -> Result<segmented::ObjectKey> {
+        let header = segmented::Header::parse(envelope)?;
+        let key = keys
+            .key_by_id(header.key_id)
+            .ok_or_else(|| EncryptionError::unknown_key_id(header.key_id))?;
+        Ok(segmented::ObjectKey::derive(key.expose_secret(), header))
+    }
+
+    /// A version 1 envelope's plaintext.
+    fn decrypt_whole(keys: &K, envelope: &[u8]) -> Result<Vec<u8>> {
         // Parse and validate header
         let header = parse_header(envelope)?;
 
@@ -198,6 +253,60 @@ where
     }
 }
 
+/// The envelope new writes use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteFormat {
+    /// Version 1, one AES-GCM message per object.
+    Whole,
+    /// Version 2, segments of the default size.
+    Segmented,
+}
+
+/// A local segmented envelope read by range: the ciphertext stays as the
+/// inner storage served it (a mapping, for a large file), and only the
+/// segments a read touches are decrypted.
+struct SegmentedSource {
+    envelope: fluree_db_core::ContentBytes,
+    key: segmented::ObjectKey,
+    identity: u128,
+}
+
+impl Debug for SegmentedSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegmentedSource")
+            .field("envelope", &self.envelope)
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+impl fluree_db_core::RangeSource for SegmentedSource {
+    fn len(&self) -> u64 {
+        self.key.header().plaintext_len()
+    }
+
+    fn read_range(&self, range: std::ops::Range<u64>) -> fluree_db_core::error::Result<Vec<u8>> {
+        self.key
+            .read_range(&self.envelope, range)
+            .map_err(Into::into)
+    }
+
+    fn read_unit(&self) -> u64 {
+        self.key.header().segment_size()
+    }
+
+    /// The ciphertext as it is held, plus the expanded key.
+    fn cache_weight(&self) -> usize {
+        self.envelope.cache_weight() + std::mem::size_of::<segmented::ObjectKey>()
+    }
+
+    /// This storage instance and this envelope: its header carries the
+    /// salt drawn for each encryption.
+    fn cache_identity(&self) -> u128 {
+        self.identity
+    }
+}
+
 // Debug impl that doesn't expose key material
 impl<S: Debug, K> Debug for EncryptedStorage<S, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -214,6 +323,8 @@ impl<S: Clone, K> Clone for EncryptedStorage<S, K> {
         Self {
             inner: self.inner.clone(),
             keys: Arc::clone(&self.keys),
+            context: self.context,
+            write: self.write,
         }
     }
 }
@@ -246,9 +357,28 @@ where
         self.decrypt(&encrypted).map_err(Into::into)
     }
 
-    // read_byte_range: uses default (full read + slice). AES-GCM encryption
-    // requires decrypting the entire blob — partial range reads on ciphertext
-    // are not meaningful. The default calls read_bytes() → decrypt → slice.
+    /// The whole envelope is fetched either way. A version 1 envelope is
+    /// decrypted whole and sliced; a segmented one decrypts only the segments
+    /// the range touches.
+    async fn read_byte_range(
+        &self,
+        address: &str,
+        range: std::ops::Range<u64>,
+    ) -> fluree_db_core::error::Result<Vec<u8>> {
+        if range.start >= range.end {
+            return Ok(Vec::new());
+        }
+        let envelope = self.inner.read_bytes(address).await?;
+        if envelope_version(&envelope)? == segmented::VERSION {
+            let key = Self::object_key(&self.keys, &envelope)?;
+            segmented::check_envelope_len(key.header(), envelope.len() as u64)?;
+            return Ok(key.read_range(&envelope, range)?);
+        }
+        let full = self.decrypt(&envelope)?;
+        let start = (range.start as usize).min(full.len());
+        let end = (range.end as usize).min(full.len());
+        Ok(full[start..end].to_vec())
+    }
 
     /// The inner storage's local ciphertext, decrypted. CPU work only, and
     /// the plaintext goes back to the caller, never into a cache file.
@@ -260,6 +390,37 @@ where
             Some(envelope) => Ok(Some(self.decrypt(&envelope)?.into())),
             None => Ok(None),
         }
+    }
+
+    /// A segmented envelope on this machine, read by range. A version 1
+    /// envelope can only be decrypted whole, so it answers `None` and the
+    /// caller reads it through `get_local`.
+    fn get_local_ranged(
+        &self,
+        address: &str,
+    ) -> fluree_db_core::error::Result<Option<Arc<dyn fluree_db_core::RangeSource>>> {
+        let Some(envelope) = self.inner.get_local(address)? else {
+            return Ok(None);
+        };
+        if envelope_version(&envelope)? != segmented::VERSION {
+            return Ok(None);
+        }
+        let key = Self::object_key(&self.keys, &envelope)?;
+        segmented::check_envelope_len(key.header(), envelope.len() as u64)?;
+        let identity = {
+            use sha2::Digest;
+            let digest = sha2::Sha256::new()
+                .chain_update(b"fluree-db/segment-cache")
+                .chain_update(self.context)
+                .chain_update(&envelope[..segmented::HEADER_LEN])
+                .finalize();
+            u128::from_le_bytes(digest[..16].try_into().expect("16 of 32 bytes"))
+        };
+        Ok(Some(Arc::new(SegmentedSource {
+            envelope,
+            key,
+            identity,
+        })))
     }
 
     async fn exists(&self, address: &str) -> fluree_db_core::error::Result<bool> {
@@ -316,7 +477,7 @@ where
             Err(fluree_db_core::error::Error::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        match crate::envelope::key_id_of_header(&prefix) {
+        match key_id_of_header(&prefix) {
             Ok(id) => Ok(Some(id)),
             // Not an envelope: plaintext left by an unencrypted run, or a
             // nameservice record. Reported, never rewritten.
@@ -327,9 +488,8 @@ where
 
     async fn reencrypt(&self, address: &str) -> fluree_db_core::error::Result<Option<u64>> {
         let envelope = self.inner.read_bytes(address).await?;
-        let header = parse_header(&envelope)?;
         let current = self.keys.current_key();
-        if header.key_id == current.id() {
+        if key_id_of_header(&envelope)? == current.id() {
             return Ok(None);
         }
         let plaintext = self.decrypt(&envelope)?;
@@ -339,8 +499,7 @@ where
         // Read back through the same path a reader takes: the write must
         // decrypt under the current key to exactly what was there before.
         let check = self.inner.read_bytes(address).await?;
-        let check_header = parse_header(&check)?;
-        if check_header.key_id != current.id() || self.decrypt(&check)? != plaintext {
+        if key_id_of_header(&check)? != current.id() || self.decrypt(&check)? != plaintext {
             return Err(fluree_db_core::error::Error::storage(format!(
                 "re-encryption of {address} did not read back under the current key"
             )));
@@ -503,6 +662,7 @@ mod nameservice_impls {
         {
             // The closure may run off this task, so it owns its keys.
             let keys = Arc::clone(&self.keys);
+            let write = self.write;
             self.inner
                 .compare_and_swap(address, move |current_encrypted| {
                     // Decrypt current value if present
@@ -516,7 +676,7 @@ mod nameservice_impls {
                     let current_ref = current_plaintext.as_deref();
                     match f(current_ref)? {
                         CasAction::Write(plaintext) => {
-                            let encrypted = Self::encrypt_with(&keys, &plaintext)
+                            let encrypted = Self::encrypt_with(&keys, write, &plaintext)
                                 .map_err(|e| StorageExtError::other(e.to_string()))?;
                             Ok(CasAction::Write(encrypted))
                         }
@@ -587,6 +747,162 @@ mod tests {
             other_key.get_local("test/data").is_err(),
             "a local copy that fails to decrypt is an error, not a miss"
         );
+    }
+
+    /// Mixed versions on one store: a version 1 envelope reads as before and
+    /// has no ranged source; a segmented one serves ranges that match a full
+    /// read, through both the local source and `read_byte_range`.
+    #[tokio::test]
+    async fn segmented_and_whole_envelopes_read_side_by_side() {
+        let storage = MemoryStorage::new();
+        let encrypted = EncryptedStorage::new(storage.clone(), test_provider());
+        let plain: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+
+        encrypted.write_bytes("seg", &plain).await.unwrap();
+        let raw = storage.read_bytes("seg").await.unwrap();
+        assert_eq!(raw[4], segmented::VERSION, "new writes are segmented");
+        let v1 = EncryptedStorage::<MemoryStorage, StaticKeyProvider>::encrypt_whole(
+            &encrypted.keys,
+            &plain,
+        )
+        .unwrap();
+        storage.write_bytes("whole", &v1).await.unwrap();
+
+        for address in ["seg", "whole"] {
+            assert_eq!(encrypted.read_bytes(address).await.unwrap(), plain);
+            assert_eq!(encrypted.get_local(address).unwrap().unwrap(), plain);
+            assert_eq!(
+                encrypted
+                    .read_byte_range(address, 70_000..140_123)
+                    .await
+                    .unwrap(),
+                plain[70_000..140_123]
+            );
+        }
+        assert!(encrypted.get_local_ranged("whole").unwrap().is_none());
+        assert!(encrypted.get_local_ranged("absent").unwrap().is_none());
+
+        let source = encrypted.get_local_ranged("seg").unwrap().expect("ranged");
+        assert_eq!(source.len(), plain.len() as u64);
+        assert_eq!(source.read_unit(), 1 << segmented::DEFAULT_SEGMENT_LOG2);
+        for range in [0..10, 65_530..65_550, 299_990..u64::MAX, 400_000..400_001] {
+            let end = (range.end as usize).min(plain.len());
+            let start = (range.start as usize).min(end);
+            assert_eq!(source.read_range(range.clone()).unwrap(), plain[start..end]);
+        }
+    }
+
+    /// A cache keyed by source identity serves a reader only what was
+    /// decrypted for that storage and that envelope: re-encryption and a
+    /// second storage over the same bytes both get identities of their own.
+    #[tokio::test]
+    async fn ranged_source_identity_is_scoped_to_storage_and_envelope() {
+        let storage = MemoryStorage::new();
+        let encrypted = EncryptedStorage::new(storage.clone(), test_provider());
+        encrypted.write_bytes("seg", &[1u8; 1000]).await.unwrap();
+        let identity = |s: &EncryptedStorage<MemoryStorage, StaticKeyProvider>| {
+            s.get_local_ranged("seg").unwrap().unwrap().cache_identity()
+        };
+        let first = identity(&encrypted);
+        assert_eq!(identity(&encrypted), first, "stable for one envelope");
+        assert_eq!(
+            identity(&encrypted.clone()),
+            first,
+            "clones share a context"
+        );
+        let other = EncryptedStorage::new(storage.clone(), test_provider());
+        assert_ne!(identity(&other), first, "another storage instance");
+        encrypted.write_bytes("seg", &[1u8; 1000]).await.unwrap();
+        assert_ne!(
+            identity(&encrypted),
+            first,
+            "the same plaintext re-encrypted"
+        );
+    }
+
+    /// A ranged source reads the envelope it opened: replacing the object
+    /// (as re-encryption does) changes nothing for a reader mid-operation.
+    #[tokio::test]
+    async fn a_ranged_source_keeps_the_envelope_it_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = fluree_db_core::FileStorage::new(dir.path());
+        let encrypted = EncryptedStorage::new(file, test_provider());
+        let address = "fluree:file://blob";
+        let first = vec![1u8; 200_000];
+        encrypted.write_bytes(address, &first).await.unwrap();
+        let source = encrypted
+            .get_local_ranged(address)
+            .unwrap()
+            .expect("ranged");
+
+        encrypted
+            .write_bytes(address, &[2u8; 200_000])
+            .await
+            .unwrap();
+        assert_eq!(source.read_range(100_000..100_010).unwrap(), [1u8; 10]);
+        assert_eq!(
+            encrypted.read_byte_range(address, 0..3).await.unwrap(),
+            [2u8; 3]
+        );
+    }
+
+    /// A local copy that fails to decrypt is an error, never a miss: a
+    /// wrong key, and a segment corrupted under a range read.
+    #[tokio::test]
+    async fn ranged_reads_fail_loudly() {
+        let storage = MemoryStorage::new();
+        let encrypted = EncryptedStorage::new(storage.clone(), test_provider());
+        encrypted.write_bytes("seg", &[7u8; 100_000]).await.unwrap();
+
+        let other_key = EncryptedStorage::new(
+            storage.clone(),
+            StaticKeyProvider::new(EncryptionKey::new([0x02; 32], 1)),
+        );
+        let source = other_key.get_local_ranged("seg").unwrap().expect("opens");
+        assert!(source.read_range(0..10).is_err());
+        let unknown = EncryptedStorage::new(
+            storage.clone(),
+            StaticKeyProvider::new(EncryptionKey::new([0x42; 32], 9)),
+        );
+        assert!(unknown.get_local_ranged("seg").is_err(), "unknown key id");
+
+        let mut raw = storage.read_bytes("seg").await.unwrap();
+        raw[segmented::HEADER_LEN + 70_000] ^= 1;
+        storage.write_bytes("seg", &raw).await.unwrap();
+        let source = encrypted.get_local_ranged("seg").unwrap().expect("opens");
+        assert_eq!(source.read_range(0..10).unwrap(), [7u8; 10]);
+        assert!(source.read_range(69_990..70_010).is_err());
+        assert!(encrypted.read_bytes("seg").await.is_err());
+
+        raw.truncate(raw.len() - 1);
+        storage.write_bytes("seg", &raw).await.unwrap();
+        assert!(
+            encrypted.get_local_ranged("seg").is_err(),
+            "a truncated envelope does not open"
+        );
+    }
+
+    /// Rotation re-envelopes segmented objects and reports them by key.
+    #[tokio::test]
+    async fn rotation_rewrites_a_segmented_envelope() {
+        let storage = MemoryStorage::new();
+        let old = || EncryptionKey::new([0x11; 32], 1);
+        let new = EncryptionKey::new([0x22; 32], 2);
+        let writer = EncryptedStorage::new(
+            storage.clone(),
+            crate::MultiKeyProvider::new(vec![old()], 1).unwrap(),
+        );
+        writer.write_bytes("seg", &[5u8; 70_000]).await.unwrap();
+
+        let rotating = EncryptedStorage::new(
+            storage.clone(),
+            crate::MultiKeyProvider::new(vec![old(), new], 2).unwrap(),
+        );
+        assert_eq!(rotating.key_id_at("seg").await.unwrap(), Some(1));
+        assert_eq!(rotating.reencrypt("seg").await.unwrap(), Some(70_000));
+        assert_eq!(rotating.key_id_at("seg").await.unwrap(), Some(2));
+        assert_eq!(rotating.reencrypt("seg").await.unwrap(), None);
+        assert_eq!(rotating.read_bytes("seg").await.unwrap(), vec![5u8; 70_000]);
     }
 
     #[tokio::test]

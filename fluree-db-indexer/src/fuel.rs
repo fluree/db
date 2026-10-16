@@ -149,6 +149,13 @@ impl ContentStore for MeteredContentStore {
         self.inner.get_local(id)
     }
 
+    fn get_local_ranged(
+        &self,
+        id: &ContentId,
+    ) -> StorageResult<Option<std::sync::Arc<dyn fluree_db_core::RangeSource>>> {
+        self.inner.get_local_ranged(id)
+    }
+
     fn supports_ranged_reads(&self) -> bool {
         self.inner.supports_ranged_reads()
     }
