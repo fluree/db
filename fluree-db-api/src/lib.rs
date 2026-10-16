@@ -1652,12 +1652,28 @@ fn default_indexing_builder_config() -> IndexingBuilderConfig {
     }
 }
 
+/// The leaflet cache for `config`'s budget. On encrypted storage the budget
+/// also holds the dictionary allowance, packs decrypted whole.
 fn make_leaflet_cache(
     config: &fluree_db_connection::ConnectionConfig,
+    backend: &StorageBackend,
 ) -> std::sync::Arc<fluree_db_binary_index::LeafletCache> {
-    std::sync::Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(
-        config.cache.max_mb as u64,
-    ))
+    const MB: u64 = 1024 * 1024;
+    let budget = (config.cache.max_mb as u64).saturating_mul(MB);
+    let encrypted = backend
+        .admin_storage()
+        .is_some_and(|storage| storage.encryption_admin().is_some());
+    std::sync::Arc::new(if encrypted {
+        fluree_db_binary_index::LeafletCache::for_decrypting_storage(
+            budget,
+            config
+                .cache
+                .dictionary_max_mb
+                .map(|mb| (mb as u64).saturating_mul(MB)),
+        )
+    } else {
+        fluree_db_binary_index::LeafletCache::with_max_bytes(budget)
+    })
 }
 
 /// Build a `RemoteServiceExecutor` from the connection registry, if any connections are registered.
@@ -2216,7 +2232,16 @@ impl FlureeBuilder {
     /// By default, cache size is calculated automatically based on 50% of
     /// available system memory. Use this method to override with a specific MB limit.
     pub fn cache_max_mb(mut self, max_mb: usize) -> Self {
-        self.config.cache = fluree_db_connection::CacheConfig::with_max_mb(max_mb);
+        self.config.cache.max_mb = max_mb;
+        self
+    }
+
+    /// On encrypted storage, set how many MB of the cache budget forward
+    /// dictionary packs may hold decrypted whole; the leaflet cache gets the
+    /// rest. By default it is 60% of the budget. Unencrypted storage holds no
+    /// pack decrypted, so gives the cache all of it.
+    pub fn cache_dictionary_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.cache.dictionary_max_mb = Some(max_mb);
         self
     }
 
@@ -3255,7 +3280,7 @@ impl FlureeBuilder {
         } = parts;
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let backend = with_artifact_cache(backend, ledger_cache_config.as_ref());
-        let leaflet_cache = make_leaflet_cache(&config);
+        let leaflet_cache = make_leaflet_cache(&config, &backend);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
         // Register SPARQL lowering hooks for f:sparql policy queries and
@@ -3675,7 +3700,7 @@ impl Fluree {
         backend: StorageBackend,
         nameservice: NameServiceMode,
     ) -> Self {
-        let leaflet_cache = make_leaflet_cache(&config);
+        let leaflet_cache = make_leaflet_cache(&config, &backend);
         Self {
             config,
             backend: with_artifact_cache(backend, None),

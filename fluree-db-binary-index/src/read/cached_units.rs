@@ -20,14 +20,6 @@ use fluree_db_core::RangeSource;
 
 use super::leaflet_cache::{LeafletCache, SourceUnitKey};
 
-/// Experiment control for the segmented-envelope A/B, not a supported
-/// configuration: `FLUREE_ENCRYPTED_SEGMENT_CACHE=0` reads ranged sources
-/// without keeping their units.
-pub(crate) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLUREE_ENCRYPTED_SEGMENT_CACHE").map_or(true, |v| v != "0"))
-}
-
 /// Units one open [`UnitMemoScope`] keeps on its thread.
 const MEMO_UNITS: usize = 8;
 
@@ -127,8 +119,7 @@ fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
 /// The read unit of a default segmented envelope.
 pub const DEFAULT_UNIT: u64 = 64 * 1024;
 
-/// An epoch that advances each time `period` units of something have been
-/// counted: bytes missed, or lookups.
+/// An epoch that advances each time `period` bytes have been counted.
 pub struct Epochs {
     epoch: AtomicU64,
     since: AtomicU64,
@@ -161,24 +152,15 @@ impl Epochs {
             return;
         }
         let period = self.period;
-        while self
+        if let Ok(since) = self
             .since
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
-                s.checked_sub(period)
+                (s >= period).then_some(s % period)
             })
-            .is_ok()
         {
-            self.epoch.fetch_add(1, Ordering::Relaxed);
+            self.epoch.fetch_add(since / period, Ordering::Relaxed);
         }
     }
-}
-
-/// The clocks recent demand ages by, shared by every meter of an allowance:
-/// rent halves for each `rent` epoch (bytes missed across all its packs),
-/// lookups for each `lookups` epoch.
-pub struct DemandClocks {
-    pub rent: Epochs,
-    pub lookups: Epochs,
 }
 
 /// A count that halves for each epoch of its clock it ages through.
@@ -223,8 +205,8 @@ impl Aging {
 
 /// What reading a source cost on cache misses since the meter was last
 /// reset: bytes read from the source, and the distinct units they covered.
-/// Units served from the cache or a scope's memo are not counted. With
-/// clocks, also its recent demand: lookups, and bytes missed, each aging.
+/// Units served from the cache or a scope's memo are not counted. With a
+/// rent clock, also its recent rent: bytes missed, aging by the clock.
 pub struct MissMeter {
     bytes: AtomicU64,
     units: Box<[AtomicU64]>,
@@ -234,13 +216,10 @@ pub struct MissMeter {
     crossed: std::sync::atomic::AtomicBool,
     /// Times the metered source has been promoted whole.
     promotions: AtomicU64,
-    clocks: Option<Arc<DemandClocks>>,
+    rent_clock: Option<Arc<Epochs>>,
     recent_rent: Aging,
-    recent_lookups: Aging,
     /// Why the source was last not promoted, for diagnostics.
     reason: std::sync::atomic::AtomicU8,
-    /// The lookup epoch it was last weighed for admission in, plus one.
-    weighed_at: AtomicU64,
 }
 
 impl MissMeter {
@@ -251,17 +230,15 @@ impl MissMeter {
             covered: AtomicU64::new(0),
             crossed: std::sync::atomic::AtomicBool::new(false),
             promotions: AtomicU64::new(0),
-            clocks: None,
+            rent_clock: None,
             recent_rent: Aging::new(),
-            recent_lookups: Aging::new(),
             reason: std::sync::atomic::AtomicU8::new(0),
-            weighed_at: AtomicU64::new(0),
         }
     }
 
-    /// Track recent demand by `clocks`.
-    pub fn with_clocks(mut self, clocks: Arc<DemandClocks>) -> Self {
-        self.clocks = Some(clocks);
+    /// Age recent rent by `clock`, which every miss also advances.
+    pub fn with_rent_clock(mut self, clock: Arc<Epochs>) -> Self {
+        self.rent_clock = Some(clock);
         self
     }
 
@@ -273,32 +250,17 @@ impl MissMeter {
                 self.covered.fetch_add(bytes as u64, Ordering::Relaxed);
             }
         }
-        if let Some(clocks) = &self.clocks {
-            self.recent_rent.add(clocks.rent.epoch(), bytes as u64);
-            clocks.rent.count(bytes as u64);
-        }
-    }
-
-    /// Count a lookup, whether served whole or by range.
-    pub fn note_lookup(&self) {
-        if let Some(clocks) = &self.clocks {
-            self.recent_lookups.add(clocks.lookups.epoch(), 1);
-            clocks.lookups.count(1);
+        if let Some(clock) = &self.rent_clock {
+            self.recent_rent.add(clock.epoch(), bytes as u64);
+            clock.count(bytes as u64);
         }
     }
 
     /// Bytes missed recently: halved for each rent epoch since.
     pub fn recent_rent(&self) -> u64 {
-        self.clocks
+        self.rent_clock
             .as_ref()
-            .map_or(0, |c| self.recent_rent.get(c.rent.epoch()))
-    }
-
-    /// Lookups recently: halved for each lookup epoch since.
-    pub fn recent_lookups(&self) -> u64 {
-        self.clocks
-            .as_ref()
-            .map_or(0, |c| self.recent_lookups.get(c.lookups.epoch()))
+            .map_or(0, |c| self.recent_rent.get(c.epoch()))
     }
 
     pub fn reason(&self) -> u8 {
@@ -309,13 +271,6 @@ impl MissMeter {
         if self.reason.load(Ordering::Relaxed) != reason {
             self.reason.store(reason, Ordering::Relaxed);
         }
-    }
-
-    /// `true` at most once per lookup epoch: whether to weigh the source
-    /// for admission now.
-    pub fn weigh_now(&self) -> bool {
-        let now = self.clocks.as_ref().map_or(0, |c| c.lookups.epoch()) + 1;
-        self.weighed_at.swap(now, Ordering::Relaxed) != now
     }
 
     pub fn bytes(&self) -> u64 {
@@ -349,11 +304,9 @@ impl MissMeter {
         self.promotions.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Start a new rental: the rent so far, recent rent included, is
-    /// spent. Recent lookups carry on.
+    /// Start a new rental: the rent so far, recent rent included, is spent.
     pub fn reset(&self) {
         self.recent_rent.value.store(0, Ordering::Relaxed);
-        self.weighed_at.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
         self.covered.store(0, Ordering::Relaxed);
         self.crossed.store(false, Ordering::Relaxed);
@@ -862,6 +815,24 @@ mod tests {
 
     /// The meter counts what cache misses read, once per miss: not cache
     /// hits, not memo hits, and a unit read again after eviction again.
+    /// The clock advances one epoch per period counted, however the counts
+    /// fall, a large count crossing several at once.
+    #[test]
+    fn the_rent_clock_advances_an_epoch_per_period() {
+        let clock = Epochs::new(10);
+        clock.count(9);
+        assert_eq!(clock.epoch(), 0);
+        clock.count(1);
+        assert_eq!(clock.epoch(), 1);
+        clock.count(35);
+        assert_eq!((clock.epoch(), clock.counted()), (4, 45));
+        clock.count(5);
+        assert_eq!(clock.epoch(), 5);
+        let fine = Epochs::new(1);
+        fine.count(64 * 1024);
+        assert_eq!(fine.epoch(), 64 * 1024);
+    }
+
     #[test]
     fn the_meter_counts_cache_misses_only() {
         let cache = Arc::new(LeafletCache::with_max_mb(4));

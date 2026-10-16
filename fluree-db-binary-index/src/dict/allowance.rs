@@ -1,14 +1,12 @@
-//! The memory forward dictionary packs may hold decrypted whole.
+//! The memory forward dictionary packs of stores that decrypt on read may
+//! hold decrypted whole.
 //!
-//! Two experiment policies draw on it. First-come ([`DictionaryAllowance::hold`]):
-//! a pack is held whole for its readers' lifetime if its size can be reserved
-//! when it is opened. Adaptive ([`DictionaryAllowance::promote`]): the
-//! allowance owns whole packs and evicts them in clock order to admit
-//! others; readers hold one only for a lookup.
-//!
-//! Either way a pack's bytes stay charged until the last reference drops,
-//! and readers of the same object — snapshots, reloads, ledgers on the same
-//! storage — share one copy, charged once.
+//! A pack is read by range until its recent ranged misses have decrypted its
+//! size and covered enough of it; then it is promoted into the allowance,
+//! which evicts packs in clock order to admit it. Readers hold a promoted
+//! pack only for a lookup. A pack's bytes stay charged until the last
+//! reference drops, and readers of the same object — snapshots, reloads,
+//! ledgers on the same storage — share one copy, charged once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -16,79 +14,25 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-/// Experiment control for the segmented-envelope A/B, not a supported
-/// configuration: `FLUREE_DICT_ALLOWANCE_MB`, unbounded when unset.
-pub(crate) fn allowance_from_env() -> u64 {
-    std::env::var("FLUREE_DICT_ALLOWANCE_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(u64::MAX, |mb| mb.saturating_mul(1024 * 1024))
-}
+use crate::read::cached_units::{Epochs, MissMeter};
 
-/// Experiment control: `FLUREE_DICT_PACK_ALLOC=mmap` backs promoted packs
-/// with anonymous mappings of their own instead of the heap.
-pub(crate) fn mapped_from_env() -> bool {
-    std::env::var("FLUREE_DICT_PACK_ALLOC").is_ok_and(|v| v == "mmap")
-}
-
-/// How the adaptive pool admits packs. Experiment control:
-/// `FLUREE_DICT_ADMISSION=recent|recent-compare|demand`; coverage otherwise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admission {
-    /// A pack whose rent since it was last whole has reached its size, and
-    /// whose misses have covered enough of it, evicting in clock order.
-    Coverage,
-    /// As `Coverage`, with the rent recent: halving each time all packs
-    /// together have missed the allowance's size.
-    Recent,
-    /// As `Recent`, evicting the clock's victims only when the candidate's
-    /// recent lookups are at least [`OUTWEIGH`] times theirs together.
-    RecentCompared,
-    /// A pack whose recent rent has reached its size, evicting the least
-    /// recently demanded packs, and only when its recent lookups clearly
-    /// outweigh theirs.
-    Demand,
-}
-
-pub(crate) fn admission_from_env() -> Admission {
-    match std::env::var("FLUREE_DICT_ADMISSION").as_deref() {
-        Ok("recent") => Admission::Recent,
-        Ok("recent-compare") => Admission::RecentCompared,
-        Ok("demand") => Admission::Demand,
-        _ => Admission::Coverage,
-    }
-}
-
-/// Experiment control: `FLUREE_DICT_DEMAND_LOOKUPS`, lookups per halving
-/// of recent lookups; by default four per unit the allowance holds.
-pub(crate) fn demand_period_from_env() -> Option<u64> {
-    std::env::var("FLUREE_DICT_DEMAND_LOOKUPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-}
-
-/// How many times the recent lookups of the packs it would evict a
-/// candidate's must reach.
-const OUTWEIGH: u64 = 2;
-
-/// Why a pack was last not promoted (`MissMeter::reason`).
+/// Why a pack was last not promoted (`MissMeter::reason`). The values are
+/// reported, so a retired reason's (3) is not reused.
 pub mod reject {
     pub const NONE: u8 = 0;
-    /// Its rent, or recent rent, is short of its size.
+    /// Its recent rent is short of its size.
     pub const RENT: u8 = 1;
     /// Its rent has not covered enough of it.
     pub const COVERAGE: u8 = 2;
-    /// The packs it would evict are in comparable demand.
-    pub const OUTWEIGHED: u8 = 3;
     /// What evicting would free is not enough, or still held by readers.
     pub const NO_ROOM: u8 = 4;
     pub const BUSY: u8 = 5;
     pub const TOO_LARGE: u8 = 6;
 }
 
-/// A promoted pack's bytes: on the heap, or in an anonymous mapping of its
-/// own whose memory goes back to the system when it is dropped, whatever the
-/// allocator would keep.
+/// A promoted pack's bytes: in an anonymous mapping of its own, whose memory
+/// goes back to the system when it is dropped whatever the allocator would
+/// keep; on the heap where there are no mappings, or nothing to map.
 enum PackBuf {
     Heap(Box<[u8]>),
     #[cfg(not(target_arch = "wasm32"))]
@@ -96,12 +40,11 @@ enum PackBuf {
 }
 
 impl PackBuf {
-    fn zeroed(len: usize, mapped: bool) -> io::Result<Self> {
+    fn zeroed(len: usize) -> io::Result<Self> {
         #[cfg(not(target_arch = "wasm32"))]
-        if mapped && len > 0 {
+        if len > 0 {
             return memmap2::MmapMut::map_anon(len).map(PackBuf::Mapped);
         }
-        let _ = mapped;
         Ok(PackBuf::Heap(vec![0u8; len].into_boxed_slice()))
     }
 
@@ -147,17 +90,13 @@ fn snapshot<const N: usize>(h: &[AtomicU64; N]) -> [u64; N] {
 
 pub struct DictionaryAllowance {
     capacity: u64,
-    /// Promoted packs live in anonymous mappings rather than on the heap.
-    mapped: bool,
-    admission: Admission,
-    clocks: Arc<crate::read::cached_units::DemandClocks>,
+    /// Advanced by bytes missed across all metered packs: recent rent halves
+    /// each time they together miss the allowance's size.
+    rent_clock: Arc<Epochs>,
     state: Mutex<State>,
     /// Bumped whenever the pool admits or evicts a pack, so a reader that
     /// found its pack absent knows when to look again.
     generation: AtomicU64,
-    admitted: AtomicU64,
-    declined: AtomicU64,
-    shared: AtomicU64,
     released: AtomicU64,
     promoted: AtomicU64,
     promoted_bytes: AtomicU64,
@@ -177,7 +116,6 @@ pub struct DictionaryAllowance {
     evicted_bytes: AtomicU64,
     busy: AtomicU64,
     no_room: AtomicU64,
-    outweighed: AtomicU64,
     too_large: AtomicU64,
     repromoted: AtomicU64,
     repromoted_bytes: AtomicU64,
@@ -185,12 +123,10 @@ pub struct DictionaryAllowance {
 
 #[derive(Default)]
 struct State {
-    /// Every byte charged: first-come holds, the pool's packs, packs it
-    /// evicted that a reader still holds, and promotions in flight.
+    /// Every byte charged: the pool's packs, packs it evicted that a reader
+    /// still holds, and promotions in flight.
     used: u64,
     peak: u64,
-    /// First-come holds.
-    held: HashMap<u128, Weak<HeldPack>>,
     /// The pool's packs, and their clock order.
     resident: HashMap<u128, Arc<HeldPack>>,
     clock: VecDeque<u128>,
@@ -204,7 +140,7 @@ struct State {
 
 /// A pack's rent meter, held weakly, with what a report names it by.
 struct MeterEntry {
-    meter: Weak<crate::read::cached_units::MissMeter>,
+    meter: Weak<MissMeter>,
     len: u64,
     kind: u8,
 }
@@ -220,8 +156,7 @@ pub struct PackReport {
     pub covered: u64,
     pub promotions: u64,
     pub resident: bool,
-    /// Recent lookups and recent rent, each aging.
-    pub recent_lookups: u64,
+    /// Bytes missed recently, aging.
     pub recent_rent: u64,
     /// Why it was last not promoted ([`reject`]).
     pub reason: u8,
@@ -240,10 +175,6 @@ pub struct AllowanceStats {
     pub capacity: u64,
     pub used: u64,
     pub peak: u64,
-    pub packs: u64,
-    pub admitted: u64,
-    pub declined: u64,
-    pub shared: u64,
     pub released: u64,
     pub resident_packs: u64,
     pub resident_bytes: u64,
@@ -262,15 +193,13 @@ pub struct AllowanceStats {
     pub evicted_served: [u64; SERVED_BUCKETS],
     pub evicted: u64,
     pub evicted_bytes: u64,
-    /// Promotions turned away: another in flight, no room yet, the packs
-    /// they would evict in comparable demand, larger than the allowance.
+    /// Promotions turned away: another in flight, no room yet, larger than
+    /// the allowance.
     pub busy: u64,
     pub no_room: u64,
-    pub outweighed: u64,
     pub too_large: u64,
-    /// The demand clocks' epochs, and the bytes the rent clock has counted.
+    /// The rent clock's epoch, and the bytes it has counted.
     pub rent_epoch: u64,
-    pub lookup_epoch: u64,
     pub rent_counted: u64,
     /// Promotions of a pack promoted before, and so evicted since.
     pub repromoted: u64,
@@ -283,7 +212,6 @@ pub struct AllowanceStats {
 /// returns its bytes to it.
 pub struct HeldPack {
     bytes: PackBuf,
-    identity: u128,
     allowance: Weak<DictionaryAllowance>,
     /// Clock reference bit: set on use, cleared as the hand passes.
     referenced: AtomicBool,
@@ -340,8 +268,6 @@ pub enum Promotion {
     /// Not enough room yet: what eviction freed is still held by readers,
     /// or the pool holds too little to make room.
     NoRoom,
-    /// The packs it would evict are in comparable recent demand.
-    Outweighed,
     /// Larger than the whole allowance.
     TooLarge,
 }
@@ -353,7 +279,6 @@ impl Promotion {
             Promotion::Promoted(_) | Promotion::Resident(_) => reject::NONE,
             Promotion::Busy => reject::BUSY,
             Promotion::NoRoom => reject::NO_ROOM,
-            Promotion::Outweighed => reject::OUTWEIGHED,
             Promotion::TooLarge => reject::TOO_LARGE,
         }
     }
@@ -371,56 +296,29 @@ impl Drop for HeldPack {
         let Some(allowance) = self.allowance.upgrade() else {
             return;
         };
-        let mut state = allowance.lock();
-        state.used -= self.bytes.len() as u64;
-        // A later hold of the same object may already have replaced this
-        // entry; only remove our own.
-        if state
-            .held
-            .get(&self.identity)
-            .is_some_and(|w| std::ptr::eq(w.as_ptr(), self))
-        {
-            state.held.remove(&self.identity);
-        }
+        allowance.lock().used -= self.bytes.len() as u64;
         allowance.released.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 impl DictionaryAllowance {
     pub fn new(capacity: u64) -> Arc<Self> {
-        Self::with_backing(capacity, false)
+        Self::aging_every(capacity, capacity)
     }
 
-    /// An allowance whose promoted packs live in anonymous mappings when
-    /// `mapped`, on the heap otherwise.
-    pub fn with_backing(capacity: u64, mapped: bool) -> Arc<Self> {
-        Self::with_policy(capacity, mapped, Admission::Coverage, None)
+    /// An allowance whose recent rent halves every `period` bytes missed
+    /// rather than every `capacity` (tests: `u64::MAX` never ages it).
+    #[cfg(test)]
+    pub(crate) fn with_rent_period(capacity: u64, period: u64) -> Arc<Self> {
+        Self::aging_every(capacity, period)
     }
 
-    /// An allowance admitting by `admission`; recent lookups halve every
-    /// `demand_period` lookups, by default four per unit it holds.
-    pub fn with_policy(
-        capacity: u64,
-        mapped: bool,
-        admission: Admission,
-        demand_period: Option<u64>,
-    ) -> Arc<Self> {
-        let demand_period = demand_period.unwrap_or_else(|| {
-            (capacity / crate::read::cached_units::DEFAULT_UNIT).saturating_mul(4)
-        });
+    fn aging_every(capacity: u64, period: u64) -> Arc<Self> {
         Arc::new(Self {
             capacity,
-            mapped,
-            admission,
-            clocks: Arc::new(crate::read::cached_units::DemandClocks {
-                rent: crate::read::cached_units::Epochs::new(capacity),
-                lookups: crate::read::cached_units::Epochs::new(demand_period),
-            }),
+            rent_clock: Arc::new(Epochs::new(period)),
             state: Mutex::default(),
             generation: AtomicU64::new(0),
-            admitted: AtomicU64::new(0),
-            declined: AtomicU64::new(0),
-            shared: AtomicU64::new(0),
             released: AtomicU64::new(0),
             promoted: AtomicU64::new(0),
             promoted_bytes: AtomicU64::new(0),
@@ -436,7 +334,6 @@ impl DictionaryAllowance {
             evicted_bytes: AtomicU64::new(0),
             busy: AtomicU64::new(0),
             no_room: AtomicU64::new(0),
-            outweighed: AtomicU64::new(0),
             too_large: AtomicU64::new(0),
             repromoted: AtomicU64::new(0),
             repromoted_bytes: AtomicU64::new(0),
@@ -447,32 +344,13 @@ impl DictionaryAllowance {
         self.capacity
     }
 
-    pub fn admission(&self) -> Admission {
-        self.admission
-    }
-
-    /// Whether admission weighs packs' recent lookups, which then need
-    /// counting.
-    pub fn counts_lookups(&self) -> bool {
-        matches!(
-            self.admission,
-            Admission::RecentCompared | Admission::Demand
-        )
-    }
-
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
     /// The rent meter of the pack `identity` — `len` bytes in `units`
     /// units, of dictionary `kind` — shared by all its readers.
-    pub fn meter(
-        &self,
-        identity: u128,
-        units: u64,
-        len: u64,
-        kind: u8,
-    ) -> Arc<crate::read::cached_units::MissMeter> {
+    pub fn meter(&self, identity: u128, units: u64, len: u64, kind: u8) -> Arc<MissMeter> {
         let mut state = self.lock();
         if let Some(meter) = state.meters.get(&identity).and_then(|e| e.meter.upgrade()) {
             return meter;
@@ -481,9 +359,7 @@ impl DictionaryAllowance {
             state.meters.retain(|_, e| e.meter.strong_count() > 0);
             state.meters_pruned_at = state.meters.len();
         }
-        let meter = Arc::new(
-            crate::read::cached_units::MissMeter::new(units).with_clocks(Arc::clone(&self.clocks)),
-        );
+        let meter = Arc::new(MissMeter::new(units).with_rent_clock(Arc::clone(&self.rent_clock)));
         state.meters.insert(
             identity,
             MeterEntry {
@@ -510,7 +386,6 @@ impl DictionaryAllowance {
                     covered: meter.covered(),
                     promotions: meter.promotions(),
                     resident: state.resident.contains_key(identity),
-                    recent_lookups: meter.recent_lookups(),
                     recent_rent: meter.recent_rent(),
                     reason: meter.reason(),
                 })
@@ -546,32 +421,6 @@ impl DictionaryAllowance {
         covered: u64,
         assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
     ) -> io::Result<Promotion> {
-        self.promote_weighed(identity, len, covered, None, assemble)
-    }
-
-    /// [`Self::promote`], but the packs the clock picks to make room are
-    /// evicted only if `candidate`'s recent lookups are at least
-    /// [`OUTWEIGH`] times theirs together; otherwise they stay, the hand
-    /// having passed.
-    pub fn promote_compared(
-        self: &Arc<Self>,
-        identity: u128,
-        len: u64,
-        covered: u64,
-        candidate: &crate::read::cached_units::MissMeter,
-        assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
-    ) -> io::Result<Promotion> {
-        self.promote_weighed(identity, len, covered, Some(candidate), assemble)
-    }
-
-    fn promote_weighed(
-        self: &Arc<Self>,
-        identity: u128,
-        len: u64,
-        covered: u64,
-        candidate: Option<&crate::read::cached_units::MissMeter>,
-        assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
-    ) -> io::Result<Promotion> {
         let victims = {
             let mut state = self.lock();
             if let Some(pack) = state.resident.get(&identity) {
@@ -584,18 +433,6 @@ impl DictionaryAllowance {
                 return Ok(self.turned_away(Promotion::Busy));
             }
             let chosen = self.clock_victims(&mut state, len);
-            if let Some(candidate) = candidate.filter(|_| !chosen.is_empty()) {
-                let demand: u64 = chosen
-                    .iter()
-                    .map(|id| Self::recent_lookups(&state, *id))
-                    .sum();
-                if candidate.recent_lookups() < demand.saturating_mul(OUTWEIGH) {
-                    for id in chosen.into_iter().rev() {
-                        state.clock.push_front(id);
-                    }
-                    return Ok(self.turned_away(Promotion::Outweighed));
-                }
-            }
             self.evict_all(&mut state, chosen)
         };
         // Dropped outside the lock: a victim no reader holds returns its
@@ -604,79 +441,11 @@ impl DictionaryAllowance {
         self.reserve_and_assemble(identity, len, covered, assemble)
     }
 
-    /// Admit `identity`, `len` bytes, by recent demand. When it does not
-    /// fit beside what is charged, the least recently looked-up packs that
-    /// would make room are evicted for it — only if `candidate`'s recent
-    /// lookups are at least [`OUTWEIGH`] times theirs together. Then as
-    /// [`Self::promote`].
-    pub fn admit(
-        self: &Arc<Self>,
-        identity: u128,
-        len: u64,
-        candidate: &crate::read::cached_units::MissMeter,
-        assemble: impl FnOnce(&mut [u8]) -> io::Result<u64>,
-    ) -> io::Result<Promotion> {
-        let victims = {
-            let mut state = self.lock();
-            if let Some(pack) = state.resident.get(&identity) {
-                return Ok(Promotion::Resident(Arc::clone(pack)));
-            }
-            if len > self.capacity {
-                return Ok(self.turned_away(Promotion::TooLarge));
-            }
-            if state.in_flight.contains(&identity) {
-                return Ok(self.turned_away(Promotion::Busy));
-            }
-            let need = (state.used + len).saturating_sub(self.capacity);
-            let mut victims = Vec::new();
-            if need > 0 {
-                let mut ranked: Vec<(u64, u128, u64)> = state
-                    .resident
-                    .iter()
-                    .map(|(id, pack)| (Self::recent_lookups(&state, *id), *id, pack.len() as u64))
-                    .collect();
-                ranked.sort_unstable();
-                let (mut freed, mut demand, mut chosen) = (0u64, 0u64, Vec::new());
-                for (lookups, id, bytes) in ranked {
-                    if freed >= need {
-                        break;
-                    }
-                    freed += bytes;
-                    demand += lookups;
-                    chosen.push(id);
-                }
-                if freed < need {
-                    return Ok(self.turned_away(Promotion::NoRoom));
-                }
-                if candidate.recent_lookups() < demand.saturating_mul(OUTWEIGH) {
-                    return Ok(self.turned_away(Promotion::Outweighed));
-                }
-                for id in chosen {
-                    victims.push(self.evict(&mut state, id));
-                }
-                self.generation.fetch_add(1, Ordering::AcqRel);
-            }
-            victims
-        };
-        drop(victims);
-        self.reserve_and_assemble(identity, len, candidate.covered(), assemble)
-    }
-
-    /// A pack's recent lookups, by its meter; none once no reader meters it.
-    fn recent_lookups(state: &State, identity: u128) -> u64 {
-        state
-            .meters
-            .get(&identity)
-            .and_then(|e| e.meter.upgrade())
-            .map_or(0, |m| m.recent_lookups())
-    }
-
     /// Count a promotion turned away, and return it.
     fn turned_away(&self, outcome: Promotion) -> Promotion {
         let counter = match outcome {
             Promotion::Busy => &self.busy,
             Promotion::NoRoom => &self.no_room,
-            Promotion::Outweighed => &self.outweighed,
             Promotion::TooLarge => &self.too_large,
             Promotion::Promoted(_) | Promotion::Resident(_) => return outcome,
         };
@@ -707,7 +476,7 @@ impl DictionaryAllowance {
             state.charge(len);
             state.in_flight.insert(identity);
         }
-        let assembled = PackBuf::zeroed(len as usize, self.mapped)
+        let assembled = PackBuf::zeroed(len as usize)
             .and_then(|mut buf| assemble(buf.as_mut()).map(|decrypted| (buf, decrypted)));
         let mut state = self.lock();
         state.in_flight.remove(&identity);
@@ -720,7 +489,6 @@ impl DictionaryAllowance {
         };
         let pack = Arc::new(HeldPack {
             bytes,
-            identity,
             allowance: Arc::downgrade(self),
             referenced: AtomicBool::new(false),
             evicted: AtomicBool::new(false),
@@ -743,9 +511,8 @@ impl DictionaryAllowance {
         Ok(Promotion::Promoted(pack))
     }
 
-    /// The packs the clock would take out of the pool for `len` more bytes
-    /// to fit, giving each referenced pack a second chance; they leave the
-    /// clock but stay resident.
+    /// The packs the clock takes out of the pool for `len` more bytes to
+    /// fit, giving each referenced pack a second chance.
     fn clock_victims(&self, state: &mut State, len: u64) -> Vec<u128> {
         let mut need = (state.used + len).saturating_sub(self.capacity);
         let mut chosen = Vec::new();
@@ -802,63 +569,6 @@ impl DictionaryAllowance {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The object `identity` of `len` bytes held whole: the copy another
-    /// reader already holds, or `load`ed within the allowance. `None` when
-    /// it does not fit beside what is held.
-    pub fn hold(
-        self: &Arc<Self>,
-        identity: u128,
-        len: u64,
-        load: impl FnOnce() -> io::Result<Vec<u8>>,
-    ) -> io::Result<Option<Arc<HeldPack>>> {
-        {
-            let mut state = self.lock();
-            if let Some(pack) = state.held.get(&identity).and_then(Weak::upgrade) {
-                self.shared.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(pack));
-            }
-            if state.used.saturating_add(len) > self.capacity {
-                self.declined.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
-            state.charge(len);
-        }
-        let unreserve = || self.lock().used -= len;
-        let bytes = match load() {
-            Ok(bytes) if bytes.len() as u64 == len => bytes,
-            Ok(_) => {
-                unreserve();
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "held pack: length differs from its source",
-                ));
-            }
-            Err(e) => {
-                unreserve();
-                return Err(e);
-            }
-        };
-        let mut state = self.lock();
-        // Another reader loaded the same object meanwhile: share theirs.
-        if let Some(pack) = state.held.get(&identity).and_then(Weak::upgrade) {
-            state.used -= len;
-            self.shared.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(pack));
-        }
-        let pack = Arc::new(HeldPack {
-            bytes: PackBuf::Heap(bytes.into_boxed_slice()),
-            identity,
-            allowance: Arc::downgrade(self),
-            referenced: AtomicBool::new(false),
-            evicted: AtomicBool::new(false),
-            served_lookups: AtomicU64::new(0),
-            served_bytes: AtomicU64::new(0),
-        });
-        state.held.insert(identity, Arc::downgrade(&pack));
-        self.admitted.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(pack))
-    }
-
     pub fn stats(&self) -> AllowanceStats {
         let state = self.lock();
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
@@ -866,10 +576,6 @@ impl DictionaryAllowance {
             capacity: self.capacity,
             used: state.used,
             peak: state.peak,
-            packs: state.held.values().filter(|w| w.strong_count() > 0).count() as u64,
-            admitted: load(&self.admitted),
-            declined: load(&self.declined),
-            shared: load(&self.shared),
             released: load(&self.released),
             resident_packs: state.resident.len() as u64,
             resident_bytes: state.resident.values().map(|p| p.len() as u64).sum(),
@@ -887,22 +593,14 @@ impl DictionaryAllowance {
             evicted_bytes: load(&self.evicted_bytes),
             busy: load(&self.busy),
             no_room: load(&self.no_room),
-            outweighed: load(&self.outweighed),
             too_large: load(&self.too_large),
-            rent_epoch: self.clocks.rent.epoch(),
-            lookup_epoch: self.clocks.lookups.epoch(),
-            rent_counted: self.clocks.rent.counted(),
+            rent_epoch: self.rent_clock.epoch(),
+            rent_counted: self.rent_clock.counted(),
             repromoted: load(&self.repromoted),
             repromoted_bytes: load(&self.repromoted_bytes),
-            outstanding: state.used.saturating_sub(
-                state.resident.values().map(|p| p.len() as u64).sum::<u64>()
-                    + state
-                        .held
-                        .values()
-                        .filter_map(Weak::upgrade)
-                        .map(|p| p.len() as u64)
-                        .sum::<u64>(),
-            ),
+            outstanding: state
+                .used
+                .saturating_sub(state.resident.values().map(|p| p.len() as u64).sum::<u64>()),
         }
     }
 }
@@ -918,58 +616,6 @@ impl std::fmt::Debug for DictionaryAllowance {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn bytes(len: usize) -> io::Result<Vec<u8>> {
-        Ok(vec![7; len])
-    }
-
-    #[test]
-    fn holds_within_capacity_and_declines_beyond() {
-        let allowance = DictionaryAllowance::new(100);
-        let a = allowance.hold(1, 60, || bytes(60)).unwrap().unwrap();
-        assert_eq!(&a[..3], [7, 7, 7]);
-        assert!(allowance
-            .hold(2, 50, || panic!("must not load"))
-            .unwrap()
-            .is_none());
-        let b = allowance.hold(3, 40, || bytes(40)).unwrap();
-        assert!(b.is_some(), "exactly full is within");
-        let stats = allowance.stats();
-        assert_eq!((stats.used, stats.packs), (100, 2));
-        assert_eq!((stats.admitted, stats.declined), (2, 1));
-    }
-
-    /// The reservation stays charged while any holder lives, and is returned
-    /// by the last.
-    #[test]
-    fn the_last_holder_returns_the_reservation() {
-        let allowance = DictionaryAllowance::new(100);
-        let a = allowance.hold(1, 80, || bytes(80)).unwrap().unwrap();
-        let again = allowance
-            .hold(1, 80, || panic!("shared, not loaded"))
-            .unwrap()
-            .unwrap();
-        assert!(Arc::ptr_eq(&a, &again));
-        assert_eq!(allowance.stats().used, 80, "charged once");
-        drop(a);
-        assert_eq!(allowance.stats().used, 80, "still held");
-        assert!(allowance.hold(2, 40, || bytes(40)).unwrap().is_none());
-        drop(again);
-        let stats = allowance.stats();
-        assert_eq!((stats.used, stats.packs, stats.released), (0, 0, 1));
-        assert!(allowance.hold(2, 40, || bytes(40)).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_failed_or_short_load_returns_its_reservation() {
-        let allowance = DictionaryAllowance::new(100);
-        assert!(allowance
-            .hold(1, 60, || Err(io::Error::other("auth")))
-            .is_err());
-        assert!(allowance.hold(1, 60, || bytes(59)).is_err());
-        assert_eq!(allowance.stats().used, 0);
-        assert!(allowance.hold(1, 60, || bytes(60)).unwrap().is_some());
-    }
 
     /// Fill a promoted pack's backing; half of it counts as decrypted.
     fn fill(buf: &mut [u8]) -> io::Result<u64> {
@@ -1031,8 +677,6 @@ mod tests {
         assert_eq!(allowance.stats().peak, 60);
     }
 
-    /// A promotion already in flight turns another away; one already done
-    /// is shared; one too large for the allowance is refused.
     /// Readers of one pack share a meter; the table forgets packs no reader
     /// holds a meter for, so it does not grow with retired packs.
     #[test]
@@ -1051,189 +695,9 @@ mod tests {
         );
     }
 
-    mod demand {
-        use super::*;
-        use crate::read::cached_units::MissMeter;
-
-        /// A demand-admitting allowance whose lookups halve every
-        /// `period` lookups.
-        fn allowance(capacity: u64, period: u64) -> Arc<DictionaryAllowance> {
-            DictionaryAllowance::with_policy(capacity, false, Admission::Demand, Some(period))
-        }
-
-        fn looked_up(allowance: &DictionaryAllowance, id: u128, n: u64) -> Arc<MissMeter> {
-            let meter = allowance.meter(id, 1, 0, 0);
-            for _ in 0..n {
-                meter.note_lookup();
-            }
-            meter
-        }
-
-        fn admit(
-            allowance: &Arc<DictionaryAllowance>,
-            meter: &MissMeter,
-            id: u128,
-            len: u64,
-        ) -> Promotion {
-            allowance.admit(id, len, meter, fill).unwrap()
-        }
-
-        /// Into room the pool has, a pack is admitted whatever the others'
-        /// demand: nothing is evicted.
-        #[test]
-        fn room_to_spare_evicts_nothing() {
-            let allowance = allowance(100, 1 << 40);
-            let busy = looked_up(&allowance, 1, 1_000);
-            drop(promoted(admit(&allowance, &busy, 1, 40)));
-            let quiet = looked_up(&allowance, 2, 0);
-            drop(promoted(admit(&allowance, &quiet, 2, 60)));
-            let stats = allowance.stats();
-            assert_eq!((stats.promoted, stats.evicted, stats.used), (2, 0, 100));
-        }
-
-        /// Packs in comparable demand never displace one another: a
-        /// candidate needs twice the recent lookups of what it would evict,
-        /// and then evicts the least looked-up.
-        #[test]
-        fn a_candidate_must_outweigh_its_victims() {
-            let allowance = allowance(80, 1 << 40);
-            let a = looked_up(&allowance, 1, 100);
-            let b = looked_up(&allowance, 2, 90);
-            drop(promoted(admit(&allowance, &a, 1, 40)));
-            drop(promoted(admit(&allowance, &b, 2, 40)));
-            let c = looked_up(&allowance, 3, 179);
-            assert!(matches!(
-                admit(&allowance, &c, 3, 40),
-                Promotion::Outweighed
-            ));
-            assert_eq!(allowance.stats().evicted, 0, "nothing evicted for it");
-            c.note_lookup();
-            drop(promoted(admit(&allowance, &c, 3, 40)));
-            assert!(allowance.resident(2).is_none(), "the least looked-up goes");
-            assert!(allowance.resident(1).is_some());
-            let stats = allowance.stats();
-            assert_eq!((stats.outweighed, stats.evicted, stats.used), (1, 1, 80));
-        }
-
-        /// Making room takes as many victims as the candidate needs, and
-        /// weighs it against all of them together.
-        #[test]
-        fn every_victim_counts() {
-            let allowance = allowance(90, 1 << 40);
-            let meters: Vec<_> = (1..=3).map(|id| looked_up(&allowance, id, 10)).collect();
-            for (id, meter) in (1..=3).zip(&meters) {
-                drop(promoted(admit(&allowance, meter, id, 30)));
-            }
-            let big = looked_up(&allowance, 9, 59);
-            assert!(
-                matches!(admit(&allowance, &big, 9, 80), Promotion::Outweighed),
-                "three victims: 30 lookups between them"
-            );
-            big.note_lookup();
-            drop(promoted(admit(&allowance, &big, 9, 80)));
-            let stats = allowance.stats();
-            assert_eq!((stats.evicted, stats.used, stats.peak), (3, 80, 90));
-        }
-
-        /// Room that eviction cannot make — too little resident, or what it
-        /// frees still held by a reader — is no room, and nothing is
-        /// charged past the allowance.
-        #[test]
-        fn memory_stays_bounded() {
-            let allowance = allowance(100, 1 << 40);
-            let cold = looked_up(&allowance, 1, 0);
-            drop(promoted(admit(&allowance, &cold, 1, 60)));
-            let reader = allowance.resident(1).unwrap();
-            let hot = looked_up(&allowance, 2, 50);
-            assert!(matches!(
-                allowance
-                    .admit(2, 60, &hot, |_| panic!("no room to assemble"))
-                    .unwrap(),
-                Promotion::NoRoom
-            ));
-            assert!(reader.is_evicted());
-            // 60 held by the reader and 30 resident: evicting the 30 cannot
-            // make room for 60, so it stays.
-            let small = looked_up(&allowance, 3, 0);
-            drop(promoted(admit(&allowance, &small, 3, 30)));
-            assert!(matches!(admit(&allowance, &hot, 2, 60), Promotion::NoRoom));
-            assert!(allowance.resident(3).is_some(), "nothing evicted in vain");
-            assert_eq!(allowance.stats().used, 90);
-            drop(reader);
-            drop(promoted(admit(&allowance, &hot, 2, 60)));
-            let stats = allowance.stats();
-            assert_eq!((stats.used, stats.peak, stats.no_room), (90, 90, 2));
-            assert!(allowance.resident(3).is_some(), "room enough beside it");
-        }
-
-        /// A pack's recent lookups halve for each lookup epoch it sits
-        /// idle through, so packs a workload has left lose to the packs it
-        /// uses now.
-        #[test]
-        fn idle_demand_ages_away() {
-            let allowance = allowance(80, 1_000);
-            let a = looked_up(&allowance, 1, 900);
-            drop(promoted(admit(&allowance, &a, 1, 80)));
-            // b's 100 lookups end the first epoch: a halves.
-            let b = looked_up(&allowance, 2, 100);
-            assert_eq!(a.recent_lookups(), 450);
-            assert!(matches!(
-                admit(&allowance, &b, 2, 80),
-                Promotion::Outweighed
-            ));
-            // Three more epochs of b alone.
-            for _ in 0..3_000 {
-                b.note_lookup();
-            }
-            assert_eq!(a.recent_lookups(), 900 >> 4);
-            drop(promoted(admit(&allowance, &b, 2, 80)));
-            assert!(allowance.resident(1).is_none());
-        }
-    }
-
-    /// Compared, the clock still picks the victims; the candidate's recent
-    /// lookups must outweigh theirs, or they stay and keep their place.
-    #[test]
-    fn comparison_weighs_the_clocks_victims() {
-        let allowance =
-            DictionaryAllowance::with_policy(80, false, Admission::RecentCompared, Some(1 << 40));
-        let busy = allowance.meter(1, 1, 0, 0);
-        let quiet = allowance.meter(2, 1, 0, 0);
-        for _ in 0..100 {
-            busy.note_lookup();
-        }
-        for _ in 0..10 {
-            quiet.note_lookup();
-        }
-        drop(promoted(allowance.promote(1, 40, 40, fill).unwrap()));
-        drop(promoted(allowance.promote(2, 40, 40, fill).unwrap()));
-        let candidate = allowance.meter(3, 1, 0, 0);
-        for _ in 0..199 {
-            candidate.note_lookup();
-        }
-        // The clock picks 1, first in its order, though 2 is looked up less.
-        assert!(matches!(
-            allowance
-                .promote_compared(3, 40, 40, &candidate, |_| panic!("outweighed"))
-                .unwrap(),
-            Promotion::Outweighed
-        ));
-        assert!(allowance.resident(1).is_some() && allowance.resident(2).is_some());
-        candidate.note_lookup();
-        drop(promoted(
-            allowance
-                .promote_compared(3, 40, 40, &candidate, fill)
-                .unwrap(),
-        ));
-        assert!(
-            allowance.resident(1).is_none(),
-            "the clock's victim, still first"
-        );
-        assert!(allowance.resident(2).is_some());
-        let stats = allowance.stats();
-        assert_eq!((stats.outweighed, stats.evicted), (1, 1));
-    }
-
+    /// A promotion already in flight turns another away; one already done
+    /// is shared; one too large for the allowance is refused; one that
+    /// fails returns its reservation.
     #[test]
     fn promotions_are_deduplicated_and_bounded() {
         let allowance = DictionaryAllowance::new(100);
@@ -1265,16 +729,5 @@ mod tests {
         let stats = allowance.stats();
         assert_eq!((stats.used, stats.promoted, stats.busy), (50, 1, 1));
         promoted(allowance.promote(3, 50, 37, fill).unwrap());
-    }
-
-    /// A released object is held again, and the new copy is shared.
-    #[test]
-    fn a_released_object_is_held_again() {
-        let allowance = DictionaryAllowance::new(100);
-        drop(allowance.hold(1, 10, || bytes(10)).unwrap());
-        let second = allowance.hold(1, 10, || bytes(10)).unwrap().unwrap();
-        let third = allowance.hold(1, 10, || panic!("shared")).unwrap().unwrap();
-        assert!(Arc::ptr_eq(&second, &third));
-        assert_eq!(allowance.stats().admitted, 2);
     }
 }

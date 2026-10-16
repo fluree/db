@@ -14,12 +14,9 @@
 //!     query --dir /data/v2 --encrypted --variant v2 --out v2.jsonl --cache-mb 4096
 //! ```
 //!
-//! The envelope new writes use, how encrypted packs are held and the
-//! dictionary allowance come from the experiment environment
-//! (`FLUREE_ENCRYPTION_ENVELOPE`, `FLUREE_ENCRYPTED_PACKS`
-//! `=whole|pages|ranged|bounded|adaptive`, `FLUREE_DICT_ALLOWANCE_MB`,
-//! `FLUREE_DICT_PROMOTE_COVERAGE`, `FLUREE_DICT_PACK_ALLOC=mmap`). Builds without the counter API (the
-//! baseline branch) compile with `--cfg no_counters`.
+//! On an encrypted store `--dictionary-mb` sets how much of `--cache-mb`
+//! dictionary packs may hold decrypted whole. Builds without the counter API
+//! (the baseline branch) compile with `--cfg no_counters`.
 
 #![allow(unexpected_cfgs)]
 
@@ -108,13 +105,21 @@ fn write_turtle(path: &Path, n: u64, ordered: bool) -> std::io::Result<()> {
     out.flush()
 }
 
-async fn open(dir: &Path, encrypted: bool, cache_mb: Option<usize>) -> fluree_db_api::Fluree {
+async fn open(
+    dir: &Path,
+    encrypted: bool,
+    cache_mb: Option<usize>,
+    dictionary_mb: Option<usize>,
+) -> fluree_db_api::Fluree {
     let mut builder = FlureeBuilder::file(dir.to_string_lossy().to_string());
     if encrypted {
         builder = builder.with_encryption_key(KEY);
     }
     if let Some(mb) = cache_mb {
         builder = builder.cache_max_mb(mb);
+    }
+    if let Some(mb) = dictionary_mb {
+        builder = builder.cache_dictionary_max_mb(mb);
     }
     builder
         .build_async()
@@ -133,7 +138,7 @@ async fn import(args: &[String]) {
     write_turtle(&ttl, n, ordered).unwrap();
     let generate_ms = started.elapsed().as_millis();
 
-    let fluree = open(&dir.join("db"), encrypted, None).await;
+    let fluree = open(&dir.join("db"), encrypted, None, None).await;
     let started = Instant::now();
     fluree
         .create(ALIAS)
@@ -380,8 +385,7 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
     let s = fluree.leaflet_cache().dictionary_allowance().stats();
     json!({
         "capacity": (s.capacity != u64::MAX).then_some(s.capacity), "used": s.used,
-        "peak": s.peak, "packs": s.packs, "admitted": s.admitted, "declined": s.declined,
-        "shared": s.shared, "released": s.released,
+        "peak": s.peak, "released": s.released,
         "resident_packs": s.resident_packs, "resident_bytes": s.resident_bytes,
         "promoted": s.promoted, "promoted_bytes": s.promoted_bytes,
         "assembly_decrypted": s.assembly_decrypted, "assembly_reused": s.assembly_reused,
@@ -390,16 +394,17 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
         "evicted_served_lookups": s.evicted_served_lookups,
         "evicted_served_bytes": s.evicted_served_bytes, "evicted_served": s.evicted_served,
         "evicted": s.evicted, "evicted_bytes": s.evicted_bytes,
-        "busy": s.busy, "no_room": s.no_room, "outweighed": s.outweighed,
-        "too_large": s.too_large, "rent_epoch": s.rent_epoch, "lookup_epoch": s.lookup_epoch,
+        "busy": s.busy, "no_room": s.no_room,
+        "too_large": s.too_large, "rent_epoch": s.rent_epoch,
         "rent_counted": s.rent_counted,
         "repromoted": s.repromoted, "repromoted_bytes": s.repromoted_bytes,
         "outstanding": s.outstanding,
-        // Per live pack: [kind, bytes, rent, covered, promotions, held,
-        // recent lookups, recent rent, why last not promoted].
+        // Per live pack: [kind, bytes, rent, covered, promotions, held, 0,
+        // recent rent, why last not promoted]; the 0 keeps the place of the
+        // retired recent-lookup count for the report scripts.
         "packs": fluree.leaflet_cache().dictionary_allowance().pack_report().iter()
             .map(|p| json!([p.kind, p.len, p.rent, p.covered, p.promotions, p.resident,
-                            p.recent_lookups, p.recent_rent, p.reason]))
+                            0, p.recent_rent, p.reason]))
             .collect::<Vec<_>>(),
     })
 }
@@ -480,6 +485,7 @@ async fn query(args: &[String]) {
     let variant = arg(args, "--variant").unwrap_or_else(|| "unnamed".into());
     let reps: usize = arg(args, "--reps").map_or(3, |v| v.parse().unwrap());
     let cache_mb: Option<usize> = arg(args, "--cache-mb").map(|v| v.parse().unwrap());
+    let dictionary_mb: Option<usize> = arg(args, "--dictionary-mb").map(|v| v.parse().unwrap());
     let state = arg(args, "--state").unwrap_or_else(|| "default".into());
     // `pass` (default) snapshots memory and cache occupancy after each pass,
     // `workload` after each workload too, `none` never: snapshots walk the
@@ -512,7 +518,7 @@ async fn query(args: &[String]) {
     };
 
     let started = Instant::now();
-    let fluree = open(&dir.join("db"), encrypted, cache_mb).await;
+    let fluree = open(&dir.join("db"), encrypted, cache_mb, dictionary_mb).await;
     let snapshot = fluree.graph(ALIAS).load().await.expect("load");
     emit(json!({
         "type": "open", "variant": variant, "state": state,
@@ -603,7 +609,7 @@ async fn probe(args: &[String]) {
         serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
     let n = meta["subjects"].as_u64().unwrap();
     let ordered = meta["ordered"].as_bool().unwrap_or(false);
-    let fluree = open(&dir.join("db"), encrypted, Some(256)).await;
+    let fluree = open(&dir.join("db"), encrypted, Some(256), None).await;
     let snapshot = fluree.graph(ALIAS).load().await.expect("load");
     let store = snapshot.db().binary_store().expect("indexed").clone();
     let fence_unit: usize = arg(args, "--unit").map_or(65_536, |v| v.parse().unwrap());

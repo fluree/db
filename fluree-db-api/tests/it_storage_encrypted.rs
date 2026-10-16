@@ -440,10 +440,6 @@ async fn encrypted_file_reads_leaves_and_packs_by_range() {
         !held("leaf-bytes-heap"),
         "a leaf decrypted whole: {occupancy:?}"
     );
-    assert!(
-        !held("forward-page"),
-        "a dictionary page assembled: {occupancy:?}"
-    );
 }
 
 /// An index build with no `data_dir` stages plaintext runs in the system temp

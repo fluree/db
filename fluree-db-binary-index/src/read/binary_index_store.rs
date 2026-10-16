@@ -1259,15 +1259,9 @@ impl BinaryIndexStore {
             Some(cache) if keep => {
                 // Its decrypted units are kept too, so a reader that loads
                 // columns without the decoded cache does not decrypt again.
-                let source: Arc<dyn fluree_db_core::RangeSource> = if super::cached_units::enabled()
-                {
-                    Arc::new(super::cached_units::CachedUnits::new(
-                        source,
-                        Arc::clone(cache),
-                    ))
-                } else {
-                    source
-                };
+                let source: Arc<dyn fluree_db_core::RangeSource> = Arc::new(
+                    super::cached_units::CachedUnits::new(source, Arc::clone(cache)),
+                );
                 cache.get_or_insert_ranged_leaf(leaf_id, source)
             }
             _ => source,

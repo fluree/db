@@ -217,9 +217,6 @@ enum CacheKey {
     /// A local leaf read by range, for a store whose whole-leaf local read
     /// decrypts it all. Key = xxh3_128(leaf CID bytes), as for `LeafBytes`.
     RangedLeaf(u128),
-    /// One decrypted page of a forward dictionary pack read by range.
-    /// Content-addressed through the pack's CID.
-    ForwardPage(ForwardPageKey),
     /// One read unit (a decrypted segment) of a ranged local source, keyed
     /// by the source's identity, which is scoped to the storage instance and
     /// to the object's envelope.
@@ -273,13 +270,6 @@ pub struct V3BatchCacheKey {
 pub struct SourceUnitKey {
     pub source: u128,
     pub unit: u64,
-}
-
-/// A forward pack page: `pack` is `xxh3_128(pack CID bytes)`.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct ForwardPageKey {
-    pub pack: u128,
-    pub page: u32,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -445,7 +435,6 @@ enum CachedEntry {
     LeafDir(Arc<DecodedLeafDirV3>),
     LeafBytes(ContentBytes),
     RangedLeaf(Arc<dyn RangeSource>),
-    ForwardPage(Arc<[u8]>),
     SourceUnit(Arc<[u8]>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
@@ -470,7 +459,6 @@ impl CachedEntry {
             #[cfg(not(target_arch = "wasm32"))]
             CachedEntry::LeafBytes(ContentBytes::Mapped(_)) => "leaf-bytes-mapped",
             CachedEntry::RangedLeaf(_) => "ranged-leaf",
-            CachedEntry::ForwardPage(_) => "forward-page",
             CachedEntry::SourceUnit(_) => "source-unit",
             CachedEntry::Bm25Leaflet(_) => "bm25-leaflet",
             CachedEntry::VectorShard(_) => "vector-shard",
@@ -491,7 +479,6 @@ impl CachedEntry {
             // it weighs far less than its length; heap bytes weigh in full.
             CachedEntry::LeafBytes(bytes) => bytes.cache_weight(),
             CachedEntry::RangedLeaf(source) => source.cache_weight(),
-            CachedEntry::ForwardPage(page) => page.len(),
             CachedEntry::SourceUnit(unit) => unit.len(),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
@@ -569,6 +556,10 @@ fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
     let builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
     builder.build()
 }
+
+/// Share of the cache budget, in percent, that storage decrypting on read
+/// gives the dictionary allowance unless configured otherwise.
+pub const DEFAULT_DICTIONARY_PERCENT: u64 = 60;
 
 /// Share of the leaflet budget for fenced reverse leaves.
 const FENCED_LEAF_BUDGET_DIVISOR: u64 = 32;
@@ -691,30 +682,44 @@ macro_rules! region_cache_methods {
 }
 
 impl LeafletCache {
-    /// Create a new cache with the given maximum byte budget.
+    /// Create a new cache with the given maximum byte budget, holding no
+    /// dictionary pack whole.
     ///
     /// One TinyLFU pool and budget for every leaflet-derived entry type. Query
     /// planner stats views get a separate LRU pool sized from the same budget;
     /// see [`stats_view_pool`].
     pub fn with_max_bytes(max_bytes: u64) -> Self {
-        let fenced_budget = fenced_leaf_budget(max_bytes);
+        Self::with_budgets(max_bytes, 0)
+    }
+
+    /// A cache for storage that decrypts on read: `max_bytes` in all, of
+    /// which `dictionary_bytes` (by default [`DEFAULT_DICTIONARY_PERCENT`])
+    /// is the dictionary allowance and the rest the leaflet budget.
+    pub fn for_decrypting_storage(max_bytes: u64, dictionary_bytes: Option<u64>) -> Self {
+        let dictionary = dictionary_bytes
+            .unwrap_or(
+                (u128::from(max_bytes) * u128::from(DEFAULT_DICTIONARY_PERCENT) / 100) as u64,
+            )
+            .min(max_bytes);
+        Self::with_budgets(max_bytes - dictionary, dictionary)
+    }
+
+    fn with_budgets(leaflet_bytes: u64, dictionary_bytes: u64) -> Self {
+        let fenced_budget = fenced_leaf_budget(leaflet_bytes);
         let inner = Cache::builder()
             .weigher(|_key: &CacheKey, val: &CachedEntry| {
                 val.byte_size().min(u32::MAX as usize) as u32
             })
-            .max_capacity(max_bytes.saturating_sub(fenced_budget))
+            .max_capacity(leaflet_bytes.saturating_sub(fenced_budget))
             .build();
 
         Self {
             inner,
-            stats_views: stats_view_pool(max_bytes),
+            stats_views: stats_view_pool(leaflet_bytes),
             fenced_leaves: fenced_leaf_pool(fenced_budget),
             fenced_leaf_max: (fenced_budget / 2) as usize,
-            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::with_policy(
-                crate::dict::allowance::allowance_from_env(),
-                crate::dict::allowance::mapped_from_env(),
-                crate::dict::allowance::admission_from_env(),
-                crate::dict::allowance::demand_period_from_env(),
+            dictionary_allowance: crate::dict::allowance::DictionaryAllowance::new(
+                dictionary_bytes,
             ),
         }
     }
@@ -733,30 +738,12 @@ impl LeafletCache {
         self
     }
 
-    /// Replace the dictionary allowance with one admitting by `admission`,
-    /// recent lookups halving every `period` lookups (tests).
+    /// Replace the dictionary allowance with one whose recent rent never
+    /// ages, for tests of eviction and sharing rather than of aging.
     #[cfg(test)]
-    pub(crate) fn with_admission(
-        mut self,
-        bytes: u64,
-        admission: crate::dict::allowance::Admission,
-        period: u64,
-    ) -> Self {
-        self.dictionary_allowance = crate::dict::allowance::DictionaryAllowance::with_policy(
-            bytes,
-            false,
-            admission,
-            Some(period),
-        );
-        self
-    }
-
-    /// Replace the dictionary allowance with one backing promoted packs in
-    /// anonymous mappings (tests).
-    #[cfg(test)]
-    pub(crate) fn with_mapped_dictionary_allowance(mut self, bytes: u64) -> Self {
+    pub(crate) fn with_unaging_dictionary_allowance(mut self, bytes: u64) -> Self {
         self.dictionary_allowance =
-            crate::dict::allowance::DictionaryAllowance::with_backing(bytes, true);
+            crate::dict::allowance::DictionaryAllowance::with_rent_period(bytes, u64::MAX);
         self
     }
 
@@ -957,32 +944,6 @@ impl LeafletCache {
         }) {
             CachedEntry::RangedLeaf(source) => source,
             _ => unreachable!("RangedLeaf key always maps to RangedLeaf entry"),
-        }
-    }
-
-    /// A forward pack page, read by `load` at most once however many
-    /// lookups race on it. A failed load is not cached.
-    pub fn try_get_or_load_forward_page<F>(
-        &self,
-        key: ForwardPageKey,
-        load: F,
-    ) -> io::Result<Arc<[u8]>>
-    where
-        F: FnOnce() -> io::Result<Arc<[u8]>>,
-    {
-        // Fast path: a plain hit must not pay the block_in_place cost.
-        if let Some(CachedEntry::ForwardPage(page)) = self.inner.get(&CacheKey::ForwardPage(key)) {
-            return Ok(page);
-        }
-        let result = in_blocking_region(|| {
-            self.inner.try_get_with(CacheKey::ForwardPage(key), || {
-                load().map(CachedEntry::ForwardPage)
-            })
-        });
-        match result {
-            Ok(CachedEntry::ForwardPage(page)) => Ok(page),
-            Ok(_) => unreachable!("ForwardPage key always maps to ForwardPage entry"),
-            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -1418,6 +1379,33 @@ mod tests {
             assert_eq!(leaflets + fences, budget);
             assert_eq!(fences, budget / 32);
         }
+    }
+
+    /// For storage that decrypts on read, the dictionary allowance is carved
+    /// out of the cache budget — by default its share, or as configured, at
+    /// most all of it — and the leaflet pools split what is left.
+    #[test]
+    fn the_dictionary_allowance_shares_a_decrypting_cache_budget() {
+        let mib = 1u64 << 20;
+        for (budget, configured, dictionary) in [
+            (640 * mib, None, 384 * mib),
+            (768 * mib, Some(512 * mib), 512 * mib),
+        ] {
+            let cache = LeafletCache::for_decrypting_storage(budget, configured);
+            let leaflets = cache.inner.policy().max_capacity().unwrap();
+            let fences = cache.fenced_leaves.policy().max_capacity().unwrap();
+            assert_eq!(cache.dictionary_allowance().capacity(), dictionary);
+            assert_eq!(leaflets + fences + dictionary, budget);
+        }
+        let all = LeafletCache::for_decrypting_storage(64 * mib, Some(100 * mib));
+        assert_eq!(all.dictionary_allowance().capacity(), 64 * mib);
+        assert_eq!(
+            LeafletCache::with_max_bytes(640 * mib)
+                .dictionary_allowance()
+                .capacity(),
+            0,
+            "plain storage holds no pack whole"
+        );
     }
 
     fn make_key(leaf_id: u128, leaflet_index: u32, to_t: i64, epoch: u64) -> LeafletCacheKey {
