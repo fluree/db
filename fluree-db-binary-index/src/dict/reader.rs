@@ -615,100 +615,6 @@ impl DictTreeReader {
         Ok(results)
     }
 
-    /// For lookups of `keys`, per leaf they touch: its length and the
-    /// distinct `unit`-byte units of it the lookups read, as a lookup reading
-    /// the leaf by range would. Loads each touched leaf whole; a diagnostic.
-    pub fn reverse_units_touched<'a, I>(
-        &self,
-        keys: I,
-        unit: usize,
-    ) -> io::Result<Vec<(usize, usize)>>
-    where
-        I: IntoIterator<Item = &'a [u8]>,
-    {
-        let mut keys_by_leaf = vec![Vec::<&[u8]>::new(); self.branch.leaves.len()];
-        for key in keys {
-            if let Some(leaf_idx) = self.branch.find_leaf(key) {
-                keys_by_leaf[leaf_idx].push(key);
-            }
-        }
-        let mut out = Vec::new();
-        for (leaf_idx, keys) in keys_by_leaf.iter().enumerate() {
-            if keys.is_empty() {
-                continue;
-            }
-            let leaf_data = self.load_leaf(&self.branch.leaves[leaf_idx].address)?;
-            let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
-            let mut units = std::collections::BTreeSet::new();
-            for key in keys {
-                leaf.lookup_reading(key, &mut |range| {
-                    units.extend(range.start / unit..=(range.end - 1) / unit);
-                });
-            }
-            out.push((leaf_data.len(), units.len()));
-        }
-        Ok(out)
-    }
-
-    /// For lookups of `keys`: distinct `unit`-byte units read, summed over
-    /// the leaves they touch, by a whole-leaf read, the leaf's binary search,
-    /// and the two fenced lookups; with whether every method agreed. Loads
-    /// each touched leaf whole; a diagnostic.
-    pub fn reverse_fence_probe<'a, I>(&self, keys: I, unit: usize) -> io::Result<FenceProbe>
-    where
-        I: IntoIterator<Item = &'a [u8]>,
-    {
-        let mut keys_by_leaf = vec![Vec::<&[u8]>::new(); self.branch.leaves.len()];
-        for key in keys {
-            if let Some(leaf_idx) = self.branch.find_leaf(key) {
-                keys_by_leaf[leaf_idx].push(key);
-            }
-        }
-        let mut probe = FenceProbe::default();
-        for (leaf_idx, keys) in keys_by_leaf.iter().enumerate() {
-            if keys.is_empty() {
-                continue;
-            }
-            let leaf_data = self.load_leaf(&self.branch.leaves[leaf_idx].address)?;
-            let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
-            let fences = leaf.fences(unit);
-            let mut sets = [(); 3].map(|()| std::collections::BTreeSet::<usize>::new());
-            for key in keys {
-                let want = leaf.lookup_reading(key, &mut |r| {
-                    sets[0].extend(r.start / unit..=(r.end - 1) / unit);
-                });
-                let scan = leaf.lookup_scanning(&fences, key, &mut |r| {
-                    sets[1].extend(r.start / unit..=(r.end - 1) / unit);
-                });
-                let slice = leaf.lookup_in_slice(&fences, key, &mut |r| {
-                    sets[2].extend(r.start / unit..=(r.end - 1) / unit);
-                });
-                probe.disagreements += u64::from(scan != want) + u64::from(slice != want);
-                probe.found += u64::from(want.is_some());
-            }
-            probe.keys += keys.len() as u64;
-            probe.leaves += 1;
-            probe.units_whole += leaf_data.len().div_ceil(unit) as u64;
-            probe.units_binary += sets[0].len() as u64;
-            probe.units_scan += sets[1].len() as u64;
-            probe.units_slice += sets[2].len() as u64;
-        }
-        Ok(probe)
-    }
-
-    /// Fences at `unit` across every leaf of the tree: their count and the
-    /// heap bytes they occupy. Loads every leaf; a diagnostic.
-    pub fn fence_memory(&self, unit: usize) -> io::Result<(u64, u64)> {
-        let (mut count, mut bytes) = (0u64, 0u64);
-        for leaf in &self.branch.leaves {
-            let leaf_data = self.load_leaf(&leaf.address)?;
-            let fences = ReverseLeaf::from_bytes(&leaf_data)?.fences(unit);
-            count += fences.len() as u64;
-            bytes += fences.heap_bytes() as u64;
-        }
-        Ok((count, bytes))
-    }
-
     /// Range scan: find all entries whose key is in `[start_key, end_key)`.
     ///
     /// Scans across multiple B-tree leaves as needed. Returns `(key_bytes, id)` pairs
@@ -950,20 +856,6 @@ impl std::fmt::Debug for DictTreeReader {
             .field("cache_misses", &self.cache_misses())
             .finish()
     }
-}
-
-/// What [`DictTreeReader::reverse_fence_probe`] measured: units summed over
-/// the leaves touched.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FenceProbe {
-    pub keys: u64,
-    pub found: u64,
-    pub leaves: u64,
-    pub units_whole: u64,
-    pub units_binary: u64,
-    pub units_scan: u64,
-    pub units_slice: u64,
-    pub disagreements: u64,
 }
 
 #[cfg(test)]
