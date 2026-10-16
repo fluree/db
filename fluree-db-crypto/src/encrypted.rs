@@ -90,6 +90,8 @@ pub struct EncryptedStorage<S, K> {
     /// Random per instance (shared by clones): scopes what a cache of
     /// decrypted bytes may serve to readers of this storage.
     context: [u8; 16],
+    /// The envelope new writes use.
+    write: WriteFormat,
 }
 
 impl<S, K> EncryptedStorage<S, K>
@@ -116,7 +118,16 @@ where
             inner,
             keys,
             context,
+            write: WriteFormat::Segmented,
         }
+    }
+
+    /// Write version 1 envelopes, as releases before version 2 did: for
+    /// tests of stores those releases wrote, not a supported configuration.
+    #[doc(hidden)]
+    pub fn writing_version_1_envelopes(mut self) -> Self {
+        self.write = WriteFormat::Whole;
+        self
     }
 
     /// Get a reference to the underlying storage.
@@ -126,17 +137,22 @@ where
 
     /// Encrypt plaintext and build the complete envelope.
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        Self::encrypt_with(&self.keys, plaintext)
+        Self::encrypt_with(&self.keys, self.write, plaintext)
     }
 
-    /// [`Self::encrypt`] with only the key provider, for callers that cannot
-    /// borrow the storage.
-    fn encrypt_with(keys: &K, plaintext: &[u8]) -> Result<Vec<u8>> {
-        match write_format() {
+    /// [`Self::encrypt`] with only the key provider and format, for callers
+    /// that cannot borrow the storage.
+    fn encrypt_with(keys: &K, write: WriteFormat, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match write {
             WriteFormat::Whole => Self::encrypt_whole(keys, plaintext),
-            WriteFormat::Segmented(segment_log2) => {
+            WriteFormat::Segmented => {
                 let key = keys.current_key();
-                segmented::encrypt(key.expose_secret(), key.id(), segment_log2, plaintext)
+                segmented::encrypt(
+                    key.expose_secret(),
+                    key.id(),
+                    segmented::DEFAULT_SEGMENT_LOG2,
+                    plaintext,
+                )
             }
         }
     }
@@ -242,31 +258,8 @@ where
 enum WriteFormat {
     /// Version 1, one AES-GCM message per object.
     Whole,
-    /// Version 2, segments of `2^n` plaintext bytes.
-    Segmented(u8),
-}
-
-/// Experiment controls for the segmented-envelope A/B, read once; not a
-/// supported configuration. `FLUREE_ENCRYPTION_ENVELOPE=1` writes version 1;
-/// `FLUREE_ENCRYPTION_SEGMENT_BYTES` sets the segment size, a power of two
-/// from 4 KiB to 16 MiB.
-fn write_format() -> WriteFormat {
-    static FORMAT: std::sync::OnceLock<WriteFormat> = std::sync::OnceLock::new();
-    *FORMAT.get_or_init(|| {
-        if std::env::var("FLUREE_ENCRYPTION_ENVELOPE").is_ok_and(|v| v.trim() == "1") {
-            return WriteFormat::Whole;
-        }
-        let log2 = std::env::var("FLUREE_ENCRYPTION_SEGMENT_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|bytes| bytes.is_power_of_two())
-            .map(|bytes| bytes.trailing_zeros() as u8)
-            .filter(|log2| {
-                (segmented::MIN_SEGMENT_LOG2..=segmented::MAX_SEGMENT_LOG2).contains(log2)
-            })
-            .unwrap_or(segmented::DEFAULT_SEGMENT_LOG2);
-        WriteFormat::Segmented(log2)
-    })
+    /// Version 2, segments of the default size.
+    Segmented,
 }
 
 /// A local segmented envelope read by range: the ciphertext stays as the
@@ -331,6 +324,7 @@ impl<S: Clone, K> Clone for EncryptedStorage<S, K> {
             inner: self.inner.clone(),
             keys: Arc::clone(&self.keys),
             context: self.context,
+            write: self.write,
         }
     }
 }
@@ -668,6 +662,7 @@ mod nameservice_impls {
         {
             // The closure may run off this task, so it owns its keys.
             let keys = Arc::clone(&self.keys);
+            let write = self.write;
             self.inner
                 .compare_and_swap(address, move |current_encrypted| {
                     // Decrypt current value if present
@@ -681,7 +676,7 @@ mod nameservice_impls {
                     let current_ref = current_plaintext.as_deref();
                     match f(current_ref)? {
                         CasAction::Write(plaintext) => {
-                            let encrypted = Self::encrypt_with(&keys, &plaintext)
+                            let encrypted = Self::encrypt_with(&keys, write, &plaintext)
                                 .map_err(|e| StorageExtError::other(e.to_string()))?;
                             Ok(CasAction::Write(encrypted))
                         }
