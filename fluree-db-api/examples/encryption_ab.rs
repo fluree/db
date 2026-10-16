@@ -118,9 +118,12 @@ async fn open(
     if let Some(mb) = cache_mb {
         builder = builder.cache_max_mb(mb);
     }
+    #[cfg(not(no_counters))]
     if let Some(mb) = dictionary_mb {
         builder = builder.cache_dictionary_max_mb(mb);
     }
+    #[cfg(no_counters)]
+    let _ = dictionary_mb;
     builder
         .build_async()
         .await
