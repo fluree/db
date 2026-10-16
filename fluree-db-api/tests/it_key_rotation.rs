@@ -551,8 +551,8 @@ fn holds(fluree: &Fluree, kind: &str) -> bool {
 
 /// A store older releases wrote, every blob a version 1 envelope, reads as
 /// before, its leaves decrypted whole. New writes land beside it as version
-/// 2; after a reindex every leaf a query reads is version 2, read by range;
-/// a rotation rewrites whatever is left.
+/// 2; after a reindex every leaf and dictionary pack a query reads is version
+/// 2, read by range; a rotation rewrites whatever is left.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_version_1_store_reads_and_moves_to_version_2() {
     let data = tempfile::TempDir::new().expect("tempdir");
@@ -595,6 +595,10 @@ async fn a_version_1_store_reads_and_moves_to_version_2() {
     assert!(
         holds(&fluree, "ranged-leaf") && !holds(&fluree, "leaf-bytes-heap"),
         "the reindexed index is read by range"
+    );
+    assert!(
+        fluree.leaflet_cache().dictionary_allowance().capacity() > 0,
+        "its dictionary packs too: a pack that could not be read by range would give the allowance back"
     );
     drop(fluree);
 

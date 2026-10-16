@@ -441,6 +441,7 @@ impl DictTreeReader {
                 .get_local_ranged(cid)
                 .map_err(|e| io::Error::other(format!("dict leaf {cid}: {e}")))?
             else {
+                cache.note_unfenceable_leaf();
                 return Ok(None);
             };
             Ok(FencedLeaf::open(source, self.fence_spacing)?.map(Arc::new))
@@ -1299,7 +1300,7 @@ mod tests {
         /// A cache as storage that decrypts on read gets, with no room for
         /// dictionary packs.
         fn fence_cache(bytes: u64) -> Arc<LeafletCache> {
-            Arc::new(LeafletCache::for_decrypting_storage(bytes, Some(0)))
+            Arc::new(LeafletCache::with_reservable_budget(bytes, Some(0)))
         }
 
         fn fenced_reader(

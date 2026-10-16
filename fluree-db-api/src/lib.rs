@@ -1652,8 +1652,10 @@ fn default_indexing_builder_config() -> IndexingBuilderConfig {
     }
 }
 
-/// The leaflet cache for `config`'s budget. On encrypted storage the budget
-/// also holds the dictionary allowance, packs decrypted whole.
+/// The leaflet cache for `config`'s budget. On encrypted storage part of it
+/// starts reserved for the dictionary allowance and fenced reverse leaves,
+/// and goes back to the leaflet cache as far as the data opened cannot use
+/// them; unencrypted storage gives leaflets all of it.
 fn make_leaflet_cache(
     config: &fluree_db_connection::ConnectionConfig,
     backend: &StorageBackend,
@@ -1664,7 +1666,7 @@ fn make_leaflet_cache(
         .admin_storage()
         .is_some_and(|storage| storage.encryption_admin().is_some());
     std::sync::Arc::new(if encrypted {
-        fluree_db_binary_index::LeafletCache::for_decrypting_storage(
+        fluree_db_binary_index::LeafletCache::with_reservable_budget(
             budget,
             config
                 .cache
@@ -2237,9 +2239,9 @@ impl FlureeBuilder {
     }
 
     /// On encrypted storage, set how many MB of the cache budget forward
-    /// dictionary packs may hold decrypted whole; the leaflet cache gets the
-    /// rest. By default it is 60% of the budget. Unencrypted storage holds no
-    /// pack decrypted, so gives the cache all of it.
+    /// dictionary packs may hold decrypted whole, by default 60% of it. Data
+    /// that cannot use it (version 1 envelopes, remote reads) gives it back
+    /// to the leaflet cache; unencrypted storage never reserves it.
     pub fn cache_dictionary_max_mb(mut self, max_mb: usize) -> Self {
         self.config.cache.dictionary_max_mb = Some(max_mb);
         self

@@ -741,6 +741,7 @@ fn fetch_and_load(
                 ctx,
             );
         }
+        cache.note_unrangeable_pack();
     }
     if let Some(backing) = ctx
         .cs
@@ -846,8 +847,10 @@ fn loaded_adaptive(
         .iter()
         .map(|_| AtomicBool::new(false))
         .collect();
+    let units = CachedUnits::new(source, Arc::clone(cache));
+    cache.note_promotable_pack(units.identity(), units.len());
     let backing = PackBacking::Adaptive(Box::new(AdaptivePack::new(
-        CachedUnits::new(source, Arc::clone(cache)),
+        units,
         checked,
         Arc::clone(cache.dictionary_allowance()),
         ctx.promote_coverage,

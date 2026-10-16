@@ -119,12 +119,13 @@ fn memo_put(key: SourceUnitKey, unit: &Arc<[u8]>) {
 /// The read unit of a default segmented envelope.
 pub const DEFAULT_UNIT: u64 = 64 * 1024;
 
-/// An epoch that advances each time `period` bytes have been counted.
+/// An epoch that advances each time `period` bytes have been counted; the
+/// period can change as it runs.
 pub struct Epochs {
     epoch: AtomicU64,
     since: AtomicU64,
     counted: AtomicU64,
-    period: u64,
+    period: AtomicU64,
 }
 
 impl Epochs {
@@ -133,7 +134,7 @@ impl Epochs {
             epoch: AtomicU64::new(0),
             since: AtomicU64::new(0),
             counted: AtomicU64::new(0),
-            period: period.max(1),
+            period: AtomicU64::new(period.max(1)),
         }
     }
 
@@ -146,12 +147,17 @@ impl Epochs {
         self.counted.load(Ordering::Relaxed)
     }
 
+    /// Advance an epoch every `period` bytes from now on.
+    pub fn set_period(&self, period: u64) {
+        self.period.store(period.max(1), Ordering::Relaxed);
+    }
+
     pub fn count(&self, n: u64) {
         self.counted.fetch_add(n, Ordering::Relaxed);
-        if self.since.fetch_add(n, Ordering::Relaxed) + n < self.period {
+        let period = self.period.load(Ordering::Relaxed);
+        if self.since.fetch_add(n, Ordering::Relaxed) + n < period {
             return;
         }
-        let period = self.period;
         if let Ok(since) = self
             .since
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {

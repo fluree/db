@@ -89,10 +89,14 @@ fn snapshot<const N: usize>(h: &[AtomicU64; N]) -> [u64; N] {
 }
 
 pub struct DictionaryAllowance {
-    capacity: u64,
+    /// Lowered by the cache as far as its data cannot use it (see
+    /// [`Self::lower_to`]); it never grows.
+    capacity: AtomicU64,
     /// Advanced by bytes missed across all metered packs: recent rent halves
     /// each time they together miss the allowance's size.
     rent_clock: Arc<Epochs>,
+    /// Whether the rent clock's period follows the capacity.
+    rent_follows_capacity: bool,
     state: Mutex<State>,
     /// Bumped whenever the pool admits or evicts a pack, so a reader that
     /// found its pack absent knows when to look again.
@@ -303,20 +307,21 @@ impl Drop for HeldPack {
 
 impl DictionaryAllowance {
     pub fn new(capacity: u64) -> Arc<Self> {
-        Self::aging_every(capacity, capacity)
+        Self::aging_every(capacity, capacity, true)
     }
 
     /// An allowance whose recent rent halves every `period` bytes missed
     /// rather than every `capacity` (tests: `u64::MAX` never ages it).
     #[cfg(test)]
     pub(crate) fn with_rent_period(capacity: u64, period: u64) -> Arc<Self> {
-        Self::aging_every(capacity, period)
+        Self::aging_every(capacity, period, false)
     }
 
-    fn aging_every(capacity: u64, period: u64) -> Arc<Self> {
+    fn aging_every(capacity: u64, period: u64, follows: bool) -> Arc<Self> {
         Arc::new(Self {
-            capacity,
+            capacity: AtomicU64::new(capacity),
             rent_clock: Arc::new(Epochs::new(period)),
+            rent_follows_capacity: follows,
             state: Mutex::default(),
             generation: AtomicU64::new(0),
             released: AtomicU64::new(0),
@@ -341,7 +346,21 @@ impl DictionaryAllowance {
     }
 
     pub fn capacity(&self) -> u64 {
-        self.capacity
+        self.capacity.load(Ordering::Acquire)
+    }
+
+    /// Lower the capacity to `level(held)`, `held` being the bytes it
+    /// charges now, and never raise it; returns the capacity. Decided under
+    /// the lock, so no promotion lands between the two.
+    pub(crate) fn lower_to(&self, level: impl FnOnce(u64) -> u64) -> u64 {
+        let state = self.lock();
+        let capacity = level(state.used).min(self.capacity());
+        self.capacity.store(capacity, Ordering::Release);
+        drop(state);
+        if self.rent_follows_capacity {
+            self.rent_clock.set_period(capacity);
+        }
+        capacity
     }
 
     pub fn generation(&self) -> u64 {
@@ -426,7 +445,7 @@ impl DictionaryAllowance {
             if let Some(pack) = state.resident.get(&identity) {
                 return Ok(Promotion::Resident(Arc::clone(pack)));
             }
-            if len > self.capacity {
+            if len > self.capacity() {
                 return Ok(self.turned_away(Promotion::TooLarge));
             }
             if state.in_flight.contains(&identity) {
@@ -470,7 +489,7 @@ impl DictionaryAllowance {
             if state.in_flight.contains(&identity) {
                 return Ok(self.turned_away(Promotion::Busy));
             }
-            if state.used.saturating_add(len) > self.capacity {
+            if state.used.saturating_add(len) > self.capacity() {
                 return Ok(self.turned_away(Promotion::NoRoom));
             }
             state.charge(len);
@@ -514,7 +533,7 @@ impl DictionaryAllowance {
     /// The packs the clock takes out of the pool for `len` more bytes to
     /// fit, giving each referenced pack a second chance.
     fn clock_victims(&self, state: &mut State, len: u64) -> Vec<u128> {
-        let mut need = (state.used + len).saturating_sub(self.capacity);
+        let mut need = (state.used + len).saturating_sub(self.capacity());
         let mut chosen = Vec::new();
         let mut turns = 2 * state.clock.len();
         while need > 0 && turns > 0 {
@@ -573,7 +592,7 @@ impl DictionaryAllowance {
         let state = self.lock();
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
         AllowanceStats {
-            capacity: self.capacity,
+            capacity: self.capacity(),
             used: state.used,
             peak: state.peak,
             released: load(&self.released),

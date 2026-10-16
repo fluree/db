@@ -387,6 +387,7 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
     let s = fluree.leaflet_cache().dictionary_allowance().stats();
     json!({
         "capacity": (s.capacity != u64::MAX).then_some(s.capacity), "used": s.used,
+        "reserved": fluree.leaflet_cache().reserved_bytes(),
         "peak": s.peak, "released": s.released,
         "resident_packs": s.resident_packs, "resident_bytes": s.resident_bytes,
         "promoted": s.promoted, "promoted_bytes": s.promoted_bytes,
