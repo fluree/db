@@ -86,7 +86,7 @@ pub const HEADER_LEN: usize = 64;
 pub const MIN_SEGMENT_LOG2: u8 = 12;
 pub const MAX_SEGMENT_LOG2: u8 = 24;
 
-/// Segment size new envelopes are written with unless configured otherwise.
+/// Segment size new envelopes are written with.
 pub const DEFAULT_SEGMENT_LOG2: u8 = 16;
 
 const SALT_LEN: usize = 32;

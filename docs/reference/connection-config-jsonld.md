@@ -69,6 +69,9 @@ Notes:
 Supported:
 - `parallelism` (default 4)
 - `cacheMaxMb` (supports `ConfigurationValue`)
+- `cacheDictionaryMaxMb` (supports `ConfigurationValue`): on encrypted storage,
+  the part of `cacheMaxMb` that dictionary packs may hold decrypted whole
+  (default 60%); see [Storage Encryption](../security/encryption.md#performance-considerations)
 - `indexStorage` (required): reference to a `Storage` node
 - `commitStorage` (optional): reference to a `Storage` node
 - `primaryPublisher` (optional): reference to a `Publisher` node
