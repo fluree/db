@@ -1670,11 +1670,8 @@ mod tests {
             "{elsewhere}"
         );
 
-        // Windows cannot read a locked file, so there the holder is unnamed.
-        if cfg!(unix) {
-            let server = already_running(&file_backed(dir.path()), Some(ours)).unwrap();
-            assert!(server.contains("server already running"), "{server}");
-        }
+        let server = already_running(&file_backed(dir.path()), Some(ours)).unwrap();
+        assert!(server.contains("server already running"), "{server}");
     }
 
     #[test]

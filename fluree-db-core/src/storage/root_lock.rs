@@ -6,9 +6,11 @@
 //! releases it however the holder exits; the file left on disk means nothing.
 
 use fs2::FileExt;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 /// The lock file's name under a storage root.
 pub const ROOT_LOCK_FILE: &str = ".fluree-lock";
@@ -22,12 +24,24 @@ pub const ALLOW_UNLOCKED_ENV_VAR: &str = "FLUREE_STORAGE_ALLOW_UNLOCKED";
 #[derive(Debug)]
 pub struct RootLock {
     _handle: Option<File>,
+    /// This root's entry in [`HELD_HERE`], while this lock holds it.
+    held_here: Option<PathBuf>,
+}
+
+/// The roots this process holds. A refusal tells this process from another
+/// by it, not by the lock file, which Windows does not let a second handle
+/// read while it is locked.
+static HELD_HERE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+fn held_here() -> MutexGuard<'static, HashSet<PathBuf>> {
+    HELD_HERE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RootLockError {
-    /// Another open instance holds the root. `holder` is its process id when
-    /// the lock file could be read.
+    /// Another open instance holds the root. `holder` is its process id:
+    /// this process's when it holds the root, else read from the lock file,
+    /// which Windows does not allow.
     #[error("storage root is held by another open instance")]
     Held { holder: Option<u32> },
     /// The root's filesystem cannot lock, and [`ALLOW_UNLOCKED_ENV_VAR`] did
@@ -45,6 +59,7 @@ impl RootLock {
     /// other, and on any error opening or locking the lock file.
     pub fn acquire(root: &Path) -> Result<Self, RootLockError> {
         std::fs::create_dir_all(root)?;
+        let key = std::fs::canonicalize(root)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -54,9 +69,12 @@ impl RootLock {
         match file.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if is_contended(&error) => {
-                return Err(RootLockError::Held {
-                    holder: read_holder(&mut file),
-                })
+                let holder = if held_here().contains(&key) {
+                    Some(std::process::id())
+                } else {
+                    read_holder(&mut file)
+                };
+                return Err(RootLockError::Held { holder });
             }
             Err(error) if is_unsupported(&error) => {
                 if !unlocked_allowed() {
@@ -68,7 +86,10 @@ impl RootLock {
                     "{ALLOW_UNLOCKED_ENV_VAR} is set: opening a storage root its \
                      filesystem cannot lock, without protection from a second process"
                 );
-                return Ok(Self { _handle: None });
+                return Ok(Self {
+                    _handle: None,
+                    held_here: None,
+                });
             }
             Err(error) => return Err(error.into()),
         }
@@ -76,9 +97,21 @@ impl RootLock {
         let _ = file
             .set_len(0)
             .and_then(|()| writeln!(file, "{}", std::process::id()));
+        held_here().insert(key.clone());
         Ok(Self {
             _handle: Some(file),
+            held_here: Some(key),
         })
+    }
+}
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        // Before the handle closes and frees the root, so no other lock can
+        // have taken it and entered it in the set by then.
+        if let Some(key) = self.held_here.take() {
+            held_here().remove(&key);
+        }
     }
 }
 
@@ -135,9 +168,23 @@ mod tests {
         let RootLockError::Held { holder } = refused else {
             panic!("expected Held, got {refused:?}");
         };
-        if cfg!(unix) {
-            assert_eq!(holder, Some(std::process::id()));
-        }
+        assert_eq!(holder, Some(std::process::id()));
+    }
+
+    /// Windows does not let a second handle read a locked file; an emptied
+    /// lock file stands in for that here.
+    #[test]
+    fn a_refusal_in_this_process_names_it_without_reading_the_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = RootLock::acquire(dir.path()).unwrap();
+        std::fs::write(dir.path().join(ROOT_LOCK_FILE), "").unwrap();
+
+        let refused = RootLock::acquire(dir.path()).unwrap_err();
+
+        assert!(
+            matches!(refused, RootLockError::Held { holder: Some(pid) } if pid == std::process::id()),
+            "{refused:?}"
+        );
     }
 
     #[test]
