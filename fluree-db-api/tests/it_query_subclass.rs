@@ -309,6 +309,7 @@ async fn subclass_inferencing_after_load_issue_core_48() {
     let _ledger2 = fluree.update(ledger1, &insert_schema).await.unwrap().ledger;
 
     let fluree2 = FlureeBuilder::file(storage_path)
+        .without_storage_lock()
         .build()
         .expect("build file fluree2");
     let loaded = fluree2.ledger(ledger_id).await.unwrap();

@@ -48,6 +48,7 @@ pub(crate) fn read_meta(data_dir: &Path) -> Option<ServerMeta> {
 
 /// A live Fluree server serving this project's storage.
 pub(crate) struct LocalServer {
+    pub pid: u32,
     listen_addr: String,
 }
 
@@ -84,6 +85,7 @@ impl LocalServer {
             return None;
         }
         Some(Self {
+            pid: meta.pid,
             listen_addr: meta.listen_addr,
         })
     }

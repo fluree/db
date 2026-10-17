@@ -376,6 +376,7 @@ async fn file_based_indexing_then_new_connection_loads_and_queries() {
             }
 
             let fluree2 = FlureeBuilder::file(path)
+                .without_storage_lock()
                 .build()
                 .expect("build file fluree2");
             let loaded = fluree2.ledger(ledger_id).await.expect("load ledger");

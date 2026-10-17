@@ -45,7 +45,10 @@ async fn stale_cached_writer_reconciles_instead_of_wedging() {
     let la1 = ra1.ledger;
 
     // --- Connection B: cache the ledger at t=1 (independent manager) ---
-    let fb = FlureeBuilder::file(path.clone()).build().expect("build B");
+    let fb = FlureeBuilder::file(path.clone())
+        .without_storage_lock()
+        .build()
+        .expect("build B");
     let hb = fb.ledger_cached(ledger_id).await.expect("B cache");
     assert_eq!(hb.t().await, 1, "B cached at t=1");
 

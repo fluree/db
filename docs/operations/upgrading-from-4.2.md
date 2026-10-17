@@ -59,6 +59,22 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
   [Iceberg](../graph-sources/iceberg.md#where-policies-live-the-model-ledger)).
 - **Key rotation covers dropped ledgers**, so retiring a key never leaves a
   restorable ledger unreadable.
+- **One process per storage directory.** Every process that opens a file
+  storage directory now locks it: the server, CLI commands, the Python package
+  and Rust programs. Another process that opens it meanwhile is refused with
+  the holder's pid. A CLI command waits for another command to finish with it
+  (30 seconds, `FLUREE_STORAGE_LOCK_WAIT_SECS`). With a server running, most
+  commands go through it, `create` and `use` now included; the few that cannot
+  yet (`index`, `verify`, `config set-origins`, `graphql`, `track add`,
+  `materialize`, `doc`, and `clone`/`pull`/`push`/`fetch`/`publish`) are
+  refused until it stops. Shared-storage query peers and Raft nodes take no lock; a
+  Rust program that reads a directory another process owns opts out with
+  `FlureeBuilder::without_storage_lock()`. See
+  [One process per directory](storage.md#one-process-per-directory).
+- **`fluree memory` no longer opens the project's storage.** In a project, its
+  ledger is a cache in memory, rebuilt from `.fluree-memory/*.ttl` on each run.
+  The `__memory` ledger earlier releases kept in `.fluree/storage` is no longer
+  read.
 
 ### For API clients
 

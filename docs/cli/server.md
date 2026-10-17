@@ -91,8 +91,10 @@ file and `server.meta.json` alone. The lock belongs to the running process, so a
 `kill -9` releases it; there is nothing to clean up. Shared-storage query peers and Raft nodes
 open a directory that other processes use on purpose, and take no lock.
 
-CLI commands route to the running server; with `--direct` they open the directory themselves,
-without the lock. See [One process per directory](../operations/storage.md#one-process-per-directory).
+Most CLI commands are sent through the running server ([Auto-Routing](#auto-routing)). A command
+that opens the storage itself, because it has no way through a server yet or ran with `--direct`,
+meets the server's lock and is refused, saying which. See
+[One process per directory](../operations/storage.md#one-process-per-directory).
 
 ## stop
 

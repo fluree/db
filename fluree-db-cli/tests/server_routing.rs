@@ -159,3 +159,29 @@ async fn a_server_on_other_storage_is_not_routed_to() {
         .stderr(predicate::str::contains("not this project's"))
         .stderr(predicate::str::contains("routing through local server").not());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_that_meets_the_servers_lock_is_told_why_at_once() {
+    let dir = project();
+    let _server = ProjectServer::start(dir.path(), &[]).await;
+    fluree(dir.path())
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    let started = Instant::now();
+    fluree(dir.path())
+        .args(["--direct", "query", "people", "SELECT * WHERE { ?s ?p ?o }"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("drop --direct"));
+    fluree(dir.path())
+        .args(["verify", "people"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not go through a server yet"));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a server's lock was waited for"
+    );
+}

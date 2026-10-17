@@ -577,10 +577,74 @@ pub async fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
         .without_indexing()
         .with_novelty_thresholds(min_bytes, max_bytes);
 
-    builder
-        .build_async()
-        .await
-        .map_err(|e| CliError::Config(format!("failed to initialize Fluree: {e}")))
+    open_waiting(builder, dirs, storage_lock_wait()).await
+}
+
+/// How long a command waits for storage another process holds; `0` refuses
+/// at once.
+pub const STORAGE_LOCK_WAIT_ENV_VAR: &str = "FLUREE_STORAGE_LOCK_WAIT_SECS";
+const DEFAULT_STORAGE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+fn storage_lock_wait() -> Duration {
+    std::env::var(STORAGE_LOCK_WAIT_ENV_VAR)
+        .ok()
+        .and_then(|secs| secs.trim().parse().ok())
+        .map_or(DEFAULT_STORAGE_LOCK_WAIT, Duration::from_secs)
+}
+
+/// Build `builder`'s file-backed instance, waiting while another process
+/// holds its storage.
+///
+/// Commands often run side by side (scripts, agents), each holding the
+/// storage only for its own short run, so one that finds it held waits up to
+/// `wait` for it. A server holds its storage for as long as it runs, so a
+/// command that meets one is refused at once and pointed at the server.
+async fn open_waiting(
+    builder: FlureeBuilder,
+    dirs: &FlureeDir,
+    wait: Duration,
+) -> CliResult<Fluree> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut waiting = false;
+    loop {
+        let error = match builder.clone().build_async().await {
+            Ok(fluree) => return Ok(fluree),
+            Err(error) => error,
+        };
+        let fatal = |error| CliError::Config(format!("failed to initialize Fluree: {error}"));
+        let fluree_db_api::ApiError::StorageInUse { root, holder } = &error else {
+            return Err(fatal(error));
+        };
+        let server = crate::local_server::LocalServer::find(dirs).map(|server| server.pid);
+        if let Some(server) = holder.filter(|pid| server == Some(*pid)) {
+            // A command that can go through the server only gets here
+            // under `--direct`.
+            let hint = if direct() {
+                "drop --direct to send the command through it".to_string()
+            } else {
+                "this command does not go through a server yet, so stop the server \
+                 first (`fluree server stop`)"
+                    .to_string()
+            };
+            return Err(CliError::Config(format!(
+                "a Fluree server (pid {server}) is running on {root}; {hint}"
+            )));
+        }
+        if *holder == Some(std::process::id()) || std::time::Instant::now() >= deadline {
+            return Err(fatal(error));
+        }
+        if !waiting {
+            let by = holder
+                .map(|pid| format!(" (pid {pid})"))
+                .unwrap_or_default();
+            eprintln!(
+                "  {} {root} is in use by another Fluree process{by}; waiting for it",
+                "storage:".yellow().bold()
+            );
+            waiting = true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Build the Fluree instance that backs the developer-memory store
@@ -872,5 +936,70 @@ mod tests {
             Ok(_) => panic!("expected a Tracked target"),
             Err(e) => panic!("resolution failed: {e:?}"),
         }
+    }
+
+    fn storage_builder(dirs: &FlureeDir) -> FlureeBuilder {
+        FlureeBuilder::file(
+            config::resolve_storage_path(dirs)
+                .to_string_lossy()
+                .to_string(),
+        )
+        .without_ledger_caching()
+        .without_indexing()
+    }
+
+    fn hold_storage(dirs: &FlureeDir) -> fluree_db_core::RootLock {
+        fluree_db_core::RootLock::acquire(&config::resolve_storage_path(dirs)).unwrap()
+    }
+
+    const HOLD_ROOT_ENV: &str = "FLUREE_CLI_TEST_HOLD_ROOT";
+
+    /// Not a test of its own: the other process
+    /// `a_command_waits_for_storage_another_process_lets_go_of` starts, which
+    /// holds a storage root for a moment.
+    #[test]
+    fn hold_a_root_for_a_moment() {
+        let Ok(root) = std::env::var(HOLD_ROOT_ENV) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let _held = fluree_db_core::RootLock::acquire(&root).unwrap();
+        std::fs::write(root.join("held"), "").unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+
+    #[tokio::test]
+    async fn a_command_waits_for_storage_another_process_lets_go_of() {
+        let (_tmp, dirs) = temp_dirs();
+        let root = config::resolve_storage_path(&dirs);
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "context::tests::hold_a_root_for_a_moment"])
+            .env(HOLD_ROOT_ENV, &root)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !root.join("held").exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "holder never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        open_waiting(storage_builder(&dirs), &dirs, Duration::from_secs(60))
+            .await
+            .expect("opened once the holder let go");
+        assert!(holder.wait().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn without_a_wait_a_held_storage_is_refused_at_once() {
+        let (_tmp, dirs) = temp_dirs();
+        let _held = hold_storage(&dirs);
+
+        let refused = open_waiting(storage_builder(&dirs), &dirs, Duration::ZERO).await;
+
+        assert!(refused.is_err());
     }
 }

@@ -92,6 +92,7 @@ async fn flipped_split_mode_persisted_for_bound_iri_lookups() {
 
     // Read with a fresh instance so the reindexed root is loaded, not a cached one.
     let fluree2 = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .without_storage_lock()
         .build()
         .expect("build second Fluree");
     assert_eq!(

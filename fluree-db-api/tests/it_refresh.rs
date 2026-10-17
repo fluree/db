@@ -202,6 +202,7 @@ async fn refresh_follows_a_ledger_created_under_the_name_elsewhere() {
     let open = || {
         FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
             .without_indexing()
+            .without_storage_lock()
             .build()
             .expect("build")
     };
@@ -259,6 +260,7 @@ async fn refresh_with_min_t_follows_a_ledger_created_under_the_name_elsewhere() 
     let open = || {
         FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
             .without_indexing()
+            .without_storage_lock()
             .build()
             .expect("build")
     };

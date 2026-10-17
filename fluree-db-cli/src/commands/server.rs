@@ -145,7 +145,7 @@ async fn run_foreground(
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
-    let mut server_config = build_server_config(
+    let server_config = build_server_config(
         config_override,
         listen_addr,
         storage_path,
@@ -157,7 +157,6 @@ async fn run_foreground(
         profile,
         extra_args,
     )?;
-    server_config.storage_lock = true;
 
     // A memory server keeps nothing in a project, so it needs no `.fluree/`
     // and writes no server.meta.json (so no CLI auto-routing either).
@@ -825,7 +824,6 @@ async fn run_child(args: &[String]) -> CliResult<()> {
 
     let mut server_config = ServerConfig::from_arg_matches(&matches)
         .map_err(|e| CliError::Server(format!("failed to build server config: {e}")))?;
-    server_config.storage_lock = true;
 
     // Merge config file values (the child inherits --config-file if present)
     if let Err(e) = load_and_merge_config(&mut server_config, &matches) {
