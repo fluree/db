@@ -955,7 +955,12 @@ where
                     index_dir: index_dir.clone(),
                     g_id,
                     leaflet_target_rows: config.leaflet_rows,
-                    leaf_target_rows: config.leaf_rows,
+                    leaf_target_rows: match build_pool {
+                        Some(_) => crate::run_index::build::graph_scope::pooled_leaf_rows(
+                            config.leaflet_rows,
+                        ),
+                        None => config.leaf_rows,
+                    },
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,

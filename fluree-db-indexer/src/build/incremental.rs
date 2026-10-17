@@ -535,7 +535,7 @@ async fn execute_phase2_task(
         g_id,
         zstd_level: 1,
         leaflet_target_rows: config.leaflet_rows.max(1),
-        leaf_target_rows: config.leaf_rows,
+        leaf_target_rows: leaf_rows_for(order, config),
         // Fact identity is order-independent; collect base-row matches from
         // one task per tree — SPOT, or the pool's GSPO (they feed the Phase
         // 3b stats deltas).
@@ -5085,7 +5085,7 @@ async fn read_pooled_graph_logs(
     graphs: &[fluree_db_core::GraphId],
 ) -> Result<std::collections::HashMap<fluree_db_core::GraphId, PooledGraphLog>> {
     use fluree_db_binary_index::format::history_sidecar::{decode_sidecar_entries, HistEntryV2};
-    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2 as Rec};
+    use fluree_db_binary_index::format::run_record_v2::RunRecordV2 as Rec;
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
     use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection};
 
@@ -5100,13 +5100,13 @@ async fn read_pooled_graph_logs(
                 IndexerError::IncrementalAbort(format!("pooled graph promotion: store load: {e}"))
             })?,
     );
-    let Some(branch) = store.pool_branch(RunSortOrder::Gspo).cloned() else {
-        return Ok(out);
-    };
     // Sidecars hold every graph of their leaf; decode each once.
     let mut sidecars: std::collections::HashMap<ContentId, Vec<HistEntryV2>> =
         std::collections::HashMap::new();
     for &g_id in graphs {
+        let Some(tree) = store.graph_tree(g_id, RunSortOrder::Spot) else {
+            continue;
+        };
         let bound = |low: bool| Rec {
             s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
             o_key: if low { 0 } else { u64::MAX },
@@ -5118,12 +5118,12 @@ async fn read_pooled_graph_logs(
         };
         let mut cursor = BinaryCursor::new(
             Arc::clone(&store),
-            RunSortOrder::Gspo,
-            Arc::clone(&branch),
+            tree.order,
+            Arc::clone(&tree.branch),
             &bound(true),
             &bound(false),
             BinaryFilter {
-                g_id: Some(g_id),
+                g_id: tree.g_filter,
                 ..Default::default()
             },
             ColumnProjection::all(),
@@ -5145,8 +5145,12 @@ async fn read_pooled_graph_logs(
                 });
             }
         }
-        let leaves = branch.find_leaves_in_range(&bound(true), &bound(false), cmp_v2_g_spot);
-        for leaf in &branch.leaves[leaves] {
+        let leaves = tree.branch.find_leaves_in_range(
+            &bound(true),
+            &bound(false),
+            cmp_v2_for_order(tree.order),
+        );
+        for leaf in &tree.branch.leaves[leaves] {
             let Some(cid) = &leaf.sidecar_cid else {
                 continue;
             };
@@ -5178,6 +5182,15 @@ async fn read_pooled_graph_logs(
         out.insert(g_id, log);
     }
     Ok(out)
+}
+
+/// Rows per leaf for a tree in `order`: the pool's own size for pooled orders.
+fn leaf_rows_for(order: RunSortOrder, config: &IndexerConfig) -> usize {
+    if order.is_pooled() {
+        crate::run_index::build::graph_scope::pooled_leaf_rows(config.leaflet_rows)
+    } else {
+        config.leaf_rows
+    }
 }
 
 /// `base` grown by a window's winning ops and superseded events, estimated
@@ -5274,7 +5287,12 @@ fn build_folded_tree(
     let cmp = cmp_v2_for_order(order);
     let mut by_key: Vec<&FoldedFact> = facts.iter().collect();
     by_key.sort_unstable_by(|a, b| cmp(a.key(), b.key()));
-    let mut writer = LeafWriter::new(order, config.leaflet_rows.max(1), config.leaf_rows, 1);
+    let mut writer = LeafWriter::new(
+        order,
+        config.leaflet_rows.max(1),
+        leaf_rows_for(order, config),
+        1,
+    );
     for fact in by_key {
         for &(rec, op) in &fact.transitions {
             writer.push_history_entry(HistEntryV2 {

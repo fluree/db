@@ -79,6 +79,15 @@ impl GraphScope {
     }
 }
 
+/// Rows per leaf in the pooled tree: one leaflet. A window's writes scatter
+/// across the pool's graph-last orders — a new document lands in every
+/// predicate and value region it uses — and each touched leaf is rewritten
+/// whole, sidecar included. Leaves this size keep a build's write cost at
+/// (touched leaves x one leaflet) rather than growing with the pool.
+pub fn pooled_leaf_rows(leaflet_rows: usize) -> usize {
+    leaflet_rows.max(1)
+}
+
 /// Live rows above which a named graph keeps a dedicated tree rather than
 /// sharing the pooled one. A graph this large fills its own leaflets, and its
 /// own tree keeps the fast paths and batched lanes that read a graph's leaf

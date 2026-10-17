@@ -6562,7 +6562,10 @@ where
                             ),
                         )),
                         leaflet_target_rows: v3_leaflet_target_rows,
-                        leaf_target_rows: v3_leaf_target_rows,
+                        leaf_target_rows:
+                            fluree_db_indexer::run_index::build::graph_scope::pooled_leaf_rows(
+                                v3_leaflet_target_rows,
+                            ),
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: v3_worker_count,

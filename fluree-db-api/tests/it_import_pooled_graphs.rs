@@ -1734,3 +1734,84 @@ async fn an_index_without_a_pool_starts_one() {
         vec!["ex:c \"C\""]
     );
 }
+
+/// Row counts of every leaf of every pooled order.
+async fn pooled_leaf_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    root: &IndexRoot,
+) -> Vec<u64> {
+    let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let mut rows = Vec::new();
+    for (_, cid) in &root.pool.as_ref().expect("a pool").orders {
+        let branch = fluree_db_binary_index::format::branch::read_branch_from_bytes(
+            &store.get(cid).await.expect("branch"),
+        )
+        .expect("decode branch");
+        rows.extend(branch.leaves.iter().map(|l| l.row_count));
+    }
+    rows
+}
+
+/// A pooled leaf holds about one leaflet's rows, from the import on and
+/// through incremental updates, so a write rewrites the few leaflets it
+/// lands in rather than most of the pool.
+#[tokio::test]
+async fn pooled_leaves_hold_one_leaflet() {
+    const LEAFLET: usize = 2;
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-leaves:main";
+    let dir = data_dir.path().join("import");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("part-00.trig"), THREE_GRAPHS).unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create(ledger_id)
+        .import(&dir)
+        .threads(1)
+        .leaflet_rows(LEAFLET)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let root = latest_root(db_dir.path());
+    let rows = pooled_leaf_rows(&fluree, ledger_id, &root).await;
+    // A leaf closes once it reaches a leaflet's rows, so one cut short at a
+    // segment boundary can share it with the next.
+    assert!(
+        rows.iter().all(|&n| n < 2 * LEAFLET as u64) && rows.len() > 10,
+        "imported pooled leaves: {rows:?}"
+    );
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g1 { ex:a3 ex:val 30 . ex:a4 ex:val 40 . ex:a5 ex:val 50 . } }",
+    )
+    .await;
+    let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let result = fluree_db_indexer::build_index_for_ledger(
+        store.clone(),
+        fluree.nameservice(),
+        ledger_id,
+        fluree_db_indexer::IndexerConfig::default()
+            .with_leaflet_rows(LEAFLET)
+            .with_incremental_enabled(true),
+    )
+    .await
+    .expect("index");
+    let root = IndexRoot::decode(&store.get(&result.root_id).await.expect("root")).unwrap();
+    assert!(
+        dedicated_user_graphs(&root).is_empty(),
+        "an incremental pool update"
+    );
+    let rows = pooled_leaf_rows(&fluree, ledger_id, &root).await;
+    assert!(
+        rows.iter().all(|&n| n <= 2 * LEAFLET as u64),
+        "a merge keeps pooled leaves within twice a leaflet: {rows:?}"
+    );
+}
