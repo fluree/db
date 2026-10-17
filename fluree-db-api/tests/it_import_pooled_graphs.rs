@@ -2232,3 +2232,293 @@ async fn pooled_secondary_orders_take_writes_as_delta_runs() {
     assert!(!in_rows.contains(&g1) && !in_history.contains(&g1));
     check(ledger).await;
 }
+
+/// Each pooled order's rows at `t`, with their assertion times.
+fn pooled_rows_at(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    order: fluree_db_binary_index::RunSortOrder,
+    t: i64,
+) -> Vec<(u32, u64, u32, u16, u64, u32, u32)> {
+    use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection};
+    let branch = Arc::clone(store.pool_branch(order).expect("pooled order"));
+    let mut cursor = BinaryCursor::scan_all(
+        Arc::clone(store),
+        order,
+        branch,
+        BinaryFilter::default(),
+        ColumnProjection::all(),
+    );
+    cursor.set_to_t(t);
+    let mut rows = Vec::new();
+    while let Some(b) = cursor.next_batch().unwrap() {
+        for i in 0..b.row_count {
+            rows.push((
+                b.g_id.get_or(i, 0),
+                b.s_id.get(i),
+                b.p_id.get_or(i, 0),
+                b.o_type.get_or(i, 0),
+                b.o_key.get(i),
+                b.o_i.get_or(i, u32::MAX),
+                b.t.get_or(i, 0),
+            ));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// Every pooled secondary order reads what GSPO reads at every `t` from
+/// `first_t`, assertion times included.
+fn assert_pooled_orders_agree(ledger: &fluree_db_api::LedgerState, first_t: i64, context: &str) {
+    use fluree_db_binary_index::RunSortOrder;
+    let store = ledger
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .clone()
+        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+    for t in first_t..=ledger.t() {
+        let expected = pooled_rows_at(&store, RunSortOrder::Gspo, t);
+        for order in [
+            RunSortOrder::SpotG,
+            RunSortOrder::PsotG,
+            RunSortOrder::PostG,
+            RunSortOrder::OpstG,
+        ] {
+            assert_eq!(
+                pooled_rows_at(&store, order, t),
+                expected,
+                "{context}: t={t} {order:?}"
+            );
+        }
+    }
+}
+
+/// Alternating retractions and reassertions across 67 builds, through
+/// run-cap compaction (build 65) and a promotion's (build 67): the
+/// secondary orders agree with GSPO after every build.
+#[tokio::test]
+async fn pooled_orders_agree_with_gspo_through_compaction() {
+    use fluree_db_binary_index::RunSortOrder;
+    let db = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let id = "test/pool-delta-agree:main";
+    let (fluree, ledger) = import_trig(db.path(), data.path(), id, THREE_GRAPHS).await;
+    let first_t = ledger.t();
+    for step in 0..67 {
+        let graph = step % 3 + 1;
+        let action = if step % 2 == 0 { "DELETE" } else { "INSERT" };
+        sparql_update(
+            &fluree,
+            id,
+            &format!(
+                "PREFIX ex: <http://example.org/> {action} DATA {{ GRAPH ex:g{graph} {{ ex:same ex:p 0 . }} }}"
+            ),
+        )
+        .await;
+        sparql_update(
+            &fluree,
+            id,
+            &format!(
+                "PREFIX ex: <http://example.org/> INSERT DATA {{ GRAPH ex:g{graph} {{ ex:n{step} ex:val {} . }} }}",
+                100 + step
+            ),
+        )
+        .await;
+        if step == 66 {
+            set_graph_placement(
+                &fluree,
+                id,
+                "PlacementAuto",
+                &[("g3", "PlacementDedicated")],
+            )
+            .await;
+        }
+        let (root, ledger) = index_and_reload(&fluree, id).await;
+        if step == 64 || step == 66 {
+            assert!(
+                root.pool
+                    .as_ref()
+                    .unwrap()
+                    .delta(RunSortOrder::PostG)
+                    .is_empty(),
+                "compaction at step {step}"
+            );
+        }
+        assert_pooled_orders_agree(&ledger, first_t, &format!("step {step}"));
+    }
+}
+
+/// The ways a fact's assertion time depends on indexing windows, through a
+/// compaction folding those windows into the bases: a reassertion alone in
+/// its window replaces the row's time (g2), including a fact asserted the
+/// window before (g1), while one followed by a retraction within its
+/// window changes nothing (g3). The secondary orders keep GSPO's times
+/// before and after compaction.
+#[tokio::test]
+async fn pooled_orders_keep_assertion_times_across_windows() {
+    use fluree_db_binary_index::RunSortOrder;
+    let db = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let id = "test/pool-delta-times:main";
+    let (fluree, ledger) = import_trig(db.path(), data.path(), id, THREE_GRAPHS).await;
+    let first_t = ledger.t();
+    let update = |body: &'static str| {
+        let fluree = &fluree;
+        async move {
+            sparql_update(
+                fluree,
+                id,
+                &format!("PREFIX ex: <http://example.org/> {body}"),
+            )
+            .await;
+        }
+    };
+
+    update("INSERT DATA { GRAPH ex:g2 { ex:same ex:p 0 . } }").await;
+    update("INSERT DATA { GRAPH ex:g1 { ex:k ex:val 7 . } GRAPH ex:g4 { ex:d ex:val 4 . } }").await;
+    let (_, ledger) = index_and_reload(&fluree, id).await;
+    assert_pooled_orders_agree(&ledger, first_t, "window 1");
+
+    update("INSERT DATA { GRAPH ex:g1 { ex:k ex:val 7 . } }").await;
+    update("DELETE DATA { GRAPH ex:g2 { ex:same ex:p 0 . } }").await;
+    let (_, ledger) = index_and_reload(&fluree, id).await;
+    assert_pooled_orders_agree(&ledger, first_t, "window 2");
+
+    update("INSERT DATA { GRAPH ex:g2 { ex:same ex:p 0 . } }").await;
+    update("INSERT DATA { GRAPH ex:g3 { ex:same ex:p 0 . } }").await;
+    update("DELETE DATA { GRAPH ex:g3 { ex:same ex:p 0 . } }").await;
+    update("INSERT DATA { GRAPH ex:g3 { ex:same ex:p 0 . } }").await;
+    let (root, ledger) = index_and_reload(&fluree, id).await;
+    assert_eq!(
+        root.pool.as_ref().unwrap().delta(RunSortOrder::PostG).len(),
+        3
+    );
+    assert_pooled_orders_agree(&ledger, first_t, "window 3");
+
+    set_graph_placement(
+        &fluree,
+        id,
+        "PlacementAuto",
+        &[("g4", "PlacementDedicated")],
+    )
+    .await;
+    let (root, ledger) = index_and_reload(&fluree, id).await;
+    assert!(root
+        .pool
+        .as_ref()
+        .unwrap()
+        .delta(RunSortOrder::PostG)
+        .is_empty());
+    assert_pooled_orders_agree(&ledger, first_t, "compacted");
+}
+
+/// A compaction keeps a reasserted fact's assertion time as of each `t`,
+/// as GSPO and the query it answers report it.
+#[tokio::test]
+async fn compaction_keeps_a_reassertion_time() {
+    use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection, RunSortOrder};
+    let db = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let id = "test/pool-delta-assert-time:main";
+    let (fluree, _) = import_trig(db.path(), data.path(), id, THREE_GRAPHS).await;
+    sparql_update(
+        &fluree,
+        id,
+        "PREFIX ex: <http://example.org/> INSERT DATA { GRAPH ex:g2 { ex:same ex:p 0 . } }",
+    )
+    .await;
+    let (_, ledger) = index_and_reload(&fluree, id).await;
+    let asserted_t = ledger.t();
+    for action in ["DELETE", "INSERT"] {
+        sparql_update(
+            &fluree,
+            id,
+            &format!(
+                "PREFIX ex: <http://example.org/> {action} DATA {{ GRAPH ex:g2 {{ ex:same ex:p 0 . }} }}"
+            ),
+        )
+        .await;
+        index_and_reload(&fluree, id).await;
+    }
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": {"@id": id, "graph": "http://example.org/g2", "t": asserted_t},
+        "select": ["?s", "?v"],
+        "where": [
+            {"@id": "?s", "ex:p": "?v"},
+            ["filter", format!("(and (>= ?v 0) (= (t ?v) {asserted_t}))")]
+        ]
+    });
+    let post_times = |ledger: &fluree_db_api::LedgerState| {
+        let store = ledger
+            .binary_store
+            .as_ref()
+            .unwrap()
+            .0
+            .clone()
+            .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+            .unwrap();
+        let g = user_graph_id(&latest_root(db.path()), "g2");
+        let p = store
+            .sid_to_p_id(&ledger.snapshot.encode_iri("http://example.org/p").unwrap())
+            .unwrap();
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&store),
+            RunSortOrder::PostG,
+            Arc::clone(store.pool_branch(RunSortOrder::PostG).unwrap()),
+            BinaryFilter {
+                g_id: Some(g),
+                p_id: Some(p),
+                ..Default::default()
+            },
+            ColumnProjection::all(),
+        );
+        cursor.set_to_t(asserted_t);
+        let mut times = Vec::new();
+        while let Some(b) = cursor.next_batch().unwrap() {
+            for i in 0..b.row_count {
+                times.push(b.t.get(i));
+            }
+        }
+        times
+    };
+    let ledger = fluree.ledger(id).await.unwrap();
+    assert_eq!(post_times(&ledger), vec![asserted_t as u32]);
+    let before = fluree
+        .query_connection(&query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(before.as_array().unwrap().len(), 1);
+
+    set_graph_placement(
+        &fluree,
+        id,
+        "PlacementAuto",
+        &[("g3", "PlacementDedicated")],
+    )
+    .await;
+    let (root, ledger) = index_and_reload(&fluree, id).await;
+    assert!(root
+        .pool
+        .as_ref()
+        .unwrap()
+        .delta(RunSortOrder::PostG)
+        .is_empty());
+    let after = fluree
+        .query_connection(&query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        post_times(&ledger),
+        vec![asserted_t as u32],
+        "POST after compaction"
+    );
+}

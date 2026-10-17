@@ -376,11 +376,6 @@ enum Phase2TaskKind {
     Folded {
         facts: Arc<Vec<FoldedFact>>,
     },
-    /// A pooled secondary order's delta run for this window: its events,
-    /// sorted by the order's key.
-    PoolDeltaRun {
-        events: Vec<fluree_db_binary_index::OverlayOp>,
-    },
 }
 
 /// The tree a Phase 2 task writes.
@@ -434,15 +429,8 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
 }
 
 enum Phase2TaskUpdate {
-    Default {
-        leaf_entries: Vec<LeafEntry>,
-    },
-    Branch {
-        branch_cid: ContentId,
-    },
-    DeltaRun {
-        run: fluree_db_binary_index::PoolDeltaRun,
-    },
+    Default { leaf_entries: Vec<LeafEntry> },
+    Branch { branch_cid: ContentId },
 }
 
 struct Phase2TaskOutput {
@@ -582,40 +570,6 @@ async fn execute_phase2_task(
         fold_graph_log(&PooledGraphLog::default(), window).0
     };
     let output = match kind {
-        Phase2TaskKind::PoolDeltaRun { events } => {
-            let bytes =
-                fluree_db_binary_index::format::pool_delta::encode_delta_run(order, &events)
-                    .map_err(|e| IndexerError::StorageWrite(format!("pool delta run: {e}")))?;
-            // A run lives with the pool's leaves; it is reachable only from
-            // the root, never from a branch.
-            let cid = content_store
-                .put(ContentKind::IndexLeaf, &bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            tracing::debug!(
-                ?order,
-                events = events.len(),
-                bytes = bytes.len(),
-                "pool delta run written"
-            );
-            Phase2TaskOutput {
-                seq,
-                target,
-                order,
-                update: Phase2TaskUpdate::DeltaRun {
-                    run: fluree_db_binary_index::PoolDeltaRun {
-                        cid,
-                        events: events.len() as u32,
-                    },
-                },
-                replaced_leaf_cids: Vec::new(),
-                replaced_sidecar_cids: Vec::new(),
-                new_leaf_count: 0,
-                fetch_stats: Phase2FetchStatsSnapshot::default(),
-                matched: Vec::new(),
-                graph_deltas: GraphDeltas::new(),
-            }
-        }
         Phase2TaskKind::DefaultExisting { leaves } if leaves.is_empty() => {
             write_folded_tree(
                 &fold_own_window(),
@@ -931,6 +885,10 @@ pub async fn incremental_index(
     graph_order.dedup();
 
     let no_purge: Arc<Vec<fluree_db_core::GraphId>> = Arc::new(Vec::new());
+    // Pooled secondary orders taking this window as a delta run, and the
+    // window's pooled events.
+    let mut delta_orders: Vec<RunSortOrder> = Vec::new();
+    let mut delta_window: Vec<(RunRecordV2, u8)> = Vec::new();
     let mut phase2_tasks = Vec::with_capacity(
         graph_order.len().saturating_mul(all_orders.len())
             + RunSortOrder::pool_build_orders().len(),
@@ -1083,6 +1041,7 @@ pub async fn incremental_index(
         });
         let base_rows: u64 =
             base_pool.map_or(0, |p| p.members.iter().map(|m| u64::from(m.rows)).sum());
+        delta_window = records.iter().chain(&superseded).copied().collect();
         for &order in RunSortOrder::pool_build_orders() {
             let cmp = cmp_v2_for_order(order);
             let (mut sorted, mut sorted_superseded) = (records.clone(), superseded.clone());
@@ -1107,26 +1066,8 @@ pub async fn incremental_index(
                     if order == RunSortOrder::Gspo {
                         Phase2TaskKind::NamedExisting { branch_cid }
                     } else if !compact_delta(runs, window_events, base_rows, !promote.is_empty()) {
-                        let mut events: Vec<fluree_db_binary_index::OverlayOp> = records
-                            .iter()
-                            .chain(&superseded)
-                            .map(|&(rec, op)| delta_event(rec, op))
-                            .collect();
-                        fluree_db_binary_index::read::types::sort_overlay_ops_stable(
-                            &mut events,
-                            order,
-                        );
-                        phase2_tasks.push(Phase2Task {
-                            seq: phase2_tasks.len(),
-                            target: TreeTarget::Pool,
-                            purge: Arc::clone(&no_purge),
-                            order,
-                            sorted_records: Vec::new(),
-                            sorted_ops: Vec::new(),
-                            sorted_superseded: Vec::new(),
-                            sorted_superseded_ops: Vec::new(),
-                            kind: Phase2TaskKind::PoolDeltaRun { events },
-                        });
+                        // Written once the GSPO merge has resolved the window.
+                        delta_orders.push(order);
                         continue;
                     } else {
                         let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
@@ -1141,20 +1082,23 @@ pub async fn incremental_index(
                                 .map_err(|e| {
                                     IndexerError::StorageRead(format!("pool delta run: {e}"))
                                 })?;
-                            events.extend(
+                            events.extend(with_replacements(
                                 run_events
                                     .into_iter()
                                     .filter(|e| promote.binary_search(&e.g_id).is_err())
-                                    .map(delta_record),
-                            );
+                                    .map(delta_record)
+                                    .collect(),
+                            ));
                         }
                         let purge_markers = records.iter().filter(|&&(_, op)| op == OP_PURGE);
-                        events.extend(
+                        events.extend(with_replacements(
                             records
                                 .iter()
                                 .chain(&superseded)
-                                .filter(|&&(_, op)| op != OP_PURGE),
-                        );
+                                .filter(|&&(_, op)| op != OP_PURGE)
+                                .copied()
+                                .collect(),
+                        ));
                         let (winners, earlier) = split_lifecycles(events, order);
                         sorted = winners;
                         sorted.extend(purge_markers);
@@ -1253,9 +1197,6 @@ pub async fn incremental_index(
             (Phase2TaskUpdate::Branch { branch_cid }, TreeTarget::Pool) => {
                 root_builder.set_pool_branch(output.order, branch_cid);
             }
-            (Phase2TaskUpdate::DeltaRun { run }, _) => {
-                root_builder.append_pool_delta_run(output.order, run);
-            }
         }
         for (g_id, delta) in output.graph_deltas {
             let total = pool_deltas.entry(g_id).or_default();
@@ -1284,6 +1225,19 @@ pub async fn incremental_index(
         sidecar_fetch_ms = phase2_fetch_totals.sidecar_fetch_ms,
         "V6 Phase 2 complete: branch updates"
     );
+
+    // The delta runs hold the window as the GSPO merge resolved it, from
+    // each fact's presence at the window's start, so the secondary orders
+    // read every `t` as GSPO does.
+    if !delta_orders.is_empty() {
+        let resolved = resolved_window_events(&delta_window, |rec| {
+            base_matched.contains(&fact_identity_key(rec))
+        });
+        for &order in delta_orders.iter().filter(|_| !resolved.is_empty()) {
+            let run = write_delta_run(content_store.as_ref(), order, &resolved).await?;
+            root_builder.append_pool_delta_run(order, run);
+        }
+    }
 
     // ---- Phase 3: Dict updates ----
     // Incremental dict tree updates.
@@ -5370,17 +5324,101 @@ fn delta_record(e: fluree_db_binary_index::OverlayOp) -> (RunRecordV2, u8) {
 /// Window events: a record and its op.
 type Events = Vec<(RunRecordV2, u8)>;
 
-/// Split events into each fact's winner — its latest event, a retract taking
-/// a same-`t` tie — and the earlier events it superseded, the shape the leaf
-/// merge consumes.
+/// One window's pooled events grouped by fact, each group in time order.
+fn by_fact(events: &[(RunRecordV2, u8)]) -> Vec<Events> {
+    let mut sorted = events.to_vec();
+    sorted.sort_unstable_by(|a, b| {
+        fact_identity_key(&a.0)
+            .cmp(&fact_identity_key(&b.0))
+            .then(a.0.t.cmp(&b.0.t))
+            .then(a.1.cmp(&b.1))
+    });
+    sorted
+        .chunk_by(|a, b| fact_identity_key(&a.0) == fact_identity_key(&b.0))
+        .map(<[_]>::to_vec)
+        .collect()
+}
+
+/// A window's pooled events as a merge applies them from each fact's
+/// presence at the window's start (`present`): the fact's transitions, plus
+/// a reassertion of a present fact alone in the window, which the merge
+/// records as replacing the row at its `t`. Events that change nothing are
+/// dropped.
+fn resolved_window_events(
+    window: &[(RunRecordV2, u8)],
+    present: impl Fn(&RunRecordV2) -> bool,
+) -> Events {
+    let mut out = Vec::with_capacity(window.len());
+    for mut fact in by_fact(window) {
+        let was_present = present(&fact[0].0);
+        if was_present && matches!(fact.as_slice(), [(_, 1)]) {
+            out.push(fact[0]);
+            continue;
+        }
+        let row = fluree_db_binary_index::format::transitions::resolve_transitions(
+            &mut fact,
+            was_present,
+        );
+        out.extend(fact);
+        out.extend(row.map(|rec| (rec, 1)));
+    }
+    out
+}
+
+/// One window's events ready to fold with other windows' into a single
+/// merge: a fact's lone assert gains a retract at its `t`, so that over a
+/// fact already present it replaces the row there, as the merge does when
+/// it applies that window alone, and over an absent fact changes nothing.
+fn with_replacements(window: Events) -> Events {
+    let mut out = Vec::with_capacity(window.len());
+    for fact in by_fact(&window) {
+        if let [(rec, 1)] = fact.as_slice() {
+            out.push((*rec, 0));
+        }
+        out.extend(fact);
+    }
+    out
+}
+
+/// Upload one pooled secondary order's delta run of `events`.
+async fn write_delta_run(
+    content_store: &dyn ContentStore,
+    order: RunSortOrder,
+    events: &[(RunRecordV2, u8)],
+) -> Result<fluree_db_binary_index::PoolDeltaRun> {
+    let mut ops: Vec<fluree_db_binary_index::OverlayOp> = events
+        .iter()
+        .map(|&(rec, op)| delta_event(rec, op))
+        .collect();
+    fluree_db_binary_index::read::types::sort_overlay_ops_stable(&mut ops, order);
+    let bytes = fluree_db_binary_index::format::pool_delta::encode_delta_run(order, &ops)
+        .map_err(|e| IndexerError::StorageWrite(format!("pool delta run: {e}")))?;
+    // A run lives with the pool's leaves; it is reachable only from the
+    // root, never from a branch.
+    let cid = content_store
+        .put(ContentKind::IndexLeaf, &bytes)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    tracing::debug!(
+        ?order,
+        events = ops.len(),
+        bytes = bytes.len(),
+        "pool delta run written"
+    );
+    Ok(fluree_db_binary_index::PoolDeltaRun {
+        cid,
+        events: ops.len() as u32,
+    })
+}
+
+/// Split events into each fact's winner — its latest event — and the
+/// earlier events it superseded, the shape the leaf merge consumes. A
+/// same-`t` pair is a replacement (see [`with_replacements`]): its retract
+/// comes first.
 fn split_lifecycles(mut events: Events, order: RunSortOrder) -> (Events, Events) {
     let cmp = cmp_v2_for_order(order);
     let same = fluree_db_binary_index::format::run_record_v2::identity_v2_for_order(order);
-    events.sort_by(|a, b| {
-        cmp(&a.0, &b.0)
-            .then(a.0.t.cmp(&b.0.t))
-            .then((a.1 == 0).cmp(&(b.1 == 0)))
-    });
+    events.sort_by(|a, b| cmp(&a.0, &b.0).then(a.0.t.cmp(&b.0.t)).then(a.1.cmp(&b.1)));
     let (mut winners, mut earlier) = (Vec::new(), Vec::new());
     for (i, &event) in events.iter().enumerate() {
         match events.get(i + 1) {
