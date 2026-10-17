@@ -27,6 +27,10 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+/// The quad path declines when the pool probe leaves fewer than one graph in
+/// this many.
+const SELECTIVE_PROBE_FACTOR: usize = 4;
+
 /// Logged when a block's pooled graphs are answered by quad scans.
 pub(crate) const QUAD_BLOCK_EVENT: &str = "quad block engaged";
 
@@ -194,7 +198,7 @@ impl QuadBlockOperator {
             let right = concat(schema, batches)?;
             let joined = match acc.take() {
                 None => right,
-                Some(left) => hash_join(ctx, &left, &right)?,
+                Some(left) => hash_join(ctx, shape.graph_var, &left, &right)?,
             };
             if joined.is_empty() {
                 return Ok(joined);
@@ -268,7 +272,12 @@ fn concat(schema: Arc<[VarId]>, batches: Vec<Batch>) -> Result<Batch> {
 /// Inner join of `left` and `right` on every variable they share (a quad
 /// scan's schema always holds the graph variable, so rows only ever join
 /// within one graph). Builds on `left`, probes with `right`.
-fn hash_join(ctx: &ExecutionContext<'_>, left: &Batch, right: &Batch) -> Result<Batch> {
+fn hash_join(
+    ctx: &ExecutionContext<'_>,
+    graph_var: VarId,
+    left: &Batch,
+    right: &Batch,
+) -> Result<Batch> {
     use crate::hash_join::inner_join_key;
     let shared: Vec<VarId> = left
         .schema()
@@ -281,7 +290,14 @@ fn hash_join(ctx: &ExecutionContext<'_>, left: &Batch, right: &Batch) -> Result<
     let key = |batch: &Batch, row: usize| -> Option<Vec<crate::hash_join::JoinKey>> {
         shared
             .iter()
-            .map(|v| inner_join_key(batch.get(row, *v)?, dicts, gv.as_ref()))
+            .map(|v| match batch.get(row, *v)? {
+                // Every quad scan binds a graph through the one `Arc` its
+                // `QuadGraphs` holds, so the pointer names the graph.
+                Binding::Iri(iri) if *v == graph_var => Some(crate::hash_join::JoinKey::Ref(
+                    Arc::as_ptr(iri).cast::<u8>() as usize as u64,
+                )),
+                binding => inner_join_key(binding, dicts, gv.as_ref()),
+            })
             .collect()
     };
     let mut table: rustc_hash::FxHashMap<Vec<crate::hash_join::JoinKey>, Vec<usize>> =
@@ -338,6 +354,13 @@ impl Operator for QuadBlockOperator {
         let Some(graphs) = self.quad_graphs(ctx) else {
             return self.graph.open(ctx).await;
         };
+        // When one pattern already rules most graphs out, visiting the few
+        // left one by one beats scanning every pattern across the pool.
+        if let Some(hits) = self.graph.probe_hit_count(ctx).await? {
+            if hits.saturating_mul(SELECTIVE_PROBE_FACTOR) < graphs.len() {
+                return self.graph.open(ctx).await;
+            }
+        }
         // The parent rows pair with the quad results and seed the per-graph
         // run of the remaining graphs, so collect them first.
         let mut child = self

@@ -1876,6 +1876,8 @@ ex:g3 { ex:c ex:val 3 ; ex:label "C" . ex:a ex:knows ex:b . }
         "SELECT ?g ?s ?l WHERE { GRAPH ?g { ?s ex:val ?v OPTIONAL { ?s ex:label ?l } } }",
         "SELECT ?g ?s WHERE { ?s ex:val 99 . GRAPH ?g { ?s ex:val ?v } }",
         "SELECT ?g ?p WHERE { GRAPH ?g { ex:a ?p ?o } }",
+        // The probe rules most graphs out: they run one by one.
+        "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:val 1000 ; ex:label ?l } }",
     ];
     for (queries, must_fire) in [(&engaged[..], true), (&declined[..], false)] {
         for q in queries {

@@ -130,6 +130,9 @@ pub struct GraphOperator {
     /// Graphs an unbound `?g` skips because a quad scan answered them (see
     /// [`crate::quad_block`]).
     skip: Option<Arc<crate::binary_scan::QuadGraphs>>,
+    /// A probe taken before `open` (see [`Self::probe_hit_count`]), which
+    /// `open` keeps rather than probing again.
+    primed_hits: Option<Option<rustc_hash::FxHashSet<GraphId>>>,
 }
 
 impl GraphOperator {
@@ -199,6 +202,7 @@ impl GraphOperator {
             seed_graph_var,
             pooled_hits: None,
             skip: None,
+            primed_hits: None,
         }
     }
 
@@ -216,6 +220,18 @@ impl GraphOperator {
     /// answered them.
     pub(crate) fn skip_graphs(&mut self, graphs: Arc<crate::binary_scan::QuadGraphs>) {
         self.skip = Some(graphs);
+    }
+
+    /// How many pooled graphs the block's probe leaves for an unbound `?g`,
+    /// or `None` when no probe can prune. Kept for `open`.
+    pub(crate) async fn probe_hit_count(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<usize>> {
+        let hits = self.probe_pooled_graphs(ctx).await?;
+        let count = hits.as_ref().map(rustc_hash::FxHashSet::len);
+        self.primed_hits = Some(hits);
+        Ok(count)
     }
 
     fn skipped(&self, ctx: &ExecutionContext<'_>, iri: &str) -> bool {
@@ -802,7 +818,7 @@ impl Operator for GraphOperator {
         self.state = OperatorState::Open;
         self.result_buffer.clear();
         self.buffer_pos = 0;
-        self.pooled_hits = None;
+        self.pooled_hits = self.primed_hits.take();
         Ok(())
     }
 
