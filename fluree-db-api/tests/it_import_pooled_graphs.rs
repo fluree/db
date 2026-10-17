@@ -1878,6 +1878,8 @@ ex:g3 { ex:c ex:val 3 ; ex:label "C" . ex:a ex:knows ex:b . }
         "SELECT ?g ?p WHERE { GRAPH ?g { ex:a ?p ?o } }",
         // The probe rules most graphs out: they run one by one.
         "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:val 1000 ; ex:label ?l } }",
+        // A row goal: the per-graph path stops early.
+        "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:val ?o } } LIMIT 2",
     ];
     for (queries, must_fire) in [(&engaged[..], true), (&declined[..], false)] {
         for q in queries {
@@ -1915,4 +1917,118 @@ ex:g3 { ex:c ex:val 3 ; ex:label "C" . ex:a ex:knows ex:b . }
             "{q}: {quad:?}"
         );
     }
+}
+
+/// A filter on transaction time reads flake metadata a quad scan does not
+/// carry, so the block runs per graph and keeps every row.
+#[tokio::test(flavor = "current_thread")]
+async fn a_transaction_time_filter_keeps_its_rows() {
+    let db = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (fluree, ledger) = import_trig(
+        db.path(),
+        data.path(),
+        "test/review-quad-t:main",
+        THREE_GRAPHS,
+    )
+    .await;
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?s", "?v"],
+        "where": [["graph", "?g",
+            {"@id": "?s", "ex:val": "?v"},
+            ["filter", "(> (t ?v) 0)"]
+        ]]
+    });
+    fluree_db_api::set_fast_paths_disabled(false);
+    let quad = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    fluree_db_api::set_fast_paths_disabled(true);
+    let per_graph = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    fluree_db_api::set_fast_paths_disabled(false);
+    assert_eq!(quad, per_graph);
+    assert_eq!(quad.as_array().unwrap().len(), 3);
+}
+
+/// The quad path charges what it buffers to the query's memory budget, so
+/// an over-budget block fails with `MemoryBudgetExceeded` rather than growing
+/// without bound.
+#[tokio::test(flavor = "current_thread")]
+async fn quad_buffers_count_against_the_memory_budget() {
+    use fluree_db_query::{
+        binding::Batch,
+        context::ExecutionContext,
+        ir::{GraphName, Pattern, Ref, Term, TriplePattern},
+        operator::Operator,
+        quad_block::QuadBlockOperator,
+        seed::BatchSeedOperator,
+        PlanningContext, VarRegistry,
+    };
+    let db = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (_, ledger) = import_trig(
+        db.path(),
+        data.path(),
+        "test/review-quad-memory:main",
+        THREE_GRAPHS,
+    )
+    .await;
+    let store = ledger
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .clone()
+        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+    let mut vars = VarRegistry::new();
+    let g = vars.get_or_insert("?g");
+    let s = vars.get_or_insert("?s");
+    let o = vars.get_or_insert("?o");
+    let cancellation = fluree_db_core::QueryCancellation::new();
+    // Room for the one parent row, not for a scan's rows.
+    cancellation.set_memory_limit(2 * fluree_db_query::context::BINDING_EST_BYTES);
+    let ctx = ExecutionContext::new(&ledger.snapshot, &vars)
+        .with_binary_store(store, 0)
+        .with_cancellation(cancellation);
+    let mut op = QuadBlockOperator::new(
+        Box::new(BatchSeedOperator::from_batch(Batch::empty_schema_with_len(
+            1,
+        ))),
+        GraphName::Var(g),
+        vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(
+                ledger
+                    .snapshot
+                    .encode_iri("http://example.org/val")
+                    .unwrap(),
+            ),
+            Term::Var(o),
+        ))],
+        PlanningContext::current(),
+    );
+    let result = op.open(&ctx).await;
+    let mut rows = 0;
+    if result.is_ok() {
+        while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+            rows += batch.len();
+        }
+    }
+    op.close();
+    assert!(
+        matches!(
+            result,
+            Err(fluree_db_query::error::QueryError::MemoryBudgetExceeded { .. })
+        ),
+        "result={result:?}, retained charge={}, rows={rows}",
+        ctx.mem_used()
+    );
 }

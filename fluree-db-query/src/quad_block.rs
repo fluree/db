@@ -24,7 +24,6 @@ use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use crate::PlanningContext;
 use async_trait::async_trait;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// The quad path declines when the pool probe leaves fewer than one graph in
@@ -86,17 +85,59 @@ impl QuadShape {
     }
 }
 
-/// Whether a filter means the same whichever graph is active: variables,
-/// constants and function calls only — no `EXISTS` or other patterns, which
-/// read the active graph, and no full-text scoring, which reads its arenas.
+/// Whether a filter can run over quad rows: variables, constants and
+/// function calls only — no `EXISTS` or other patterns, which read the active
+/// graph; no full-text scoring, which reads its arenas; and no `T` / `OP`,
+/// which read flake metadata a quad scan does not carry.
 fn graph_free(expr: &crate::ir::Expression) -> bool {
     use crate::ir::{Expression, Function};
     match expr {
         Expression::Var(_) | Expression::Const(_) => true,
         Expression::Call { func, args } => {
-            !matches!(func, Function::Fulltext) && args.iter().all(graph_free)
+            !matches!(func, Function::Fulltext | Function::T | Function::Op)
+                && args.iter().all(graph_free)
         }
         _ => false,
+    }
+}
+
+/// A batch and the query memory charged for it.
+struct Charged {
+    batch: Batch,
+    bytes: usize,
+}
+
+/// Charge `rows` rows of `cols` bindings to the query's retained memory and
+/// enforce its budget.
+fn charge(ctx: &ExecutionContext<'_>, rows: usize, cols: usize) -> Result<usize> {
+    let bytes = rows
+        .saturating_mul(cols.max(1))
+        .saturating_mul(crate::context::BINDING_EST_BYTES);
+    ctx.record_alloc(bytes);
+    ctx.checkpoint()?;
+    Ok(bytes)
+}
+
+/// Rows a join appends between memory charges.
+const CHARGE_ROWS: usize = 4096;
+
+/// Quad results being paired with the parent rows, one output batch at a
+/// time.
+struct QuadOutput {
+    /// The execution's memory counter, released when the output drops.
+    cancellation: fluree_db_core::QueryCancellation,
+    schema: Arc<[VarId]>,
+    parents: Vec<Batch>,
+    rows: Charged,
+    parent_bytes: usize,
+    /// Next (parent batch, parent row, quad row) to emit.
+    cursor: (usize, usize, usize),
+}
+
+impl Drop for QuadOutput {
+    fn drop(&mut self) {
+        self.cancellation
+            .release(self.rows.bytes + self.parent_bytes);
     }
 }
 
@@ -106,8 +147,11 @@ pub struct QuadBlockOperator {
     graph: GraphOperator,
     shape: Option<QuadShape>,
     planning: PlanningContext,
-    /// Quad results joined with the parent rows, ahead of `graph`'s.
-    quad_out: VecDeque<Batch>,
+    /// A downstream row goal: the per-graph path stops early, which a quad
+    /// scan of the whole pool cannot, so the block runs per graph.
+    row_budget: Option<usize>,
+    /// Quad results, emitted ahead of `graph`'s.
+    quad: Option<QuadOutput>,
     state: OperatorState,
 }
 
@@ -123,7 +167,8 @@ impl QuadBlockOperator {
             graph: GraphOperator::new(child, graph_name, inner_patterns, planning),
             shape,
             planning,
-            quad_out: VecDeque::new(),
+            row_budget: None,
+            quad: None,
             state: OperatorState::Created,
         }
     }
@@ -171,36 +216,45 @@ impl QuadBlockOperator {
 
     /// The block over `graphs`: each triple pattern's quad scan, hash-joined
     /// on the variables (and graph) it shares with the patterns before it,
-    /// then the block's filters.
+    /// then the block's filters. Every buffer is charged to the query's
+    /// memory budget as it grows and released when dropped.
     async fn run_quad(
         &self,
         ctx: &ExecutionContext<'_>,
         shape: &QuadShape,
         graphs: &Arc<QuadGraphs>,
-    ) -> Result<Batch> {
+    ) -> Result<Charged> {
         // A pattern binding its object or subject is the most selective
         // start; the rest keep their written order.
         let mut order: Vec<&TriplePattern> = shape.triples.iter().collect();
         order.sort_by_key(|tp| (!tp.o_bound(), !tp.s_bound()));
 
-        let mut acc: Option<Batch> = None;
+        let mut acc: Option<Charged> = None;
         for tp in order {
             let mut scan = BinaryScanOperator::new(tp.clone(), None, Vec::new())
                 .into_quad(shape.graph_var, Arc::clone(graphs));
             scan.open(ctx).await?;
+            let schema: Arc<[VarId]> = Arc::from(scan.schema());
             let mut batches = Vec::new();
+            let mut bytes = 0;
             while let Some(batch) = scan.next_batch(ctx).await? {
-                ctx.check_cancelled()?;
+                bytes += charge(ctx, batch.len(), schema.len())?;
                 batches.push(batch);
             }
-            let schema: Arc<[VarId]> = Arc::from(scan.schema());
             scan.close();
-            let right = concat(schema, batches)?;
+            let right = Charged {
+                batch: concat(schema, batches)?,
+                bytes,
+            };
             let joined = match acc.take() {
                 None => right,
-                Some(left) => hash_join(ctx, shape.graph_var, &left, &right)?,
+                Some(left) => {
+                    let joined = hash_join(ctx, shape.graph_var, &left.batch, &right.batch)?;
+                    ctx.release(left.bytes + right.bytes);
+                    joined
+                }
             };
-            if joined.is_empty() {
+            if joined.batch.is_empty() {
                 return Ok(joined);
             }
             acc = Some(joined);
@@ -209,8 +263,8 @@ impl QuadBlockOperator {
         if shape.filters.is_empty() {
             return Ok(joined);
         }
-        let schema = joined.schema_arc();
-        let seed = BatchReplayOperator::new(Arc::clone(&schema), vec![joined]);
+        let schema = joined.batch.schema_arc();
+        let seed = BatchReplayOperator::new(Arc::clone(&schema), vec![joined.batch]);
         let mut filtered = crate::execute::build_where_operators_seeded(
             Some(Box::new(seed)),
             &shape.filters,
@@ -220,36 +274,58 @@ impl QuadBlockOperator {
         )?;
         filtered.open(ctx).await?;
         let mut batches = Vec::new();
+        let mut bytes = 0;
         while let Some(batch) = filtered.next_batch(ctx).await? {
+            bytes += charge(ctx, batch.len(), schema.len())?;
             batches.push(batch);
         }
         filtered.close();
-        concat(schema, batches)
+        ctx.release(joined.bytes);
+        Ok(Charged {
+            batch: concat(schema, batches)?,
+            bytes,
+        })
     }
 
-    /// Pair every parent row with every quad row, in this operator's schema.
-    fn pair_with_parents(&self, parents: &[Batch], quad: &Batch) -> Result<Vec<Batch>> {
-        let schema: Arc<[VarId]> = Arc::from(self.graph.schema());
-        let mut out = Vec::new();
-        for parent in parents {
-            let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); schema.len()];
-            for p in 0..parent.len() {
-                for q in 0..quad.len() {
-                    for (col, var) in schema.iter().enumerate() {
-                        let binding = parent
-                            .get(p, *var)
-                            .or_else(|| quad.get(q, *var))
-                            .cloned()
-                            .unwrap_or(Binding::Unbound);
-                        columns[col].push(binding);
-                    }
-                }
+    /// The next batch of quad rows paired with parent rows, or `None` once
+    /// every pair has been emitted.
+    fn next_paired(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        let Some(out) = self.quad.as_mut() else {
+            return Ok(None);
+        };
+        ctx.check_cancelled()?;
+        let limit = ctx.batch_size.max(1);
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::with_capacity(limit); out.schema.len()];
+        let mut produced = 0;
+        while produced < limit {
+            let (b, p, q) = out.cursor;
+            let Some(parent) = out.parents.get(b) else {
+                break;
+            };
+            if p >= parent.len() {
+                out.cursor = (b + 1, 0, 0);
+                continue;
             }
-            if !columns.first().is_none_or(Vec::is_empty) {
-                out.push(Batch::new(Arc::clone(&schema), columns)?);
+            if q >= out.rows.batch.len() {
+                out.cursor = (b, p + 1, 0);
+                continue;
             }
+            for (col, var) in out.schema.iter().enumerate() {
+                let binding = parent
+                    .get(p, *var)
+                    .or_else(|| out.rows.batch.get(q, *var))
+                    .cloned()
+                    .unwrap_or(Binding::Unbound);
+                columns[col].push(binding);
+            }
+            out.cursor = (b, p, q + 1);
+            produced += 1;
         }
-        Ok(out)
+        if produced == 0 {
+            self.quad = None;
+            return Ok(None);
+        }
+        Ok(Some(Batch::new(Arc::clone(&out.schema), columns)?))
     }
 }
 
@@ -277,7 +353,7 @@ fn hash_join(
     graph_var: VarId,
     left: &Batch,
     right: &Batch,
-) -> Result<Batch> {
+) -> Result<Charged> {
     use crate::hash_join::inner_join_key;
     let shared: Vec<VarId> = left
         .schema()
@@ -300,6 +376,7 @@ fn hash_join(
             })
             .collect()
     };
+    let table_bytes = charge(ctx, left.len(), shared.len() + 1)?;
     let mut table: rustc_hash::FxHashMap<Vec<crate::hash_join::JoinKey>, Vec<usize>> =
         rustc_hash::FxHashMap::default();
     for row in 0..left.len() {
@@ -311,6 +388,7 @@ fn hash_join(
     schema.extend(right.schema().iter().filter(|v| !shared.contains(v)));
     let schema: Arc<[VarId]> = schema.into();
     let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); schema.len()];
+    let (mut bytes, mut uncharged) = (0, 0);
     for row in 0..right.len() {
         ctx.check_cancelled()?;
         let Some(matches) = key(right, row).and_then(|k| table.get(&k)) else {
@@ -326,8 +404,18 @@ fn hash_join(
                 columns[col].push(binding);
             }
         }
+        uncharged += matches.len();
+        if uncharged >= CHARGE_ROWS {
+            bytes += charge(ctx, uncharged, schema.len())?;
+            uncharged = 0;
+        }
     }
-    Ok(Batch::new(schema, columns)?)
+    bytes += charge(ctx, uncharged, schema.len())?;
+    ctx.release(table_bytes);
+    Ok(Charged {
+        batch: Batch::new(schema, columns)?,
+        bytes,
+    })
 }
 
 #[async_trait]
@@ -341,6 +429,7 @@ impl Operator for QuadBlockOperator {
     }
 
     fn set_row_budget(&mut self, budget: usize) {
+        self.row_budget = Some(budget);
         self.graph.set_row_budget(budget);
     }
 
@@ -349,10 +438,11 @@ impl Operator for QuadBlockOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        self.quad_out.clear();
+        self.quad = None;
         self.state = OperatorState::Open;
-        let Some(graphs) = self.quad_graphs(ctx) else {
-            return self.graph.open(ctx).await;
+        let graphs = match self.quad_graphs(ctx) {
+            Some(graphs) if self.row_budget.is_none() => graphs,
+            _ => return self.graph.open(ctx).await,
         };
         // When one pattern already rules most graphs out, visiting the few
         // left one by one beats scanning every pattern across the pool.
@@ -366,21 +456,31 @@ impl Operator for QuadBlockOperator {
         let mut child = self
             .graph
             .replace_child(Box::new(crate::seed::EmptyOperator::new()));
+        let parent_schema: Arc<[VarId]> = Arc::from(child.schema());
         child.open(ctx).await?;
         let mut parents = Vec::new();
+        let mut parent_bytes = 0;
         while let Some(batch) = child.next_batch(ctx).await? {
             if !batch.is_empty() {
+                parent_bytes += charge(ctx, batch.len(), parent_schema.len())?;
                 parents.push(batch);
             }
         }
-        let parent_schema: Arc<[VarId]> = Arc::from(child.schema());
         child.close();
 
-        let shape = self.shape.as_ref().expect("quad graphs imply a quad shape");
-        tracing::debug!(graphs = graphs.len(), "{QUAD_BLOCK_EVENT}");
-        let quad = self.run_quad(ctx, shape, &graphs).await?;
-        self.quad_out = self.pair_with_parents(&parents, &quad)?.into();
-
+        if !parents.is_empty() {
+            let shape = self.shape.as_ref().expect("quad graphs imply a quad shape");
+            tracing::debug!(graphs = graphs.len(), "{QUAD_BLOCK_EVENT}");
+            let rows = self.run_quad(ctx, shape, &graphs).await?;
+            self.quad = Some(QuadOutput {
+                cancellation: ctx.cancellation.clone(),
+                schema: Arc::from(self.graph.schema()),
+                parents: parents.clone(),
+                rows,
+                parent_bytes,
+                cursor: (0, 0, 0),
+            });
+        }
         self.graph
             .replace_child(Box::new(BatchReplayOperator::new(parent_schema, parents)));
         self.graph.skip_graphs(graphs);
@@ -391,14 +491,14 @@ impl Operator for QuadBlockOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
-        if let Some(batch) = self.quad_out.pop_front() {
+        if let Some(batch) = self.next_paired(ctx)? {
             return Ok(Some(batch));
         }
         self.graph.next_batch(ctx).await
     }
 
     fn close(&mut self) {
-        self.quad_out.clear();
+        self.quad = None;
         self.graph.close();
         self.state = OperatorState::Closed;
     }
