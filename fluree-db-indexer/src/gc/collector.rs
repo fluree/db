@@ -2298,6 +2298,7 @@ mod tests {
             sketch_ref: None,
             prev_index,
             term_dict: None,
+            pooled_graphs: Vec::new(),
         }
     }
 

@@ -195,6 +195,8 @@ pub(crate) struct Fir6Inputs {
     pub predicate_sids: Vec<(u16, String)>,
     pub uploaded_dicts: UploadedDicts,
     pub v3_uploaded: UploadedIndexes,
+    /// Named graphs built into the pooled tree (`v3_uploaded.pool_orders`).
+    pub pooled_graphs: Vec<u16>,
     pub graph_arenas: Vec<GraphArenaRefs>,
     pub datatype_iris: Vec<String>,
     pub language_tags: Vec<String>,
@@ -321,7 +323,12 @@ pub(crate) async fn encode_and_write_root_v6(
         legacy_annotation_arena: None,
         term_dict: inputs.term_dict,
         has_list_meta: Some(inputs.saw_list_meta),
-        pool: None,
+        pool: (!inputs.v3_uploaded.pool_orders.is_empty()).then(|| {
+            fluree_db_binary_index::PoolRouting {
+                graphs: inputs.pooled_graphs.clone(),
+                orders: inputs.v3_uploaded.pool_orders.clone(),
+            }
+        }),
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.

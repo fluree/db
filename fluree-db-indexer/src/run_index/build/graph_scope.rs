@@ -104,3 +104,15 @@ pub fn place_named_graphs(
         .iter()
         .partition(|g| rows.get(g).copied().unwrap_or(0) > max_rows)
 }
+
+/// Per-graph record counts of a graph-first sorted slice, ascending by graph.
+pub fn graph_row_counts(graphs: impl IntoIterator<Item = GraphId>) -> Vec<(GraphId, u64)> {
+    let mut out: Vec<(GraphId, u64)> = Vec::new();
+    for g in graphs {
+        match out.last_mut() {
+            Some((last, n)) if *last == g => *n += 1,
+            _ => out.push((g, 1)),
+        }
+    }
+    out
+}

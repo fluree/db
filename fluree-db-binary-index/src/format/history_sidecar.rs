@@ -142,6 +142,37 @@ impl HistEntryV2 {
     }
 }
 
+/// Every entry of a whole sidecar blob, segment by segment (the segments sit
+/// back to back after the header).
+pub fn decode_sidecar_entries(bytes: &[u8]) -> std::io::Result<Vec<HistEntryV2>> {
+    if bytes.len() < SIDECAR_HEADER_SIZE || bytes[0..4] != *SIDECAR_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "history sidecar: bad header",
+        ));
+    }
+    let width = if bytes[4] == SIDECAR_VERSION_GRAPH {
+        HIST_ENTRY_V2_G_SIZE
+    } else {
+        HIST_ENTRY_V2_SIZE
+    };
+    let mut out = Vec::new();
+    let mut pos = SIDECAR_HEADER_SIZE;
+    while pos + 4 <= bytes.len() {
+        let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let end = pos + 4 + count * width;
+        if end > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "history sidecar: truncated segment",
+            ));
+        }
+        out.extend(decode_segment_bytes(&bytes[pos..end])?);
+        pos = end;
+    }
+    Ok(out)
+}
+
 /// Decode one segment's bytes (count prefix, then entries), taking the entry
 /// width from the segment's own length.
 pub fn decode_segment_bytes(bytes: &[u8]) -> std::io::Result<Vec<HistEntryV2>> {
@@ -387,6 +418,27 @@ mod tests {
         assert_eq!(
             decode_segment_bytes(&bytes[at..at + refs[0].len as usize]).unwrap(),
             decoded
+        );
+    }
+
+    #[test]
+    fn a_whole_sidecar_decodes_segment_by_segment() {
+        use crate::format::run_record::RunSortOrder;
+        let entry = |g_id, t| HistEntryV2 {
+            g_id,
+            ..make_entry(1, 10, OType::XSD_INTEGER.as_u16(), 100, t, 1)
+        };
+        let mut builder = HistSidecarBuilder::for_order(RunSortOrder::Gspo);
+        builder.start_leaflet();
+        builder.push_entry(entry(7, 3));
+        builder.start_leaflet();
+        builder.start_leaflet();
+        builder.push_entry(entry(9, 4));
+        builder.push_entry(entry(9, 6));
+        let (bytes, _) = builder.build();
+        assert_eq!(
+            decode_sidecar_entries(&bytes).unwrap(),
+            vec![entry(7, 3), entry(9, 6), entry(9, 4)]
         );
     }
 

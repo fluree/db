@@ -1708,7 +1708,14 @@ pub fn build_indexes_from_remapped_commits(
     // the merge/build phase can filter out retract-winners.
     let remap_start = Instant::now();
 
-    let orders = RunSortOrder::all_build_orders().to_vec();
+    // A pooled build writes all five pooled orders from run files: the
+    // sorted commits are not merged into GSPO here as the import does.
+    let scope = config.scope();
+    let orders = if scope.is_pool() {
+        RunSortOrder::pool_build_orders().to_vec()
+    } else {
+        RunSortOrder::all_build_orders().to_vec()
+    };
     let mut writer = MultiOrderRunWriterWithOp::new(MultiOrderConfig {
         total_budget_bytes: config.run_budget_bytes,
         orders: orders.clone(),
@@ -1727,7 +1734,7 @@ pub fn build_indexes_from_remapped_commits(
             &s_remap,
             &str_remap,
             lang_remap,
-            config.g_id,
+            &scope,
             registry,
             &mut writer,
         )?;
@@ -1777,7 +1784,7 @@ pub fn build_indexes_from_remapped_commits(
     // Total rows from the POST result (canonical count).
     let total_rows = order_results
         .iter()
-        .find(|(o, _)| *o == RunSortOrder::Post)
+        .find(|(o, _)| o.base() == RunSortOrder::Post)
         .map(|(_, r)| r.total_rows)
         .unwrap_or_else(|| {
             order_results

@@ -229,20 +229,19 @@ impl BinaryHistoryScanOperator {
                     matches!(self.pattern.p, Ref::Iri(_) | Ref::Sid(_)) && filter.p_id.is_none();
                 let skip_persisted = s_literal_unresolvable || p_literal_unresolvable;
 
-                let order = self.pick_order(&filter);
-                // Pooled history entries do not carry their graph yet, so a
-                // pooled graph's indexed history cannot be separated from its
-                // neighbors'. Refuse rather than return only the novelty part.
-                if store.is_pooled(g_id) && !skip_persisted {
-                    return Err(QueryError::Internal(format!(
-                        "history queries over pooled named graph {g_id} are not supported yet"
-                    )));
-                }
-                if let Some(branch) = store
-                    .branch_for_order(g_id, order)
+                // A pooled graph reads the pooled tree, keeping only its own
+                // rows and history entries.
+                if let Some(tree) = store
+                    .graph_tree(g_id, self.pick_order(&filter))
                     .filter(|_| !skip_persisted)
                 {
-                    let leaf_indices = leaf_index_range(branch, &filter, order);
+                    let (branch, order, pooled_g) = (&tree.branch, tree.order, tree.g_filter);
+                    let leaf_indices = match pooled_g {
+                        Some(g) if order == RunSortOrder::Gspo => {
+                            gspo_leaf_range(branch, g, filter.s_id)
+                        }
+                        _ => leaf_index_range(branch, &filter, order),
+                    };
                     let view = BinaryGraphView::with_novelty(
                         Arc::clone(store),
                         g_id,
@@ -294,6 +293,9 @@ impl BinaryHistoryScanOperator {
                                     })?;
                                 for entry_v2 in &segment {
                                     let s_id = entry_v2.s_id.as_u64();
+                                    if pooled_g.is_some_and(|g| entry_v2.g_id != g) {
+                                        continue;
+                                    }
                                     if !filter.matches(
                                         s_id,
                                         entry_v2.p_id,
@@ -341,6 +343,9 @@ impl BinaryHistoryScanOperator {
                                     let t_u32 = batch.t.get_or(i, 0);
                                     let t = t_u32 as i64;
 
+                                    if pooled_g.is_some_and(|g| batch.g_id.get_or(i, 0) != g) {
+                                        continue;
+                                    }
                                     if !filter.matches(s_id, p_id, o_type, o_key, o_i) {
                                         continue;
                                     }
@@ -520,6 +525,25 @@ fn leaf_index_range(
     } else {
         0..branch.leaves.len()
     }
+}
+
+/// GSPO leaves holding graph `g`'s rows (for subject `s_id` when bound).
+fn gspo_leaf_range(
+    branch: &fluree_db_binary_index::format::branch::BranchManifest,
+    g: GraphId,
+    s_id: Option<u64>,
+) -> Range<usize> {
+    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2};
+    let key = |low: bool| RunRecordV2 {
+        s_id: fluree_db_core::subject_id::SubjectId(s_id.unwrap_or(if low { 0 } else { u64::MAX })),
+        o_key: if low { 0 } else { u64::MAX },
+        p_id: if low { 0 } else { u32::MAX },
+        t: if low { 0 } else { u32::MAX },
+        o_i: if low { 0 } else { u32::MAX },
+        o_type: if low { 0 } else { u16::MAX },
+        g_id: g,
+    };
+    branch.find_leaves_in_range(&key(true), &key(false), cmp_v2_g_spot)
 }
 
 /// Quick leaflet-level filter skip using directory constants.

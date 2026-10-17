@@ -359,10 +359,18 @@ async fn run_update_branch(
 }
 
 enum Phase2TaskKind {
-    DefaultExisting { leaves: Vec<LeafEntry> },
+    DefaultExisting {
+        leaves: Vec<LeafEntry>,
+    },
     DefaultFresh,
-    NamedExisting { branch_cid: ContentId },
+    NamedExisting {
+        branch_cid: ContentId,
+    },
     NamedFresh,
+    /// A pooled graph leaving the pool: its whole resolved log.
+    NamedPromoted {
+        facts: Arc<Vec<PromotedFact>>,
+    },
 }
 
 struct Phase2Task {
@@ -570,6 +578,42 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
+        Phase2TaskKind::NamedPromoted { facts } => {
+            let BranchUpdateResult {
+                new_leaf_blobs,
+                replaced_leaf_cids,
+                replaced_sidecar_cids,
+                branch_bytes,
+                branch_cid: expected_branch_cid,
+                ..
+            } = build_promoted_graph_tree(&facts, order, g_id, config)?;
+            let new_leaf_count = new_leaf_blobs.len();
+            upload_leaf_blobs(
+                content_store.as_ref(),
+                &tracker,
+                upload_budget.as_ref(),
+                upload_buffer,
+                new_leaf_blobs,
+            )
+            .await?;
+            let branch_cid = content_store
+                .put(ContentKind::IndexBranch, &branch_bytes)
+                .await
+                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+            debug_assert!(branch_cid == expected_branch_cid);
+            cache_artifact_bytes(&*content_store, &branch_cid, &branch_bytes, "index_branch");
+            Phase2TaskOutput {
+                seq,
+                g_id,
+                order,
+                update: Phase2TaskUpdate::Named { branch_cid },
+                replaced_leaf_cids,
+                replaced_sidecar_cids,
+                new_leaf_count,
+                fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
+            }
+        }
         Phase2TaskKind::NamedFresh => {
             if !sorted_superseded.is_empty() {
                 // Permanent gap; see the DefaultFresh arm above.
@@ -718,9 +762,10 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
-    // A write to a pooled graph promotes it to a dedicated tree: its current
-    // pooled rows plus this window's records become a fresh branch per order,
-    // and it leaves the pool. Untouched pooled graphs carry over unchanged.
+    // A write to a pooled graph promotes it to a dedicated tree: its pooled
+    // rows and history plus this window's events become a fresh branch per
+    // order, history included, and it leaves the pool. Untouched pooled
+    // graphs carry over unchanged.
     let promoted = read_promoted_graphs(&content_store, &novelty).await?;
 
     // ---- Phase 2: Per-(graph, order) branch updates ----
@@ -761,24 +806,8 @@ pub async fn incremental_index(
     let mut promoted_matched: Vec<RunRecordV2> = Vec::new();
     for g_id in graph_order.iter().copied() {
         let indices = &by_graph[&g_id];
-        let mut graph_records: Vec<RunRecordV2> =
-            indices.iter().map(|&i| novelty.records[i]).collect();
-        let mut graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
-        if let Some(base_rows) = promoted.get(&g_id) {
-            let Some((rows, matched)) = promoted_graph_state(base_rows, &graph_records, &graph_ops)
-            else {
-                // The pooled tree keeps no history sidecars, so a retraction of
-                // a pooled fact has nowhere to record what was true before it;
-                // a full rebuild keeps time travel exact.
-                return Err(IndexerError::IncrementalAbort(format!(
-                    "a retraction in pooled named graph {g_id} needs a full rebuild"
-                )));
-            };
-            graph_ops = vec![1; rows.len()];
-            graph_records = rows;
-            promoted_matched.extend(matched);
-            root_builder.remove_from_pool(g_id);
-        }
+        let graph_records: Vec<RunRecordV2> = indices.iter().map(|&i| novelty.records[i]).collect();
+        let graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
         let superseded_indices = superseded_by_graph.get(&g_id);
         let graph_superseded: Vec<RunRecordV2> = superseded_indices
             .map(|idxs| idxs.iter().map(|&i| novelty.superseded[i]).collect())
@@ -786,6 +815,22 @@ pub async fn incremental_index(
         let graph_superseded_ops: Vec<u8> = superseded_indices
             .map(|idxs| idxs.iter().map(|&i| novelty.superseded_ops[i]).collect())
             .unwrap_or_default();
+        let promoted_facts = promoted.get(&g_id).map(|log| {
+            let window = graph_records
+                .iter()
+                .copied()
+                .zip(graph_ops.iter().copied())
+                .chain(
+                    graph_superseded
+                        .iter()
+                        .copied()
+                        .zip(graph_superseded_ops.iter().copied()),
+                );
+            let (facts, matched) = resolve_promoted_graph(log, window);
+            promoted_matched.extend(matched);
+            root_builder.remove_from_pool(g_id);
+            Arc::new(facts)
+        });
 
         for &order in &all_orders {
             let cmp = cmp_v2_for_order(order);
@@ -806,7 +851,11 @@ pub async fn incremental_index(
                 .map(|&i| graph_superseded_ops[i])
                 .collect();
 
-            let kind = if g_id == 0 {
+            let kind = if let Some(facts) = &promoted_facts {
+                Phase2TaskKind::NamedPromoted {
+                    facts: Arc::clone(facts),
+                }
+            } else if g_id == 0 {
                 match base_root
                     .default_graph_orders
                     .iter()
@@ -4817,14 +4866,22 @@ async fn upload_leaf_blobs(
     Ok(())
 }
 
-/// Build a fresh V3 branch from pure novelty for the default graph.
-/// The current pooled rows of every pooled graph this window writes, by
-/// graph. Empty (and no store load) when the window touches none.
+/// A pooled graph's persisted state: its rows (each the assert that made the
+/// fact present) and its history transitions, together its whole log.
+#[derive(Default)]
+struct PooledGraphLog {
+    rows: Vec<RunRecordV2>,
+    history: Vec<(RunRecordV2, u8)>,
+}
+
+/// The persisted log of every pooled graph this window writes, by graph.
+/// Empty (and no store load) when the window touches none.
 async fn read_promoted_graphs(
     content_store: &Arc<dyn ContentStore>,
     novelty: &crate::run_index::build::incremental_resolve::IncrementalNovelty,
-) -> Result<std::collections::HashMap<u16, Vec<RunRecordV2>>> {
-    use fluree_db_binary_index::format::run_record_v2::RunRecordV2 as Rec;
+) -> Result<std::collections::HashMap<u16, PooledGraphLog>> {
+    use fluree_db_binary_index::format::history_sidecar::{decode_sidecar_entries, HistEntryV2};
+    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2 as Rec};
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
     use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection};
 
@@ -4853,6 +4910,9 @@ async fn read_promoted_graphs(
     let Some(branch) = store.pool_branch(RunSortOrder::Gspo).cloned() else {
         return Ok(out);
     };
+    // Sidecars hold every graph of their leaf; decode each once.
+    let mut sidecars: std::collections::HashMap<ContentId, Vec<HistEntryV2>> =
+        std::collections::HashMap::new();
     for g_id in graphs {
         let bound = |low: bool| Rec {
             s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
@@ -4875,13 +4935,13 @@ async fn read_promoted_graphs(
             },
             ColumnProjection::all(),
         );
-        let mut rows = Vec::new();
+        let mut log = PooledGraphLog::default();
         while let Some(batch) = cursor
             .next_batch()
             .map_err(|e| IndexerError::StorageRead(format!("pooled graph promotion: {e}")))?
         {
             for i in 0..batch.row_count {
-                rows.push(Rec {
+                log.rows.push(Rec {
                     s_id: fluree_db_core::subject_id::SubjectId(batch.s_id.get(i)),
                     o_key: batch.o_key.get(i),
                     p_id: batch.p_id.get_or(i, 0),
@@ -4892,46 +4952,140 @@ async fn read_promoted_graphs(
                 });
             }
         }
-        out.insert(g_id, rows);
+        let leaves = branch.find_leaves_in_range(&bound(true), &bound(false), cmp_v2_g_spot);
+        for leaf in &branch.leaves[leaves] {
+            let Some(cid) = &leaf.sidecar_cid else {
+                continue;
+            };
+            if !sidecars.contains_key(cid) {
+                let bytes = content_store.get(cid).await.map_err(|e| {
+                    IndexerError::StorageRead(format!("pooled graph promotion: sidecar: {e}"))
+                })?;
+                let entries = decode_sidecar_entries(&bytes).map_err(|e| {
+                    IndexerError::StorageRead(format!("pooled graph promotion: sidecar: {e}"))
+                })?;
+                sidecars.insert(cid.clone(), entries);
+            }
+            log.history
+                .extend(sidecars[cid].iter().filter(|e| e.g_id == g_id).map(|e| {
+                    (
+                        Rec {
+                            s_id: e.s_id,
+                            o_key: e.o_key,
+                            p_id: e.p_id,
+                            t: e.t,
+                            o_i: e.o_i,
+                            o_type: e.o_type,
+                            g_id,
+                        },
+                        e.op,
+                    )
+                }));
+        }
+        out.insert(g_id, log);
     }
     Ok(out)
 }
 
-/// A promoted graph's state after this window: its pooled rows with the
-/// window's records applied (one lifecycle winner per fact). A re-assert keeps
-/// the base row (no new transition), an assert of a new fact adds a row, a
-/// retract of a fact the graph never had is a no-op. Returns the rows and the
-/// base rows the window touched — the base presence Phase 3b's stats deltas
-/// read — or `None` when the window retracts a base fact.
-fn promoted_graph_state(
-    base_rows: &[RunRecordV2],
-    records: &[RunRecordV2],
-    ops: &[u8],
-) -> Option<(Vec<RunRecordV2>, Vec<RunRecordV2>)> {
-    let mut window: std::collections::HashMap<FactIdentityKey, (RunRecordV2, u8)> = records
-        .iter()
-        .zip(ops)
-        .map(|(r, &op)| (fact_identity_key(r), (*r, op)))
-        .collect();
-    let mut rows = Vec::with_capacity(base_rows.len() + records.len());
-    let mut matched = Vec::new();
-    for base in base_rows {
-        match window.remove(&fact_identity_key(base)) {
-            Some((_, 0)) => return None,
-            Some(_) => matched.push(*base),
-            None => {}
-        }
-        rows.push(*base);
-    }
-    rows.extend(
-        window
-            .into_values()
-            .filter(|&(_, op)| op == 1)
-            .map(|(r, _)| r),
-    );
-    Some((rows, matched))
+/// One fact of a promoted graph after this window: its row (absent when the
+/// fact's final state is retracted) and the transitions its sidecar keeps.
+struct PromotedFact {
+    row: Option<RunRecordV2>,
+    transitions: Vec<(RunRecordV2, u8)>,
 }
 
+impl PromotedFact {
+    fn key(&self) -> &RunRecordV2 {
+        self.row.as_ref().unwrap_or_else(|| &self.transitions[0].0)
+    }
+}
+
+/// A promoted graph's facts after this window: its persisted log and the
+/// window's events, folded per fact from absent the way a full rebuild folds
+/// the whole log. Also returns the persisted rows the window touched — the
+/// base presence Phase 3b's stats deltas read.
+fn resolve_promoted_graph(
+    base: &PooledGraphLog,
+    window: impl IntoIterator<Item = (RunRecordV2, u8)>,
+) -> (Vec<PromotedFact>, Vec<RunRecordV2>) {
+    use fluree_db_binary_index::format::transitions::resolve_transitions;
+
+    let mut events: std::collections::HashMap<FactIdentityKey, Vec<(RunRecordV2, u8)>> =
+        std::collections::HashMap::new();
+    let mut touched: std::collections::HashSet<FactIdentityKey> = std::collections::HashSet::new();
+    for (rec, op) in window {
+        let key = fact_identity_key(&rec);
+        touched.insert(key);
+        events.entry(key).or_default().push((rec, op));
+    }
+    let matched = base
+        .rows
+        .iter()
+        .filter(|r| touched.contains(&fact_identity_key(r)))
+        .copied()
+        .collect();
+    for row in &base.rows {
+        events
+            .entry(fact_identity_key(row))
+            .or_default()
+            .push((*row, 1));
+    }
+    for &(rec, op) in &base.history {
+        events
+            .entry(fact_identity_key(&rec))
+            .or_default()
+            .push((rec, op));
+    }
+    let facts = events
+        .into_values()
+        .filter_map(|mut evs| {
+            let row = resolve_transitions(&mut evs, false);
+            (row.is_some() || !evs.is_empty()).then_some(PromotedFact {
+                row,
+                transitions: evs,
+            })
+        })
+        .collect();
+    (facts, matched)
+}
+
+/// A promoted graph's dedicated tree for `order`, rows and history.
+fn build_promoted_graph_tree(
+    facts: &[PromotedFact],
+    order: RunSortOrder,
+    g_id: u16,
+    config: &IndexerConfig,
+) -> Result<BranchUpdateResult> {
+    use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
+    use fluree_db_binary_index::format::leaf::LeafWriter;
+
+    let cmp = cmp_v2_for_order(order);
+    let mut by_key: Vec<&PromotedFact> = facts.iter().collect();
+    by_key.sort_unstable_by(|a, b| cmp(a.key(), b.key()));
+    let mut writer = LeafWriter::new(order, config.leaflet_rows.max(1), config.leaf_rows, 1);
+    for fact in by_key {
+        for &(rec, op) in &fact.transitions {
+            writer.push_history_entry(HistEntryV2 {
+                s_id: rec.s_id,
+                p_id: rec.p_id,
+                o_type: rec.o_type,
+                o_key: rec.o_key,
+                o_i: rec.o_i,
+                t: rec.t,
+                op,
+                g_id: rec.g_id,
+            });
+        }
+        if let Some(row) = fact.row {
+            writer
+                .push_record(row)
+                .map_err(|e| IndexerError::StorageWrite(format!("promoted graph writer: {e}")))?;
+        }
+    }
+    finish_fresh_branch(writer, order, g_id)
+}
+
+/// Build a fresh V3 branch from pure novelty for the default graph.
 fn build_fresh_default_graph_v3(
     sorted_records: &[RunRecordV2],
     // Kept for: filtering retractions in fresh branches once the rebuild
@@ -4943,10 +5097,7 @@ fn build_fresh_default_graph_v3(
     config: &IndexerConfig,
 ) -> Result<BranchUpdateResult> {
     let _ = sorted_ops;
-    use crate::run_index::build::incremental_leaf::NewLeafBlob;
-    use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
     use fluree_db_binary_index::format::leaf::LeafWriter;
-    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
 
     let leaflet_target = config.leaflet_rows.max(1);
     let leaf_target = config.leaf_rows;
@@ -4957,6 +5108,18 @@ fn build_fresh_default_graph_v3(
             .push_record(*rec)
             .map_err(|e| IndexerError::StorageWrite(format!("V3 fresh branch writer: {e}")))?;
     }
+    finish_fresh_branch(writer, order, g_id)
+}
+
+/// Finish a fresh branch's leaf writer into its leaves and branch manifest.
+fn finish_fresh_branch(
+    writer: fluree_db_binary_index::format::leaf::LeafWriter,
+    order: RunSortOrder,
+    g_id: u16,
+) -> Result<BranchUpdateResult> {
+    use crate::run_index::build::incremental_leaf::NewLeafBlob;
+    use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
+    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
 
     let leaf_infos = writer
         .finish()

@@ -1628,7 +1628,7 @@ pub(crate) fn remap_commit_to_runs_with_op<S: SubjectRemap, R: StringRemap>(
     subject_remap: &S,
     string_remap: &R,
     lang_remap: &[u16],
-    target_g_id: u16,
+    scope: &crate::run_index::build::graph_scope::GraphScope,
     registry: &OTypeRegistry,
     writer: &mut super::run_writer::MultiOrderRunWriterWithOp,
 ) -> io::Result<u64> {
@@ -1642,7 +1642,7 @@ pub(crate) fn remap_commit_to_runs_with_op<S: SubjectRemap, R: StringRemap>(
     let mut count = 0u64;
     for result in reader {
         let v1_record = result?;
-        if v1_record.g_id != target_g_id {
+        if !scope.accepts(v1_record.g_id) {
             continue;
         }
         let op = v1_record.op;

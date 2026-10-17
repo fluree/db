@@ -387,14 +387,95 @@ async fn appending_to_a_pooled_graph_promotes_only_that_graph() {
     );
 }
 
-/// A retraction in a pooled graph has no pooled history to record into, so
-/// the build falls back to a full rebuild; the result is exact.
+/// Values of `?o` for `s p ?o` in graph `g`, as of `t` (`None`: current).
+async fn objects_at(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    ledger_id: &str,
+    graph: &str,
+    t: Option<i64>,
+) -> Vec<String> {
+    let mut from =
+        serde_json::json!({"@id": ledger_id, "graph": format!("http://example.org/{graph}")});
+    if let Some(t) = t {
+        from["t"] = serde_json::json!(t);
+    }
+    let rows = fluree
+        .query_connection(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": from,
+            "select": ["?s", "?o"],
+            "where": {"@id": "?s", "ex:label": "?o"}
+        }))
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    let mut out: Vec<String> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| format!("{} {}", r[0].as_str().unwrap(), r[1]))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `?s ex:label ?o` events over the whole history of graph `graph`, read by
+/// the history scan bound to that graph.
+async fn history_events(ledger: &fluree_db_api::LedgerState, graph: &str) -> usize {
+    use fluree_db_query::{
+        context::ExecutionContext,
+        ir::{Ref, Term, TriplePattern},
+        operator::Operator,
+        BinaryHistoryScanOperator, VarRegistry,
+    };
+    let store = ledger
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .clone()
+        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+    let g_id = store
+        .graph_id_for_iri(&format!("http://example.org/{graph}"))
+        .expect("graph id");
+    assert!(store.is_pooled(g_id), "the scan must read the pooled tree");
+    let mut vars = VarRegistry::new();
+    let pattern = TriplePattern::new(
+        Ref::Var(vars.get_or_insert("?s")),
+        Ref::Sid(
+            ledger
+                .snapshot
+                .encode_iri("http://example.org/label")
+                .expect("predicate sid"),
+        ),
+        Term::Var(vars.get_or_insert("?o")),
+    );
+    let mut ctx = ExecutionContext::new(&ledger.snapshot, &vars).with_binary_store(store, g_id);
+    ctx.from_t = Some(1);
+    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
+    scan.open(&ctx).await.expect("open");
+    let mut events = 0;
+    while let Some(batch) = scan.next_batch(&ctx).await.expect("batch") {
+        events += batch.len();
+    }
+    events
+}
+
+/// A retraction in a pooled graph promotes it incrementally, history and
+/// all: the pool's trees are untouched, and an earlier `t` still sees the
+/// retracted fact.
 #[tokio::test]
-async fn retracting_from_a_pooled_graph_rebuilds() {
+async fn retracting_from_a_pooled_graph_promotes_it_with_its_history() {
     let db_dir = tempfile::tempdir().unwrap();
     let data_dir = tempfile::tempdir().unwrap();
     let ledger_id = "test/pool-retract:main";
-    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    let (fluree, ledger) =
+        import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    let before = latest_root(db_dir.path()).pool.expect("pooled");
+    let t_before = ledger.t();
 
     sparql_update(
         &fluree,
@@ -404,22 +485,96 @@ async fn retracting_from_a_pooled_graph_rebuilds() {
     )
     .await;
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
-    assert!(
-        root.pool.as_ref().is_none_or(|p| p.graphs.is_empty()),
-        "a full rebuild writes dedicated trees"
+    let pool = root.pool.as_ref().expect("g1 and g3 stay pooled");
+    assert_eq!(pool.graphs.len(), 2);
+    assert_eq!(
+        pool.orders, before.orders,
+        "the pooled trees are reused as they were"
     );
     assert_eq!(
-        select(
-            &fluree,
-            &ledger,
-            &format!("{PREFIXES}SELECT ?s ?o WHERE {{ GRAPH ex:g2 {{ ?s ?p ?o }} }}")
-        )
-        .await,
-        vec![
-            "o=0 s=http://example.org/same",
-            "o=2 s=http://example.org/b"
-        ],
+        dedicated_user_graphs(&root).len(),
+        1,
+        "g2 has a tree of its own"
     );
+
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "g2", None).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "g2", Some(t_before)).await,
+        vec!["ex:b \"B\""]
+    );
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "g1", None).await,
+        vec!["ex:a \"A\""]
+    );
+}
+
+/// A full rebuild pools small named graphs with their history, and a later
+/// retraction promotes one of them carrying that history: every `t` answers
+/// as it did when written.
+#[tokio::test]
+async fn a_rebuild_pools_graphs_with_their_history() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-rebuild:main";
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let update = |sparql: &'static str| sparql_update(&fluree, ledger_id, sparql);
+    update(
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g1 { ex:a ex:label \"A1\" . }
+                       GRAPH ex:g2 { ex:b ex:label \"B1\" . } }",
+    )
+    .await;
+    let t1 = fluree.ledger(ledger_id).await.unwrap().t();
+    update(
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g1 { ex:a ex:label \"A1\" . } } ;
+         INSERT DATA { GRAPH ex:g1 { ex:a ex:label \"A2\" . } }",
+    )
+    .await;
+    let t2 = fluree.ledger(ledger_id).await.unwrap().t();
+
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    assert_eq!(
+        root.pool.as_ref().map(|p| p.graphs.len()),
+        Some(2),
+        "the first index is a full rebuild, and it pools both graphs"
+    );
+    let at = |graph, t| objects_at(&fluree, &ledger, ledger_id, graph, t);
+    assert_eq!(at("g1", Some(t1)).await, vec!["ex:a \"A1\""]);
+    assert_eq!(at("g1", Some(t2)).await, vec!["ex:a \"A2\""]);
+    assert_eq!(at("g2", Some(t1)).await, vec!["ex:b \"B1\""]);
+    assert_eq!(
+        history_events(&ledger, "g1").await,
+        3,
+        "A1 asserted, A1 retracted, A2 asserted"
+    );
+    assert_eq!(
+        history_events(&ledger, "g2").await,
+        1,
+        "only g2's own event"
+    );
+
+    update(
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g1 { ex:a ex:label \"A2\" . } }",
+    )
+    .await;
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    assert_eq!(
+        root.pool.as_ref().map(|p| p.graphs.len()),
+        Some(1),
+        "g1 left the pool"
+    );
+    let at = |graph, t| objects_at(&fluree, &ledger, ledger_id, graph, t);
+    assert_eq!(at("g1", None).await, Vec::<String>::new());
+    assert_eq!(at("g1", Some(t1)).await, vec!["ex:a \"A1\""]);
+    assert_eq!(at("g1", Some(t2)).await, vec!["ex:a \"A2\""]);
+    assert_eq!(at("g2", None).await, vec!["ex:b \"B1\""]);
 }
 
 /// An imported pool is append-only: an earlier `t` sees exactly the rows
