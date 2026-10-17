@@ -55,6 +55,7 @@ from fluree._sources import (
 from fluree._terms import IRI, BlankNode, LangString, Literal, Vector
 from fluree.errors import (
     ConflictError,
+    DatabaseInUseError,
     FlureeError,
     InvalidRequestError,
     NotFoundError,
@@ -78,6 +79,7 @@ __all__ = [
     "Conflict",
     "ConflictError",
     "Connection",
+    "DatabaseInUseError",
     "EnvVar",
     "FlureeError",
     "FullText",

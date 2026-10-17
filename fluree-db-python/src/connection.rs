@@ -20,7 +20,8 @@ use fluree_db_api::{
     build_transact_policy_context, export::ExportFormat, ApiError, CommitDetail, CommitReceipt,
     CommitRef, DataSetDb, DropMode, Fluree, FlureeBuilder, FormatterConfig, GovernanceOptions,
     GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, ParsedContext, PolicyContext,
-    QueryExecutionOptions, SparqlParamMap, TimeSpec, Tracker, TxnOperation,
+    QueryExecutionOptions, SharedFluree, SharedOptions, SparqlParamMap, TimeSpec, Tracker,
+    TxnOperation,
 };
 use fluree_db_api::{CommitOpts, GraphPayload, GraphSel, SyncGraphOpts, TxnOpts};
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
@@ -32,8 +33,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 #[pyclass(frozen, module = "fluree._fluree")]
 pub(crate) struct Connection {
@@ -46,32 +46,91 @@ pub(crate) struct Connection {
 pub(crate) struct Database(Arc<DatabaseState>);
 
 struct DatabaseState {
-    fluree: InRuntime<Fluree>,
-    closed: AtomicBool,
+    /// `None` once closed. Closing gives the engine back at once: each call
+    /// in flight holds a reference of its own (an [`EngineRef`]), so nothing
+    /// here keeps a closed connection's storage open.
+    engine: InRuntime<Mutex<Option<Engine>>>,
+}
+
+#[derive(Clone)]
+enum Engine {
+    /// `:memory:` and connection-config engines, the connection's own.
+    Own(Arc<Fluree>),
+    /// A directory connection's handle on the one engine this process keeps
+    /// for that directory.
+    Shared(SharedFluree),
+}
+
+/// A call's reference to its connection's engine, dropped inside the runtime.
+pub(crate) struct EngineRef(Option<Engine>);
+
+impl std::ops::Deref for EngineRef {
+    type Target = Fluree;
+
+    fn deref(&self) -> &Fluree {
+        match self.0.as_ref().expect("taken only by drop") {
+            Engine::Own(fluree) => fluree,
+            Engine::Shared(handle) => handle,
+        }
+    }
+}
+
+impl Drop for EngineRef {
+    fn drop(&mut self) {
+        let engine = self.0.take();
+        // Possibly the last reference: engine `Drop` impls need the runtime.
+        let _runtime = enter();
+        drop(engine);
+    }
 }
 
 impl Database {
     fn new(fluree: Fluree) -> Self {
+        Self::with_engine(Engine::Own(Arc::new(fluree)))
+    }
+
+    fn shared(handle: SharedFluree) -> Self {
+        Self::with_engine(Engine::Shared(handle))
+    }
+
+    fn with_engine(engine: Engine) -> Self {
         Self(Arc::new(DatabaseState {
-            fluree: InRuntime::new(fluree),
-            closed: AtomicBool::new(false),
+            engine: InRuntime::new(Mutex::new(Some(engine))),
         }))
     }
 
-    pub(crate) fn get(&self) -> PyResult<&Fluree> {
-        if self.0.closed.load(Ordering::Acquire) {
-            return Err(invalid_request("the connection is closed"));
+    pub(crate) fn get(&self) -> PyResult<EngineRef> {
+        let engine = self
+            .0
+            .engine
+            .get()?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match engine {
+            Some(engine) => Ok(EngineRef(Some(engine))),
+            None => Err(invalid_request("the connection is closed")),
         }
-        self.0.fluree.get()
     }
 
-    /// Close the connection, once; closing it again does nothing.
+    /// Close the connection, once; closing it again does nothing. A shared
+    /// engine shuts down only when its directory's last connection closes.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let fluree = self.0.fluree.get()?;
-        if self.0.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let engine = self
+            .0
+            .engine
+            .get()?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match engine {
+            None => Ok(()),
+            Some(Engine::Shared(handle)) => block_on(py, handle.close()),
+            Some(Engine::Own(fluree)) => block_on(py, async move {
+                fluree.disconnect().await;
+                drop(fluree);
+            }),
         }
-        block_on(py, fluree.disconnect())
     }
 }
 
@@ -275,26 +334,28 @@ impl Connection {
         })
     }
 
+    /// Every connection in the process to one directory shares one engine;
+    /// see `fluree_db_api::SharedFluree`.
     #[staticmethod]
     #[pyo3(signature = (path, *, indexing = true))]
-    fn file(path: PathBuf, indexing: bool) -> PyResult<Self> {
-        let _runtime = enter()?;
-        let mut builder = FlureeBuilder::file(path.to_string_lossy().into_owned());
-        if !indexing {
-            builder = builder.without_indexing();
-        }
-        let fluree = builder.build().map_err(api_error)?;
+    fn file(py: Python<'_>, path: PathBuf, indexing: bool) -> PyResult<Self> {
+        let mut options = SharedOptions::default();
+        options.indexing = indexing;
+        let handle = block_on(py, SharedFluree::open(path, options))?.map_err(api_error)?;
         Ok(Self {
-            fluree: Database::new(fluree),
+            fluree: Database::shared(handle),
         })
     }
 
     /// A connection built from a JSON-LD connection config: S3 or tiered
     /// storage, a DynamoDB nameservice, encryption keys, `envVar` values.
+    /// File storage is locked against a second open, but not shared.
     #[staticmethod]
     fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>) -> PyResult<Self> {
         let config = to_json(config)?;
-        let builder = FlureeBuilder::from_json_ld(&config).map_err(api_error)?;
+        let builder = FlureeBuilder::from_json_ld(&config)
+            .map_err(api_error)?
+            .with_storage_lock();
         let fluree = block_on(py, builder.build_client())?.map_err(api_error)?;
         Ok(Self {
             fluree: Database::new(fluree),
@@ -364,7 +425,7 @@ impl Connection {
 
     /// Every branch of `ledger`'s ledger, by name.
     fn branches<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        branch::list(py, self.fluree.get()?, &canonical(ledger)?)
+        branch::list(py, &*self.fluree.get()?, &canonical(ledger)?)
     }
 
     /// Branch `name` off `ledger` at its head or at `at`; returns its id.
@@ -378,7 +439,7 @@ impl Connection {
     ) -> PyResult<String> {
         branch::create(
             py,
-            self.fluree.get()?,
+            &*self.fluree.get()?,
             &canonical(ledger)?,
             name,
             time_spec(at)?,
@@ -386,7 +447,7 @@ impl Connection {
     }
 
     fn drop_branch(&self, py: Python<'_>, ledger: &str) -> PyResult<()> {
-        branch::drop(py, self.fluree.get()?, &canonical(ledger)?)
+        branch::drop(py, &*self.fluree.get()?, &canonical(ledger)?)
     }
 
     fn merge<'py>(
@@ -398,7 +459,7 @@ impl Connection {
     ) -> PyResult<Bound<'py, PyDict>> {
         branch::merge(
             py,
-            self.fluree.get()?,
+            &*self.fluree.get()?,
             &canonical(target)?,
             source,
             strategy,
@@ -411,7 +472,7 @@ impl Connection {
         ledger: &str,
         strategy: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::rebase(py, self.fluree.get()?, &canonical(ledger)?, strategy)
+        branch::rebase(py, &*self.fluree.get()?, &canonical(ledger)?, strategy)
     }
 
     fn revert<'py>(
@@ -423,7 +484,7 @@ impl Connection {
     ) -> PyResult<Bound<'py, PyDict>> {
         branch::revert(
             py,
-            self.fluree.get()?,
+            &*self.fluree.get()?,
             &canonical(ledger)?,
             commits,
             strategy,
@@ -437,7 +498,13 @@ impl Connection {
         source: &str,
         options: branch::MergePreviewArgs,
     ) -> PyResult<Bound<'py, PyDict>> {
-        branch::merge_preview(py, self.fluree.get()?, &canonical(target)?, source, options)
+        branch::merge_preview(
+            py,
+            &*self.fluree.get()?,
+            &canonical(target)?,
+            source,
+            options,
+        )
     }
 
     fn revert_preview<'py>(
@@ -449,7 +516,7 @@ impl Connection {
     ) -> PyResult<Bound<'py, PyDict>> {
         branch::revert_preview(
             py,
-            self.fluree.get()?,
+            &*self.fluree.get()?,
             &canonical(ledger)?,
             commits,
             options,
@@ -475,7 +542,7 @@ impl Connection {
         let operation = operation(op, kind, payload, params)?;
         let fluree = self.fluree.get()?;
         let receipt = block_on(py, async {
-            let policy = write_policy(fluree, &id, policy.as_ref()).await?;
+            let policy = write_policy(&fluree, &id, policy.as_ref()).await?;
             let graph = fluree.graph(&id);
             let tx = graph.transact();
             let tx = match &operation {
@@ -506,20 +573,20 @@ impl Connection {
         ledger: &str,
         options: ops::ValidateArgs,
     ) -> PyResult<Bound<'py, PyAny>> {
-        ops::validate(py, self.fluree.get()?, &canonical(ledger)?, options)
+        ops::validate(py, &*self.fluree.get()?, &canonical(ledger)?, options)
     }
 
     fn index_status<'py>(&self, py: Python<'py>, ledger: &str) -> PyResult<Bound<'py, PyDict>> {
-        ops::index_status(py, self.fluree.get()?, &canonical(ledger)?)
+        ops::index_status(py, &*self.fluree.get()?, &canonical(ledger)?)
     }
 
     #[pyo3(signature = (ledger, timeout = None))]
     fn index(&self, py: Python<'_>, ledger: &str, timeout: Option<f64>) -> PyResult<i64> {
-        ops::index(py, self.fluree.get()?, &canonical(ledger)?, timeout)
+        ops::index(py, &*self.fluree.get()?, &canonical(ledger)?, timeout)
     }
 
     fn reindex(&self, py: Python<'_>, ledger: &str) -> PyResult<i64> {
-        ops::reindex(py, self.fluree.get()?, &canonical(ledger)?)
+        ops::reindex(py, &*self.fluree.get()?, &canonical(ledger)?)
     }
 
     #[pyo3(signature = (ledger, max_commits = None))]
@@ -529,7 +596,7 @@ impl Connection {
         ledger: &str,
         max_commits: Option<usize>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        ops::verify(py, self.fluree.get()?, &canonical(ledger)?, max_commits)
+        ops::verify(py, &*self.fluree.get()?, &canonical(ledger)?, max_commits)
     }
 
     fn sweep<'py>(
@@ -538,7 +605,7 @@ impl Connection {
         ledger: &str,
         dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        ops::sweep(py, self.fluree.get()?, &canonical(ledger)?, dry_run)
+        ops::sweep(py, &*self.fluree.get()?, &canonical(ledger)?, dry_run)
     }
 
     /// Make `graph` (the default graph when `None`) hold exactly `payload`,
@@ -577,7 +644,7 @@ impl Connection {
         };
         let fluree = self.fluree.get()?;
         let report = block_on(py, async {
-            let policy = write_policy(fluree, &id, policy.as_ref()).await?;
+            let policy = write_policy(&fluree, &id, policy.as_ref()).await?;
             let payload = match &payload {
                 Payload::Json(json) => GraphPayload::JsonLd(json),
                 Payload::Text(text) => GraphPayload::Rdf(text),
@@ -618,9 +685,9 @@ impl Connection {
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let fluree = self.fluree.get()?;
-        let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
+        let db = block_on(py, load(&fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         let controls = controls.unwrap_or_default();
-        cypher::read(py, fluree, &db, cypher, params.as_ref(), controls)
+        cypher::read(py, &fluree, &db, cypher, params.as_ref(), controls)
     }
 
     /// The plan a Cypher read would run with.
@@ -640,7 +707,7 @@ impl Connection {
         let policy = governance(policy)?;
         let fluree = self.fluree.get()?;
         let plan = block_on(py, async {
-            let db = load(fluree, &id, spec, policy.as_ref()).await?;
+            let db = load(&fluree, &id, spec, policy.as_ref()).await?;
             fluree.explain_cypher(&db, cypher, params.as_ref()).await
         })?
         .map_err(api_error)?;
@@ -680,8 +747,8 @@ impl Connection {
         let controls = controls.unwrap_or_default();
         let (id, policy) = (&id, policy.as_ref());
         let answer = controls.run(py, |cancel, controls| async move {
-            let db = load(fluree, id, spec, policy).await?;
-            let builder = GraphSnapshotQueryBuilder::new_from_parts(fluree, &db)
+            let db = load(&fluree, id, spec, policy).await?;
+            let builder = GraphSnapshotQueryBuilder::new_from_parts(&fluree, &db)
                 .sparql(sparql)
                 .format(FormatterConfig::sparql_json());
             let builder = match params {
@@ -713,11 +780,11 @@ impl Connection {
         let controls = controls.unwrap_or_default();
         let (id, policy, query) = (&id, policy.as_ref(), &query);
         let answer = controls.run(py, |cancel, controls| async move {
-            let db = load(fluree, id, spec, policy).await?;
+            let db = load(&fluree, id, spec, policy).await?;
             execute!(
                 controls,
                 cancel,
-                GraphSnapshotQueryBuilder::new_from_parts(fluree, &db).jsonld(query)
+                GraphSnapshotQueryBuilder::new_from_parts(&fluree, &db).jsonld(query)
             )
         })?;
         answer.into_py(py, None)
@@ -794,7 +861,7 @@ impl Connection {
         let policy = governance(policy)?;
         let query = QueryText::from_py(query, params)?;
         let fluree = self.fluree.get()?;
-        let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
+        let db = block_on(py, load(&fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         start_stream(py, &self.fluree, db, query, controls.unwrap_or_default())
     }
 
@@ -815,8 +882,8 @@ impl Connection {
         let query = QueryText::from_py(query, params)?;
         let fluree = self.fluree.get()?;
         let plan = block_on(py, async {
-            let db = load(fluree, &id, spec, policy.as_ref()).await?;
-            query.explain(fluree, &db).await
+            let db = load(&fluree, &id, spec, policy.as_ref()).await?;
+            query.explain(&fluree, &db).await
         })?
         .map_err(api_error)?;
         from_json(py, &plan)
@@ -834,7 +901,7 @@ impl Connection {
         let spec = time_spec(at)?;
         let policy = governance(policy)?;
         let fluree = self.fluree.get()?;
-        let db = block_on(py, load(fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
+        let db = block_on(py, load(&fluree, &id, spec, policy.as_ref()))?.map_err(api_error)?;
         Ok(Snapshot::new(&self.fluree, db))
     }
 
@@ -1017,7 +1084,7 @@ impl Connection {
         common: graph_source::Common,
         spec: graph_source::IcebergSpec,
     ) -> PyResult<Bound<'py, PyDict>> {
-        graph_source::map_iceberg(py, self.fluree.get()?, common, spec)
+        graph_source::map_iceberg(py, &*self.fluree.get()?, common, spec)
     }
 
     /// Register Delta tables as a graph source.
@@ -1027,7 +1094,7 @@ impl Connection {
         common: graph_source::Common,
         spec: graph_source::DeltaSpec,
     ) -> PyResult<Bound<'py, PyDict>> {
-        graph_source::map_delta(py, self.fluree.get()?, common, spec)
+        graph_source::map_delta(py, &*self.fluree.get()?, common, spec)
     }
 
     /// Register tables behind a Trino-protocol SQL endpoint as a graph source.
@@ -1037,15 +1104,15 @@ impl Connection {
         common: graph_source::Common,
         spec: graph_source::SqlSpec,
     ) -> PyResult<Bound<'py, PyDict>> {
-        graph_source::map_sql(py, self.fluree.get()?, common, spec)
+        graph_source::map_sql(py, &*self.fluree.get()?, common, spec)
     }
 
     fn graph_sources<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        graph_source::list(py, self.fluree.get()?)
+        graph_source::list(py, &*self.fluree.get()?)
     }
 
     fn drop_graph_source(&self, py: Python<'_>, name: &str, branch: &str) -> PyResult<()> {
-        graph_source::drop(py, self.fluree.get()?, name, branch)
+        graph_source::drop(py, &*self.fluree.get()?, name, branch)
     }
 
     #[pyo3(signature = (source, into, full = false))]
@@ -1056,7 +1123,7 @@ impl Connection {
         into: &str,
         full: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        graph_source::materialize(py, self.fluree.get()?, source, &canonical(into)?, full)
+        graph_source::materialize(py, &*self.fluree.get()?, source, &canonical(into)?, full)
     }
 
     /// A SPARQL (text) or JSON-LD (object) query of graph `graph` — a ledger,
@@ -1196,7 +1263,7 @@ impl Snapshot {
         let controls = controls.unwrap_or_default();
         cypher::read(
             py,
-            self.fluree.get()?,
+            &*self.fluree.get()?,
             self.db.get()?,
             cypher,
             params.as_ref(),
@@ -1235,7 +1302,7 @@ impl Snapshot {
         let controls = controls.unwrap_or_default();
         let (fluree, db) = (self.fluree.get()?, self.db.get()?);
         let answer = controls.run(py, |cancel, controls| async move {
-            let builder = GraphSnapshotQueryBuilder::new_from_parts(fluree, db)
+            let builder = GraphSnapshotQueryBuilder::new_from_parts(&fluree, db)
                 .sparql(sparql)
                 .format(FormatterConfig::sparql_json());
             let builder = match params {
@@ -1263,7 +1330,7 @@ impl Snapshot {
             execute!(
                 controls,
                 cancel,
-                GraphSnapshotQueryBuilder::new_from_parts(fluree, db).jsonld(query)
+                GraphSnapshotQueryBuilder::new_from_parts(&fluree, db).jsonld(query)
             )
         })?;
         answer.into_py(py, None)
@@ -1295,8 +1362,8 @@ impl Snapshot {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let query = QueryText::from_py(query, params)?;
-        let plan =
-            block_on(py, query.explain(self.fluree.get()?, self.db.get()?))?.map_err(api_error)?;
+        let plan = block_on(py, query.explain(&*self.fluree.get()?, self.db.get()?))?
+            .map_err(api_error)?;
         from_json(py, &plan)
     }
 }
