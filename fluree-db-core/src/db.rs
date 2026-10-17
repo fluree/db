@@ -564,6 +564,9 @@ impl LedgerSnapshot {
 fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata> {
     use crate::stats_wire;
 
+    let inflated = crate::fir6_frame::inflate(bytes)?;
+    let bytes: &[u8] = &inflated;
+
     // Mirror `fluree-db-binary-index` wire format:
     // [magic(4)][version(1)][flags(1)][pad(2)][index_t(8)][base_t(8)] ...
     if bytes.len() < 24 {

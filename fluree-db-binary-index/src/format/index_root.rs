@@ -649,6 +649,7 @@ impl IndexRoot {
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
     /// Root carries a pool routing section after the named-graph routing.
     const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
+    // Bit 5 marks a zstd-compressed body: `fluree_db_core::fir6_frame`.
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -658,7 +659,8 @@ impl IndexRoot {
         self.decimal_encoding
     }
 
-    /// Encode to the binary FIR6 wire format.
+    /// Encode to the binary FIR6 wire format, the body after the header
+    /// zstd-compressed (`fluree_db_core::fir6_frame`).
     ///
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
     /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
@@ -890,7 +892,7 @@ impl IndexRoot {
             write_term_dict_refs(&mut buf, td);
         }
 
-        buf
+        fluree_db_core::fir6_frame::deflate(&buf).expect("root has its header")
     }
 
     /// The snapshot metadata this root carries, so a caller holding the
@@ -929,6 +931,8 @@ impl IndexRoot {
 
     /// Decode from FIR6 binary bytes.
     pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let inflated = fluree_db_core::fir6_frame::inflate(data)?;
+        let data: &[u8] = &inflated;
         if data.len() < Self::HEADER_LEN {
             return Err(io_err("root v6: too small for header"));
         }
@@ -1664,7 +1668,7 @@ mod tests {
 
         let mut root = minimal_root_v6();
         root.has_annotations = true;
-        let section_at = root.encode().len();
+        let section_at = raw(&root.encode()).len();
         root.term_dict = Some(crate::format::wire_helpers::TermDictRefs {
             forward_packs: vec![],
             reverse: crate::format::wire_helpers::DictTreeRefs {
@@ -1675,7 +1679,7 @@ mod tests {
             term_count: 0,
             object_reverse: None,
         });
-        let current = root.encode();
+        let current = raw(&root.encode());
         let mut legacy = current[..section_at].to_vec();
         legacy[5] |= IndexRoot::FLAG_LEGACY_ANNOTATION_ARENA;
         legacy[6] |= 1 << 0; // the retired sticky bit legacy encoders set
@@ -1694,7 +1698,7 @@ mod tests {
         let ids = decoded.all_cas_ids();
         assert!(arena.branches().all(|branch| ids.contains(branch)));
 
-        let reencoded = decoded.encode();
+        let reencoded = raw(&decoded.encode());
         assert_eq!(reencoded, current, "re-encoding drops the legacy section");
     }
 
@@ -1811,7 +1815,7 @@ mod tests {
         );
 
         // Legacy: a zeroed extended-flags byte decodes to untracked.
-        let mut bytes_legacy = bytes_true;
+        let mut bytes_legacy = raw(&bytes_true);
         bytes_legacy[6] = 0;
         assert_eq!(
             IndexRoot::decode(&bytes_legacy).unwrap().has_list_meta,
@@ -1825,19 +1829,32 @@ mod tests {
         );
     }
 
+    /// The uncompressed encoding, the layout roots had before compression.
+    fn raw(bytes: &[u8]) -> Vec<u8> {
+        fluree_db_core::fir6_frame::inflate(bytes)
+            .unwrap()
+            .into_owned()
+    }
+
     #[test]
     fn fir6_rejects_trailing_bytes() {
         // A future format extension that appended bytes after the
         // last section must not silently load on this build.
         // Both decode paths reject the stray byte explicitly.
         let bytes = minimal_root_v6().encode();
-        let mut tampered = bytes.clone();
+        let mut tampered = raw(&bytes);
         tampered.push(0xff);
         let err = IndexRoot::decode(&tampered).expect_err("trailing byte must be rejected");
         assert!(err.to_string().contains("trailing bytes"), "got: {err}");
         let err = fluree_db_core::LedgerSnapshot::from_root_bytes(&tampered)
             .expect_err("metadata path must reject trailing bytes too");
         assert!(err.to_string().contains("trailing bytes"), "got: {err}");
+
+        // After the compressed body, too.
+        let mut tampered = bytes;
+        tampered.push(0xff);
+        assert!(IndexRoot::decode(&tampered).is_err());
+        assert!(fluree_db_core::LedgerSnapshot::from_root_bytes(&tampered).is_err());
     }
 
     #[test]

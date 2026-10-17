@@ -47,6 +47,7 @@ pub mod disk_cache;
 pub mod edge;
 pub mod error;
 pub mod fd_limit;
+pub mod fir6_frame;
 pub mod flake;
 pub mod geo;
 pub mod graph_db_ref;
