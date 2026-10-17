@@ -616,6 +616,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
+    const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
     let flags_ext = bytes[6];
     let has_term_dict_section = flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
@@ -920,6 +921,18 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let named_count = read_u16(bytes, &mut pos)? as usize;
     for _ in 0..named_count {
         let _g_id = read_u16(bytes, &mut pos)?;
+        let order_count = read_u8(bytes, &mut pos)? as usize;
+        for _ in 0..order_count {
+            let _order_id = read_u8(bytes, &mut pos)?;
+            skip_cid(bytes, &mut pos)?;
+        }
+    }
+
+    // Pool routing (skip)
+    if flags_ext & FLAG_EXT_HAS_POOL != 0 {
+        let graph_count = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, graph_count * 4, "pool graph ids")?;
+        pos += graph_count * 4;
         let order_count = read_u8(bytes, &mut pos)? as usize;
         for _ in 0..order_count {
             let _order_id = read_u8(bytes, &mut pos)?;

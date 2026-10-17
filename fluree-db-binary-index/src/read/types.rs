@@ -5,6 +5,7 @@
 //! `(s_id, p_id, o_type, o_key, o_i)` instead of `(s_id, p_id, o_kind, o_key, dt)`.
 
 use crate::format::run_record::RunSortOrder;
+use fluree_db_core::GraphId;
 use std::cmp::Ordering;
 
 // ============================================================================
@@ -72,6 +73,9 @@ pub struct OverlayOp {
     pub t: i64,
     /// true = assert, false = retract.
     pub op: bool,
+    /// Graph of the fact. Compared only by pooled orders; dedicated trees hold
+    /// one graph and leave it 0.
+    pub g_id: GraphId,
 }
 
 impl OverlayOp {
@@ -92,9 +96,22 @@ impl OverlayOp {
 // Sort / comparison helpers
 // ============================================================================
 
-/// Compare two overlay ops by the V3 sort order (no `t` in sort order).
-fn cmp_overlay_v3(a: &OverlayOp, b: &OverlayOp, order: RunSortOrder) -> Ordering {
-    match order {
+/// The sort-key fields of a row, overlay op or routing key.
+#[derive(Clone, Copy)]
+struct KeyFields {
+    s_id: u64,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+    o_i: u32,
+    g_id: GraphId,
+}
+
+/// Compare by `order`'s sort key. Pooled orders compare `g_id` last, except
+/// `Gspo`, which leads with it.
+#[inline]
+fn cmp_key_fields(a: KeyFields, b: KeyFields, order: RunSortOrder) -> Ordering {
+    let base = match order.base() {
         RunSortOrder::Spot => a
             .s_id
             .cmp(&b.s_id)
@@ -116,14 +133,38 @@ fn cmp_overlay_v3(a: &OverlayOp, b: &OverlayOp, order: RunSortOrder) -> Ordering
             .then(a.o_key.cmp(&b.o_key))
             .then(a.o_i.cmp(&b.o_i))
             .then(a.s_id.cmp(&b.s_id)),
-        RunSortOrder::Opst => a
+        _ => a
             .o_type
             .cmp(&b.o_type)
             .then(a.o_key.cmp(&b.o_key))
             .then(a.o_i.cmp(&b.o_i))
             .then(a.p_id.cmp(&b.p_id))
             .then(a.s_id.cmp(&b.s_id)),
+    };
+    match order {
+        RunSortOrder::Gspo => a.g_id.cmp(&b.g_id).then(base),
+        o if o.is_pooled() => base.then(a.g_id.cmp(&b.g_id)),
+        _ => base,
     }
+}
+
+impl OverlayOp {
+    #[inline]
+    fn key_fields(&self) -> KeyFields {
+        KeyFields {
+            s_id: self.s_id,
+            p_id: self.p_id,
+            o_type: self.o_type,
+            o_key: self.o_key,
+            o_i: self.o_i,
+            g_id: self.g_id,
+        }
+    }
+}
+
+/// Compare two overlay ops by the V3 sort order (no `t` in sort order).
+fn cmp_overlay_v3(a: &OverlayOp, b: &OverlayOp, order: RunSortOrder) -> Ordering {
+    cmp_key_fields(a.key_fields(), b.key_fields(), order)
 }
 
 /// Sort overlay ops by the given V3 sort order.
@@ -197,41 +238,26 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
 /// Compare a decoded row (from a `ColumnBatch`) against an overlay op
 /// using the V3 sort order. Used by the two-pointer merge in `BinaryCursor`.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn cmp_row_vs_overlay(
     s_id: u64,
     p_id: u32,
     o_type: u16,
     o_key: u64,
     o_i: u32,
+    g_id: GraphId,
     ov: &OverlayOp,
     order: RunSortOrder,
 ) -> Ordering {
-    match order {
-        RunSortOrder::Spot => s_id
-            .cmp(&ov.s_id)
-            .then(p_id.cmp(&ov.p_id))
-            .then(o_type.cmp(&ov.o_type))
-            .then(o_key.cmp(&ov.o_key))
-            .then(o_i.cmp(&ov.o_i)),
-        RunSortOrder::Psot => p_id
-            .cmp(&ov.p_id)
-            .then(s_id.cmp(&ov.s_id))
-            .then(o_type.cmp(&ov.o_type))
-            .then(o_key.cmp(&ov.o_key))
-            .then(o_i.cmp(&ov.o_i)),
-        RunSortOrder::Post => p_id
-            .cmp(&ov.p_id)
-            .then(o_type.cmp(&ov.o_type))
-            .then(o_key.cmp(&ov.o_key))
-            .then(o_i.cmp(&ov.o_i))
-            .then(s_id.cmp(&ov.s_id)),
-        RunSortOrder::Opst => o_type
-            .cmp(&ov.o_type)
-            .then(o_key.cmp(&ov.o_key))
-            .then(o_i.cmp(&ov.o_i))
-            .then(p_id.cmp(&ov.p_id))
-            .then(s_id.cmp(&ov.s_id)),
-    }
+    let row = KeyFields {
+        s_id,
+        p_id,
+        o_type,
+        o_key,
+        o_i,
+        g_id,
+    };
+    cmp_key_fields(row, ov.key_fields(), order)
 }
 
 /// Compare an overlay op against a `RunRecordV2` branch key.
@@ -244,36 +270,15 @@ pub fn cmp_overlay_vs_record(
     rec: &crate::format::run_record_v2::RunRecordV2,
     order: RunSortOrder,
 ) -> Ordering {
-    let ov_sid = fluree_db_core::subject_id::SubjectId(ov.s_id);
-    match order {
-        RunSortOrder::Spot => ov_sid
-            .cmp(&rec.s_id)
-            .then(ov.p_id.cmp(&rec.p_id))
-            .then(ov.o_type.cmp(&rec.o_type))
-            .then(ov.o_key.cmp(&rec.o_key))
-            .then(ov.o_i.cmp(&rec.o_i)),
-        RunSortOrder::Psot => ov
-            .p_id
-            .cmp(&rec.p_id)
-            .then(ov_sid.cmp(&rec.s_id))
-            .then(ov.o_type.cmp(&rec.o_type))
-            .then(ov.o_key.cmp(&rec.o_key))
-            .then(ov.o_i.cmp(&rec.o_i)),
-        RunSortOrder::Post => ov
-            .p_id
-            .cmp(&rec.p_id)
-            .then(ov.o_type.cmp(&rec.o_type))
-            .then(ov.o_key.cmp(&rec.o_key))
-            .then(ov.o_i.cmp(&rec.o_i))
-            .then(ov_sid.cmp(&rec.s_id)),
-        RunSortOrder::Opst => ov
-            .o_type
-            .cmp(&rec.o_type)
-            .then(ov.o_key.cmp(&rec.o_key))
-            .then(ov.o_i.cmp(&rec.o_i))
-            .then(ov.p_id.cmp(&rec.p_id))
-            .then(ov_sid.cmp(&rec.s_id)),
-    }
+    let rec = KeyFields {
+        s_id: rec.s_id.as_u64(),
+        p_id: rec.p_id,
+        o_type: rec.o_type,
+        o_key: rec.o_key,
+        o_i: rec.o_i,
+        g_id: rec.g_id,
+    };
+    cmp_key_fields(ov.key_fields(), rec, order)
 }
 
 /// Binary-search the window of `ops` (sorted by `order`) that intersects the
@@ -324,6 +329,7 @@ mod tests {
                 o_i: u32::MAX,
                 t: 1,
                 op: true,
+                g_id: 0,
             },
             OverlayOp {
                 s_id: 1,
@@ -333,6 +339,7 @@ mod tests {
                 o_i: u32::MAX,
                 t: 1,
                 op: true,
+                g_id: 0,
             },
         ];
         sort_overlay_ops(&mut ops, RunSortOrder::Spot);
@@ -351,6 +358,7 @@ mod tests {
                 o_i: u32::MAX,
                 t: 1,
                 op: true,
+                g_id: 0,
             },
             OverlayOp {
                 s_id: 1,
@@ -360,6 +368,7 @@ mod tests {
                 o_i: u32::MAX,
                 t: 1,
                 op: true,
+                g_id: 0,
             },
         ];
         sort_overlay_ops(&mut ops, RunSortOrder::Post);

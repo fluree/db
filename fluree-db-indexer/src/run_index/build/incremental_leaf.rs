@@ -563,7 +563,7 @@ fn split_by_segmentation_and_size(
 
 /// Find the end of the homogeneous segment starting at `start`.
 fn find_segment_end(records: &[RunRecordV2], start: usize, order: RunSortOrder) -> usize {
-    match order {
+    match order.base() {
         RunSortOrder::Post | RunSortOrder::Psot => {
             let p_id = records[start].p_id;
             records[start..]
@@ -578,8 +578,8 @@ fn find_segment_end(records: &[RunRecordV2], start: usize, order: RunSortOrder) 
                 .position(|r| r.o_type != o_type)
                 .map_or(records.len(), |pos| start + pos)
         }
-        RunSortOrder::Spot => {
-            // No segmentation — entire slice is one segment.
+        _ => {
+            // SPOT / GSPO: no segmentation — entire slice is one segment.
             records.len()
         }
     }

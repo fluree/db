@@ -138,7 +138,7 @@ fn cmp_batch_row_vs_record(
     let o_i = batch.o_i.get_or(row, OI_NONE);
 
     let rec_s_id = rec.s_id.as_u64();
-    match order {
+    let base = match order.base() {
         RunSortOrder::Spot => s_id
             .cmp(&rec_s_id)
             .then(p_id.cmp(&rec.p_id))
@@ -157,12 +157,18 @@ fn cmp_batch_row_vs_record(
             .then(o_key.cmp(&rec.o_key))
             .then(o_i.cmp(&rec.o_i))
             .then(s_id.cmp(&rec_s_id)),
-        RunSortOrder::Opst => o_type
+        _ => o_type
             .cmp(&rec.o_type)
             .then(o_key.cmp(&rec.o_key))
             .then(o_i.cmp(&rec.o_i))
             .then(p_id.cmp(&rec.p_id))
             .then(s_id.cmp(&rec_s_id)),
+    };
+    let g_id = batch.g_id.get_or(row, 0);
+    match order {
+        RunSortOrder::Gspo => g_id.cmp(&rec.g_id).then(base),
+        o if o.is_pooled() => base.then(g_id.cmp(&rec.g_id)),
+        _ => base,
     }
 }
 
@@ -451,6 +457,7 @@ mod tests {
                 ColumnData::AbsentDefault
             },
             t: ColumnData::Block(ts),
+            g_id: ColumnData::AbsentDefault,
         }
     }
 
@@ -981,6 +988,7 @@ mod tests {
             o_type: ColumnData::Const(OType::XSD_INTEGER.as_u16()),
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::Block(Arc::from(vec![1u32, 1, 1])),
+            g_id: ColumnData::AbsentDefault,
         };
 
         // Insert s=4 with same p_id=42

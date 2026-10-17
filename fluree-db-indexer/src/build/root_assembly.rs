@@ -321,6 +321,7 @@ pub(crate) async fn encode_and_write_root_v6(
         legacy_annotation_arena: None,
         term_dict: inputs.term_dict,
         has_list_meta: Some(inputs.saw_list_meta),
+        pool: None,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
@@ -464,6 +465,7 @@ mod tests {
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            pool: None,
         }
     }
 

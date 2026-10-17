@@ -181,6 +181,13 @@ pub fn load_leaflet_columns(
         ColumnData::AbsentDefault
     };
 
+    // ── g_id ── (pooled-tree leaflets only; dedicated trees have no block)
+    let g_id = if eff.contains(ColumnId::GId) && find_ref(ColumnId::GId).is_some() {
+        ColumnData::Block(Arc::from(decode_u16_col(ColumnId::GId)?))
+    } else {
+        ColumnData::AbsentDefault
+    };
+
     Ok(ColumnBatch {
         row_count,
         s_id,
@@ -189,6 +196,7 @@ pub fn load_leaflet_columns(
         o_type,
         o_i,
         t,
+        g_id,
     })
 }
 

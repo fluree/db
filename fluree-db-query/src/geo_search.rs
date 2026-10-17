@@ -202,6 +202,7 @@ impl GeoSearchOperator {
                 o_type: Some(geo_otype),
                 o_key: None, // Range filtering done by cursor bounds
                 o_i: None,
+                g_id: None,
             };
 
             // Create cursor for POST order

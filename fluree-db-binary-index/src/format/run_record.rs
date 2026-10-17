@@ -287,6 +287,25 @@ pub fn cmp_g_spot(a: &RunRecord, b: &RunRecord) -> Ordering {
     a.g_id.cmp(&b.g_id).then_with(|| cmp_spot(a, b))
 }
 
+/// Pooled orders compare the base order's identity columns, then `g_id`,
+/// then `t`/`op` (so a fact's history stays adjacent within its graph).
+macro_rules! pooled_v1_cmp {
+    ($name:ident, $($field:ident),+) => {
+        #[inline]
+        fn $name(a: &RunRecord, b: &RunRecord) -> Ordering {
+            Ordering::Equal
+                $(.then(a.$field.cmp(&b.$field)))+
+                .then(a.g_id.cmp(&b.g_id))
+                .then(a.t.cmp(&b.t))
+                .then(a.op.cmp(&b.op))
+        }
+    };
+}
+pooled_v1_cmp!(cmp_spot_g, s_id, p_id, o_kind, o_key, dt);
+pooled_v1_cmp!(cmp_psot_g, p_id, s_id, o_kind, o_key, dt);
+pooled_v1_cmp!(cmp_post_g, p_id, o_kind, o_key, dt, s_id);
+pooled_v1_cmp!(cmp_opst_g, o_kind, o_key, dt, p_id, s_id);
+
 /// Return the comparator function for a given sort order.
 pub fn cmp_for_order(order: RunSortOrder) -> fn(&RunRecord, &RunRecord) -> Ordering {
     match order {
@@ -294,10 +313,21 @@ pub fn cmp_for_order(order: RunSortOrder) -> fn(&RunRecord, &RunRecord) -> Order
         RunSortOrder::Psot => cmp_psot,
         RunSortOrder::Post => cmp_post,
         RunSortOrder::Opst => cmp_opst,
+        RunSortOrder::Gspo => cmp_g_spot,
+        RunSortOrder::SpotG => cmp_spot_g,
+        RunSortOrder::PsotG => cmp_psot_g,
+        RunSortOrder::PostG => cmp_post_g,
+        RunSortOrder::OpstG => cmp_opst_g,
     }
 }
 
 /// Sort order identifier for run files.
+///
+/// `Spot`..`Opst` are the orders of a dedicated tree, which holds one graph
+/// and keeps the graph implicit. The pooled orders belong to the shared tree
+/// for small named graphs: each carries `g_id` per row, `SpotG`..`OpstG`
+/// compare it after the base order's columns (so cross-graph prefixes stay
+/// contiguous) and `Gspo` leads with it (one graph's rows are contiguous).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunSortOrder {
@@ -305,6 +335,11 @@ pub enum RunSortOrder {
     Psot = 1,
     Post = 2,
     Opst = 3,
+    Gspo = 4,
+    SpotG = 5,
+    PsotG = 6,
+    PostG = 7,
+    OpstG = 8,
 }
 
 impl PartialOrd for RunSortOrder {
@@ -327,6 +362,11 @@ impl RunSortOrder {
             1 => Some(Self::Psot),
             2 => Some(Self::Post),
             3 => Some(Self::Opst),
+            4 => Some(Self::Gspo),
+            5 => Some(Self::SpotG),
+            6 => Some(Self::PsotG),
+            7 => Some(Self::PostG),
+            8 => Some(Self::OpstG),
             _ => None,
         }
     }
@@ -353,6 +393,11 @@ impl RunSortOrder {
             Self::Psot => "psot",
             Self::Post => "post",
             Self::Opst => "opst",
+            Self::Gspo => "gspo",
+            Self::SpotG => "spot_g",
+            Self::PsotG => "psot_g",
+            Self::PostG => "post_g",
+            Self::OpstG => "opst_g",
         }
     }
 
@@ -363,6 +408,11 @@ impl RunSortOrder {
             "psot" => Some(Self::Psot),
             "post" => Some(Self::Post),
             "opst" => Some(Self::Opst),
+            "gspo" => Some(Self::Gspo),
+            "spot_g" => Some(Self::SpotG),
+            "psot_g" => Some(Self::PsotG),
+            "post_g" => Some(Self::PostG),
+            "opst_g" => Some(Self::OpstG),
             _ => None,
         }
     }
@@ -376,6 +426,53 @@ impl RunSortOrder {
     /// from sorted commit files via streaming k-way merge.
     pub fn secondary_orders() -> &'static [RunSortOrder] {
         &[Self::Psot, Self::Post, Self::Opst]
+    }
+
+    /// Orders of the pooled tree.
+    pub fn pool_build_orders() -> &'static [RunSortOrder] {
+        &[
+            Self::Gspo,
+            Self::SpotG,
+            Self::PsotG,
+            Self::PostG,
+            Self::OpstG,
+        ]
+    }
+
+    /// Pooled orders built from run files. `Gspo` comes from the
+    /// `(g_id, SPOT)`-sorted commit files, as `Spot` does for a single graph.
+    pub fn pool_secondary_orders() -> &'static [RunSortOrder] {
+        &[Self::SpotG, Self::PsotG, Self::PostG, Self::OpstG]
+    }
+
+    /// Whether this order belongs to the pooled tree (rows carry `g_id`).
+    #[inline]
+    pub fn is_pooled(self) -> bool {
+        (self as u8) >= Self::Gspo as u8
+    }
+
+    /// The dedicated order whose columns and segmentation this order uses.
+    /// `Gspo` lays out its columns as SPOT does.
+    #[inline]
+    pub fn base(self) -> RunSortOrder {
+        match self {
+            Self::Spot | Self::Gspo | Self::SpotG => Self::Spot,
+            Self::Psot | Self::PsotG => Self::Psot,
+            Self::Post | Self::PostG => Self::Post,
+            Self::Opst | Self::OpstG => Self::Opst,
+        }
+    }
+
+    /// The pooled counterpart of a dedicated order (trailing `g_id`).
+    #[inline]
+    pub fn pooled(self) -> RunSortOrder {
+        match self {
+            Self::Spot | Self::SpotG => Self::SpotG,
+            Self::Psot | Self::PsotG => Self::PsotG,
+            Self::Post | Self::PostG => Self::PostG,
+            Self::Opst | Self::OpstG => Self::OpstG,
+            Self::Gspo => Self::Gspo,
+        }
     }
 }
 
@@ -708,8 +805,32 @@ mod tests {
         assert_eq!(RunSortOrder::from_u8(1), Some(RunSortOrder::Psot));
         assert_eq!(RunSortOrder::from_u8(2), Some(RunSortOrder::Post));
         assert_eq!(RunSortOrder::from_u8(3), Some(RunSortOrder::Opst));
-        assert_eq!(RunSortOrder::from_u8(4), None);
+        assert_eq!(RunSortOrder::from_u8(4), Some(RunSortOrder::Gspo));
+        assert_eq!(RunSortOrder::from_u8(8), Some(RunSortOrder::OpstG));
+        assert_eq!(RunSortOrder::from_u8(9), None);
         assert_eq!(RunSortOrder::from_u8(255), None);
+        for &o in RunSortOrder::all_build_orders()
+            .iter()
+            .chain(RunSortOrder::pool_build_orders())
+        {
+            assert_eq!(RunSortOrder::from_wire_id(o.to_wire_id()), Some(o));
+            assert_eq!(RunSortOrder::from_dir_name(o.dir_name()), Some(o));
+        }
+    }
+
+    #[test]
+    fn pooled_orders_map_to_their_base() {
+        for &o in RunSortOrder::all_build_orders() {
+            assert!(!o.is_pooled());
+            assert_eq!(o.base(), o);
+            assert!(o.pooled().is_pooled());
+            assert_eq!(o.pooled().base(), o);
+        }
+        for &o in RunSortOrder::pool_build_orders() {
+            assert!(o.is_pooled());
+            assert_eq!(o.pooled(), o);
+        }
+        assert_eq!(RunSortOrder::Gspo.base(), RunSortOrder::Spot);
     }
 
     #[test]

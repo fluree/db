@@ -108,6 +108,24 @@ pub struct NamedGraphRouting {
     pub orders: Vec<(RunSortOrder, ContentId)>,
 }
 
+/// The shared tree for small named graphs: one branch per pooled order, and
+/// the graphs it holds. A graph listed here has no `NamedGraphRouting` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolRouting {
+    /// Pooled graph ids, sorted.
+    pub graphs: Vec<GraphId>,
+    /// `(order, branch_cid)` pairs over [`RunSortOrder::pool_build_orders`].
+    pub orders: Vec<(RunSortOrder, ContentId)>,
+}
+
+impl PoolRouting {
+    /// Whether `g_id` lives in the pool.
+    #[inline]
+    pub fn contains(&self, g_id: GraphId) -> bool {
+        self.graphs.binary_search(&g_id).is_ok()
+    }
+}
+
 // ============================================================================
 // IndexRoot
 // ============================================================================
@@ -243,6 +261,8 @@ pub struct IndexRoot {
     // ── V3-specific: named graph routing using V3 branch CIDs ────────
     /// Named graph routing: branch CIDs per sort order (FBR3 branches).
     pub named_graphs: Vec<NamedGraphRouting>,
+    /// The pooled tree for small named graphs, when any graph lives there.
+    pub pool: Option<PoolRouting>,
 
     // ── Optional sections ──────────────────────────────────────────────────
     pub stats: Option<IndexStats>,
@@ -627,6 +647,8 @@ impl IndexRoot {
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
     /// Root carries a triple-term dictionary section, the root's last.
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
+    /// Root carries a pool routing section after the named-graph routing.
+    const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -690,6 +712,9 @@ impl IndexRoot {
         }
         if self.term_dict.is_some() {
             flags_ext |= Self::FLAG_EXT_HAS_TERM_DICT;
+        }
+        if self.pool.is_some() {
+            flags_ext |= Self::FLAG_EXT_HAS_POOL;
         }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
@@ -808,6 +833,23 @@ impl IndexRoot {
             sorted_orders.sort_by_key(|(order, _)| order.to_wire_id());
             buf.push(sorted_orders.len() as u8);
             for (order, branch_cid) in &sorted_orders {
+                buf.push(order.to_wire_id());
+                write_cid(&mut buf, branch_cid);
+            }
+        }
+
+        // ---- Optional: pool routing ----
+        if let Some(pool) = &self.pool {
+            let mut graphs = pool.graphs.clone();
+            graphs.sort_unstable();
+            buf.extend_from_slice(&(graphs.len() as u32).to_le_bytes());
+            for g in graphs {
+                buf.extend_from_slice(&u32::from(g).to_le_bytes());
+            }
+            let mut orders = pool.orders.clone();
+            orders.sort_by_key(|(order, _)| order.to_wire_id());
+            buf.push(orders.len() as u8);
+            for (order, branch_cid) in &orders {
                 buf.push(order.to_wire_id());
                 write_cid(&mut buf, branch_cid);
             }
@@ -1070,6 +1112,31 @@ impl IndexRoot {
             named_graphs.push(NamedGraphRouting { g_id, orders });
         }
 
+        // Pool routing
+        let pool = if flags_ext & Self::FLAG_EXT_HAS_POOL != 0 {
+            let graph_count = read_u32_at(data, &mut pos)? as usize;
+            let mut graphs = Vec::with_capacity(graph_count);
+            for _ in 0..graph_count {
+                let g = read_u32_at(data, &mut pos)?;
+                graphs
+                    .push(GraphId::try_from(g).map_err(|_| {
+                        io_err(&format!("root v6: pool graph id {g} out of range"))
+                    })?);
+            }
+            let order_count = read_u8_at(data, &mut pos)? as usize;
+            let mut orders = Vec::with_capacity(order_count);
+            for _ in 0..order_count {
+                let oid = read_u8_at(data, &mut pos)?;
+                let order = RunSortOrder::from_wire_id(oid)
+                    .filter(|o| o.is_pooled())
+                    .ok_or_else(|| io_err(&format!("root v6: invalid pool order_id {oid}")))?;
+                orders.push((order, read_cid(data, &mut pos)?));
+            }
+            Some(PoolRouting { graphs, orders })
+        } else {
+            None
+        };
+
         // Optional sections
         let stats = if flags & Self::FLAG_HAS_STATS != 0 {
             let stats_len = read_u32_at(data, &mut pos)? as usize;
@@ -1166,6 +1233,7 @@ impl IndexRoot {
             o_type_table,
             default_graph_orders,
             named_graphs,
+            pool,
             stats,
             schema,
             prev_index,
@@ -1251,6 +1319,13 @@ impl IndexRoot {
         // Named graph branch CIDs
         for ng in &self.named_graphs {
             for (_, branch_cid) in &ng.orders {
+                ids.push(branch_cid.clone());
+            }
+        }
+
+        // Pool branch CIDs
+        if let Some(pool) = &self.pool {
+            for (_, branch_cid) in &pool.orders {
                 ids.push(branch_cid.clone());
             }
         }
@@ -1485,6 +1560,7 @@ mod tests {
             has_list_meta: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            pool: None,
         }
     }
 
@@ -1869,6 +1945,50 @@ mod tests {
         assert!(decoded.default_graph_orders[0].leaves[0]
             .sidecar_cid
             .is_some());
+    }
+
+    /// The pool section round-trips, its branches are reachable for GC, and
+    /// core's metadata-only parser skips it to read the stats behind it.
+    #[test]
+    fn fir6_round_trip_with_pool() {
+        let cid = |tag: &[u8]| {
+            ContentId::from_hex_digest(
+                fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
+                &fluree_db_core::sha256_hex(tag),
+            )
+            .unwrap()
+        };
+        let mut root = minimal_root_v6();
+        root.pool = Some(PoolRouting {
+            graphs: vec![3, 4, 70],
+            orders: RunSortOrder::pool_build_orders()
+                .iter()
+                .map(|&o| (o, cid(o.dir_name().as_bytes())))
+                .collect(),
+        });
+        root.stats = Some(IndexStats {
+            flakes: 42,
+            ..Default::default()
+        });
+
+        let bytes = root.encode();
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        let pool = decoded.pool.as_ref().expect("pool decodes");
+        assert_eq!(pool, root.pool.as_ref().unwrap());
+        assert!(pool.contains(70) && !pool.contains(5));
+        assert_eq!(decoded.stats.as_ref().unwrap().flakes, 42);
+
+        let ids = root.all_cas_ids();
+        for &o in RunSortOrder::pool_build_orders() {
+            assert!(
+                ids.contains(&cid(o.dir_name().as_bytes())),
+                "{o:?} unreachable"
+            );
+        }
+
+        let snap =
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).expect("core metadata decode");
+        assert_eq!(snap.stats.as_ref().map(|s| s.flakes), Some(42));
     }
 
     #[test]

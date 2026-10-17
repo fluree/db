@@ -1260,6 +1260,7 @@ mod tests {
             o_type: ColumnData::Const(7),
             o_i: ColumnData::Block(vec![0u32, 1].into()),
             t: ColumnData::Block(vec![3u32, 4].into()),
+            g_id: ColumnData::AbsentDefault,
         };
         let all_key = V3BatchCacheKey {
             leaf_id: 0xABCD,
@@ -1309,6 +1310,7 @@ mod tests {
             o_type: ColumnData::Const(7),
             o_i: ColumnData::Block(vec![0u32, 1].into()),
             t: ColumnData::Block(vec![3u32, 4].into()),
+            g_id: ColumnData::AbsentDefault,
         };
         let key = |columns: ColumnSet| V3BatchCacheKey {
             leaf_id: 0xBEEF,
@@ -1361,6 +1363,7 @@ mod tests {
             o_type: ColumnData::Const(7),
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::Block(vec![3u32].into()),
+            g_id: ColumnData::AbsentDefault,
         };
         let key = |columns: ColumnSet| V3BatchCacheKey {
             leaf_id: 0xF00D,

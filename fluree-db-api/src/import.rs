@@ -7071,6 +7071,7 @@ where
             // Same source as the spool object resolution (SpoolConfig): the root
             // version must match how the import encoded decimals.
             decimal_encoding: IMPORT_DECIMAL_ENCODING,
+            pool: None,
         };
 
         // Encode and upload FIR6 root.

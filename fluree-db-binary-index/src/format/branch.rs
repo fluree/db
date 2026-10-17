@@ -16,7 +16,9 @@
 //!   _reserved: u32 (= 0)
 //! [Leaf entries: leaf_count × variable]
 //!   first_key: RunRecordV2 (30B, LE, graphless)
+//!   [if order is pooled] first_key g_id: u32 (LE)
 //!   last_key: RunRecordV2 (30B, LE, graphless)
+//!   [if order is pooled] last_key g_id: u32 (LE)
 //!   row_count: u64 (LE)
 //!   leaf_cid_len: u16 (LE)
 //!   leaf_cid_bytes: [u8; leaf_cid_len]
@@ -147,14 +149,17 @@ pub fn build_branch_bytes(order: RunSortOrder, g_id: u16, leaves: &[LeafEntry]) 
     buf.extend_from_slice(&(leaves.len() as u32).to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
 
-    // Leaf entries.
+    // Leaf entries. A pooled tree routes on the graph too, so its keys carry it.
+    let pooled = order.is_pooled();
     let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
     for leaf in leaves {
-        leaf.first_key.write_run_le(&mut rec_buf);
-        buf.extend_from_slice(&rec_buf);
-
-        leaf.last_key.write_run_le(&mut rec_buf);
-        buf.extend_from_slice(&rec_buf);
+        for key in [&leaf.first_key, &leaf.last_key] {
+            key.write_run_le(&mut rec_buf);
+            buf.extend_from_slice(&rec_buf);
+            if pooled {
+                buf.extend_from_slice(&u32::from(key.g_id).to_le_bytes());
+            }
+        }
 
         buf.extend_from_slice(&leaf.row_count.to_le_bytes());
 
@@ -204,32 +209,39 @@ pub fn read_branch_from_bytes(data: &[u8]) -> io::Result<BranchManifest> {
         ));
     }
 
+    let pooled = RunSortOrder::from_wire_id(data[5]).is_some_and(RunSortOrder::is_pooled);
+    let key_len = RECORD_V2_WIRE_SIZE + if pooled { 4 } else { 0 };
+    let read_key = |pos: usize, what: &str| -> io::Result<RunRecordV2> {
+        if pos + key_len > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("FBR3: truncated at {what}"),
+            ));
+        }
+        let mut rec =
+            RunRecordV2::read_run_le(data[pos..pos + RECORD_V2_WIRE_SIZE].try_into().unwrap());
+        if pooled {
+            let at = pos + RECORD_V2_WIRE_SIZE;
+            let g = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+            rec.g_id = u16::try_from(g).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("FBR3: graph id {g} out of range"),
+                )
+            })?;
+        }
+        Ok(rec)
+    };
+
     let leaf_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
     let mut leaves = Vec::with_capacity(leaf_count);
     let mut pos = BRANCH_V3_HEADER_LEN;
 
     for _ in 0..leaf_count {
-        // first_key: 30 bytes
-        if pos + RECORD_V2_WIRE_SIZE > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FBR3: truncated at first_key",
-            ));
-        }
-        let first_key =
-            RunRecordV2::read_run_le(data[pos..pos + RECORD_V2_WIRE_SIZE].try_into().unwrap());
-        pos += RECORD_V2_WIRE_SIZE;
-
-        // last_key: 30 bytes
-        if pos + RECORD_V2_WIRE_SIZE > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FBR3: truncated at last_key",
-            ));
-        }
-        let last_key =
-            RunRecordV2::read_run_le(data[pos..pos + RECORD_V2_WIRE_SIZE].try_into().unwrap());
-        pos += RECORD_V2_WIRE_SIZE;
+        let first_key = read_key(pos, "first_key")?;
+        pos += key_len;
+        let last_key = read_key(pos, "last_key")?;
+        pos += key_len;
 
         // row_count: 8 bytes
         if pos + 8 > data.len() {
@@ -417,6 +429,36 @@ mod tests {
         assert_eq!(manifest.leaves[0].sidecar_cid, None);
         assert_eq!(manifest.leaves[1].row_count, 3000);
         assert_eq!(manifest.leaves[1].leaf_cid, make_leaf_cid(1));
+    }
+
+    /// A pooled branch keeps each leaf bound's graph; a dedicated branch's
+    /// bytes carry none.
+    #[test]
+    fn pooled_branch_round_trips_graph_bounds() {
+        let int = OType::XSD_INTEGER.as_u16();
+        let mut first = make_rec(1, 1, int, 0, 1);
+        first.g_id = 7;
+        let mut last = make_rec(100, 5, int, 99, 1);
+        last.g_id = 4000;
+        let leaves = vec![LeafEntry {
+            first_key: first,
+            last_key: last,
+            row_count: 10,
+            leaf_cid: make_leaf_cid(0),
+            sidecar_cid: Some(make_sidecar_cid(0)),
+        }];
+
+        let pooled = build_branch_bytes(RunSortOrder::Gspo, 0, &leaves);
+        let manifest = read_branch_from_bytes(&pooled).unwrap();
+        assert_eq!(manifest.leaves[0].first_key.g_id, 7);
+        assert_eq!(manifest.leaves[0].last_key.g_id, 4000);
+        assert_eq!(manifest.leaves[0].sidecar_cid, Some(make_sidecar_cid(0)));
+
+        let dedicated = build_branch_bytes(RunSortOrder::Spot, 0, &leaves);
+        assert_eq!(pooled.len(), dedicated.len() + 8);
+        let manifest = read_branch_from_bytes(&dedicated).unwrap();
+        assert_eq!(manifest.leaves[0].first_key.g_id, 0);
+        assert_eq!(manifest.leaves[0].row_count, 10);
     }
 
     #[test]

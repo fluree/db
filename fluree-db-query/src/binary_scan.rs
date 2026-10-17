@@ -83,11 +83,11 @@ pub fn index_type_to_sort_order(index: IndexType) -> RunSortOrder {
 /// overlay cursor in a given order to select the matching novelty overlay index
 /// for `OverlayProvider::for_each_overlay_flake`.
 pub fn sort_order_to_index_type(order: RunSortOrder) -> IndexType {
-    match order {
-        RunSortOrder::Spot => IndexType::Spot,
+    match order.base() {
         RunSortOrder::Psot => IndexType::Psot,
         RunSortOrder::Post => IndexType::Post,
         RunSortOrder::Opst => IndexType::Opst,
+        _ => IndexType::Spot,
     }
 }
 
@@ -1185,6 +1185,7 @@ impl BinaryScanOperator {
             o_type: None,
             o_key: None,
             o_i: None,
+            g_id: None,
         })
     }
 
@@ -3846,6 +3847,7 @@ pub(crate) fn translate_one_flake_v3_pub(
                 o_i,
                 t: flake.t,
                 op: flake.op,
+                g_id,
             });
         }
         // No matching base row. For a retraction this means the assertion
@@ -3893,6 +3895,7 @@ pub(crate) fn translate_one_flake_v3_pub(
         o_i,
         t: flake.t,
         op: flake.op,
+        g_id,
     })
 }
 
@@ -4625,9 +4628,12 @@ pub(crate) fn object_slice_filters(
     slices: &[ObjectSlice],
 ) -> Vec<BinaryFilter> {
     let ordered = match order {
-        RunSortOrder::Opst => true,
-        RunSortOrder::Post => filter.p_id.is_some(),
-        RunSortOrder::Spot | RunSortOrder::Psot => filter.s_id.is_some() && filter.p_id.is_some(),
+        RunSortOrder::Opst | RunSortOrder::OpstG => true,
+        RunSortOrder::Post | RunSortOrder::PostG => filter.p_id.is_some(),
+        RunSortOrder::Gspo => {
+            filter.g_id.is_some() && filter.s_id.is_some() && filter.p_id.is_some()
+        }
+        _ => filter.s_id.is_some() && filter.p_id.is_some(),
     };
     if slices.is_empty() || !ordered {
         return vec![filter];
@@ -5231,6 +5237,7 @@ mod bounded_overlay_walk_tests {
                     o_i: u32::MAX,
                     t: (rng(&mut st) % 9) as i64,
                     op: rng(&mut st).is_multiple_of(2),
+                    g_id: 0,
                 });
             }
 
@@ -5275,6 +5282,7 @@ mod bounded_overlay_walk_tests {
                     o_i: u32::MAX,
                     t: (rng(&mut st) % 9) as i64,
                     op: rng(&mut st).is_multiple_of(2),
+                    g_id: 0,
                 });
             }
 
@@ -5315,6 +5323,7 @@ mod bounded_overlay_walk_tests {
             o_i: u32::MAX,
             t: 5,
             op: true,
+            g_id: 0,
         };
         let b = OverlayOp {
             t: 8,

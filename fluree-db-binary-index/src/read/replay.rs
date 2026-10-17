@@ -473,6 +473,7 @@ pub fn replay_leaflet(
             ColumnData::AbsentDefault
         },
         t: ColumnData::Block(Arc::from(out_t)),
+        g_id: ColumnData::AbsentDefault,
     })
 }
 
@@ -546,6 +547,7 @@ mod tests {
             o_type: ColumnData::Block(o_types),
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::Block(ts),
+            g_id: ColumnData::AbsentDefault,
         }
     }
 
@@ -680,8 +682,8 @@ mod tests {
         let entry = LeafletDirEntryV3 {
             row_count: 0,
             lead_group_count: 0,
-            first_key: [0u8; 26],
-            last_key: [0u8; 26],
+            first_key: [0u8; crate::format::run_record_v2::ORDERED_KEY_V2_SIZE],
+            last_key: [0u8; crate::format::run_record_v2::ORDERED_KEY_V2_SIZE],
             p_const: Some(1),
             o_type_const: None,
             flags: 0,
