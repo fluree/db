@@ -5,7 +5,9 @@
 //! Tracks replaced CIDs for garbage collection.
 
 use fluree_db_binary_index::format::branch::LeafEntry;
-use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, IndexRoot, NamedGraphRouting};
+use fluree_db_binary_index::format::index_root::{
+    DefaultGraphOrder, IndexRoot, NamedGraphRouting, PoolMember, PoolRouting,
+};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
 use fluree_db_binary_index::{DictRefs, GraphArenaRefs};
@@ -52,11 +54,54 @@ impl IncrementalRootBuilder {
     }
 
     /// Take `g_id` out of the pooled tree's graphs: it now has a dedicated
-    /// tree. Its rows stay in the pooled leaves, which no longer route reads
-    /// for it; a full rebuild drops them.
+    /// tree, and this build's pool update purges its rows and history.
     pub fn remove_from_pool(&mut self, g_id: fluree_db_core::GraphId) {
         if let Some(pool) = self.root.pool.as_mut() {
             pool.members.retain(|m| m.g_id != g_id);
+        }
+    }
+
+    /// Replace the pooled tree's branch for one pooled order, creating the
+    /// pool if the root has none.
+    ///
+    /// **GC note**: Records the old branch CID as replaced, like
+    /// [`Self::set_named_graph_branch`].
+    pub fn set_pool_branch(&mut self, order: RunSortOrder, branch_cid: ContentId) {
+        let pool = self.root.pool.get_or_insert_with(|| PoolRouting {
+            members: Vec::new(),
+            orders: Vec::new(),
+        });
+        if let Some(entry) = pool.orders.iter_mut().find(|(o, _)| *o == order) {
+            self.replaced_cids.push(entry.1.clone());
+            entry.1 = branch_cid;
+        } else {
+            pool.orders.push((order, branch_cid));
+        }
+    }
+
+    /// Admit `joined` to the pool and apply this build's per-graph changes
+    /// in rows and history to its members' sizes.
+    pub fn update_pool_members(
+        &mut self,
+        joined: &[fluree_db_core::GraphId],
+        deltas: &crate::run_index::build::incremental_leaf::GraphDeltas,
+    ) {
+        let Some(pool) = self.root.pool.as_mut() else {
+            return;
+        };
+        for &g_id in joined {
+            if let Err(at) = pool.members.binary_search_by_key(&g_id, |m| m.g_id) {
+                pool.members.insert(at, PoolMember::new(g_id));
+            }
+        }
+        let apply =
+            |size: u32, delta: i64| (i64::from(size) + delta).clamp(0, i64::from(u32::MAX)) as u32;
+        for (&g_id, delta) in deltas {
+            if let Ok(at) = pool.members.binary_search_by_key(&g_id, |m| m.g_id) {
+                let m = &mut pool.members[at];
+                m.rows = apply(m.rows, delta.rows);
+                m.history = apply(m.history, delta.history);
+            }
         }
     }
 

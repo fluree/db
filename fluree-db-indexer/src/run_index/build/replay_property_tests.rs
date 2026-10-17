@@ -313,6 +313,7 @@ fn run_incremental(case: &Case, case_id: usize) -> (LeafView, Option<(u32, u8)>)
     let winner = winners.first().map(|w| (w.t, w.op));
 
     let config = BranchUpdateConfig {
+        pool: Default::default(),
         order: RunSortOrder::Spot,
         g_id: 0,
         zstd_level: 1,

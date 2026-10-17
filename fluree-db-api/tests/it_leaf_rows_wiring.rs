@@ -34,6 +34,10 @@ async fn leaf_counts(fluree: &Fluree, ledger_id: &str, root: &ContentId) -> Vec<
             counts.push((format!("g{} {order:?}", graph.g_id), branch.leaves.len()));
         }
     }
+    for (order, branch_cid) in root.pool.iter().flat_map(|p| &p.orders) {
+        let branch = read_branch_from_bytes(&cs.get(branch_cid).await.unwrap()).unwrap();
+        counts.push((format!("pool {order:?}"), branch.leaves.len()));
+    }
     counts
 }
 
@@ -70,8 +74,8 @@ async fn smaller_leaflets_keep_one_leaf_through_rebuild_and_incremental() {
             let counts = leaf_counts(&fluree, ledger_id, &rebuilt).await;
             assert!(counts.iter().all(|(_, n)| *n == 1), "rebuild: {counts:?}");
 
-            // An incremental merge into the default graph's leaves, and a
-            // named graph's first build.
+            // An incremental merge into the default graph's leaves, and the
+            // pool's first build, for the new named graph.
             let ledger = fluree.ledger(ledger_id).await.unwrap();
             let more = format!(
                 "{prefix}{}GRAPH <{GRAPH_IRI}> {{\n{}}}\n",
@@ -91,8 +95,8 @@ async fn smaller_leaflets_keep_one_leaf_through_rebuild_and_incremental() {
                 .root_id
                 .expect("root");
             let counts = leaf_counts(&fluree, ledger_id, &merged).await;
-            // The default graph, txn-meta (g1) and the new graph.
-            assert_eq!(counts.len(), 12, "every graph in every order: {counts:?}");
+            // The default graph, txn-meta (g1) and the pool.
+            assert_eq!(counts.len(), 13, "every tree in every order: {counts:?}");
             assert!(
                 counts.iter().all(|(_, n)| *n == 1),
                 "incremental: {counts:?}"

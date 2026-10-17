@@ -80,6 +80,7 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
     let novelty_ops = vec![1u8]; // assert
 
     let config = BranchUpdateConfig {
+        pool: Default::default(),
         order: RunSortOrder::Spot,
         g_id: 0,
         zstd_level: 1,

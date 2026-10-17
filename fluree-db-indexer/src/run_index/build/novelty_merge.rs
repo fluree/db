@@ -13,7 +13,7 @@
 
 use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{same_identity_v2, RunRecordV2};
+use fluree_db_binary_index::format::run_record_v2::{identity_v2_for_order, RunRecordV2};
 use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_binary_index::read::column_types::ColumnBatch;
 use fluree_db_core::subject_id::SubjectId;
@@ -21,6 +21,11 @@ use std::cmp::Ordering;
 
 /// Sentinel for o_i when no list index is present.
 const OI_NONE: u32 = u32::MAX;
+
+/// Novelty op marking an identity of a graph leaving the pool. It routes the
+/// merge to every leaflet holding that graph (see [`MergeInput::purge`]) and
+/// otherwise contributes nothing: no row, no history, no match.
+pub const OP_PURGE: u8 = 2;
 
 // ============================================================================
 // MergeInput / MergeOutput
@@ -48,6 +53,9 @@ pub struct MergeInput<'a> {
     pub superseded_ops: &'a [u8],
     /// Sort order (determines merge comparison).
     pub order: RunSortOrder,
+    /// Pooled tree only: graphs leaving the pool, sorted. Their rows and
+    /// history are dropped from the leaflet.
+    pub purge: &'a [fluree_db_core::GraphId],
 }
 
 /// Output of the V3 novelty merge.
@@ -267,10 +275,25 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     let mut si = 0usize; // superseded index
                          // Scratch: one identity's full event sequence, reused across identities.
     let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
+    let purged = |row: usize| {
+        !input.purge.is_empty()
+            && input
+                .purge
+                .binary_search(&input.batch.g_id.get_or(row, 0))
+                .is_ok()
+    };
 
     while ei < existing_len && ni < novelty_len {
+        if purged(ei) {
+            ei += 1;
+            continue;
+        }
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
+        if op == OP_PURGE {
+            ni += 1;
+            continue;
+        }
         let cmp = cmp_batch_row_vs_record(input.batch, ei, nov, input.order);
 
         match cmp {
@@ -322,7 +345,9 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
 
     // Drain remaining existing rows.
     while ei < existing_len {
-        out.push(batch_row_to_record(input.batch, ei));
+        if !purged(ei) {
+            out.push(batch_row_to_record(input.batch, ei));
+        }
         ei += 1;
     }
 
@@ -331,6 +356,10 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     while ni < novelty_len {
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
+        if op == OP_PURGE {
+            ni += 1;
+            continue;
+        }
         gather_identity_events(input, &mut si, nov, op, &mut events);
         push_transition_entries(&mut events, false, &mut new_history);
         if op == 1 {
@@ -349,7 +378,17 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
         "every superseded event's identity must have a winner in this leaflet's novelty"
     );
 
-    let history = assemble_history(new_history, input.existing_history);
+    let history = if input.purge.is_empty() {
+        assemble_history(new_history, input.existing_history)
+    } else {
+        let kept: Vec<HistEntryV2> = input
+            .existing_history
+            .iter()
+            .filter(|h| input.purge.binary_search(&h.g_id).is_err())
+            .copied()
+            .collect();
+        assemble_history(new_history, &kept)
+    };
     MergeOutput {
         records: out,
         history,
@@ -369,7 +408,9 @@ fn gather_identity_events(
     events: &mut Vec<(RunRecordV2, u8)>,
 ) {
     events.clear();
-    while *si < input.superseded.len() && same_identity_v2(&input.superseded[*si], nov) {
+    // In the pooled tree the same triple in two graphs is two identities.
+    let same_identity = identity_v2_for_order(input.order);
+    while *si < input.superseded.len() && same_identity(&input.superseded[*si], nov) {
         events.push((input.superseded[*si], input.superseded_ops[*si]));
         *si += 1;
     }
@@ -480,6 +521,7 @@ mod tests {
             superseded: &[],
             superseded_ops: &[],
             order,
+            purge: &[],
         }
     }
 

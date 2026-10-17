@@ -29,15 +29,17 @@ use fluree_db_core::{ContentBytes, ContentId, ContentKind, ContentStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{IndexerError, Result};
+use crate::run_index::build::graph_scope::{GraphSize, PlacementPolicy};
 use crate::run_index::build::incremental_branch::{
     touched_leaf_refs, update_branch_streaming, BranchUpdateConfig, BranchUpdateMeta,
-    BranchUpdateResult,
+    BranchUpdateResult, PoolUpdate,
 };
-use crate::run_index::build::incremental_leaf::NewLeafBlob;
+use crate::run_index::build::incremental_leaf::{GraphDelta, GraphDeltas, NewLeafBlob};
 use crate::run_index::build::incremental_resolve::{
     resolve_incremental_commits_v6, IncrementalResolveConfig, IncrementalResolveError,
 };
 use crate::run_index::build::incremental_root::IncrementalRootBuilder;
+use crate::run_index::build::novelty_merge::OP_PURGE;
 use crate::{IndexResult, IndexStats, IndexerConfig};
 use tokio::sync::Semaphore;
 
@@ -373,9 +375,31 @@ enum Phase2TaskKind {
     },
 }
 
+/// The tree a Phase 2 task writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeTarget {
+    /// A graph's own tree; graph 0 is the default graph, inline in the root.
+    Graph(fluree_db_core::GraphId),
+    /// The pooled tree shared by small named graphs.
+    Pool,
+}
+
+impl TreeTarget {
+    /// The graph id this tree's branch manifests record.
+    fn branch_g_id(self) -> fluree_db_core::GraphId {
+        match self {
+            Self::Graph(g_id) => g_id,
+            Self::Pool => 0,
+        }
+    }
+}
+
 struct Phase2Task {
     seq: usize,
-    g_id: fluree_db_core::GraphId,
+    target: TreeTarget,
+    /// Pooled tree only: graphs leaving the pool this window, sorted. The
+    /// records carry an [`OP_PURGE`] marker per identity they hold.
+    purge: Arc<Vec<fluree_db_core::GraphId>>,
     order: RunSortOrder,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
@@ -403,12 +427,12 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
 
 enum Phase2TaskUpdate {
     Default { leaf_entries: Vec<LeafEntry> },
-    Named { branch_cid: ContentId },
+    Branch { branch_cid: ContentId },
 }
 
 struct Phase2TaskOutput {
     seq: usize,
-    g_id: fluree_db_core::GraphId,
+    target: TreeTarget,
     order: RunSortOrder,
     update: Phase2TaskUpdate,
     replaced_leaf_cids: Vec<ContentId>,
@@ -418,6 +442,8 @@ struct Phase2TaskOutput {
     /// Novelty ops whose identity matched an existing base row (SPOT task
     /// only; fresh-graph tasks have no base rows to match).
     matched: Vec<RunRecordV2>,
+    /// Pooled GSPO task only: each graph's change in rows and history.
+    graph_deltas: GraphDeltas,
 }
 
 /// Write and upload a tree for `order` holding `facts`.
@@ -425,7 +451,7 @@ struct Phase2TaskOutput {
 async fn write_folded_tree(
     facts: &[FoldedFact],
     seq: usize,
-    g_id: fluree_db_core::GraphId,
+    target: TreeTarget,
     order: RunSortOrder,
     config: &IndexerConfig,
     content_store: &Arc<dyn fluree_db_core::storage::ContentStore>,
@@ -440,8 +466,9 @@ async fn write_folded_tree(
         replaced_sidecar_cids,
         branch_bytes,
         branch_cid: expected_branch_cid,
+        graph_deltas,
         ..
-    } = build_folded_tree(facts, order, g_id, config)?;
+    } = build_folded_tree(facts, order, target.branch_g_id(), config)?;
     let new_leaf_count = new_leaf_blobs.len();
     upload_leaf_blobs(
         content_store.as_ref(),
@@ -451,7 +478,7 @@ async fn write_folded_tree(
         new_leaf_blobs,
     )
     .await?;
-    let update = if g_id == 0 {
+    let update = if target == TreeTarget::Graph(0) {
         Phase2TaskUpdate::Default { leaf_entries }
     } else {
         let branch_cid = content_store
@@ -460,11 +487,11 @@ async fn write_folded_tree(
             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
         debug_assert!(branch_cid == expected_branch_cid);
         cache_artifact_bytes(&**content_store, &branch_cid, &branch_bytes, "index_branch");
-        Phase2TaskUpdate::Named { branch_cid }
+        Phase2TaskUpdate::Branch { branch_cid }
     };
     Ok(Phase2TaskOutput {
         seq,
-        g_id,
+        target,
         order,
         update,
         replaced_leaf_cids,
@@ -472,6 +499,7 @@ async fn write_folded_tree(
         new_leaf_count,
         fetch_stats: Phase2FetchStatsSnapshot::default(),
         matched: Vec::new(),
+        graph_deltas,
     })
 }
 
@@ -486,7 +514,8 @@ async fn execute_phase2_task(
 ) -> Result<Phase2TaskOutput> {
     let Phase2Task {
         seq,
-        g_id,
+        target,
+        purge,
         order,
         sorted_records,
         sorted_ops,
@@ -494,16 +523,23 @@ async fn execute_phase2_task(
         sorted_superseded_ops,
         kind,
     } = task;
+    let g_id = target.branch_g_id();
 
     let branch_config = BranchUpdateConfig {
+        pool: PoolUpdate {
+            purge: purge.as_ref().clone(),
+            // Like matches, one order's tally covers every order.
+            tally: order == RunSortOrder::Gspo,
+        },
         order,
         g_id,
         zstd_level: 1,
         leaflet_target_rows: config.leaflet_rows.max(1),
         leaf_target_rows: config.leaf_rows,
         // Fact identity is order-independent; collect base-row matches from
-        // the SPOT task only (they feed the Phase 3b stats deltas).
-        collect_matched: order == RunSortOrder::Spot,
+        // one task per tree — SPOT, or the pool's GSPO (they feed the Phase
+        // 3b stats deltas).
+        collect_matched: matches!(order, RunSortOrder::Spot | RunSortOrder::Gspo),
     };
 
     let started = Instant::now();
@@ -521,6 +557,7 @@ async fn execute_phase2_task(
             .iter()
             .copied()
             .zip(sorted_ops.iter().copied())
+            .filter(|&(_, op)| op != OP_PURGE)
             .chain(
                 sorted_superseded
                     .iter()
@@ -534,7 +571,7 @@ async fn execute_phase2_task(
             write_folded_tree(
                 &fold_own_window(),
                 seq,
-                g_id,
+                target,
                 order,
                 config,
                 &content_store,
@@ -563,7 +600,7 @@ async fn execute_phase2_task(
             .await?;
             Phase2TaskOutput {
                 seq,
-                g_id,
+                target,
                 order,
                 update: Phase2TaskUpdate::Default {
                     leaf_entries: meta.leaf_entries,
@@ -573,6 +610,7 @@ async fn execute_phase2_task(
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
                 matched: meta.matched,
+                graph_deltas: meta.graph_deltas,
             }
         }
         Phase2TaskKind::NamedExisting { branch_cid } => {
@@ -591,7 +629,7 @@ async fn execute_phase2_task(
                 return write_folded_tree(
                     &fold_own_window(),
                     seq,
-                    g_id,
+                    target,
                     order,
                     config,
                     &content_store,
@@ -628,21 +666,22 @@ async fn execute_phase2_task(
             );
             Phase2TaskOutput {
                 seq,
-                g_id,
+                target,
                 order,
-                update: Phase2TaskUpdate::Named { branch_cid },
+                update: Phase2TaskUpdate::Branch { branch_cid },
                 replaced_leaf_cids: meta.replaced_leaf_cids,
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
                 matched: meta.matched,
+                graph_deltas: meta.graph_deltas,
             }
         }
         Phase2TaskKind::Folded { facts } => {
             write_folded_tree(
                 &facts,
                 seq,
-                g_id,
+                target,
                 order,
                 config,
                 &content_store,
@@ -656,7 +695,7 @@ async fn execute_phase2_task(
 
     tracing::debug!(
         seq,
-        g_id,
+        ?target,
         ?order,
         new_leaf_count = output.new_leaf_count,
         leaf_fetches = output.fetch_stats.leaf_fetches,
@@ -754,12 +793,6 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
-    // A write to a pooled graph promotes it to a dedicated tree: its pooled
-    // rows and history plus this window's events become a fresh branch per
-    // order, history included, and it leaves the pool. Untouched pooled
-    // graphs carry over unchanged.
-    let promoted = read_promoted_graphs(&content_store, &novelty).await?;
-
     // ---- Phase 2: Per-(graph, order) branch updates ----
     let all_orders = [
         RunSortOrder::Spot,
@@ -790,14 +823,72 @@ pub async fn incremental_index(
         novelty.delta_retracts,
     );
 
-    let concurrency = config.incremental_max_concurrency.max(1);
-    let mut graph_order: Vec<fluree_db_core::GraphId> = by_graph.keys().copied().collect();
-    graph_order.sort_unstable_by_key(|&g_id| (u8::from(g_id == 0), g_id));
+    // Placement. A pooled graph this window writes stays pooled while the
+    // policy keeps it there, judged on its recorded size grown by this
+    // window; otherwise it is promoted — its pooled rows and history plus
+    // this window's events become trees of its own, and the pool drops
+    // them. A graph new to the index joins the pool on the same terms. A
+    // graph with trees of its own keeps them; only a full rebuild repools.
+    // A pooled graph the config now pins dedicated leaves whether or not
+    // this window writes it.
+    let placement = PlacementPolicy::new(&config.graph_placement, |iri| {
+        novelty.shared.graphs.get(iri).map(|id| id + 1)
+    });
+    let base_pool = base_root.pool.as_ref();
+    let has_own_trees: std::collections::HashSet<fluree_db_core::GraphId> =
+        base_root.named_graphs.iter().map(|ng| ng.g_id).collect();
+    let mut pool_writes: Vec<fluree_db_core::GraphId> = Vec::new();
+    let mut promote: Vec<fluree_db_core::GraphId> = Vec::new();
+    for (&g_id, indices) in &by_graph {
+        if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID
+            || has_own_trees.contains(&g_id)
+        {
+            continue;
+        }
+        let pooled = base_pool.and_then(|p| p.member(g_id));
+        let size = window_size(
+            pooled.map_or(GraphSize::default(), |m| GraphSize {
+                rows: m.rows.into(),
+                history: m.history.into(),
+            }),
+            indices.iter().map(|&i| novelty.ops[i]),
+            superseded_by_graph.get(&g_id).map_or(0, Vec::len),
+        );
+        if placement.pools(g_id, size) {
+            pool_writes.push(g_id);
+        } else if pooled.is_some() {
+            promote.push(g_id);
+        }
+    }
+    if let Some(pool) = base_pool {
+        promote.extend(
+            pool.graph_ids()
+                .filter(|g| !by_graph.contains_key(g) && placement.pinned_dedicated(*g)),
+        );
+    }
+    promote.sort_unstable();
+    let promoted = read_pooled_graph_logs(&content_store, base_root, &promote).await?;
 
-    let mut phase2_tasks = Vec::with_capacity(by_graph.len().saturating_mul(all_orders.len()));
+    let concurrency = config.incremental_max_concurrency.max(1);
+    // Graphs written to trees of their own: every graph with novelty outside
+    // the pool, and every promoted graph.
+    let mut graph_order: Vec<fluree_db_core::GraphId> = by_graph
+        .keys()
+        .copied()
+        .filter(|g| pool_writes.binary_search(g).is_err())
+        .chain(promote.iter().copied())
+        .collect();
+    graph_order.sort_unstable_by_key(|&g_id| (u8::from(g_id == 0), g_id));
+    graph_order.dedup();
+
+    let no_purge: Arc<Vec<fluree_db_core::GraphId>> = Arc::new(Vec::new());
+    let mut phase2_tasks = Vec::with_capacity(
+        graph_order.len().saturating_mul(all_orders.len())
+            + RunSortOrder::pool_build_orders().len(),
+    );
     let mut promoted_matched: Vec<RunRecordV2> = Vec::new();
     for g_id in graph_order.iter().copied() {
-        let indices = &by_graph[&g_id];
+        let indices: &[usize] = by_graph.get(&g_id).map_or(&[], Vec::as_slice);
         let graph_records: Vec<RunRecordV2> = indices.iter().map(|&i| novelty.records[i]).collect();
         let graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
         let superseded_indices = superseded_by_graph.get(&g_id);
@@ -885,12 +976,96 @@ pub async fn incremental_index(
 
             phase2_tasks.push(Phase2Task {
                 seq: phase2_tasks.len(),
-                g_id,
+                target: TreeTarget::Graph(g_id),
+                purge: Arc::clone(&no_purge),
                 order,
                 sorted_records,
                 sorted_ops,
                 sorted_superseded,
                 sorted_superseded_ops,
+                kind,
+            });
+        }
+    }
+
+    // The pool: one update per pooled order for every pooled graph this
+    // window writes, which also drops the promoted graphs. Each promoted
+    // identity rides along as an `OP_PURGE` marker so the update touches
+    // every leaflet that holds it.
+    if !pool_writes.is_empty() || !promote.is_empty() {
+        let pooled_write = |rec: &RunRecordV2| pool_writes.binary_search(&rec.g_id).is_ok();
+        let mut records: Vec<(RunRecordV2, u8)> = novelty
+            .records
+            .iter()
+            .zip(&novelty.ops)
+            .filter(|(rec, _)| pooled_write(rec))
+            .map(|(rec, &op)| (*rec, op))
+            .collect();
+        let superseded: Vec<(RunRecordV2, u8)> = novelty
+            .superseded
+            .iter()
+            .zip(&novelty.superseded_ops)
+            .filter(|(rec, _)| pooled_write(rec))
+            .map(|(rec, &op)| (*rec, op))
+            .collect();
+        for log in promoted.values() {
+            let mut seen: std::collections::HashSet<FactIdentityKey> =
+                std::collections::HashSet::new();
+            for rec in log
+                .rows
+                .iter()
+                .chain(log.history.iter().map(|(rec, _)| rec))
+            {
+                if seen.insert(fact_identity_key(rec)) {
+                    records.push((*rec, OP_PURGE));
+                }
+            }
+        }
+        let purge = Arc::new(promote.clone());
+        // No pool yet: write one from this window's pooled graphs alone.
+        let fresh_pool = base_pool.is_none().then(|| {
+            Arc::new(
+                fold_graph_log(
+                    &PooledGraphLog::default(),
+                    records.iter().chain(&superseded).copied(),
+                )
+                .0,
+            )
+        });
+        for &order in RunSortOrder::pool_build_orders() {
+            let cmp = cmp_v2_for_order(order);
+            let mut sorted = records.clone();
+            sorted.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+            let mut sorted_superseded = superseded.clone();
+            sorted_superseded.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+            let kind = match (base_pool, &fresh_pool) {
+                (Some(pool), _) => {
+                    let branch_cid = pool
+                        .orders
+                        .iter()
+                        .find(|(o, _)| *o == order)
+                        .map(|(_, cid)| cid.clone())
+                        .ok_or_else(|| {
+                            IndexerError::IncrementalAbort(format!(
+                                "pooled tree has no {order:?} branch"
+                            ))
+                        })?;
+                    Phase2TaskKind::NamedExisting { branch_cid }
+                }
+                (None, Some(facts)) => Phase2TaskKind::Folded {
+                    facts: Arc::clone(facts),
+                },
+                (None, None) => unreachable!("a missing pool is folded"),
+            };
+            phase2_tasks.push(Phase2Task {
+                seq: phase2_tasks.len(),
+                target: TreeTarget::Pool,
+                purge: Arc::clone(&purge),
+                order,
+                sorted_records: sorted.iter().map(|&(rec, _)| rec).collect(),
+                sorted_ops: sorted.iter().map(|&(_, op)| op).collect(),
+                sorted_superseded: sorted_superseded.iter().map(|&(rec, _)| rec).collect(),
+                sorted_superseded_ops: sorted_superseded.iter().map(|&(_, op)| op).collect(),
                 kind,
             });
         }
@@ -940,6 +1115,7 @@ pub async fn incremental_index(
     base_matched.extend(promoted_matched.iter().map(fact_identity_key));
 
     let mut phase2_fetch_totals = Phase2FetchStatsSnapshot::default();
+    let mut pool_deltas = GraphDeltas::new();
     for output in phase2_outputs {
         total_new_leaves += output.new_leaf_count;
         base_matched.extend(output.matched.iter().map(fact_identity_key));
@@ -954,17 +1130,26 @@ pub async fn incremental_index(
         phase2_fetch_totals.sidecar_absent += output.fetch_stats.sidecar_absent;
         phase2_fetch_totals.sidecar_bytes += output.fetch_stats.sidecar_bytes;
         phase2_fetch_totals.sidecar_fetch_ms += output.fetch_stats.sidecar_fetch_ms;
-        match output.update {
-            Phase2TaskUpdate::Default { leaf_entries } => {
+        match (output.update, output.target) {
+            (Phase2TaskUpdate::Default { leaf_entries }, _) => {
                 root_builder.set_default_graph_order(output.order, leaf_entries);
             }
-            Phase2TaskUpdate::Named { branch_cid } => {
-                root_builder.set_named_graph_branch(output.g_id, output.order, branch_cid);
+            (Phase2TaskUpdate::Branch { branch_cid }, TreeTarget::Graph(g_id)) => {
+                root_builder.set_named_graph_branch(g_id, output.order, branch_cid);
             }
+            (Phase2TaskUpdate::Branch { branch_cid }, TreeTarget::Pool) => {
+                root_builder.set_pool_branch(output.order, branch_cid);
+            }
+        }
+        for (g_id, delta) in output.graph_deltas {
+            let total = pool_deltas.entry(g_id).or_default();
+            total.rows += delta.rows;
+            total.history += delta.history;
         }
         root_builder.add_replaced_cids(output.replaced_leaf_cids);
         root_builder.add_replaced_cids(output.replaced_sidecar_cids);
     }
+    root_builder.update_pool_members(&pool_writes, &pool_deltas);
 
     tracing::debug!(
         new_leaves = total_new_leaves,
@@ -4892,11 +5077,12 @@ struct PooledGraphLog {
     history: Vec<(RunRecordV2, u8)>,
 }
 
-/// The persisted log of every pooled graph this window writes, by graph.
-/// Empty (and no store load) when the window touches none.
-async fn read_promoted_graphs(
+/// The persisted log of each of `graphs` in the pool, by graph. Empty (and
+/// no store load) when `graphs` is.
+async fn read_pooled_graph_logs(
     content_store: &Arc<dyn ContentStore>,
-    novelty: &crate::run_index::build::incremental_resolve::IncrementalNovelty,
+    base_root: &fluree_db_binary_index::IndexRoot,
+    graphs: &[fluree_db_core::GraphId],
 ) -> Result<std::collections::HashMap<fluree_db_core::GraphId, PooledGraphLog>> {
     use fluree_db_binary_index::format::history_sidecar::{decode_sidecar_entries, HistEntryV2};
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2 as Rec};
@@ -4904,22 +5090,11 @@ async fn read_promoted_graphs(
     use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection};
 
     let mut out = std::collections::HashMap::new();
-    let Some(pool) = &novelty.base_root.pool else {
-        return Ok(out);
-    };
-    let mut graphs: Vec<fluree_db_core::GraphId> = novelty
-        .records
-        .iter()
-        .map(|r| r.g_id)
-        .filter(|&g| pool.contains(g))
-        .collect();
-    graphs.sort_unstable();
-    graphs.dedup();
-    if graphs.is_empty() {
+    if graphs.is_empty() || base_root.pool.is_none() {
         return Ok(out);
     }
     let store = Arc::new(
-        BinaryIndexStore::load_from_root_v6(content_store.clone(), &novelty.base_root, None)
+        BinaryIndexStore::load_from_root_v6(content_store.clone(), base_root, None)
             .await
             .map_err(|e| {
                 IndexerError::IncrementalAbort(format!("pooled graph promotion: store load: {e}"))
@@ -4931,7 +5106,7 @@ async fn read_promoted_graphs(
     // Sidecars hold every graph of their leaf; decode each once.
     let mut sidecars: std::collections::HashMap<ContentId, Vec<HistEntryV2>> =
         std::collections::HashMap::new();
-    for g_id in graphs {
+    for &g_id in graphs {
         let bound = |low: bool| Rec {
             s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
             o_key: if low { 0 } else { u64::MAX },
@@ -5003,6 +5178,25 @@ async fn read_promoted_graphs(
         out.insert(g_id, log);
     }
     Ok(out)
+}
+
+/// `base` grown by a window's winning ops and superseded events, estimated
+/// before the merge resolves them: an assert adds a row, a retract removes
+/// one and leaves two history entries (the row's assert and the retract),
+/// and a superseded event leaves one.
+fn window_size(base: GraphSize, ops: impl Iterator<Item = u8>, superseded: usize) -> GraphSize {
+    let (mut asserts, mut retracts) = (0u64, 0u64);
+    for op in ops {
+        if op == 1 {
+            asserts += 1;
+        } else {
+            retracts += 1;
+        }
+    }
+    GraphSize {
+        rows: (base.rows + asserts).saturating_sub(retracts),
+        history: base.history + 2 * retracts + superseded as u64,
+    }
 }
 
 /// One fact of a graph after this window: its row (absent when the fact's
@@ -5105,7 +5299,7 @@ fn build_folded_tree(
 
 /// Finish a fresh branch's leaf writer into its leaves and branch manifest.
 fn finish_fresh_branch(
-    writer: fluree_db_binary_index::format::leaf::LeafWriter,
+    mut writer: fluree_db_binary_index::format::leaf::LeafWriter,
     order: RunSortOrder,
     g_id: fluree_db_core::GraphId,
 ) -> Result<BranchUpdateResult> {
@@ -5113,6 +5307,19 @@ fn finish_fresh_branch(
     use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
     use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
 
+    let graph_deltas = writer
+        .take_pool_members()
+        .into_iter()
+        .map(|m| {
+            (
+                m.g_id,
+                GraphDelta {
+                    rows: i64::from(m.rows),
+                    history: i64::from(m.history),
+                },
+            )
+        })
+        .collect();
     let leaf_infos = writer
         .finish()
         .map_err(|e| IndexerError::StorageWrite(format!("V3 fresh branch finish: {e}")))?;
@@ -5153,6 +5360,7 @@ fn finish_fresh_branch(
         branch_bytes,
         branch_cid,
         matched: Vec::new(),
+        graph_deltas,
     })
 }
 
@@ -5182,6 +5390,36 @@ fn build_predicate_sids(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn a_window_grows_a_graph_by_its_net_rows_and_its_transitions() {
+        let base = GraphSize {
+            rows: 10,
+            history: 4,
+        };
+        // Two asserts, one retract (its row's assert and the retract become
+        // history), one superseded event.
+        assert_eq!(
+            window_size(base, [1, 1, 0].into_iter(), 1),
+            GraphSize {
+                rows: 11,
+                history: 7
+            }
+        );
+        assert_eq!(
+            window_size(GraphSize::default(), [0, 0].into_iter(), 0),
+            GraphSize {
+                rows: 0,
+                history: 4
+            },
+            "rows never go negative"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5546,6 +5784,7 @@ mod warm_tests {
         let old = writer.finish().unwrap().remove(0);
         let novelty = [record(301, 5)];
         let output = update_leaf(&LeafUpdateInput {
+            pool: Default::default(),
             leaf_bytes: &old.leaf_bytes,
             novelty: &novelty,
             novelty_ops: &[1],
