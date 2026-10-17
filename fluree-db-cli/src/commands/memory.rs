@@ -76,24 +76,20 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
 }
 
 async fn build_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
-    // Short-lived CLI commands keep a persistent (file-backed) ledger so that
-    // `import` and the `init` legacy-ledger migration work and repeated
-    // invocations don't rebuild from scratch. The long-lived `mcp serve` path
-    // uses an ephemeral in-memory ledger instead (see `mcp_serve`), which is
-    // what makes many concurrent MCP processes safe.
-    let fluree = context::build_fluree(dirs).await?;
-
-    // Determine memory_dir: use .fluree-memory/ at the project root.
-    // In unified (local) mode, data_dir is .fluree/ so its parent is the project root.
-    // Always enable in unified mode — MemoryStore creates the directory structure on init.
-    let memory_dir = if dirs.is_unified() {
+    // In a project, the `.fluree-memory/*.ttl` files are the store and the
+    // ledger only a query cache rebuilt from them, so it is the process's
+    // own, in memory, as `mcp serve`'s is. It never opens the project's
+    // storage: that works while a server or another program holds it, and
+    // lets any number of memory commands run at once. In global mode there
+    // are no files and the ledger is the store, so it stays on disk.
+    if dirs.is_unified() {
         let project_root = dirs.data_dir().parent().unwrap_or(dirs.data_dir());
-        Some(project_root.join(".fluree-memory"))
-    } else {
-        None // Global mode — no file sharing
-    };
-
-    Ok(MemoryStore::new(fluree, memory_dir))
+        return Ok(MemoryStore::new_ephemeral_ledger(
+            context::build_memory_fluree(),
+            Some(project_root.join(".fluree-memory")),
+        ));
+    }
+    Ok(MemoryStore::new(context::build_fluree(dirs).await?, None))
 }
 
 /// Build the memory store and bring its in-memory ledger up to date with
