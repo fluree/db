@@ -172,7 +172,7 @@ When a local server is running on the project's storage (started with `fluree se
 `fluree server run`), CLI commands that can run through a server are **sent through its HTTP API**
 instead of opening the storage beside it. This applies to:
 
-- ledger commands: `query`, `insert`, `upsert`, `update`, `load`, `show`, `info`, `index`,
+- ledger commands: `query`, `insert`, `upsert`, `update`, `load`, `show`, `info`, `reindex`,
   `sweep`, `graph`, `sync`, `model` and the `branch` subcommands;
 - `create` (including `--from`, which uploads the file for a server-side import), and `use`,
   which asks the server whether the ledger exists;

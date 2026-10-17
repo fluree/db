@@ -209,8 +209,8 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         listen_addr: server_config.listen_addr.to_string(),
         storage_path: server_config
             .storage_path
-            .as_ref()
-            .map(|p| p.display().to_string())
+            .as_deref()
+            .map(recorded_path)
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: server_config
             .connection_config
@@ -221,6 +221,16 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         started_at: now_iso8601(),
         args: Vec::new(),
     }
+}
+
+/// A path as `server.meta.json` records it: absolute, so a command run from
+/// any directory compares it with its own storage.
+fn recorded_path(path: &Path) -> String {
+    fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn write_meta(meta_file: &Path, meta: &ServerMeta) {
@@ -342,8 +352,8 @@ async fn run_start(
         listen_addr: server_config.listen_addr.to_string(),
         storage_path: server_config
             .storage_path
-            .as_ref()
-            .map(|p| p.display().to_string())
+            .as_deref()
+            .map(recorded_path)
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: server_config
             .connection_config
@@ -498,7 +508,7 @@ async fn run_start_with_child_args(
         storage_path: child_args
             .windows(2)
             .find(|w| w[0] == "--storage-path")
-            .map(|w| w[1].clone())
+            .map(|w| recorded_path(Path::new(&w[1])))
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: child_args
             .windows(2)

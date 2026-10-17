@@ -185,3 +185,78 @@ async fn a_command_that_meets_the_servers_lock_is_told_why_at_once() {
         "a server's lock was waited for"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_query_without_an_active_ledger_goes_through_the_server() {
+    let dir = project();
+    let _server = ProjectServer::start(dir.path(), &[]).await;
+    fluree(dir.path())
+        .args(["create", "people"])
+        .assert()
+        .success();
+    std::fs::remove_file(dir.path().join(".fluree").join("active")).unwrap();
+
+    fluree(dir.path())
+        .args([
+            "query",
+            "--connection",
+            "SELECT * FROM <people:main> WHERE { ?s ?p ?o }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("routing through local server"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_server_storage_path_is_routed_to_from_a_subdirectory() {
+    let dir = project();
+    let _server = ProjectServer::start(dir.path(), &["--storage-path", ".fluree/storage"]).await;
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    fluree(&sub)
+        .env("HOME", dir.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("routing through local server"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_graph_source_the_server_holds_wins_over_a_tracked_remote_of_its_name() {
+    let dir = project();
+    let storage = dir.path().join(".fluree").join("storage");
+    {
+        let fluree = fluree_db_api::FlureeBuilder::file(storage.to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        fluree
+            .publisher()
+            .unwrap()
+            .publish_graph_source(
+                "shared",
+                "main",
+                fluree_db_nameservice::GraphSourceType::R2rml,
+                "{}",
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+    let shared = fluree_db_api::LedgerId::parse("shared:main").unwrap();
+    fluree_db_cli::config::TomlSyncConfigStore::new(dir.path().join(".fluree"))
+        .add_tracked(fluree_db_cli::config::TrackedLedgerConfig {
+            local_alias: shared.clone(),
+            remote: "origin".to_string(),
+            remote_alias: shared,
+            mode: Default::default(),
+        })
+        .unwrap();
+    let _server = ProjectServer::start(dir.path(), &[]).await;
+
+    fluree(dir.path())
+        .args(["query", "shared", "SELECT * WHERE { ?s ?p ?o }"])
+        .assert()
+        .stderr(predicate::str::contains("routing through local server"));
+}

@@ -722,9 +722,10 @@ pub async fn persist_refreshed_tokens(
 /// Token persistence is skipped for this value.
 pub const LOCAL_SERVER_REMOTE: &str = "";
 
-/// The target a server on the project's storage gives `alias`: a ledger it
-/// holds, else a tracked remote of that name, else the server, which also
-/// knows its graph sources and reports a name it lacks.
+/// The target a server on the project's storage gives `alias`, in the order
+/// local resolution uses: a ledger or graph source it holds ("local wins"),
+/// else a tracked remote of that name, else the server, which reports a name
+/// it lacks.
 async fn local_server_target(
     server: &crate::local_server::LocalServer,
     alias: String,
@@ -733,7 +734,9 @@ async fn local_server_target(
 ) -> CliResult<QueryTarget> {
     let ledger_id = to_ledger_id(ledger_part)?;
     let client = server.client();
-    if !client.ledger_exists(&ledger_id).await? {
+    let held =
+        client.ledger_exists(&ledger_id).await? || serves_graph_source(&client, &ledger_id).await?;
+    if !held {
         let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
         if let Some(tracked) = store.get_tracked(&ledger_id) {
             return build_tracked_target(&store, &tracked, ledger_part).await;
@@ -745,6 +748,20 @@ async fn local_server_target(
         remote_alias: alias.clone(),
         local_alias: alias,
         remote_name: LOCAL_SERVER_REMOTE.to_string(),
+    }))
+}
+
+/// Whether the server lists a graph source under `ledger_id`.
+async fn serves_graph_source(client: &RemoteLedgerClient, ledger_id: &LedgerId) -> CliResult<bool> {
+    let listed = client.list_ledgers().await?;
+    let wanted = ledger_id.to_string();
+    Ok(listed.as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            let field = |key| entry.get(key).and_then(serde_json::Value::as_str);
+            field("type").is_some_and(|kind| kind != "Ledger")
+                && matches!((field("name"), field("branch")), (Some(name), Some(branch))
+                    if format!("{name}:{branch}") == wanted)
+        })
     }))
 }
 
