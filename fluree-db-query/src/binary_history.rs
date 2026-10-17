@@ -360,6 +360,21 @@ impl BinaryHistoryScanOperator {
             } // end `if from_t <= persisted_to_t`
         } // end `if let Some(store)`
 
+        // The persisted walk narrows by subject and predicate only; a bound
+        // object, its datatype and its bounds are matched on the decoded
+        // events, as the novelty walk below does.
+        let object_match = RangeMatch {
+            s: None,
+            p: None,
+            o: o_val_opt.clone(),
+            dt: self.pattern.dtc.as_ref().map(|d| d.datatype().clone()),
+            t: None,
+        };
+        flakes.retain(|f| {
+            flake_matches_range_eq(f, &object_match)
+                && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
+        });
+
         // ---- Novelty events in (index_t, to_t] ----
         if to_t > index_t {
             // Build a RangeMatch for pattern-level filtering.
