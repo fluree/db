@@ -816,3 +816,40 @@ async fn graph_pruning_matches_an_arena_decimal_in_its_own_graph() {
         vec!["g=http://example.org/g2 s=http://example.org/b"],
     );
 }
+
+/// A graph's only fact, asserted then retracted before the pooled rebuild,
+/// lives only in a history-only leaflet; reading at the assert still sees it.
+#[tokio::test]
+async fn a_retracted_sole_fact_is_visible_at_its_assert() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-history-only:main";
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree.create_ledger(ledger_id).await.expect("create");
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g1 { ex:a ex:label \"A1\" . } }",
+    )
+    .await;
+    let t1 = fluree.ledger(ledger_id).await.unwrap().t();
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g1 { ex:a ex:label \"A1\" . } }",
+    )
+    .await;
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    assert_eq!(root.pool.as_ref().map(|p| p.graphs.len()), Some(1));
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "g1", Some(t1)).await,
+        vec!["ex:a \"A1\""]
+    );
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "g1", None).await,
+        Vec::<String>::new()
+    );
+}

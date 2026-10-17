@@ -488,10 +488,12 @@ pub fn replay_leaflet(
             ColumnData::AbsentDefault
         },
         t: ColumnData::Block(Arc::from(out_t)),
-        g_id: if batch.g_id.is_absent() {
-            ColumnData::AbsentDefault
-        } else {
+        // A pooled order always carries the graph, even when the leaflet held
+        // only history and the input batch was empty.
+        g_id: if order.is_pooled() {
             ColumnData::Block(Arc::from(out_g))
+        } else {
+            ColumnData::AbsentDefault
         },
     })
 }
@@ -608,6 +610,21 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, vec![(4, 1, 1), (9, 1, 2)]);
+    }
+
+    /// A history-only pooled leaflet (every fact retracted) restores its
+    /// facts with their graph.
+    #[test]
+    fn a_history_only_pooled_leaflet_keeps_the_graph() {
+        let in_graph = |t, op| HistEntryV2 {
+            g_id: 9,
+            ..make_hist(1, 10, t, op)
+        };
+        let history = vec![in_graph(5, 0), in_graph(2, 1)];
+        let replayed =
+            replay_leaflet(&ColumnBatch::empty(), &history, 3, RunSortOrder::Gspo).unwrap();
+        assert_eq!(replayed.row_count, 1);
+        assert_eq!(replayed.g_id.get(0), 9);
     }
 
     #[test]
