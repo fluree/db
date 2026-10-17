@@ -470,3 +470,44 @@ async fn pooled_graphs_answer_at_an_earlier_t() {
         vec!["s=http://example.org/a", "s=http://example.org/a2"],
     );
 }
+
+/// A pooled graph that also holds an arena (a big integer here) is still one
+/// graph: the store's count matches its graph list.
+#[tokio::test]
+async fn pooled_graph_with_an_arena_counts_once() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let trig = "@prefix ex: <http://example.org/> .\n\
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+        ex:a { ex:x ex:big \"123456789012345678901234567890\"^^xsd:integer . }\n\
+        ex:b { ex:y ex:rank 2 . }\n";
+    let (fluree, ledger) =
+        import_trig(db_dir.path(), data_dir.path(), "test/arena:main", trig).await;
+    assert_eq!(
+        latest_root(db_dir.path())
+            .pool
+            .expect("pooled")
+            .graphs
+            .len(),
+        2
+    );
+
+    let store = ledger
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .clone()
+        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+    assert_eq!(store.graph_count(), store.graph_ids().len());
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?v WHERE {{ GRAPH ex:a {{ ex:x ex:big ?v }} }}")
+        )
+        .await,
+        vec!["v=123456789012345678901234567890"],
+    );
+}

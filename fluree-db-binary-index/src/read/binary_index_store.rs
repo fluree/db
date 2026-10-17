@@ -261,6 +261,9 @@ struct PoolIndex {
     member: Vec<bool>,
     /// Pooled graph ids, sorted.
     graphs: Vec<GraphId>,
+    /// Pooled graphs without a `graph_indexes` entry (one holding only
+    /// arenas), so the graph count needs no walk.
+    unindexed: usize,
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
     /// Branch cid behind each order; what a reload matches on to reuse it.
     order_cids: HashMap<RunSortOrder, ContentId>,
@@ -648,7 +651,7 @@ impl BinaryIndexStore {
 
         // The pooled tree: one branch per pooled order, reused from the
         // previous store when its cid is unchanged.
-        let pool = match &root.pool {
+        let mut pool = match &root.pool {
             Some(routing) => {
                 let mut orders = HashMap::new();
                 let mut order_cids = HashMap::new();
@@ -677,6 +680,7 @@ impl BinaryIndexStore {
                 Some(PoolIndex {
                     member,
                     graphs,
+                    unindexed: 0,
                     orders,
                     order_cids,
                 })
@@ -698,6 +702,14 @@ impl BinaryIndexStore {
             gi.vectors = arenas.vectors;
             gi.spatial = arenas.spatial;
             gi.fulltext = arenas.fulltext;
+        }
+
+        if let Some(pool) = pool.as_mut() {
+            pool.unindexed = pool
+                .graphs
+                .iter()
+                .filter(|g| !graph_indexes.contains_key(g))
+                .count();
         }
 
         let leaf_count: usize = graph_indexes
@@ -2813,6 +2825,11 @@ impl BinaryIndexStore {
                     format!("no namespace prefix for code={ns_code}"),
                 )
             })
+    }
+
+    /// Number of graphs in the index: `graph_ids().len()` without the walk.
+    pub fn graph_count(&self) -> usize {
+        self.graph_indexes.len() + self.pool.as_ref().map_or(0, |p| p.unindexed)
     }
 
     /// Returns all graph IDs present in the index.
