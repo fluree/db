@@ -148,9 +148,13 @@ pub const ROOT_V6_MAGIC: &[u8; 4] = b"FIR6";
 /// first" safety property.
 pub const ROOT_V6_VERSION: u8 = 2;
 
-/// Root format version that enables inline `xsd:decimal` encoding. Written only
-/// by a full reindex/import under [`DecimalEncoding::InlineWhenFits`]; see
-/// [`IndexRoot::decimal_encoding`].
+/// The v5 (`next`) index format: `main` writes version 2, and every format
+/// change `next` makes shares this one bump — inline `xsd:decimal` encoding,
+/// the triple-term dictionary, the pooled tree, the compressed body and
+/// graph-carrying history. Written only by a full reindex/import (under
+/// [`DecimalEncoding::InlineWhenFits`]); an incremental build keeps its base
+/// root's version, so a `main`-format ledger stays `main`-readable until it
+/// is reindexed. See [`IndexRoot::decimal_encoding`].
 pub const ROOT_V6_VERSION_INLINE_DECIMAL: u8 = 3;
 
 /// Derive the decimal-encoding policy from a decoded root format version.
@@ -659,8 +663,9 @@ impl IndexRoot {
         self.decimal_encoding
     }
 
-    /// Encode to the binary FIR6 wire format, the body after the header
-    /// zstd-compressed (`fluree_db_core::fir6_frame`).
+    /// Encode to the binary FIR6 wire format. A v5 root's body after the
+    /// header is zstd-compressed (`fluree_db_core::fir6_frame`); a `main`-format
+    /// root stays byte-compatible with `main`.
     ///
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
     /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
@@ -892,7 +897,18 @@ impl IndexRoot {
             write_term_dict_refs(&mut buf, td);
         }
 
-        fluree_db_core::fir6_frame::deflate(&buf).expect("root has its header")
+        if self.is_v5_format() {
+            fluree_db_core::fir6_frame::deflate(&buf).expect("root has its header")
+        } else {
+            debug_assert!(self.pool.is_none(), "a pooled tree is v5-only");
+            buf
+        }
+    }
+
+    /// Whether this root is written in the v5 format (version 3) rather than
+    /// `main`'s.
+    pub fn is_v5_format(&self) -> bool {
+        version_for_decimal_encoding(self.decimal_encoding) == ROOT_V6_VERSION_INLINE_DECIMAL
     }
 
     /// The snapshot metadata this root carries, so a caller holding the
@@ -1881,10 +1897,17 @@ mod tests {
             DecimalEncoding::InlineWhenFits
         );
 
-        // The two roots are byte-identical except for the version byte: the v3
-        // capability is purely a header signal, not a layout change.
-        assert_eq!(arena_bytes[0..4], inline_bytes[0..4]); // magic
-        assert_eq!(arena_bytes[5..], inline_bytes[5..]); // everything after version
+        // A main-format (v2) root stays uncompressed, byte-compatible with
+        // main; the v5 root compresses its body. Uncompressed, the two differ
+        // only in the version byte.
+        assert_eq!(raw(&arena_bytes), arena_bytes);
+        assert_ne!(
+            inline_bytes[6] & fluree_db_core::fir6_frame::FLAG_EXT_COMPRESSED,
+            0
+        );
+        let inline_raw = raw(&inline_bytes);
+        assert_eq!(arena_bytes[0..4], inline_raw[0..4]); // magic
+        assert_eq!(arena_bytes[5..], inline_raw[5..]); // everything after version
     }
 
     #[test]
@@ -1976,6 +1999,7 @@ mod tests {
             .unwrap()
         };
         let mut root = minimal_root_v6();
+        root.decimal_encoding = fluree_db_core::DecimalEncoding::InlineWhenFits;
         root.pool = Some(PoolRouting {
             graphs: vec![3, 4, 70],
             orders: RunSortOrder::pool_build_orders()
