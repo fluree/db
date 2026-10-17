@@ -179,6 +179,7 @@ async fn run_update_branch(
 ) -> std::result::Result<(BranchUpdateMeta, Phase2FetchStatsSnapshot), IndexerError> {
     let parent_span = tracing::Span::current();
     let stats = Phase2FetchStats::default();
+    let (order, g_id) = (branch_config.order, branch_config.g_id);
 
     // The leaves (+ sidecars) update_branch will request: exactly the leaves
     // with a non-empty novelty slice. Computed with the same slicing logic, so
@@ -350,6 +351,8 @@ async fn run_update_branch(
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
     tracing::debug!(
+        ?order,
+        g_id,
         leaves = meta.new_leaf_count,
         leaf_bytes = upload_totals.leaf_bytes,
         sidecars = upload_totals.sidecar_count,
