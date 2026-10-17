@@ -645,11 +645,36 @@ impl IndexRoot {
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
     /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
     pub fn encode(&self) -> Vec<u8> {
+        fluree_db_core::fir6_frame::deflate(&self.encode_raw(true)).expect("root has its header")
+    }
+
+    /// `main`'s v2 layout (16-bit graph ids, no v5 sections), for tests of the
+    /// read path a `main` ledger's first v5 index takes.
+    #[cfg(test)]
+    pub(crate) fn encode_main_layout(&self) -> Vec<u8> {
+        assert!(self.pool.is_none() && self.stats.is_none());
+        self.encode_raw(false)
+    }
+
+    /// The uncompressed encoding; `wide` is the v5 layout, otherwise `main`'s.
+    fn encode_raw(&self, wide: bool) -> Vec<u8> {
+        let write_graph = |buf: &mut Vec<u8>, v: u32| {
+            if wide {
+                buf.extend_from_slice(&v.to_le_bytes());
+            } else {
+                let narrow = u16::try_from(v).expect("main's layout holds 16-bit graph ids");
+                buf.extend_from_slice(&narrow.to_le_bytes());
+            }
+        };
         let mut buf = Vec::with_capacity(8192);
 
         // ---- Header (24 bytes) ----
         buf.extend_from_slice(ROOT_V6_MAGIC);
-        buf.push(ROOT_V6_VERSION_V5);
+        buf.push(if wide {
+            ROOT_V6_VERSION_V5
+        } else {
+            ROOT_V6_VERSION
+        });
         let flags = (if self.stats.is_some() {
             Self::FLAG_HAS_STATS
         } else {
@@ -696,7 +721,7 @@ impl IndexRoot {
         if self.pool.is_some() {
             flags_ext |= Self::FLAG_EXT_HAS_POOL;
         }
-        if self.decimal_encoding == fluree_db_core::DecimalEncoding::ArenaOnly {
+        if wide && self.decimal_encoding == fluree_db_core::DecimalEncoding::ArenaOnly {
             flags_ext |= Self::FLAG_EXT_DECIMAL_ARENA_ONLY;
         }
         buf.push(flags_ext);
@@ -735,7 +760,11 @@ impl IndexRoot {
         }
 
         // ---- Small dict inlines ----
-        write_string_array(&mut buf, &self.graph_iris);
+        // A graph per document outgrows a 16-bit count: v5 counts in 32 bits.
+        write_graph(&mut buf, self.graph_iris.len() as u32);
+        for iri in &self.graph_iris {
+            write_str(&mut buf, iri);
+        }
         write_string_array(&mut buf, &self.datatype_iris);
         write_string_array(&mut buf, &self.language_tags);
 
@@ -747,9 +776,9 @@ impl IndexRoot {
         // ---- Per-graph specialty arenas ----
         let mut sorted_arenas = self.graph_arenas.clone();
         sorted_arenas.sort_by_key(|ga| ga.g_id);
-        buf.extend_from_slice(&(sorted_arenas.len() as u16).to_le_bytes());
+        write_graph(&mut buf, sorted_arenas.len() as u32);
         for ga in &sorted_arenas {
-            buf.extend_from_slice(&ga.g_id.to_le_bytes());
+            write_graph(&mut buf, ga.g_id);
             write_graph_arenas_v5(&mut buf, ga);
         }
 
@@ -809,9 +838,9 @@ impl IndexRoot {
         // ---- Named graph routing (V3 branch CIDs) ----
         let mut sorted_named = self.named_graphs.clone();
         sorted_named.sort_by_key(|ng| ng.g_id);
-        buf.extend_from_slice(&(sorted_named.len() as u16).to_le_bytes());
+        write_graph(&mut buf, sorted_named.len() as u32);
         for ng in &sorted_named {
-            buf.extend_from_slice(&ng.g_id.to_le_bytes());
+            write_graph(&mut buf, ng.g_id);
             let mut sorted_orders = ng.orders.clone();
             sorted_orders.sort_by_key(|(order, _)| order.to_wire_id());
             buf.push(sorted_orders.len() as u8);
@@ -827,7 +856,7 @@ impl IndexRoot {
             graphs.sort_unstable();
             buf.extend_from_slice(&(graphs.len() as u32).to_le_bytes());
             for g in graphs {
-                buf.extend_from_slice(&u32::from(g).to_le_bytes());
+                buf.extend_from_slice(&g.to_le_bytes());
             }
             let mut orders = pool.orders.clone();
             orders.sort_by_key(|(order, _)| order.to_wire_id());
@@ -873,7 +902,7 @@ impl IndexRoot {
             write_term_dict_refs(&mut buf, td);
         }
 
-        fluree_db_core::fir6_frame::deflate(&buf).expect("root has its header")
+        buf
     }
 
     /// The snapshot metadata this root carries, so a caller holding the
@@ -924,6 +953,8 @@ impl IndexRoot {
             )));
         }
         let version = data[4];
+        // `main`'s v2 roots hold 16-bit graph ids and counts; v5 roots 32-bit.
+        let wide = version == ROOT_V6_VERSION_V5;
         // `main`'s v2 (read so its ledgers upgrade on their first index) or v5.
         if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_V5 {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
@@ -986,7 +1017,11 @@ impl IndexRoot {
         }
 
         // Small dict inlines
-        let graph_iris = read_string_array(data, &mut pos)?;
+        let graph_iri_count = read_graph_width(data, &mut pos, wide)? as usize;
+        let mut graph_iris = Vec::with_capacity(graph_iri_count.min(data.len()));
+        for _ in 0..graph_iri_count {
+            graph_iris.push(read_string(data, &mut pos)?);
+        }
         let datatype_iris = read_string_array(data, &mut pos)?;
         let language_tags = read_string_array(data, &mut pos)?;
 
@@ -1001,10 +1036,10 @@ impl IndexRoot {
         };
 
         // Per-graph specialty arenas
-        let arena_count = read_u16_at(data, &mut pos)? as usize;
+        let arena_count = read_graph_width(data, &mut pos, wide)? as usize;
         let mut graph_arenas = Vec::with_capacity(arena_count);
         for _ in 0..arena_count {
-            graph_arenas.push(read_graph_arenas_v5(data, &mut pos)?);
+            graph_arenas.push(read_graph_arenas_v5(data, &mut pos, wide)?);
         }
 
         // Watermarks
@@ -1083,10 +1118,10 @@ impl IndexRoot {
         }
 
         // Named graph routing
-        let named_count = read_u16_at(data, &mut pos)? as usize;
+        let named_count = read_graph_width(data, &mut pos, wide)? as usize;
         let mut named_graphs = Vec::with_capacity(named_count);
         for _ in 0..named_count {
-            let g_id = read_u16_at(data, &mut pos)?;
+            let g_id = read_graph_width(data, &mut pos, wide)?;
             let ng_order_count = read_u8_at(data, &mut pos)? as usize;
             let mut orders = Vec::with_capacity(ng_order_count);
             for _ in 0..ng_order_count {
@@ -1105,11 +1140,7 @@ impl IndexRoot {
             let graph_count = read_u32_at(data, &mut pos)? as usize;
             let mut graphs = Vec::with_capacity(graph_count);
             for _ in 0..graph_count {
-                let g = read_u32_at(data, &mut pos)?;
-                graphs
-                    .push(GraphId::try_from(g).map_err(|_| {
-                        io_err(&format!("root v6: pool graph id {g} out of range"))
-                    })?);
+                graphs.push(read_u32_at(data, &mut pos)?);
             }
             let order_count = read_u8_at(data, &mut pos)? as usize;
             let mut orders = Vec::with_capacity(order_count);
@@ -1129,7 +1160,10 @@ impl IndexRoot {
         let stats = if flags & Self::FLAG_HAS_STATS != 0 {
             let stats_len = read_u32_at(data, &mut pos)? as usize;
             ensure_bytes(data, pos, stats_len, "stats section")?;
-            let (stats, _) = stats_wire::decode_stats_with_len(&data[pos..pos + stats_len])?;
+            let (stats, _) = stats_wire::decode_stats_with_len(
+                &data[pos..pos + stats_len],
+                stats_wire::GraphWidth::for_root_version(version),
+            )?;
             pos += stats_len;
             Some(stats)
         } else {
@@ -1394,8 +1428,17 @@ fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs) {
     }
 }
 
-fn read_graph_arenas_v5(data: &[u8], pos: &mut usize) -> io::Result<GraphArenaRefs> {
-    let g_id = read_u16_at(data, pos)?;
+/// A graph id or graph count: 16-bit in `main`'s v2 roots, 32-bit in v5.
+fn read_graph_width(data: &[u8], pos: &mut usize, wide: bool) -> io::Result<u32> {
+    if wide {
+        read_u32_at(data, pos)
+    } else {
+        read_u16_at(data, pos).map(u32::from)
+    }
+}
+
+fn read_graph_arenas_v5(data: &[u8], pos: &mut usize, wide: bool) -> io::Result<GraphArenaRefs> {
+    let g_id = read_graph_width(data, pos, wide)?;
     // numbig
     let nb_count = read_u16_at(data, pos)? as usize;
     let mut numbig = Vec::with_capacity(nb_count);
@@ -1866,10 +1909,26 @@ mod tests {
     /// its first index.
     #[test]
     fn fir6_reads_a_main_root() {
-        let mut main_root = raw(&minimal_root_v6().encode());
-        main_root[4] = ROOT_V6_VERSION;
-        main_root[6] &= !IndexRoot::FLAG_EXT_DECIMAL_ARENA_ONLY;
+        let mut root = minimal_root_v6();
+        root.named_graphs = vec![NamedGraphRouting {
+            g_id: 7,
+            orders: vec![(
+                RunSortOrder::Spot,
+                ContentId::from_hex_digest(
+                    fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
+                    &fluree_db_core::sha256_hex(b"main-branch"),
+                )
+                .unwrap(),
+            )],
+        }];
+        let main_root = root.encode_main_layout();
+        assert_eq!(main_root[4], ROOT_V6_VERSION);
         let decoded = IndexRoot::decode(&main_root).unwrap();
+        assert_eq!(decoded.named_graphs.len(), 1);
+        assert_eq!(decoded.named_graphs[0].g_id, 7);
+        assert_eq!(decoded.named_graphs[0].orders, root.named_graphs[0].orders);
+        fluree_db_core::LedgerSnapshot::from_root_bytes(&main_root)
+            .expect("core's metadata decode reads main's layout");
         assert_eq!(
             decoded.decimal_encoding(),
             fluree_db_core::DecimalEncoding::ArenaOnly

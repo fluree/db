@@ -55,8 +55,8 @@ pub const SIDECAR_HEADER_SIZE: usize = 8;
 pub const HIST_ENTRY_V2_SIZE: usize = 31;
 
 /// Wire size of an entry that carries its graph: the 31 bytes above, then
-/// `g_id: u16 [31..33]`.
-pub const HIST_ENTRY_V2_G_SIZE: usize = 33;
+/// `g_id: u32 [31..35]`.
+pub const HIST_ENTRY_V2_G_SIZE: usize = 35;
 
 /// A single history entry for the V2/V3 index format.
 ///
@@ -75,7 +75,7 @@ pub struct HistEntryV2 {
     pub op: u8,
     /// Graph of the fact; on the wire only in a pooled tree's sidecar, 0
     /// elsewhere.
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
 }
 
 impl HistEntryV2 {
@@ -122,7 +122,7 @@ impl HistEntryV2 {
     pub fn write_le_width(&self, buf: &mut [u8], width: usize) {
         self.write_le(buf);
         if width == HIST_ENTRY_V2_G_SIZE {
-            buf[31..33].copy_from_slice(&self.g_id.to_le_bytes());
+            buf[31..35].copy_from_slice(&self.g_id.to_le_bytes());
         }
     }
 
@@ -130,13 +130,13 @@ impl HistEntryV2 {
     pub fn read_le_width(buf: &[u8], width: usize) -> std::io::Result<Self> {
         let mut entry = Self::read_le(buf)?;
         if width == HIST_ENTRY_V2_G_SIZE {
-            let g = buf.get(31..33).ok_or_else(|| {
+            let g = buf.get(31..35).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "HistEntryV2 with graph requires 33 bytes",
+                    "HistEntryV2 with graph requires 35 bytes",
                 )
             })?;
-            entry.g_id = u16::from_le_bytes(g.try_into().unwrap());
+            entry.g_id = u32::from_le_bytes(g.try_into().unwrap());
         }
         Ok(entry)
     }

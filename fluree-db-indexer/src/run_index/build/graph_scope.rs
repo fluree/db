@@ -19,16 +19,16 @@ impl PoolGraphs {
         let mut ids: Vec<GraphId> = ids.into_iter().collect();
         ids.sort_unstable();
         ids.dedup();
-        let mut member = vec![false; ids.last().map_or(0, |&g| usize::from(g) + 1)];
+        let mut member = vec![false; ids.last().map_or(0, |&g| g as usize + 1)];
         for &g in &ids {
-            member[usize::from(g)] = true;
+            member[g as usize] = true;
         }
         Self { member, ids }
     }
 
     #[inline]
     pub fn contains(&self, g_id: GraphId) -> bool {
-        self.member.get(usize::from(g_id)).copied().unwrap_or(false)
+        self.member.get(g_id as usize).copied().unwrap_or(false)
     }
 
     /// Pooled graph ids, sorted.

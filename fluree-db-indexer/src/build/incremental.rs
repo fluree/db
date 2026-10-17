@@ -375,7 +375,7 @@ enum Phase2TaskKind {
 
 struct Phase2Task {
     seq: usize,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     order: RunSortOrder,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
@@ -388,7 +388,7 @@ struct Phase2Task {
 }
 
 /// Graph-scoped V2 fact identity: `(g_id, s_id, p_id, o_type, o_key, o_i)`.
-type FactIdentityKey = (u16, u64, u32, u16, u64, u32);
+type FactIdentityKey = (fluree_db_core::GraphId, u64, u32, u16, u64, u32);
 
 fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
     (
@@ -408,7 +408,7 @@ enum Phase2TaskUpdate {
 
 struct Phase2TaskOutput {
     seq: usize,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     order: RunSortOrder,
     update: Phase2TaskUpdate,
     replaced_leaf_cids: Vec<ContentId>,
@@ -777,12 +777,12 @@ pub async fn incremental_index(
     ];
 
     // Group records + ops by g_id.
-    let mut by_graph: std::collections::BTreeMap<u16, Vec<usize>> =
+    let mut by_graph: std::collections::BTreeMap<fluree_db_core::GraphId, Vec<usize>> =
         std::collections::BTreeMap::new();
     for (idx, rec) in novelty.records.iter().enumerate() {
         by_graph.entry(rec.g_id).or_default().push(idx);
     }
-    let mut superseded_by_graph: std::collections::BTreeMap<u16, Vec<usize>> =
+    let mut superseded_by_graph: std::collections::BTreeMap<fluree_db_core::GraphId, Vec<usize>> =
         std::collections::BTreeMap::new();
     for (idx, rec) in novelty.superseded.iter().enumerate() {
         superseded_by_graph.entry(rec.g_id).or_default().push(idx);
@@ -799,7 +799,7 @@ pub async fn incremental_index(
     );
 
     let concurrency = config.incremental_max_concurrency.max(1);
-    let mut graph_order: Vec<u16> = by_graph.keys().copied().collect();
+    let mut graph_order: Vec<fluree_db_core::GraphId> = by_graph.keys().copied().collect();
     graph_order.sort_unstable_by_key(|&g_id| (u8::from(g_id == 0), g_id));
 
     let mut phase2_tasks = Vec::with_capacity(by_graph.len().saturating_mul(all_orders.len()));
@@ -1472,7 +1472,7 @@ pub async fn incremental_index(
         };
         use std::collections::BTreeMap;
 
-        let mut arenas_by_gid: BTreeMap<u16, GraphArenaRefs> = BTreeMap::new();
+        let mut arenas_by_gid: BTreeMap<fluree_db_core::GraphId, GraphArenaRefs> = BTreeMap::new();
         for ga in &base_root.graph_arenas {
             arenas_by_gid.insert(ga.g_id, ga.clone());
         }
@@ -1845,7 +1845,7 @@ pub async fn incremental_index(
 
                 // Group entries by (g_id, p_id, bucket_lang_id).
                 let mut ft_grouped: BTreeMap<
-                    (u16, u32, u16),
+                    (fluree_db_core::GraphId, u32, u16),
                     Vec<&crate::fulltext_hook::FulltextEntry>,
                 > = BTreeMap::new();
                 for entry in fulltext_entries {
@@ -1998,8 +1998,10 @@ pub async fn incremental_index(
                     .unwrap_or(&[]);
 
                 // Group novelty entries by (g_id, p_id).
-                let mut grouped: BTreeMap<(u16, u32), Vec<&crate::spatial_hook::SpatialEntry>> =
-                    BTreeMap::new();
+                let mut grouped: BTreeMap<
+                    (fluree_db_core::GraphId, u32),
+                    Vec<&crate::spatial_hook::SpatialEntry>,
+                > = BTreeMap::new();
                 for entry in spatial_entries {
                     grouped
                         .entry((entry.g_id, entry.p_id))
@@ -2500,7 +2502,7 @@ pub async fn incremental_index(
                 );
                 // subject_classes: (g_id, s_id) → HashSet<class_sid64>
                 let mut subject_classes: std::collections::HashMap<
-                    (u16, u64),
+                    (fluree_db_core::GraphId, u64),
                     std::collections::HashSet<u64>,
                 > = std::collections::HashMap::new();
 
@@ -2582,8 +2584,10 @@ pub async fn incremental_index(
                 // Also include ref-object s_ids so we can resolve ref-class edges.
                 if let Some(ref store) = store_opt {
                     let iri_ref_otype = fluree_db_core::o_type::OType::IRI_REF.as_u16();
-                    let mut subjects_by_graph: std::collections::HashMap<u16, Vec<u64>> =
-                        std::collections::HashMap::new();
+                    let mut subjects_by_graph: std::collections::HashMap<
+                        fluree_db_core::GraphId,
+                        Vec<u64>,
+                    > = std::collections::HashMap::new();
                     for &(g_id, s_id) in novelty_subject_class_deltas
                         .keys()
                         .chain(novelty_subject_props.keys())
@@ -2762,7 +2766,7 @@ pub async fn incremental_index(
                 // below skips them and the base-index re-scan (Stage 2) handles them.
                 // A no-op rdf:type assertion (same type) leaves base == net and is not
                 // considered changed. See issue #1266.
-                let changed_membership: std::collections::HashSet<(u16, u64)> =
+                let changed_membership: std::collections::HashSet<(fluree_db_core::GraphId, u64)> =
                     novelty_subject_class_deltas
                         .keys()
                         .filter(|key| base_subject_classes.get(*key) != subject_classes.get(*key))
@@ -2798,19 +2802,19 @@ pub async fn incremental_index(
                 // Build class→properties, class→prop→dts, class→prop→langs, ref_edges.
                 let attribution_maps_started = Instant::now();
                 let mut class_properties: std::collections::HashMap<
-                    (u16, u64),
+                    (fluree_db_core::GraphId, u64),
                     std::collections::HashSet<u32>,
                 > = std::collections::HashMap::new();
                 let mut class_prop_dts: std::collections::HashMap<
-                    (u16, u64),
+                    (fluree_db_core::GraphId, u64),
                     std::collections::HashMap<u32, std::collections::HashMap<u8, i64>>,
                 > = std::collections::HashMap::new();
                 let mut class_prop_lang_deltas: std::collections::HashMap<
-                    (u16, u64),
+                    (fluree_db_core::GraphId, u64),
                     std::collections::HashMap<u32, std::collections::HashMap<u16, i64>>,
                 > = std::collections::HashMap::new();
                 let mut ref_edges: std::collections::HashMap<
-                    (u16, u64),
+                    (fluree_db_core::GraphId, u64),
                     std::collections::HashMap<u32, std::collections::HashMap<u64, i64>>,
                 > = std::collections::HashMap::new();
 
@@ -2953,9 +2957,12 @@ pub async fn incremental_index(
                         // re-attribution (Case A). Combined with re-typed objects' inbound
                         // edges (Case B, reverse OPST) below to move ref-class stats across
                         // the type change (issue #1266).
-                        let mut outgoing_ref_edges: Vec<(u16, u64, u32, u64)> = Vec::new();
-                        let mut changed_by_graph: std::collections::HashMap<u16, Vec<u64>> =
-                            std::collections::HashMap::new();
+                        let mut outgoing_ref_edges: Vec<(fluree_db_core::GraphId, u64, u32, u64)> =
+                            Vec::new();
+                        let mut changed_by_graph: std::collections::HashMap<
+                            fluree_db_core::GraphId,
+                            Vec<u64>,
+                        > = std::collections::HashMap::new();
                         for &(g_id, s_id) in &changed_membership {
                             changed_by_graph.entry(g_id).or_default().push(s_id);
                         }
@@ -3324,8 +3331,10 @@ pub async fn incremental_index(
                 let seed_entries_started = Instant::now();
                 let base_class_sid_lookups = AtomicUsize::new(0usize);
                 let base_class_sid_hits = AtomicUsize::new(0usize);
-                let mut entries_by_key: std::collections::HashMap<(u16, u64), is::ClassStatEntry> =
-                    std::collections::HashMap::new();
+                let mut entries_by_key: std::collections::HashMap<
+                    (fluree_db_core::GraphId, u64),
+                    is::ClassStatEntry,
+                > = std::collections::HashMap::new();
 
                 // Prewarm the subject reverse-tree leaves the serial seed loop
                 // below will read. The loop resolves each base class Sid via
@@ -3363,7 +3372,7 @@ pub async fn incremental_index(
                     store_opt.as_ref(),
                     base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()),
                 ) {
-                    let entries: Vec<(u16, &is::ClassStatEntry)> = graphs
+                    let entries: Vec<(fluree_db_core::GraphId, &is::ClassStatEntry)> = graphs
                         .iter()
                         .filter_map(|g| g.classes.as_ref().map(|c| (g.g_id, c)))
                         .flat_map(|(g_id, classes)| classes.iter().map(move |e| (g_id, e)))
@@ -3447,8 +3456,10 @@ pub async fn incremental_index(
                 // from the base stats (issue #1266: a class that only lost a property
                 // via retraction, or gained one via re-typing, must be revisited so its
                 // decrement/move is applied rather than dropped).
-                let mut delta_class_keys: std::collections::HashSet<(u16, u64)> =
-                    std::collections::HashSet::new();
+                let mut delta_class_keys: std::collections::HashSet<(
+                    fluree_db_core::GraphId,
+                    u64,
+                )> = std::collections::HashSet::new();
                 delta_class_keys.extend(class_properties.keys().copied());
                 delta_class_keys.extend(class_prop_dts.keys().copied());
                 delta_class_keys.extend(class_prop_lang_deltas.keys().copied());
@@ -3790,8 +3801,10 @@ pub async fn incremental_index(
                 entries_by_key.retain(|_, e| e.count > 0);
 
                 // Group into per-graph class lists.
-                let mut by_graph: std::collections::HashMap<u16, Vec<is::ClassStatEntry>> =
-                    std::collections::HashMap::new();
+                let mut by_graph: std::collections::HashMap<
+                    fluree_db_core::GraphId,
+                    Vec<is::ClassStatEntry>,
+                > = std::collections::HashMap::new();
                 for ((g_id, _), entry) in entries_by_key {
                     by_graph.entry(g_id).or_default().push(entry);
                 }
@@ -4879,7 +4892,7 @@ struct PooledGraphLog {
 async fn read_promoted_graphs(
     content_store: &Arc<dyn ContentStore>,
     novelty: &crate::run_index::build::incremental_resolve::IncrementalNovelty,
-) -> Result<std::collections::HashMap<u16, PooledGraphLog>> {
+) -> Result<std::collections::HashMap<fluree_db_core::GraphId, PooledGraphLog>> {
     use fluree_db_binary_index::format::history_sidecar::{decode_sidecar_entries, HistEntryV2};
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2 as Rec};
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
@@ -4889,7 +4902,7 @@ async fn read_promoted_graphs(
     let Some(pool) = &novelty.base_root.pool else {
         return Ok(out);
     };
-    let mut graphs: Vec<u16> = novelty
+    let mut graphs: Vec<fluree_db_core::GraphId> = novelty
         .records
         .iter()
         .map(|r| r.g_id)
@@ -5053,7 +5066,7 @@ fn resolve_promoted_graph(
 fn build_promoted_graph_tree(
     facts: &[PromotedFact],
     order: RunSortOrder,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     config: &IndexerConfig,
 ) -> Result<BranchUpdateResult> {
     use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
@@ -5093,7 +5106,7 @@ fn build_fresh_default_graph_v3(
     // appear in fresh branches so ops are not consulted.
     sorted_ops: &[u8],
     order: RunSortOrder,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     config: &IndexerConfig,
 ) -> Result<BranchUpdateResult> {
     let _ = sorted_ops;
@@ -5115,7 +5128,7 @@ fn build_fresh_default_graph_v3(
 fn finish_fresh_branch(
     writer: fluree_db_binary_index::format::leaf::LeafWriter,
     order: RunSortOrder,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
 ) -> Result<BranchUpdateResult> {
     use crate::run_index::build::incremental_leaf::NewLeafBlob;
     use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
@@ -5170,7 +5183,7 @@ fn finish_fresh_branch(
 fn build_fresh_named_graph_v3(
     sorted_records: &[RunRecordV2],
     order: RunSortOrder,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     config: &IndexerConfig,
 ) -> Result<BranchUpdateResult> {
     build_fresh_default_graph_v3(sorted_records, &[], order, g_id, config)

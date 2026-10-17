@@ -27,7 +27,7 @@
 //!
 //! Each record is exactly [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian,
 //! serialized via [`RunRecord::write_spool_le`] / [`RunRecord::read_spool_le`].
-//! Unlike the 34-byte run wire format, spool records include `g_id: u16`
+//! Unlike the 34-byte run wire format, spool records include `g_id: fluree_db_core::GraphId`
 //! because spool files are pre-graph-partition.
 
 use crate::run_index::build::graph_scope::GraphScope;
@@ -1387,7 +1387,7 @@ fn remap_records_to_runs<I, S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
     subject_remap: &S,
     string_remap: &R,
     lang_remap: Option<&[u16]>,
-    target_g_id: Option<u16>,
+    target_g_id: Option<fluree_db_core::GraphId>,
     registry: &OTypeRegistry,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
@@ -1511,7 +1511,7 @@ pub fn remap_commit_to_runs<S: SubjectRemap + ?Sized, R: StringRemap + ?Sized>(
     subject_remap: &S,
     string_remap: &R,
     lang_remap: &[u16],
-    target_g_id: u16,
+    target_g_id: fluree_db_core::GraphId,
     registry: &OTypeRegistry,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     stats_hook: Option<&mut crate::stats::IdStatsHook>,
@@ -1681,8 +1681,8 @@ pub struct SortedCommitInfo {
     pub string_count: u64,
     /// Path to the types-map sidecar (`.types`), if rdf:type extraction was enabled.
     ///
-    /// Contains `(g_id: u16, s_sorted_local: u64, class_sorted_local: u64)` tuples
-    /// (18 bytes each) for every `rdf:type` assertion. Used after Phase B vocab merge
+    /// Contains `(g_id: u32, s_sorted_local: u64, class_sorted_local: u64)` tuples
+    /// (`TYPES_RECORD_BYTES` each) for every `rdf:type` assertion. Used after Phase B vocab merge
     /// to build the global subject→class bitset table.
     pub types_map_path: Option<PathBuf>,
     /// Duplicate statements collapsed by the within-chunk dedup (step 4b).
@@ -1694,7 +1694,7 @@ pub struct SortedCommitInfo {
     pub term_table: Option<(PathBuf, u64)>,
     /// Post-dedup record count per graph, ascending by `g_id` — what an import
     /// sizes each graph by to place it in the pool or its own tree.
-    pub graph_rows: Vec<(u16, u64)>,
+    pub graph_rows: Vec<(fluree_db_core::GraphId, u64)>,
 }
 
 /// Sort, remap, and write a sorted commit file from buffered parse output.
@@ -1908,7 +1908,7 @@ pub fn sort_remap_and_write_sorted_commit(
     };
 
     // Records are sorted graph-first, so each graph is one run.
-    let mut graph_rows: Vec<(u16, u64)> = Vec::new();
+    let mut graph_rows: Vec<(fluree_db_core::GraphId, u64)> = Vec::new();
     for record in &records {
         match graph_rows.last_mut() {
             Some((g, n)) if *g == record.g_id => *n += 1,

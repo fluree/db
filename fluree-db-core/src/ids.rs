@@ -66,11 +66,12 @@ impl fmt::Display for RuntimePredicateId {
 // GraphId
 // ---------------------------------------------------------------------------
 
-/// Graph dictionary ID (u16).
+/// Graph dictionary ID (u32).
 ///
 /// 0 = default graph, 1 = txn-meta. Named-graph dict indices start at 2.
-/// Using a type alias keeps a single definition for easy future changes.
-pub type GraphId = u16;
+/// v5 formats persist it at 32 bits, or block-local width where a column
+/// holds many; `main`'s v2 roots hold 16-bit ids, widened on read.
+pub type GraphId = u32;
 
 // ---------------------------------------------------------------------------
 // TxnT

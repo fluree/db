@@ -11,6 +11,7 @@ use crate::index_stats::{
     IndexStats, LinkStatEntry, PropertyStatEntry,
 };
 use crate::sid::Sid;
+use crate::GraphId;
 use std::io;
 
 // ---- Binary helpers ----
@@ -44,6 +45,32 @@ fn read_u16(data: &[u8], pos: &mut usize) -> io::Result<u16> {
     let v = u16::from_le_bytes(data[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
     Ok(v)
+}
+
+/// Width of graph ids and graph counts on the stats wire: 16 bits in `main`'s
+/// v2 roots, 32 in v5 roots. Encoders always write v5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphWidth {
+    Narrow,
+    Wide,
+}
+
+impl GraphWidth {
+    /// The width a root of format `version` holds.
+    pub fn for_root_version(version: u8) -> Self {
+        if version >= 3 {
+            Self::Wide
+        } else {
+            Self::Narrow
+        }
+    }
+
+    fn read(self, data: &[u8], pos: &mut usize) -> io::Result<u32> {
+        match self {
+            Self::Narrow => read_u16(data, pos).map(u32::from),
+            Self::Wide => read_u32(data, pos),
+        }
+    }
 }
 
 #[inline]
@@ -139,7 +166,7 @@ fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphProper
 }
 
 /// One graph's rows in the tail: `(g_id, [(p_id, tags)])`.
-type GraphTagSets = Vec<(u16, Vec<(u32, Vec<u8>)>)>;
+type GraphTagSets = Vec<(GraphId, Vec<(u32, Vec<u8>)>)>;
 
 /// The historical tail section appended after the classes section.
 ///
@@ -168,7 +195,11 @@ fn read_tag_set(data: &[u8], pos: &mut usize) -> io::Result<Vec<u8>> {
 /// (an old blob, exactly `pos == data.len()`) or carries an unknown future
 /// tag — in which case the remainder is consumed, which is safe because the
 /// root length-prefixes the whole stats section.
-fn decode_historical_tail(data: &[u8], pos: &mut usize) -> io::Result<Option<HistoricalTail>> {
+fn decode_historical_tail(
+    data: &[u8],
+    pos: &mut usize,
+    width: GraphWidth,
+) -> io::Result<Option<HistoricalTail>> {
     if *pos >= data.len() {
         return Ok(None);
     }
@@ -186,10 +217,10 @@ fn decode_historical_tail(data: &[u8], pos: &mut usize) -> io::Result<Option<His
         let tags = read_tag_set(data, pos)?;
         agg.push((sid, tags));
     }
-    let graph_count = read_u16(data, pos)? as usize;
+    let graph_count = width.read(data, pos)? as usize;
     let mut graphs = Vec::with_capacity(graph_count);
     for _ in 0..graph_count {
-        let g_id = read_u16(data, pos)?;
+        let g_id = width.read(data, pos)?;
         let prop_count = read_u32(data, pos)? as usize;
         let mut props = Vec::with_capacity(prop_count);
         for _ in 0..prop_count {
@@ -222,7 +253,7 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
         }
     }
     if let Some(graphs) = stats.graphs.as_mut() {
-        let mut by_key: std::collections::HashMap<(u16, u32), Vec<u8>> = tail
+        let mut by_key: std::collections::HashMap<(GraphId, u32), Vec<u8>> = tail
             .graphs
             .into_iter()
             .flat_map(|(g_id, props)| {
@@ -271,7 +302,7 @@ fn read_count(data: &[u8], pos: &mut usize) -> io::Result<(usize, usize)> {
 /// [sid_count: varint]
 ///   per Sid, sorted: [ns_code: u16 LE][shared: varint][rest_len: varint][rest]
 /// [graph_count: varint]
-///   per graph with classes, by g_id: [g_id: u16 LE][class_count: varint]
+///   per graph with classes, by g_id: [g_id: u32 LE][class_count: varint]
 ///   per class, by Sid: [index delta from the previous class: varint]
 ///                      [count: varint][property_count: varint]
 ///     per property, by Sid: [index: varint]
@@ -283,7 +314,7 @@ pub fn encode_class_tail(buf: &mut Vec<u8>, graphs: &[&GraphStatsEntry]) {
     use crate::commit::codec::varint::encode_varint;
     use std::collections::{BTreeSet, HashMap};
 
-    let with_classes: Vec<(u16, &[ClassStatEntry])> = graphs
+    let with_classes: Vec<(GraphId, &[ClassStatEntry])> = graphs
         .iter()
         .filter_map(|g| g.classes.as_deref().map(|c| (g.g_id, c)))
         .collect();
@@ -421,7 +452,11 @@ fn decode_link_tail(data: &[u8], pos: &mut usize) -> io::Result<Vec<LinkStatEntr
 
 /// Decode the class tail written by [`encode_class_tail`] (tag already
 /// consumed): each graph's class table. Decoded Sids share their names.
-fn decode_class_tail(data: &[u8], pos: &mut usize) -> io::Result<Vec<(u16, Vec<ClassStatEntry>)>> {
+fn decode_class_tail(
+    data: &[u8],
+    pos: &mut usize,
+    width: GraphWidth,
+) -> io::Result<Vec<(GraphId, Vec<ClassStatEntry>)>> {
     let invalid =
         |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("class tail: {what}"));
 
@@ -453,7 +488,7 @@ fn decode_class_tail(data: &[u8], pos: &mut usize) -> io::Result<Vec<(u16, Vec<C
     let (graph_count, cap) = read_count(data, pos)?;
     let mut graphs = Vec::with_capacity(cap);
     for _ in 0..graph_count {
-        let g_id = read_u16(data, pos)?;
+        let g_id = width.read(data, pos)?;
         let (class_count, cap) = read_count(data, pos)?;
         let mut classes = Vec::with_capacity(cap);
         let mut class_index = 0u64;
@@ -569,16 +604,16 @@ fn decode_class_property_payload(
 /// Decode `IndexStats` from the binary wire format.
 ///
 /// Returns `(stats, bytes_consumed)`.
-pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
+pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, usize)> {
     let mut pos = 0usize;
 
     let flakes = read_u64(data, &mut pos)?;
     let size = read_u64(data, &mut pos)?;
 
-    let graph_count = read_u16(data, &mut pos)? as usize;
+    let graph_count = width.read(data, &mut pos)? as usize;
     let mut graphs = Vec::with_capacity(graph_count);
     for _ in 0..graph_count {
-        let g_id = read_u16(data, &mut pos)?;
+        let g_id = width.read(data, &mut pos)?;
         let g_flakes = read_u64(data, &mut pos)?;
         let g_size = read_u64(data, &mut pos)?;
         let prop_count = read_u32(data, &mut pos)? as usize;
@@ -685,14 +720,14 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
     let mut links = None;
     while pos < data.len() {
         match data[pos] {
-            HISTORICAL_TAIL_TAG => tail = decode_historical_tail(data, &mut pos)?,
+            HISTORICAL_TAIL_TAG => tail = decode_historical_tail(data, &mut pos, width)?,
             LINK_TAIL_TAG => {
                 pos += 1;
                 links = Some(decode_link_tail(data, &mut pos)?);
             }
             CLASS_TAIL_TAG => {
                 pos += 1;
-                for (g_id, classes) in decode_class_tail(data, &mut pos)? {
+                for (g_id, classes) in decode_class_tail(data, &mut pos, width)? {
                     let graph = graphs.iter_mut().find(|g| g.g_id == g_id).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,

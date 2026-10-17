@@ -81,7 +81,7 @@ impl Novelty {
     pub fn set_attachment_base(&mut self, base: LinkBase) -> Result<Vec<Flake>> {
         let derived = if self.links_through < self.t {
             let mut touched = Touched::new();
-            for g_id in 0..self.graphs.len() as GraphId {
+            for g_id in self.present_graphs() {
                 for flake in self.graph_flakes(g_id) {
                     if flake.t > self.links_through && is_attachment_slot(&flake.p) {
                         touched.entry((g_id, flake.s.clone())).or_default();
@@ -197,7 +197,7 @@ impl Novelty {
             Some(FlakeMeta::max()),
         );
         let mut ops = Vec::new();
-        if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
+        if let Some(Some(segs)) = self.graphs.get(g_id) {
             for seg in segs {
                 if !seg.may_overlap(IndexType::Spot, Some(&first), Some(&rhs), false) {
                     continue;
@@ -216,7 +216,7 @@ impl Novelty {
     /// Every flake of `g_id`, segment by segment.
     fn graph_flakes(&self, g_id: GraphId) -> impl Iterator<Item = &Flake> {
         self.graphs
-            .get(g_id as usize)
+            .get(g_id)
             .and_then(Option::as_ref)
             .into_iter()
             .flatten()

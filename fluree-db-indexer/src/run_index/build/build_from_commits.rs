@@ -122,7 +122,7 @@ pub struct BuildConfig {
     pub index_dir: PathBuf,
     /// Graph ID of a dedicated build. A pooled build (`pool` set) writes under
     /// this id's directory but its rows keep their own graphs.
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Build the pooled tree over these graphs instead of graph `g_id`.
     pub pool: Option<Arc<PoolGraphs>>,
     /// Target rows per leaflet.
@@ -187,11 +187,11 @@ pub struct BuildResult {
 /// in [`ClassMembership`] when a ledger has ≤ 64 classes.
 pub struct ClassBitsetTable {
     pub bit_to_class: Vec<u64>,
-    graph_bitsets: FxHashMap<u16, FxHashMap<u16, Vec<u64>>>,
+    graph_bitsets: FxHashMap<fluree_db_core::GraphId, FxHashMap<u16, Vec<u64>>>,
 }
 
 impl ClassBitsetTable {
-    pub fn get(&self, g_id: u16, sid: u64) -> u64 {
+    pub fn get(&self, g_id: fluree_db_core::GraphId, sid: u64) -> u64 {
         let ns_code = (sid >> 48) as u16;
         let local_id = (sid & 0x0000_FFFF_FFFF_FFFF) as usize;
         self.graph_bitsets
@@ -209,14 +209,14 @@ impl ClassBitsetTable {
 /// fallback in [`ClassMembership`] once a ledger exceeds 64 distinct classes.
 pub struct SparseClassMembership {
     /// `(g_id, subject_sid64)` → sorted, deduped global class sids.
-    membership: FxHashMap<(u16, u64), Box<[u64]>>,
+    membership: FxHashMap<(fluree_db_core::GraphId, u64), Box<[u64]>>,
     /// Number of distinct classes (diagnostics only).
     distinct_classes: usize,
 }
 
 impl SparseClassMembership {
     #[inline]
-    fn classes_of(&self, g_id: u16, sid: u64) -> &[u64] {
+    fn classes_of(&self, g_id: fluree_db_core::GraphId, sid: u64) -> &[u64] {
         self.membership
             .get(&(g_id, sid))
             .map(|b| &b[..])
@@ -225,7 +225,20 @@ impl SparseClassMembership {
 }
 
 const CLASS_MEMBERSHIP_BUCKETS: usize = 256;
-const CLASS_MEMBERSHIP_ENTRY_BYTES: usize = 18;
+/// A type entry (`.types` sidecar record, class-membership partition entry):
+/// `[g_id: u32 LE][subject: u64 LE][class: u64 LE]`.
+pub(crate) const TYPES_RECORD_BYTES: usize = 20;
+const CLASS_MEMBERSHIP_ENTRY_BYTES: usize = TYPES_RECORD_BYTES;
+
+/// Decode one [`TYPES_RECORD_BYTES`] record as `(g_id, subject, class)`.
+#[inline]
+pub(crate) fn decode_types_record(chunk: &[u8]) -> (fluree_db_core::GraphId, u64, u64) {
+    (
+        u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+        u64::from_le_bytes(chunk[4..12].try_into().unwrap()),
+        u64::from_le_bytes(chunk[12..20].try_into().unwrap()),
+    )
+}
 const CLASS_MEMBERSHIP_INDEX_BYTES: usize = 32;
 
 /// Disk-backed subject→class membership used by the import path at large scale.
@@ -248,7 +261,7 @@ pub struct DiskClassMembershipBucket {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TypeEntry {
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     subject: u64,
     class: u64,
 }
@@ -265,7 +278,7 @@ impl PartialOrd for TypeEntry {
     }
 }
 
-fn class_membership_bucket(g_id: u16, sid: u64) -> usize {
+fn class_membership_bucket(g_id: fluree_db_core::GraphId, sid: u64) -> usize {
     let h = sid.wrapping_mul(11_400_714_819_323_198_485).rotate_left(17) ^ (g_id as u64);
     (h as usize) & (CLASS_MEMBERSHIP_BUCKETS - 1)
 }
@@ -293,10 +306,11 @@ fn read_type_entries(path: &Path) -> io::Result<Vec<TypeEntry>> {
     file.read_exact(&mut bytes)?;
     let mut entries = Vec::with_capacity(len / CLASS_MEMBERSHIP_ENTRY_BYTES);
     for chunk in bytes.chunks_exact(CLASS_MEMBERSHIP_ENTRY_BYTES) {
+        let (g_id, subject, class) = decode_types_record(chunk);
         entries.push(TypeEntry {
-            g_id: u16::from_le_bytes(chunk[0..2].try_into().unwrap()),
-            subject: u64::from_le_bytes(chunk[2..10].try_into().unwrap()),
-            class: u64::from_le_bytes(chunk[10..18].try_into().unwrap()),
+            g_id,
+            subject,
+            class,
         });
     }
     Ok(entries)
@@ -304,23 +318,23 @@ fn read_type_entries(path: &Path) -> io::Result<Vec<TypeEntry>> {
 
 fn write_membership_index_entry<W: std::io::Write>(
     writer: &mut W,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     subject: u64,
     offset: u64,
     count: u32,
 ) -> io::Result<()> {
     let mut buf = [0u8; CLASS_MEMBERSHIP_INDEX_BYTES];
-    buf[0..2].copy_from_slice(&g_id.to_le_bytes());
+    buf[0..4].copy_from_slice(&g_id.to_le_bytes());
     buf[8..16].copy_from_slice(&subject.to_le_bytes());
     buf[16..24].copy_from_slice(&offset.to_le_bytes());
     buf[24..28].copy_from_slice(&count.to_le_bytes());
     writer.write_all(&buf)
 }
 
-fn membership_index_key(index: &[u8], pos: usize) -> (u16, u64) {
+fn membership_index_key(index: &[u8], pos: usize) -> (fluree_db_core::GraphId, u64) {
     let start = pos * CLASS_MEMBERSHIP_INDEX_BYTES;
     (
-        u16::from_le_bytes(index[start..start + 2].try_into().unwrap()),
+        u32::from_le_bytes(index[start..start + 4].try_into().unwrap()),
         u64::from_le_bytes(index[start + 8..start + 16].try_into().unwrap()),
     )
 }
@@ -430,7 +444,7 @@ impl BucketWriterPool {
 }
 
 impl DiskClassMembership {
-    fn classes_of(&self, g_id: u16, sid: u64, out: &mut Vec<u64>) {
+    fn classes_of(&self, g_id: fluree_db_core::GraphId, sid: u64, out: &mut Vec<u64>) {
         out.clear();
         let bucket_idx = class_membership_bucket(g_id, sid);
         let Some(bucket) = self.buckets.get(bucket_idx).and_then(Option::as_ref) else {
@@ -495,7 +509,7 @@ impl ClassMembership {
     /// Append the classes of `(g_id, sid)` into `out` (cleared first).
     /// No allocation once `out` has capacity.
     #[inline]
-    fn collect_classes(&self, g_id: u16, sid: u64, out: &mut Vec<u64>) {
+    fn collect_classes(&self, g_id: fluree_db_core::GraphId, sid: u64, out: &mut Vec<u64>) {
         out.clear();
         match self {
             Self::Bitset(b) => {
@@ -551,7 +565,7 @@ impl ClassMembership {
         let mut type_entries = 0u64;
         let mut sidecar_bytes = 0u64;
         let mut distinct_classes = FxHashSet::default();
-        let mut buf = [0u8; 18];
+        let mut buf = [0u8; TYPES_RECORD_BYTES];
 
         if scratch_dir.exists() {
             std::fs::remove_dir_all(scratch_dir)?;
@@ -575,7 +589,7 @@ impl ClassMembership {
             let remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
             let file = std::fs::File::open(types_map_path)?;
             let file_bytes = file.metadata()?.len();
-            let entry_count = file_bytes / 18;
+            let entry_count = file_bytes / TYPES_RECORD_BYTES as u64;
             sidecar_files += 1;
             type_entries += entry_count;
             sidecar_bytes += file_bytes;
@@ -583,9 +597,7 @@ impl ClassMembership {
 
             for _ in 0..entry_count {
                 reader.read_exact(&mut buf)?;
-                let g_id = u16::from_le_bytes([buf[0], buf[1]]);
-                let s_local = u64::from_le_bytes(buf[2..10].try_into().unwrap());
-                let c_local = u64::from_le_bytes(buf[10..18].try_into().unwrap());
+                let (g_id, s_local, c_local) = decode_types_record(&buf);
                 let s_global = remap.get(s_local as usize)?;
                 let c_global = remap.get(c_local as usize)?;
                 distinct_classes.insert(c_global);
@@ -733,13 +745,13 @@ impl ClassMembership {
     /// Used by the full rebuild path (`rebuild.rs`) where `.types` sidecars are
     /// written after chunk-local → global remapping (no `MmapSubjectRemap` needed).
     ///
-    /// Wire format: 18 bytes per entry — `(g_id: u16 LE, s_id: u64 LE, class_sid64: u64 LE)`.
+    /// Wire format: [`TYPES_RECORD_BYTES`] per entry.
     pub fn build_from_global_types(types_paths: &[PathBuf]) -> io::Result<Option<Self>> {
         use std::io::{BufReader, Read};
 
         let mut builder = ClassMembershipBuilder::new();
         let mut saw_sidecar = false;
-        let mut buf = [0u8; 18];
+        let mut buf = [0u8; TYPES_RECORD_BYTES];
 
         for types_path in types_paths {
             if !types_path.exists() {
@@ -747,14 +759,12 @@ impl ClassMembership {
             }
             saw_sidecar = true;
             let file = std::fs::File::open(types_path)?;
-            let entry_count = file.metadata()?.len() / 18;
+            let entry_count = file.metadata()?.len() / TYPES_RECORD_BYTES as u64;
             let mut reader = BufReader::new(file);
 
             for _ in 0..entry_count {
                 reader.read_exact(&mut buf)?;
-                let g_id = u16::from_le_bytes([buf[0], buf[1]]);
-                let s_global = u64::from_le_bytes(buf[2..10].try_into().unwrap());
-                let c_global = u64::from_le_bytes(buf[10..18].try_into().unwrap());
+                let (g_id, s_global, c_global) = decode_types_record(&buf);
                 builder.add(g_id, s_global, c_global);
             }
         }
@@ -774,9 +784,9 @@ impl ClassMembership {
 struct ClassMembershipBuilder {
     class_to_bit: FxHashMap<u64, u8>,
     bit_to_class: Vec<u64>,
-    graph_bitsets: FxHashMap<u16, FxHashMap<u16, Vec<u64>>>,
+    graph_bitsets: FxHashMap<fluree_db_core::GraphId, FxHashMap<u16, Vec<u64>>>,
     /// `Some` once promoted to sparse mode: `(g_id, s_global)` → class list.
-    sparse: Option<FxHashMap<(u16, u64), Vec<u64>>>,
+    sparse: Option<FxHashMap<(fluree_db_core::GraphId, u64), Vec<u64>>>,
     /// Distinct classes seen after promotion (seeded from `bit_to_class`).
     sparse_classes: FxHashSet<u64>,
 }
@@ -793,7 +803,7 @@ impl ClassMembershipBuilder {
     }
 
     #[inline]
-    fn add(&mut self, g_id: u16, s_global: u64, c_global: u64) {
+    fn add(&mut self, g_id: fluree_db_core::GraphId, s_global: u64, c_global: u64) {
         if let Some(sparse) = self.sparse.as_mut() {
             sparse.entry((g_id, s_global)).or_default().push(c_global);
             self.sparse_classes.insert(c_global);
@@ -828,7 +838,7 @@ impl ClassMembershipBuilder {
     /// switch into sparse mode. One-time O(subjects-seen) cost, paid only on
     /// ledgers that exceed 64 classes.
     fn promote_to_sparse(&mut self) {
-        let mut sparse: FxHashMap<(u16, u64), Vec<u64>> = FxHashMap::default();
+        let mut sparse: FxHashMap<(fluree_db_core::GraphId, u64), Vec<u64>> = FxHashMap::default();
         for (&g_id, ns_map) in &self.graph_bitsets {
             for (&ns_code, vec) in ns_map {
                 for (local_id, &bits) in vec.iter().enumerate() {
@@ -855,7 +865,8 @@ impl ClassMembershipBuilder {
     fn finish(self) -> ClassMembership {
         if let Some(sparse) = self.sparse {
             let distinct_classes = self.sparse_classes.len();
-            let mut membership: FxHashMap<(u16, u64), Box<[u64]>> = FxHashMap::default();
+            let mut membership: FxHashMap<(fluree_db_core::GraphId, u64), Box<[u64]>> =
+                FxHashMap::default();
             membership.reserve(sparse.len());
             for (key, mut classes) in sparse {
                 classes.sort_unstable();
@@ -903,7 +914,7 @@ const MAX_CLASS_REF_LEAF_ENTRIES: usize = 64_000_000;
 pub struct SpotClassStatsCollector {
     rdf_type_p_id: u32,
     current_s_id: Option<u64>,
-    current_g_id: u16,
+    current_g_id: fluree_db_core::GraphId,
     classes: Vec<u64>,
     prop_dts: FxHashMap<(u32, u16), u64>,
     prop_langs: FxHashMap<(u32, u16), u64>,
@@ -1377,7 +1388,7 @@ pub fn build_indexes_from_commits(
 /// Cross-chunk duplicate copies the SPOT merge collapsed, keyed `(g_id, p_id,
 /// o_type, inner predicate)`; the inner predicate is a triple-term row's and
 /// 0 for every other row.
-type DuplicateTally = FxHashMap<(u16, u32, u16, u32), u64>;
+type DuplicateTally = FxHashMap<(fluree_db_core::GraphId, u32, u16, u32), u64>;
 
 struct SpotBuild {
     result: IndexBuildResult,
@@ -1617,7 +1628,7 @@ fn term_ctx_for(commit: &CommitInput, config: &BuildConfig) -> io::Result<Option
 fn pump_spot_merge<T, F>(
     merge: &mut KWayMerge<T, F>,
     writer: &mut PersistingLeafWriter,
-    restamp: Option<u16>,
+    restamp: Option<fluree_db_core::GraphId>,
     mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
     progress: Option<&AtomicU64>,
     duplicates: &mut DuplicateTally,
@@ -2082,7 +2093,7 @@ mod tests {
     /// requires identical, correctly-keyed stats.
     #[test]
     fn spot_hierarchical_matches_flat_stats_nonzero_graph() {
-        const G: u16 = 5;
+        const G: fluree_db_core::GraphId = 5;
         const TYPE_P: u32 = 7;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2152,7 +2163,8 @@ mod tests {
         // Membership keyed under g_id 5 so ref-target class resolution only
         // succeeds when the collector sees correctly-stamped records.
         let types_path = dir.path().join("global.types");
-        let entries: Vec<(u16, u64, u64)> = (0..200u64).map(|s| (G, s, 1000 + s % 3)).collect();
+        let entries: Vec<(fluree_db_core::GraphId, u64, u64)> =
+            (0..200u64).map(|s| (G, s, 1000 + s % 3)).collect();
         write_types_sidecar(&types_path, &entries);
 
         let build = |tag: &str, plan: &FdPlan| {
@@ -2206,8 +2218,11 @@ mod tests {
         assert_eq!(flat_stats.class_prop_refs, hier_stats.class_prop_refs);
     }
 
-    /// Helper: write `.types` sidecar entries (g_id: u16, s_id: u64, class_sid64: u64).
-    fn write_types_sidecar(path: &std::path::Path, entries: &[(u16, u64, u64)]) {
+    /// Helper: write `.types` sidecar entries (g_id, s_id, class_sid64).
+    fn write_types_sidecar(
+        path: &std::path::Path,
+        entries: &[(fluree_db_core::GraphId, u64, u64)],
+    ) {
         use std::io::Write;
         let mut file = std::fs::File::create(path).unwrap();
         for (g_id, s_id, c_id) in entries {
@@ -2311,11 +2326,11 @@ mod tests {
 
             // ~500 subjects spraying across many (but not all) buckets, with
             // interleaved revisits so evicted buckets are reopened mid-pass.
-            let entries0: Vec<(u16, u64, u64)> = (0..500u64)
-                .map(|s| (0u16, s * 7 % 1500, 1000 + s % 70))
+            let entries0: Vec<(fluree_db_core::GraphId, u64, u64)> = (0..500u64)
+                .map(|s| (0u32, s * 7 % 1500, 1000 + s % 70))
                 .collect();
-            let entries1: Vec<(u16, u64, u64)> = (0..500u64)
-                .map(|s| (0u16, s * 13 % 1500, 1000 + s % 90))
+            let entries1: Vec<(fluree_db_core::GraphId, u64, u64)> = (0..500u64)
+                .map(|s| (0u32, s * 13 % 1500, 1000 + s % 90))
                 .collect();
             write_types_sidecar(&types0, &entries0);
             write_types_sidecar(&types1, &entries1);
@@ -2410,7 +2425,7 @@ mod tests {
 
         // 65 distinct classes, one unique subject each. The old bitset capped at
         // 64 and dropped the 65th; the sparse promotion must retain ALL of them.
-        let mut entries: Vec<(u16, u64, u64)> = Vec::new();
+        let mut entries: Vec<(fluree_db_core::GraphId, u64, u64)> = Vec::new();
         for class_idx in 0u64..65 {
             entries.push((0, class_idx + 1, 10_000 + class_idx));
         }
@@ -2448,7 +2463,7 @@ mod tests {
         // classes force promotion, then subject 1 gets another class (sparse
         // mode). After promotion the early bitset bit must be carried over so
         // subject 1 ends up with BOTH classes.
-        let mut entries: Vec<(u16, u64, u64)> = vec![(0, 1, 500)];
+        let mut entries: Vec<(fluree_db_core::GraphId, u64, u64)> = vec![(0, 1, 500)];
         for class_idx in 0u64..64 {
             entries.push((0, 1000 + class_idx, 20_000 + class_idx));
         }

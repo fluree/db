@@ -296,16 +296,29 @@ pub fn encode_leaflet(
         }
     }
 
-    // Pooled trees carry each row's graph.
+    // Pooled trees carry each row's graph, two bytes wide unless this
+    // leaflet holds a graph id past u16.
     if order.is_pooled() {
-        let g_ids: Vec<u16> = records.iter().map(|r| r.g_id).collect();
-        append_column_u16(
-            &mut payload,
-            &mut column_refs,
-            ColumnId::GId,
-            &g_ids,
-            zstd_level,
-        )?;
+        let narrow: Option<Vec<u16>> = records.iter().map(|r| u16::try_from(r.g_id).ok()).collect();
+        match narrow {
+            Some(g_ids) => append_column_u16(
+                &mut payload,
+                &mut column_refs,
+                ColumnId::GId,
+                &g_ids,
+                zstd_level,
+            )?,
+            None => {
+                let g_ids: Vec<u32> = records.iter().map(|r| r.g_id).collect();
+                append_column_u32(
+                    &mut payload,
+                    &mut column_refs,
+                    ColumnId::GId,
+                    &g_ids,
+                    zstd_level,
+                )?;
+            }
+        }
     }
 
     // Optional o_i column (only if any row has a list index).

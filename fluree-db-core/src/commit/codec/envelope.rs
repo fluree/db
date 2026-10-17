@@ -15,8 +15,8 @@ use super::varint::{
     decode_varint, encode_varint, read_exact, read_u8, zigzag_decode, zigzag_encode,
 };
 use crate::ns_encoding::NsSplitMode;
-use crate::ContentId;
 use crate::{CommitId, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_ENTRIES};
+use crate::{ContentId, GraphId};
 use std::collections::HashMap;
 
 // --- Presence flag bits ---
@@ -32,8 +32,9 @@ const FLAG_TXN_SIGNATURE: u8 = 0x80;
 const KNOWN_FLAGS: u8 =
     FLAG_TXN_META | FLAG_PARENT | FLAG_NAMESPACE_DELTA | FLAG_TXN | FLAG_TIME | FLAG_TXN_SIGNATURE;
 
-/// Maximum number of named graph entries per commit.
-pub const MAX_GRAPH_DELTA_ENTRIES: usize = 256;
+/// Maximum number of named graph entries per commit: one bulk-import file can
+/// introduce a whole document collection's graphs.
+pub const MAX_GRAPH_DELTA_ENTRIES: usize = 1 << 20;
 
 /// Maximum length of a graph IRI in bytes.
 pub const MAX_GRAPH_IRI_LENGTH: usize = 8192;
@@ -68,7 +69,7 @@ pub struct CodecEnvelope {
     /// User-provided transaction metadata (replay-safe)
     pub txn_meta: Vec<TxnMetaEntry>,
     /// Named graph IRI to g_id mappings introduced by this commit.
-    pub graph_delta: HashMap<u16, String>,
+    pub graph_delta: HashMap<GraphId, String>,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<NsSplitMode>,
@@ -457,10 +458,10 @@ fn decode_ns_delta(data: &[u8], pos: &mut usize) -> Result<HashMap<u16, String>,
 }
 
 // =============================================================================
-// graph_delta (HashMap<u16, String>)
+// graph_delta (HashMap<GraphId, String>)
 // =============================================================================
 
-fn encode_graph_delta(delta: &HashMap<u16, String>, buf: &mut Vec<u8>) {
+fn encode_graph_delta(delta: &HashMap<GraphId, String>, buf: &mut Vec<u8>) {
     encode_varint(delta.len() as u64, buf);
     let mut entries: Vec<_> = delta.iter().collect();
     entries.sort_by_key(|(g_id, _)| **g_id);
@@ -473,12 +474,17 @@ fn encode_graph_delta(delta: &HashMap<u16, String>, buf: &mut Vec<u8>) {
 fn decode_graph_delta(
     data: &[u8],
     pos: &mut usize,
-) -> Result<HashMap<u16, String>, CommitCodecError> {
+) -> Result<HashMap<GraphId, String>, CommitCodecError> {
     let count = decode_varint(data, pos)? as usize;
-    let mut map = HashMap::with_capacity(count);
+    if count > MAX_GRAPH_DELTA_ENTRIES {
+        return Err(CommitCodecError::LimitExceeded(format!(
+            "graph_delta has {count} entries, max is {MAX_GRAPH_DELTA_ENTRIES}"
+        )));
+    }
+    let mut map = HashMap::with_capacity(count.min(4096));
     for _ in 0..count {
         let raw = decode_varint(data, pos)?;
-        let g_id = u16::try_from(raw).map_err(|_| CommitCodecError::GIdOutOfRange(raw))?;
+        let g_id = GraphId::try_from(raw).map_err(|_| CommitCodecError::GIdOutOfRange(raw))?;
         let iri = decode_len_str(data, pos)?;
         map.insert(g_id, iri);
     }
@@ -728,6 +734,26 @@ mod tests {
             d.graph_delta.get(&2),
             Some(&"http://example.org/graph/products".to_string())
         );
+    }
+
+    /// Graph ids past 16 bits round-trip; a count past the cap is refused
+    /// before anything is allocated for it.
+    #[test]
+    fn graph_delta_ids_are_32_bit_and_counts_are_capped() {
+        let mut commit = make_minimal_commit();
+        commit.graph_delta = HashMap::from([(70_000, "http://example.org/g70000".into())]);
+        let mut buf = Vec::new();
+        encode_envelope(&commit, &mut buf).unwrap();
+        let d = decode_envelope(&buf).unwrap();
+        assert_eq!(
+            d.graph_delta.get(&70_000).map(String::as_str),
+            Some("http://example.org/g70000")
+        );
+
+        let mut over = Vec::new();
+        encode_varint(MAX_GRAPH_DELTA_ENTRIES as u64 + 1, &mut over);
+        let err = decode_graph_delta(&over, &mut 0).unwrap_err();
+        assert!(err.to_string().contains("graph_delta has"), "{err}");
     }
 
     #[test]

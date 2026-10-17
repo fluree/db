@@ -790,7 +790,7 @@ struct OutRows {
     o_type: Vec<u16>,
     o_i: Vec<u32>,
     t: Vec<u32>,
-    g_id: Option<Vec<u16>>,
+    g_id: Option<Vec<fluree_db_core::GraphId>>,
 }
 
 impl OutRows {

@@ -335,7 +335,7 @@ impl SequentialStager {
         for (g_id, iri) in self.sim_registry.iter_entries() {
             reverse_graph.insert(ns_registry.sid_for_iri(iri), g_id);
         }
-        let mut graph_delta: FxHashMap<u16, String> = FxHashMap::default();
+        let mut graph_delta: FxHashMap<fluree_db_core::GraphId, String> = FxHashMap::default();
         for iri in &self.merged_graph_iris {
             if let Some(g_id) = self.sim_registry.graph_id_for_iri(iri) {
                 graph_delta.insert(g_id, iri.clone());
@@ -579,7 +579,7 @@ fn validate_staged_reasoning_modes(
 #[cfg(feature = "shacl")]
 fn build_per_graph_shacl_policy(
     config: &LedgerConfig,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_delta: &FxHashMap<fluree_db_core::GraphId, String>,
     requested_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
     request_identity: Option<&fluree_db_core::VerifiedIdentity>,
 ) -> Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>> {
@@ -649,7 +649,7 @@ pub(crate) struct StagedShaclContext<'a> {
     /// Per-`GraphId` IRI map from the transaction. Used only for resolving
     /// per-graph SHACL config overlays. Pass `None` when txn graph metadata
     /// is unavailable (Turtle insert, commit replay).
-    pub graph_delta: Option<&'a FxHashMap<u16, String>>,
+    pub graph_delta: Option<&'a FxHashMap<fluree_db_core::GraphId, String>>,
 
     /// Optional tracker for SHACL fuel accounting during validation.
     pub tracker: Option<&'a fluree_db_core::Tracker>,
@@ -1047,9 +1047,9 @@ pub(crate) fn resolve_shapes_source_g_ids(
     }
 
     let g_id = match source.graph_selector.as_deref() {
-        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-        None => Some(0u16),
+        None => Some(0),
     };
 
     match g_id {
@@ -1116,7 +1116,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 Some(cfg) if cfg.enabled => {
                     let mut m = HashMap::new();
                     m.insert(
-                        0u16,
+                        0,
                         fluree_db_transact::ShaclGraphPolicy {
                             mode: cfg.validation_mode,
                         },
@@ -1227,7 +1227,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 ));
                 vec![fluree_db_core::GraphDbRef::new(
                     &base.snapshot,
-                    0u16,
+                    0,
                     cl_overlay_holder.as_ref().expect("just set above"),
                     base.t(),
                 )]
@@ -1277,7 +1277,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         ));
         shape_dbs.push(fluree_db_core::GraphDbRef::new(
             &base.snapshot,
-            0u16,
+            0,
             inline_overlay_holder.as_ref().expect("just set above"),
             base.t(),
         ));
@@ -1535,7 +1535,7 @@ async fn stage_with_config_shacl(
         StagedLedger,
         NamespaceRegistry,
         bool,
-        FxHashMap<u16, String>,
+        FxHashMap<fluree_db_core::GraphId, String>,
     ),
     fluree_db_transact::TransactError,
 > {
@@ -1671,7 +1671,7 @@ async fn stage_with_config_shacl(
 /// instance — the staging path always has it on `&self`.
 async fn enforce_unique_after_staging(
     view: &StagedLedger,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_delta: &FxHashMap<fluree_db_core::GraphId, String>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     inline_unique_properties: Option<&[String]>,
     staged_ns: &NamespaceRegistry,
@@ -1760,7 +1760,7 @@ fn affected_graph_ids(view: &StagedLedger) -> FxHashSet<GraphId> {
 async fn resolve_per_graph_unique_sids(
     view: &StagedLedger,
     config: &LedgerConfig,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_delta: &FxHashMap<fluree_db_core::GraphId, String>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
@@ -1792,7 +1792,7 @@ async fn resolve_per_graph_unique_sids(
 
         if transact_config.constraints_sources.is_empty() {
             // Default: annotations in the default graph (g_id=0)
-            let annotations = read_enforce_unique_from_graph(view, 0u16).await?;
+            let annotations = read_enforce_unique_from_graph(view, 0).await?;
             unique_sids.extend(annotations);
         } else {
             let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
@@ -1905,9 +1905,9 @@ fn resolve_constraint_source_g_ids_for(
         }
 
         let g_id = match source.graph_selector.as_deref() {
-            Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
+            Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0),
             Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-            None => Some(0u16), // no selector → default graph
+            None => Some(0), // no selector → default graph
         };
         match g_id {
             Some(id) => g_ids.push(id),
@@ -1975,7 +1975,7 @@ async fn read_enforce_unique_from_graph(
 async fn enforce_unique_constraints(
     view: &StagedLedger,
     per_graph_unique: &HashMap<GraphId, FxHashSet<Sid>>,
-    graph_delta: &FxHashMap<u16, String>,
+    graph_delta: &FxHashMap<fluree_db_core::GraphId, String>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     // Fast path: nothing configured
     if per_graph_unique.is_empty() {
@@ -2174,7 +2174,7 @@ pub struct StageResult {
     /// User-provided transaction metadata (extracted from envelope-form JSON-LD)
     pub txn_meta: Vec<TxnMetaEntry>,
     /// Named graph IRI to g_id mappings introduced by this transaction
-    pub graph_delta: rustc_hash::FxHashMap<u16, String>,
+    pub graph_delta: rustc_hash::FxHashMap<fluree_db_core::GraphId, String>,
     /// Graph-sync target, when this was a sync transaction (see
     /// [`fluree_db_transact::Txn::sync_graph`]). A sync that stages zero
     /// flakes is a legitimate no-change outcome, so the commit paths skip
@@ -2434,7 +2434,7 @@ fn stage_options<'a>(
 struct CheckedStage {
     view: StagedLedger,
     ns_registry: NamespaceRegistry,
-    graph_delta: FxHashMap<u16, String>,
+    graph_delta: FxHashMap<fluree_db_core::GraphId, String>,
     /// SHACL validation or uniqueness enforcement ran, so the stage read
     /// beyond the subjects the transaction names.
     governed: bool,
@@ -2916,7 +2916,7 @@ impl crate::Fluree {
         NamespaceRegistry,
         WriteScope,
         Vec<TxnMetaEntry>,
-        FxHashMap<u16, String>,
+        FxHashMap<fluree_db_core::GraphId, String>,
     )> {
         // Adopt any namespace allocations the lowering step already made
         // (e.g. `lower_sparql_update` allocates IRIs against a caller-owned

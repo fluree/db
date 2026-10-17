@@ -668,7 +668,7 @@ pub struct Staged {
     /// envelope delta (namespace codes + graph IRIs) to the snapshot clone,
     /// ensuring `decode_sid` works for SIDs referencing new namespaces or
     /// graphs introduced by the staged transaction.
-    pub graph_delta: rustc_hash::FxHashMap<u16, String>,
+    pub graph_delta: rustc_hash::FxHashMap<fluree_db_core::GraphId, String>,
 }
 
 impl std::fmt::Debug for Staged {

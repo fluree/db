@@ -196,7 +196,7 @@ pub(crate) struct Fir6Inputs {
     pub uploaded_dicts: UploadedDicts,
     pub v3_uploaded: UploadedIndexes,
     /// Named graphs built into the pooled tree (`v3_uploaded.pool_orders`).
-    pub pooled_graphs: Vec<u16>,
+    pub pooled_graphs: Vec<fluree_db_core::GraphId>,
     pub graph_arenas: Vec<GraphArenaRefs>,
     pub datatype_iris: Vec<String>,
     pub language_tags: Vec<String>,

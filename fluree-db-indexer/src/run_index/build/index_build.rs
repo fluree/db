@@ -93,7 +93,7 @@ pub struct IndexBuildConfig {
     /// Graph ID for all records. Required because V2 run files (FRN2) do
     /// not carry g_id on the wire — the pipeline must be graph-scoped by
     /// construction (per-graph run directories + per-graph build calls).
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Shared progress counter.
     pub progress: Option<Arc<AtomicU64>>,
     /// Max run files the k-way merge may hold open simultaneously. Run counts
@@ -333,7 +333,11 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
 // Helpers
 // ============================================================================
 
-fn create_graph_dir(index_dir: &Path, g_id: u16, order_name: &str) -> io::Result<PathBuf> {
+fn create_graph_dir(
+    index_dir: &Path,
+    g_id: fluree_db_core::GraphId,
+    order_name: &str,
+) -> io::Result<PathBuf> {
     let graph_dir = index_dir.join(format!("graph_{g_id}/{order_name}"));
     std::fs::create_dir_all(&graph_dir)?;
     Ok(graph_dir)
@@ -654,7 +658,7 @@ pub struct BuildAllConfig {
     pub import_unique_asserts: bool,
     pub skip_history: bool,
     /// Graph ID — builds are graph-scoped (run files don't carry g_id).
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     pub progress: Option<Arc<AtomicU64>>,
     /// Max number of orders to build concurrently. Each order is an independent
     /// single-threaded k-way merge + leaf-encode pipeline over disjoint input
@@ -846,7 +850,14 @@ mod tests {
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
 
-    fn make_rec(g_id: u16, s_id: u64, p_id: u32, o_type: u16, o_key: u64, t: u32) -> RunRecordV2 {
+    fn make_rec(
+        g_id: fluree_db_core::GraphId,
+        s_id: u64,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+        t: u32,
+    ) -> RunRecordV2 {
         RunRecordV2 {
             s_id: SubjectId(s_id),
             o_key,

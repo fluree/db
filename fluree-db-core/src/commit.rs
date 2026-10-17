@@ -16,7 +16,7 @@
 pub mod codec;
 
 use crate::error::{Error, Result};
-use crate::{CommitId, ContentId, ContentStore, Flake};
+use crate::{CommitId, ContentId, ContentStore, Flake, GraphId};
 use codec::format::CommitSignature;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -217,7 +217,7 @@ pub struct Commit {
     /// - `0`: default graph
     /// - `1`: txn-meta graph (`#txn-meta`)
     /// - `2+`: user-defined named graphs
-    pub graph_delta: HashMap<u16, String>,
+    pub graph_delta: HashMap<GraphId, String>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set in the genesis commit; absent in subsequent commits.
@@ -360,7 +360,7 @@ pub struct CommitEnvelope {
     /// graph has ever been registered without paying for a full ops fetch.
     /// Used by `ApiFulltextConfigProvider` to short-circuit when the config
     /// graph was never registered anywhere in the chain.
-    pub graph_delta: HashMap<u16, String>,
+    pub graph_delta: HashMap<GraphId, String>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.

@@ -43,8 +43,8 @@ pub const RECORD_V2_WIRE_SIZE: usize = 30;
 /// Import uses `RECORD_V2_WIRE_SIZE` (no op, all records are asserts).
 pub const RECORD_V2_WITH_OP_WIRE_SIZE: usize = 31;
 
-/// Wire format size of a V2 spool record (includes g_id).
-pub const SPOOL_V2_WIRE_SIZE: usize = 32;
+/// Wire format size of a V2 spool record (includes a `u32` g_id).
+pub const SPOOL_V2_WIRE_SIZE: usize = 34;
 
 /// V2 run record — `o_type` replaces `(o_kind, dt, lang_id)`.
 ///
@@ -76,18 +76,18 @@ pub struct RunRecordV2 {
     pub o_i: u32,
     /// Unified type tag (OType).
     pub o_type: u16,
-    /// Graph ID (0 = default graph). In-memory only; not in run wire format.
-    pub g_id: u16,
+    /// Graph ID (0 = default graph). Only pooled run files carry it.
+    pub g_id: fluree_db_core::GraphId,
 }
 
-// Verify size: 8 + 8 + 4 + 4 + 4 + 2 + 2 = 32 bytes.
-const _: () = assert!(std::mem::size_of::<RunRecordV2>() == 32);
+// Verify size: 8 + 8 + 4 + 4 + 4 + 2 + 4, padded to 40 bytes.
+const _: () = assert!(std::mem::size_of::<RunRecordV2>() == 40);
 
 impl RunRecordV2 {
     /// Create a new V2 record with all fields.
     #[inline]
     pub fn new(
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         s_id: SubjectId,
         p_id: u32,
         o_type: OType,
@@ -193,35 +193,35 @@ impl RunRecordV2 {
         (record, buf[30])
     }
 
-    /// Serialize to spool wire format (32 bytes, includes g_id).
+    /// Serialize to spool wire format (34 bytes, includes g_id).
     #[inline]
     pub fn write_spool_le(&self, buf: &mut [u8; SPOOL_V2_WIRE_SIZE]) {
-        buf[0..2].copy_from_slice(&self.g_id.to_le_bytes());
-        buf[2..10].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
-        buf[10..18].copy_from_slice(&self.o_key.to_le_bytes());
-        buf[18..22].copy_from_slice(&self.p_id.to_le_bytes());
-        buf[22..26].copy_from_slice(&self.t.to_le_bytes());
-        buf[26..30].copy_from_slice(&self.o_i.to_le_bytes());
-        buf[30..32].copy_from_slice(&self.o_type.to_le_bytes());
+        buf[0..4].copy_from_slice(&self.g_id.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
+        buf[12..20].copy_from_slice(&self.o_key.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.p_id.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.t.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.o_i.to_le_bytes());
+        buf[32..34].copy_from_slice(&self.o_type.to_le_bytes());
     }
 
-    /// Deserialize from spool wire format (32 bytes, includes g_id).
+    /// Deserialize from spool wire format (34 bytes, includes g_id).
     #[inline]
     pub fn read_spool_le(buf: &[u8; SPOOL_V2_WIRE_SIZE]) -> Self {
         Self {
-            g_id: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
-            s_id: SubjectId(u64::from_le_bytes(buf[2..10].try_into().unwrap())),
-            o_key: u64::from_le_bytes(buf[10..18].try_into().unwrap()),
-            p_id: u32::from_le_bytes(buf[18..22].try_into().unwrap()),
-            t: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
-            o_i: u32::from_le_bytes(buf[26..30].try_into().unwrap()),
-            o_type: u16::from_le_bytes(buf[30..32].try_into().unwrap()),
+            g_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            s_id: SubjectId(u64::from_le_bytes(buf[4..12].try_into().unwrap())),
+            o_key: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            p_id: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            t: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            o_i: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+            o_type: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
         }
     }
 }
 
 /// Run-file record layout for one file: the 30-byte record, then `g_id`
-/// (u16 LE) when the file's order is pooled, then the op byte when the file
+/// (u32 LE) when the file's order is pooled, then the op byte when the file
 /// carries ops. Dedicated orders keep the 30/31-byte layouts above, so their
 /// run files are unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +242,7 @@ impl RunRecordLayout {
     /// Bytes per record.
     #[inline]
     pub fn size(self) -> usize {
-        RECORD_V2_WIRE_SIZE + if self.pooled { 2 } else { 0 } + usize::from(self.with_op)
+        RECORD_V2_WIRE_SIZE + if self.pooled { 4 } else { 0 } + usize::from(self.with_op)
     }
 
     /// Encode `rec` (and `op`, when the layout carries ops) into `buf`.
@@ -251,8 +251,8 @@ impl RunRecordLayout {
         rec.write_run_le((&mut buf[..RECORD_V2_WIRE_SIZE]).try_into().unwrap());
         let mut at = RECORD_V2_WIRE_SIZE;
         if self.pooled {
-            buf[at..at + 2].copy_from_slice(&rec.g_id.to_le_bytes());
-            at += 2;
+            buf[at..at + 4].copy_from_slice(&rec.g_id.to_le_bytes());
+            at += 4;
         }
         if self.with_op {
             buf[at] = op;
@@ -265,8 +265,8 @@ impl RunRecordLayout {
         let mut rec = RunRecordV2::read_run_le(buf[..RECORD_V2_WIRE_SIZE].try_into().unwrap());
         let mut at = RECORD_V2_WIRE_SIZE;
         if self.pooled {
-            rec.g_id = u16::from_le_bytes(buf[at..at + 2].try_into().unwrap());
-            at += 2;
+            rec.g_id = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            at += 4;
         }
         let op = if self.with_op { buf[at] } else { 1 };
         (rec, op)
@@ -521,7 +521,7 @@ pub fn write_ordered_key_v2(
     rec: &RunRecordV2,
     buf: &mut [u8; ORDERED_KEY_V2_SIZE],
 ) {
-    let g = u32::from(rec.g_id).to_be_bytes();
+    let g = rec.g_id.to_be_bytes();
     match order {
         RunSortOrder::Gspo => {
             buf[0..4].copy_from_slice(&g);
@@ -548,12 +548,12 @@ pub fn read_ordered_key_v2(order: RunSortOrder, buf: &[u8; ORDERED_KEY_V2_SIZE])
     match order {
         RunSortOrder::Gspo => {
             let mut rec = read_base_key(RunSortOrder::Spot, &buf[4..30]);
-            rec.g_id = g_at(0) as u16;
+            rec.g_id = g_at(0);
             rec
         }
         o if o.is_pooled() => {
             let mut rec = read_base_key(o.base(), &buf[0..26]);
-            rec.g_id = g_at(26) as u16;
+            rec.g_id = g_at(26);
             rec
         }
         o => read_base_key(o, &buf[0..26]),
@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(v2.g_id, v1.g_id);
     }
 
-    fn in_graph(mut rec: RunRecordV2, g_id: u16) -> RunRecordV2 {
+    fn in_graph(mut rec: RunRecordV2, g_id: fluree_db_core::GraphId) -> RunRecordV2 {
         rec.g_id = g_id;
         rec
     }
@@ -767,7 +767,7 @@ mod tests {
             in_graph(make_rec(1, 1, int, 5, 0, 1), 3),
             in_graph(make_rec(2, 1, int, 5, LIST_INDEX_NONE, 1), 3),
             in_graph(make_rec(1, 2, int, 4, LIST_INDEX_NONE, 1), 300),
-            in_graph(make_rec(0, 9, string, 1, LIST_INDEX_NONE, 1), u16::MAX),
+            in_graph(make_rec(0, 9, string, 1, LIST_INDEX_NONE, 1), u32::MAX),
             in_graph(make_rec(u64::MAX, 0, 0, u64::MAX, LIST_INDEX_NONE, 1), 0),
         ];
         for &order in RunSortOrder::pool_build_orders() {

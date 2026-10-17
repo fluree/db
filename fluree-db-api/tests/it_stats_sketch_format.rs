@@ -192,7 +192,7 @@ fn encode_v1(blob: &HllSketchBlob) -> Vec<u8> {
     .unwrap()
 }
 
-type UserStats = BTreeMap<(u16, u32), (u64, u64, u64, i64, Vec<(u8, u64)>)>;
+type UserStats = BTreeMap<(fluree_db_core::GraphId, u32), (u64, u64, u64, i64, Vec<(u8, u64)>)>;
 
 /// Per-(graph, property) stats for the default graph and every user named
 /// graph: count, ndv values, ndv subjects, last modified t, datatypes.

@@ -26,7 +26,7 @@ fn find_roots(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Named graphs with a dedicated tree, excluding the system graphs.
-fn dedicated_user_graphs(root: &IndexRoot) -> Vec<u16> {
+fn dedicated_user_graphs(root: &IndexRoot) -> Vec<fluree_db_core::GraphId> {
     root.named_graphs
         .iter()
         .map(|ng| ng.g_id)
@@ -1022,5 +1022,76 @@ async fn pooled_graphs_answer_every_shape_like_unindexed_data() {
         "after promotion",
         &differential_rows(&fluree, pooled).await,
         &want,
+    );
+}
+
+/// Graph ids past 16 bits, end to end: 70,000 imported graphs pool, answer
+/// by id and through `GRAPH ?g`, take a write over the pooled base, promote,
+/// and a new graph past the old limit indexes too.
+#[tokio::test]
+async fn graph_ids_past_16_bits_import_write_and_index() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/wide-graph-ids:main";
+    let mut trig = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..70_000 {
+        trig.push_str(&format!("ex:g{i} {{ ex:s{i} ex:val {i} . }}\n"));
+    }
+    let (fluree, ledger) = import_trig(db_dir.path(), data_dir.path(), ledger_id, &trig).await;
+    let pool = latest_root(db_dir.path()).pool.expect("pooled");
+    assert!(pool.graphs.iter().any(|&g| g > u32::from(u16::MAX)));
+
+    let in_graph =
+        |i: u32| format!("{PREFIXES}SELECT ?s ?v WHERE {{ GRAPH ex:g{i} {{ ?s ex:val ?v }} }}");
+    assert_eq!(
+        select(&fluree, &ledger, &in_graph(69_999)).await,
+        vec!["s=http://example.org/s69999 v=69999"]
+    );
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?g WHERE {{ GRAPH ?g {{ ?s ex:val 69999 }} }}")
+        )
+        .await,
+        vec!["g=http://example.org/g69999"]
+    );
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g69998 { ex:extra ex:val 1 . }
+                       GRAPH ex:brand-new { ex:n ex:val 2 . } }",
+    )
+    .await;
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let both = vec![
+        "s=http://example.org/extra v=1",
+        "s=http://example.org/s69998 v=69998",
+    ];
+    assert_eq!(
+        select(&fluree, &ledger, &in_graph(69_998)).await,
+        both,
+        "over the pool"
+    );
+
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    let dedicated = dedicated_user_graphs(&root);
+    assert_eq!(dedicated.len(), 2, "the promoted graph and the new one");
+    assert!(dedicated.iter().all(|&g| g > u32::from(u16::MAX)));
+    assert_eq!(
+        select(&fluree, &ledger, &in_graph(69_998)).await,
+        both,
+        "promoted"
+    );
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?s WHERE {{ GRAPH ex:brand-new {{ ?s ex:val 2 }} }}")
+        )
+        .await,
+        vec!["s=http://example.org/n"]
     );
 }

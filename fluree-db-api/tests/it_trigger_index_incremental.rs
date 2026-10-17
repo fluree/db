@@ -156,7 +156,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
             let p_amount_b = find_p_id(&v1, amount_b_iri);
 
             let numbig_cid = |root: &fluree_db_binary_index::format::index_root::IndexRoot,
-                              g_id: u16,
+                              g_id: fluree_db_core::GraphId,
                               p_id: u32|
              -> fluree_db_core::ContentId {
                 let ga = root

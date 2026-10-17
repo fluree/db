@@ -885,10 +885,10 @@ where
             // Collect all graph IDs: g_id 0 (default) + named graphs (1+).
             // Graph IRI list maps dict_index → graph IRI, where g_id = dict_index + 1
             // (g_id=0 is always the default graph, g_id=1 is always txn-meta).
-            let all_g_ids: Vec<u16> = {
-                let mut ids = vec![0u16]; // default graph
+            let all_g_ids: Vec<fluree_db_core::GraphId> = {
+                let mut ids = vec![0]; // default graph
                 for g_idx in 0..shared.graphs.len() {
-                    let g_id = (g_idx + 1) as u16;
+                    let g_id = (g_idx + 1) as fluree_db_core::GraphId;
                     if !ids.contains(&g_id) {
                         ids.push(g_id);
                     }
@@ -899,7 +899,7 @@ where
             // Small user named graphs share the pooled tree, built in one pass
             // with their history; the default graph, the system graphs and
             // large named graphs keep a tree each.
-            let user_g_ids: Vec<u16> = all_g_ids
+            let user_g_ids: Vec<fluree_db_core::GraphId> = all_g_ids
                 .iter()
                 .copied()
                 .filter(|&g| g >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
@@ -913,7 +913,7 @@ where
                     pooled_g_ids.iter().copied(),
                 ))
             });
-            let builds: Vec<(u16, Option<std::sync::Arc<_>>)> = all_g_ids
+            let builds: Vec<(fluree_db_core::GraphId, Option<std::sync::Arc<_>>)> = all_g_ids
                 .iter()
                 .copied()
                 .filter(|g| !pool.as_ref().is_some_and(|p| p.contains(*g)))
@@ -1312,12 +1312,12 @@ where
             let graph_arenas: Vec<GraphArenaRefs> = {
                 let mut graph_ids = std::collections::BTreeSet::new();
                 for g_id_str in uploaded_dicts.numbig.keys() {
-                    if let Ok(g_id) = g_id_str.parse::<u16>() {
+                    if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                         graph_ids.insert(g_id);
                     }
                 }
                 for g_id_str in uploaded_dicts.vectors.keys() {
-                    if let Ok(g_id) = g_id_str.parse::<u16>() {
+                    if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                         graph_ids.insert(g_id);
                     }
                 }

@@ -535,7 +535,7 @@ mod tests {
             // and lands at an address of its own.
             let manifest = fluree_db_binary_index::format::branch::build_branch_bytes(
                 fluree_db_binary_index::RunSortOrder::Spot,
-                t as u16,
+                t as fluree_db_core::GraphId,
                 &[],
             );
             let (branch_cid, branch_addr) =

@@ -272,7 +272,7 @@ struct PoolIndex {
 impl PoolIndex {
     #[inline]
     fn contains(&self, g_id: GraphId) -> bool {
-        self.member.get(usize::from(g_id)).copied().unwrap_or(false)
+        self.member.get(g_id as usize).copied().unwrap_or(false)
     }
 }
 
@@ -673,9 +673,9 @@ impl BinaryIndexStore {
                 }
                 let mut graphs = routing.graphs.clone();
                 graphs.sort_unstable();
-                let mut member = vec![false; graphs.last().map_or(0, |&g| usize::from(g) + 1)];
+                let mut member = vec![false; graphs.last().map_or(0, |&g| g as usize + 1)];
                 for &g in &graphs {
-                    member[usize::from(g)] = true;
+                    member[g as usize] = true;
                 }
                 Some(PoolIndex {
                     member,

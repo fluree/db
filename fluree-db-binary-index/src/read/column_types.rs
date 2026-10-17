@@ -110,7 +110,7 @@ pub struct ColumnBatch {
     pub t: ColumnData<u32>,
     /// Graph of each row — a column only in pooled-tree leaflets; dedicated
     /// trees leave it `AbsentDefault`.
-    pub g_id: ColumnData<u16>,
+    pub g_id: ColumnData<fluree_db_core::GraphId>,
 }
 
 impl ColumnBatch {
@@ -321,7 +321,7 @@ pub struct BinaryFilter {
     pub o_key: Option<u64>,
     pub o_i: Option<u32>,
     /// Graph to keep, for a scan of the pooled tree on behalf of one graph.
-    pub g_id: Option<u16>,
+    pub g_id: Option<fluree_db_core::GraphId>,
 }
 
 impl BinaryFilter {
@@ -337,7 +337,7 @@ impl BinaryFilter {
 
     /// Whether a row's graph passes this filter.
     #[inline]
-    pub fn matches_graph(&self, g_id: u16) -> bool {
+    pub fn matches_graph(&self, g_id: fluree_db_core::GraphId) -> bool {
         self.g_id.is_none_or(|g| g == g_id)
     }
 
@@ -552,10 +552,10 @@ mod tests {
     #[test]
     fn byte_size_counts_the_graph_column() {
         let batch = ColumnBatch {
-            g_id: ColumnData::Block(vec![7u16; 25_000].into()),
+            g_id: ColumnData::Block(vec![7u32; 25_000].into()),
             ..ColumnBatch::empty()
         };
-        assert_eq!(batch.byte_size(), 50_000);
+        assert_eq!(batch.byte_size(), 100_000);
     }
 
     #[test]

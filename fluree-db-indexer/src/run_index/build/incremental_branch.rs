@@ -44,7 +44,7 @@ pub struct BranchUpdateConfig {
     /// Sort order.
     pub order: RunSortOrder,
     /// Graph id.
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Zstd compression level for re-encoded leaflets.
     pub zstd_level: i32,
     /// Target rows per leaflet.

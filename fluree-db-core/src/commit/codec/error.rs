@@ -90,7 +90,7 @@ impl fmt::Display for CommitCodecError {
                 write!(f, "commit-codec: t value {t} out of u32 range")
             }
             Self::GIdOutOfRange(g) => {
-                write!(f, "commit-codec: graph_delta key {g} exceeds u16::MAX")
+                write!(f, "commit-codec: graph_delta key {g} exceeds u32::MAX")
             }
             Self::NegativeListIndex(i) => {
                 write!(f, "commit-codec: negative list index {i}")

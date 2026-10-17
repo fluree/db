@@ -60,8 +60,8 @@ fn key_of(f: &Flake) -> FactKey {
 /// Cheap to clone (persistent map).
 #[derive(Clone, Default)]
 pub(crate) struct NoveltyFactState {
-    /// Indexed by `g_id`; `None` for graphs with no novelty yet.
-    graphs: Vec<Option<OrdMap<FactKey, (i64, bool)>>>,
+    /// By graph; absent for graphs with no novelty yet.
+    graphs: OrdMap<GraphId, OrdMap<FactKey, (i64, bool)>>,
 }
 
 impl NoveltyFactState {
@@ -73,8 +73,7 @@ impl NoveltyFactState {
     /// Absent identity → `false`.
     pub(crate) fn is_asserted(&self, g: GraphId, flake: &Flake) -> bool {
         self.graphs
-            .get(g as usize)
-            .and_then(Option::as_ref)
+            .get(&g)
             .and_then(|m| m.get(&key_of(flake)).map(|&(_, op)| op))
             .unwrap_or(false)
     }
@@ -88,11 +87,7 @@ impl NoveltyFactState {
     /// `clear_up_to` rebuild) — rather than depending on callers feeding ops in
     /// ascending-`t`, retract-last order.
     pub(crate) fn record(&mut self, g: GraphId, flake: &Flake) {
-        let idx = g as usize;
-        if idx >= self.graphs.len() {
-            self.graphs.resize_with(idx + 1, || None);
-        }
-        let m = self.graphs[idx].get_or_insert_with(OrdMap::new);
+        let m = self.graphs.entry(g).or_default();
         let key = key_of(flake);
         let wins = match m.get(&key) {
             Some(&(cur_t, cur_op)) => flake.t > cur_t || (flake.t == cur_t && cur_op && !flake.op),

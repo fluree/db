@@ -562,15 +562,24 @@ impl LeafHandle for RangeReadLeafHandle {
             ColumnData::AbsentDefault
         };
 
-        // Pooled-tree leaflets only; dedicated trees have no graph block.
-        let has_g = entry
+        // Pooled-tree leaflets only; dedicated trees have no graph block. Its
+        // width is the leaflet's own (2 or 4 bytes).
+        let g_ref = entry
             .column_refs
             .iter()
-            .any(|r| r.col_id == ColumnId::GId.to_u16());
-        let g_id = if eff.contains(ColumnId::GId) && has_g {
-            ColumnData::Block(Arc::from(find_and_decode_u16_col(ColumnId::GId)?))
-        } else {
-            ColumnData::AbsentDefault
+            .find(|r| r.col_id == ColumnId::GId.to_u16())
+            .filter(|_| eff.contains(ColumnId::GId));
+        let g_id = match g_ref {
+            Some(r) if r.elem_width == 4 => {
+                ColumnData::Block(Arc::from(find_and_decode_u32(ColumnId::GId)?))
+            }
+            Some(_) => ColumnData::Block(
+                find_and_decode_u16_col(ColumnId::GId)?
+                    .into_iter()
+                    .map(u32::from)
+                    .collect(),
+            ),
+            None => ColumnData::AbsentDefault,
         };
 
         Ok(ColumnBatch {

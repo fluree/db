@@ -38,8 +38,11 @@ use std::ops::Range;
 /// Magic bytes for a V3 branch manifest.
 const BRANCH_V3_MAGIC: [u8; 4] = *b"FBR3";
 
-/// Current V3 branch manifest format version.
-const BRANCH_V3_VERSION: u8 = 1;
+/// `main`'s branch header: `g_id: u16` at bytes 6..8. Read, never written.
+const BRANCH_V3_VERSION_MAIN: u8 = 1;
+
+/// The v5 branch header: bytes 6..8 reserved, `g_id: u32` at 12..16.
+const BRANCH_V3_VERSION: u8 = 2;
 
 /// Size of the branch header in bytes.
 const BRANCH_V3_HEADER_LEN: usize = 16;
@@ -136,7 +139,11 @@ impl BranchManifest {
 // ============================================================================
 
 /// Build FBR3 branch manifest bytes in memory.
-pub fn build_branch_bytes(order: RunSortOrder, g_id: u16, leaves: &[LeafEntry]) -> Vec<u8> {
+pub fn build_branch_bytes(
+    order: RunSortOrder,
+    g_id: fluree_db_core::GraphId,
+    leaves: &[LeafEntry],
+) -> Vec<u8> {
     let estimated =
         BRANCH_V3_HEADER_LEN + leaves.len() * (2 * RECORD_V2_WIRE_SIZE + 8 + 2 + 40 + 1 + 2 + 40);
     let mut buf = Vec::with_capacity(estimated);
@@ -145,9 +152,9 @@ pub fn build_branch_bytes(order: RunSortOrder, g_id: u16, leaves: &[LeafEntry]) 
     buf.extend_from_slice(&BRANCH_V3_MAGIC);
     buf.push(BRANCH_V3_VERSION);
     buf.push(order.to_wire_id());
-    buf.extend_from_slice(&g_id.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
     buf.extend_from_slice(&(leaves.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    buf.extend_from_slice(&g_id.to_le_bytes());
 
     // Leaf entries. A pooled tree routes on the graph too, so its keys carry it.
     let pooled = order.is_pooled();
@@ -157,7 +164,7 @@ pub fn build_branch_bytes(order: RunSortOrder, g_id: u16, leaves: &[LeafEntry]) 
             key.write_run_le(&mut rec_buf);
             buf.extend_from_slice(&rec_buf);
             if pooled {
-                buf.extend_from_slice(&u32::from(key.g_id).to_le_bytes());
+                buf.extend_from_slice(&key.g_id.to_le_bytes());
             }
         }
 
@@ -202,7 +209,7 @@ pub fn read_branch_from_bytes(data: &[u8]) -> io::Result<BranchManifest> {
         ));
     }
     let version = data[4];
-    if version != BRANCH_V3_VERSION {
+    if version != BRANCH_V3_VERSION && version != BRANCH_V3_VERSION_MAIN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("branch v3: unsupported version {version}"),
@@ -222,13 +229,7 @@ pub fn read_branch_from_bytes(data: &[u8]) -> io::Result<BranchManifest> {
             RunRecordV2::read_run_le(data[pos..pos + RECORD_V2_WIRE_SIZE].try_into().unwrap());
         if pooled {
             let at = pos + RECORD_V2_WIRE_SIZE;
-            let g = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
-            rec.g_id = u16::try_from(g).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("FBR3: graph id {g} out of range"),
-                )
-            })?;
+            rec.g_id = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
         }
         Ok(rec)
     };
@@ -347,7 +348,7 @@ pub fn read_branch_order(data: &[u8]) -> io::Result<RunSortOrder> {
 }
 
 /// Read g_id from an FBR3 header without full decode.
-pub fn read_branch_g_id(data: &[u8]) -> io::Result<u16> {
+pub fn read_branch_g_id(data: &[u8]) -> io::Result<fluree_db_core::GraphId> {
     if data.len() < BRANCH_V3_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -360,7 +361,11 @@ pub fn read_branch_g_id(data: &[u8]) -> io::Result<u16> {
             "FBR3: expected magic FBR3",
         ));
     }
-    Ok(u16::from_le_bytes(data[6..8].try_into().unwrap()))
+    Ok(if data[4] == BRANCH_V3_VERSION_MAIN {
+        u32::from(u16::from_le_bytes(data[6..8].try_into().unwrap()))
+    } else {
+        u32::from_le_bytes(data[12..16].try_into().unwrap())
+    })
 }
 
 #[cfg(test)]
@@ -480,11 +485,33 @@ mod tests {
 
     #[test]
     fn header_metadata() {
-        let bytes = build_branch_bytes(RunSortOrder::Opst, 42, &[]);
+        let bytes = build_branch_bytes(RunSortOrder::Opst, 70_000, &[]);
         assert_eq!(&bytes[0..4], b"FBR3");
-        assert_eq!(bytes[4], 1);
+        assert_eq!(bytes[4], BRANCH_V3_VERSION);
         assert_eq!(read_branch_order(&bytes).unwrap(), RunSortOrder::Opst);
+        assert_eq!(read_branch_g_id(&bytes).unwrap(), 70_000);
+    }
+
+    /// `main`'s branches (header version 1, 16-bit graph) still decode, so a
+    /// `main` ledger's untouched trees carry over its first v5 index.
+    #[test]
+    fn a_main_branch_decodes() {
+        let leaves = vec![LeafEntry {
+            first_key: make_rec(1, 1, OType::XSD_INTEGER.as_u16(), 0, 1),
+            last_key: make_rec(9, 1, OType::XSD_INTEGER.as_u16(), 9, 1),
+            row_count: 9,
+            leaf_cid: make_leaf_cid(0),
+            sidecar_cid: None,
+        }];
+        let mut bytes = build_branch_bytes(RunSortOrder::Spot, 0, &leaves);
+        bytes[4] = BRANCH_V3_VERSION_MAIN;
+        bytes[6..8].copy_from_slice(&42u16.to_le_bytes());
+        bytes[12..16].fill(0);
         assert_eq!(read_branch_g_id(&bytes).unwrap(), 42);
+        let decoded = read_branch_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.leaves.len(), 1);
+        assert_eq!(decoded.leaves[0].row_count, 9);
+        assert_eq!(decoded.leaves[0].leaf_cid, leaves[0].leaf_cid);
     }
 
     #[test]

@@ -3859,7 +3859,7 @@ struct IndexBuildInput<'a> {
     prefix_map: &'a HashMap<String, String>,
     /// User-defined named graph g_ids (>= 2) to build index segments for.
     /// Empty for single-graph imports.
-    named_g_ids: Vec<u16>,
+    named_g_ids: Vec<fluree_db_core::GraphId>,
     /// Actual split mode the import used; written into the root and predicate sids.
     ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
     /// Whether any imported record carried an RDF-list position (OR'd across
@@ -4059,7 +4059,7 @@ struct ChunkImportResult {
     rdf_type_p_id: u32,
     /// User-defined named graph g_ids (>= 2) to build index segments for.
     /// Empty for single-graph imports.
-    named_g_ids: Vec<u16>,
+    named_g_ids: Vec<fluree_db_core::GraphId>,
     /// Split mode the allocator actually used (the ns preflight may coarsen it to
     /// `HostPlusN`). Recorded into the root, predicate sids, and genesis commit so
     /// reads split IRIs the same way the dictionary was keyed.
@@ -5543,7 +5543,7 @@ where
 
         // txn-meta is always pre-seeded as dict_id=0 in the graph allocator
         // (via SharedDictAllocator::new_graph), so g_id = dict_id + 1 = 1.
-        let g_id: u16 = 1;
+        let g_id: fluree_db_core::GraphId = 1;
 
         // meta_chunk_idx = number of data chunks (next sequential index).
         let meta_chunk_idx = sort_write_handles.len();
@@ -6077,10 +6077,10 @@ where
     // skipped entirely and the optimized default-graph path pays nothing. g_id 1
     // (txn-meta) is built separately; g_id 2 (config) is not populated by bulk
     // RDF import.
-    let v3_named_g_ids: Vec<u16> = {
+    let v3_named_g_ids: Vec<fluree_db_core::GraphId> = {
         let graph_count = spool_config.graph_alloc.len();
-        (u32::from(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)..=graph_count)
-            .map(|g| g as u16)
+        (fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID..=graph_count)
+            .map(|g| g as fluree_db_core::GraphId)
             .collect()
     };
 
@@ -6814,12 +6814,12 @@ where
 
         let mut graph_ids = std::collections::BTreeSet::new();
         for g_id_str in uploaded_dicts.numbig.keys() {
-            if let Ok(g_id) = g_id_str.parse::<u16>() {
+            if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                 graph_ids.insert(g_id);
             }
         }
         for g_id_str in uploaded_dicts.vectors.keys() {
-            if let Ok(g_id) = g_id_str.parse::<u16>() {
+            if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                 graph_ids.insert(g_id);
             }
         }

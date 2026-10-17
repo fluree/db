@@ -88,7 +88,7 @@ impl IncrementalRootBuilder {
     /// also pass leaf-level replaced CIDs via `add_replaced_cids()`.
     pub fn set_named_graph_branch(
         &mut self,
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         order: RunSortOrder,
         branch_cid: ContentId,
     ) {

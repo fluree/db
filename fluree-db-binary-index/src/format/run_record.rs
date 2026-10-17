@@ -5,7 +5,7 @@
 //!
 //! `g_id` is NOT stored in the run wire format (34 bytes) because each graph
 //! gets its own set of run files and indexes. The spool wire format (36 bytes)
-//! still includes `g_id` as `u16` because spool files are pre-partition.
+//! still includes `g_id` (`u32`) because spool files are pre-partition.
 
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -20,8 +20,8 @@ pub const RECORD_WIRE_SIZE: usize = 34;
 
 /// Wire format size of a single record in **spool files**, in bytes.
 ///
-/// Includes `g_id` as `u16` (spool records are pre-graph-partition).
-pub const SPOOL_RECORD_WIRE_SIZE: usize = 36;
+/// Includes `g_id` as `u32` (spool records are pre-graph-partition).
+pub const SPOOL_RECORD_WIRE_SIZE: usize = 38;
 
 /// Sentinel value for "not a list member" in the `u32` `i` field.
 pub const LIST_INDEX_NONE: u32 = u32::MAX;
@@ -78,7 +78,7 @@ pub struct RunRecord {
     /// List index (u32::MAX = none).
     pub i: u32,
     /// Graph ID (0 = default graph). In-memory only; not in run wire format.
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Datatype dict index (for sort-key tie-breaking).
     pub dt: u16,
     /// Language tag id (per-run assignment, 0 = none).
@@ -95,7 +95,7 @@ impl RunRecord {
     /// Create a new RunRecord with all fields.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         s_id: SubjectId,
         p_id: u32,
         o_kind: ObjKind,
@@ -153,37 +153,35 @@ impl RunRecord {
         }
     }
 
-    /// Serialize to [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian.
+    /// Serialize to [`SPOOL_RECORD_WIRE_SIZE`] (38) bytes, little-endian.
     ///
-    /// Includes `g_id` as `u16` — spool records are pre-graph-partition.
+    /// Includes `g_id` — spool records are pre-graph-partition.
     pub fn write_spool_le(&self, buf: &mut [u8; SPOOL_RECORD_WIRE_SIZE]) {
-        buf[0..2].copy_from_slice(&self.g_id.to_le_bytes());
-        buf[2..10].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
-        buf[10..18].copy_from_slice(&self.o_key.to_le_bytes());
-        buf[18..22].copy_from_slice(&self.p_id.to_le_bytes());
-        buf[22..26].copy_from_slice(&self.t.to_le_bytes());
-        buf[26..30].copy_from_slice(&self.i.to_le_bytes());
-        buf[30..32].copy_from_slice(&self.dt.to_le_bytes());
-        buf[32..34].copy_from_slice(&self.lang_id.to_le_bytes());
-        buf[34] = self.o_kind;
-        buf[35] = self.op;
+        buf[0..4].copy_from_slice(&self.g_id.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.s_id.as_u64().to_le_bytes());
+        buf[12..20].copy_from_slice(&self.o_key.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.p_id.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.t.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.i.to_le_bytes());
+        buf[32..34].copy_from_slice(&self.dt.to_le_bytes());
+        buf[34..36].copy_from_slice(&self.lang_id.to_le_bytes());
+        buf[36] = self.o_kind;
+        buf[37] = self.op;
     }
 
-    /// Deserialize from [`SPOOL_RECORD_WIRE_SIZE`] (36) bytes, little-endian.
-    ///
-    /// Includes `g_id` as `u16`.
+    /// Deserialize from [`SPOOL_RECORD_WIRE_SIZE`] (38) bytes, little-endian.
     pub fn read_spool_le(buf: &[u8; SPOOL_RECORD_WIRE_SIZE]) -> Self {
         Self {
-            g_id: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
-            s_id: SubjectId::from_u64(u64::from_le_bytes(buf[2..10].try_into().unwrap())),
-            o_key: u64::from_le_bytes(buf[10..18].try_into().unwrap()),
-            p_id: u32::from_le_bytes(buf[18..22].try_into().unwrap()),
-            t: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
-            i: u32::from_le_bytes(buf[26..30].try_into().unwrap()),
-            dt: u16::from_le_bytes(buf[30..32].try_into().unwrap()),
-            lang_id: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
-            o_kind: buf[34],
-            op: buf[35],
+            g_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            s_id: SubjectId::from_u64(u64::from_le_bytes(buf[4..12].try_into().unwrap())),
+            o_key: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            p_id: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            t: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            i: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+            dt: u16::from_le_bytes(buf[32..34].try_into().unwrap()),
+            lang_id: u16::from_le_bytes(buf[34..36].try_into().unwrap()),
+            o_kind: buf[36],
+            op: buf[37],
         }
     }
 

@@ -182,10 +182,15 @@ pub fn load_leaflet_columns(
     };
 
     // ── g_id ── (pooled-tree leaflets only; dedicated trees have no block)
-    let g_id = if eff.contains(ColumnId::GId) && find_ref(ColumnId::GId).is_some() {
-        ColumnData::Block(Arc::from(decode_u16_col(ColumnId::GId)?))
-    } else {
-        ColumnData::AbsentDefault
+    let g_id = match find_ref(ColumnId::GId).filter(|_| eff.contains(ColumnId::GId)) {
+        Some(r) if r.elem_width == 4 => ColumnData::Block(Arc::from(decode_u32(ColumnId::GId)?)),
+        Some(_) => ColumnData::Block(
+            decode_u16_col(ColumnId::GId)?
+                .into_iter()
+                .map(u32::from)
+                .collect(),
+        ),
+        None => ColumnData::AbsentDefault,
     };
 
     Ok(ColumnBatch {

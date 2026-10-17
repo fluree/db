@@ -104,7 +104,7 @@ impl SlotValue {
 /// chunk-local until [`AttachmentOp::remap`]; predicate ids are global.
 #[derive(Debug, Clone, Copy)]
 pub struct AttachmentOp {
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     pub ann: u64,
     pub t: u32,
     pub op: u8,
@@ -324,7 +324,7 @@ fn is_arena_kind(kind: ObjKind) -> bool {
 /// link records emitted.
 pub fn replay_attachments(
     ops: &mut [AttachmentOp],
-    mut prior: impl FnMut(u16, u64) -> [Option<SlotValue>; 3],
+    mut prior: impl FnMut(fluree_db_core::GraphId, u64) -> [Option<SlotValue>; 3],
     registry: &OTypeRegistry,
     link: LinkIds,
     handle_for: &mut dyn FnMut(TermKey) -> io::Result<u64>,
@@ -375,7 +375,14 @@ pub fn replay_attachments(
     Ok(emitted)
 }
 
-fn link_record(g_id: u16, ann: u64, link: LinkIds, handle: u64, t: u32, op: u8) -> RunRecord {
+fn link_record(
+    g_id: fluree_db_core::GraphId,
+    ann: u64,
+    link: LinkIds,
+    handle: u64,
+    t: u32,
+    op: u8,
+) -> RunRecord {
     RunRecord {
         g_id,
         s_id: SubjectId::from_u64(ann),

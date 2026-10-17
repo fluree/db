@@ -177,7 +177,10 @@ impl<'a> ExportBuilder<'a> {
     /// excluded from dataset exports" and then never called from anywhere, so
     /// `--all-graphs` shipped emitting `#txn-meta` and `#config` from the v4
     /// baseline onward. This is the call site it was missing.
-    fn selected_named_graphs<'r>(&self, registry: &'r GraphRegistry) -> Vec<(u16, &'r str)> {
+    fn selected_named_graphs<'r>(
+        &self,
+        registry: &'r GraphRegistry,
+    ) -> Vec<(fluree_db_core::GraphId, &'r str)> {
         registry
             .iter_entries()
             .filter(|(g_id, _)| self.system_graphs || !export::is_system_graph(*g_id))
@@ -189,7 +192,11 @@ impl<'a> ExportBuilder<'a> {
     /// Zero under `all_graphs()`. Under a single-graph or default-graph-only
     /// export it is every other user graph in the registry — the number the
     /// caller needs to say so out loud.
-    fn omitted_named_graph_count(&self, registry: &GraphRegistry, target: Option<u16>) -> u64 {
+    fn omitted_named_graph_count(
+        &self,
+        registry: &GraphRegistry,
+        target: Option<fluree_db_core::GraphId>,
+    ) -> u64 {
         // Zero whenever the caller chose which graphs it wanted — either all
         // of them, or one by IRI. The count answers "your request lost data
         // you did not ask to drop", so a *targeted* export has nothing to
@@ -209,7 +216,10 @@ impl<'a> ExportBuilder<'a> {
     }
 
     /// Resolve a graph IRI to a `(g_id, iri)` pair via the graph registry.
-    fn resolve_graph_iri(&self, registry: &GraphRegistry) -> Result<(u16, String)> {
+    fn resolve_graph_iri(
+        &self,
+        registry: &GraphRegistry,
+    ) -> Result<(fluree_db_core::GraphId, String)> {
         let iri = self.graph_iri.as_deref().unwrap();
         match registry.graph_id_for_iri(iri) {
             Some(g_id) => Ok((g_id, iri.to_string())),
@@ -279,7 +289,7 @@ impl<'a> ExportBuilder<'a> {
         };
         // `EdgeKey.g` for a graph being scanned. Computed per graph rather
         // than per row, and not at all when nothing will probe it.
-        let graph_sid_of = |g_id: u16| -> Option<fluree_db_core::Sid> {
+        let graph_sid_of = |g_id: fluree_db_core::GraphId| -> Option<fluree_db_core::Sid> {
             if annotations.is_none() || g_id == 0 {
                 return None;
             }

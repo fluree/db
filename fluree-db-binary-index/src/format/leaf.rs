@@ -1129,7 +1129,7 @@ mod tests {
         }
     }
 
-    fn in_graph(mut rec: RunRecordV2, g_id: u16) -> RunRecordV2 {
+    fn in_graph(mut rec: RunRecordV2, g_id: fluree_db_core::GraphId) -> RunRecordV2 {
         rec.g_id = g_id;
         rec
     }
@@ -1142,9 +1142,15 @@ mod tests {
         use crate::read::column_types::{ColumnProjection, ColumnSet};
 
         let int = OType::XSD_INTEGER.as_u16();
-        for order in [RunSortOrder::PostG, RunSortOrder::Gspo] {
+        // Graph ids that fit 16 bits get a 2-byte column; past them, 4 bytes.
+        for (order, base, width) in [
+            (RunSortOrder::PostG, 3, 2),
+            (RunSortOrder::Gspo, 3, 2),
+            (RunSortOrder::PostG, 70_000, 4),
+            (RunSortOrder::Gspo, 70_000, 4),
+        ] {
             let mut recs: Vec<RunRecordV2> = (0..300u64)
-                .map(|i| in_graph(make_rec(i % 7, 1, int, i % 11, 1), 3 + (i % 5) as u16))
+                .map(|i| in_graph(make_rec(i % 7, 1, int, i % 11, 1), base + (i % 5) as u32))
                 .collect();
             recs.sort_by(cmp_v2_for_order(order));
             recs.dedup_by(|a, b| cmp_v2_for_order(order)(a, b).is_eq());
@@ -1179,6 +1185,14 @@ mod tests {
                 .sum();
             assert_eq!(dir.payload_base, leaf_header_size(order) + dir_size);
             assert_eq!(leaf_header_size(order), 80);
+            for entry in &dir.entries {
+                let g_ref = entry
+                    .column_refs
+                    .iter()
+                    .find(|r| r.col_id == ColumnId::GId.to_u16())
+                    .expect("pooled leaflet has a graph column");
+                assert_eq!(g_ref.elem_width, width);
+            }
 
             let projection = ColumnProjection {
                 output: ColumnSet::ALL,

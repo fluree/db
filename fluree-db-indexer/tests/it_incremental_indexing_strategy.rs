@@ -18,7 +18,13 @@ use fluree_db_core::ContentId;
 use fluree_db_indexer::run_index::incremental_branch::{update_branch, BranchUpdateConfig};
 use std::collections::HashMap;
 
-fn int_record_v2(g_id: u16, s_id: u64, p_id: u32, v: i64, t: u32) -> RunRecordV2 {
+fn int_record_v2(
+    g_id: fluree_db_core::GraphId,
+    s_id: u64,
+    p_id: u32,
+    v: i64,
+    t: u32,
+) -> RunRecordV2 {
     use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
     use fluree_db_core::value_id::ObjKey;
     RunRecordV2 {

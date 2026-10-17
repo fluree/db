@@ -373,11 +373,12 @@ fn time_cell(t: &fluree_db_core::temporal::Time) -> CypherTemporal {
 /// version stamp): callers must treat every subject as dirty.
 fn overlay_dirty_subjects(
     overlay: &dyn fluree_db_core::OverlayProvider,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
 ) -> Option<Arc<std::collections::HashSet<Sid>>> {
     use std::sync::OnceLock;
-    type DirtyCache =
-        parking_lot::Mutex<lru::LruCache<(u64, u16), Arc<std::collections::HashSet<Sid>>>>;
+    type DirtyCache = parking_lot::Mutex<
+        lru::LruCache<(u64, fluree_db_core::GraphId), Arc<std::collections::HashSet<Sid>>>,
+    >;
     static CACHE: OnceLock<DirtyCache> = OnceLock::new();
 
     if overlay.is_effectively_empty() {
@@ -672,7 +673,7 @@ impl<'a> NodeHydrator<'a> {
         sid: &Sid,
         rows: &[(u32, u16, u64)],
         store: &fluree_db_binary_index::BinaryIndexStore,
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         reifies_pid: Option<u32>,
     ) -> Result<Option<CypherRelationship>> {
         let Some(reifies_pid) = reifies_pid else {
@@ -714,7 +715,7 @@ impl<'a> NodeHydrator<'a> {
         sid: &Sid,
         rows: &[(u32, u16, u64)],
         store: &fluree_db_binary_index::BinaryIndexStore,
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
     ) -> Result<CypherNode> {
         let iri = self.compactor.decode_sid_shared(sid)?;
         let rdf_type_p_id = self

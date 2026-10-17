@@ -37,7 +37,7 @@ struct FactKeyV3 {
     o_key: u64,
     o_i: u32,
     /// The graph, part of a fact's identity in a pooled leaflet (0 elsewhere).
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
 }
 
 impl FactKeyV3 {
@@ -326,7 +326,7 @@ pub fn replay_leaflet(
     let mut out_oi: Vec<u32> = Vec::new();
     let mut out_t: Vec<u32> = Vec::new();
     // Graph of each row; meaningful only for a pooled leaflet.
-    let mut out_g: Vec<u16> = Vec::new();
+    let mut out_g: Vec<fluree_db_core::GraphId> = Vec::new();
 
     let mut bi = 0usize; // base row index
     let mut ii = 0usize; // include index
@@ -340,7 +340,7 @@ pub fn replay_leaflet(
                      ok: &mut Vec<u64>,
                      oi: &mut Vec<u32>,
                      t: &mut Vec<u32>,
-                     g: &mut Vec<u16>| {
+                     g: &mut Vec<fluree_db_core::GraphId>| {
         s.push(batch.s_id.get(row));
         p.push(batch.p_id.get(row));
         ot.push(batch.o_type.get(row));
@@ -358,7 +358,7 @@ pub fn replay_leaflet(
                         ok: &mut Vec<u64>,
                         oi: &mut Vec<u32>,
                         t: &mut Vec<u32>,
-                        g: &mut Vec<u16>| {
+                        g: &mut Vec<fluree_db_core::GraphId>| {
         s.push(rec.s_id.as_u64());
         p.push(rec.p_id);
         ot.push(rec.o_type);
@@ -591,7 +591,7 @@ mod tests {
     fn pooled_replay_restores_a_fact_in_its_own_graph() {
         let base = make_batch(&[(1, 1, 10, 1)]);
         let batch = ColumnBatch {
-            g_id: ColumnData::Block(vec![4u16].into()),
+            g_id: ColumnData::Block(vec![4u32].into()),
             ..base
         };
         let in_graph = |g_id, t, op| HistEntryV2 {
@@ -600,7 +600,7 @@ mod tests {
         };
         let history = vec![in_graph(9, 5, 0), in_graph(9, 2, 1)];
         let replayed = replay_leaflet(&batch, &history, 3, RunSortOrder::Gspo).unwrap();
-        let rows: Vec<(u16, u64, u32)> = (0..replayed.row_count)
+        let rows: Vec<(fluree_db_core::GraphId, u64, u32)> = (0..replayed.row_count)
             .map(|i| {
                 (
                     replayed.g_id.get(i),
