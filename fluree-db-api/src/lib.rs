@@ -2672,10 +2672,31 @@ impl FlureeBuilder {
     #[cfg(feature = "native")]
     pub async fn build_async(mut self) -> Result<Fluree> {
         let (storage, root_lock) = self.open_file_storage()?;
-        storage.recover_wal_async().await?;
-        let nameservice = FileNameService::with_storage(storage.clone());
-        Box::pin(nameservice.migrate()).await?;
+        let startup_storage = storage.clone();
+        let (nameservice, root_lock) = Self::holding_root(root_lock, async move {
+            startup_storage.recover_wal_async().await?;
+            // A store from before name bindings moves to the current format.
+            let nameservice = FileNameService::with_storage(startup_storage);
+            Box::pin(nameservice.migrate()).await?;
+            Ok(nameservice)
+        })
+        .await?;
         Ok(self.build_file(storage, nameservice).holding(root_lock))
+    }
+
+    /// Run a build's startup work on its root in a task that holds
+    /// `root_lock` until the work ends. The work goes on when the caller
+    /// stops waiting (WAL replay runs on the blocking pool, the nameservice
+    /// migration writes the store), so the lock must not go with the caller's
+    /// future.
+    #[cfg(feature = "native")]
+    async fn holding_root<T: Send + 'static>(
+        root_lock: Option<Arc<fluree_db_core::RootLock>>,
+        work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<(T, Option<Arc<fluree_db_core::RootLock>>)> {
+        tokio::spawn(async move { work.await.map(|done| (done, root_lock)) })
+            .await
+            .map_err(|e| ApiError::internal(format!("storage startup task failed: {e}")))?
     }
 
     /// Takes the builder's storage path and opens its file storage, with
@@ -3517,7 +3538,11 @@ impl FlureeBuilder {
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
-            file_storage.recover_wal_async().await?;
+            let startup_storage = file_storage.clone();
+            let ((), root_lock) = Self::holding_root(root_lock, async move {
+                Ok(startup_storage.recover_wal_async().await?)
+            })
+            .await?;
             let ns_storage = file_storage.clone();
             let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
 
@@ -6421,5 +6446,41 @@ mod storage_lock_tests {
         let _one = node("node-1").build().unwrap();
 
         let _two = node("node-2").build().expect("a shared payload root");
+    }
+
+    /// One blocking thread, held busy, queues the build's WAL replay behind
+    /// it; the build is then dropped mid-replay.
+    #[test]
+    fn a_cancelled_build_keeps_the_root_locked_until_its_replay_ends() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+            });
+            let build = FlureeBuilder::file(dir.path().to_str().unwrap())
+                .without_indexing()
+                .with_storage_lock()
+                .build_async();
+
+            let cancelled = tokio::time::timeout(std::time::Duration::ZERO, build).await;
+
+            assert!(cancelled.is_err(), "the replay was meant to be queued");
+            assert!(
+                matches!(
+                    fluree_db_core::RootLock::acquire(dir.path()),
+                    Err(fluree_db_core::RootLockError::Held { .. })
+                ),
+                "the root was released while its replay was still queued"
+            );
+            release.send(()).unwrap();
+            busy.await.unwrap();
+        });
     }
 }
