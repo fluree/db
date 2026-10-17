@@ -666,3 +666,48 @@ async fn pooled_graph_with_an_arena_counts_once() {
         vec!["v=123456789012345678901234567890"],
     );
 }
+
+/// The pooled tree is live: a storage sweep plans no orphans and leaves the
+/// pooled graphs readable from a fresh process.
+#[tokio::test]
+async fn sweeping_keeps_the_pooled_tree() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (fluree, _) = import_trig(
+        db_dir.path(),
+        data_dir.path(),
+        "test/pool-sweep:main",
+        THREE_GRAPHS,
+    )
+    .await;
+    assert!(latest_root(db_dir.path()).pool.is_some());
+
+    let plan = fluree
+        .plan_index_sweep("test/pool-sweep")
+        .await
+        .expect("plan sweep");
+    assert!(
+        plan.orphans.is_empty(),
+        "live pooled artifacts: {:?}",
+        plan.orphans
+    );
+    fluree
+        .sweep_index_storage("test/pool-sweep")
+        .await
+        .expect("sweep");
+    drop(fluree);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("reopen");
+    let ledger = fluree.ledger("test/pool-sweep:main").await.expect("load");
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?s ?o WHERE {{ GRAPH ex:g3 {{ ?s ex:val ?o }} }}")
+        )
+        .await,
+        vec!["o=3 s=http://example.org/c"],
+    );
+}
