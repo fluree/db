@@ -267,6 +267,9 @@ struct PoolIndex {
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
     /// Branch cid behind each order; what a reload matches on to reuse it.
     order_cids: HashMap<RunSortOrder, ContentId>,
+    /// Each secondary order's delta events since its base, every run merged
+    /// and sorted by the order's key, with the run cids they came from.
+    deltas: HashMap<RunSortOrder, (Vec<ContentId>, Arc<[crate::read::types::OverlayOp]>)>,
 }
 
 impl PoolIndex {
@@ -662,6 +665,36 @@ impl BinaryIndexStore {
             }
         }
 
+        let mut pool_deltas = HashMap::new();
+        for (order, runs) in root.pool.iter().flat_map(|p| &p.deltas) {
+            if runs.is_empty() {
+                continue;
+            }
+            let cids: Vec<ContentId> = runs.iter().map(|r| r.cid.clone()).collect();
+            // A build appends runs, so the previous store's merged events
+            // usually cover a prefix of them.
+            let carried = prev
+                .and_then(|p| p.pool.as_ref())
+                .and_then(|pi| pi.deltas.get(order))
+                .filter(|(prev_cids, _)| cids.starts_with(prev_cids));
+            let events = match carried {
+                Some((prev_cids, events)) if prev_cids.len() == cids.len() => Arc::clone(events),
+                _ => {
+                    let (done, mut events) = match carried {
+                        Some((prev_cids, events)) => (prev_cids.len(), events.to_vec()),
+                        None => (0, Vec::new()),
+                    };
+                    for cid in &cids[done..] {
+                        let bytes = cs.get(cid).await.map_err(storage_io_error)?;
+                        events.extend(crate::format::pool_delta::decode_delta_run(&bytes)?.1);
+                    }
+                    crate::read::types::sort_overlay_ops_stable(&mut events, *order);
+                    Arc::from(events)
+                }
+            };
+            pool_deltas.insert(*order, (cids, events));
+        }
+
         let mut pool = root.pool.as_ref().map(|routing| {
             let graphs: Vec<GraphId> = routing.graph_ids().collect();
             let mut member = vec![false; graphs.last().map_or(0, |&g| g as usize + 1)];
@@ -674,6 +707,7 @@ impl BinaryIndexStore {
                 unindexed: 0,
                 orders: pool_orders,
                 order_cids: pool_order_cids,
+                deltas: pool_deltas,
             }
         });
 
@@ -803,6 +837,16 @@ impl BinaryIndexStore {
     /// The pooled tree's branch for a pooled order.
     pub fn pool_branch(&self, order: RunSortOrder) -> Option<&Arc<BranchManifest>> {
         self.pool.as_ref().and_then(|p| p.orders.get(&order))
+    }
+
+    /// The events a pooled secondary order holds beyond its branch, sorted by
+    /// its key, which every cursor over that branch merges in (see
+    /// [`crate::format::pool_delta`]).
+    pub fn pool_delta(&self, order: RunSortOrder) -> Option<&Arc<[crate::read::types::OverlayOp]>> {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.deltas.get(&order))
+            .map(|(_, events)| events)
     }
 
     /// The tree a scan of one graph in `order` reads: the graph's own branch,

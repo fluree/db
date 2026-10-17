@@ -45,6 +45,7 @@ impl UploadedIndexes {
             fluree_db_binary_index::PoolRouting {
                 members,
                 orders: self.pool_orders.clone(),
+                deltas: Vec::new(),
             }
         })
     }

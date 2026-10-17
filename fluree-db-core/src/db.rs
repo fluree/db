@@ -954,6 +954,16 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
             let _order_id = read_u8(bytes, &mut pos)?;
             skip_cid(bytes, &mut pos)?;
         }
+        let delta_count = read_u8(bytes, &mut pos)? as usize;
+        for _ in 0..delta_count {
+            let _order_id = read_u8(bytes, &mut pos)?;
+            let run_count = read_u16(bytes, &mut pos)? as usize;
+            for _ in 0..run_count {
+                skip_cid(bytes, &mut pos)?;
+                ensure(bytes, pos, 4, "pool delta run")?;
+                pos += 4;
+            }
+        }
     }
 
     // Optional sections

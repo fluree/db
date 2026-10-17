@@ -235,6 +235,69 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
     ops.truncate(write);
 }
 
+/// Each fact's state at `to_t` among `events`, which are sorted by `order`'s
+/// key (a fact's events adjacent, in any `t` order): its latest event at or
+/// before `to_t`, a retract winning a same-`t` tie. Unlike
+/// [`resolve_overlay_ops`], a fact's identity includes its graph, so the same
+/// triple in two pooled graphs stays two facts.
+pub fn resolve_events_at(events: &[OverlayOp], to_t: i64) -> Vec<OverlayOp> {
+    let mut out: Vec<OverlayOp> = Vec::new();
+    let mut i = 0;
+    while i < events.len() {
+        let key = (events[i].fact_key(), events[i].g_id);
+        let mut best: Option<OverlayOp> = None;
+        while i < events.len() && (events[i].fact_key(), events[i].g_id) == key {
+            let e = events[i];
+            i += 1;
+            if e.t > to_t {
+                continue;
+            }
+            let better = best.is_none_or(|b| e.t > b.t || (e.t == b.t && !e.op && b.op));
+            if better {
+                best = Some(e);
+            }
+        }
+        out.extend(best);
+    }
+    out
+}
+
+/// Merge two resolved op lists sorted by `order`'s key into one; where both
+/// hold a fact, `newer` wins.
+pub fn merge_resolved_ops(
+    older: &[OverlayOp],
+    newer: &[OverlayOp],
+    order: RunSortOrder,
+) -> Vec<OverlayOp> {
+    let mut out = Vec::with_capacity(older.len() + newer.len());
+    let (mut i, mut j) = (0, 0);
+    while i < older.len() && j < newer.len() {
+        match cmp_overlay_v3(&older[i], &newer[j], order) {
+            Ordering::Less => {
+                out.push(older[i]);
+                i += 1;
+            }
+            Ordering::Greater => {
+                out.push(newer[j]);
+                j += 1;
+            }
+            Ordering::Equal => {
+                if older[i].fact_key() == newer[j].fact_key() && older[i].g_id == newer[j].g_id {
+                    out.push(newer[j]);
+                    i += 1;
+                    j += 1;
+                } else {
+                    out.push(older[i]);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&older[i..]);
+    out.extend_from_slice(&newer[j..]);
+    out
+}
+
 /// Compare a decoded row (from a `ColumnBatch`) against an overlay op
 /// using the V3 sort order. Used by the two-pointer merge in `BinaryCursor`.
 #[inline]

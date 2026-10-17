@@ -79,6 +79,21 @@ pub struct BinaryCursor {
     /// Sorted lead keys a batched probe wants; leaflets whose directory key
     /// range holds none of them are skipped. See [`Self::set_wanted_keys`].
     wanted_keys: Option<Arc<[u64]>>,
+    /// A pooled secondary order's delta events, folded into the overlay ops
+    /// on the first `next_batch` (once the caller has set novelty and `to_t`).
+    pending_delta: Option<Arc<[OverlayOp]>>,
+}
+
+/// The delta a cursor over `order` of `store` merges: a pooled secondary
+/// order's events beyond its branch, if any.
+fn pending_delta(store: &BinaryIndexStore, order: RunSortOrder) -> Option<Arc<[OverlayOp]>> {
+    if !order.is_pooled() || order == RunSortOrder::Gspo {
+        return None;
+    }
+    store
+        .pool_delta(order)
+        .filter(|events| !events.is_empty())
+        .cloned()
 }
 
 /// State for a leaf that's been opened via `LeafHandle`.
@@ -99,7 +114,9 @@ impl BinaryCursor {
     ) -> Self {
         let cmp = cmp_v2_for_order(order);
         let leaf_range = branch.find_leaves_in_range(min_key, max_key, cmp);
+        let pending_delta = pending_delta(&store, order);
         Self {
+            pending_delta,
             store,
             order,
             branch,
@@ -133,7 +150,9 @@ impl BinaryCursor {
         projection: ColumnProjection,
     ) -> Self {
         let leaf_count = branch.leaves.len();
+        let pending_delta = pending_delta(&store, order);
         Self {
+            pending_delta,
             store,
             order,
             branch,
@@ -369,6 +388,9 @@ impl BinaryCursor {
     /// Returns `None` when all leaflets in all leaves are exhausted
     /// (and overlay-only ops have been emitted).
     pub fn next_batch(&mut self) -> io::Result<Option<ColumnBatch>> {
+        if self.pending_delta.is_some() {
+            self.fold_in_delta();
+        }
         loop {
             if self.exhausted {
                 return Ok(None);
@@ -638,6 +660,34 @@ impl BinaryCursor {
             self.current_leaf = Some(OpenLeaf { handle });
             self.current_leaflet_idx = start_leaflet;
         }
+    }
+
+    /// Fold the pooled delta's events in this cursor's range, resolved at
+    /// `to_t`, under the overlay ops the caller set (newer, so they win).
+    fn fold_in_delta(&mut self) {
+        let Some(delta) = self.pending_delta.take() else {
+            return;
+        };
+        let (start, end) = match (&self.range_min, &self.range_max) {
+            (Some(min), Some(max)) => {
+                crate::read::types::overlay_window_for_range(&delta, min, max, self.order)
+            }
+            _ => (0, delta.len()),
+        };
+        let mut resolved = crate::read::types::resolve_events_at(&delta[start..end], self.to_t);
+        resolved.retain(|op| self.filter.matches_graph(op.g_id));
+        if resolved.is_empty() {
+            return;
+        }
+        let combined = crate::read::types::merge_resolved_ops(
+            &resolved,
+            &self.overlay_ops[self.overlay_pos..self.overlay_end],
+            self.order,
+        );
+        self.overlay_end = combined.len();
+        self.overlay_ops = combined.into();
+        self.overlay_pos = 0;
+        self.leaf_overlay_end = self.overlay_end;
     }
 
     // ========================================================================

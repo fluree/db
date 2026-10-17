@@ -136,14 +136,25 @@ impl PoolMember {
     }
 }
 
+/// One delta run of a pooled secondary order (see
+/// [`crate::format::pool_delta`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolDeltaRun {
+    pub cid: ContentId,
+    pub events: u32,
+}
+
 /// The shared tree for small named graphs: one branch per pooled order, and
 /// the graphs it holds. A graph listed here has no `NamedGraphRouting` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolRouting {
     /// Pooled graphs, sorted by id.
     pub members: Vec<PoolMember>,
-    /// `(order, branch_cid)` pairs over [`RunSortOrder::pool_build_orders`].
+    /// `(order, branch_cid)` pairs over [`RunSortOrder::pool_build_orders`]:
+    /// GSPO current, the secondary orders as of their last compaction.
     pub orders: Vec<(RunSortOrder, ContentId)>,
+    /// Each secondary order's delta runs since its base, oldest first.
+    pub deltas: Vec<(RunSortOrder, Vec<PoolDeltaRun>)>,
 }
 
 impl PoolRouting {
@@ -164,6 +175,14 @@ impl PoolRouting {
     /// Pooled graph ids, ascending.
     pub fn graph_ids(&self) -> impl Iterator<Item = GraphId> + '_ {
         self.members.iter().map(|m| m.g_id)
+    }
+
+    /// The delta runs of `order`, oldest first.
+    pub fn delta(&self, order: RunSortOrder) -> &[PoolDeltaRun] {
+        self.deltas
+            .iter()
+            .find(|(o, _)| *o == order)
+            .map_or(&[], |(_, runs)| runs.as_slice())
     }
 }
 
@@ -908,6 +927,21 @@ impl IndexRoot {
                 buf.push(order.to_wire_id());
                 write_cid(&mut buf, branch_cid);
             }
+            let mut deltas: Vec<&(RunSortOrder, Vec<PoolDeltaRun>)> = pool
+                .deltas
+                .iter()
+                .filter(|(_, runs)| !runs.is_empty())
+                .collect();
+            deltas.sort_by_key(|(order, _)| order.to_wire_id());
+            buf.push(deltas.len() as u8);
+            for (order, runs) in deltas {
+                buf.push(order.to_wire_id());
+                buf.extend_from_slice(&(runs.len() as u16).to_le_bytes());
+                for run in runs {
+                    write_cid(&mut buf, &run.cid);
+                    buf.extend_from_slice(&run.events.to_le_bytes());
+                }
+            }
         }
 
         // ---- Optional: stats ----
@@ -1200,7 +1234,29 @@ impl IndexRoot {
                     .ok_or_else(|| io_err(&format!("root v6: invalid pool order_id {oid}")))?;
                 orders.push((order, read_cid(data, &mut pos)?));
             }
-            Some(PoolRouting { members, orders })
+            let delta_count = read_u8_at(data, &mut pos)? as usize;
+            let mut deltas = Vec::with_capacity(delta_count);
+            for _ in 0..delta_count {
+                let oid = read_u8_at(data, &mut pos)?;
+                let order = RunSortOrder::from_wire_id(oid)
+                    .filter(|o| o.is_pooled() && *o != RunSortOrder::Gspo)
+                    .ok_or_else(|| io_err(&format!("root v6: invalid delta order_id {oid}")))?;
+                let run_count = read_u16_at(data, &mut pos)? as usize;
+                let mut runs = Vec::with_capacity(run_count);
+                for _ in 0..run_count {
+                    let cid = read_cid(data, &mut pos)?;
+                    runs.push(PoolDeltaRun {
+                        cid,
+                        events: read_u32_at(data, &mut pos)?,
+                    });
+                }
+                deltas.push((order, runs));
+            }
+            Some(PoolRouting {
+                members,
+                orders,
+                deltas,
+            })
         } else {
             None
         };
@@ -1356,6 +1412,13 @@ impl IndexRoot {
             }))
     }
 
+    /// Every delta run of the pooled tree's secondary orders.
+    pub fn pool_delta_runs(&self) -> impl Iterator<Item = &PoolDeltaRun> {
+        self.pool
+            .iter()
+            .flat_map(|pool| pool.deltas.iter().flat_map(|(_, runs)| runs))
+    }
+
     pub fn all_cas_ids(&self) -> Vec<ContentId> {
         let mut ids = Vec::new();
 
@@ -1409,6 +1472,7 @@ impl IndexRoot {
         }
 
         ids.extend(self.branches().map(|(_, _, cid)| cid.clone()));
+        ids.extend(self.pool_delta_runs().map(|run| run.cid.clone()));
 
         // Sketch
         if let Some(ref sketch) = self.sketch_ref {
@@ -2098,6 +2162,19 @@ mod tests {
                 .iter()
                 .map(|&o| (o, cid(o.dir_name().as_bytes())))
                 .collect(),
+            deltas: vec![(
+                RunSortOrder::PostG,
+                vec![
+                    PoolDeltaRun {
+                        cid: cid(b"post-run-1"),
+                        events: 12,
+                    },
+                    PoolDeltaRun {
+                        cid: cid(b"post-run-2"),
+                        events: 3,
+                    },
+                ],
+            )],
         });
         root.stats = Some(IndexStats {
             flakes: 42,
@@ -2110,6 +2187,8 @@ mod tests {
         assert_eq!(pool, root.pool.as_ref().unwrap());
         assert!(pool.contains(70) && !pool.contains(5));
         assert_eq!(pool.member(4).map(|m| (m.rows, m.history)), Some((17, 9)));
+        assert_eq!(pool.delta(RunSortOrder::PostG).len(), 2);
+        assert!(pool.delta(RunSortOrder::OpstG).is_empty());
         assert_eq!(decoded.stats.as_ref().unwrap().flakes, 42);
 
         let ids = root.all_cas_ids();
@@ -2119,6 +2198,7 @@ mod tests {
                 "{o:?} unreachable"
             );
         }
+        assert!(ids.contains(&cid(b"post-run-1")) && ids.contains(&cid(b"post-run-2")));
 
         let snap =
             fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).expect("core metadata decode");

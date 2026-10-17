@@ -604,6 +604,7 @@ mod tests {
         root.pool = Some(crate::format::index_root::PoolRouting {
             members: vec![crate::format::index_root::PoolMember::new(3)],
             orders: vec![(RunSortOrder::Gspo, branch_cid)],
+            deltas: Vec::new(),
         });
 
         let strict = collect_root_cas_ids_expanded(&store, &root).await.unwrap();

@@ -70,12 +70,41 @@ impl IncrementalRootBuilder {
         let pool = self.root.pool.get_or_insert_with(|| PoolRouting {
             members: Vec::new(),
             orders: Vec::new(),
+            deltas: Vec::new(),
         });
         if let Some(entry) = pool.orders.iter_mut().find(|(o, _)| *o == order) {
             self.replaced_cids.push(entry.1.clone());
             entry.1 = branch_cid;
         } else {
             pool.orders.push((order, branch_cid));
+        }
+    }
+
+    /// Append a delta run to a pooled secondary order.
+    pub fn append_pool_delta_run(
+        &mut self,
+        order: RunSortOrder,
+        run: fluree_db_binary_index::PoolDeltaRun,
+    ) {
+        let Some(pool) = self.root.pool.as_mut() else {
+            return;
+        };
+        match pool.deltas.iter_mut().find(|(o, _)| *o == order) {
+            Some((_, runs)) => runs.push(run),
+            None => pool.deltas.push((order, vec![run])),
+        }
+    }
+
+    /// Drop a pooled secondary order's delta runs: this build folds them into
+    /// its base.
+    ///
+    /// **GC note**: Records the runs as replaced.
+    pub fn clear_pool_delta(&mut self, order: RunSortOrder) {
+        if let Some(pool) = self.root.pool.as_mut() {
+            if let Some(at) = pool.deltas.iter().position(|(o, _)| *o == order) {
+                let (_, runs) = pool.deltas.remove(at);
+                self.replaced_cids.extend(runs.into_iter().map(|r| r.cid));
+            }
         }
     }
 

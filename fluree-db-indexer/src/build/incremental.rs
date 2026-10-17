@@ -376,6 +376,11 @@ enum Phase2TaskKind {
     Folded {
         facts: Arc<Vec<FoldedFact>>,
     },
+    /// A pooled secondary order's delta run for this window: its events,
+    /// sorted by the order's key.
+    PoolDeltaRun {
+        events: Vec<fluree_db_binary_index::OverlayOp>,
+    },
 }
 
 /// The tree a Phase 2 task writes.
@@ -429,8 +434,15 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
 }
 
 enum Phase2TaskUpdate {
-    Default { leaf_entries: Vec<LeafEntry> },
-    Branch { branch_cid: ContentId },
+    Default {
+        leaf_entries: Vec<LeafEntry>,
+    },
+    Branch {
+        branch_cid: ContentId,
+    },
+    DeltaRun {
+        run: fluree_db_binary_index::PoolDeltaRun,
+    },
 }
 
 struct Phase2TaskOutput {
@@ -570,6 +582,40 @@ async fn execute_phase2_task(
         fold_graph_log(&PooledGraphLog::default(), window).0
     };
     let output = match kind {
+        Phase2TaskKind::PoolDeltaRun { events } => {
+            let bytes =
+                fluree_db_binary_index::format::pool_delta::encode_delta_run(order, &events)
+                    .map_err(|e| IndexerError::StorageWrite(format!("pool delta run: {e}")))?;
+            // A run lives with the pool's leaves; it is reachable only from
+            // the root, never from a branch.
+            let cid = content_store
+                .put(ContentKind::IndexLeaf, &bytes)
+                .await
+                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+            tracing::debug!(
+                ?order,
+                events = events.len(),
+                bytes = bytes.len(),
+                "pool delta run written"
+            );
+            Phase2TaskOutput {
+                seq,
+                target,
+                order,
+                update: Phase2TaskUpdate::DeltaRun {
+                    run: fluree_db_binary_index::PoolDeltaRun {
+                        cid,
+                        events: events.len() as u32,
+                    },
+                },
+                replaced_leaf_cids: Vec::new(),
+                replaced_sidecar_cids: Vec::new(),
+                new_leaf_count: 0,
+                fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
+                graph_deltas: GraphDeltas::new(),
+            }
+        }
         Phase2TaskKind::DefaultExisting { leaves } if leaves.is_empty() => {
             write_folded_tree(
                 &fold_own_window(),
@@ -1035,12 +1081,11 @@ pub async fn incremental_index(
                 .0,
             )
         });
+        let base_rows: u64 =
+            base_pool.map_or(0, |p| p.members.iter().map(|m| u64::from(m.rows)).sum());
         for &order in RunSortOrder::pool_build_orders() {
             let cmp = cmp_v2_for_order(order);
-            let mut sorted = records.clone();
-            sorted.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
-            let mut sorted_superseded = superseded.clone();
-            sorted_superseded.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+            let (mut sorted, mut sorted_superseded) = (records.clone(), superseded.clone());
             let kind = match (base_pool, &fresh_pool) {
                 (Some(pool), _) => {
                     let branch_cid = pool
@@ -1053,13 +1098,78 @@ pub async fn incremental_index(
                                 "pooled tree has no {order:?} branch"
                             ))
                         })?;
-                    Phase2TaskKind::NamedExisting { branch_cid }
+                    // GSPO merges every window. A secondary order appends the
+                    // window as a delta run, unless its runs have outgrown
+                    // their bounds or a graph is leaving the pool: then the
+                    // runs and the window merge into its base at once.
+                    let runs = pool.delta(order);
+                    let window_events = records.len() + superseded.len();
+                    if order == RunSortOrder::Gspo {
+                        Phase2TaskKind::NamedExisting { branch_cid }
+                    } else if !compact_delta(runs, window_events, base_rows, !promote.is_empty()) {
+                        let mut events: Vec<fluree_db_binary_index::OverlayOp> = records
+                            .iter()
+                            .chain(&superseded)
+                            .map(|&(rec, op)| delta_event(rec, op))
+                            .collect();
+                        fluree_db_binary_index::read::types::sort_overlay_ops_stable(
+                            &mut events,
+                            order,
+                        );
+                        phase2_tasks.push(Phase2Task {
+                            seq: phase2_tasks.len(),
+                            target: TreeTarget::Pool,
+                            purge: Arc::clone(&no_purge),
+                            order,
+                            sorted_records: Vec::new(),
+                            sorted_ops: Vec::new(),
+                            sorted_superseded: Vec::new(),
+                            sorted_superseded_ops: Vec::new(),
+                            kind: Phase2TaskKind::PoolDeltaRun { events },
+                        });
+                        continue;
+                    } else {
+                        let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
+                        for run in runs {
+                            let bytes = content_store.get(&run.cid).await.map_err(|e| {
+                                IndexerError::StorageRead(format!("pool delta run: {e}"))
+                            })?;
+                            let (_, run_events) =
+                                fluree_db_binary_index::format::pool_delta::decode_delta_run(
+                                    &bytes,
+                                )
+                                .map_err(|e| {
+                                    IndexerError::StorageRead(format!("pool delta run: {e}"))
+                                })?;
+                            events.extend(
+                                run_events
+                                    .into_iter()
+                                    .filter(|e| promote.binary_search(&e.g_id).is_err())
+                                    .map(delta_record),
+                            );
+                        }
+                        let purge_markers = records.iter().filter(|&&(_, op)| op == OP_PURGE);
+                        events.extend(
+                            records
+                                .iter()
+                                .chain(&superseded)
+                                .filter(|&&(_, op)| op != OP_PURGE),
+                        );
+                        let (winners, earlier) = split_lifecycles(events, order);
+                        sorted = winners;
+                        sorted.extend(purge_markers);
+                        sorted_superseded = earlier;
+                        root_builder.clear_pool_delta(order);
+                        Phase2TaskKind::NamedExisting { branch_cid }
+                    }
                 }
                 (None, Some(facts)) => Phase2TaskKind::Folded {
                     facts: Arc::clone(facts),
                 },
                 (None, None) => unreachable!("a missing pool is folded"),
             };
+            sorted.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+            sorted_superseded.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
             phase2_tasks.push(Phase2Task {
                 seq: phase2_tasks.len(),
                 target: TreeTarget::Pool,
@@ -1142,6 +1252,9 @@ pub async fn incremental_index(
             }
             (Phase2TaskUpdate::Branch { branch_cid }, TreeTarget::Pool) => {
                 root_builder.set_pool_branch(output.order, branch_cid);
+            }
+            (Phase2TaskUpdate::DeltaRun { run }, _) => {
+                root_builder.append_pool_delta_run(output.order, run);
             }
         }
         for (g_id, delta) in output.graph_deltas {
@@ -5196,6 +5309,88 @@ fn leaf_rows_for(order: RunSortOrder, config: &IndexerConfig) -> usize {
     }
 }
 
+/// Most delta runs a pooled secondary order keeps before compacting them.
+const DELTA_MAX_RUNS: usize = 64;
+
+/// Delta events a pooled secondary order may hold however small its base.
+const DELTA_MIN_EVENTS: u64 = 50_000;
+
+/// A delta may hold up to its base's live rows divided by this.
+const DELTA_BASE_SHARE: u64 = 4;
+
+/// Delta events a pooled secondary order holds at most, however large its
+/// base: readers keep each order's delta in memory.
+const DELTA_MAX_EVENTS: u64 = 250_000;
+
+/// Whether a pooled secondary order should fold its delta runs, and this
+/// window's events, into its base rather than append the window as a run:
+/// at its run or size bound, or when a graph is leaving the pool, which only
+/// the base can purge.
+fn compact_delta(
+    runs: &[fluree_db_binary_index::PoolDeltaRun],
+    window_events: usize,
+    base_rows: u64,
+    promoting: bool,
+) -> bool {
+    let events: u64 = runs.iter().map(|r| u64::from(r.events)).sum::<u64>() + window_events as u64;
+    let limit = (base_rows / DELTA_BASE_SHARE).clamp(DELTA_MIN_EVENTS, DELTA_MAX_EVENTS);
+    promoting || runs.len() + 1 > DELTA_MAX_RUNS || events > limit
+}
+
+/// A window event as a delta run event.
+fn delta_event(rec: RunRecordV2, op: u8) -> fluree_db_binary_index::OverlayOp {
+    fluree_db_binary_index::OverlayOp {
+        s_id: rec.s_id.as_u64(),
+        p_id: rec.p_id,
+        o_type: rec.o_type,
+        o_key: rec.o_key,
+        o_i: rec.o_i,
+        t: i64::from(rec.t),
+        op: op == 1,
+        g_id: rec.g_id,
+    }
+}
+
+/// A delta run event as a window event.
+fn delta_record(e: fluree_db_binary_index::OverlayOp) -> (RunRecordV2, u8) {
+    (
+        RunRecordV2 {
+            s_id: fluree_db_core::subject_id::SubjectId(e.s_id),
+            o_key: e.o_key,
+            p_id: e.p_id,
+            t: u32::try_from(e.t).unwrap_or(u32::MAX),
+            o_i: e.o_i,
+            o_type: e.o_type,
+            g_id: e.g_id,
+        },
+        u8::from(e.op),
+    )
+}
+
+/// Window events: a record and its op.
+type Events = Vec<(RunRecordV2, u8)>;
+
+/// Split events into each fact's winner — its latest event, a retract taking
+/// a same-`t` tie — and the earlier events it superseded, the shape the leaf
+/// merge consumes.
+fn split_lifecycles(mut events: Events, order: RunSortOrder) -> (Events, Events) {
+    let cmp = cmp_v2_for_order(order);
+    let same = fluree_db_binary_index::format::run_record_v2::identity_v2_for_order(order);
+    events.sort_by(|a, b| {
+        cmp(&a.0, &b.0)
+            .then(a.0.t.cmp(&b.0.t))
+            .then((a.1 == 0).cmp(&(b.1 == 0)))
+    });
+    let (mut winners, mut earlier) = (Vec::new(), Vec::new());
+    for (i, &event) in events.iter().enumerate() {
+        match events.get(i + 1) {
+            Some(next) if same(&event.0, &next.0) => earlier.push(event),
+            _ => winners.push(event),
+        }
+    }
+    (winners, earlier)
+}
+
 /// `base` grown by a window's winning ops and superseded events, estimated
 /// before the merge resolves them: an assert adds a row, a retract removes
 /// one and leaves two history entries (the row's assert and the retract),
@@ -5416,6 +5611,37 @@ fn build_predicate_sids(
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+
+    #[test]
+    fn a_delta_compacts_at_its_run_size_or_promotion_bound() {
+        let run = |events| fluree_db_binary_index::PoolDeltaRun {
+            cid: ContentId::new(ContentKind::IndexLeaf, b"run"),
+            events,
+        };
+        let runs = vec![run(10); DELTA_MAX_RUNS - 1];
+        assert!(!compact_delta(&runs, 10, 0, false));
+        assert!(compact_delta(&runs, 10, 0, true), "a graph leaving");
+        assert!(
+            compact_delta(&[runs.clone(), vec![run(10)]].concat(), 10, 0, false),
+            "runs"
+        );
+
+        let below = (DELTA_MIN_EVENTS - 10) as usize;
+        assert!(!compact_delta(&[run(10)], below, 0, false));
+        assert!(compact_delta(&[run(11)], below, 0, false), "small base");
+        let base = 4 * (DELTA_MIN_EVENTS + 100);
+        assert!(
+            !compact_delta(&[run(110)], below, base, false),
+            "base share"
+        );
+        assert!(compact_delta(&[run(111)], below, base, false));
+        let huge = u64::MAX / 2;
+        assert!(!compact_delta(&[], DELTA_MAX_EVENTS as usize, huge, false));
+        assert!(
+            compact_delta(&[run(1)], DELTA_MAX_EVENTS as usize, huge, false),
+            "absolute"
+        );
+    }
 
     #[test]
     fn a_window_grows_a_graph_by_its_net_rows_and_its_transitions() {

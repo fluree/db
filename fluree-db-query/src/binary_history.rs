@@ -229,12 +229,16 @@ impl BinaryHistoryScanOperator {
                     matches!(self.pattern.p, Ref::Iri(_) | Ref::Sid(_)) && filter.p_id.is_none();
                 let skip_persisted = s_literal_unresolvable || p_literal_unresolvable;
 
-                // A pooled graph reads the pooled tree, keeping only its own
-                // rows and history entries.
-                if let Some(tree) = store
-                    .graph_tree(g_id, self.pick_order(&filter))
-                    .filter(|_| !skip_persisted)
-                {
+                // A pooled graph reads the pooled tree's GSPO, keeping only its
+                // own rows and history entries: GSPO is current every build,
+                // while the other pooled orders hold recent events in delta
+                // runs this walk of leaves and sidecars would not see.
+                let order = if store.is_pooled(g_id) {
+                    RunSortOrder::Spot
+                } else {
+                    self.pick_order(&filter)
+                };
+                if let Some(tree) = store.graph_tree(g_id, order).filter(|_| !skip_persisted) {
                     let (branch, order, pooled_g) = (&tree.branch, tree.order, tree.g_filter);
                     let leaf_indices = match pooled_g {
                         Some(g) if order == RunSortOrder::Gspo => {

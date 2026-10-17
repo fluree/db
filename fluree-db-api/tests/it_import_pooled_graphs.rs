@@ -440,6 +440,16 @@ async fn objects_at(
 /// `?s ex:label ?o` events over the whole history of graph `graph`, read by
 /// the history scan bound to that graph.
 async fn history_events(ledger: &fluree_db_api::LedgerState, graph: &str) -> usize {
+    history_events_via(ledger, graph, None).await
+}
+
+/// [`history_events`] with the planner's index hint, as a history scan
+/// grouped by its object (POST) or under a prefix filter (OPST) gets.
+async fn history_events_via(
+    ledger: &fluree_db_api::LedgerState,
+    graph: &str,
+    index_hint: Option<fluree_db_core::IndexType>,
+) -> usize {
     use fluree_db_query::{
         context::ExecutionContext,
         ir::{Ref, Term, TriplePattern},
@@ -471,7 +481,13 @@ async fn history_events(ledger: &fluree_db_api::LedgerState, graph: &str) -> usi
     );
     let mut ctx = ExecutionContext::new(&ledger.snapshot, &vars).with_binary_store(store, g_id);
     ctx.from_t = Some(1);
-    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
+    let mut scan = BinaryHistoryScanOperator::new_with_emit_and_index(
+        pattern,
+        None,
+        Vec::new(),
+        fluree_db_query::binary_scan::EmitMask::ALL,
+        index_hint,
+    );
     scan.open(&ctx).await.expect("open");
     let mut events = 0;
     while let Some(batch) = scan.next_batch(&ctx).await.expect("batch") {
@@ -2031,4 +2047,188 @@ async fn quad_buffers_count_against_the_memory_budget() {
         "result={result:?}, retained charge={}, rows={rows}",
         ctx.mem_used()
     );
+}
+
+/// Writes to pooled graphs merge into GSPO and land in delta runs of the
+/// four secondary orders, whose bases stay as they were: every read through
+/// those orders — object lookups, quad scans, an earlier `t`, history —
+/// still sees them. A graph leaving the pool compacts the runs into the
+/// bases.
+#[tokio::test]
+async fn pooled_secondary_orders_take_writes_as_delta_runs() {
+    use fluree_db_binary_index::RunSortOrder;
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-delta:main";
+    let (fluree, ledger) =
+        import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    let t_import = ledger.t();
+    let imported = latest_root(db_dir.path()).pool.expect("pooled");
+    let secondary = [
+        RunSortOrder::SpotG,
+        RunSortOrder::PsotG,
+        RunSortOrder::PostG,
+        RunSortOrder::OpstG,
+    ];
+    let branch = |pool: &fluree_db_binary_index::PoolRouting, order| {
+        pool.orders
+            .iter()
+            .find(|(o, _)| *o == order)
+            .map(|(_, cid)| cid.clone())
+    };
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g2 { ex:z ex:label \"Z\" . ex:z ex:val 20 . } }",
+    )
+    .await;
+    let t_added = fluree.ledger(ledger_id).await.unwrap().t();
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g2 { ex:z ex:label \"Z\" . } }",
+    )
+    .await;
+    let (root, _) = index_and_reload(&fluree, ledger_id).await;
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g3 { ex:w ex:val 30 . } }",
+    )
+    .await;
+    let (root2, ledger) = index_and_reload(&fluree, ledger_id).await;
+    for pool in [root.pool.as_ref().unwrap(), root2.pool.as_ref().unwrap()] {
+        assert_ne!(
+            branch(pool, RunSortOrder::Gspo),
+            branch(&imported, RunSortOrder::Gspo)
+        );
+        for order in secondary {
+            assert_eq!(
+                branch(pool, order),
+                branch(&imported, order),
+                "{order:?} base"
+            );
+        }
+    }
+    for order in secondary {
+        assert_eq!(
+            root.pool.as_ref().unwrap().delta(order).len(),
+            1,
+            "{order:?}"
+        );
+        assert_eq!(
+            root2.pool.as_ref().unwrap().delta(order).len(),
+            2,
+            "{order:?}"
+        );
+    }
+    let reachable = root2.all_cas_ids();
+    assert!(root2
+        .pool_delta_runs()
+        .all(|run| reachable.contains(&run.cid)));
+
+    let check = |ledger: fluree_db_api::LedgerState| {
+        let fluree = &fluree;
+        async move {
+            // A value range reads the pooled POST; an object alone the pooled
+            // OPST; GRAPH ?g every pooled order as quad scans.
+            assert_eq!(
+                select(
+                    fluree,
+                    &ledger,
+                    &format!(
+                        "{PREFIXES}SELECT ?s ?v WHERE {{ GRAPH ex:g2 {{ ?s ex:val ?v FILTER(?v > 5) }} }}"
+                    )
+                )
+                .await,
+                vec!["s=http://example.org/z v=20"]
+            );
+            assert_eq!(
+                select(
+                    fluree,
+                    &ledger,
+                    &format!("{PREFIXES}SELECT ?s ?p WHERE {{ GRAPH ex:g3 {{ ?s ?p 30 }} }}")
+                )
+                .await,
+                vec!["p=http://example.org/val s=http://example.org/w"]
+            );
+            assert_eq!(
+                select(
+                    fluree,
+                    &ledger,
+                    &format!("{PREFIXES}SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s ex:val ?v FILTER(?v >= 20) }} }}")
+                )
+                .await,
+                vec![
+                    "g=http://example.org/g2 s=http://example.org/z",
+                    "g=http://example.org/g3 s=http://example.org/w"
+                ]
+            );
+            assert_eq!(
+                objects_at(fluree, &ledger, ledger_id, "g2", Some(t_added)).await,
+                vec!["ex:b \"B\"", "ex:z \"Z\""]
+            );
+            assert_eq!(
+                objects_at(fluree, &ledger, ledger_id, "g2", Some(t_import)).await,
+                vec!["ex:b \"B\""]
+            );
+            assert_eq!(
+                objects_at(fluree, &ledger, ledger_id, "g2", None).await,
+                vec!["ex:b \"B\""]
+            );
+        }
+    };
+    check(ledger.clone()).await;
+    // Value-ordered history scans read GSPO too: the delta runs hold Z.
+    for hint in [
+        fluree_db_core::IndexType::Post,
+        fluree_db_core::IndexType::Opst,
+    ] {
+        assert_eq!(
+            history_events_via(&ledger, "g2", Some(hint)).await,
+            3,
+            "{hint:?}: B's assert, Z's assert and retract"
+        );
+    }
+
+    // g1 leaves the pool: the runs fold into the bases, without g1.
+    set_graph_placement(
+        &fluree,
+        ledger_id,
+        "PlacementAuto",
+        &[("g1", "PlacementDedicated")],
+    )
+    .await;
+    let (root3, ledger) = index_and_reload(&fluree, ledger_id).await;
+    let pool = root3.pool.as_ref().unwrap();
+    for order in secondary {
+        assert!(pool.delta(order).is_empty(), "{order:?} compacted");
+        assert_ne!(
+            branch(pool, order),
+            branch(&imported, order),
+            "{order:?} rebased"
+        );
+    }
+    let content = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let garbage: fluree_db_indexer::GarbageRecord = serde_json::from_slice(
+        &content
+            .get(&root3.garbage.as_ref().expect("garbage").id)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        root2
+            .pool_delta_runs()
+            .all(|run| garbage.garbage.contains(&run.cid.to_string())),
+        "compacted runs are garbage"
+    );
+    let (in_rows, in_history) = graphs_in_pool(&fluree, &ledger, ledger_id).await;
+    let g1 = user_graph_id(&root3, "g1");
+    assert!(!in_rows.contains(&g1) && !in_history.contains(&g1));
+    check(ledger).await;
 }
