@@ -91,7 +91,7 @@ impl Profile {
     }
 }
 
-pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         ModelAccessAction::Enable {
             dataset,
@@ -115,7 +115,6 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
                 *dry_run,
                 remote.as_deref(),
                 dirs,
-                direct,
             )
             .await
         }
@@ -137,12 +136,11 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
                 *dry_run,
                 remote.as_deref(),
                 dirs,
-                direct,
             )
             .await
         }
         ModelAccessAction::Show { dataset, remote } => {
-            run_show(dataset, remote.as_deref(), dirs, direct).await
+            run_show(dataset, remote.as_deref(), dirs).await
         }
     }
 }
@@ -161,7 +159,6 @@ async fn run_enable(
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
-    direct: bool,
 ) -> CliResult<()> {
     let profile = Profile::parse(profile_str)?;
     require_absolute_iri("--class", class)?;
@@ -237,7 +234,7 @@ async fn run_enable(
     // (harmless) rather than a grant naming classes that don't exist.
     // Both policy ids are replaced atomically whether or not this profile
     // emits them — see the module doc for why merge semantics are unsafe.
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    let mode = resolve_mode(dataset, remote, dirs).await?;
     let view_id = format!("{policy_class}/view");
     let write_id = format!("{policy_class}/write");
     replace_nodes(&mode, &graph, &[&view_id, &write_id], &[]).await?;
@@ -306,7 +303,6 @@ async fn run_disable(
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
-    direct: bool,
 ) -> CliResult<()> {
     let policy_class = resolve_policy_class(policy_class_override, profile, class)?;
     if space.is_some() && remote.is_none() {
@@ -332,7 +328,7 @@ async fn run_disable(
         detach_grant(dirs, remote_name, dataset, space_id, &policy_class).await?;
     }
 
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    let mode = resolve_mode(dataset, remote, dirs).await?;
     update(&mode, &txn).await?;
     println!("\nPolicies removed from '{dataset}'.");
 
@@ -510,13 +506,8 @@ fn compile(
 
 /// List compiled access policies grouped by policy class — read straight
 /// from the `f:` artifacts (there is no separate intent store to consult).
-async fn run_show(
-    dataset: &str,
-    remote: Option<&str>,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+async fn run_show(dataset: &str, remote: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
+    let mode = resolve_mode(dataset, remote, dirs).await?;
     let q = json!({
         "@context": {"f": F},
         "select": {"?policy": ["*"]},

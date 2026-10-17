@@ -166,19 +166,28 @@ fluree server logs -f
 
 ## Auto-Routing
 
-When a local server is running (started via `fluree server start`), CLI commands that support remote execution are **automatically routed through the server's HTTP API**. This applies to:
+When a local server is running on the project's storage (started with `fluree server start` or
+`fluree server run`), CLI commands that can run through a server are **sent through its HTTP API**
+instead of opening the storage beside it. This applies to:
 
-- `fluree query`
-- `fluree insert`
-- `fluree upsert`
-- `fluree list`
-- `fluree info`
+- ledger commands: `query`, `insert`, `upsert`, `update`, `load`, `show`, `info`, `index`,
+  `sweep`, `graph`, `sync`, `model` and the `branch` subcommands;
+- `create` (including `--from`, which uploads the file for a server-side import), and `use`,
+  which asks the server whether the ledger exists;
+- connection-wide commands: `list`, `log`, `history`, `export`, `drop`, `dropped`, `context`,
+  `bm25`, `sql`, `delta`, `iceberg` and `multi-query`.
 
-The CLI detects the running server by checking `.fluree/server.meta.json` and verifying the PID is alive. When auto-routing is active, you'll see a hint on stderr:
+The CLI finds the server through `.fluree/server.meta.json`, which the server writes when it starts
+and removes when it stops. It routes to that server only when its process is alive, is a Fluree
+server, and serves the storage this project's commands would otherwise open; a server started on
+another `--storage-path` is left alone. The choice is made before anything opens the storage. When
+a command is routed, you'll see a hint on stderr:
 
 ```
   server: routing through local server at 0.0.0.0:8090 (use --direct to bypass)
 ```
+
+A ledger the server doesn't hold still resolves to a tracked remote of that name, if there is one.
 
 ### Opting out
 
@@ -199,6 +208,8 @@ If the server has crashed or been killed, the CLI detects the stale PID and fall
 ```
   notice: local server (pid 12345) is no longer running; executing directly
 ```
+
+The same happens, with its own notice, when `server.meta.json` names a server on other storage.
 
 Use `fluree server status` to check server health, or `fluree server logs` to view crash output.
 

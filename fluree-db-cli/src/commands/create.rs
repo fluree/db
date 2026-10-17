@@ -2,6 +2,7 @@ use crate::config;
 use crate::context;
 use crate::detect;
 use crate::error::{CliError, CliResult};
+use crate::remote_client::RemoteLedgerClient;
 use fluree_db_api::server_defaults::FlureeDir;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,31 +22,74 @@ pub struct ImportOpts {
     pub base_iri: Option<String>,
 }
 
-/// `fluree create <ledger> --remote <name>` — create an empty ledger on the
-/// remote server. Only the empty-create case is supported; bulk imports
-/// (`--from`, `--memory`) require local data ingestion and are dispatched
-/// before this is reached. Active-ledger pointer is **not** touched —
-/// remote storage is separate from local.
-pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> CliResult<()> {
-    let client = context::build_remote_client(remote_name, dirs).await?;
+/// Where a create goes when it is not made in this project's storage: the
+/// remote `--remote` names, or the local server running on that storage.
+pub struct Destination {
+    client: RemoteLedgerClient,
+    remote: Option<String>,
+}
+
+impl Destination {
+    pub async fn remote(name: &str, dirs: &FlureeDir) -> CliResult<Self> {
+        Ok(Self {
+            client: context::build_remote_client(name, dirs).await?,
+            remote: Some(name.to_string()),
+        })
+    }
+
+    pub fn local_server(client: RemoteLedgerClient) -> Self {
+        Self {
+            client,
+            remote: None,
+        }
+    }
+
+    fn label(&self) -> String {
+        match &self.remote {
+            Some(name) => format!("remote '{name}'"),
+            None => "the local server".to_string(),
+        }
+    }
+
+    /// The fallback a refused server-side import points at.
+    fn create_locally_hint(&self, ledger: &str) -> String {
+        match &self.remote {
+            Some(name) => format!("create locally then `fluree publish {name} {ledger}`"),
+            None => "stop the server (`fluree server stop`) and create it locally".to_string(),
+        }
+    }
+
+    async fn finish(&self, dirs: &FlureeDir) {
+        if let Some(name) = &self.remote {
+            context::persist_refreshed_tokens(&self.client, name, dirs).await;
+        }
+    }
+}
+
+/// `fluree create <ledger>` on a server — create an empty ledger there.
+/// Bulk imports from memory history (`--memory`) need local data ingestion
+/// and are dispatched before this is reached. The active-ledger pointer is
+/// **not** touched.
+pub async fn run_remote(ledger: &str, dest: &Destination, dirs: &FlureeDir) -> CliResult<()> {
     let ledger_id = context::to_ledger_id(ledger)?;
-    let response = client.create_ledger(&ledger_id).await.map_err(|e| {
+    let response = dest.client.create_ledger(&ledger_id).await.map_err(|e| {
         CliError::Remote(format!(
-            "failed to create '{ledger}' on remote '{remote_name}': {e}"
+            "failed to create '{ledger}' on {}: {e}",
+            dest.label()
         ))
     })?;
-    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+    dest.finish(dirs).await;
 
     let resolved = response
         .get("ledger")
         .and_then(|v| v.as_str())
         .unwrap_or(&ledger_id);
-    println!("Created ledger '{resolved}' on remote '{remote_name}'");
+    println!("Created ledger '{resolved}' on {}", dest.label());
     Ok(())
 }
 
-/// `fluree create <ledger> --remote <name> --from <archive>.flpack` — restore a
-/// ledger onto a remote server from a local `.flpack` archive. The remote
+/// `fluree create <ledger> --from <archive>.flpack` on a server — restore a
+/// ledger onto it from a local `.flpack` archive. The remote
 /// creates the ledger under `ledger` (which may differ from the archived
 /// ledger's name). No local state is written — remote storage is separate.
 ///
@@ -54,7 +98,7 @@ pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> Cl
 /// when the server is size-capped and the archive exceeds its direct limit.
 pub async fn run_remote_flpack_import(
     ledger: &str,
-    remote_name: &str,
+    dest: &Destination,
     path: &Path,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
@@ -62,18 +106,18 @@ pub async fn run_remote_flpack_import(
         .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
     let size = meta.len();
 
-    let client = context::build_remote_client(remote_name, dirs).await?;
     let ledger_id = context::to_ledger_id(ledger)?;
+    let label = dest.label();
 
-    let cap = client.fetch_import_capability().await;
+    let cap = dest.client.fetch_import_capability().await;
     let result = if cap.needs_negotiated_upload(size) {
-        run_remote_flpack_negotiated(&client, ledger, &ledger_id, remote_name, path, size).await?
+        run_remote_flpack_negotiated(&dest.client, ledger, &ledger_id, &label, path, size).await?
     } else {
-        run_remote_flpack_direct(&client, ledger, &ledger_id, remote_name, path, size).await?
+        run_remote_flpack_direct(&dest.client, ledger, &ledger_id, &label, path, size).await?
     };
-    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+    dest.finish(dirs).await;
 
-    print_remote_import_summary(remote_name, &ledger_id, &result);
+    print_remote_import_summary(&label, &ledger_id, &result);
     Ok(())
 }
 
@@ -82,23 +126,22 @@ async fn run_remote_flpack_direct(
     client: &crate::remote_client::RemoteLedgerClient,
     ledger: &str,
     ledger_id: &str,
-    remote_name: &str,
+    label: &str,
     path: &Path,
     size: u64,
 ) -> CliResult<serde_json::Value> {
     use colored::Colorize;
     eprintln!(
-        "Importing '{}' to remote '{}' from {} ({})...",
+        "Importing '{}' to {} from {} ({})...",
         ledger.cyan(),
-        remote_name,
+        label,
         path.display(),
         format_human_bytes(size),
     );
-    client.import_ledger(ledger_id, path).await.map_err(|e| {
-        CliError::Remote(format!(
-            "failed to import '{ledger}' to remote '{remote_name}': {e}"
-        ))
-    })
+    client
+        .import_ledger(ledger_id, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to import '{ledger}' to {label}: {e}")))
 }
 
 /// Negotiated path: mint an upload slot, PUT the archive out-of-band, notify
@@ -107,16 +150,16 @@ async fn run_remote_flpack_negotiated(
     client: &crate::remote_client::RemoteLedgerClient,
     ledger: &str,
     ledger_id: &str,
-    remote_name: &str,
+    label: &str,
     path: &Path,
     size: u64,
 ) -> CliResult<serde_json::Value> {
     use colored::Colorize;
 
     eprintln!(
-        "Uploading '{}' to remote '{}' via presigned upload ({})...",
+        "Uploading '{}' to {} via presigned upload ({})...",
         ledger.cyan(),
-        remote_name,
+        label,
         format_human_bytes(size),
     );
 
@@ -125,7 +168,7 @@ async fn run_remote_flpack_negotiated(
     let mint = client
         .mint_import_upload(ledger_id, Some(size))
         .await
-        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+        .map_err(|e| CliError::Remote(format!("failed to start upload to {label}: {e}")))?;
     let import_id = mint["import_id"]
         .as_str()
         .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
@@ -146,7 +189,7 @@ async fn run_remote_flpack_negotiated(
         .await
         .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
 
-    eprintln!("Upload complete; restoring on '{remote_name}'...");
+    eprintln!("Upload complete; restoring on {label}...");
 
     // 4. Poll status to a terminal state.
     poll_remote_import(client, &import_id).await
@@ -281,14 +324,14 @@ async fn poll_remote_import(
     }
 }
 
-/// `fluree create <ledger> --remote <name> --from <data>` for non-`.flpack`
+/// `fluree create <ledger> --from <data>` on a server, for non-`.flpack`
 /// inputs: upload the raw source file to a server advertising
 /// `source-upload` and let it run the bulk-import pipeline (the same formats
 /// `fluree create --from` takes locally). Single files only — a directory
 /// can't ride one upload slot; pack it or create locally and publish.
 pub async fn run_remote_source_import(
     ledger: &str,
-    remote_name: &str,
+    dest: &Destination,
     path: &Path,
     dirs: &FlureeDir,
     edge_policy: fluree_db_api::csv_import::EdgePolicy,
@@ -296,12 +339,13 @@ pub async fn run_remote_source_import(
 ) -> CliResult<()> {
     use colored::Colorize;
 
+    let label = dest.label();
     if !path.is_file() {
         return Err(CliError::Usage(format!(
-            "--remote --from requires a single file ({} is a directory); \
-             create locally then `fluree publish {remote_name} {ledger}`, or export \
-             to .flpack (`fluree export <ledger> --format ledger -o out.flpack`).",
-            path.display()
+            "creating on {label} from data takes a single file ({} is a directory); \
+             {}, or export to .flpack (`fluree export <ledger> --format ledger -o out.flpack`).",
+            path.display(),
+            dest.create_locally_hint(ledger),
         )));
     }
     let filename = path
@@ -312,22 +356,23 @@ pub async fn run_remote_source_import(
         .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
     let size = meta.len();
 
-    let client = context::build_remote_client(remote_name, dirs).await?;
+    let client = &dest.client;
     let ledger_id = context::to_ledger_id(ledger)?;
 
     let cap = client.fetch_import_capability().await;
     if !cap.supports_source_upload() {
         return Err(CliError::Usage(format!(
-            "remote '{remote_name}' does not offer server-side bulk import (source-upload); \
+            "{label} does not offer server-side bulk import (source-upload); \
              export to .flpack first (`fluree export <ledger> --format ledger -o out.flpack`), \
-             or create locally then `fluree publish {remote_name} {ledger}`."
+             or {}.",
+            dest.create_locally_hint(ledger),
         )));
     }
 
     eprintln!(
-        "Uploading '{}' to remote '{}' for server-side bulk import ({}, {})...",
+        "Uploading '{}' to {} for server-side bulk import ({}, {})...",
         ledger.cyan(),
-        remote_name,
+        label,
         filename,
         format_human_bytes(size),
     );
@@ -339,16 +384,16 @@ pub async fn run_remote_source_import(
     let mint = client
         .mint_source_import_upload(&ledger_id, Some(size), filename, edge_policy, base_iri)
         .await
-        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+        .map_err(|e| CliError::Remote(format!("failed to start upload to {label}: {e}")))?;
     let import_id = mint["import_id"]
         .as_str()
         .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
         .to_string();
 
     let completed_parts = if mint.get("multipart").is_some() {
-        upload_multipart(&client, &mint, path, size).await?
+        upload_multipart(client, &mint, path, size).await?
     } else {
-        upload_single(&client, &mint, path).await?
+        upload_single(client, &mint, path).await?
     };
 
     client
@@ -356,19 +401,19 @@ pub async fn run_remote_source_import(
         .await
         .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
 
-    eprintln!("Upload complete; importing on '{remote_name}'...");
+    eprintln!("Upload complete; importing on {label}...");
 
-    let result = poll_remote_import(&client, &import_id).await?;
-    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+    let result = poll_remote_import(client, &import_id).await?;
+    dest.finish(dirs).await;
 
     let resolved = result["ledger_id"].as_str().unwrap_or(&ledger_id);
     let t = result["t"].as_i64().unwrap_or(0);
     let flakes = result["flake_count"].as_u64().unwrap_or(0);
     println!(
-        "{} Imported '{}' to remote '{}' — t={}, {} flakes",
+        "{} Imported '{}' to {} — t={}, {} flakes",
         "✓".green(),
         resolved,
-        remote_name,
+        label,
         t,
         flakes,
     );
@@ -376,17 +421,17 @@ pub async fn run_remote_source_import(
 }
 
 /// Print the shared success summary for a remote import (both paths).
-fn print_remote_import_summary(remote_name: &str, ledger_id: &str, result: &serde_json::Value) {
+fn print_remote_import_summary(label: &str, ledger_id: &str, result: &serde_json::Value) {
     use colored::Colorize;
     let resolved = result["ledger_id"].as_str().unwrap_or(ledger_id);
     let commits = result["commits"].as_u64().unwrap_or(0);
     let txn_blobs = result["txn_blobs"].as_u64().unwrap_or(0);
     let index_artifacts = result["index_artifacts"].as_u64().unwrap_or(0);
     println!(
-        "{} Imported '{}' to remote '{}' — {} commits, {} txn blobs, {} index artifacts",
+        "{} Imported '{}' to {} — {} commits, {} txn blobs, {} index artifacts",
         "✓".green(),
         resolved,
-        remote_name,
+        label,
         commits,
         txn_blobs,
         index_artifacts,

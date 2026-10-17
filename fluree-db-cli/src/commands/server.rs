@@ -7,33 +7,17 @@
 use crate::cli::ServerAction;
 use crate::config;
 use crate::error::{CliError, CliResult};
+use crate::local_server::{is_fluree_process, is_process_alive, meta_path, ServerMeta};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_server::config_file::load_and_merge_config;
 use fluree_db_server::{
     init_logging, shutdown_tracer, FlureeServer, ServerConfig, TelemetryConfig,
 };
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-
-/// Metadata persisted alongside the PID file for `restart` and `status`.
-#[derive(Debug, Serialize, Deserialize)]
-struct ServerMeta {
-    pid: u32,
-    listen_addr: String,
-    storage_path: String,
-    #[serde(default)]
-    connection_config: Option<String>,
-    #[serde(default)]
-    bolt_listen_addr: Option<String>,
-    config_path: Option<String>,
-    started_at: String,
-    /// The raw args passed to the `_child` process (for `restart`).
-    args: Vec<String>,
-}
 
 // ---------------------------------------------------------------------------
 // File paths within data_dir
@@ -45,10 +29,6 @@ fn pid_path(data_dir: &Path) -> PathBuf {
 
 fn log_path(data_dir: &Path) -> PathBuf {
     data_dir.join("server.log")
-}
-
-fn meta_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("server.meta.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,50 +1272,6 @@ fn send_signal(pid: u32, sig: Signal) {
 #[cfg(not(unix))]
 fn send_signal(_pid: u32, _sig: Signal) {
     eprintln!("Signal sending is only supported on Unix. Use task manager to stop the server.");
-}
-
-#[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_process_alive(_pid: u32) -> bool {
-    // Conservative: assume alive if we can't check
-    true
-}
-
-/// Validate that a PID belongs to a Fluree server process (not a recycled PID).
-///
-/// On Linux, reads `/proc/<pid>/cmdline`. On macOS (and Linux fallback), uses
-/// `ps -o command=` to get the full argv and checks for "fluree" + "server child".
-/// Returns true if we can confirm it's ours, or if we can't check (conservative).
-#[cfg(unix)]
-fn is_fluree_process(pid: u32) -> bool {
-    // Try /proc/<pid>/cmdline first (Linux). Fields are NUL-separated.
-    if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
-        let cmdline = String::from_utf8_lossy(&raw);
-        // Look for "server" + "child" in the command line (our _child pattern)
-        return cmdline.contains("fluree") && cmdline.contains("server");
-    }
-    // Fallback: use `ps -o command=` for the full argv (works on macOS and Linux).
-    // `command=` gives the full command line, not just the executable name.
-    if let Ok(output) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    {
-        if output.status.success() {
-            let cmd = String::from_utf8_lossy(&output.stdout);
-            return cmd.contains("fluree") && cmd.contains("server");
-        }
-    }
-    // Can't verify — assume it's ours (conservative)
-    true
-}
-
-#[cfg(not(unix))]
-fn is_fluree_process(_pid: u32) -> bool {
-    true
 }
 
 fn read_pid(path: &Path) -> Option<u32> {

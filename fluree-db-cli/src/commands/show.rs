@@ -9,18 +9,13 @@ pub async fn run(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     let mode = if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
         context::build_remote_mode(remote_name, &alias, dirs).await?
     } else {
         let m = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            m
-        } else {
-            context::try_server_route(m, dirs)
-        }
+        m
     };
 
     match mode {

@@ -19,7 +19,6 @@ pub async fn run(
     format_flag: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
     let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
@@ -43,11 +42,7 @@ pub async fn run(
         context::build_remote_mode(remote_name, &alias, dirs).await?
     } else {
         let mode = context::resolve_ledger_mode(explicit_ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {

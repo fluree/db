@@ -10,11 +10,7 @@ use fluree_db_api::server_defaults::FlureeDir;
 // fluree iceberg map
 // =============================================================================
 
-pub async fn run_iceberg_map(
-    args: IcebergMapArgs,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
+pub async fn run_iceberg_map(args: IcebergMapArgs, dirs: &FlureeDir) -> CliResult<()> {
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
         let result = run_iceberg_map_remote(&client, &args).await.map_err(|e| {
@@ -27,12 +23,10 @@ pub async fn run_iceberg_map(
     }
 
     // Try server routing (unless --direct)
-    if !direct {
-        if let Some(client) = crate::context::try_server_route_client(dirs) {
-            return run_iceberg_map_remote(&client, &args)
-                .await
-                .map_err(|e| CliError::Remote(format!("failed to map Iceberg graph source: {e}")));
-        }
+    if let Some(client) = crate::context::local_server_client(dirs) {
+        return run_iceberg_map_remote(&client, &args)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to map Iceberg graph source: {e}")));
     }
 
     // Local execution
@@ -43,11 +37,7 @@ pub async fn run_iceberg_map(
 // fluree iceberg list
 // =============================================================================
 
-pub async fn run_iceberg_list(
-    dirs: &FlureeDir,
-    remote_flag: Option<&str>,
-    direct: bool,
-) -> CliResult<()> {
+pub async fn run_iceberg_list(dirs: &FlureeDir, remote_flag: Option<&str>) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let client = context::build_remote_client(remote_name, dirs).await?;
         let result = client.list_ledgers().await.map_err(|e| {
@@ -59,13 +49,12 @@ pub async fn run_iceberg_list(
         return print_iceberg_list_remote(&result, Some(remote_name));
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let result = client.list_ledgers().await.map_err(|e| {
-                CliError::Remote(format!("failed to list Iceberg graph sources: {e}"))
-            })?;
-            return print_iceberg_list_remote(&result, None);
-        }
+    if let Some(client) = context::local_server_client(dirs) {
+        let result = client
+            .list_ledgers()
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to list Iceberg graph sources: {e}")))?;
+        return print_iceberg_list_remote(&result, None);
     }
 
     let fluree = context::build_fluree(dirs).await?;
@@ -111,7 +100,6 @@ pub async fn run_iceberg_info(
     name: &str,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let client = context::build_remote_client(remote_name, dirs).await?;
@@ -124,13 +112,11 @@ pub async fn run_iceberg_info(
         return print_iceberg_info_remote(name, &info);
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let info = client.ledger_info(name, None).await.map_err(|e| {
-                CliError::Remote(format!("failed to load Iceberg graph source info: {e}"))
-            })?;
-            return print_iceberg_info_remote(name, &info);
-        }
+    if let Some(client) = context::local_server_client(dirs) {
+        let info = client.ledger_info(name, None).await.map_err(|e| {
+            CliError::Remote(format!("failed to load Iceberg graph source info: {e}"))
+        })?;
+        return print_iceberg_info_remote(name, &info);
     }
 
     let fluree = context::build_fluree(dirs).await?;
@@ -162,7 +148,6 @@ pub async fn run_iceberg_drop(
     force: bool,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if !force {
         return Err(CliError::Usage(format!(
@@ -188,18 +173,17 @@ pub async fn run_iceberg_drop(
         return print_remote_drop_response(&response);
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let info = client.ledger_info(name, None).await.map_err(|e| {
-                CliError::Remote(format!("failed to validate Iceberg graph source: {e}"))
-            })?;
-            ensure_remote_iceberg_info(name, &info)?;
+    if let Some(client) = context::local_server_client(dirs) {
+        let info = client.ledger_info(name, None).await.map_err(|e| {
+            CliError::Remote(format!("failed to validate Iceberg graph source: {e}"))
+        })?;
+        ensure_remote_iceberg_info(name, &info)?;
 
-            let response = client.drop_resource(name, true).await.map_err(|e| {
-                CliError::Remote(format!("failed to drop Iceberg graph source: {e}"))
-            })?;
-            return print_remote_drop_response(&response);
-        }
+        let response = client
+            .drop_resource(name, true)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to drop Iceberg graph source: {e}")))?;
+        return print_remote_drop_response(&response);
     }
 
     let fluree = context::build_fluree(dirs).await?;

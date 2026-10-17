@@ -54,7 +54,6 @@ pub async fn run(
     all: bool,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     // `--all` on a remote lane is still bounded by the server's hard cap; the
     // truncation line reports what was actually returned.
@@ -73,14 +72,12 @@ pub async fn run(
         return result;
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let alias = context::resolve_ledger(ledger, dirs)?;
-            let ledger_id = context::to_ledger_id(&alias)?;
-            let result = run_remote(&ledger_id, oneline, limit, &client).await;
-            context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
-            return result;
-        }
+    if let Some(client) = context::local_server_client(dirs) {
+        let alias = context::resolve_ledger(ledger, dirs)?;
+        let ledger_id = context::to_ledger_id(&alias)?;
+        let result = run_remote(&ledger_id, oneline, limit, &client).await;
+        context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+        return result;
     }
 
     run_local(ledger, oneline, limit, dirs).await

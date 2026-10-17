@@ -264,7 +264,6 @@ pub async fn run(
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     connection: Option<&str>,
-    direct: bool,
     tracking: TrackingFlags,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
@@ -395,11 +394,7 @@ pub async fn run(
         // with `NoActiveLedger` (symmetric with the `=REMOTE` arm above). A
         // provided or active ledger still resolves normally.
         match context::resolve_query_target(explicit_ledger, dirs).await {
-            Ok(context::QueryTarget::Ledger(mode)) => context::QueryTarget::Ledger(if direct {
-                mode
-            } else {
-                context::try_server_route(mode, dirs)
-            }),
+            Ok(context::QueryTarget::Ledger(mode)) => context::QueryTarget::Ledger(mode),
             Ok(gs) => gs,
             Err(CliError::NoActiveLedger) if force_connection => {
                 context::QueryTarget::Ledger(LedgerMode::Local {

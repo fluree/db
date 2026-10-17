@@ -7,7 +7,7 @@ use crate::cli::SqlMapArgs;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
 
-pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> {
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
         let result = run_sql_map_remote(&client, &args).await.map_err(|e| {
@@ -19,12 +19,10 @@ pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir, direct: bool) -> Cl
         return result;
     }
 
-    if !direct {
-        if let Some(client) = crate::context::try_server_route_client(dirs) {
-            return run_sql_map_remote(&client, &args)
-                .await
-                .map_err(|e| CliError::Remote(format!("failed to map SQL graph source: {e}")));
-        }
+    if let Some(client) = crate::context::local_server_client(dirs) {
+        return run_sql_map_remote(&client, &args)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to map SQL graph source: {e}")));
     }
 
     run_sql_map_local(args, dirs).await

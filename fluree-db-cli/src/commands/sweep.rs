@@ -34,7 +34,6 @@ pub async fn run_sweep(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
     mode: SweepMode,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
@@ -47,11 +46,7 @@ pub async fn run_sweep(
 
     let resolved = {
         let resolved = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            resolved
-        } else {
-            context::try_server_route(resolved, dirs)
-        }
+        resolved
     };
 
     match resolved {

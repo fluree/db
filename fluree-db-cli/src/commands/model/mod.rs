@@ -21,11 +21,11 @@ use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
 use serde_json::Value;
 
-pub async fn run(action: &ModelAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: &ModelAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
-        ModelAction::Access { action } => access::run(action, dirs, direct).await,
-        ModelAction::Entity { action } => entity::run(action, dirs, direct).await,
-        ModelAction::Class { action } => class::run(action, dirs, direct).await,
+        ModelAction::Access { action } => access::run(action, dirs).await,
+        ModelAction::Entity { action } => entity::run(action, dirs).await,
+        ModelAction::Class { action } => class::run(action, dirs).await,
     }
 }
 
@@ -35,18 +35,13 @@ pub(crate) async fn resolve_mode(
     dataset: &str,
     remote: Option<&str>,
     dirs: &FlureeDir,
-    direct: bool,
 ) -> CliResult<LedgerMode> {
     if let Some(remote_name) = remote {
         let alias = context::resolve_ledger(Some(dataset), dirs)?;
         context::build_remote_mode(remote_name, &alias, dirs).await
     } else {
         let mode = context::resolve_ledger_mode(Some(dataset), dirs).await?;
-        Ok(if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        })
+        Ok(mode)
     }
 }
 

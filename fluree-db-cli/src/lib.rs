@@ -13,6 +13,7 @@ pub mod detect;
 pub mod error;
 pub mod graph_source_display;
 pub mod input;
+pub(crate) mod local_server;
 pub mod output;
 pub mod remote_client;
 
@@ -28,6 +29,7 @@ use fluree_db_api::server_defaults::{generate_config_template_for, ConfigFormat,
 pub async fn run(cli: Cli) -> error::CliResult<()> {
     // Set the global remote HTTP timeout from CLI args before dispatching.
     context::set_remote_timeout(std::time::Duration::from_secs(cli.timeout));
+    context::set_direct(cli.direct);
 
     let config_path = cli.config.as_deref();
     let direct = cli.direct;
@@ -63,30 +65,50 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
             // `--remote` doesn't write any local state, so it must work even
             // when the user has no project-local `.fluree/` directory — fall
-            // back to global config for remote registration lookups.
-            if let Some(remote_name) = remote {
-                if memory.is_some() {
-                    return Err(error::CliError::Usage(
-                        "--remote cannot import memory history; \
-                         run `fluree create <ledger> --memory ...` locally, then \
-                         `fluree publish <remote> <ledger>`."
-                            .to_string(),
-                    ));
+            // back to global config for remote registration lookups. Without
+            // it, a server running on the project's storage takes the create,
+            // so nothing opens that storage beside it. Memory history is
+            // ingested locally.
+            let server = match &remote {
+                Some(remote_name) => {
+                    if memory.is_some() {
+                        return Err(error::CliError::Usage(
+                            "--remote cannot import memory history; \
+                             run `fluree create <ledger> --memory ...` locally, then \
+                             `fluree publish <remote> <ledger>`."
+                                .to_string(),
+                        ));
+                    }
+                    let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+                    let dest =
+                        commands::create::Destination::remote(remote_name, &fluree_dir).await?;
+                    Some((dest, fluree_dir))
                 }
-                let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
-                return match from.as_deref() {
-                    // `.flpack` archives restore wholesale via the remote's
+                None if memory.is_none() => {
+                    let fluree_dir = config::require_fluree_dir(config_path)?;
+                    context::local_server_client(&fluree_dir).map(|client| {
+                        (
+                            commands::create::Destination::local_server(client),
+                            fluree_dir,
+                        )
+                    })
+                }
+                None => None,
+            };
+            if let Some((dest, fluree_dir)) = server {
+                match from.as_deref() {
+                    // `.flpack` archives restore wholesale via the server's
                     // import endpoint — the generic "push any local data to a
                     // server" path (build locally in any format → export to
                     // .flpack → import here).
                     Some(path) if commands::create::is_flpack_path(path) => {
                         commands::create::run_remote_flpack_import(
                             &ledger,
-                            &remote_name,
+                            &dest,
                             path,
                             &fluree_dir,
                         )
-                        .await
+                        .await?;
                     }
                     // Raw source data (TTL/JSON-LD/JSONL/CSV/Cypher …) uploads
                     // to servers that advertise `source-upload` and runs the
@@ -96,16 +118,22 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     Some(path) => {
                         commands::create::run_remote_source_import(
                             &ledger,
-                            &remote_name,
+                            &dest,
                             path,
                             &fluree_dir,
                             edge_policy,
                             base_iri.as_deref(),
                         )
-                        .await
+                        .await?;
                     }
-                    None => commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await,
-                };
+                    None => commands::create::run_remote(&ledger, &dest, &fluree_dir).await?,
+                }
+                // A ledger the local server made is this project's, as a local
+                // create's is.
+                if remote.is_none() {
+                    config::write_active_ledger(fluree_dir.data_dir(), &ledger)?;
+                }
+                return Ok(());
             }
 
             // Local-create paths still require a project `.fluree/` so the
@@ -158,7 +186,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::List { remote } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
-            commands::list::run(&fluree_dir, remote.as_deref(), direct).await
+            commands::list::run(&fluree_dir, remote.as_deref()).await
         }
 
         Commands::Info {
@@ -171,7 +199,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 ledger.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
                 graph.as_deref(),
             )
             .await
@@ -179,7 +206,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Branch { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::branch::run(action, &fluree_dir, direct).await
+            commands::branch::run(action, &fluree_dir).await
         }
 
         #[cfg(feature = "server")]
@@ -194,17 +221,17 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             remote,
         } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::drop::run(&name, hard, force, &fluree_dir, remote.as_deref(), direct).await
+            commands::drop::run(&name, hard, force, &fluree_dir, remote.as_deref()).await
         }
 
         Commands::Dropped { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::dropped::run(action, &fluree_dir, direct).await
+            commands::dropped::run(action, &fluree_dir).await
         }
 
         Commands::Graph { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::graph::run(action, &fluree_dir, direct).await
+            commands::graph::run(action, &fluree_dir).await
         }
 
         Commands::Bm25 { action } => {
@@ -230,7 +257,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 format.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
                 &policy,
             )
             .await
@@ -254,7 +280,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 format.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
                 &policy,
             )
             .await
@@ -279,7 +304,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &field_terminator,
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -302,7 +326,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 format.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
                 &policy,
             )
             .await
@@ -381,7 +404,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &fluree_dir,
                 remote.as_deref(),
                 connection.as_deref(),
-                direct,
                 commands::query::TrackingFlags {
                     track,
                     track_fuel,
@@ -439,7 +461,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &format,
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -448,13 +469,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             match action {
                 cli::ContextAction::Get { ledger, remote } => {
-                    commands::context_cmd::get(
-                        ledger.as_deref(),
-                        &fluree_dir,
-                        remote.as_deref(),
-                        direct,
-                    )
-                    .await
+                    commands::context_cmd::get(ledger.as_deref(), &fluree_dir, remote.as_deref())
+                        .await
                 }
                 cli::ContextAction::Set {
                     ledger,
@@ -468,7 +484,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         file.as_ref(),
                         &fluree_dir,
                         remote.as_deref(),
-                        direct,
                     )
                     .await
                 }
@@ -570,7 +585,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 at.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -590,7 +604,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 all,
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -610,14 +623,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
-            commands::show::run(
-                &commit,
-                ledger.as_deref(),
-                &fluree_dir,
-                remote.as_deref(),
-                cli.direct,
-            )
-            .await
+            commands::show::run(&commit, ledger.as_deref(), &fluree_dir, remote.as_deref()).await
         }
 
         Commands::Config { action } => {
@@ -748,8 +754,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Reindex { ledger, remote } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref(), direct)
-                .await
+            commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref()).await
         }
 
         Commands::Sweep {
@@ -762,7 +767,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 ledger.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
-                direct,
                 commands::sweep::SweepMode::from_dry_run(dry_run),
             )
             .await
@@ -778,7 +782,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Model { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::model::run(&action, &fluree_dir, direct).await
+            commands::model::run(&action, &fluree_dir).await
         }
 
         Commands::Memory { action } => {
@@ -789,24 +793,15 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Sql { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             match action {
-                cli::SqlAction::Map(args) => {
-                    commands::sql::run_sql_map(*args, &fluree_dir, direct).await
-                }
+                cli::SqlAction::Map(args) => commands::sql::run_sql_map(*args, &fluree_dir).await,
                 cli::SqlAction::Check { name } => {
                     commands::sql::run_sql_check(&name, &fluree_dir).await
                 }
                 cli::SqlAction::List { remote } => {
-                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
-                        .await
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref()).await
                 }
                 cli::SqlAction::Info { name, remote } => {
-                    commands::iceberg::run_iceberg_info(
-                        &name,
-                        &fluree_dir,
-                        remote.as_deref(),
-                        direct,
-                    )
-                    .await
+                    commands::iceberg::run_iceberg_info(&name, &fluree_dir, remote.as_deref()).await
                 }
                 cli::SqlAction::Drop {
                     name,
@@ -818,7 +813,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         force,
                         &fluree_dir,
                         remote.as_deref(),
-                        direct,
                     )
                     .await
                 }
@@ -829,35 +823,28 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             match action {
                 cli::DeltaAction::Map(args) => {
-                    commands::delta::run_delta_map(*args, &fluree_dir, direct).await
+                    commands::delta::run_delta_map(*args, &fluree_dir).await
                 }
                 cli::DeltaAction::Browse(args) => {
-                    commands::delta::run_delta_browse(*args, &fluree_dir, direct).await
+                    commands::delta::run_delta_browse(*args, &fluree_dir).await
                 }
                 cli::DeltaAction::Preview(args) => {
-                    commands::delta::run_delta_preview(*args, &fluree_dir, direct).await
+                    commands::delta::run_delta_preview(*args, &fluree_dir).await
                 }
                 cli::DeltaAction::Verify(args) => {
-                    commands::delta::run_delta_verify(*args, &fluree_dir, direct).await
+                    commands::delta::run_delta_verify(*args, &fluree_dir).await
                 }
                 cli::DeltaAction::Generate(args) => {
-                    commands::delta::run_delta_generate(*args, &fluree_dir, direct).await
+                    commands::delta::run_delta_generate(*args, &fluree_dir).await
                 }
                 cli::DeltaAction::Validate(args) => {
-                    commands::delta::run_delta_validate(*args, &fluree_dir, direct).await
+                    commands::delta::run_delta_validate(*args, &fluree_dir).await
                 }
                 cli::DeltaAction::List { remote } => {
-                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
-                        .await
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref()).await
                 }
                 cli::DeltaAction::Info { name, remote } => {
-                    commands::iceberg::run_iceberg_info(
-                        &name,
-                        &fluree_dir,
-                        remote.as_deref(),
-                        direct,
-                    )
-                    .await
+                    commands::iceberg::run_iceberg_info(&name, &fluree_dir, remote.as_deref()).await
                 }
                 cli::DeltaAction::Drop {
                     name,
@@ -869,7 +856,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         force,
                         &fluree_dir,
                         remote.as_deref(),
-                        direct,
                     )
                     .await
                 }
@@ -880,20 +866,13 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             match action {
                 cli::IcebergAction::Map(args) => {
-                    commands::iceberg::run_iceberg_map(*args, &fluree_dir, direct).await
+                    commands::iceberg::run_iceberg_map(*args, &fluree_dir).await
                 }
                 cli::IcebergAction::List { remote } => {
-                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
-                        .await
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref()).await
                 }
                 cli::IcebergAction::Info { name, remote } => {
-                    commands::iceberg::run_iceberg_info(
-                        &name,
-                        &fluree_dir,
-                        remote.as_deref(),
-                        direct,
-                    )
-                    .await
+                    commands::iceberg::run_iceberg_info(&name, &fluree_dir, remote.as_deref()).await
                 }
                 cli::IcebergAction::Drop {
                     name,
@@ -905,7 +884,6 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         force,
                         &fluree_dir,
                         remote.as_deref(),
-                        direct,
                     )
                     .await
                 }
