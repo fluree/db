@@ -853,3 +853,174 @@ async fn a_retracted_sole_fact_is_visible_at_its_assert() {
         Vec::<String>::new()
     );
 }
+
+/// Query shapes over pooled graphs, checked against a ledger that holds the
+/// same transactions unindexed. A fast path that reads "no dedicated branch"
+/// as "no facts" disagrees here.
+const DIFFERENTIAL_QUERIES: &[&str] = &[
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s ?p ?o } }",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s ex:val ?o } }",
+    "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ex:g1 { ?s ?p ?o } }",
+    "SELECT (COUNT(DISTINCT ?p) AS ?n) WHERE { GRAPH ex:g1 { ?s ?p ?o } }",
+    "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { GRAPH ex:g1 { ?s ex:val ?o } }",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s ?p ?o FILTER(isLiteral(?o)) } }",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s ?p ?o FILTER(isBlank(?s)) } }",
+    "SELECT ?p (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s ?p ?o } } GROUP BY ?p",
+    "SELECT ?c (COUNT(?s) AS ?n) WHERE { GRAPH ex:g1 { ?s a ?c } } GROUP BY ?c",
+    "SELECT (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) (SUM(?v) AS ?sum) WHERE { GRAPH ex:g1 { ?s ex:val ?v } }",
+    "SELECT (MIN(?l) AS ?lo) (MAX(?l) AS ?hi) WHERE { GRAPH ex:g1 { ?s ex:label ?l } }",
+    "SELECT ?s WHERE { GRAPH ex:g1 { ?s a ex:C } }",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s a ex:C } }",
+    "SELECT ?s ?o WHERE { GRAPH ex:g1 { ?s ex:knows+ ?o } }",
+    "SELECT ?s WHERE { GRAPH ex:g1 { ?s ex:val ?v FILTER(?v > 1) } }",
+    "SELECT ?s ?l WHERE { GRAPH ex:g1 { ?s ex:val ?v OPTIONAL { ?s ex:label ?l } } }",
+    "SELECT ?s WHERE { GRAPH ex:g1 { ?s a ex:C FILTER NOT EXISTS { ?s ex:label \"A\" } } }",
+    "SELECT ?s WHERE { GRAPH ex:g1 { ?s a ex:C MINUS { ?s ex:val 2 } } }",
+    "SELECT ?s ?o WHERE { GRAPH ex:g1 { VALUES ?o { 1 2 3 } ?s ex:val ?o } }",
+    "SELECT ?s ?v WHERE { GRAPH ex:g1 { ?s ex:val ?v } } ORDER BY DESC(?v) LIMIT 2",
+    "SELECT ?s ?x WHERE { GRAPH ex:g1 { ?s ex:knows ?o . ?o ex:knows ?x } }",
+    "SELECT ?o ?x WHERE { GRAPH ex:g1 { ?s ex:knows ?o . ?o ex:val ?x } }",
+    "SELECT ?p ?o WHERE { GRAPH ex:g1 { ex:a ?p ?o } }",
+    "SELECT ?s ?p WHERE { GRAPH ex:g1 { ?s ?p ex:b } }",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g1 { ?s ex:knows ex:b } }",
+    "SELECT ?s WHERE { GRAPH ex:g1 { ?s ex:label ?l FILTER(LANG(?l) = \"en\") } }",
+    "SELECT ?s ?d WHERE { GRAPH ex:g1 { ?s ex:date ?d FILTER(?d > \"2019-01-01\"^^xsd:date) } }",
+    "SELECT ?s WHERE { GRAPH ex:g1 { ?s ex:amount 1.5 } }",
+    "SELECT ?s ?x WHERE { GRAPH ex:g1 { ?s ex:val ?v ; ex:label ?l ; ex:knows ?x } }",
+    "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s a ex:C } }",
+    "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
+    "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:val 10 } }",
+    "SELECT ?g ?s ?l WHERE { GRAPH ?g { ?s a ex:C OPTIONAL { ?s ex:label ?l } } }",
+];
+
+async fn differential_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> Vec<(String, Vec<String>)> {
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    let mut out = Vec::new();
+    for q in DIFFERENTIAL_QUERIES {
+        let sparql = format!("{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{q}");
+        let rows = select(fluree, &ledger, &sparql).await;
+        out.push((
+            q.to_string(),
+            rows.iter().map(|r| ledger_neutral(r)).collect(),
+        ));
+        // The same shape with g1 as the query's default graph, where whole-query
+        // fast paths plan against the pooled graph.
+        if let Some(at) = q.find("WHERE { GRAPH ex:g1 { ") {
+            let close = q.rfind("} }").expect("GRAPH block closes");
+            let body = &q[at + "WHERE { GRAPH ex:g1 { ".len()..close];
+            let from = format!(
+                "{}FROM <http://example.org/g1> WHERE {{ {body}}}{}",
+                &q[..at],
+                &q[close + 3..]
+            );
+            let sparql =
+                format!("{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{from}");
+            let rows = select(fluree, &ledger, &sparql).await;
+            out.push((from, rows.iter().map(|r| ledger_neutral(r)).collect()));
+        }
+    }
+    for graph in ["g1", "g2"] {
+        let count = fluree
+            .query_connection(&serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": {"@id": ledger_id, "graph": format!("http://example.org/{graph}")},
+                "select": ["(count ?s)"],
+                "where": {"@id": "?s", "@type": "ex:C"}
+            }))
+            .await
+            .expect("jsonld count")
+            .to_jsonld(&ledger.snapshot)
+            .expect("jsonld");
+        out.push((
+            format!("jsonld count C in {graph}"),
+            vec![count.to_string()],
+        ));
+    }
+    out
+}
+
+/// A row with skolemized blank-node labels (`fdb-<ledger hex>-<n>-<label>`)
+/// stripped of their ledger-specific part.
+fn ledger_neutral(row: &str) -> String {
+    let mut out = String::new();
+    let mut rest = row;
+    while let Some(at) = rest.find("fdb-") {
+        out.push_str(&rest[..at + 4]);
+        rest = &rest[at + 4..];
+        let hex = rest.find('-').unwrap_or(0);
+        rest = &rest[hex..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn assert_same_rows(stage: &str, got: &[(String, Vec<String>)], want: &[(String, Vec<String>)]) {
+    for ((q, g), (_, w)) in got.iter().zip(want) {
+        assert_eq!(g, w, "{stage}: {q}");
+    }
+}
+
+#[tokio::test]
+async fn pooled_graphs_answer_every_shape_like_unindexed_data() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let (pooled, oracle) = ("test/diff-pooled:main", "test/diff-oracle:main");
+    let both = |sparql: &'static str| {
+        let fluree = &fluree;
+        async move {
+            sparql_update(fluree, pooled, sparql).await;
+            sparql_update(fluree, oracle, sparql).await;
+        }
+    };
+    fluree.create_ledger(pooled).await.expect("create");
+    fluree.create_ledger(oracle).await.expect("create");
+    both(
+        "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+         INSERT DATA {
+           ex:a ex:val 100 . ex:q a ex:C .
+           GRAPH ex:g1 {
+             ex:a a ex:C ; ex:val 1 ; ex:label \"A\" ; ex:knows ex:b ; ex:amount 1.5 ;
+                  ex:date \"2020-01-01\"^^xsd:date .
+             ex:b a ex:C ; ex:val 2 ; ex:label \"B\"@en ; ex:knows ex:c .
+             ex:c a ex:D ; ex:val 3 ; ex:knows ex:a ; ex:date \"2018-06-01\"^^xsd:date .
+             _:x ex:val 4 .
+           }
+           GRAPH ex:g2 { ex:a ex:val 10 . ex:z a ex:C ; ex:label \"Z\" . }
+         }",
+    )
+    .await;
+    let (root, _) = index_and_reload(&fluree, pooled).await;
+    assert_eq!(root.pool.as_ref().map(|p| p.graphs.len()), Some(2));
+    let want = differential_rows(&fluree, oracle).await;
+    assert_same_rows(
+        "pooled base",
+        &differential_rows(&fluree, pooled).await,
+        &want,
+    );
+
+    both(
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g1 { ex:b ex:label \"B\"@en . ex:c ex:val 3 . } } ;
+         INSERT DATA { GRAPH ex:g1 { ex:d a ex:C ; ex:val 5 ; ex:knows ex:a . }
+                       GRAPH ex:g2 { ex:y ex:val 10 . } }",
+    )
+    .await;
+    let want = differential_rows(&fluree, oracle).await;
+    assert_same_rows(
+        "pooled base + novelty",
+        &differential_rows(&fluree, pooled).await,
+        &want,
+    );
+
+    index_and_reload(&fluree, pooled).await;
+    assert_same_rows(
+        "after promotion",
+        &differential_rows(&fluree, pooled).await,
+        &want,
+    );
+}
