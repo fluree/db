@@ -124,8 +124,9 @@ impl SegmentKey {
     }
 }
 
-/// The routing identity of a history entry, as a record. `t` and `g_id` are
-/// carried for completeness; neither appears in an ordered routing key.
+/// The routing identity of a history entry, as a record. `t` is carried for
+/// completeness; it never appears in an ordered routing key, while `g_id` does
+/// in a pooled order's.
 fn record_from_history(entry: &HistEntryV2) -> RunRecordV2 {
     RunRecordV2 {
         s_id: entry.s_id,
@@ -134,7 +135,7 @@ fn record_from_history(entry: &HistEntryV2) -> RunRecordV2 {
         t: entry.t,
         o_i: entry.o_i,
         o_type: entry.o_type,
-        g_id: 0,
+        g_id: entry.g_id,
     }
 }
 
@@ -211,7 +212,7 @@ impl LeafWriter {
             zstd_level,
             skip_history: false,
             record_buf: Vec::with_capacity(leaflet_target_rows),
-            sidecar_builder: HistSidecarBuilder::new(),
+            sidecar_builder: HistSidecarBuilder::for_order(order),
             current_segment_started: false,
             pending_history: Vec::new(),
             leaflet_hist_min: None,
@@ -633,7 +634,10 @@ impl LeafWriter {
         let last_record = self.last_record.unwrap();
 
         // 1. Build history sidecar (must come first — CAS ordering).
-        let sidecar_builder = std::mem::take(&mut self.sidecar_builder);
+        let sidecar_builder = std::mem::replace(
+            &mut self.sidecar_builder,
+            HistSidecarBuilder::for_order(self.order),
+        );
         // The replacement builder has no current segment. This is normally
         // already false after flush_leaflet(), but keep the state coupled to
         // the builder so future flush paths cannot drop history.
@@ -1509,6 +1513,7 @@ mod tests {
             o_i: LIST_INDEX_NONE,
             t,
             op,
+            g_id: 0,
         }
     }
 

@@ -586,8 +586,6 @@ impl LeafHandle for RangeReadLeafHandle {
     }
 
     fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
-        use crate::format::history_sidecar::HIST_ENTRY_V2_SIZE;
-
         let entry = &self.dir.entries[leaflet_idx];
         if entry.history_len == 0 {
             return Ok(Vec::new());
@@ -605,23 +603,7 @@ impl LeafHandle for RangeReadLeafHandle {
         let end = offset + entry.history_len as u64;
         let bytes = self.fetcher.fetch_range(sidecar_cid, offset..end)?;
 
-        // Segment format: 4-byte entry_count (u32 LE) followed by
-        // entry_count × 31-byte HistEntryV2 records, sorted by t descending.
-        if bytes.len() < 4 {
-            return Ok(Vec::new());
-        }
-        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let mut entries = Vec::with_capacity(entry_count);
-        let mut pos = 4;
-        for _ in 0..entry_count {
-            if pos + HIST_ENTRY_V2_SIZE > bytes.len() {
-                break;
-            }
-            entries.push(HistEntryV2::read_le(&bytes[pos..])?);
-
-            pos += HIST_ENTRY_V2_SIZE;
-        }
-        Ok(entries)
+        crate::format::history_sidecar::decode_segment_bytes(&bytes)
     }
 
     fn sidecar_bytes(&self) -> Option<&[u8]> {
@@ -878,7 +860,8 @@ mod tests {
                 o_key: 100,
                 o_i: u32::MAX,
                 t: 5,
-                op: 1, // assert
+                op: 1, // assert,
+                g_id: 0,
             },
             HistEntryV2 {
                 s_id: SubjectId(1),
@@ -887,7 +870,8 @@ mod tests {
                 o_key: 50,
                 o_i: u32::MAX,
                 t: 3,
-                op: 0, // retract
+                op: 0, // retract,
+                g_id: 0,
             },
         ];
         let mut builder = HistSidecarBuilder::new();
@@ -964,7 +948,8 @@ mod tests {
             o_key: 200,
             o_i: u32::MAX,
             t: 10,
-            op: 1, // assert
+            op: 1, // assert,
+            g_id: 0,
         }];
         let mut builder = HistSidecarBuilder::new();
         builder.start_leaflet();

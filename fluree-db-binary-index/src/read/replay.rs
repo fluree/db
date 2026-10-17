@@ -36,6 +36,8 @@ struct FactKeyV3 {
     o_type: u16,
     o_key: u64,
     o_i: u32,
+    /// The graph, part of a fact's identity in a pooled leaflet (0 elsewhere).
+    g_id: u16,
 }
 
 impl FactKeyV3 {
@@ -47,6 +49,7 @@ impl FactKeyV3 {
             o_type: batch.o_type.get(row),
             o_key: batch.o_key.get(row),
             o_i: batch.o_i.get_or(row, OI_NONE),
+            g_id: batch.g_id.get_or(row, 0),
         }
     }
 
@@ -58,6 +61,7 @@ impl FactKeyV3 {
             o_type: entry.o_type,
             o_key: entry.o_key,
             o_i: entry.o_i,
+            g_id: entry.g_id,
         }
     }
 }
@@ -373,7 +377,7 @@ pub fn replay_leaflet(
             t: batch.t.get_or(row, 0),
             o_i: batch.o_i.get_or(row, OI_NONE),
             o_type: batch.o_type.get(row),
-            g_id: 0,
+            g_id: batch.g_id.get_or(row, 0),
         }
     };
 
@@ -505,7 +509,7 @@ fn hist_entry_to_record(entry: &HistEntryV2) -> RunRecordV2 {
         t: entry.t,
         o_i: entry.o_i,
         o_type: entry.o_type,
-        g_id: 0,
+        g_id: entry.g_id,
     }
 }
 
@@ -575,7 +579,35 @@ mod tests {
             o_i: OI_NONE,
             t,
             op,
+            g_id: 0,
         }
+    }
+
+    /// The same fact in two graphs of a pooled leaflet: undoing graph 9's
+    /// retraction restores it in graph 9, while graph 4's copy is untouched.
+    #[test]
+    fn pooled_replay_restores_a_fact_in_its_own_graph() {
+        let base = make_batch(&[(1, 1, 10, 1)]);
+        let batch = ColumnBatch {
+            g_id: ColumnData::Block(vec![4u16].into()),
+            ..base
+        };
+        let in_graph = |g_id, t, op| HistEntryV2 {
+            g_id,
+            ..make_hist(1, 10, t, op)
+        };
+        let history = vec![in_graph(9, 5, 0), in_graph(9, 2, 1)];
+        let replayed = replay_leaflet(&batch, &history, 3, RunSortOrder::Gspo).unwrap();
+        let rows: Vec<(u16, u64, u32)> = (0..replayed.row_count)
+            .map(|i| {
+                (
+                    replayed.g_id.get(i),
+                    replayed.s_id.get(i),
+                    replayed.t.get(i),
+                )
+            })
+            .collect();
+        assert_eq!(rows, vec![(4, 1, 1), (9, 1, 2)]);
     }
 
     #[test]

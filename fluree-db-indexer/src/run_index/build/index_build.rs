@@ -273,6 +273,7 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
                             o_i: rec.o_i,
                             t: rec.t,
                             op: rec_op,
+                            g_id: rec.g_id,
                         },
                     );
                 }

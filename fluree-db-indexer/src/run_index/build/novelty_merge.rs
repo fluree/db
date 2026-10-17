@@ -71,8 +71,8 @@ pub struct MergeOutput {
 /// Extract a `RunRecordV2` from a `ColumnBatch` at the given row index.
 ///
 /// This reconstitutes a full record from the columnar representation.
-/// `g_id` is set to 0 (not relevant for incremental merge; the caller
-/// knows which graph this leaflet belongs to).
+/// `g_id` comes from the graph column, which only a pooled leaflet has; a
+/// dedicated leaflet's rows read 0 (the caller knows the graph).
 #[inline]
 fn batch_row_to_record(batch: &ColumnBatch, row: usize) -> RunRecordV2 {
     RunRecordV2 {
@@ -82,7 +82,7 @@ fn batch_row_to_record(batch: &ColumnBatch, row: usize) -> RunRecordV2 {
         t: batch.t.get_or(row, 0),
         o_i: batch.o_i.get_or(row, OI_NONE),
         o_type: batch.o_type.get(row),
-        g_id: 0,
+        g_id: batch.g_id.get_or(row, 0),
     }
 }
 
@@ -97,6 +97,7 @@ fn record_to_hist_entry(rec: &RunRecordV2, op: u8) -> HistEntryV2 {
         o_i: rec.o_i,
         t: rec.t,
         op,
+        g_id: rec.g_id,
     }
 }
 
@@ -111,6 +112,7 @@ fn batch_row_to_hist_entry(batch: &ColumnBatch, row: usize, op: u8) -> HistEntry
         o_i: batch.o_i.get_or(row, OI_NONE),
         t: batch.t.get_or(row, 0),
         op,
+        g_id: batch.g_id.get_or(row, 0),
     }
 }
 
@@ -783,7 +785,8 @@ mod tests {
             o_key: ObjKey::encode_i64(5).as_u64(),
             o_i: OI_NONE,
             t: 2,
-            op: 0, // retraction at t=2
+            op: 0, // retraction at t=2,
+            g_id: 0,
         }];
 
         let novelty = vec![rec2(2, 1, 20, 5)];
@@ -869,7 +872,8 @@ mod tests {
             o_key: ObjKey::encode_i64(10).as_u64(),
             o_i: OI_NONE,
             t: 1,
-            op: 1, // original assert at t=1
+            op: 1, // original assert at t=1,
+            g_id: 0,
         }];
 
         let novelty = vec![rec2(1, 1, 10, 5)];

@@ -514,7 +514,7 @@ fn widen_leaflet_keys_over_history(
             t: entry.t,
             o_i: entry.o_i,
             o_type: entry.o_type,
-            g_id: 0,
+            g_id: entry.g_id,
         };
         write_ordered_key_v2(order, &rec, &mut key);
         if key < encoded.first_key {
@@ -619,7 +619,7 @@ fn partition_history_to_chunks(
             t: 0,
             o_i: entry.o_i,
             o_type: entry.o_type,
-            g_id: 0,
+            g_id: entry.g_id,
         };
 
         // Find the chunk this entry belongs to via binary search on boundaries.
@@ -722,7 +722,7 @@ fn build_leaf_from_group(
     use fluree_db_binary_index::format::leaflet::EncodedLeaflet;
 
     // Build sidecar from history entries.
-    let mut sidecar_builder = HistSidecarBuilder::new();
+    let mut sidecar_builder = HistSidecarBuilder::for_order(order);
     for (_, history, _) in &group {
         sidecar_builder.start_leaflet();
         for entry in history {
@@ -1438,6 +1438,7 @@ mod tests {
                 o_i: OI_NONE,
                 t,
                 op,
+                g_id: 0,
             });
         }
         let leaves = writer.finish().unwrap();
@@ -1505,6 +1506,7 @@ mod tests {
                 o_i: OI_NONE,
                 t,
                 op,
+                g_id: 0,
             });
         }
         let leaves = writer.finish().unwrap();
