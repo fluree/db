@@ -108,6 +108,15 @@ pub struct NamedGraphRouting {
     pub orders: Vec<(RunSortOrder, ContentId)>,
 }
 
+/// The tree a branch manifest belongs to (see [`IndexRoot::branches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchTree {
+    /// A named graph's own tree.
+    Graph(GraphId),
+    /// The pooled tree.
+    Pool,
+}
+
 /// A pooled graph and its size in the pool, which placement weighs: its live
 /// rows and its retained history entries (both saturating).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1321,11 +1330,32 @@ impl IndexRoot {
     ///
     /// Does NOT include the root's own CID or the garbage manifest CID.
     ///
-    /// Callers that need leaf CIDs sitting behind named-graph or legacy arena
-    /// branches must fetch + decode those branch manifests from storage. See
+    /// Callers that need leaf CIDs sitting behind branches (see
+    /// [`Self::branches`]) or legacy arena branches must fetch + decode those
+    /// manifests from storage. See
     /// [`crate::collect_root_cas_ids_expanded`] (strict) and
     /// [`crate::collect_root_cas_ids_expanded_tolerant`] (best-effort) for
     /// the shared expansion helpers.
+    /// Every branch manifest the root routes to — each named graph's own
+    /// orders and the pooled tree's — with the tree it belongs to. The one
+    /// enumeration every walk of the root's physical artifacts builds on
+    /// (reachability, GC, pack, drop). Default-graph orders are inline
+    /// leaves, not branches.
+    pub fn branches(&self) -> impl Iterator<Item = (BranchTree, RunSortOrder, &ContentId)> {
+        self.named_graphs
+            .iter()
+            .flat_map(|ng| {
+                ng.orders
+                    .iter()
+                    .map(move |(order, cid)| (BranchTree::Graph(ng.g_id), *order, cid))
+            })
+            .chain(self.pool.iter().flat_map(|pool| {
+                pool.orders
+                    .iter()
+                    .map(|(order, cid)| (BranchTree::Pool, *order, cid))
+            }))
+    }
+
     pub fn all_cas_ids(&self) -> Vec<ContentId> {
         let mut ids = Vec::new();
 
@@ -1378,19 +1408,7 @@ impl IndexRoot {
             }
         }
 
-        // Named graph branch CIDs
-        for ng in &self.named_graphs {
-            for (_, branch_cid) in &ng.orders {
-                ids.push(branch_cid.clone());
-            }
-        }
-
-        // Pool branch CIDs
-        if let Some(pool) = &self.pool {
-            for (_, branch_cid) in &pool.orders {
-                ids.push(branch_cid.clone());
-            }
-        }
+        ids.extend(self.branches().map(|(_, _, cid)| cid.clone()));
 
         // Sketch
         if let Some(ref sketch) = self.sketch_ref {

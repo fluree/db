@@ -2820,7 +2820,7 @@ impl NestedLoopJoinOperator {
             }
             None => {
                 let branch = store
-                    .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+                    .dedicated_branch(ctx.binary_g_id, RunSortOrder::Psot)
                     .ok_or_else(|| QueryError::Internal("PSOT index not found for graph".into()))?;
                 let range = Self::find_psot_leaf_range(
                     branch,
@@ -3059,7 +3059,7 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
+        let Some(branch) = store.dedicated_branch(ctx.binary_g_id, RunSortOrder::Opst) else {
             debug_assert!(
                 !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
                 "lane plan must decline branchless graphs"
@@ -3838,7 +3838,7 @@ fn batched_subject_probe_binary_uncharged(
         debug_assert!(probe_ops.is_none(), "pooled subject lane runs overlay-free");
         return pooled_subject_probe(ctx, store, params, p_id);
     }
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
+    let Some(branch) = store.dedicated_branch(ctx.binary_g_id, RunSortOrder::Psot) else {
         debug_assert!(
             probe_ops.is_none(),
             "lane plan must decline branchless graphs"
@@ -4060,7 +4060,7 @@ fn batched_subject_star_spot_uncharged(
         return Ok(Vec::new());
     }
 
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Spot) else {
+    let Some(branch) = store.dedicated_branch(ctx.binary_g_id, RunSortOrder::Spot) else {
         debug_assert!(
             probe_ops.is_none(),
             "lane plan must decline branchless graphs"

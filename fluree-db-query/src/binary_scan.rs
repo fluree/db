@@ -4352,7 +4352,7 @@ fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
 fn prove_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<bool> {
     use fluree_db_binary_index::format::run_record::RunSortOrder;
     if !store.numbig_is_decimal_only(g_id, p_id)
-        || store.branch_for_order(g_id, RunSortOrder::Post).is_none()
+        || store.dedicated_branch(g_id, RunSortOrder::Post).is_none()
     {
         return Some(false);
     }

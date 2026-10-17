@@ -203,7 +203,7 @@ fn indexed_placement(store: Option<&BinaryIndexStore>, g_id: GraphId) -> Option<
         RunSortOrder::Opst,
     ]
     .into_iter()
-    .any(|order| store.branch_for_order(g_id, order).is_some())
+    .any(|order| store.dedicated_branch(g_id, order).is_some())
     .then_some(IndexedPlacement::Dedicated)
 }
 

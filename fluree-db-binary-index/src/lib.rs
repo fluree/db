@@ -35,7 +35,9 @@ pub use format::expanded_cas::{
     collect_root_cas_ids_expanded, collect_root_cas_ids_expanded_tolerant,
     legacy_annotation_arena_cids, ChainCasIds,
 };
-pub use format::index_root::{IndexRoot, LegacyAnnotationArena, PoolMember, PoolRouting};
+pub use format::index_root::{
+    BranchTree, IndexRoot, LegacyAnnotationArena, PoolMember, PoolRouting,
+};
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};
 pub use format::wire_helpers::{
     BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, FulltextArenaRef,

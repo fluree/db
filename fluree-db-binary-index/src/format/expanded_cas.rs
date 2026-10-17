@@ -117,7 +117,7 @@ impl ChainCasIds {
     pub async fn add_root(&mut self, store: &dyn ContentStore, root: &IndexRoot) -> Result<()> {
         self.ids.extend(root.all_cas_ids());
 
-        for branch_cid in routed_branch_cids(root) {
+        for branch_cid in root.branches().map(|(_, _, cid)| cid) {
             self.expand_named_graph_branch(store, branch_cid).await?;
         }
 
@@ -225,7 +225,7 @@ pub async fn collect_root_cas_ids_expanded_tolerant(
 ) -> HashSet<ContentId> {
     let mut ids: HashSet<ContentId> = root.all_cas_ids().into_iter().collect();
 
-    for branch_cid in routed_branch_cids(root) {
+    for branch_cid in root.branches().map(|(_, _, cid)| cid) {
         match store.get(branch_cid).await {
             Ok(bytes) => match read_branch_from_bytes(&bytes) {
                 Ok(manifest) => {
@@ -268,16 +268,6 @@ pub async fn collect_root_cas_ids_expanded_tolerant(
     }
 
     ids
-}
-
-/// Every branch manifest the root routes to: each named graph's orders and
-/// the pooled tree's.
-fn routed_branch_cids(root: &IndexRoot) -> impl Iterator<Item = &ContentId> {
-    root.named_graphs
-        .iter()
-        .flat_map(|ng| ng.orders.iter())
-        .chain(root.pool.iter().flat_map(|pool| pool.orders.iter()))
-        .map(|(_, cid)| cid)
 }
 
 /// Every blob of a legacy annotation arena: both branches and their leaves.

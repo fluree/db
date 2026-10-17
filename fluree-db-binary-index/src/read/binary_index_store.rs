@@ -32,7 +32,7 @@ use crate::dict::pack_reader::ForwardPackReader;
 use crate::dict::term_dict::TermDictReader;
 use crate::dict::DictTreeReader;
 use crate::format::branch::{read_branch_from_bytes, BranchManifest};
-use crate::format::index_root::{IndexRoot, OTypeTableEntry};
+use crate::format::index_root::{BranchTree, IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
@@ -288,6 +288,19 @@ struct GraphIndex {
     /// on each property. `@fulltext`-datatype and configured-English content
     /// both resolve to the dict-assigned id for `"en"` and share a bucket.
     fulltext: HashMap<(u32, u16), Arc<crate::arena::fulltext::FulltextArena>>,
+}
+
+impl GraphIndex {
+    fn empty() -> Self {
+        Self {
+            orders: HashMap::new(),
+            order_cids: HashMap::new(),
+            numbig: HashMap::new(),
+            vectors: HashMap::new(),
+            spatial: HashMap::new(),
+            fulltext: HashMap::new(),
+        }
+    }
 }
 
 // ============================================================================
@@ -609,94 +622,64 @@ impl BinaryIndexStore {
             let branch = BranchManifest {
                 leaves: dgo.leaves.clone(),
             };
-            let gi = graph_indexes.entry(0).or_insert_with(|| GraphIndex {
-                orders: HashMap::new(),
-                order_cids: HashMap::new(),
-                numbig: HashMap::new(),
-                vectors: HashMap::new(),
-                spatial: HashMap::new(),
-                fulltext: HashMap::new(),
-            });
+            let gi = graph_indexes.entry(0).or_insert_with(GraphIndex::empty);
             gi.orders.insert(dgo.order, Arc::new(branch));
         }
 
-        // Named graphs: FBR3 branch manifests from CAS, or from the previous
-        // store when the cid is unchanged.
-        for ng in &root.named_graphs {
-            for (order, branch_cid) in &ng.orders {
-                let carried = prev
-                    .and_then(|p| p.graph_indexes.get(&ng.g_id))
-                    .filter(|gi| gi.order_cids.get(order) == Some(branch_cid))
-                    .and_then(|gi| gi.orders.get(order))
-                    .cloned();
-                let branch = match carried {
-                    Some(branch) => branch,
-                    None => {
-                        let branch_bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
-                        Arc::new(read_branch_from_bytes(&branch_bytes)?)
-                    }
-                };
-                let gi = graph_indexes.entry(ng.g_id).or_insert_with(|| GraphIndex {
-                    orders: HashMap::new(),
-                    order_cids: HashMap::new(),
-                    numbig: HashMap::new(),
-                    vectors: HashMap::new(),
-                    spatial: HashMap::new(),
-                    fulltext: HashMap::new(),
-                });
-                gi.orders.insert(*order, branch);
-                gi.order_cids.insert(*order, branch_cid.clone());
+        // Branch manifests — each named graph's own and the pooled tree's —
+        // from CAS, or from the previous store when the cid is unchanged.
+        let mut pool_orders: HashMap<RunSortOrder, Arc<BranchManifest>> = HashMap::new();
+        let mut pool_order_cids: HashMap<RunSortOrder, ContentId> = HashMap::new();
+        for (tree, order, branch_cid) in root.branches() {
+            let carried = match tree {
+                BranchTree::Graph(g_id) => prev
+                    .and_then(|p| p.graph_indexes.get(&g_id))
+                    .filter(|gi| gi.order_cids.get(&order) == Some(branch_cid))
+                    .and_then(|gi| gi.orders.get(&order)),
+                BranchTree::Pool => prev
+                    .and_then(|p| p.pool.as_ref())
+                    .filter(|pi| pi.order_cids.get(&order) == Some(branch_cid))
+                    .and_then(|pi| pi.orders.get(&order)),
+            }
+            .cloned();
+            let branch = match carried {
+                Some(branch) => branch,
+                None => {
+                    let branch_bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
+                    Arc::new(read_branch_from_bytes(&branch_bytes)?)
+                }
+            };
+            match tree {
+                BranchTree::Graph(g_id) => {
+                    let gi = graph_indexes.entry(g_id).or_insert_with(GraphIndex::empty);
+                    gi.orders.insert(order, branch);
+                    gi.order_cids.insert(order, branch_cid.clone());
+                }
+                BranchTree::Pool => {
+                    pool_orders.insert(order, branch);
+                    pool_order_cids.insert(order, branch_cid.clone());
+                }
             }
         }
 
-        // The pooled tree: one branch per pooled order, reused from the
-        // previous store when its cid is unchanged.
-        let mut pool = match &root.pool {
-            Some(routing) => {
-                let mut orders = HashMap::new();
-                let mut order_cids = HashMap::new();
-                for (order, branch_cid) in &routing.orders {
-                    let carried = prev
-                        .and_then(|p| p.pool.as_ref())
-                        .filter(|pi| pi.order_cids.get(order) == Some(branch_cid))
-                        .and_then(|pi| pi.orders.get(order))
-                        .cloned();
-                    let branch = match carried {
-                        Some(branch) => branch,
-                        None => {
-                            let bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
-                            Arc::new(read_branch_from_bytes(&bytes)?)
-                        }
-                    };
-                    orders.insert(*order, branch);
-                    order_cids.insert(*order, branch_cid.clone());
-                }
-                let graphs: Vec<GraphId> = routing.graph_ids().collect();
-                let mut member = vec![false; graphs.last().map_or(0, |&g| g as usize + 1)];
-                for &g in &graphs {
-                    member[g as usize] = true;
-                }
-                Some(PoolIndex {
-                    member,
-                    graphs,
-                    unindexed: 0,
-                    orders,
-                    order_cids,
-                })
+        let mut pool = root.pool.as_ref().map(|routing| {
+            let graphs: Vec<GraphId> = routing.graph_ids().collect();
+            let mut member = vec![false; graphs.last().map_or(0, |&g| g as usize + 1)];
+            for &g in &graphs {
+                member[g as usize] = true;
             }
-            None => None,
-        };
+            PoolIndex {
+                member,
+                graphs,
+                unindexed: 0,
+                orders: pool_orders,
+                order_cids: pool_order_cids,
+            }
+        });
 
         // Inject per-graph arenas into graph indexes.
         for (g_id, arenas) in per_graph_arenas.drain() {
-            let gi = graph_indexes.entry(g_id).or_insert_with(|| GraphIndex {
-                orders: HashMap::new(),
-                order_cids: HashMap::new(),
-                numbig: HashMap::new(),
-                vectors: HashMap::new(),
-                spatial: HashMap::new(),
-                fulltext: HashMap::new(),
-            });
+            let gi = graph_indexes.entry(g_id).or_insert_with(GraphIndex::empty);
             gi.numbig = arenas.numbig;
             gi.vectors = arenas.vectors;
             gi.spatial = arenas.spatial;
@@ -805,7 +788,7 @@ impl BinaryIndexStore {
     }
 
     /// Whether `g_id` lives in the pooled tree. A pooled graph has no tree of
-    /// its own: [`Self::branch_for_order`] returns `None` for it, and readers
+    /// its own: [`Self::dedicated_branch`] returns `None` for it, and readers
     /// scan [`Self::pool_branch`] filtered to the graph instead.
     #[inline]
     pub fn is_pooled(&self, g_id: GraphId) -> bool {
@@ -840,7 +823,7 @@ impl BinaryIndexStore {
                 g_filter: Some(g_id),
             });
         }
-        self.branch_for_order(g_id, order).map(|branch| GraphTree {
+        self.dedicated_branch(g_id, order).map(|branch| GraphTree {
             branch: Arc::clone(branch),
             order,
             g_filter: None,
@@ -857,8 +840,11 @@ impl BinaryIndexStore {
         }
     }
 
-    /// Get the branch manifest for a graph + sort order.
-    pub fn branch_for_order(
+    /// The branch manifest of a graph's own tree for `order` (the default
+    /// graph's included). `None` for a pooled graph: a reader that can scan
+    /// one reads [`Self::graph_tree`] instead, and paths that read a
+    /// graph's leaf metadata whole (the fast paths) decline it.
+    pub fn dedicated_branch(
         &self,
         g_id: GraphId,
         order: RunSortOrder,
@@ -917,7 +903,7 @@ impl BinaryIndexStore {
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
-        let Some(branch) = self.branch_for_order(g_id, order) else {
+        let Some(branch) = self.dedicated_branch(g_id, order) else {
             return;
         };
 

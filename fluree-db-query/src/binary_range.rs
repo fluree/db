@@ -1715,7 +1715,7 @@ fn overlay_only_flakes_bounded(
 /// exists for `(g_id, order)`.
 ///
 /// That second trigger is broader than "genesis / pre-first-index":
-/// `branch_for_order` is keyed per graph AND order, and the bulk-import path
+/// `dedicated_branch` is keyed per graph AND order, and the bulk-import path
 /// emits SPOT unconditionally while skipping PSOT/POST/OPST when the order
 /// produced no run files (`index_build.rs`'s empty-run-dir early return),
 /// so a graph with zero rows at the indexed `t` lands here for three of the

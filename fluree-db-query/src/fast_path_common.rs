@@ -383,7 +383,7 @@ pub fn leaf_entries_for_predicate(
     order: RunSortOrder,
     p_id: u32,
 ) -> &[LeafEntry] {
-    let Some(branch) = store.branch_for_order(g_id, order) else {
+    let Some(branch) = store.dedicated_branch(g_id, order) else {
         return &[];
     };
     let cmp = cmp_v2_for_order(order);
@@ -1060,7 +1060,7 @@ impl<'a> PsotSubjectSeek<'a> {
         g_id: GraphId,
         p_id: u32,
     ) -> Option<Self> {
-        store.branch_for_order(g_id, RunSortOrder::Psot)?;
+        store.dedicated_branch(g_id, RunSortOrder::Psot)?;
         Some(Self::with_projection(
             store,
             g_id,
@@ -2063,7 +2063,7 @@ pub fn build_range_cursor(
     filter: BinaryFilter,
     projection: ColumnProjection,
 ) -> Option<BinaryCursor> {
-    let branch = Arc::clone(store.branch_for_order(g_id, order)?);
+    let branch = Arc::clone(store.dedicated_branch(g_id, order)?);
     Some(BinaryCursor::new(
         Arc::clone(store),
         order,
@@ -2794,7 +2794,7 @@ pub fn subject_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Psot)
         .is_none()
     {
         tracing::debug!("subject probe: PSOT branch absent with novelty present; declining");
@@ -2829,7 +2829,7 @@ pub fn object_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Opst)
         .is_none()
     {
         tracing::debug!("object probe: OPST branch absent with novelty present; declining");
@@ -2873,7 +2873,7 @@ pub fn star_probe_lane_plan(
         return Ok(ProbeLanePlan::Clean);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Spot)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Spot)
         .is_none()
     {
         tracing::debug!("star probe: SPOT branch absent with novelty present; declining");
