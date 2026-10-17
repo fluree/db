@@ -666,6 +666,8 @@ impl BinaryIndexStore {
         }
 
         let mut pool_deltas = HashMap::new();
+        let deltas_started = std::time::Instant::now();
+        let mut runs_fetched = 0usize;
         for (order, runs) in root.pool.iter().flat_map(|p| &p.deltas) {
             if runs.is_empty() {
                 continue;
@@ -688,11 +690,25 @@ impl BinaryIndexStore {
                         let bytes = cs.get(cid).await.map_err(storage_io_error)?;
                         events.extend(crate::format::pool_delta::decode_delta_run(&bytes)?.1);
                     }
+                    runs_fetched += cids.len() - done;
                     crate::read::types::sort_overlay_ops_stable(&mut events, *order);
                     Arc::from(events)
                 }
             };
             pool_deltas.insert(*order, (cids, events));
+        }
+        if !pool_deltas.is_empty() {
+            tracing::debug!(
+                orders = pool_deltas.len(),
+                runs = pool_deltas
+                    .values()
+                    .map(|(cids, _)| cids.len())
+                    .sum::<usize>(),
+                runs_fetched,
+                events = pool_deltas.values().map(|(_, e)| e.len()).sum::<usize>(),
+                elapsed_ms = deltas_started.elapsed().as_millis() as u64,
+                "pool deltas loaded"
+            );
         }
 
         let mut pool = root.pool.as_ref().map(|routing| {
