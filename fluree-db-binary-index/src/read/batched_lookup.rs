@@ -55,10 +55,12 @@ pub fn batched_lookup_predicate_refs(
 
     let mut out: HashMap<u64, Vec<u64>> = HashMap::new();
 
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
+    // A pooled graph reads its GSPO rows (subject order with the graph fixed).
+    let Some(tree) = store.graph_tree(g_id, RunSortOrder::Psot) else {
         return Ok(out);
     };
-    let branch = Arc::clone(branch);
+    let branch = Arc::clone(&tree.branch);
+    let order = tree.order;
 
     let iri_ref = OType::IRI_REF.as_u16();
 
@@ -136,7 +138,7 @@ pub fn batched_lookup_predicate_refs(
     register_routed_wants(
         store,
         &branch,
-        RunSortOrder::Psot,
+        order,
         chunks.iter().map(|chunk| {
             let (min_s, max_s) = (chunk[0], *chunk.last().unwrap());
             (
@@ -199,12 +201,13 @@ pub fn batched_lookup_predicate_refs(
 
         let filter = BinaryFilter {
             p_id: Some(p_id),
+            g_id: tree.g_filter,
             ..Default::default()
         };
 
         let mut cursor = BinaryCursor::new(
             Arc::clone(store),
-            RunSortOrder::Psot,
+            order,
             Arc::clone(&branch),
             &min_key,
             &max_key,
@@ -462,7 +465,7 @@ pub struct WildcardMatches {
 /// not the order (or multiplicity) of the input keys.
 pub struct BatchedWildcardCursor {
     store: Arc<BinaryIndexStore>,
-    branch: Option<Arc<crate::BranchManifest>>,
+    tree: Option<crate::GraphTree>,
     g_id: GraphId,
     to_t: i64,
     direction: WildcardDirection,
@@ -488,13 +491,16 @@ impl BatchedWildcardCursor {
             .into_iter()
             .map(Arc::from)
             .collect();
-        let branch = store.branch_for_order(g_id, direction.order()).cloned();
+        // A pooled graph reads the pooled tree filtered to it (GSPO outgoing,
+        // the pooled OPST incoming); with the graph fixed the rows keep the
+        // dedicated order's sequence.
+        let tree = store.graph_tree(g_id, direction.order());
         #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-        if let Some(branch) = &branch {
+        if let Some(tree) = &tree {
             register_routed_wants(
                 &store,
-                branch,
-                direction.order(),
+                &tree.branch,
+                tree.order,
                 chunks
                     .iter()
                     .map(|chunk| Self::bounds(g_id, direction, chunk)),
@@ -502,7 +508,7 @@ impl BatchedWildcardCursor {
         }
         Self {
             store,
-            branch,
+            tree,
             g_id,
             to_t,
             direction,
@@ -552,7 +558,7 @@ impl BatchedWildcardCursor {
     }
 
     pub fn next_batch(&mut self) -> io::Result<Option<WildcardMatches>> {
-        let Some(branch) = &self.branch else {
+        let Some(tree) = &self.tree else {
             return Ok(None);
         };
         while let Some(chunk) = self.chunks.get(self.chunk_idx) {
@@ -560,11 +566,14 @@ impl BatchedWildcardCursor {
                 let (lo, hi) = Self::bounds(self.g_id, self.direction, chunk);
                 let mut cursor = BinaryCursor::new(
                     Arc::clone(&self.store),
-                    self.direction.order(),
-                    Arc::clone(branch),
+                    tree.order,
+                    Arc::clone(&tree.branch),
                     &lo,
                     &hi,
-                    BinaryFilter::default(),
+                    BinaryFilter {
+                        g_id: tree.g_filter,
+                        ..Default::default()
+                    },
                     self.projection,
                 );
                 cursor.set_to_t(self.to_t);

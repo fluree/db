@@ -61,32 +61,6 @@ use tracing::Instrument;
 /// a head at a different `t`/id means a foreign writer got ahead of the
 /// import, and a head still behind `t` means the CAS retry budget ran
 /// out under contention.
-/// Rows above which an imported named graph keeps a dedicated tree rather than
-/// sharing the pooled one. A graph this large fills its own leaflets, and its
-/// own tree keeps the fast paths and batched lanes that read leaf metadata.
-const POOL_MAX_GRAPH_ROWS: u64 = 4096;
-
-/// Split user named graphs into `(dedicated, pooled)` by their imported row
-/// counts (`FLUREE_POOL_MAX_GRAPH_ROWS` overrides the threshold).
-fn place_named_graphs(
-    named_g_ids: &[u16],
-    infos: &[fluree_db_indexer::run_index::runs::spool::SortedCommitInfo],
-) -> (Vec<u16>, Vec<u16>) {
-    let max_rows = std::env::var("FLUREE_POOL_MAX_GRAPH_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(POOL_MAX_GRAPH_ROWS);
-    let mut rows: HashMap<u16, u64> = HashMap::new();
-    for info in infos {
-        for &(g, n) in &info.graph_rows {
-            *rows.entry(g).or_insert(0) += n;
-        }
-    }
-    named_g_ids
-        .iter()
-        .partition(|g| rows.get(g).copied().unwrap_or(0) > max_rows)
-}
-
 async fn publish_import_commit_head(
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
@@ -6374,7 +6348,10 @@ where
         // Place each user named graph: a large one keeps its own tree (its own
         // per-graph pass), the rest share the pooled tree (one pass for all).
         let (v3_dedicated_g_ids, v3_named_g_ids) =
-            place_named_graphs(&input.named_g_ids, &v3_sorted_commit_infos);
+            fluree_db_indexer::run_index::build::graph_scope::place_named_graphs(
+                &input.named_g_ids,
+                &v3_sorted_commit_infos,
+            );
         let pooled_g_ids = v3_named_g_ids.clone();
 
         config.emit_progress(ImportPhase::PreparingIndex {

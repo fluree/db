@@ -51,6 +51,15 @@ impl IncrementalRootBuilder {
         self.root.index_t = t;
     }
 
+    /// Take `g_id` out of the pooled tree's graphs: it now has a dedicated
+    /// tree. Its rows stay in the pooled leaves, which no longer route reads
+    /// for it; a full rebuild drops them.
+    pub fn remove_from_pool(&mut self, g_id: fluree_db_core::GraphId) {
+        if let Some(pool) = self.root.pool.as_mut() {
+            pool.graphs.retain(|&g| g != g_id);
+        }
+    }
+
     /// Replace the default graph's leaf entries for one sort order.
     ///
     /// If an existing entry for `order` exists, it is replaced; otherwise appended.

@@ -77,3 +77,30 @@ impl GraphScope {
         }
     }
 }
+
+/// Rows above which a named graph keeps a dedicated tree rather than sharing
+/// the pooled one. A graph this large fills its own leaflets, and its own tree
+/// keeps the fast paths and batched lanes that read a graph's leaf metadata.
+pub const POOL_MAX_GRAPH_ROWS: u64 = 4096;
+
+/// Split user named graphs into `(dedicated, pooled)` by their row counts in
+/// the sorted commit files (`FLUREE_POOL_MAX_GRAPH_ROWS` overrides the
+/// threshold).
+pub fn place_named_graphs(
+    named_g_ids: &[GraphId],
+    infos: &[crate::run_index::runs::spool::SortedCommitInfo],
+) -> (Vec<GraphId>, Vec<GraphId>) {
+    let max_rows = std::env::var("FLUREE_POOL_MAX_GRAPH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(POOL_MAX_GRAPH_ROWS);
+    let mut rows: std::collections::HashMap<GraphId, u64> = std::collections::HashMap::new();
+    for info in infos {
+        for &(g, n) in &info.graph_rows {
+            *rows.entry(g).or_insert(0) += n;
+        }
+    }
+    named_g_ids
+        .iter()
+        .partition(|g| rows.get(g).copied().unwrap_or(0) > max_rows)
+}

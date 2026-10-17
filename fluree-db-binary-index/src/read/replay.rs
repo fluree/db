@@ -321,6 +321,8 @@ pub fn replay_leaflet(
     let mut out_okey: Vec<u64> = Vec::new();
     let mut out_oi: Vec<u32> = Vec::new();
     let mut out_t: Vec<u32> = Vec::new();
+    // Graph of each row; meaningful only for a pooled leaflet.
+    let mut out_g: Vec<u16> = Vec::new();
 
     let mut bi = 0usize; // base row index
     let mut ii = 0usize; // include index
@@ -333,13 +335,15 @@ pub fn replay_leaflet(
                      ot: &mut Vec<u16>,
                      ok: &mut Vec<u64>,
                      oi: &mut Vec<u32>,
-                     t: &mut Vec<u32>| {
+                     t: &mut Vec<u32>,
+                     g: &mut Vec<u16>| {
         s.push(batch.s_id.get(row));
         p.push(batch.p_id.get(row));
         ot.push(batch.o_type.get(row));
         ok.push(batch.o_key.get(row));
         oi.push(batch.o_i.get_or(row, OI_NONE));
         t.push(batch.t.get_or(row, 0));
+        g.push(batch.g_id.get_or(row, 0));
     };
 
     // Helper: push an include record to output.
@@ -349,13 +353,15 @@ pub fn replay_leaflet(
                         ot: &mut Vec<u16>,
                         ok: &mut Vec<u64>,
                         oi: &mut Vec<u32>,
-                        t: &mut Vec<u32>| {
+                        t: &mut Vec<u32>,
+                        g: &mut Vec<u16>| {
         s.push(rec.s_id.as_u64());
         p.push(rec.p_id);
         ot.push(rec.o_type);
         ok.push(rec.o_key);
         oi.push(rec.o_i);
         t.push(rec.t);
+        g.push(rec.g_id);
     };
 
     // Convert base row to RunRecordV2 for comparison.
@@ -393,6 +399,7 @@ pub fn replay_leaflet(
                     &mut out_okey,
                     &mut out_oi,
                     &mut out_t,
+                    &mut out_g,
                 );
                 bi += 1;
             }
@@ -405,6 +412,7 @@ pub fn replay_leaflet(
                     &mut out_okey,
                     &mut out_oi,
                     &mut out_t,
+                    &mut out_g,
                 );
                 ii += 1;
             }
@@ -418,6 +426,7 @@ pub fn replay_leaflet(
                     &mut out_okey,
                     &mut out_oi,
                     &mut out_t,
+                    &mut out_g,
                 );
                 bi += 1;
                 ii += 1;
@@ -437,6 +446,7 @@ pub fn replay_leaflet(
                 &mut out_okey,
                 &mut out_oi,
                 &mut out_t,
+                &mut out_g,
             );
         }
         bi += 1;
@@ -452,6 +462,7 @@ pub fn replay_leaflet(
             &mut out_okey,
             &mut out_oi,
             &mut out_t,
+            &mut out_g,
         );
         ii += 1;
     }
@@ -473,7 +484,11 @@ pub fn replay_leaflet(
             ColumnData::AbsentDefault
         },
         t: ColumnData::Block(Arc::from(out_t)),
-        g_id: ColumnData::AbsentDefault,
+        g_id: if batch.g_id.is_absent() {
+            ColumnData::AbsentDefault
+        } else {
+            ColumnData::Block(Arc::from(out_g))
+        },
     })
 }
 

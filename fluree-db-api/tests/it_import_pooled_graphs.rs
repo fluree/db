@@ -82,14 +82,27 @@ async fn import_trig(
     ledger_id: &str,
     trig: &str,
 ) -> (fluree_db_api::Fluree, fluree_db_api::LedgerState) {
-    let path = data_dir.join("data.trig");
-    std::fs::write(&path, trig).unwrap();
+    import_trig_files(db_dir, data_dir, ledger_id, &[trig]).await
+}
+
+/// Import TriG files in order, one commit each.
+async fn import_trig_files(
+    db_dir: &Path,
+    data_dir: &Path,
+    ledger_id: &str,
+    files: &[&str],
+) -> (fluree_db_api::Fluree, fluree_db_api::LedgerState) {
+    let dir = data_dir.join("import");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, trig) in files.iter().enumerate() {
+        std::fs::write(dir.join(format!("part-{i:02}.trig")), trig).unwrap();
+    }
     let fluree = FlureeBuilder::file(db_dir.to_string_lossy().to_string())
         .build()
         .expect("build file-backed Fluree");
     fluree
         .create(ledger_id)
-        .import(&path)
+        .import(&dir)
         .threads(1)
         .memory_budget_mb(128)
         .cleanup(false)
@@ -255,5 +268,205 @@ async fn large_named_graph_keeps_its_own_tree() {
         )
         .await,
         vec!["s=http://example.org/n1", "s=http://example.org/solo"],
+    );
+}
+
+async fn sparql_update(fluree: &fluree_db_api::Fluree, ledger_id: &str, sparql: &str) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(sparql)
+        .index_config(fluree_db_api::IndexConfig {
+            reindex_min_bytes: usize::MAX,
+            reindex_max_bytes: usize::MAX,
+        })
+        .commit()
+        .await
+        .expect("sparql update");
+}
+
+/// Build the index for the commits since the last one (incremental when it
+/// can be), publish it, and return its root and the reloaded ledger.
+async fn index_and_reload(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> (IndexRoot, fluree_db_api::LedgerState) {
+    let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let result = fluree_db_indexer::build_index_for_ledger(
+        store.clone(),
+        fluree.nameservice(),
+        ledger_id,
+        fluree_db_indexer::IndexerConfig {
+            incremental_enabled: true,
+            incremental_max_commits: 100,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("index");
+    fluree
+        .publisher()
+        .unwrap()
+        .publish_index_fenced(
+            ledger_id,
+            support::fence_of(fluree, ledger_id).await,
+            result.index_t,
+            &result.root_id,
+        )
+        .await
+        .expect("publish index");
+    let root = IndexRoot::decode(&store.get(&result.root_id).await.expect("root bytes"))
+        .expect("decode root");
+    (root, fluree.ledger(ledger_id).await.expect("reload ledger"))
+}
+
+const THREE_GRAPHS: &str = r#"
+@prefix ex: <http://example.org/> .
+ex:g1 { ex:a ex:val 1 . ex:a ex:label "A" . ex:same ex:p 0 . }
+ex:g2 { ex:b ex:val 2 . ex:b ex:label "B" . ex:same ex:p 0 . }
+ex:g3 { ex:c ex:val 3 . ex:same ex:p 0 . }
+"#;
+
+/// An append-only write to a pooled graph promotes just that graph to its
+/// own tree, incrementally; every graph still reads back exactly.
+#[tokio::test]
+async fn appending_to_a_pooled_graph_promotes_only_that_graph() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-promote:main";
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g1 { ex:a ex:val 1 . ex:a2 ex:val 10 . } }",
+    )
+    .await;
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    let pool = root.pool.as_ref().expect("untouched graphs stay pooled");
+    assert_eq!(
+        pool.graphs.len(),
+        2,
+        "g2 and g3 stay pooled: {:?}",
+        pool.graphs
+    );
+    let dedicated = dedicated_user_graphs(&root);
+    assert_eq!(dedicated.len(), 1, "g1 has its own tree now");
+    assert!(!pool.contains(dedicated[0]));
+
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?s ?o WHERE {{ GRAPH ex:g1 {{ ?s ex:val ?o }} }}")
+        )
+        .await,
+        vec!["o=1 s=http://example.org/a", "o=10 s=http://example.org/a2"],
+    );
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?g WHERE {{ GRAPH ?g {{ ex:same ex:p 0 }} }}")
+        )
+        .await,
+        vec![
+            "g=http://example.org/g1",
+            "g=http://example.org/g2",
+            "g=http://example.org/g3"
+        ],
+    );
+    assert_eq!(
+        select(&fluree, &ledger, &format!("{PREFIXES}SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }} GROUP BY ?g")).await,
+        vec![
+            "g=http://example.org/g1 n=4",
+            "g=http://example.org/g2 n=3",
+            "g=http://example.org/g3 n=2"
+        ],
+    );
+}
+
+/// A retraction in a pooled graph has no pooled history to record into, so
+/// the build falls back to a full rebuild; the result is exact.
+#[tokio::test]
+async fn retracting_from_a_pooled_graph_rebuilds() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-retract:main";
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g2 { ex:b ex:label \"B\" . } }",
+    )
+    .await;
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    assert!(
+        root.pool.as_ref().is_none_or(|p| p.graphs.is_empty()),
+        "a full rebuild writes dedicated trees"
+    );
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?s ?o WHERE {{ GRAPH ex:g2 {{ ?s ?p ?o }} }}")
+        )
+        .await,
+        vec![
+            "o=0 s=http://example.org/same",
+            "o=2 s=http://example.org/b"
+        ],
+    );
+}
+
+/// An imported pool is append-only: an earlier `t` sees exactly the rows
+/// written by then.
+#[tokio::test]
+async fn pooled_graphs_answer_at_an_earlier_t() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-t:main";
+    let first = "@prefix ex: <http://example.org/> .\nex:g1 { ex:a ex:val 1 . }\nex:g2 { ex:b ex:val 2 . }\n";
+    let second = "@prefix ex: <http://example.org/> .\nex:g1 { ex:a2 ex:val 10 . }\nex:g3 { ex:c ex:val 3 . }\n";
+    let (fluree, ledger) =
+        import_trig_files(db_dir.path(), data_dir.path(), ledger_id, &[first, second]).await;
+    assert!(latest_root(db_dir.path()).pool.is_some());
+    let t = ledger.t();
+    assert!(t >= 2, "two commits");
+
+    let earlier = fluree
+        .query_connection(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": {"@id": ledger_id, "t": 1, "graph": "http://example.org/g1"},
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:val": "?v"}
+        }))
+        .await
+        .expect("query at t=1")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    let mut subjects: Vec<String> = earlier
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string())
+        })
+        .collect();
+    subjects.sort();
+    assert_eq!(subjects.len(), 1, "g1 at t=1 holds only ex:a: {subjects:?}");
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?s WHERE {{ GRAPH ex:g1 {{ ?s ex:val ?v }} }}")
+        )
+        .await,
+        vec!["s=http://example.org/a", "s=http://example.org/a2"],
     );
 }

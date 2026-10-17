@@ -3756,7 +3756,7 @@ fn pooled_subject_probe(
 fn partition_rows(rows: usize, before: impl Fn(usize) -> bool) -> usize {
     let (mut lo, mut hi) = (0usize, rows);
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = lo.midpoint(hi);
         if before(mid) {
             lo = mid + 1;
         } else {

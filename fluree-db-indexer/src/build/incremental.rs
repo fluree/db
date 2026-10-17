@@ -718,13 +718,10 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
-    // Pooled trees are built only from a full pass so far; a full rebuild
-    // indexes these commits correctly.
-    if novelty.base_root.pool.is_some() {
-        return Err(IndexerError::IncrementalAbort(
-            "incremental indexing of a pooled root is not supported yet".into(),
-        ));
-    }
+    // A write to a pooled graph promotes it to a dedicated tree: its current
+    // pooled rows plus this window's records become a fresh branch per order,
+    // and it leaves the pool. Untouched pooled graphs carry over unchanged.
+    let promoted = read_promoted_graphs(&content_store, &novelty).await?;
 
     // ---- Phase 2: Per-(graph, order) branch updates ----
     let all_orders = [
@@ -761,10 +758,27 @@ pub async fn incremental_index(
     graph_order.sort_unstable_by_key(|&g_id| (u8::from(g_id == 0), g_id));
 
     let mut phase2_tasks = Vec::with_capacity(by_graph.len().saturating_mul(all_orders.len()));
+    let mut promoted_matched: Vec<RunRecordV2> = Vec::new();
     for g_id in graph_order.iter().copied() {
         let indices = &by_graph[&g_id];
-        let graph_records: Vec<RunRecordV2> = indices.iter().map(|&i| novelty.records[i]).collect();
-        let graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
+        let mut graph_records: Vec<RunRecordV2> =
+            indices.iter().map(|&i| novelty.records[i]).collect();
+        let mut graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
+        if let Some(base_rows) = promoted.get(&g_id) {
+            let Some((rows, matched)) = promoted_graph_state(base_rows, &graph_records, &graph_ops)
+            else {
+                // The pooled tree keeps no history sidecars, so a retraction of
+                // a pooled fact has nowhere to record what was true before it;
+                // a full rebuild keeps time travel exact.
+                return Err(IndexerError::IncrementalAbort(format!(
+                    "a retraction in pooled named graph {g_id} needs a full rebuild"
+                )));
+            };
+            graph_ops = vec![1; rows.len()];
+            graph_records = rows;
+            promoted_matched.extend(matched);
+            root_builder.remove_from_pool(g_id);
+        }
         let superseded_indices = superseded_by_graph.get(&g_id);
         let graph_superseded: Vec<RunRecordV2> = superseded_indices
             .map(|idxs| idxs.iter().map(|&i| novelty.superseded[i]).collect())
@@ -868,6 +882,8 @@ pub async fn incremental_index(
     // a base-present fact and a retract of a base-absent fact change no rows.
     let mut base_matched: std::collections::HashSet<FactIdentityKey> =
         std::collections::HashSet::new();
+
+    base_matched.extend(promoted_matched.iter().map(fact_identity_key));
 
     let mut phase2_fetch_totals = Phase2FetchStatsSnapshot::default();
     for output in phase2_outputs {
@@ -4802,6 +4818,120 @@ async fn upload_leaf_blobs(
 }
 
 /// Build a fresh V3 branch from pure novelty for the default graph.
+/// The current pooled rows of every pooled graph this window writes, by
+/// graph. Empty (and no store load) when the window touches none.
+async fn read_promoted_graphs(
+    content_store: &Arc<dyn ContentStore>,
+    novelty: &crate::run_index::build::incremental_resolve::IncrementalNovelty,
+) -> Result<std::collections::HashMap<u16, Vec<RunRecordV2>>> {
+    use fluree_db_binary_index::format::run_record_v2::RunRecordV2 as Rec;
+    use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
+    use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection};
+
+    let mut out = std::collections::HashMap::new();
+    let Some(pool) = &novelty.base_root.pool else {
+        return Ok(out);
+    };
+    let mut graphs: Vec<u16> = novelty
+        .records
+        .iter()
+        .map(|r| r.g_id)
+        .filter(|&g| pool.contains(g))
+        .collect();
+    graphs.sort_unstable();
+    graphs.dedup();
+    if graphs.is_empty() {
+        return Ok(out);
+    }
+    let store = Arc::new(
+        BinaryIndexStore::load_from_root_v6(content_store.clone(), &novelty.base_root, None)
+            .await
+            .map_err(|e| {
+                IndexerError::IncrementalAbort(format!("pooled graph promotion: store load: {e}"))
+            })?,
+    );
+    let Some(branch) = store.pool_branch(RunSortOrder::Gspo).cloned() else {
+        return Ok(out);
+    };
+    for g_id in graphs {
+        let bound = |low: bool| Rec {
+            s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
+            o_key: if low { 0 } else { u64::MAX },
+            p_id: if low { 0 } else { u32::MAX },
+            t: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u32::MAX },
+            o_type: if low { 0 } else { u16::MAX },
+            g_id,
+        };
+        let mut cursor = BinaryCursor::new(
+            Arc::clone(&store),
+            RunSortOrder::Gspo,
+            Arc::clone(&branch),
+            &bound(true),
+            &bound(false),
+            BinaryFilter {
+                g_id: Some(g_id),
+                ..Default::default()
+            },
+            ColumnProjection::all(),
+        );
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor
+            .next_batch()
+            .map_err(|e| IndexerError::StorageRead(format!("pooled graph promotion: {e}")))?
+        {
+            for i in 0..batch.row_count {
+                rows.push(Rec {
+                    s_id: fluree_db_core::subject_id::SubjectId(batch.s_id.get(i)),
+                    o_key: batch.o_key.get(i),
+                    p_id: batch.p_id.get_or(i, 0),
+                    t: batch.t.get_or(i, 0),
+                    o_i: batch.o_i.get_or(i, u32::MAX),
+                    o_type: batch.o_type.get_or(i, 0),
+                    g_id,
+                });
+            }
+        }
+        out.insert(g_id, rows);
+    }
+    Ok(out)
+}
+
+/// A promoted graph's state after this window: its pooled rows with the
+/// window's records applied (one lifecycle winner per fact). A re-assert keeps
+/// the base row (no new transition), an assert of a new fact adds a row, a
+/// retract of a fact the graph never had is a no-op. Returns the rows and the
+/// base rows the window touched — the base presence Phase 3b's stats deltas
+/// read — or `None` when the window retracts a base fact.
+fn promoted_graph_state(
+    base_rows: &[RunRecordV2],
+    records: &[RunRecordV2],
+    ops: &[u8],
+) -> Option<(Vec<RunRecordV2>, Vec<RunRecordV2>)> {
+    let mut window: std::collections::HashMap<FactIdentityKey, (RunRecordV2, u8)> = records
+        .iter()
+        .zip(ops)
+        .map(|(r, &op)| (fact_identity_key(r), (*r, op)))
+        .collect();
+    let mut rows = Vec::with_capacity(base_rows.len() + records.len());
+    let mut matched = Vec::new();
+    for base in base_rows {
+        match window.remove(&fact_identity_key(base)) {
+            Some((_, 0)) => return None,
+            Some(_) => matched.push(*base),
+            None => {}
+        }
+        rows.push(*base);
+    }
+    rows.extend(
+        window
+            .into_values()
+            .filter(|&(_, op)| op == 1)
+            .map(|(r, _)| r),
+    );
+    Some((rows, matched))
+}
+
 fn build_fresh_default_graph_v3(
     sorted_records: &[RunRecordV2],
     // Kept for: filtering retractions in fresh branches once the rebuild
