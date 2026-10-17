@@ -2745,12 +2745,39 @@ pub(crate) fn probe_lane_admission(
     None
 }
 
+/// The batched-lane verdict for a pooled graph. Only the subject lane can
+/// read one (through the pooled GSPO), and only from persisted rows: no
+/// overlay, at the index's `t`, one graph, and a policy that clears the
+/// predicates.
+pub(crate) fn pooled_probe_lane(ctx: &ExecutionContext<'_>, pred_sids: &[&Sid]) -> ProbeLanePlan {
+    let ok = !ctx.is_history_range()
+        && !ctx.eager_materialization
+        && matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single)
+        && ctx.overlay_free_single_graph()
+        && ctx
+            .binary_store
+            .as_ref()
+            .is_some_and(|store| ctx.to_t >= store.max_t())
+        && matches!(
+            policy_lane_for_predicates(ctx, pred_sids, POLICY_PREDICATE_PROBE_SITE),
+            PredicateFastPath::Allow
+        );
+    if ok {
+        ProbeLanePlan::Clean
+    } else {
+        ProbeLanePlan::Decline
+    }
+}
+
 /// Plan a single-predicate PSOT subject probe under the active overlay.
 pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
+    if active_graph_pooled(ctx) {
+        return Ok(pooled_probe_lane(ctx, &[pred_sid]));
+    }
     if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
         return Ok(plan);
     }

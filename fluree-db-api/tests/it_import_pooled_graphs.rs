@@ -178,6 +178,15 @@ ex:g3 { ex:s ex:p "same" . ex:c ex:val 42 . }
             "d=http://example.org/x g=http://example.org/g2 l=X2"
         ],
     );
+    // OPTIONAL probes stay in the row's graph: ex:y's only label is in g2.
+    assert_eq!(
+        select(&fluree, &ledger, &format!("{PREFIXES}SELECT ?g ?d ?l WHERE {{ GRAPH ?g {{ ?d a ex:Doc . OPTIONAL {{ ?d ex:label ?l }} }} }}")).await,
+        vec![
+            "d=http://example.org/x g=http://example.org/g1 l=X1",
+            "d=http://example.org/x g=http://example.org/g2 l=X2",
+            "d=http://example.org/y g=http://example.org/g1"
+        ],
+    );
     assert_eq!(
         select(&fluree, &ledger, &format!("{PREFIXES}SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }} GROUP BY ?g")).await,
         vec![
