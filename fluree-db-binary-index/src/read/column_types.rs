@@ -142,6 +142,7 @@ impl ColumnBatch {
             + self.o_type.byte_size()
             + self.o_i.byte_size()
             + self.t.byte_size()
+            + self.g_id.byte_size()
     }
 
     /// Project a (super)batch down to `requested`, mirroring what a fresh narrow
@@ -546,6 +547,16 @@ mod tests {
     use super::*;
     use crate::format::run_record_v2::write_ordered_key_v2;
     use fluree_db_core::subject_id::SubjectId;
+
+    /// A pooled batch's graph column is cache weight like any other column.
+    #[test]
+    fn byte_size_counts_the_graph_column() {
+        let batch = ColumnBatch {
+            g_id: ColumnData::Block(vec![7u16; 25_000].into()),
+            ..ColumnBatch::empty()
+        };
+        assert_eq!(batch.byte_size(), 50_000);
+    }
 
     #[test]
     fn column_data_const() {
