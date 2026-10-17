@@ -711,3 +711,50 @@ async fn sweeping_keeps_the_pooled_tree() {
         vec!["o=3 s=http://example.org/c"],
     );
 }
+
+/// A vector in a pooled graph keeps its fact-to-handle mapping, so deleting it
+/// retracts it: over the pooled base before the next index, and in the tree
+/// the graph is promoted to after it.
+#[tokio::test]
+async fn deleting_a_vector_from_a_pooled_graph_retracts_it() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-vector:main";
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree.create_ledger(ledger_id).await.expect("create");
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+         INSERT DATA { GRAPH ex:g1 { ex:doc ex:embedding \"[0.1, 0.2, 0.3]\"^^f:embeddingVector .
+                                     ex:doc ex:label \"d\" . }
+                       GRAPH ex:g2 { ex:x ex:label \"x\" . } }",
+    )
+    .await;
+    let (root, _) = index_and_reload(&fluree, ledger_id).await;
+    assert_eq!(root.pool.as_ref().map(|p| p.graphs.len()), Some(2));
+
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+         DELETE DATA { GRAPH ex:g1 { ex:doc ex:embedding \"[0.1, 0.2, 0.3]\"^^f:embeddingVector . } }",
+    )
+    .await;
+    let count = format!(
+        "{PREFIXES}SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH ex:g1 {{ ?s ex:embedding ?v }} }}"
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    assert_eq!(
+        select(&fluree, &ledger, &count).await,
+        vec!["n=0"],
+        "over the pooled base"
+    );
+    let (_, ledger) = index_and_reload(&fluree, ledger_id).await;
+    assert_eq!(
+        select(&fluree, &ledger, &count).await,
+        vec!["n=0"],
+        "after promotion"
+    );
+}

@@ -1189,9 +1189,8 @@ async fn seed_vector_fact_handles(
     // handle into the shared fact map.
     let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
     for g_id in graphs_with_vectors {
-        let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
-            Some(b) => Arc::clone(b),
-            None => continue,
+        let Some(tree) = store.graph_tree(g_id, RunSortOrder::Spot) else {
+            continue;
         };
         let arena_map = match shared.vectors.get(&g_id) {
             Some(m) => m,
@@ -1199,16 +1198,41 @@ async fn seed_vector_fact_handles(
         };
         let filter = BinaryFilter {
             o_type: Some(OType::VECTOR.as_u16()),
+            g_id: tree.g_filter,
             ..Default::default()
         };
-        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
-        let mut cursor = BinaryCursor::scan_all(
-            Arc::clone(&store),
-            RunSortOrder::Spot,
-            branch,
-            filter,
-            projection,
-        );
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, tree.order);
+        let mut cursor = match tree.g_filter {
+            // The graph's run of the pooled GSPO.
+            Some(g) => {
+                let bound =
+                    |low: bool| fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                        s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
+                        o_key: if low { 0 } else { u64::MAX },
+                        p_id: if low { 0 } else { u32::MAX },
+                        t: if low { 0 } else { u32::MAX },
+                        o_i: if low { 0 } else { u32::MAX },
+                        o_type: if low { 0 } else { u16::MAX },
+                        g_id: g,
+                    };
+                BinaryCursor::new(
+                    Arc::clone(&store),
+                    tree.order,
+                    tree.branch,
+                    &bound(true),
+                    &bound(false),
+                    filter,
+                    projection,
+                )
+            }
+            None => BinaryCursor::scan_all(
+                Arc::clone(&store),
+                tree.order,
+                tree.branch,
+                filter,
+                projection,
+            ),
+        };
         let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
         while let Some(batch) = cursor.next_batch()? {
             for i in 0..batch.row_count {

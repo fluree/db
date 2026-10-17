@@ -1752,9 +1752,8 @@ impl BinaryIndexStore {
         use crate::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
         use fluree_db_core::o_type::OType;
 
-        let branch = match self.branch_for_order(g_id, RunSortOrder::Spot) {
-            Some(b) => Arc::clone(b),
-            None => return Ok(None),
+        let Some(tree) = self.graph_tree(g_id, RunSortOrder::Spot) else {
+            return Ok(None);
         };
         let arena = self
             .graph_indexes
@@ -1766,13 +1765,27 @@ impl BinaryIndexStore {
             p_id: Some(p_id),
             o_type: Some(OType::VECTOR.as_u16()),
             o_i: Some(o_i),
+            g_id: tree.g_filter,
             ..Default::default()
         };
-        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
-        let mut cursor = BinaryCursor::scan_all(
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, tree.order);
+        // The fact's (graph, subject, predicate) run; the graph bounds only
+        // the pooled tree's keys.
+        let bound = |low: bool| crate::format::run_record_v2::RunRecordV2 {
+            s_id: fluree_db_core::subject_id::SubjectId(s_id),
+            o_key: if low { 0 } else { u64::MAX },
+            p_id,
+            t: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u32::MAX },
+            o_type: if low { 0 } else { u16::MAX },
+            g_id,
+        };
+        let mut cursor = BinaryCursor::new(
             Arc::clone(self),
-            RunSortOrder::Spot,
-            branch,
+            tree.order,
+            tree.branch,
+            &bound(true),
+            &bound(false),
             filter,
             projection,
         );
