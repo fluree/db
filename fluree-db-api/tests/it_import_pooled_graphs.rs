@@ -1815,3 +1815,102 @@ async fn pooled_leaves_hold_one_leaflet() {
         "a merge keeps pooled leaves within twice a leaflet: {rows:?}"
     );
 }
+
+/// `GRAPH ?g` over pooled graphs: rows of `sparql` with the quad path open,
+/// whether it engaged, and the rows with it (and every fast path) off.
+async fn quad_and_per_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    sparql: &str,
+) -> (Vec<String>, bool, Vec<String>) {
+    let sparql = format!("{PREFIXES}{sparql}");
+    let (spans, guard) = support::span_capture::init_test_tracing();
+    // A callsite first reached under another test's subscriber keeps that
+    // interest unless rebuilt.
+    tracing::callsite::rebuild_interest_cache();
+    fluree_db_api::set_fast_paths_disabled(false);
+    let quad = select(fluree, ledger, &sparql).await;
+    let fired = spans.has_event("quad block engaged");
+    drop(guard);
+    fluree_db_api::set_fast_paths_disabled(true);
+    let per_graph = select(fluree, ledger, &sparql).await;
+    fluree_db_api::set_fast_paths_disabled(false);
+    (quad, fired, per_graph)
+}
+
+/// A `GRAPH ?g` block of triple patterns and graph-free filters runs as quad
+/// scans over the pooled graphs without novelty, and answers as the
+/// per-graph path does — with novelty in one graph too, which then runs per
+/// graph beside the quad scans. Blocks the quad path cannot answer exactly
+/// never engage it.
+#[tokio::test(flavor = "current_thread")]
+async fn graph_blocks_over_pooled_graphs_run_as_quad_scans() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-quad:main";
+    let (fluree, ledger) = import_trig(
+        db_dir.path(),
+        data_dir.path(),
+        ledger_id,
+        r#"
+@prefix ex: <http://example.org/> .
+ex:shared ex:val 99 .
+ex:g1 { ex:a ex:val 1 ; ex:label "A" ; ex:knows ex:b . ex:b ex:val 2 . ex:same ex:p 0 . }
+ex:g2 { ex:a ex:val 1 ; ex:label "A2" . ex:b ex:val 3 ; ex:knows ex:a . ex:same ex:p 0 . }
+ex:g3 { ex:c ex:val 3 ; ex:label "C" . ex:a ex:knows ex:b . }
+"#,
+    )
+    .await;
+
+    let engaged = [
+        "SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s ex:val ?o } }",
+        "SELECT ?g ?s ?v ?l WHERE { GRAPH ?g { ?s ex:val ?v ; ex:label ?l } }",
+        "SELECT ?g WHERE { GRAPH ?g { ex:same ex:p 0 } }",
+        "SELECT ?g ?s ?v WHERE { GRAPH ?g { ?s ex:val ?v FILTER(?v > 1) } }",
+        "SELECT ?g ?x ?v WHERE { GRAPH ?g { ?s ex:knows ?x . ?x ex:val ?v } }",
+        "SELECT ?g (COUNT(?s) AS ?n) WHERE { GRAPH ?g { ?s ex:val ?v } } GROUP BY ?g",
+    ];
+    let declined = [
+        // A filter in the block runs before ?g is bound.
+        "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:val ?v FILTER(?g = ex:g1) } }",
+        "SELECT ?g ?s ?l WHERE { GRAPH ?g { ?s ex:val ?v OPTIONAL { ?s ex:label ?l } } }",
+        "SELECT ?g ?s WHERE { ?s ex:val 99 . GRAPH ?g { ?s ex:val ?v } }",
+        "SELECT ?g ?p WHERE { GRAPH ?g { ex:a ?p ?o } }",
+    ];
+    for (queries, must_fire) in [(&engaged[..], true), (&declined[..], false)] {
+        for q in queries {
+            let (quad, fired, per_graph) = quad_and_per_graph(&fluree, &ledger, q).await;
+            assert_eq!(fired, must_fire, "{q}");
+            assert_eq!(quad, per_graph, "{q}");
+        }
+    }
+    let (rows, _, _) = quad_and_per_graph(&fluree, &ledger, engaged[1]).await;
+    assert_eq!(
+        rows,
+        vec![
+            "g=http://example.org/g1 l=A s=http://example.org/a v=1",
+            "g=http://example.org/g2 l=A2 s=http://example.org/a v=1",
+            "g=http://example.org/g3 l=C s=http://example.org/c v=3",
+        ],
+        "one row per graph's own pairing: the shared subject never joins across graphs"
+    );
+
+    // Novelty in g1: g2 and g3 still run as quad scans, g1 per graph.
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g1 { ex:n ex:val 7 ; ex:label \"N\" . } }",
+    )
+    .await;
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    for q in &engaged[..2] {
+        let (quad, fired, per_graph) = quad_and_per_graph(&fluree, &ledger, q).await;
+        assert!(fired, "{q}");
+        assert_eq!(quad, per_graph, "{q}");
+        assert!(
+            quad.iter().any(|r| r.contains("http://example.org/n")),
+            "{q}: {quad:?}"
+        );
+    }
+}

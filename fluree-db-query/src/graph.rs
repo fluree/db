@@ -127,6 +127,9 @@ pub struct GraphOperator {
     /// one probe of the pooled tree per open (see `probe_pooled_graphs`).
     /// Outer `None`: not probed yet; inner `None`: no pruning possible.
     pooled_hits: Option<Option<rustc_hash::FxHashSet<GraphId>>>,
+    /// Graphs an unbound `?g` skips because a quad scan answered them (see
+    /// [`crate::quad_block`]).
+    skip: Option<Arc<crate::binary_scan::QuadGraphs>>,
 }
 
 impl GraphOperator {
@@ -195,7 +198,31 @@ impl GraphOperator {
             topk: None,
             seed_graph_var,
             pooled_hits: None,
+            skip: None,
         }
+    }
+
+    /// The schema of the rows feeding the block.
+    pub(crate) fn parent_schema(&self) -> &[VarId] {
+        self.child.schema()
+    }
+
+    /// Swap the operator feeding the block, returning the previous one.
+    pub(crate) fn replace_child(&mut self, child: BoxedOperator) -> BoxedOperator {
+        std::mem::replace(&mut self.child, child)
+    }
+
+    /// Leave `graphs` out of an unbound `?g`'s enumeration: another path
+    /// answered them.
+    pub(crate) fn skip_graphs(&mut self, graphs: Arc<crate::binary_scan::QuadGraphs>) {
+        self.skip = Some(graphs);
+    }
+
+    fn skipped(&self, ctx: &ExecutionContext<'_>, iri: &str) -> bool {
+        self.skip.as_ref().is_some_and(|skip| {
+            ctx.single_db_user_graph_id(iri)
+                .is_some_and(|g_id| skip.contains(g_id))
+        })
     }
 
     /// The pooled graphs worth visiting for an unbound `?g`: those whose
@@ -954,7 +981,9 @@ impl Operator for GraphOperator {
                                     self.pooled_hits = Some(self.probe_pooled_graphs(ctx).await?);
                                 }
                                 for iri in ctx.single_db_user_graph_iris() {
-                                    if self.pooled_graph_ruled_out(ctx, &iri) {
+                                    if self.pooled_graph_ruled_out(ctx, &iri)
+                                        || self.skipped(ctx, &iri)
+                                    {
                                         continue;
                                     }
                                     self.execute_in_graph(

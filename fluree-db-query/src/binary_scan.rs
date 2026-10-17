@@ -172,6 +172,36 @@ fn inline_ops_need_t(ops: &[InlineOperator]) -> bool {
 // BinaryScanOperator
 // ============================================================================
 
+/// The graphs a quad scan reads (see [`BinaryScanOperator::into_quad`]), with
+/// the IRI each binds the graph variable to.
+pub(crate) struct QuadGraphs {
+    iris: rustc_hash::FxHashMap<GraphId, Arc<str>>,
+}
+
+impl QuadGraphs {
+    pub(crate) fn new(iris: impl IntoIterator<Item = (GraphId, Arc<str>)>) -> Self {
+        Self {
+            iris: iris.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn iri(&self, g_id: GraphId) -> Option<&Arc<str>> {
+        self.iris.get(&g_id)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.iris.len()
+    }
+
+    pub(crate) fn contains(&self, g_id: GraphId) -> bool {
+        self.iris.contains_key(&g_id)
+    }
+}
+
+struct QuadScan {
+    graphs: Arc<QuadGraphs>,
+}
+
 /// Encoded form of the inner-subject and inner-object bounds on a term
 /// variable (see `ObjectBounds::term_subject` / `term_object`).
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +222,9 @@ pub struct BinaryScanOperator {
     /// Read the pooled tree across all its graphs, for
     /// [`Self::drain_probe_graphs`] (see [`Self::into_pool_probe`]).
     pool_probe: bool,
+    /// Read the pooled tree across the graphs of a [`QuadGraphs`] and bind
+    /// each row's graph (see [`Self::into_quad`]).
+    quad: Option<QuadScan>,
     schema: Arc<[VarId]>,
     s_var_pos: Option<usize>,
     p_var_pos: Option<usize>,
@@ -744,6 +777,26 @@ impl BinaryScanOperator {
         Ok(Some(graphs))
     }
 
+    /// A quad scan: `open` reads the pattern's pooled order across the
+    /// graphs of `graphs` at once, and every row binds `graph_var` to its
+    /// graph's IRI, appended to the schema. The overlay is not merged — the
+    /// caller hands only graphs without novelty — and each row's values decode
+    /// through its own graph.
+    pub(crate) fn into_quad(mut self, graph_var: VarId, graphs: Arc<QuadGraphs>) -> Self {
+        debug_assert!(self.inline_ops.is_empty() && !self.schema.contains(&graph_var));
+        let mut schema = self.schema.to_vec();
+        schema.push(graph_var);
+        self.schema = schema.into();
+        self.quad = Some(QuadScan { graphs });
+        self
+    }
+
+    /// Whether this scan reads the pooled tree across graphs (a probe or a
+    /// quad scan) rather than one graph's rows.
+    fn spans_pool(&self) -> bool {
+        self.pool_probe || self.quad.is_some()
+    }
+
     fn with_mode(
         pattern: TriplePattern,
         object_bounds: Option<ObjectBounds>,
@@ -794,6 +847,7 @@ impl BinaryScanOperator {
             index,
             planned_index: index,
             pool_probe: false,
+            quad: None,
             schema,
             s_var_pos,
             p_var_pos,
@@ -1435,10 +1489,10 @@ impl BinaryScanOperator {
         let mut bindings = Vec::with_capacity(ncols.max(base_len));
         let store_arc: Arc<BinaryIndexStore> = Arc::clone(self.store());
         let dict_novelty_arc = ctx.and_then(|c| c.dict_novelty.clone());
-        let view = {
+        let make_view = |g_id: GraphId| {
             let mut v = BinaryGraphView::with_novelty(
                 Arc::clone(&store_arc),
-                self.g_id,
+                g_id,
                 dict_novelty_arc.clone(),
             )
             .with_namespace_codes_fallback(ctx.and_then(|c| c.namespace_codes_fallback.clone()));
@@ -1447,6 +1501,9 @@ impl BinaryScanOperator {
             }
             v
         };
+        let scan_view = make_view(self.g_id);
+        // A quad scan's rows decode through their own graphs.
+        let mut quad_views: HashMap<GraphId, BinaryGraphView> = HashMap::new();
         // DictOverlay is no longer needed here for decoding — BinaryGraphView
         // handles watermark routing internally. DictOverlay is still used for
         // overlay translation (translate_overlay_flakes) in BinaryScanOperator::open.
@@ -1480,6 +1537,21 @@ impl BinaryScanOperator {
             };
             let t_enc = t_opt.unwrap_or(0);
 
+            let quad_graph = match &self.quad {
+                Some(quad) => {
+                    let g_id = batch.g_id.get_or(row, 0);
+                    match quad.graphs.iri(g_id) {
+                        Some(iri) => Some((g_id, Arc::clone(iri))),
+                        None => continue,
+                    }
+                }
+                None => None,
+            };
+            let view = match quad_graph {
+                Some((g_id, _)) => &*quad_views.entry(g_id).or_insert_with(|| make_view(g_id)),
+                None => &scan_view,
+            };
+
             // Skip internal db: predicates on wildcard scans.
             if self.is_internal_predicate(p_id) {
                 continue;
@@ -1499,7 +1571,7 @@ impl BinaryScanOperator {
             }
 
             // Enforce datatype constraints before decoding into bindings.
-            if !self.matches_datatype_constraint(&view, o_type, o_key, p_id) {
+            if !self.matches_datatype_constraint(view, o_type, o_key, p_id) {
                 continue;
             }
 
@@ -1661,9 +1733,21 @@ impl BinaryScanOperator {
                         }
                     }
                 };
+                // An arena handle names a value in one graph's arenas, which a
+                // quad scan's consumers cannot tell apart: decode it here.
+                let binding =
+                    if quad_graph.is_some() && crate::object_binding::is_arena_encoded(&binding) {
+                        crate::group_aggregate::materialize_encoded(&binding, Some(view))
+                    } else {
+                        binding
+                    };
                 if !Self::set_binding_at(&mut bindings, pos, binding) {
                     continue;
                 }
+            }
+
+            if let Some((_, iri)) = quad_graph {
+                bindings.push(Binding::iri(iri));
             }
 
             // Apply inline operators.
@@ -2304,11 +2388,11 @@ impl Operator for BinaryScanOperator {
                 // Scan-time datatype narrowing only — never semantic elision.
                 false,
             );
-            // A pool probe reads every pooled graph, so it narrows only by
-            // encodings that mean the same in each: no datatype inferred from
-            // this graph's stats, and no arena handle, which is local to a
-            // (graph, predicate).
-            let graph_local_ok = !self.pool_probe;
+            // A pool probe or quad scan reads every pooled graph, so it
+            // narrows only by encodings that mean the same in each: no
+            // datatype inferred from this graph's stats, and no arena handle,
+            // which is local to a (graph, predicate).
+            let graph_local_ok = !self.spans_pool();
             let mut inferred_dt_sid = if dt_sid.is_none() && lang.is_none() && graph_local_ok {
                 filter.p_id.and_then(|p_id| {
                     infer_exact_datatype_sid_from_stats(
@@ -2573,7 +2657,7 @@ impl Operator for BinaryScanOperator {
         // Get branch manifest (clone into Arc for cursor ownership).
         let store_arc = Arc::clone(self.store.as_ref().expect("store set above"));
         let store_ref = store_arc.as_ref();
-        let tree = if self.pool_probe {
+        let tree = if self.spans_pool() {
             let pooled = order.pooled();
             store_ref
                 .pool_branch(pooled)
@@ -2856,7 +2940,7 @@ impl Operator for BinaryScanOperator {
                 t: 0,
                 o_i: 0,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(0),
-                g_id: if self.pool_probe { 0 } else { self.g_id },
+                g_id: if self.spans_pool() { 0 } else { self.g_id },
             };
             let max_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
@@ -2865,7 +2949,7 @@ impl Operator for BinaryScanOperator {
                 t: u32::MAX,
                 o_i: u32::MAX,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(u16::MAX),
-                g_id: if self.pool_probe {
+                g_id: if self.spans_pool() {
                     GraphId::MAX
                 } else {
                     self.g_id
@@ -2904,7 +2988,7 @@ impl Operator for BinaryScanOperator {
         // `overlay_has_novelty`, which also trusts a zero epoch: this block is
         // the scan's only overlay merge, so a wrong answer here drops rows
         // instead of declining a fast path.
-        if ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
+        if self.quad.is_none() && ctx.overlay.is_some_and(|o| !o.is_effectively_empty()) {
             let epoch = ctx.overlay().epoch();
             // A bound subject (or, failing that, a bound predicate) turns the
             // translation from a whole-novelty walk into a seek. Without it the
