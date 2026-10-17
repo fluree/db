@@ -362,14 +362,14 @@ enum Phase2TaskKind {
     DefaultExisting {
         leaves: Vec<LeafEntry>,
     },
-    DefaultFresh,
     NamedExisting {
         branch_cid: ContentId,
     },
-    NamedFresh,
-    /// A pooled graph leaving the pool: its whole resolved log.
-    NamedPromoted {
-        facts: Arc<Vec<PromotedFact>>,
+    /// A tree written whole from its graph's folded facts: an order the base
+    /// root lacks (built from this window alone), or a pooled graph leaving
+    /// the pool (its pooled log plus this window).
+    Folded {
+        facts: Arc<Vec<FoldedFact>>,
     },
 }
 
@@ -420,6 +420,61 @@ struct Phase2TaskOutput {
     matched: Vec<RunRecordV2>,
 }
 
+/// Write and upload a tree for `order` holding `facts`.
+#[allow(clippy::too_many_arguments)]
+async fn write_folded_tree(
+    facts: &[FoldedFact],
+    seq: usize,
+    g_id: fluree_db_core::GraphId,
+    order: RunSortOrder,
+    config: &IndexerConfig,
+    content_store: &Arc<dyn fluree_db_core::storage::ContentStore>,
+    tracker: &fluree_db_core::tracking::Tracker,
+    upload_budget: &Semaphore,
+    upload_buffer: usize,
+) -> Result<Phase2TaskOutput> {
+    let BranchUpdateResult {
+        leaf_entries,
+        new_leaf_blobs,
+        replaced_leaf_cids,
+        replaced_sidecar_cids,
+        branch_bytes,
+        branch_cid: expected_branch_cid,
+        ..
+    } = build_folded_tree(facts, order, g_id, config)?;
+    let new_leaf_count = new_leaf_blobs.len();
+    upload_leaf_blobs(
+        content_store.as_ref(),
+        tracker,
+        upload_budget,
+        upload_buffer,
+        new_leaf_blobs,
+    )
+    .await?;
+    let update = if g_id == 0 {
+        Phase2TaskUpdate::Default { leaf_entries }
+    } else {
+        let branch_cid = content_store
+            .put(ContentKind::IndexBranch, &branch_bytes)
+            .await
+            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        debug_assert!(branch_cid == expected_branch_cid);
+        cache_artifact_bytes(&**content_store, &branch_cid, &branch_bytes, "index_branch");
+        Phase2TaskUpdate::Named { branch_cid }
+    };
+    Ok(Phase2TaskOutput {
+        seq,
+        g_id,
+        order,
+        update,
+        replaced_leaf_cids,
+        replaced_sidecar_cids,
+        new_leaf_count,
+        fetch_stats: Phase2FetchStatsSnapshot::default(),
+        matched: Vec::new(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_phase2_task(
     task: Phase2Task,
@@ -459,7 +514,36 @@ async fn execute_phase2_task(
         .warm_cache_source
         .as_ref()
         .and_then(|s| s.warm_cache());
+    // An order with no leaves has nothing to merge into (slicing routes
+    // novelty only to existing leaves): write it from this window instead.
+    let fold_own_window = || {
+        let window = sorted_records
+            .iter()
+            .copied()
+            .zip(sorted_ops.iter().copied())
+            .chain(
+                sorted_superseded
+                    .iter()
+                    .copied()
+                    .zip(sorted_superseded_ops.iter().copied()),
+            );
+        fold_graph_log(&PooledGraphLog::default(), window).0
+    };
     let output = match kind {
+        Phase2TaskKind::DefaultExisting { leaves } if leaves.is_empty() => {
+            write_folded_tree(
+                &fold_own_window(),
+                seq,
+                g_id,
+                order,
+                config,
+                &content_store,
+                &tracker,
+                &upload_budget,
+                upload_buffer,
+            )
+            .await?
+        }
         Phase2TaskKind::DefaultExisting { leaves } => {
             let branch_bytes =
                 fluree_db_binary_index::format::branch::build_branch_bytes(order, g_id, &leaves);
@@ -491,49 +575,6 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::DefaultFresh => {
-            if !sorted_superseded.is_empty() {
-                // Permanent gap: these are real in-window transitions (e.g. a
-                // fact born and deleted between two index builds) and the next
-                // window's novelty never re-sees them. Reachable beyond
-                // genesis — the root format permits graphs with fewer than
-                // four materialized orders, so a newly added order takes this
-                // arm for an existing graph, leaving that order's replay
-                // without history its sibling orders have.
-                tracing::warn!(
-                    g_id,
-                    ?order,
-                    dropped = sorted_superseded.len(),
-                    "fresh default-graph order has no sidecar to merge into; \
-                     dropping this window's intra-window transition history"
-                );
-            }
-            let BranchUpdateResult {
-                leaf_entries,
-                new_leaf_blobs,
-                ..
-            } = build_fresh_default_graph_v3(&sorted_records, &sorted_ops, order, g_id, config)?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget.as_ref(),
-                upload_buffer,
-                new_leaf_blobs,
-            )
-            .await?;
-            Phase2TaskOutput {
-                seq,
-                g_id,
-                order,
-                update: Phase2TaskUpdate::Default { leaf_entries },
-                replaced_leaf_cids: Vec::new(),
-                replaced_sidecar_cids: Vec::new(),
-                new_leaf_count,
-                fetch_stats: Phase2FetchStatsSnapshot::default(),
-                matched: Vec::new(),
-            }
-        }
         Phase2TaskKind::NamedExisting { branch_cid } => {
             let branch_bytes = fetch_cached_index_bytes(
                 content_store.as_ref(),
@@ -541,6 +582,25 @@ async fn execute_phase2_task(
                 format!("fetch V3 branch g_id={g_id} {order:?}"),
             )
             .await?;
+            let branch_is_empty =
+                fluree_db_binary_index::format::branch::read_branch_from_bytes(&branch_bytes)
+                    .map_err(|e| IndexerError::StorageRead(format!("decode V3 branch: {e}")))?
+                    .leaves
+                    .is_empty();
+            if branch_is_empty {
+                return write_folded_tree(
+                    &fold_own_window(),
+                    seq,
+                    g_id,
+                    order,
+                    config,
+                    &content_store,
+                    &tracker,
+                    &upload_budget,
+                    upload_buffer,
+                )
+                .await;
+            }
             let (meta, fetch_stats) = run_update_branch(
                 branch_bytes,
                 sorted_records,
@@ -578,87 +638,19 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::NamedPromoted { facts } => {
-            let BranchUpdateResult {
-                new_leaf_blobs,
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
-                branch_bytes,
-                branch_cid: expected_branch_cid,
-                ..
-            } = build_promoted_graph_tree(&facts, order, g_id, config)?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget.as_ref(),
-                upload_buffer,
-                new_leaf_blobs,
-            )
-            .await?;
-            let branch_cid = content_store
-                .put(ContentKind::IndexBranch, &branch_bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(&*content_store, &branch_cid, &branch_bytes, "index_branch");
-            Phase2TaskOutput {
+        Phase2TaskKind::Folded { facts } => {
+            write_folded_tree(
+                &facts,
                 seq,
                 g_id,
                 order,
-                update: Phase2TaskUpdate::Named { branch_cid },
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
-                new_leaf_count,
-                fetch_stats: Phase2FetchStatsSnapshot::default(),
-                matched: Vec::new(),
-            }
-        }
-        Phase2TaskKind::NamedFresh => {
-            if !sorted_superseded.is_empty() {
-                // Permanent gap; see the DefaultFresh arm above.
-                tracing::warn!(
-                    g_id,
-                    ?order,
-                    dropped = sorted_superseded.len(),
-                    "fresh named-graph order has no sidecar to merge into; \
-                     dropping this window's intra-window transition history"
-                );
-            }
-            let BranchUpdateResult {
-                new_leaf_blobs,
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
-                branch_bytes,
-                branch_cid: expected_branch_cid,
-                ..
-            } = build_fresh_named_graph_v3(&sorted_records, order, g_id, config)?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
+                config,
+                &content_store,
                 &tracker,
-                upload_budget.as_ref(),
+                &upload_budget,
                 upload_buffer,
-                new_leaf_blobs,
             )
-            .await?;
-            let branch_cid = content_store
-                .put(ContentKind::IndexBranch, &branch_bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(&*content_store, &branch_cid, &branch_bytes, "index_branch");
-            Phase2TaskOutput {
-                seq,
-                g_id,
-                order,
-                update: Phase2TaskUpdate::Named { branch_cid },
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
-                new_leaf_count,
-                fetch_stats: Phase2FetchStatsSnapshot::default(),
-                matched: Vec::new(),
-            }
+            .await?
         }
     };
 
@@ -815,8 +807,8 @@ pub async fn incremental_index(
         let graph_superseded_ops: Vec<u8> = superseded_indices
             .map(|idxs| idxs.iter().map(|&i| novelty.superseded_ops[i]).collect())
             .unwrap_or_default();
-        let promoted_facts = promoted.get(&g_id).map(|log| {
-            let window = graph_records
+        let window = || {
+            graph_records
                 .iter()
                 .copied()
                 .zip(graph_ops.iter().copied())
@@ -825,12 +817,21 @@ pub async fn incremental_index(
                         .iter()
                         .copied()
                         .zip(graph_superseded_ops.iter().copied()),
-                );
-            let (facts, matched) = resolve_promoted_graph(log, window);
+                )
+        };
+        let promoted_facts = promoted.get(&g_id).map(|log| {
+            let (facts, matched) = fold_graph_log(log, window());
             promoted_matched.extend(matched);
             root_builder.remove_from_pool(g_id);
             Arc::new(facts)
         });
+        // An order the base root lacks is written from this window alone.
+        let mut window_facts: Option<Arc<Vec<FoldedFact>>> = None;
+        let mut fold_window = || {
+            Arc::clone(window_facts.get_or_insert_with(|| {
+                Arc::new(fold_graph_log(&PooledGraphLog::default(), window()).0)
+            }))
+        };
 
         for &order in &all_orders {
             let cmp = cmp_v2_for_order(order);
@@ -852,7 +853,7 @@ pub async fn incremental_index(
                 .collect();
 
             let kind = if let Some(facts) = &promoted_facts {
-                Phase2TaskKind::NamedPromoted {
+                Phase2TaskKind::Folded {
                     facts: Arc::clone(facts),
                 }
             } else if g_id == 0 {
@@ -863,7 +864,9 @@ pub async fn incremental_index(
                     .map(|o| o.leaves.clone())
                 {
                     Some(leaves) => Phase2TaskKind::DefaultExisting { leaves },
-                    None => Phase2TaskKind::DefaultFresh,
+                    None => Phase2TaskKind::Folded {
+                        facts: fold_window(),
+                    },
                 }
             } else {
                 match base_root
@@ -874,7 +877,9 @@ pub async fn incremental_index(
                     .map(|(_, cid)| cid.clone())
                 {
                     Some(branch_cid) => Phase2TaskKind::NamedExisting { branch_cid },
-                    None => Phase2TaskKind::NamedFresh,
+                    None => Phase2TaskKind::Folded {
+                        facts: fold_window(),
+                    },
                 }
             };
 
@@ -5000,27 +5005,27 @@ async fn read_promoted_graphs(
     Ok(out)
 }
 
-/// One fact of a promoted graph after this window: its row (absent when the
-/// fact's final state is retracted) and the transitions its sidecar keeps.
-struct PromotedFact {
+/// One fact of a graph after this window: its row (absent when the fact's
+/// final state is retracted) and the transitions its sidecar keeps.
+struct FoldedFact {
     row: Option<RunRecordV2>,
     transitions: Vec<(RunRecordV2, u8)>,
 }
 
-impl PromotedFact {
+impl FoldedFact {
     fn key(&self) -> &RunRecordV2 {
         self.row.as_ref().unwrap_or_else(|| &self.transitions[0].0)
     }
 }
 
-/// A promoted graph's facts after this window: its persisted log and the
-/// window's events, folded per fact from absent the way a full rebuild folds
-/// the whole log. Also returns the persisted rows the window touched — the
-/// base presence Phase 3b's stats deltas read.
-fn resolve_promoted_graph(
+/// A graph's facts after this window: its persisted log (empty for a graph
+/// with no tree yet) and the window's events, folded per fact from absent the
+/// way a full rebuild folds the whole log. Also returns the persisted rows the
+/// window touched — the base presence Phase 3b's stats deltas read.
+fn fold_graph_log(
     base: &PooledGraphLog,
     window: impl IntoIterator<Item = (RunRecordV2, u8)>,
-) -> (Vec<PromotedFact>, Vec<RunRecordV2>) {
+) -> (Vec<FoldedFact>, Vec<RunRecordV2>) {
     use fluree_db_binary_index::format::transitions::resolve_transitions;
 
     let mut events: std::collections::HashMap<FactIdentityKey, Vec<(RunRecordV2, u8)>> =
@@ -5053,7 +5058,7 @@ fn resolve_promoted_graph(
         .into_values()
         .filter_map(|mut evs| {
             let row = resolve_transitions(&mut evs, false);
-            (row.is_some() || !evs.is_empty()).then_some(PromotedFact {
+            (row.is_some() || !evs.is_empty()).then_some(FoldedFact {
                 row,
                 transitions: evs,
             })
@@ -5062,9 +5067,9 @@ fn resolve_promoted_graph(
     (facts, matched)
 }
 
-/// A promoted graph's dedicated tree for `order`, rows and history.
-fn build_promoted_graph_tree(
-    facts: &[PromotedFact],
+/// A tree for `order` holding folded facts, rows and history.
+fn build_folded_tree(
+    facts: &[FoldedFact],
     order: RunSortOrder,
     g_id: fluree_db_core::GraphId,
     config: &IndexerConfig,
@@ -5073,7 +5078,7 @@ fn build_promoted_graph_tree(
     use fluree_db_binary_index::format::leaf::LeafWriter;
 
     let cmp = cmp_v2_for_order(order);
-    let mut by_key: Vec<&PromotedFact> = facts.iter().collect();
+    let mut by_key: Vec<&FoldedFact> = facts.iter().collect();
     by_key.sort_unstable_by(|a, b| cmp(a.key(), b.key()));
     let mut writer = LeafWriter::new(order, config.leaflet_rows.max(1), config.leaf_rows, 1);
     for fact in by_key {
@@ -5092,34 +5097,8 @@ fn build_promoted_graph_tree(
         if let Some(row) = fact.row {
             writer
                 .push_record(row)
-                .map_err(|e| IndexerError::StorageWrite(format!("promoted graph writer: {e}")))?;
+                .map_err(|e| IndexerError::StorageWrite(format!("folded tree writer: {e}")))?;
         }
-    }
-    finish_fresh_branch(writer, order, g_id)
-}
-
-/// Build a fresh V3 branch from pure novelty for the default graph.
-fn build_fresh_default_graph_v3(
-    sorted_records: &[RunRecordV2],
-    // Kept for: filtering retractions in fresh branches once the rebuild
-    // pipeline supports retraction-aware builds. Currently only assertions
-    // appear in fresh branches so ops are not consulted.
-    sorted_ops: &[u8],
-    order: RunSortOrder,
-    g_id: fluree_db_core::GraphId,
-    config: &IndexerConfig,
-) -> Result<BranchUpdateResult> {
-    let _ = sorted_ops;
-    use fluree_db_binary_index::format::leaf::LeafWriter;
-
-    let leaflet_target = config.leaflet_rows.max(1);
-    let leaf_target = config.leaf_rows;
-
-    let mut writer = LeafWriter::new(order, leaflet_target, leaf_target, 1);
-    for rec in sorted_records {
-        writer
-            .push_record(*rec)
-            .map_err(|e| IndexerError::StorageWrite(format!("V3 fresh branch writer: {e}")))?;
     }
     finish_fresh_branch(writer, order, g_id)
 }
@@ -5179,16 +5158,6 @@ fn finish_fresh_branch(
 
 /// Build a fresh V3 branch from pure novelty for a named graph.
 ///
-/// Same as `build_fresh_default_graph_v3` — the build pipeline is graph-agnostic.
-fn build_fresh_named_graph_v3(
-    sorted_records: &[RunRecordV2],
-    order: RunSortOrder,
-    g_id: fluree_db_core::GraphId,
-    config: &IndexerConfig,
-) -> Result<BranchUpdateResult> {
-    build_fresh_default_graph_v3(sorted_records, &[], order, g_id, config)
-}
-
 /// Build predicate SIDs from resolver state for the index root.
 fn build_predicate_sids(
     shared: &crate::run_index::resolve::resolver::SharedResolverState,

@@ -1095,3 +1095,109 @@ async fn graph_ids_past_16_bits_import_write_and_index() {
         vec!["s=http://example.org/n"]
     );
 }
+
+/// `?s ex:label ?o` in the default graph, as of `t` (`None`: current).
+async fn default_labels_at(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    ledger_id: &str,
+    t: Option<i64>,
+) -> Vec<String> {
+    let mut from = serde_json::json!({"@id": ledger_id});
+    if let Some(t) = t {
+        from["t"] = serde_json::json!(t);
+    }
+    let rows = fluree
+        .query_connection(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": from,
+            "select": ["?s", "?o"],
+            "where": {"@id": "?s", "ex:label": "?o"}
+        }))
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    let mut out: Vec<String> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| format!("{} {}", r[0].as_str().unwrap(), r[1]))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A fact asserted and retracted within the window that writes a graph's
+/// first tree stays retracted, and the tree keeps its lived interval for an
+/// earlier `t` — for a new named graph, and for a default graph whose only
+/// order has no leaves (a TriG import with no default-graph triples).
+#[tokio::test]
+async fn a_fact_retracted_in_a_trees_first_window_stays_retracted() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/first-window-retract:main";
+    let (fluree, _) = import_trig(
+        db_dir.path(),
+        data_dir.path(),
+        ledger_id,
+        "@prefix ex: <http://example.org/> .\nex:seed { ex:s ex:label \"seed\" . }\n",
+    )
+    .await;
+    // The default graph has a SPOT order with no leaves, and no other order.
+    let base = latest_root(db_dir.path());
+    assert!(base
+        .default_graph_orders
+        .iter()
+        .all(|o| o.leaves.is_empty()));
+    assert!(base
+        .default_graph_orders
+        .iter()
+        .any(|o| o.order == fluree_db_binary_index::RunSortOrder::Spot));
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA {
+           ex:x ex:label \"X\" . ex:y ex:label \"Y\" .
+           GRAPH ex:fresh { ex:x ex:label \"X\" . ex:y ex:label \"Y\" . }
+         }",
+    )
+    .await;
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { ex:x ex:label \"X\" . GRAPH ex:fresh { ex:x ex:label \"X\" . } }",
+    )
+    .await;
+    let (_, ledger) = index_and_reload(&fluree, ledger_id).await;
+
+    let y = vec![r#"ex:y "Y""#.to_string()];
+    let xy = vec![r#"ex:x "X""#.to_string(), r#"ex:y "Y""#.to_string()];
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "fresh", None).await,
+        y
+    );
+    assert_eq!(
+        objects_at(&fluree, &ledger, ledger_id, "fresh", Some(2)).await,
+        xy
+    );
+    assert_eq!(
+        default_labels_at(&fluree, &ledger, ledger_id, None).await,
+        y
+    );
+    assert_eq!(
+        default_labels_at(&fluree, &ledger, ledger_id, Some(2)).await,
+        xy
+    );
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{PREFIXES}SELECT ?p ?o WHERE {{ ex:y ?p ?o }}")
+        )
+        .await,
+        vec!["o=Y p=http://example.org/label"],
+    );
+}
