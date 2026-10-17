@@ -150,7 +150,7 @@ async fn run_list(
 
     let mut table = Table::new();
     table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec!["IRI", "Kind", "g-id", "Flakes", "Size"]);
+    table.set_header(vec!["IRI", "Kind", "g-id", "Flakes", "Size", "Placement"]);
     for (entry, g_id) in entries {
         let iri = entry
             .get("iri")
@@ -176,12 +176,17 @@ async fn run_list(
             .and_then(serde_json::Value::as_u64)
             .map(format_bytes)
             .unwrap_or_else(|| "-".to_string());
+        let placement = entry
+            .get("placement")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
         table.add_row(vec![
             iri.to_string(),
             kind.to_string(),
             g_id_label,
             flakes,
             size,
+            placement.to_string(),
         ]);
     }
     println!("{table}");

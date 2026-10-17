@@ -1589,6 +1589,24 @@ async fn ledger_config_places_named_graphs() {
     };
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
     check(&root);
+    let info = fluree
+        .ledger_info(ledger_id)
+        .execute()
+        .await
+        .expect("ledger info");
+    let placement = |graph: &str| {
+        info["ledger"]["named-graphs"]
+            .as_array()
+            .expect("named graphs")
+            .iter()
+            .find(|g| g["iri"] == format!("http://example.org/{graph}"))
+            .map(|g| g["placement"].clone())
+    };
+    assert_eq!(
+        ["g1", "g2", "g3"].map(placement),
+        ["dedicated", "pooled", "dedicated"].map(|p| Some(serde_json::json!(p))),
+        "ledger info reports where the index holds each graph"
+    );
     for (graph, label) in [
         ("g1", "ex:a \"A\""),
         ("g2", "ex:b \"B\""),
