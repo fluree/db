@@ -133,49 +133,22 @@ impl PoolRouting {
 /// Magic bytes for the index root.
 pub const ROOT_V6_MAGIC: &[u8; 4] = b"FIR6";
 
-/// Format version.
+/// `main`'s root format version, which this build reads but never writes.
 ///
 /// Version 2 adds `lang_id: u16` to each `FulltextArenaRef` so arenas can
 /// be keyed by `(g_id, p_id, lang_id)` for multi-language full-text indexing.
 /// Pre-v2 roots are refused outright — operators upgrading must run a full
 /// reindex before queries resume.
-///
-/// Version 3 enables inline `xsd:decimal` encoding ([`DecimalEncoding`]): leaf
-/// data may carry [`OType::XSD_DECIMAL_INLINE`] rows. The root layout is
-/// byte-identical to v2; the version is the capability signal. Old binaries
-/// refuse a v3 root outright (the strict version check below) rather than
-/// misdecoding inline-decimal leaf rows, which is the required "upgrade code
-/// first" safety property.
 pub const ROOT_V6_VERSION: u8 = 2;
 
-/// The v5 (`next`) index format: `main` writes version 2, and every format
-/// change `next` makes shares this one bump — inline `xsd:decimal` encoding,
-/// the triple-term dictionary, the pooled tree, the compressed body and
-/// graph-carrying history. Written only by a full reindex/import (under
-/// [`DecimalEncoding::InlineWhenFits`]); an incremental build keeps its base
-/// root's version, so a `main`-format ledger stays `main`-readable until it
-/// is reindexed. See [`IndexRoot::decimal_encoding`].
-pub const ROOT_V6_VERSION_INLINE_DECIMAL: u8 = 3;
-
-/// Derive the decimal-encoding policy from a decoded root format version.
-#[inline]
-pub const fn decimal_encoding_for_version(version: u8) -> fluree_db_core::DecimalEncoding {
-    if version >= ROOT_V6_VERSION_INLINE_DECIMAL {
-        fluree_db_core::DecimalEncoding::InlineWhenFits
-    } else {
-        fluree_db_core::DecimalEncoding::ArenaOnly
-    }
-}
-
-/// The root format version that must be written for a given decimal-encoding
-/// policy. Inverse of [`decimal_encoding_for_version`].
-#[inline]
-pub const fn version_for_decimal_encoding(enc: fluree_db_core::DecimalEncoding) -> u8 {
-    match enc {
-        fluree_db_core::DecimalEncoding::InlineWhenFits => ROOT_V6_VERSION_INLINE_DECIMAL,
-        fluree_db_core::DecimalEncoding::ArenaOnly => ROOT_V6_VERSION,
-    }
-}
+/// The v5 (`next`) root format, `next`'s one version bump over `main`: inline
+/// `xsd:decimal` encoding, the triple-term dictionary, the pooled tree, the
+/// compressed body, graph-carrying history and 32-bit graph ids all ride on
+/// it. Every root this build writes is v5 — the first index of a `main`
+/// ledger upgrades it — and `main` refuses v5 outright rather than misreading
+/// it. The decimal policy is an extended flag, so an arena-only ledger stays
+/// arena-only until a reindex.
+pub const ROOT_V6_VERSION_V5: u8 = 3;
 
 /// What garbage collection needs from a retired annotation-arena root
 /// section: its two branch manifests. Decoding ignores the section's other
@@ -237,9 +210,8 @@ pub struct IndexRoot {
     /// this flag on the first post-import write.
     pub lex_sorted_string_ids: bool,
 
-    /// How this root encodes `xsd:decimal` values. Derived from the format
-    /// version on decode ([`decimal_encoding_for_version`]) and mapped back to
-    /// the version on encode ([`version_for_decimal_encoding`]). Sticky:
+    /// How this root encodes `xsd:decimal` values: arena-only for a `main` (v2)
+    /// root, otherwise the `FLAG_EXT_DECIMAL_ARENA_ONLY` flag. Sticky:
     /// incremental writes preserve it; only a full reindex changes it.
     pub decimal_encoding: fluree_db_core::DecimalEncoding,
 
@@ -654,6 +626,9 @@ impl IndexRoot {
     /// Root carries a pool routing section after the named-graph routing.
     const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
     // Bit 5 marks a zstd-compressed body: `fluree_db_core::fir6_frame`.
+    /// v5 root whose decimals are arena-only (a `main` ledger not yet
+    /// reindexed); clear means inline-when-fits.
+    const FLAG_EXT_DECIMAL_ARENA_ONLY: u8 = 1 << 6;
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -674,9 +649,7 @@ impl IndexRoot {
 
         // ---- Header (24 bytes) ----
         buf.extend_from_slice(ROOT_V6_MAGIC);
-        // The version byte is the inline-decimal capability signal: a root that
-        // inlines decimals is written as v3 so old binaries refuse it.
-        buf.push(version_for_decimal_encoding(self.decimal_encoding));
+        buf.push(ROOT_V6_VERSION_V5);
         let flags = (if self.stats.is_some() {
             Self::FLAG_HAS_STATS
         } else {
@@ -722,6 +695,9 @@ impl IndexRoot {
         }
         if self.pool.is_some() {
             flags_ext |= Self::FLAG_EXT_HAS_POOL;
+        }
+        if self.decimal_encoding == fluree_db_core::DecimalEncoding::ArenaOnly {
+            flags_ext |= Self::FLAG_EXT_DECIMAL_ARENA_ONLY;
         }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
@@ -897,18 +873,7 @@ impl IndexRoot {
             write_term_dict_refs(&mut buf, td);
         }
 
-        if self.is_v5_format() {
-            fluree_db_core::fir6_frame::deflate(&buf).expect("root has its header")
-        } else {
-            debug_assert!(self.pool.is_none(), "a pooled tree is v5-only");
-            buf
-        }
-    }
-
-    /// Whether this root is written in the v5 format (version 3) rather than
-    /// `main`'s.
-    pub fn is_v5_format(&self) -> bool {
-        version_for_decimal_encoding(self.decimal_encoding) == ROOT_V6_VERSION_INLINE_DECIMAL
+        fluree_db_core::fir6_frame::deflate(&buf).expect("root has its header")
     }
 
     /// The snapshot metadata this root carries, so a caller holding the
@@ -959,13 +924,10 @@ impl IndexRoot {
             )));
         }
         let version = data[4];
-        // Accept v2 (arena-only) and v3 (inline-decimal-capable); the layouts are
-        // byte-identical, the version only signals whether inline-decimal leaf
-        // rows may appear. Any other version is refused.
-        if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_INLINE_DECIMAL {
+        // `main`'s v2 (read so its ledgers upgrade on their first index) or v5.
+        if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_V5 {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
         }
-        let decimal_encoding = decimal_encoding_for_version(version);
 
         let flags = data[5];
         // Extended-flags byte at data[6]; data[7] reserved.
@@ -973,6 +935,12 @@ impl IndexRoot {
         // `0u16` here, so old roots decode to all extended flags
         // = false.
         let flags_ext = data[6];
+        let decimal_encoding =
+            if version == ROOT_V6_VERSION || flags_ext & Self::FLAG_EXT_DECIMAL_ARENA_ONLY != 0 {
+                fluree_db_core::DecimalEncoding::ArenaOnly
+            } else {
+                fluree_db_core::DecimalEncoding::InlineWhenFits
+            };
         let mut pos = 8; // skip past flags_ext + reserved
         let index_t = read_i64_at(data, &mut pos)?;
         let base_t = read_i64_at(data, &mut pos)?;
@@ -1590,7 +1558,7 @@ mod tests {
         let bytes = root.encode();
 
         assert_eq!(&bytes[0..4], b"FIR6");
-        assert_eq!(bytes[4], ROOT_V6_VERSION);
+        assert_eq!(bytes[4], ROOT_V6_VERSION_V5);
         assert_eq!(bytes[5], 0); // no optional sections
 
         let decoded = IndexRoot::decode(&bytes).unwrap();
@@ -1877,37 +1845,36 @@ mod tests {
     fn fir6_decimal_encoding_version_round_trip() {
         use fluree_db_core::DecimalEncoding;
 
-        // Arena-only root is written as v2 and decodes back to ArenaOnly.
-        let arena = minimal_root_v6();
-        let arena_bytes = arena.encode();
-        assert_eq!(arena_bytes[4], ROOT_V6_VERSION);
-        assert_eq!(
-            IndexRoot::decode(&arena_bytes).unwrap().decimal_encoding(),
-            DecimalEncoding::ArenaOnly
-        );
+        // Every root is written v5; the decimal policy is a flag on it.
+        for encoding in [DecimalEncoding::ArenaOnly, DecimalEncoding::InlineWhenFits] {
+            let mut root = minimal_root_v6();
+            root.decimal_encoding = encoding;
+            let bytes = root.encode();
+            assert_eq!(bytes[4], ROOT_V6_VERSION_V5);
+            assert_ne!(
+                bytes[6] & fluree_db_core::fir6_frame::FLAG_EXT_COMPRESSED,
+                0
+            );
+            assert_eq!(
+                IndexRoot::decode(&bytes).unwrap().decimal_encoding(),
+                encoding
+            );
+        }
+    }
 
-        // Inline-decimal root is written as v3 (the capability signal) and
-        // decodes back to InlineWhenFits.
-        let mut inline = minimal_root_v6();
-        inline.decimal_encoding = DecimalEncoding::InlineWhenFits;
-        let inline_bytes = inline.encode();
-        assert_eq!(inline_bytes[4], ROOT_V6_VERSION_INLINE_DECIMAL);
+    /// A `main` (v2) root decodes, arena-only, so a `main` ledger upgrades on
+    /// its first index.
+    #[test]
+    fn fir6_reads_a_main_root() {
+        let mut main_root = raw(&minimal_root_v6().encode());
+        main_root[4] = ROOT_V6_VERSION;
+        main_root[6] &= !IndexRoot::FLAG_EXT_DECIMAL_ARENA_ONLY;
+        let decoded = IndexRoot::decode(&main_root).unwrap();
         assert_eq!(
-            IndexRoot::decode(&inline_bytes).unwrap().decimal_encoding(),
-            DecimalEncoding::InlineWhenFits
+            decoded.decimal_encoding(),
+            fluree_db_core::DecimalEncoding::ArenaOnly
         );
-
-        // A main-format (v2) root stays uncompressed, byte-compatible with
-        // main; the v5 root compresses its body. Uncompressed, the two differ
-        // only in the version byte.
-        assert_eq!(raw(&arena_bytes), arena_bytes);
-        assert_ne!(
-            inline_bytes[6] & fluree_db_core::fir6_frame::FLAG_EXT_COMPRESSED,
-            0
-        );
-        let inline_raw = raw(&inline_bytes);
-        assert_eq!(arena_bytes[0..4], inline_raw[0..4]); // magic
-        assert_eq!(arena_bytes[5..], inline_raw[5..]); // everything after version
+        assert_eq!(decoded.index_t, minimal_root_v6().index_t);
     }
 
     #[test]
