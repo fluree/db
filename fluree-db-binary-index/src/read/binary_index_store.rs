@@ -667,7 +667,14 @@ impl BinaryIndexStore {
 
         let mut pool_deltas = HashMap::new();
         let deltas_started = std::time::Instant::now();
-        let mut runs_fetched = 0usize;
+        // Orders whose runs need fetching: (order, run cids, runs already
+        // decoded, their events).
+        let mut pending: Vec<(
+            RunSortOrder,
+            Vec<ContentId>,
+            usize,
+            Vec<crate::read::types::OverlayOp>,
+        )> = Vec::new();
         for (order, runs) in root.pool.iter().flat_map(|p| &p.deltas) {
             if runs.is_empty() {
                 continue;
@@ -679,23 +686,42 @@ impl BinaryIndexStore {
                 .and_then(|p| p.pool.as_ref())
                 .and_then(|pi| pi.deltas.get(order))
                 .filter(|(prev_cids, _)| cids.starts_with(prev_cids));
-            let events = match carried {
-                Some((prev_cids, events)) if prev_cids.len() == cids.len() => Arc::clone(events),
-                _ => {
-                    let (done, mut events) = match carried {
-                        Some((prev_cids, events)) => (prev_cids.len(), events.to_vec()),
-                        None => (0, Vec::new()),
-                    };
-                    for cid in &cids[done..] {
-                        let bytes = cs.get(cid).await.map_err(storage_io_error)?;
-                        events.extend(crate::format::pool_delta::decode_delta_run(&bytes)?.1);
-                    }
-                    runs_fetched += cids.len() - done;
-                    crate::read::types::sort_overlay_ops_stable(&mut events, *order);
-                    Arc::from(events)
+            match carried {
+                Some((prev_cids, events)) if prev_cids.len() == cids.len() => {
+                    pool_deltas.insert(*order, (cids, Arc::clone(events)));
                 }
-            };
-            pool_deltas.insert(*order, (cids, events));
+                Some((prev_cids, events)) => {
+                    pending.push((*order, cids, prev_cids.len(), events.to_vec()));
+                }
+                None => pending.push((*order, cids, 0, Vec::new())),
+            }
+        }
+        // Every order's missing runs at once: a store near the run cap
+        // otherwise waits on each read in turn.
+        let fetches: Vec<(usize, ContentId)> = pending
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (_, cids, done, _))| cids[*done..].iter().map(move |c| (i, c.clone())))
+            .collect();
+        let runs_fetched = fetches.len();
+        let fetched: Vec<(usize, Vec<crate::read::types::OverlayOp>)> = {
+            use futures::stream::{StreamExt, TryStreamExt};
+            let cs = &cs;
+            futures::stream::iter(fetches)
+                .map(|(i, cid)| async move {
+                    let bytes = cs.get(&cid).await.map_err(storage_io_error)?;
+                    Ok::<_, io::Error>((i, crate::format::pool_delta::decode_delta_run(&bytes)?.1))
+                })
+                .buffered(32)
+                .try_collect()
+                .await?
+        };
+        for (i, events) in fetched {
+            pending[i].3.extend(events);
+        }
+        for (order, cids, _, mut events) in pending {
+            crate::read::types::sort_overlay_ops_stable(&mut events, order);
+            pool_deltas.insert(order, (cids, Arc::from(events)));
         }
         if !pool_deltas.is_empty() {
             tracing::debug!(
