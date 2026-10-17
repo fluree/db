@@ -946,9 +946,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
 
     // Pool routing (skip)
     if flags_ext & FLAG_EXT_HAS_POOL != 0 {
-        let graph_count = read_u32(bytes, &mut pos)? as usize;
-        ensure(bytes, pos, graph_count * 4, "pool graph ids")?;
-        pos += graph_count * 4;
+        let member_count = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, member_count * 12, "pool members")?;
+        pos += member_count * 12;
         let order_count = read_u8(bytes, &mut pos)? as usize;
         for _ in 0..order_count {
             let _order_id = read_u8(bytes, &mut pos)?;

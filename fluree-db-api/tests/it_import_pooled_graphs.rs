@@ -34,6 +34,17 @@ fn dedicated_user_graphs(root: &IndexRoot) -> Vec<fluree_db_core::GraphId> {
         .collect()
 }
 
+/// `(rows, history)` the pool records for `ex:{graph}`, `None` when the graph
+/// is not pooled.
+fn pooled_size(root: &IndexRoot, graph: &str) -> Option<(u32, u32)> {
+    let iri = format!("http://example.org/{graph}");
+    let g_id = root.graph_iris.iter().position(|g| *g == iri)? as u32 + 1;
+    root.pool
+        .as_ref()?
+        .member(g_id)
+        .map(|m| (m.rows, m.history))
+}
+
 fn latest_root(dir: &Path) -> IndexRoot {
     let roots = find_roots(dir);
     let newest = roots
@@ -132,14 +143,19 @@ ex:g3 { ex:s ex:p "same" . ex:c ex:val 42 . }
     let root = latest_root(db_dir.path());
     let pool = root.pool.as_ref().expect("small named graphs are pooled");
     assert_eq!(
-        pool.graphs.len(),
+        pool.members.len(),
         3,
         "all three graphs pooled: {:?}",
-        pool.graphs
+        pool.members
     );
     assert!(
         dedicated_user_graphs(&root).is_empty(),
         "no dedicated user graph trees"
+    );
+    assert_eq!(
+        ["g1", "g2", "g3"].map(|g| pooled_size(&root, g)),
+        [Some((5, 0)), Some((5, 0)), Some((2, 0))],
+        "each member's rows, and no history from an import"
     );
 
     assert_eq!(
@@ -235,7 +251,7 @@ async fn large_named_graph_keeps_its_own_tree() {
 
     let root = latest_root(db_dir.path());
     let pool = root.pool.as_ref().expect("the small graph is pooled");
-    assert_eq!(pool.graphs.len(), 1);
+    assert_eq!(pool.members.len(), 1);
     let dedicated = dedicated_user_graphs(&root);
     assert_eq!(dedicated.len(), 1, "the large graph has a tree of its own");
     assert!(!pool.contains(dedicated[0]));
@@ -300,7 +316,8 @@ async fn index_and_reload(
             incremental_enabled: true,
             incremental_max_commits: 100,
             ..Default::default()
-        },
+        }
+        .with_ledger_config_provider(fluree.ledger_config_provider()),
     )
     .await
     .expect("index");
@@ -346,10 +363,10 @@ async fn appending_to_a_pooled_graph_promotes_only_that_graph() {
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
     let pool = root.pool.as_ref().expect("untouched graphs stay pooled");
     assert_eq!(
-        pool.graphs.len(),
+        pool.members.len(),
         2,
         "g2 and g3 stay pooled: {:?}",
-        pool.graphs
+        pool.members
     );
     let dedicated = dedicated_user_graphs(&root);
     assert_eq!(dedicated.len(), 1, "g1 has its own tree now");
@@ -486,7 +503,7 @@ async fn retracting_from_a_pooled_graph_promotes_it_with_its_history() {
     .await;
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
     let pool = root.pool.as_ref().expect("g1 and g3 stay pooled");
-    assert_eq!(pool.graphs.len(), 2);
+    assert_eq!(pool.members.len(), 2);
     assert_eq!(
         pool.orders, before.orders,
         "the pooled trees are reused as they were"
@@ -540,10 +557,16 @@ async fn a_rebuild_pools_graphs_with_their_history() {
 
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
     assert_eq!(
-        root.pool.as_ref().map(|p| p.graphs.len()),
+        root.pool.as_ref().map(|p| p.members.len()),
         Some(2),
         "the first index is a full rebuild, and it pools both graphs"
     );
+    assert_eq!(
+        pooled_size(&root, "g1"),
+        Some((1, 2)),
+        "A2's row; A1's assert and retract"
+    );
+    assert_eq!(pooled_size(&root, "g2"), Some((1, 0)));
     let at = |graph, t| objects_at(&fluree, &ledger, ledger_id, graph, t);
     assert_eq!(at("g1", Some(t1)).await, vec!["ex:a \"A1\""]);
     assert_eq!(at("g1", Some(t2)).await, vec!["ex:a \"A2\""]);
@@ -566,7 +589,7 @@ async fn a_rebuild_pools_graphs_with_their_history() {
     .await;
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
     assert_eq!(
-        root.pool.as_ref().map(|p| p.graphs.len()),
+        root.pool.as_ref().map(|p| p.members.len()),
         Some(1),
         "g1 left the pool"
     );
@@ -642,7 +665,7 @@ async fn pooled_graph_with_an_arena_counts_once() {
         latest_root(db_dir.path())
             .pool
             .expect("pooled")
-            .graphs
+            .members
             .len(),
         2
     );
@@ -733,7 +756,7 @@ async fn deleting_a_vector_from_a_pooled_graph_retracts_it() {
     )
     .await;
     let (root, _) = index_and_reload(&fluree, ledger_id).await;
-    assert_eq!(root.pool.as_ref().map(|p| p.graphs.len()), Some(2));
+    assert_eq!(root.pool.as_ref().map(|p| p.members.len()), Some(2));
 
     sparql_update(
         &fluree,
@@ -781,7 +804,7 @@ async fn graph_pruning_matches_an_arena_decimal_in_its_own_graph() {
     )
     .await;
     assert_eq!(
-        latest_root(db_dir.path()).pool.map(|p| p.graphs.len()),
+        latest_root(db_dir.path()).pool.map(|p| p.members.len()),
         Some(2)
     );
     let target = "\"222222222222222222222222222222.222222222\"^^xsd:decimal";
@@ -843,7 +866,7 @@ async fn a_retracted_sole_fact_is_visible_at_its_assert() {
     )
     .await;
     let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
-    assert_eq!(root.pool.as_ref().map(|p| p.graphs.len()), Some(1));
+    assert_eq!(root.pool.as_ref().map(|p| p.members.len()), Some(1));
     assert_eq!(
         objects_at(&fluree, &ledger, ledger_id, "g1", Some(t1)).await,
         vec!["ex:a \"A1\""]
@@ -995,7 +1018,7 @@ async fn pooled_graphs_answer_every_shape_like_unindexed_data() {
     )
     .await;
     let (root, _) = index_and_reload(&fluree, pooled).await;
-    assert_eq!(root.pool.as_ref().map(|p| p.graphs.len()), Some(2));
+    assert_eq!(root.pool.as_ref().map(|p| p.members.len()), Some(2));
     let want = differential_rows(&fluree, oracle).await;
     assert_same_rows(
         "pooled base",
@@ -1039,7 +1062,7 @@ async fn graph_ids_past_16_bits_import_write_and_index() {
     }
     let (fluree, ledger) = import_trig(db_dir.path(), data_dir.path(), ledger_id, &trig).await;
     let pool = latest_root(db_dir.path()).pool.expect("pooled");
-    assert!(pool.graphs.iter().any(|&g| g > u32::from(u16::MAX)));
+    assert!(pool.graph_ids().any(|g| g > u32::from(u16::MAX)));
 
     let in_graph =
         |i: u32| format!("{PREFIXES}SELECT ?s ?v WHERE {{ GRAPH ex:g{i} {{ ?s ex:val ?v }} }}");
@@ -1200,4 +1223,108 @@ async fn a_fact_retracted_in_a_trees_first_window_stays_retracted() {
         .await,
         vec!["o=Y p=http://example.org/label"],
     );
+}
+
+/// Write `f:graphPlacement` into the ledger's config graph: `default` for
+/// every user named graph, and `overrides` as `(graph, placement)` pairs.
+async fn set_graph_placement(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    default: &str,
+    overrides: &[(&str, &str)],
+) {
+    let mut body = format!(
+        "<urn:config:main> a f:LedgerConfig ;
+           f:indexingDefaults [ f:graphPlacement f:{default} ] .\n"
+    );
+    for (graph, placement) in overrides {
+        body.push_str(&format!(
+            "<urn:config:main> f:graphOverrides <urn:config:{graph}> .
+             <urn:config:{graph}> a f:GraphConfig ;
+               f:targetGraph ex:{graph} ;
+               f:indexingDefaults [ f:graphPlacement f:{placement} ] .\n"
+        ));
+    }
+    sparql_update(
+        fluree,
+        ledger_id,
+        &format!(
+            "PREFIX ex: <http://example.org/>
+             PREFIX f: <https://ns.flur.ee/db#>
+             INSERT DATA {{ GRAPH <urn:fluree:{ledger_id}#config> {{ {body} }} }}"
+        ),
+    )
+    .await;
+}
+
+fn user_graph_id(root: &IndexRoot, graph: &str) -> fluree_db_core::GraphId {
+    let iri = format!("http://example.org/{graph}");
+    root.graph_iris
+        .iter()
+        .position(|g| *g == iri)
+        .expect("registered graph") as fluree_db_core::GraphId
+        + 1
+}
+
+/// `f:graphPlacement` places named graphs: a `PlacementDedicated` ledger
+/// default keeps every graph in its own trees, and a `PlacementAuto` graph
+/// override lets that one pool. Both a ledger's first index and a reindex
+/// apply it, and every graph reads back the same.
+#[tokio::test]
+async fn ledger_config_places_named_graphs() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/placement-config:main";
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree.create_ledger(ledger_id).await.expect("create");
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g1 { ex:a ex:label \"A\" . }
+                       GRAPH ex:g2 { ex:b ex:label \"B\" . }
+                       GRAPH ex:g3 { ex:c ex:label \"C\" . } }",
+    )
+    .await;
+    set_graph_placement(
+        &fluree,
+        ledger_id,
+        "PlacementDedicated",
+        &[("g2", "PlacementAuto")],
+    )
+    .await;
+
+    let check = |root: &IndexRoot| {
+        let pooled: Vec<_> = root
+            .pool
+            .as_ref()
+            .map(|p| p.graph_ids().collect())
+            .unwrap_or_default();
+        assert_eq!(pooled, vec![user_graph_id(root, "g2")]);
+        let mut dedicated = dedicated_user_graphs(root);
+        dedicated.sort_unstable();
+        assert_eq!(
+            dedicated,
+            vec![user_graph_id(root, "g1"), user_graph_id(root, "g3")]
+        );
+    };
+    let (root, ledger) = index_and_reload(&fluree, ledger_id).await;
+    check(&root);
+    for (graph, label) in [
+        ("g1", "ex:a \"A\""),
+        ("g2", "ex:b \"B\""),
+        ("g3", "ex:c \"C\""),
+    ] {
+        assert_eq!(
+            objects_at(&fluree, &ledger, ledger_id, graph, None).await,
+            vec![label.to_string()]
+        );
+    }
+
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    check(&latest_root(db_dir.path()));
 }

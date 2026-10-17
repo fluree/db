@@ -195,6 +195,10 @@ pub struct LeafWriter {
 
     // Completed leaves.
     completed_leaves: Vec<LeafInfo>,
+
+    /// Rows and history entries per graph, tallied for the pool's GSPO order
+    /// only (see [`Self::take_pool_members`]).
+    pool_members: Vec<crate::format::index_root::PoolMember>,
 }
 
 impl LeafWriter {
@@ -225,7 +229,42 @@ impl LeafWriter {
             leaf_first_record: None,
             last_record: None,
             completed_leaves: Vec::new(),
+            pool_members: Vec::new(),
         }
+    }
+
+    /// The pooled graphs this GSPO writer has written, with the rows and
+    /// history entries each holds. Empty for every other order.
+    pub fn take_pool_members(&mut self) -> Vec<crate::format::index_root::PoolMember> {
+        std::mem::take(&mut self.pool_members)
+    }
+
+    fn tally(&mut self, g_id: fluree_db_core::GraphId, rows: u32, history: u32) {
+        use crate::format::index_root::PoolMember;
+        if self.order != RunSortOrder::Gspo {
+            return;
+        }
+        // GSPO pushes arrive graph-ascending, so this is almost always the
+        // last member or a new one after it.
+        let at = match self.pool_members.last() {
+            Some(m) if m.g_id == g_id => self.pool_members.len() - 1,
+            Some(m) if m.g_id > g_id => {
+                match self.pool_members.binary_search_by_key(&g_id, |m| m.g_id) {
+                    Ok(i) => i,
+                    Err(i) => {
+                        self.pool_members.insert(i, PoolMember::new(g_id));
+                        i
+                    }
+                }
+            }
+            _ => {
+                self.pool_members.push(PoolMember::new(g_id));
+                self.pool_members.len() - 1
+            }
+        };
+        let m = &mut self.pool_members[at];
+        m.rows = m.rows.saturating_add(rows);
+        m.history = m.history.saturating_add(history);
     }
 
     /// Skip history sidecar production (import fast path).
@@ -281,6 +320,7 @@ impl LeafWriter {
 
         self.record_buf.push(record);
         self.last_record = Some(record);
+        self.tally(record.g_id, 1, 0);
 
         // Row-count threshold.
         if self.record_buf.len() >= self.leaflet_target_rows {
@@ -306,6 +346,7 @@ impl LeafWriter {
         if self.skip_history {
             return;
         }
+        self.tally(entry.g_id, 0, 1);
         self.pending_history.push(entry);
     }
 

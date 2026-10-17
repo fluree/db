@@ -358,7 +358,7 @@ pub struct CommitEnvelope {
     /// envelope so envelope-only walkers (`walk_dag`, callers of
     /// [`load_commit_envelope_by_id`]) can detect that a particular named
     /// graph has ever been registered without paying for a full ops fetch.
-    /// Used by `ApiFulltextConfigProvider` to short-circuit when the config
+    /// Used by `ApiLedgerConfigProvider` to short-circuit when the config
     /// graph was never registered anywhere in the chain.
     pub graph_delta: HashMap<GraphId, String>,
 
@@ -523,7 +523,7 @@ pub enum GraphRegistrationProbe {
 ///   immediately on first such envelope; callers must fall through to a
 ///   full-chain load if correctness depends on the answer.
 ///
-/// Used by [`ApiFulltextConfigProvider`][^1] to short-circuit fulltext
+/// Used by [`ApiLedgerConfigProvider`][^1] to short-circuit fulltext
 /// config resolution on first-ever reindex when the config graph was
 /// never written to. For a chain with no config graph at all, this
 /// avoids the per-commit full-blob read + zstd decompress + flake
@@ -539,7 +539,7 @@ pub enum GraphRegistrationProbe {
 /// future optimization (see follow-up notes in the PR description that
 /// added this helper).
 ///
-/// [^1]: `fluree-db-api/src/indexer_fulltext_provider.rs`
+/// [^1]: `fluree-db-api/src/indexer_config_provider.rs`
 pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,

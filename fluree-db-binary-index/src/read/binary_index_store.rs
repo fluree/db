@@ -671,8 +671,7 @@ impl BinaryIndexStore {
                     orders.insert(*order, branch);
                     order_cids.insert(*order, branch_cid.clone());
                 }
-                let mut graphs = routing.graphs.clone();
-                graphs.sort_unstable();
+                let graphs: Vec<GraphId> = routing.graph_ids().collect();
                 let mut member = vec![false; graphs.last().map_or(0, |&g| g as usize + 1)];
                 for &g in &graphs {
                     member[g as usize] = true;

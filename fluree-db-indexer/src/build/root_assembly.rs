@@ -264,6 +264,7 @@ pub(crate) async fn encode_and_write_root_v6(
         string_reverse: dr.string_reverse,
     };
 
+    let pool = inputs.v3_uploaded.pool_routing(&inputs.pooled_graphs);
     // Build default_graph_orders from V3 upload result.
     let default_graph_orders: Vec<DefaultGraphOrder> = inputs
         .v3_uploaded
@@ -323,12 +324,7 @@ pub(crate) async fn encode_and_write_root_v6(
         legacy_annotation_arena: None,
         term_dict: inputs.term_dict,
         has_list_meta: Some(inputs.saw_list_meta),
-        pool: (!inputs.v3_uploaded.pool_orders.is_empty()).then(|| {
-            fluree_db_binary_index::PoolRouting {
-                graphs: inputs.pooled_graphs.clone(),
-                orders: inputs.v3_uploaded.pool_orders.clone(),
-            }
-        }),
+        pool,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.

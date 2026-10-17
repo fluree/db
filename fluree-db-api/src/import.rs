@@ -6349,6 +6349,7 @@ where
         // per-graph pass), the rest share the pooled tree (one pass for all).
         let (v3_dedicated_g_ids, v3_named_g_ids) =
             fluree_db_indexer::run_index::build::graph_scope::place_named_graphs(
+                &fluree_db_indexer::run_index::build::graph_scope::PlacementPolicy::automatic(),
                 &input.named_g_ids,
                 &v3_sorted_commit_infos,
             );
@@ -7041,6 +7042,7 @@ where
             ))
         };
 
+        let pool = v3_uploaded.pool_routing(&pooled_g_ids);
         // Build default_graph_orders from V3 upload result.
         let default_graph_orders: Vec<DefaultGraphOrder> = v3_uploaded
             .default_graph_orders
@@ -7114,12 +7116,7 @@ where
             // Same source as the spool object resolution (SpoolConfig): the root
             // version must match how the import encoded decimals.
             decimal_encoding: IMPORT_DECIMAL_ENCODING,
-            pool: (!v3_uploaded.pool_orders.is_empty()).then(|| {
-                fluree_db_binary_index::PoolRouting {
-                    graphs: pooled_g_ids,
-                    orders: v3_uploaded.pool_orders.clone(),
-                }
-            }),
+            pool,
         };
 
         // Encode and upload FIR6 root.

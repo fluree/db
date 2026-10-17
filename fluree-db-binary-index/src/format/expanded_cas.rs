@@ -612,7 +612,7 @@ mod tests {
         let branch_cid = store.put(ContentKind::IndexBranch, &branch).await.unwrap();
         let mut root = minimal_root();
         root.pool = Some(crate::format::index_root::PoolRouting {
-            graphs: vec![3],
+            members: vec![crate::format::index_root::PoolMember::new(3)],
             orders: vec![(RunSortOrder::Gspo, branch_cid)],
         });
 

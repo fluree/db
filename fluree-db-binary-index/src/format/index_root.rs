@@ -108,12 +108,31 @@ pub struct NamedGraphRouting {
     pub orders: Vec<(RunSortOrder, ContentId)>,
 }
 
+/// A pooled graph and its size in the pool, which placement weighs: its live
+/// rows and its retained history entries (both saturating).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolMember {
+    pub g_id: GraphId,
+    pub rows: u32,
+    pub history: u32,
+}
+
+impl PoolMember {
+    pub fn new(g_id: GraphId) -> Self {
+        Self {
+            g_id,
+            rows: 0,
+            history: 0,
+        }
+    }
+}
+
 /// The shared tree for small named graphs: one branch per pooled order, and
 /// the graphs it holds. A graph listed here has no `NamedGraphRouting` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolRouting {
-    /// Pooled graph ids, sorted.
-    pub graphs: Vec<GraphId>,
+    /// Pooled graphs, sorted by id.
+    pub members: Vec<PoolMember>,
     /// `(order, branch_cid)` pairs over [`RunSortOrder::pool_build_orders`].
     pub orders: Vec<(RunSortOrder, ContentId)>,
 }
@@ -122,7 +141,20 @@ impl PoolRouting {
     /// Whether `g_id` lives in the pool.
     #[inline]
     pub fn contains(&self, g_id: GraphId) -> bool {
-        self.graphs.binary_search(&g_id).is_ok()
+        self.member(g_id).is_some()
+    }
+
+    #[inline]
+    pub fn member(&self, g_id: GraphId) -> Option<&PoolMember> {
+        self.members
+            .binary_search_by_key(&g_id, |m| m.g_id)
+            .ok()
+            .map(|i| &self.members[i])
+    }
+
+    /// Pooled graph ids, ascending.
+    pub fn graph_ids(&self) -> impl Iterator<Item = GraphId> + '_ {
+        self.members.iter().map(|m| m.g_id)
     }
 }
 
@@ -852,11 +884,13 @@ impl IndexRoot {
 
         // ---- Optional: pool routing ----
         if let Some(pool) = &self.pool {
-            let mut graphs = pool.graphs.clone();
-            graphs.sort_unstable();
-            buf.extend_from_slice(&(graphs.len() as u32).to_le_bytes());
-            for g in graphs {
-                buf.extend_from_slice(&g.to_le_bytes());
+            let mut members = pool.members.clone();
+            members.sort_unstable_by_key(|m| m.g_id);
+            buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
+            for m in members {
+                buf.extend_from_slice(&m.g_id.to_le_bytes());
+                buf.extend_from_slice(&m.rows.to_le_bytes());
+                buf.extend_from_slice(&m.history.to_le_bytes());
             }
             let mut orders = pool.orders.clone();
             orders.sort_by_key(|(order, _)| order.to_wire_id());
@@ -1137,11 +1171,17 @@ impl IndexRoot {
 
         // Pool routing
         let pool = if flags_ext & Self::FLAG_EXT_HAS_POOL != 0 {
-            let graph_count = read_u32_at(data, &mut pos)? as usize;
-            let mut graphs = Vec::with_capacity(graph_count);
-            for _ in 0..graph_count {
-                graphs.push(read_u32_at(data, &mut pos)?);
+            let member_count = read_u32_at(data, &mut pos)? as usize;
+            ensure_bytes(data, pos, member_count * 12, "pool members")?;
+            let mut members = Vec::with_capacity(member_count);
+            for _ in 0..member_count {
+                members.push(PoolMember {
+                    g_id: read_u32_at(data, &mut pos)?,
+                    rows: read_u32_at(data, &mut pos)?,
+                    history: read_u32_at(data, &mut pos)?,
+                });
             }
+            members.sort_unstable_by_key(|m| m.g_id);
             let order_count = read_u8_at(data, &mut pos)? as usize;
             let mut orders = Vec::with_capacity(order_count);
             for _ in 0..order_count {
@@ -1151,7 +1191,7 @@ impl IndexRoot {
                     .ok_or_else(|| io_err(&format!("root v6: invalid pool order_id {oid}")))?;
                 orders.push((order, read_cid(data, &mut pos)?));
             }
-            Some(PoolRouting { graphs, orders })
+            Some(PoolRouting { members, orders })
         } else {
             None
         };
@@ -2027,7 +2067,15 @@ mod tests {
         let mut root = minimal_root_v6();
         root.decimal_encoding = fluree_db_core::DecimalEncoding::InlineWhenFits;
         root.pool = Some(PoolRouting {
-            graphs: vec![3, 4, 70],
+            members: vec![
+                PoolMember::new(3),
+                PoolMember {
+                    g_id: 4,
+                    rows: 17,
+                    history: 9,
+                },
+                PoolMember::new(70),
+            ],
             orders: RunSortOrder::pool_build_orders()
                 .iter()
                 .map(|&o| (o, cid(o.dir_name().as_bytes())))
@@ -2043,6 +2091,7 @@ mod tests {
         let pool = decoded.pool.as_ref().expect("pool decodes");
         assert_eq!(pool, root.pool.as_ref().unwrap());
         assert!(pool.contains(70) && !pool.contains(5));
+        assert_eq!(pool.member(4).map(|m| (m.rows, m.history)), Some((17, 9)));
         assert_eq!(decoded.stats.as_ref().unwrap().flakes, 42);
 
         let ids = root.all_cas_ids();

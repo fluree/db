@@ -2285,6 +2285,7 @@ mod tests {
                 default_graph_orders: Vec::new(),
                 named_graphs: Vec::new(),
                 pool_orders: Vec::new(),
+                pool_members: Vec::new(),
             },
             graph_arenas: Vec::new(),
             datatype_iris: Vec::new(),

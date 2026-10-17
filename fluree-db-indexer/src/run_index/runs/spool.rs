@@ -1692,9 +1692,12 @@ pub struct SortedCommitInfo {
     /// chunk's reified base edges in ordinal order, sorted-local ids. `None`
     /// when the chunk reified nothing.
     pub term_table: Option<(PathBuf, u64)>,
-    /// Post-dedup record count per graph, ascending by `g_id` — what an import
-    /// sizes each graph by to place it in the pool or its own tree.
-    pub graph_rows: Vec<(fluree_db_core::GraphId, u64)>,
+    /// Post-dedup asserts and retracts per graph, ascending by `g_id` — what a
+    /// build sizes each graph by to place it in the pool or its own tree.
+    pub graph_events: Vec<(
+        fluree_db_core::GraphId,
+        crate::run_index::build::graph_scope::GraphEvents,
+    )>,
 }
 
 /// Sort, remap, and write a sorted commit file from buffered parse output.
@@ -1908,13 +1911,9 @@ pub fn sort_remap_and_write_sorted_commit(
     };
 
     // Records are sorted graph-first, so each graph is one run.
-    let mut graph_rows: Vec<(fluree_db_core::GraphId, u64)> = Vec::new();
-    for record in &records {
-        match graph_rows.last_mut() {
-            Some((g, n)) if *g == record.g_id => *n += 1,
-            _ => graph_rows.push((record.g_id, 1)),
-        }
-    }
+    let graph_events = crate::run_index::build::graph_scope::graph_event_counts(
+        records.iter().map(|r| (r.g_id, r.op)),
+    );
 
     Ok(SortedCommitInfo {
         path: spool_info.path,
@@ -1926,7 +1925,7 @@ pub fn sort_remap_and_write_sorted_commit(
         types_map_path,
         duplicates_removed,
         term_table,
-        graph_rows,
+        graph_events,
     })
 }
 

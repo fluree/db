@@ -2669,8 +2669,12 @@ impl crate::Fluree {
             let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
             match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
                 Ok(Some(cfg)) => {
-                    indexer_config.fulltext_configured_properties =
-                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
+                    let fluree_db_indexer::LedgerIndexingConfig {
+                        fulltext_properties,
+                        graph_placement,
+                    } = crate::config_resolver::indexing_config_for_indexer(&cfg);
+                    indexer_config.fulltext_configured_properties = fulltext_properties;
+                    indexer_config.graph_placement = graph_placement;
                 }
                 Ok(None) => {
                     // No LedgerConfig — nothing to seed.
@@ -2678,7 +2682,7 @@ impl crate::Fluree {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped and graphs placed automatically"
                     );
                 }
             }

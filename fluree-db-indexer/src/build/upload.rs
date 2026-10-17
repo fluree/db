@@ -112,6 +112,7 @@ pub(crate) async fn upload_indexes_to_cas(
     let mut default_orders: Vec<(RunSortOrder, Vec<LeafEntry>)> = Vec::new();
     let mut named_map: BTreeMap<GraphId, Vec<(RunSortOrder, ContentId)>> = BTreeMap::new();
     let mut pool_orders: Vec<(RunSortOrder, ContentId)> = Vec::new();
+    let mut pool_members: Vec<fluree_db_binary_index::PoolMember> = Vec::new();
 
     for (order, order_result) in &build_result.order_results {
         for graph in &order_result.graphs {
@@ -183,6 +184,7 @@ pub(crate) async fn upload_indexes_to_cas(
             } else if order.is_pooled() {
                 let branch_cid = uploaded_branch_cid.expect("pooled tree must have branch CID");
                 pool_orders.push((*order, branch_cid));
+                pool_members.extend_from_slice(&graph.pool_members);
             } else {
                 let branch_cid = uploaded_branch_cid.expect("named graph must have branch CID");
                 named_map
@@ -202,6 +204,7 @@ pub(crate) async fn upload_indexes_to_cas(
         default_graph_orders: default_orders,
         named_graphs,
         pool_orders,
+        pool_members,
     })
 }
 

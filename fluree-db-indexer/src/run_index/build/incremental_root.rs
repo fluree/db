@@ -56,7 +56,7 @@ impl IncrementalRootBuilder {
     /// for it; a full rebuild drops them.
     pub fn remove_from_pool(&mut self, g_id: fluree_db_core::GraphId) {
         if let Some(pool) = self.root.pool.as_mut() {
-            pool.graphs.retain(|&g| g != g_id);
+            pool.members.retain(|m| m.g_id != g_id);
         }
     }
 

@@ -137,6 +137,8 @@ pub struct GraphIndexResult {
     /// Per-leaf branch entries for root assembly.
     pub leaf_entries: Vec<LeafEntry>,
     pub graph_dir: PathBuf,
+    /// The pool's GSPO build only: each pooled graph's rows and history.
+    pub pool_members: Vec<fluree_db_binary_index::PoolMember>,
 }
 
 /// Result of the full V2 index build.
@@ -397,6 +399,7 @@ fn build_graph_index_result(
     order: RunSortOrder,
     graph_dir: PathBuf,
     persisted_leaf_infos: Vec<PersistedLeafInfo>,
+    pool_members: Vec<fluree_db_binary_index::PoolMember>,
 ) -> io::Result<GraphIndexResult> {
     let total_rows: u64 = persisted_leaf_infos.iter().map(|l| l.total_rows).sum();
 
@@ -431,6 +434,7 @@ fn build_graph_index_result(
         leaf_infos: persisted_leaf_infos,
         leaf_entries,
         graph_dir,
+        pool_members,
     })
 }
 
@@ -497,11 +501,18 @@ impl PersistingLeafWriter {
     pub(crate) fn finish(mut self) -> io::Result<GraphIndexResult> {
         // `finish()` flushes the trailing leaf into the completed-leaves buffer;
         // persist that final batch (everything prior was drained per-push).
+        let pool_members = self.inner.take_pool_members();
         let final_batch = self.inner.finish()?;
         for info in final_batch {
             self.persisted.push(persist_leaf(&self.graph_dir, info)?);
         }
-        build_graph_index_result(self.g_id, self.order, self.graph_dir, self.persisted)
+        build_graph_index_result(
+            self.g_id,
+            self.order,
+            self.graph_dir,
+            self.persisted,
+            pool_members,
+        )
     }
 }
 

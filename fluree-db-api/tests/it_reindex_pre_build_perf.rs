@@ -8,7 +8,7 @@
 //!    via repeated two-way `merge_batch_into_index` calls. Replaced with
 //!    `Novelty::bulk_apply_commits` (`O(N log N)`).
 //!
-//! 2. `ApiFulltextConfigProvider::resolve` always called
+//! 2. `ApiLedgerConfigProvider::resolve` always called
 //!    `LedgerState::load`, so even when the config graph had never been
 //!    written the resolver paid for a full chain walk plus full novelty
 //!    build just to discover it was empty. Replaced with an
@@ -291,7 +291,7 @@ async fn first_t_where_graph_registered_returns_lowest_t_when_iri_present() {
 
 /// End-to-end orchestrator-path reindex on a no-config ledger. Mirrors the
 /// AWS Lambda configuration: `BackgroundIndexerWorker` with the API's
-/// `ApiFulltextConfigProvider` attached, `IndexerHandle::trigger`,
+/// `ApiLedgerConfigProvider` attached, `IndexerHandle::trigger`,
 /// `wait().await`. Asserts wall-clock stays well under the pre-fix
 /// regression scale (production reindexes sat past the 13-min waiter
 /// timeout repeatedly before the fix).
@@ -324,7 +324,7 @@ async fn orchestrator_first_reindex_no_config_completes_quickly() {
     // does for AWS: provider attached so `build_index_for_record` invokes
     // it before dispatching.
     let cfg = fluree_db_indexer::IndexerConfig::small()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        .with_ledger_config_provider(fluree.ledger_config_provider());
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
         fluree

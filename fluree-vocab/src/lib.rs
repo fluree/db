@@ -2495,6 +2495,25 @@ pub mod config_iris {
     /// default graph reads the union of the ledger's default graph and its
     /// named graphs. Absent means false.
     pub const UNION_DEFAULT_GRAPH: &str = "https://ns.flur.ee/db#unionDefaultGraph";
+
+    // ---- Indexing defaults fields ----
+
+    /// `f:indexingDefaults` — physical-index defaults on LedgerConfig/GraphConfig.
+    /// Not subject to override control: requests never choose index layout.
+    pub const INDEXING_DEFAULTS: &str = "https://ns.flur.ee/db#indexingDefaults";
+
+    /// `f:graphPlacement` — IRI: f:PlacementAuto or f:PlacementDedicated. On
+    /// LedgerConfig, the default for user named graphs; on GraphConfig, its
+    /// target graph's own placement.
+    pub const GRAPH_PLACEMENT: &str = "https://ns.flur.ee/db#graphPlacement";
+
+    /// `f:PlacementAuto` — the indexer places the graph; a small one shares
+    /// the pooled tree with other small graphs.
+    pub const PLACEMENT_AUTO: &str = "https://ns.flur.ee/db#PlacementAuto";
+
+    /// `f:PlacementDedicated` — the graph keeps its own index trees whatever
+    /// its size.
+    pub const PLACEMENT_DEDICATED: &str = "https://ns.flur.ee/db#PlacementDedicated";
 }
 
 // ============================================================================

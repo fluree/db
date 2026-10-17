@@ -653,8 +653,8 @@ where
 
                 // Sort by (g_id, SPOT).
                 records.sort_unstable_by(fluree_db_binary_index::format::run_record::cmp_g_spot);
-                let graph_rows = crate::run_index::build::graph_scope::graph_row_counts(
-                    records.iter().map(|r| r.g_id),
+                let graph_events = crate::run_index::build::graph_scope::graph_event_counts(
+                    records.iter().map(|r| (r.g_id, r.op)),
                 );
 
                 // Write sorted commit file (.fsc) via SpoolWriter.
@@ -711,7 +711,7 @@ where
                     types_map_path: Some(types_path),
                     duplicates_removed: 0,
                     term_table: None,
-                    graph_rows,
+                    graph_events,
                 });
             }
 
@@ -751,7 +751,7 @@ where
                         types_map_path: None,
                         duplicates_removed: 0,
                         term_table: None,
-                        graph_rows: Vec::new(),
+                        graph_events: Vec::new(),
                     });
                 } else {
                     let _ = std::fs::remove_file(&fsc_path);
@@ -904,7 +904,12 @@ where
                 .copied()
                 .filter(|&g| g >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
                 .collect();
+            let placement = crate::run_index::build::graph_scope::PlacementPolicy::new(
+                &config.graph_placement,
+                |iri| shared.graphs.get(iri).map(|id| id + 1),
+            );
             let (_, pooled_g_ids) = crate::run_index::build::graph_scope::place_named_graphs(
+                &placement,
                 &user_g_ids,
                 &sorted_commit_infos,
             );
