@@ -2284,6 +2284,7 @@ mod tests {
             v3_uploaded: UploadedIndexes {
                 default_graph_orders: Vec::new(),
                 named_graphs: Vec::new(),
+                pool_orders: Vec::new(),
             },
             graph_arenas: Vec::new(),
             datatype_iris: Vec::new(),

@@ -30,6 +30,7 @@
 //! Unlike the 34-byte run wire format, spool records include `g_id: u16`
 //! because spool files are pre-graph-partition.
 
+use crate::run_index::build::graph_scope::GraphScope;
 use fluree_db_binary_index::format::run_record::{RunRecord, SPOOL_RECORD_WIRE_SIZE};
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::o_type_registry::OTypeRegistry;
@@ -982,7 +983,7 @@ pub struct SortedCommitMergeReaderV2<S: SubjectRemap, R: StringRemap> {
     subject_remap: S,
     string_remap: R,
     lang_remap: Vec<u16>,
-    target_g_id: u16,
+    scope: GraphScope,
     term_ctx: Option<Arc<TermRemapCtx>>,
     current: Option<RunRecordV2>,
 }
@@ -994,7 +995,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
         subject_remap: S,
         string_remap: R,
         lang_remap: Vec<u16>,
-        target_g_id: u16,
+        scope: GraphScope,
         term_ctx: Option<Arc<TermRemapCtx>>,
     ) -> io::Result<Self> {
         let mut reader = Self {
@@ -1002,7 +1003,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
             subject_remap,
             string_remap,
             lang_remap,
-            target_g_id,
+            scope,
             term_ctx,
             current: None,
         };
@@ -1013,7 +1014,7 @@ impl<S: SubjectRemap, R: StringRemap> SortedCommitMergeReaderV2<S, R> {
     fn advance_to_next(&mut self) -> io::Result<()> {
         self.current = None;
         while let Some(mut record) = self.reader.next_record()? {
-            if record.g_id != self.target_g_id {
+            if !self.scope.accepts(record.g_id) {
                 continue;
             }
             let lang_remap = if self.lang_remap.is_empty() {
@@ -1537,7 +1538,7 @@ pub fn remap_sorted_commit_v2_to_runs<S: SubjectRemap + ?Sized, R: StringRemap +
     subject_remap: &S,
     string_remap: &R,
     lang_remap: &[u16],
-    target_g_id: u16,
+    scope: &GraphScope,
     term_ctx: Option<&TermRemapCtx>,
     writer: &mut super::run_writer::MultiOrderRunWriter,
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
@@ -1556,7 +1557,7 @@ pub fn remap_sorted_commit_v2_to_runs<S: SubjectRemap + ?Sized, R: StringRemap +
     let mut progress_batch = 0u64;
     for result in reader {
         let mut record = result?;
-        if record.g_id != target_g_id {
+        if !scope.accepts(record.g_id) {
             continue;
         }
         remap_v2_record(
@@ -1691,6 +1692,9 @@ pub struct SortedCommitInfo {
     /// chunk's reified base edges in ordinal order, sorted-local ids. `None`
     /// when the chunk reified nothing.
     pub term_table: Option<(PathBuf, u64)>,
+    /// Post-dedup record count per graph, ascending by `g_id` — what an import
+    /// sizes each graph by to place it in the pool or its own tree.
+    pub graph_rows: Vec<(u16, u64)>,
 }
 
 /// Sort, remap, and write a sorted commit file from buffered parse output.
@@ -1903,6 +1907,15 @@ pub fn sort_remap_and_write_sorted_commit(
         None
     };
 
+    // Records are sorted graph-first, so each graph is one run.
+    let mut graph_rows: Vec<(u16, u64)> = Vec::new();
+    for record in &records {
+        match graph_rows.last_mut() {
+            Some((g, n)) if *g == record.g_id => *n += 1,
+            _ => graph_rows.push((record.g_id, 1)),
+        }
+    }
+
     Ok(SortedCommitInfo {
         path: spool_info.path,
         record_count: spool_info.record_count,
@@ -1913,6 +1926,7 @@ pub fn sort_remap_and_write_sorted_commit(
         types_map_path,
         duplicates_removed,
         term_table,
+        graph_rows,
     })
 }
 
@@ -2772,8 +2786,8 @@ mod tests {
             info.record_count,
             &subject_remap,
             &string_remap,
-            &[],  // no lang remap
-            0,    // target g_id (default graph)
+            &[], // no lang remap
+            &GraphScope::One(0),
             None, // no term table
             &mut writer,
             Some(&mut stats_hook),

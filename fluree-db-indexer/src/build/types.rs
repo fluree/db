@@ -16,6 +16,9 @@ pub struct UploadedIndexes {
     pub default_graph_orders: Vec<(RunSortOrder, Vec<LeafEntry>)>,
     /// Named graphs (g_id!=0): branch CIDs per sort order per graph.
     pub named_graphs: Vec<NamedGraphRouting>,
+    /// The pooled tree's branch CID per pooled order (empty when no build
+    /// produced the pool). The caller knows which graphs it holds.
+    pub pool_orders: Vec<(RunSortOrder, ContentId)>,
 }
 
 /// Result of uploading persisted dict flat files to CAS.

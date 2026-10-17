@@ -1,6 +1,7 @@
 pub mod build_from_commits;
 pub use build_from_commits::{ClassMembership, SpotClassStatsCollector};
 pub mod fd_plan;
+pub mod graph_scope;
 pub mod incremental_branch;
 pub mod incremental_leaf;
 pub mod incremental_resolve;

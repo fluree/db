@@ -2715,7 +2715,9 @@ pub(crate) fn probe_lane_admission(
     ctx: &ExecutionContext<'_>,
     pred_sids: &[&Sid],
 ) -> Option<ProbeLanePlan> {
-    if ctx.is_history_range() {
+    // The batched lanes read a graph's own branches; the per-row path scans
+    // a pooled graph through the pooled tree.
+    if ctx.is_history_range() || active_graph_pooled(ctx) {
         return Some(ProbeLanePlan::Decline);
     }
     // Every predicate the lane reads must clear; an empty set has nothing to
@@ -3815,7 +3817,20 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
 /// unfiltered).
 #[inline]
 fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
+    !ctx.is_multi_ledger()
+        && !ctx.is_history_range()
+        && !overlay_has_novelty(ctx)
+        && !active_graph_pooled(ctx)
+}
+
+/// Whether the context's active graph lives in the pooled tree. Fast paths
+/// read a graph's own branches and leaf metadata (row counts, lead groups,
+/// constant columns), which a pooled graph does not have, so they decline.
+#[inline]
+pub fn active_graph_pooled(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.binary_store
+        .as_ref()
+        .is_some_and(|store| store.is_pooled(ctx.binary_g_id))
 }
 
 /// True when the overlay can still contribute flakes.
@@ -3877,7 +3892,10 @@ pub fn fast_path_store_policy_cleared<'a>(
 /// at the planner level.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered()
+    !ctx.is_multi_ledger()
+        && !ctx.is_history_range()
+        && ctx.allow_unfiltered()
+        && !active_graph_pooled(ctx)
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned
@@ -3917,7 +3935,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.is_history_range() {
+    if ctx.is_multi_ledger() || ctx.is_history_range() || active_graph_pooled(ctx) {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.

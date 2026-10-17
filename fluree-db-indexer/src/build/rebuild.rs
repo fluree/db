@@ -708,6 +708,7 @@ where
                     types_map_path: Some(types_path),
                     duplicates_removed: 0,
                     term_table: None,
+                    graph_rows: Vec::new(),
                 });
             }
 
@@ -747,6 +748,7 @@ where
                         types_map_path: None,
                         duplicates_removed: 0,
                         term_table: None,
+                        graph_rows: Vec::new(),
                     });
                 } else {
                     let _ = std::fs::remove_file(&fsc_path);
@@ -933,6 +935,7 @@ where
                     build_progress: None,
                     stage_marker: None,
                     term_builder: None,
+                    pool: None,
                 };
 
                 let v3_result = crate::build_indexes_from_remapped_commits(

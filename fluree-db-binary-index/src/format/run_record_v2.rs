@@ -220,6 +220,59 @@ impl RunRecordV2 {
     }
 }
 
+/// Run-file record layout for one file: the 30-byte record, then `g_id`
+/// (u16 LE) when the file's order is pooled, then the op byte when the file
+/// carries ops. Dedicated orders keep the 30/31-byte layouts above, so their
+/// run files are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRecordLayout {
+    pooled: bool,
+    with_op: bool,
+}
+
+impl RunRecordLayout {
+    #[inline]
+    pub fn new(order: RunSortOrder, with_op: bool) -> Self {
+        Self {
+            pooled: order.is_pooled(),
+            with_op,
+        }
+    }
+
+    /// Bytes per record.
+    #[inline]
+    pub fn size(self) -> usize {
+        RECORD_V2_WIRE_SIZE + if self.pooled { 2 } else { 0 } + usize::from(self.with_op)
+    }
+
+    /// Encode `rec` (and `op`, when the layout carries ops) into `buf`.
+    #[inline]
+    pub fn write(self, rec: &RunRecordV2, op: u8, buf: &mut [u8]) {
+        rec.write_run_le((&mut buf[..RECORD_V2_WIRE_SIZE]).try_into().unwrap());
+        let mut at = RECORD_V2_WIRE_SIZE;
+        if self.pooled {
+            buf[at..at + 2].copy_from_slice(&rec.g_id.to_le_bytes());
+            at += 2;
+        }
+        if self.with_op {
+            buf[at] = op;
+        }
+    }
+
+    /// Decode one record; the op reads as 1 (assert) when the layout has none.
+    #[inline]
+    pub fn read(self, buf: &[u8]) -> (RunRecordV2, u8) {
+        let mut rec = RunRecordV2::read_run_le(buf[..RECORD_V2_WIRE_SIZE].try_into().unwrap());
+        let mut at = RECORD_V2_WIRE_SIZE;
+        if self.pooled {
+            rec.g_id = u16::from_le_bytes(buf[at..at + 2].try_into().unwrap());
+            at += 2;
+        }
+        let op = if self.with_op { buf[at] } else { 1 };
+        (rec, op)
+    }
+}
+
 impl std::fmt::Debug for RunRecordV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunRecordV2")

@@ -230,6 +230,14 @@ impl BinaryHistoryScanOperator {
                 let skip_persisted = s_literal_unresolvable || p_literal_unresolvable;
 
                 let order = self.pick_order(&filter);
+                // Pooled history entries do not carry their graph yet, so a
+                // pooled graph's indexed history cannot be separated from its
+                // neighbors'. Refuse rather than return only the novelty part.
+                if store.is_pooled(g_id) && !skip_persisted {
+                    return Err(QueryError::Internal(format!(
+                        "history queries over pooled named graph {g_id} are not supported yet"
+                    )));
+                }
                 if let Some(branch) = store
                     .branch_for_order(g_id, order)
                     .filter(|_| !skip_persisted)

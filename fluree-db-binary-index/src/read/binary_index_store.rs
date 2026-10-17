@@ -245,6 +245,34 @@ where
 // Per-graph V3 index data
 // ============================================================================
 
+/// What a single-graph scan reads: see [`BinaryIndexStore::graph_tree`].
+#[derive(Clone)]
+pub struct GraphTree {
+    pub branch: Arc<BranchManifest>,
+    /// The order of `branch` — pooled when `g_filter` is set.
+    pub order: RunSortOrder,
+    /// Keep only this graph's rows (pooled tree).
+    pub g_filter: Option<GraphId>,
+}
+
+/// The pooled tree shared by small named graphs.
+struct PoolIndex {
+    /// Membership by graph id.
+    member: Vec<bool>,
+    /// Pooled graph ids, sorted.
+    graphs: Vec<GraphId>,
+    orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
+    /// Branch cid behind each order; what a reload matches on to reuse it.
+    order_cids: HashMap<RunSortOrder, ContentId>,
+}
+
+impl PoolIndex {
+    #[inline]
+    fn contains(&self, g_id: GraphId) -> bool {
+        self.member.get(usize::from(g_id)).copied().unwrap_or(false)
+    }
+}
+
 struct GraphIndex {
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
     /// Branch cid behind each named-graph order (default-graph orders are
@@ -379,6 +407,7 @@ pub struct BinaryIndexStore {
     store_id: u64,
     dicts: DictionarySet,
     graph_indexes: HashMap<GraphId, GraphIndex>,
+    pool: Option<PoolIndex>,
     /// o_type table: full list (for iteration / serialization).
     o_type_table: Vec<OTypeTableEntry>,
     /// O(1) lookup: o_type value → index into o_type_table.
@@ -484,6 +513,7 @@ impl BinaryIndexStore {
                 dt_sids: Vec::new(),
             },
             graph_indexes: HashMap::new(),
+            pool: None,
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -616,6 +646,44 @@ impl BinaryIndexStore {
             }
         }
 
+        // The pooled tree: one branch per pooled order, reused from the
+        // previous store when its cid is unchanged.
+        let pool = match &root.pool {
+            Some(routing) => {
+                let mut orders = HashMap::new();
+                let mut order_cids = HashMap::new();
+                for (order, branch_cid) in &routing.orders {
+                    let carried = prev
+                        .and_then(|p| p.pool.as_ref())
+                        .filter(|pi| pi.order_cids.get(order) == Some(branch_cid))
+                        .and_then(|pi| pi.orders.get(order))
+                        .cloned();
+                    let branch = match carried {
+                        Some(branch) => branch,
+                        None => {
+                            let bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
+                            Arc::new(read_branch_from_bytes(&bytes)?)
+                        }
+                    };
+                    orders.insert(*order, branch);
+                    order_cids.insert(*order, branch_cid.clone());
+                }
+                let mut graphs = routing.graphs.clone();
+                graphs.sort_unstable();
+                let mut member = vec![false; graphs.last().map_or(0, |&g| usize::from(g) + 1)];
+                for &g in &graphs {
+                    member[usize::from(g)] = true;
+                }
+                Some(PoolIndex {
+                    member,
+                    graphs,
+                    orders,
+                    order_cids,
+                })
+            }
+            None => None,
+        };
+
         // Inject per-graph arenas into graph indexes.
         for (g_id, arenas) in per_graph_arenas.drain() {
             let gi = graph_indexes.entry(g_id).or_insert_with(|| GraphIndex {
@@ -658,6 +726,7 @@ impl BinaryIndexStore {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts,
             graph_indexes,
+            pool,
             o_type_table,
             o_type_index,
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -722,6 +791,59 @@ impl BinaryIndexStore {
     #[inline]
     pub fn decimal_encoding(&self) -> fluree_db_core::DecimalEncoding {
         self.decimal_encoding
+    }
+
+    /// Whether `g_id` lives in the pooled tree. A pooled graph has no tree of
+    /// its own: [`Self::branch_for_order`] returns `None` for it, and readers
+    /// scan [`Self::pool_branch`] filtered to the graph instead.
+    #[inline]
+    pub fn is_pooled(&self, g_id: GraphId) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.contains(g_id))
+    }
+
+    /// Graphs held by the pooled tree, sorted.
+    pub fn pooled_graph_ids(&self) -> &[GraphId] {
+        self.pool.as_ref().map_or(&[], |p| p.graphs.as_slice())
+    }
+
+    /// The pooled tree's branch for a pooled order.
+    pub fn pool_branch(&self, order: RunSortOrder) -> Option<&Arc<BranchManifest>> {
+        self.pool.as_ref().and_then(|p| p.orders.get(&order))
+    }
+
+    /// The tree a scan of one graph in `order` reads: the graph's own branch,
+    /// or — for a pooled graph — the pooled tree in the corresponding pooled
+    /// order, with the graph to filter rows on.
+    ///
+    /// A pooled scan reads GSPO for SPOT and PSOT (one graph's rows are
+    /// contiguous there, and with the graph fixed they come back in SPOT
+    /// order, which for a fixed predicate is PSOT's), and POST/OPST with the
+    /// graph last (value lookups are selective across graphs). In every case
+    /// the rows of the one graph arrive in `order`'s sequence.
+    pub fn graph_tree(&self, g_id: GraphId, order: RunSortOrder) -> Option<GraphTree> {
+        if self.is_pooled(g_id) {
+            let pooled = Self::pooled_order_for(order);
+            return self.pool_branch(pooled).map(|branch| GraphTree {
+                branch: Arc::clone(branch),
+                order: pooled,
+                g_filter: Some(g_id),
+            });
+        }
+        self.branch_for_order(g_id, order).map(|branch| GraphTree {
+            branch: Arc::clone(branch),
+            order,
+            g_filter: None,
+        })
+    }
+
+    /// The pooled order a single-graph scan in `order` reads (see
+    /// [`Self::graph_tree`]).
+    #[inline]
+    pub fn pooled_order_for(order: RunSortOrder) -> RunSortOrder {
+        match order.base() {
+            RunSortOrder::Spot | RunSortOrder::Psot => RunSortOrder::Gspo,
+            base => base.pooled(),
+        }
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -2695,7 +2817,13 @@ impl BinaryIndexStore {
 
     /// Returns all graph IDs present in the index.
     pub fn graph_ids(&self) -> Vec<GraphId> {
-        self.graph_indexes.keys().copied().collect()
+        let mut ids: Vec<GraphId> = self.graph_indexes.keys().copied().collect();
+        ids.extend(
+            self.pooled_graph_ids()
+                .iter()
+                .filter(|g| !self.graph_indexes.contains_key(g)),
+        );
+        ids
     }
 
     /// Lookup graph IRI → `GraphId`. Returns `None` if the IRI is not known.

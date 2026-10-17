@@ -184,7 +184,14 @@ struct TermKeyFilter {
 /// `ColumnBatch` rows into `Binding::Sid` / `Binding::Lit` values.
 pub struct BinaryScanOperator {
     pattern: TriplePattern,
+    /// The index this open scans; reset from `planned_index` on every open,
+    /// then adjusted for the graph being read (see `open`).
     index: IndexType,
+    /// The planner's index choice.
+    planned_index: IndexType,
+    /// Read the pooled tree across all its graphs, for
+    /// [`Self::drain_probe_graphs`] (see [`Self::into_pool_probe`]).
+    pool_probe: bool,
     schema: Arc<[VarId]>,
     s_var_pos: Option<usize>,
     p_var_pos: Option<usize>,
@@ -707,6 +714,36 @@ impl BinaryScanOperator {
         )
     }
 
+    /// A probe over the pooled tree: `open` reads the pattern's pooled order
+    /// across every pooled graph, and [`Self::drain_probe_graphs`] reports the
+    /// graphs whose persisted rows match the pattern's bound terms. Overlay and
+    /// decoded-value filters are not applied, so the set may over-include.
+    pub(crate) fn into_pool_probe(mut self) -> Self {
+        self.pool_probe = true;
+        self
+    }
+
+    /// After `open` on a [`Self::into_pool_probe`] scan: the graphs of the
+    /// persisted rows the cursors yield, or `None` when the scan did not take
+    /// the cursor path (the caller then cannot rule any graph out).
+    pub(crate) fn drain_probe_graphs(&mut self) -> Result<Option<rustc_hash::FxHashSet<GraphId>>> {
+        let Some(first) = self.cursor.take() else {
+            return Ok(None);
+        };
+        let mut graphs = rustc_hash::FxHashSet::default();
+        for mut cursor in std::iter::once(first).chain(self.pending_cursors.drain(..)) {
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("pool probe: {e}")))?
+            {
+                for i in 0..batch.row_count {
+                    graphs.insert(batch.g_id.get_or(i, 0));
+                }
+            }
+        }
+        Ok(Some(graphs))
+    }
+
     fn with_mode(
         pattern: TriplePattern,
         object_bounds: Option<ObjectBounds>,
@@ -755,6 +792,8 @@ impl BinaryScanOperator {
         Self {
             pattern,
             index,
+            planned_index: index,
+            pool_probe: false,
             schema,
             s_var_pos,
             p_var_pos,
@@ -2128,6 +2167,9 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // The same operator reopens per graph (GRAPH ?g, per-row probes), and
+        // a pooled graph remaps the index below.
+        self.index = self.planned_index;
         // History-range queries unconditionally surface `f:reifies*`
         // events: attachment lifecycle is part of ledger history and
         // hiding it would defeat the point of inspecting a history
@@ -2506,7 +2548,7 @@ impl Operator for BinaryScanOperator {
             self.index = IndexType::Psot;
         }
 
-        let order = index_type_to_sort_order(self.index);
+        let mut order = index_type_to_sort_order(self.index);
         // Decode only columns needed for correctness:
         // - `o_i` is part of the V3 identity model (list semantics)
         // - `t` is only required for history mode
@@ -2523,15 +2565,51 @@ impl Operator for BinaryScanOperator {
         // Get branch manifest (clone into Arc for cursor ownership).
         let store_arc = Arc::clone(self.store.as_ref().expect("store set above"));
         let store_ref = store_arc.as_ref();
-        let Some(branch_ref) = store_ref.branch_for_order(self.g_id, order) else {
+        let tree = if self.pool_probe {
+            let pooled = order.pooled();
+            store_ref
+                .pool_branch(pooled)
+                .map(|branch| fluree_db_binary_index::GraphTree {
+                    branch: Arc::clone(branch),
+                    order: pooled,
+                    g_filter: None,
+                })
+        } else if order == RunSortOrder::Post
+            && store_ref.is_pooled(self.g_id)
+            && filter.o_key.is_some()
+            && object_slices.is_empty()
+            && self.object_bounds.is_none()
+        {
+            // One exact object value: the graph's own GSPO rows, filtered to
+            // (p, o), cost at most the graph's size, where the pooled POST range
+            // for (p, o) spans every pooled graph. With p and o fixed both come
+            // back ordered by subject.
+            store_ref.pool_branch(RunSortOrder::Gspo).map(|branch| {
+                fluree_db_binary_index::GraphTree {
+                    branch: Arc::clone(branch),
+                    order: RunSortOrder::Gspo,
+                    g_filter: Some(self.g_id),
+                }
+            })
+        } else {
+            store_ref.graph_tree(self.g_id, order)
+        };
+        let Some(tree) = tree else {
             // The index root may omit graphs (or specific sort orders) that have
             // zero indexed rows. Queries over such graphs should return empty
             // results (or overlay-only results when novelty is present), not
             // fail with an internal error.
             return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
         };
-        let branch: Arc<fluree_db_binary_index::format::branch::BranchManifest> =
-            Arc::clone(branch_ref);
+        // A pooled graph reads the pooled tree filtered to the graph. With the
+        // graph fixed, the pooled order's rows arrive in its base order, so
+        // that base is the index the overlay ops are sorted and cached by.
+        if let Some(g_id) = tree.g_filter {
+            filter.g_id = Some(g_id);
+            self.index = sort_order_to_index_type(tree.order);
+        }
+        order = tree.order;
+        let branch = tree.branch;
 
         // If this scan has range bounds on the object variable and we're scanning in POST order,
         // narrow the cursor's leaf range by object-key range. Two cases are safe:
@@ -2547,7 +2625,7 @@ impl Operator for BinaryScanOperator {
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
         let mut term_o_key_range: Option<(u64, u64)> = None;
-        if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
+        if order.base() == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
             if self.term_only && filter.o_type.is_none() {
                 filter.o_type = Some(OType::TRIPLE_TERM.as_u16());
             }
@@ -2770,7 +2848,7 @@ impl Operator for BinaryScanOperator {
                 t: 0,
                 o_i: 0,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(0),
-                g_id: self.g_id,
+                g_id: if self.pool_probe { 0 } else { self.g_id },
             };
             let max_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
@@ -2779,7 +2857,11 @@ impl Operator for BinaryScanOperator {
                 t: u32::MAX,
                 o_i: u32::MAX,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(u16::MAX),
-                g_id: self.g_id,
+                g_id: if self.pool_probe {
+                    GraphId::MAX
+                } else {
+                    self.g_id
+                },
             };
             let cursor = BinaryCursor::new(
                 Arc::clone(&store_arc),

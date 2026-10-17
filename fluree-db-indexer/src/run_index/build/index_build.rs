@@ -16,7 +16,9 @@ use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
 use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::leaf::{LeafInfo, LeafWriter};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
+use fluree_db_binary_index::format::run_record_v2::{
+    cmp_v2_for_order, identity_v2_for_order, RunRecordV2,
+};
 use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_core::ContentId;
 use fluree_db_core::GraphId;
@@ -197,7 +199,8 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
         .collect::<io::Result<Vec<_>>>()?;
 
     let cmp = cmp_v2_for_order(config.sort_order);
-    let mut merge = KWayMerge::new(streams, cmp)?;
+    let mut merge =
+        KWayMerge::new(streams, cmp)?.with_identity(identity_v2_for_order(config.sort_order));
 
     let order = config.sort_order;
 
@@ -681,6 +684,7 @@ pub fn build_all_indexes(
     // Collect the orders that actually have run files to build.
     let buildable: Vec<RunSortOrder> = RunSortOrder::all_build_orders()
         .iter()
+        .chain(RunSortOrder::pool_build_orders())
         .copied()
         .filter(|order| config.base_run_dir.join(order.dir_name()).exists())
         .collect();

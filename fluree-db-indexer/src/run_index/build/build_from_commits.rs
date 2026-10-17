@@ -10,6 +10,7 @@
 use crate::run_index::build::fd_plan::{
     plan_fd_usage, FdPlan, IMPORT_CONCURRENT_ORDERS, REBUILD_CONCURRENT_ORDERS,
 };
+use crate::run_index::build::graph_scope::{GraphScope, PoolGraphs};
 use crate::run_index::build::index_build::{
     build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, IndexBuildError, IndexBuildResult,
     PersistingLeafWriter,
@@ -26,7 +27,9 @@ use crate::run_index::runs::spool::{
 use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{cmp_v2_spot, RunRecordV2};
+use fluree_db_binary_index::format::run_record_v2::{
+    cmp_v2_for_order, identity_v2_for_order, RunRecordV2,
+};
 use fluree_db_core::fd_limit::FdBudget;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
@@ -117,8 +120,11 @@ pub struct BuildConfig {
     pub run_dir: PathBuf,
     /// Output directory for per-graph index artifacts.
     pub index_dir: PathBuf,
-    /// Graph ID (builds are graph-scoped).
+    /// Graph ID of a dedicated build. A pooled build (`pool` set) writes under
+    /// this id's directory but its rows keep their own graphs.
     pub g_id: u16,
+    /// Build the pooled tree over these graphs instead of graph `g_id`.
+    pub pool: Option<Arc<PoolGraphs>>,
     /// Target rows per leaflet.
     pub leaflet_target_rows: usize,
     /// Target rows per leaf.
@@ -145,6 +151,16 @@ pub struct BuildConfig {
     /// term-carrying chunk then fails the build rather than emitting
     /// dangling handles).
     pub term_builder: Option<Arc<std::sync::Mutex<fluree_db_binary_index::dict::TermDictBuilder>>>,
+}
+
+impl BuildConfig {
+    /// The graphs this build covers.
+    pub fn scope(&self) -> GraphScope {
+        match &self.pool {
+            Some(pool) => GraphScope::Pool(Arc::clone(pool)),
+            None => GraphScope::One(self.g_id),
+        }
+    }
 }
 
 /// Result of the V3 build pipeline.
@@ -1174,7 +1190,7 @@ pub fn build_indexes_from_commits(
             let next_chunk = Arc::clone(&next_chunk);
             let run_dir = config.run_dir.clone();
             let remap_progress = config.remap_progress.clone();
-            let target_g_id = config.g_id;
+            let graph_scope = config.scope();
             let collect_stats = stats_hook.is_some();
             // IMPORTANT: worker hooks intentionally do NOT set rdf:type p_id.
             // Setting it makes `IdStatsHook::on_record` build per-subject class /
@@ -1204,7 +1220,7 @@ pub fn build_indexes_from_commits(
                         let term_ctx = term_ctx_for(commit, config_ref)?;
                         let mut writer = MultiOrderRunWriter::new(MultiOrderConfig {
                             total_budget_bytes: per_thread_budget_bytes,
-                            orders: RunSortOrder::secondary_orders().to_vec(),
+                            orders: graph_scope.secondary_orders().to_vec(),
                             base_run_dir: chunk_run_dir,
                         })?;
 
@@ -1214,7 +1230,7 @@ pub fn build_indexes_from_commits(
                             &s_remap,
                             &str_remap,
                             &commit.lang_remap,
-                            target_g_id,
+                            &graph_scope,
                             term_ctx.as_ref(),
                             &mut writer,
                             worker_hook.as_mut(),
@@ -1262,8 +1278,8 @@ pub fn build_indexes_from_commits(
         // commits, so cross-chunk duplicates were counted once per copy;
         // discount the copies the SPOT merge collapsed. HLL sketches are
         // duplicate-insensitive and need no correction.
-        for (&(p_id, o_type, inner), &n) in &merge_duplicates {
-            target_hook.discount_import_duplicates(config.g_id, p_id, o_type, inner, n);
+        for (&(g_id, p_id, o_type, inner), &n) in &merge_duplicates {
+            target_hook.discount_import_duplicates(g_id, p_id, o_type, inner, n);
         }
         tracing::info!(
             elapsed_ms = stats_merge_start.elapsed().as_millis(),
@@ -1277,7 +1293,7 @@ pub fn build_indexes_from_commits(
         stage.store(BUILD_STAGE_LINK_RUNS, Ordering::Relaxed);
     }
     log_index_memory("secondary_run_link:start");
-    for &order in RunSortOrder::secondary_orders() {
+    for &order in config.scope().secondary_orders() {
         let link_start = Instant::now();
         let flat_dir = config.run_dir.join(order.dir_name());
         if flat_dir.exists() {
@@ -1321,7 +1337,7 @@ pub fn build_indexes_from_commits(
 
     let mut order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
     log_index_memory("secondary_index_merge:complete");
-    order_results.push((RunSortOrder::Spot, spot_result));
+    order_results.push((config.scope().spot_order(), spot_result));
 
     let _ = build_start;
     let build_elapsed = overall_start.elapsed().saturating_sub(remap_elapsed);
@@ -1336,7 +1352,7 @@ pub fn build_indexes_from_commits(
     // Total rows from the POST result (canonical count — avoids double-counting).
     let total_rows = order_results
         .iter()
-        .find(|(o, _)| *o == RunSortOrder::Post)
+        .find(|(o, _)| o.base() == RunSortOrder::Post)
         .map(|(_, r)| r.total_rows)
         .unwrap_or_else(|| {
             order_results
@@ -1358,10 +1374,10 @@ pub fn build_indexes_from_commits(
     ))
 }
 
-/// Cross-chunk duplicate copies the SPOT merge collapsed, keyed `(p_id,
+/// Cross-chunk duplicate copies the SPOT merge collapsed, keyed `(g_id, p_id,
 /// o_type, inner predicate)`; the inner predicate is a triple-term row's and
 /// 0 for every other row.
-type DuplicateTally = FxHashMap<(u32, u16, u32), u64>;
+type DuplicateTally = FxHashMap<(u16, u32, u16, u32), u64>;
 
 struct SpotBuild {
     result: IndexBuildResult,
@@ -1405,7 +1421,11 @@ fn build_spot_index_from_commits(
         });
     }
 
-    let order = RunSortOrder::Spot;
+    let scope = config.scope();
+    let order = scope.spot_order();
+    // A dedicated build restamps its graph (see `pump_spot_merge`); pooled rows
+    // keep their own.
+    let restamp = (!scope.is_pool()).then_some(g_id);
 
     // Streams each completed leaf to disk as produced (see PersistingLeafWriter)
     // so the SPOT build — which overlaps the parallel secondary-order builds —
@@ -1427,12 +1447,13 @@ fn build_spot_index_from_commits(
     let total_rows = if commits.len() <= fd_plan.spot_fan_in {
         // Flat merge: one long-lived reader per chunk, all open at once.
         // The common case, and byte-for-byte the pre-budget behavior.
-        let streams = open_spot_commit_readers(commits, g_id, config)?;
-        let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+        let streams = open_spot_commit_readers(commits, &scope, config)?;
+        let mut merge = KWayMerge::new(streams, cmp_v2_for_order(order))?
+            .with_identity(identity_v2_for_order(order));
         pump_spot_merge(
             &mut merge,
             &mut writer,
-            g_id,
+            restamp,
             class_stats_collector.as_mut(),
             progress.as_deref(),
             &mut merge_duplicates,
@@ -1459,8 +1480,8 @@ fn build_spot_index_from_commits(
 
         let mut intermediates = Vec::with_capacity(commits.len().div_ceil(fd_plan.spot_fan_in));
         for (i, group) in commits.chunks(fd_plan.spot_fan_in).enumerate() {
-            let streams = open_spot_commit_readers(group, g_id, config)?;
-            let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+            let streams = open_spot_commit_readers(group, &scope, config)?;
+            let mut merge = KWayMerge::new(streams, cmp_v2_for_order(order))?;
             let out_path = pass_dir.join(format!("merged_{i:06}.frn"));
             // Carry op bytes through verbatim (with-op intermediates), so
             // this arm agrees with the flat arm by construction: the shared
@@ -1489,11 +1510,12 @@ fn build_spot_index_from_commits(
             .iter()
             .map(|p| StreamingRunReader::open(p))
             .collect::<io::Result<Vec<_>>>()?;
-        let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+        let mut merge = KWayMerge::new(streams, cmp_v2_for_order(order))?
+            .with_identity(identity_v2_for_order(order));
         let rows = pump_spot_merge(
             &mut merge,
             &mut writer,
-            g_id,
+            restamp,
             class_stats_collector.as_mut(),
             progress.as_deref(),
             &mut merge_duplicates,
@@ -1543,7 +1565,7 @@ fn index_build_err_to_io(e: IndexBuildError) -> io::Error {
 /// mmaps drop their `File` on open and cost address space only.
 fn open_spot_commit_readers(
     commits: &[CommitInput],
-    g_id: u16,
+    scope: &GraphScope,
     config: &BuildConfig,
 ) -> io::Result<Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>>> {
     commits
@@ -1558,7 +1580,7 @@ fn open_spot_commit_readers(
                 s_remap,
                 str_remap,
                 commit.lang_remap.clone(),
-                g_id,
+                scope.clone(),
                 term_ctx,
             )
         })
@@ -1584,17 +1606,18 @@ fn term_ctx_for(commit: &CommitInput, config: &BuildConfig) -> io::Result<Option
 /// batching progress updates. Shared by the flat and hierarchical SPOT
 /// arms so both consume the merged sequence identically.
 ///
-/// `g_id` is restamped onto every record before consumption: the FRN2 run
-/// wire format carries no g_id (readers decode it as 0), so records arriving
-/// through the hierarchical arm's intermediate run files would otherwise
-/// reach the class-stats collector as g_id 0 — silently folding a named
-/// graph's class stats into the default graph's. The flat arm's records
-/// already carry `g_id` (its readers filter on it), so the stamp is a no-op
-/// there; the pipeline is graph-scoped by construction either way.
+/// A dedicated build passes `restamp = Some(g_id)` and stamps it onto every
+/// record before consumption: its FRN2 run wire carries no g_id (readers
+/// decode it as 0), so records arriving through the hierarchical arm's
+/// intermediate run files would otherwise reach the class-stats collector as
+/// g_id 0 — silently folding a named graph's class stats into the default
+/// graph's. The flat arm's records already carry `g_id` (its readers filter
+/// on it), so the stamp is a no-op there. A pooled build passes `None`: its
+/// run wire keeps each record's graph.
 fn pump_spot_merge<T, F>(
     merge: &mut KWayMerge<T, F>,
     writer: &mut PersistingLeafWriter,
-    g_id: u16,
+    restamp: Option<u16>,
     mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
     progress: Option<&AtomicU64>,
     duplicates: &mut DuplicateTally,
@@ -1622,14 +1645,17 @@ where
             } else {
                 0
             };
+            let g_id = restamp.unwrap_or(record.g_id);
             *duplicates
-                .entry((record.p_id, record.o_type, inner))
+                .entry((g_id, record.p_id, record.o_type, inner))
                 .or_insert(0) += pop_dropped;
         }
         if op == 0 {
             continue;
         }
-        record.g_id = g_id;
+        if let Some(g_id) = restamp {
+            record.g_id = g_id;
+        }
         if let Some(collector) = class_stats_collector.as_deref_mut() {
             collector.on_record(&record);
         }
@@ -1776,6 +1802,7 @@ mod tests {
     use crate::run_index::runs::spool::SortedCommitWriterV2;
     use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3, decode_leaf_header_v3};
     use fluree_db_binary_index::format::run_record::RunRecord;
+    use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
     use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 
     use fluree_db_core::subject_id::SubjectId;
@@ -1878,6 +1905,7 @@ mod tests {
             build_progress: None,
             stage_marker: None,
             term_builder: None,
+            pool: None,
         };
 
         let (result, _spot_class_stats) =
@@ -2001,6 +2029,7 @@ mod tests {
                 build_progress: None,
                 stage_marker: None,
                 term_builder: None,
+                pool: None,
             };
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, None, None, plan)
@@ -2138,6 +2167,7 @@ mod tests {
                 build_progress: None,
                 stage_marker: None,
                 term_builder: None,
+                pool: None,
             };
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, Some(TYPE_P), Some(membership), plan)

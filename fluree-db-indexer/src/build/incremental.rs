@@ -718,6 +718,14 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
+    // Pooled trees are built only from a full pass so far; a full rebuild
+    // indexes these commits correctly.
+    if novelty.base_root.pool.is_some() {
+        return Err(IndexerError::IncrementalAbort(
+            "incremental indexing of a pooled root is not supported yet".into(),
+        ));
+    }
+
     // ---- Phase 2: Per-(graph, order) branch updates ----
     let all_orders = [
         RunSortOrder::Spot,
