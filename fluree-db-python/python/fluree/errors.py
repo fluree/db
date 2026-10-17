@@ -87,8 +87,20 @@ class ResourceLimitError(FlureeError):
     """The operation exceeded a fuel, memory, or size limit."""
 
 
+class DatabaseInUseError(FlureeError):
+    """The database directory is open in another process.
+
+    One process opens a directory at a time, and its threads share that
+    connection. To use the same data from several processes, run
+    ``fluree server`` on the directory and send requests to it. ``pid`` is
+    the other process's id, or ``None`` when it could not be read."""
+
+    pid: int | None = None
+
+
 __all__ = [
     "ConflictError",
+    "DatabaseInUseError",
     "FlureeError",
     "InvalidRequestError",
     "NotFoundError",

@@ -106,7 +106,15 @@ def connect(
 
     Give a directory ``path``, or ``":memory:"`` for a database that lives
     only as long as the connection. ``indexing=False`` turns off background
-    indexing, for a process that only queries while another one indexes.
+    indexing in this process.
+
+    Connections in one process to the same directory share one engine, so
+    threads may each open their own; they must agree on ``indexing``. While
+    any of them is open, another process that opens the directory raises
+    :class:`DatabaseInUseError`: run ``fluree server`` on it to share it
+    across processes. A ``config`` connection to file storage is not shared:
+    while it is open, opening that storage again raises
+    :class:`DatabaseInUseError`, in this process too.
 
     For anything else — S3 or split commit/index storage, a DynamoDB
     nameservice, encryption at rest, values read from environment variables —
@@ -145,7 +153,9 @@ class Connection:
         return isinstance(ledger, str) and self._native.exists(ledger)
 
     def close(self) -> None:
-        """Flush pending writes and release the database.
+        """Close the connection. Closing the last open connection to a
+        directory in this process flushes pending writes and releases the
+        directory, so another process can open it.
 
         Afterwards the connection, and every ledger, snapshot, transaction
         and stream opened through it, raises :class:`InvalidRequestError`;
