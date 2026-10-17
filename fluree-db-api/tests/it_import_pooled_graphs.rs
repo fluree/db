@@ -758,3 +758,61 @@ async fn deleting_a_vector_from_a_pooled_graph_retracts_it() {
         "after promotion"
     );
 }
+
+/// Pruning `GRAPH ?g` by a probe of the pool must not use graph-local value
+/// encodings: an arena-backed decimal has handle 1 in the default graph and
+/// handle 0 in the pooled graph, and the pooled graph still matches.
+#[tokio::test]
+async fn graph_pruning_matches_an_arena_decimal_in_its_own_graph() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let trig = "@prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        ex:d1 ex:amount \"111111111111111111111111111111.111111111\"^^xsd:decimal .
+        ex:d2 ex:amount \"222222222222222222222222222222.222222222\"^^xsd:decimal .
+        ex:g1 { ex:a ex:amount \"222222222222222222222222222222.222222222\"^^xsd:decimal . }
+        ex:g2 { ex:b ex:amount 5 . }
+    ";
+    let (fluree, ledger) = import_trig(
+        db_dir.path(),
+        data_dir.path(),
+        "test/pool-decimal:main",
+        trig,
+    )
+    .await;
+    assert_eq!(
+        latest_root(db_dir.path()).pool.map(|p| p.graphs.len()),
+        Some(2)
+    );
+    let target = "\"222222222222222222222222222222.222222222\"^^xsd:decimal";
+    let prefixes = format!("{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n");
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{prefixes}SELECT ?s WHERE {{ GRAPH ex:g1 {{ ?s ex:amount {target} }} }}")
+        )
+        .await,
+        vec!["s=http://example.org/a"],
+    );
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{prefixes}SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s ex:amount {target} }} }}")
+        )
+        .await,
+        vec!["g=http://example.org/g1 s=http://example.org/a"],
+    );
+    // The default graph's stats see only decimals for ex:amount; g2 holds an
+    // integer, which a bare number matches all the same.
+    assert_eq!(
+        select(
+            &fluree,
+            &ledger,
+            &format!("{prefixes}SELECT ?g ?s WHERE {{ GRAPH ?g {{ ?s ex:amount 5 }} }}")
+        )
+        .await,
+        vec!["g=http://example.org/g2 s=http://example.org/b"],
+    );
+}

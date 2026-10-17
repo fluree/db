@@ -2304,7 +2304,12 @@ impl Operator for BinaryScanOperator {
                 // Scan-time datatype narrowing only — never semantic elision.
                 false,
             );
-            let mut inferred_dt_sid = if dt_sid.is_none() && lang.is_none() {
+            // A pool probe reads every pooled graph, so it narrows only by
+            // encodings that mean the same in each: no datatype inferred from
+            // this graph's stats, and no arena handle, which is local to a
+            // (graph, predicate).
+            let graph_local_ok = !self.pool_probe;
+            let mut inferred_dt_sid = if dt_sid.is_none() && lang.is_none() && graph_local_ok {
                 filter.p_id.and_then(|p_id| {
                     infer_exact_datatype_sid_from_stats(
                         stats_view.as_deref(),
@@ -2322,7 +2327,8 @@ impl Operator for BinaryScanOperator {
             // encoding and arena contents instead of interpreting UNKNOWN as a
             // datatype. Limit this additional proof to current, indexed reads;
             // novelty and historical reads retain the general numeric matcher.
-            if dt_sid.is_none()
+            if graph_local_ok
+                && dt_sid.is_none()
                 && inferred_dt_sid.is_none()
                 && lang.is_none()
                 && matches!(bound_o, FlakeValue::Decimal(_))
@@ -2356,6 +2362,7 @@ impl Operator for BinaryScanOperator {
             let numeric_slices = if untyped_number {
                 let observed = filter
                     .p_id
+                    .filter(|_| graph_local_ok)
                     .and_then(|p_id| observed_datatypes(stats_view.as_deref(), self.g_id, p_id));
                 untyped_numeric_slices(
                     store_ref,
@@ -2363,7 +2370,7 @@ impl Operator for BinaryScanOperator {
                     filter.p_id,
                     observed,
                     bound_o,
-                    !self.mode.is_history() && ctx.to_t >= store_ref.max_t(),
+                    graph_local_ok && !self.mode.is_history() && ctx.to_t >= store_ref.max_t(),
                 )
             } else {
                 None
@@ -2438,6 +2445,7 @@ impl Operator for BinaryScanOperator {
                         // rows; novelty still goes through the decoded fallback.
                         if let FlakeValue::Decimal(value) = bound_o {
                             if *dt_sid == Sid::new(namespaces::XSD, xsd_names::DECIMAL)
+                                && graph_local_ok
                                 && !self.mode.is_history()
                                 // The arena reflects the index at max_t. It keeps
                                 // retracted values today, but an absent handle only
