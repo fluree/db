@@ -41,6 +41,10 @@ pub(crate) fn api_error(e: ApiError) -> PyErr {
                 details.set_item("head_t", head_t)?;
                 "ConflictError"
             }
+            ApiError::StorageInUse { holder, .. } => {
+                details.set_item("pid", holder)?;
+                "DatabaseInUseError"
+            }
             // Every retry lost a race: still a conflict, so `transact` retries
             // it. A 503 would otherwise read as a plain `FlureeError`.
             ApiError::CommitContention { last, .. } => {
