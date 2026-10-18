@@ -1509,7 +1509,8 @@ impl BinaryScanOperator {
         // overlay translation (translate_overlay_flakes) in BinaryScanOperator::open.
 
         // Late materialization is safe only when the BinaryIndexStore is authoritative
-        // for decoding (no novelty overlay with ephemeral IDs).
+        // for decoding (no novelty overlay with ephemeral IDs) — for the graphs this
+        // scan reads: its own, or a quad scan's, which hold no novelty.
         //
         // An indexed cached ledger retains a nonzero overlay epoch even after
         // all novelty is drained. Test for live overlay rows, not past writes.
@@ -1517,7 +1518,8 @@ impl BinaryScanOperator {
         // bindings eagerly — infrastructure queries (config, policy) need concrete
         // `Binding::Sid`/`Lit`, not `EncodedSid`/`EncodedLit`.
         let late_materialize = ctx.is_some_and(|c| {
-            !crate::fast_path_common::overlay_has_novelty(c) && !c.eager_materialization
+            (self.quad.is_some() || !crate::fast_path_common::graph_has_novelty(c, self.g_id))
+                && !c.eager_materialization
         })
             // If a repeated variable forces two components into the same output slot,
             // late-materialization must produce comparable binding representations.

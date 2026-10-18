@@ -2642,3 +2642,80 @@ async fn a_scan_merges_only_its_own_graphs_novelty() {
         );
     }
 }
+
+/// Scans of graphs the pending writes didn't touch read as indexed scans
+/// (late-materialized bindings, the independent-scan join lane) while the
+/// changed graph merges its novelty, which mints an entity. Every answer
+/// with the writes pending equals the answer once they are indexed: GROUP
+/// BY, OPTIONAL, a join out of the graph block, DISTINCT and a selective
+/// lookup, through SPARQL, and GROUP BY through JSON-LD.
+#[tokio::test]
+async fn pending_writes_to_one_graph_answer_as_once_indexed() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-pending-mixed:main";
+    let trig = r#"
+@prefix ex: <http://example.org/> .
+ex:e1 ex:name "E1" . ex:e2 ex:name "E2" .
+ex:g1 { ex:a ex:refers ex:e1 ; ex:ctx ex:d1 . ex:d1 ex:title "D1" . }
+ex:g2 { ex:b ex:refers ex:e1 ; ex:ctx ex:d2 . ex:d2 ex:title "D2" . }
+ex:g3 { ex:c ex:refers ex:e2 ; ex:ctx ex:d3 . }
+"#;
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, trig).await;
+    sparql_update(
+        &fluree,
+        ledger_id,
+        r#"PREFIX ex: <http://example.org/>
+           INSERT DATA { GRAPH ex:g1 {
+               ex:a2 ex:refers ex:e1 ; ex:ctx ex:d1 .
+               ex:x ex:refers ex:eNew ; ex:ctx ex:dNew . ex:dNew ex:title "DNew" . } } ;
+           DELETE DATA { GRAPH ex:g2 { ex:b ex:refers ex:e1 . } } ;
+           INSERT DATA { ex:eNew ex:name "ENew" . }"#,
+    )
+    .await;
+    let queries = [
+        "SELECT ?ent ?d (COUNT(?occ) AS ?n) WHERE { GRAPH ?g { ?occ ex:refers ?ent ; ex:ctx ?d } } GROUP BY ?ent ?d",
+        "SELECT ?g ?d ?t WHERE { GRAPH ?g { ?occ ex:ctx ?d OPTIONAL { ?d ex:title ?t } } }",
+        "SELECT ?occ ?name WHERE { GRAPH ?g { ?occ ex:refers ?ent } ?ent ex:name ?name }",
+        "SELECT DISTINCT ?ent WHERE { GRAPH ?g { ?occ ex:refers ?ent } }",
+        "SELECT ?g ?occ WHERE { GRAPH ?g { ?occ ex:refers ex:e1 } }",
+    ];
+    let grouped = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?ent", "?d", "(count ?occ)"],
+        "where": [["graph", "?g", {"@id": "?occ", "ex:refers": "?ent", "ex:ctx": "?d"}]],
+        "groupBy": ["?ent", "?d"],
+        "orderBy": ["?ent", "?d"]
+    });
+    let answers = |ledger: fluree_db_api::LedgerState| {
+        let fluree = &fluree;
+        let grouped = &grouped;
+        async move {
+            let mut out = Vec::new();
+            for q in queries {
+                out.push(select(fluree, &ledger, &format!("{PREFIXES}{q}")).await);
+            }
+            let rows = support::query_jsonld(fluree, &ledger, grouped)
+                .await
+                .unwrap()
+                .to_jsonld(&ledger.snapshot)
+                .unwrap();
+            (out, rows)
+        }
+    };
+    let pending = answers(fluree.ledger(ledger_id).await.unwrap()).await;
+    assert_eq!(
+        pending.0[0],
+        vec![
+            "d=http://example.org/d1 ent=http://example.org/e1 n=2",
+            "d=http://example.org/d3 ent=http://example.org/e2 n=1",
+            "d=http://example.org/dNew ent=http://example.org/eNew n=1",
+        ]
+    );
+    let (_, ledger) = index_and_reload(&fluree, ledger_id).await;
+    let indexed = answers(ledger).await;
+    for (q, (p, i)) in queries.iter().zip(pending.0.iter().zip(&indexed.0)) {
+        assert_eq!(p, i, "{q}");
+    }
+    assert_eq!(pending.1, indexed.1, "JSON-LD GROUP BY");
+}

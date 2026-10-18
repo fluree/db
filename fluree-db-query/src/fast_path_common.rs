@@ -3878,6 +3878,15 @@ pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
     }
 }
 
+/// [`overlay_has_novelty`] for one graph: false also when the overlay holds
+/// no rows for `g_id`, so a scan of a graph the pending writes didn't touch
+/// reads as an indexed one. An overlay that can't count one graph's rows is
+/// taken to hold some.
+#[inline]
+pub fn graph_has_novelty(ctx: &ExecutionContext<'_>, g_id: GraphId) -> bool {
+    overlay_has_novelty(ctx) && ctx.overlay().overlay_flake_count(g_id) != Some(0)
+}
+
 /// Combined fast-path eligibility: [`allow_fast_path`] + binary store present + `to_t == max_t`.
 ///
 /// Returns the store reference if the fast path can proceed, `None` otherwise.
