@@ -24,6 +24,7 @@ Everything runs in-process against local storage: the ledger written is always a
 |------------|-------------|
 | `ingest` | Parse documents into a ledger and build the indexes over them |
 | `search` | Search a ledger's chunks by meaning (vector) or by words (full-text) |
+| `parse` | Parse one document and print its DoCO graph, without writing to a ledger |
 
 ## fluree doc ingest
 
@@ -159,6 +160,40 @@ A fused hit shows each method's own score and rank, which is also the diagnostic
 ```
 
 The chunk IRI is a real node: follow `doc:sourceElement` to the paragraphs and cells it was built from, and from those `nif:beginIndex`, `doc:pageIndex` and `doc:bbox` locate the passage on the page.
+
+## fluree doc parse
+
+Prints the structure graph `fluree doc ingest` would write for one file, as JSON-LD, or the plain-text projection its offsets index into. Nothing is written and no ledger is needed, so it runs outside a project too. Where there is a project (or a global config), its `[doc.vlm]` slot reads what the deterministic pass could not and its parse cache is used, exactly as for `ingest`.
+
+### Usage
+
+```bash
+fluree doc parse <FILE> [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-f, --format <FORMAT>` | `doco` (default): the DoCO JSON-LD graph. `text`: the plain-text projection that `nif:beginIndex` / `nif:endIndex` index into. |
+| `-o, --output <FILE>` | Write to this file instead of stdout. |
+| `--base-iri <IRI>` | Prefix the file name is appended to, forming the document IRI (default `urn:fluree:doc:`), as `ingest` does for a file named on its command line. |
+| `--doc-iri <IRI>` | The document IRI in full, in place of `--base-iri` and the file name. Every node is minted under it and stamped with it. |
+| `--no-escalate` | Never call a vision model, whatever `[doc.vlm]` says. |
+| `--max-crops <N>` | Most crops the document may send to the vision model (default `70`). |
+| `--no-cache` | Neither read nor write the parse and reading caches. |
+
+Warnings go to stderr: pages nothing could read, crops over the cap, an email's attachments (described in the graph, not read).
+
+### Examples
+
+```bash
+fluree doc parse report.pdf > report.jsonld
+fluree doc parse call.vtt --format text
+fluree doc parse memo.docx --doc-iri https://example.org/doc/memo -o memo.jsonld
+```
+
+The output is the engine's own JSON-LD, insertable as it is: `fluree insert docs -f memo.jsonld` writes the structure graph alone, without chunks, embeddings or a document node.
 
 ## Configuration
 

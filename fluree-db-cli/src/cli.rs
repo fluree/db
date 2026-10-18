@@ -4004,6 +4004,23 @@ pub enum DocAction {
     #[command(verbatim_doc_comment)]
     Ingest(DocIngestArgs),
 
+    /// Parse one document and print its DoCO graph, without writing to a ledger
+    ///
+    /// Prints the structure graph `fluree doc ingest` would write for this
+    /// file, as JSON-LD: sections, paragraphs, lists, tables and their cells,
+    /// each with character offsets into the text projection and, for a PDF,
+    /// page and bounding box. `--format text` prints that projection instead.
+    /// Needs no project; where there is one (or a global config), its
+    /// `[doc.vlm]` reads what the deterministic pass could not, and its parse
+    /// cache is used.
+    ///
+    /// Examples:
+    ///   fluree doc parse report.pdf > report.jsonld
+    ///   fluree doc parse call.vtt --format text
+    ///   fluree doc parse memo.docx --doc-iri https://example.org/doc/memo
+    #[command(verbatim_doc_comment)]
+    Parse(DocParseArgs),
+
     /// Search a ledger's chunks by meaning (vector) or by words (full-text)
     ///
     /// Examples:
@@ -4120,6 +4137,49 @@ pub struct DocIngestArgs {
     /// Also write each document's transaction as `<relative-path>.jsonld` here
     #[arg(long, value_name = "DIR")]
     pub out_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DocParseArgs {
+    /// The document to parse
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// `doco` prints the structure graph; `text` prints the plain-text
+    /// projection its `nif:beginIndex`/`nif:endIndex` offsets index into
+    #[arg(short = 'f', long, value_enum, default_value_t = DocParseFormat::Doco)]
+    pub format: DocParseFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// IRI prefix the file name is appended to, forming the document IRI,
+    /// as `doc ingest` does
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// The document IRI in full, in place of `--base-iri` and the file name
+    #[arg(long, value_name = "IRI", conflicts_with = "base_iri")]
+    pub doc_iri: Option<String>,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Most crops the document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocParseFormat {
+    Doco,
+    Text,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

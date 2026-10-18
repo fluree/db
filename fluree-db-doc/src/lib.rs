@@ -45,7 +45,9 @@ pub use embed::EmbeddingClient;
 pub use escalate::VlmReader;
 pub use extract::{ExtractOptions, Extractor, RelationMode, ResolvePolicy};
 pub use gazetteer::{Gazetteer, Mention};
-pub use ingest::{collect_inputs, prepare, IngestOptions, PreparedDocument, SourceMeta};
+pub use ingest::{
+    collect_inputs, parse_file, prepare, IngestOptions, PreparedDocument, SourceMeta,
+};
 pub use llm::LlmClient;
 pub use model::Model;
 pub use parse::{ParsedDocument, SourceKind};

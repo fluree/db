@@ -5210,6 +5210,78 @@ fn doc_ingest_reingest_retracts_the_cells_of_a_changed_table() {
         .stdout(predicate::str::contains("5.1").not());
 }
 
+/// One document's structure graph on stdout, from a directory with no
+/// project: nothing is written, and the IRIs are the ones `ingest` mints.
+#[test]
+fn doc_parse_prints_the_graph_without_a_project() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("note.md"),
+        "# Note\n\nSee [the policy](https://example.org/policy).\n\n- one\n- two\n",
+    )
+    .unwrap();
+
+    let out = fluree_cmd(&tmp)
+        .args(["doc", "parse", "note.md"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let graph: serde_json::Value = serde_json::from_slice(&out).expect("stdout is JSON-LD");
+    let nodes = graph["@graph"].as_array().expect("@graph");
+    let root = nodes
+        .iter()
+        .find(|n| n["@type"] == "foaf:Document")
+        .expect("a foaf:Document root");
+    assert_eq!(root["@id"], "urn:fluree:doc:note.md-element-0");
+    assert_eq!(root["doc:sourceName"], "note.md");
+    let items: Vec<&serde_json::Value> =
+        nodes.iter().filter(|n| n["doc:xhtmlTag"] == "li").collect();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|n| n["@type"] == "doco:Paragraph"));
+    assert!(nodes.iter().any(|n| n["@type"] == "doco:List"));
+    assert!(
+        !tmp.path().join(".fluree").exists(),
+        "parse wrote a project"
+    );
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "parse",
+            "note.md",
+            "--format",
+            "text",
+            "--doc-iri",
+            "https://example.org/doc/note",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("Note\n\nSee the policy."));
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "parse",
+            "note.md",
+            "--doc-iri",
+            "https://example.org/doc/note",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "https://example.org/doc/note-element-0",
+        ));
+
+    std::fs::write(tmp.path().join("data.bin"), b"\0\x01").unwrap();
+    fluree_cmd(&tmp)
+        .args(["doc", "parse", "data.bin"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a document"));
+}
+
 #[test]
 fn doc_ingest_dry_run_writes_nothing() {
     let tmp = TempDir::new().unwrap();

@@ -60,4 +60,4 @@ Every score reproduces from committed model-output caches without a GPU or a key
 - [Entities and relations](concepts/entities-and-relations.md) — `--model` and `--entities`, and why a known entity keeps its IRI.
 - [Models and calls](concepts/models-and-calls.md) — the three slots, which calls are made, and where data goes.
 - [Publish to Fluree AI](guides/publish-to-fluree-ai.md) — move a built ledger to your account.
-- [CLI reference](cli/README.md) — `ingest` and `search`, flag by flag.
+- [CLI reference](cli/README.md) — `ingest`, `search` and `parse`, flag by flag.
