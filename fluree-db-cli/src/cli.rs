@@ -3986,7 +3986,7 @@ mod tests {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum DocAction {
-    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks, embeddings, and the vector + full-text indexes over them
+    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks, embeddings, and a full-text index
     ///
     /// Reads PDF, Markdown, HTML, DOCX, PPTX, XLSX, WebVTT and SubRip
     /// transcripts, email (.eml, .msg) and images. Parsing is deterministic
@@ -4053,8 +4053,8 @@ pub struct DocIngestArgs {
     #[arg(long)]
     pub no_escalate: bool,
 
-    /// Skip indexing after the run: the ledger's own index, and the vector
-    /// and full-text indexes
+    /// Skip indexing after the run: the ledger's own index and the
+    /// full-text index
     #[arg(long)]
     pub no_index: bool,
 
@@ -4203,10 +4203,11 @@ pub struct DocSearchArgs {
     #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
     pub limit: usize,
 
-    /// `vector` embeds the query with `[doc.embedding]` and searches the HNSW
-    /// index; `text` runs BM25; `hybrid` runs both and fuses them by
-    /// reciprocal rank; `auto` picks hybrid when both indexes exist and the
-    /// query can be embedded, else whichever there is
+    /// `vector` embeds the query with `[doc.embedding]` and scores every
+    /// chunk's embedding by cosine similarity; `text` runs BM25; `hybrid` runs
+    /// both and fuses their scores, each first mapped to 0–1; `auto` picks
+    /// hybrid when the chunks carry embeddings, the full-text index exists and
+    /// the query can be embedded, else whichever there is
     #[arg(long, value_enum, default_value_t = DocSearchMode::Auto)]
     pub mode: DocSearchMode,
 
