@@ -342,25 +342,26 @@ fn parse_pdf(
             Err(e) => return Err(e),
         };
         escalated_crops = readings.len();
-        if !readings.is_empty() {
-            // The page's own text, so the arbiter can ask whether a reading
-            // says anything the page does not.
-            let page_text: Vec<Vec<String>> = doc
-                .pages
-                .iter()
-                .map(|p| fluree_doc_pdf::fidelity::page_lines(&p.glyphs))
-                .collect();
-            fluree_doc_pdf::arbiter::splice_with_page(
-                &mut analysis.elements,
-                stem,
-                &readings,
-                None,
-                &page_text,
-            );
-            // The same furniture the deterministic pass already stripped, so
-            // a page reads the same whether or not it escalated.
-            fluree_doc_pdf::arbiter::scrub_furniture(&mut analysis.elements, &analysis.furniture);
-        }
+        // Spliced even with no readings: an anchor nothing read is dropped
+        // there, and would otherwise reach the text as a `[[VLM…]]` token.
+        //
+        // The page's own text, so the arbiter can ask whether a reading
+        // says anything the page does not.
+        let page_text: Vec<Vec<String>> = doc
+            .pages
+            .iter()
+            .map(|p| fluree_doc_pdf::fidelity::page_lines(&p.glyphs))
+            .collect();
+        fluree_doc_pdf::arbiter::splice_with_page(
+            &mut analysis.elements,
+            stem,
+            &readings,
+            None,
+            &page_text,
+        );
+        // The same furniture the deterministic pass already stripped, so
+        // a page reads the same whether or not it escalated.
+        fluree_doc_pdf::arbiter::scrub_furniture(&mut analysis.elements, &analysis.furniture);
     }
 
     // After the tiers: an escalated reading replaces the text an anchor has
@@ -453,6 +454,52 @@ fn parse_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelEndpoint;
+
+    /// A table PDF from the engine's own fixtures: routed to the vision
+    /// model for its table, so a reader is asked for at least one crop.
+    const TABLE_PDF: &[u8] = include_bytes!("../testdata/probe-booktabs.pdf");
+
+    /// Over the crop cap nothing is read, and the anchors the analysis
+    /// emitted for the splice must still go: they are placeholders, not
+    /// text. They used to reach the projection as `[[VLM…]]` tokens.
+    #[test]
+    fn over_the_crop_cap_no_anchor_reaches_the_text() {
+        // Nothing is called: a cap of zero refuses before the first crop.
+        let vlm = VlmReader::new(
+            ModelEndpoint {
+                url: "http://127.0.0.1:9/v1".into(),
+                model: "unreachable".into(),
+                ..Default::default()
+            },
+            None,
+            0,
+        )
+        .unwrap();
+        let parsed = parse_bytes(
+            TABLE_PDF.to_vec(),
+            SourceKind::Pdf,
+            "table",
+            &ParseOptions {
+                base_iri: "urn:t".into(),
+                doc_iri: "urn:t".into(),
+                source_name: None,
+                vlm: Some(Arc::new(vlm)),
+            },
+        )
+        .unwrap();
+        assert!(
+            parsed.escalation_skipped.is_some(),
+            "the fixture no longer asks for a crop, so it proves nothing"
+        );
+        assert_eq!(parsed.escalated_crops, 0);
+        assert!(!parsed.text.contains("[[VLM"), "{}", parsed.text);
+        assert!(!parsed.doco.contains("[[VLM"));
+        assert!(
+            !parsed.text.trim().is_empty(),
+            "the deterministic reading stands"
+        );
+    }
 
     #[test]
     fn a_transcript_or_an_email_saved_as_text_is_read_as_one() {
