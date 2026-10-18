@@ -242,13 +242,18 @@ impl GraphOperator {
     }
 
     /// The pooled graphs worth visiting for an unbound `?g`: those whose
-    /// persisted rows match one required triple pattern of the block. A
-    /// solution in graph `g` must match every required pattern in `g`, so a
-    /// pooled graph without such a row produces nothing and is skipped.
+    /// rows match one required triple pattern of the block. A solution in
+    /// graph `g` must match every required pattern in `g`, so a pooled graph
+    /// without such a row produces nothing and is skipped.
     ///
-    /// `None` (visit every graph) unless the persisted index is the whole
-    /// story — no overlay that could add a match, reading at the index's `t`,
-    /// one ledger — and some required pattern has a bound predicate.
+    /// The probe reads the persisted pool at the index's `t`. Unindexed
+    /// changes can add a match only in a graph they touch, so every pooled
+    /// graph the overlay changed is a candidate too.
+    ///
+    /// `None` (visit every graph) when the probe can't answer: reading below
+    /// the index's `t`, a history range, several ledgers, an overlay that
+    /// can't name the graphs it changed, or no required pattern with a bound
+    /// predicate.
     async fn probe_pooled_graphs(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -257,23 +262,46 @@ impl GraphOperator {
             return Ok(None);
         };
         if store.pooled_graph_ids().is_empty()
-            || ctx.overlay.is_some_and(|o| !o.is_effectively_empty())
-            || ctx.to_t != store.max_t()
+            || ctx.to_t < store.max_t()
             || ctx.from_t.is_some()
             || ctx.is_history_range()
             || ctx.is_multi_ledger()
         {
             return Ok(None);
         }
+        let changed = match ctx.overlay.filter(|o| !o.is_effectively_empty()) {
+            None => Vec::new(),
+            Some(overlay) => match overlay.overlay_graph_ids() {
+                Some(graphs) => graphs,
+                None => return Ok(None),
+            },
+        };
         let Some(pattern) = probe_pattern(&self.inner_patterns) else {
             return Ok(None);
         };
+        let started = std::time::Instant::now();
+        let mut persisted = ctx.clone();
+        persisted.overlay = None;
+        persisted.to_t = store.max_t();
         let mut probe =
             BinaryScanOperator::new(pattern.clone(), None, Vec::new()).into_pool_probe();
-        probe.open(ctx).await?;
+        probe.open(&persisted).await?;
         let hits = probe.drain_probe_graphs();
         probe.close();
-        hits
+        let Some(mut hits) = hits? else {
+            return Ok(None);
+        };
+        let persisted_hits = hits.len();
+        hits.extend(changed.iter().copied().filter(|&g| store.is_pooled(g)));
+        tracing::debug!(
+            persisted_hits,
+            changed = changed.len(),
+            candidates = hits.len(),
+            pooled = store.pooled_graph_ids().len(),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "pool probe"
+        );
+        Ok(Some(hits))
     }
 
     /// Whether the probe ruled out the pooled graph named `iri`.

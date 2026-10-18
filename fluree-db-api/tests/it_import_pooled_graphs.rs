@@ -2522,3 +2522,123 @@ async fn compaction_keeps_a_reassertion_time() {
         "POST after compaction"
     );
 }
+
+/// With unindexed writes, `GRAPH ?g` still prunes by a probe of the
+/// persisted pool, and visits every graph those writes touched as well: a
+/// match only novelty holds (g3's new label, a new graph g4) is found, a
+/// persisted match novelty retracted (g2's) is gone, and an untouched
+/// graph's persisted match (g1's) stays — through SPARQL and JSON-LD.
+#[tokio::test]
+async fn graph_pruning_admits_graphs_with_unindexed_changes() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-probe-novelty:main";
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    for update in [
+        r#"INSERT DATA { GRAPH ex:g3 { ex:c ex:label "Z" . } GRAPH ex:g4 { ex:d ex:label "Z" . } }"#,
+        r#"DELETE DATA { GRAPH ex:g2 { ex:b ex:label "B" . } }"#,
+    ] {
+        sparql_update(
+            &fluree,
+            ledger_id,
+            &format!("PREFIX ex: <http://example.org/> {update}"),
+        )
+        .await;
+    }
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let store = ledger
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .clone()
+        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+    assert!(ledger.t() > store.max_t(), "the writes are unindexed");
+
+    for (pattern, expected) in [
+        (
+            r#"?s ex:label "Z""#,
+            vec![
+                "g=http://example.org/g3 s=http://example.org/c",
+                "g=http://example.org/g4 s=http://example.org/d",
+            ],
+        ),
+        (r#"?s ex:label "B""#, vec![]),
+        (
+            r#"?s ex:label "A""#,
+            vec!["g=http://example.org/g1 s=http://example.org/a"],
+        ),
+    ] {
+        assert_eq!(
+            select(
+                &fluree,
+                &ledger,
+                &format!("{PREFIXES}SELECT ?g ?s WHERE {{ GRAPH ?g {{ {pattern} }} }}")
+            )
+            .await,
+            expected,
+            "{pattern}"
+        );
+    }
+
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?s"],
+        "where": [["graph", "?g", {"@id": "?s", "ex:label": "Z"}]],
+        "orderBy": ["?g"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            ["http://example.org/g3", "ex:c"],
+            ["http://example.org/g4", "ex:d"]
+        ]),
+        "JSON-LD"
+    );
+}
+
+/// A scan merges novelty only for its own graph: with unindexed writes in
+/// g1 alone, g1 reads them, while g2 and the default graph read their
+/// persisted rows unchanged.
+#[tokio::test]
+async fn a_scan_merges_only_its_own_graphs_novelty() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-scan-novelty:main";
+    let trig = format!("{THREE_GRAPHS}\n@prefix ex: <http://example.org/> .\nex:root ex:val 9 .\n");
+    let (fluree, _) = import_trig(db_dir.path(), data_dir.path(), ledger_id, &trig).await;
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         DELETE DATA { GRAPH ex:g1 { ex:a ex:val 1 . } } ;
+         INSERT DATA { GRAPH ex:g1 { ex:a ex:val 11 . ex:n ex:val 12 . } }",
+    )
+    .await;
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    for (graph, expected) in [
+        (
+            "GRAPH ex:g1",
+            vec!["s=http://example.org/a v=11", "s=http://example.org/n v=12"],
+        ),
+        ("GRAPH ex:g2", vec!["s=http://example.org/b v=2"]),
+        ("", vec!["s=http://example.org/root v=9"]),
+    ] {
+        assert_eq!(
+            select(
+                &fluree,
+                &ledger,
+                &format!("{PREFIXES}SELECT ?s ?v WHERE {{ {graph} {{ ?s ex:val ?v }} }}")
+            )
+            .await,
+            expected,
+            "{graph}"
+        );
+    }
+}

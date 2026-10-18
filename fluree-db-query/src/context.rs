@@ -236,6 +236,7 @@ pub type TranslatedOverlayCache = Arc<
 ///
 /// When `dataset` is `None`, this is single-db mode and operators use `active_snapshot`/`overlay()`/`to_t`.
 ///
+#[derive(Clone)]
 pub struct ExecutionContext<'a> {
     /// The snapshot used for data access in the current execution scope.
     ///

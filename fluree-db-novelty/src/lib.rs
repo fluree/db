@@ -1637,6 +1637,17 @@ impl OverlayProvider for Novelty {
         )
     }
 
+    fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
+        Some(
+            self.graphs
+                .slots
+                .iter()
+                .filter(|(_, segs)| segs.as_ref().is_some_and(|segs| !segs.is_empty()))
+                .map(|&(g_id, _)| g_id)
+                .collect(),
+        )
+    }
+
     fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {
         match self.graphs.get(g_id).and_then(Option::as_ref) {
             Some(segs) => segs
@@ -2361,6 +2372,29 @@ mod tests {
         assert_eq!(novelty.present_graphs(), vec![3_000_000]);
         assert_eq!(objects(&novelty, 3_000_000), vec![40]);
         assert!(objects(&novelty, 70_000).is_empty());
+    }
+
+    #[test]
+    fn overlay_graph_ids_lists_the_graphs_holding_flakes() {
+        let mut novelty = Novelty::new(0);
+        assert_eq!(novelty.overlay_graph_ids(), Some(vec![]));
+        let (g2, g5) = (Sid::new(100, "graph2"), Sid::new(100, "graph5"));
+        let rg: HashMap<Sid, GraphId> = [(g2.clone(), 2u32), (g5.clone(), 5u32)].into();
+        novelty
+            .apply_commit(
+                vec![
+                    make_graph_flake(10, 1, 300, 1, g5),
+                    make_graph_flake(11, 1, 400, 1, g2),
+                ],
+                1,
+                &rg,
+            )
+            .unwrap();
+        let mut graphs = novelty.overlay_graph_ids().unwrap();
+        graphs.sort_unstable();
+        assert_eq!(graphs, vec![2, 5]);
+        novelty.clear_up_to(1);
+        assert_eq!(novelty.overlay_graph_ids(), Some(vec![]));
     }
 
     #[test]
