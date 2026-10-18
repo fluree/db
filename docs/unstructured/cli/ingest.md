@@ -10,7 +10,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 
 | Argument | Description |
 |---|---|
-| `<PATH>...` | Files or directories. Directories are walked recursively; hidden entries are skipped. PDF, Markdown, HTML, DOCX, PPTX, PNG, JPEG. |
+| `<PATH>...` | Files or directories. Directories are walked recursively; hidden entries are skipped. PDF, Markdown and text, HTML, DOCX, PPTX, XLSX, WebVTT and SubRip transcripts, email (`.eml`, `.msg`), and PNG, JPEG, GIF or WebP images (read only by a vision model). A `.txt` holding a transcript or a saved email is read as one. An email's attachments are described on the document, not read: save and ingest each as a document of its own. |
 
 ## Options
 

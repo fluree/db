@@ -116,9 +116,10 @@ pub fn document_iri(prefix: &str, relative_path: &str) -> String {
 }
 
 pub fn prepare(path: &Path, relative_path: &str, opts: &IngestOptions) -> Result<PreparedDocument> {
-    let kind = SourceKind::from_path(path)
-        .ok_or_else(|| DocError::Unsupported(path.display().to_string()))?;
     let data = std::fs::read(path).map_err(|e| DocError::Io(format!("{}: {e}", path.display())))?;
+    let kind = SourceKind::from_path(path)
+        .ok_or_else(|| DocError::Unsupported(path.display().to_string()))?
+        .refine(&data);
     let meta = SourceMeta {
         path: path.to_path_buf(),
         relative_path: relative_path.to_string(),
@@ -139,6 +140,7 @@ pub fn prepare(path: &Path, relative_path: &str, opts: &IngestOptions) -> Result
     let parse_opts = ParseOptions {
         base_iri: doc_iri.clone(),
         doc_iri: doc_iri.clone(),
+        source_name: Some(meta.file_name.clone()),
         vlm: opts.vlm.clone(),
     };
     let fingerprint = parse_opts.fingerprint();

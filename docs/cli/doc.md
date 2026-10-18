@@ -2,9 +2,9 @@
 
 Turn a folder of documents into a searchable graph, and search it.
 
-`fluree doc ingest` reads PDF, Markdown, HTML, DOCX, PPTX and image files and writes, per document, one commit holding:
+`fluree doc ingest` reads PDF, Markdown, HTML, DOCX, PPTX, XLSX, WebVTT and SubRip transcripts, email (`.eml`, `.msg`) and image files and writes, per document, one commit holding:
 
-- a **DoCO structure graph** from the [fluree-doc-parse](https://github.com/fluree/fluree-doc-parse) engine: sections, paragraphs, lists, captions and table cells, each with character offsets into the text projection and, for PDFs, page index and bounding box;
+- a **DoCO structure graph** from the [fluree-doc-parse](https://github.com/fluree/fluree-doc-parse) engine: sections, paragraphs, lists, tables and their cells, each with character offsets into the text projection and, for PDFs, page index and bounding box;
 - **retrieval chunks** cut along that structure, each citing the elements it was built from and carrying its section path;
 - an **embedding** per chunk, when an embedding endpoint is configured;
 - a **document node** recording the file, its content hash, the parser revision and the embedding model;
@@ -37,7 +37,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<PATH>...` | Files or directories. Directories are walked recursively; hidden entries are skipped. |
+| `<PATH>...` | Files or directories. Directories are walked recursively; hidden entries are skipped. Read by extension: `.pdf`; `.md`, `.txt`; `.html`; `.docx`; `.pptx`; `.xlsx`; `.vtt`, `.srt`; `.eml`, `.msg`; `.png`, `.jpg`, `.gif`, `.webp` (images need a vision model). A `.txt` holding a transcript or a saved email is read as one. |
 
 ### Options
 
@@ -145,10 +145,10 @@ fluree doc search "termination notice period" -l contracts -n 3
 ```
  1. 0.812  msa-2024.pdf  Master Services Agreement / 12. Term and Termination
     Either party may terminate this Agreement for convenience on ninety (90) days' written notice…
-    urn:fluree:doc:msa-2024.pdf/chunk/97
+    urn:fluree:doc:msa-2024.pdf-chunk-97
  2. 0.774  nda.docx  Term
     This Agreement terminates two years after the Effective Date unless…
-    urn:fluree:doc:nda.docx/chunk/2
+    urn:fluree:doc:nda.docx-chunk-2
 (2 result(s), vector, 41 ms)
 ```
 
@@ -233,17 +233,17 @@ Three caches under `.fluree/cache/doc/` make re-runs cheap:
 
 ## The graph
 
-Structure elements use the DoCO, NIF and pattern ontologies under `doc:` (`https://ns.flur.ee/doc#`) as documented by fluree-doc-parse. Chunks and document nodes extend the same namespace:
+Structure elements use DoCO, NIF, the pattern ontology, Dublin Core and `foaf:Document`, with Fluree's own terms under `doc:` (`https://ns.flur.ee/doc#`), as documented in fluree-doc-parse's [vocabulary reference](https://github.com/fluree/fluree-doc-parse/blob/main/docs/reference/vocabulary.md); [What gets built](../unstructured/concepts/what-gets-built.md#the-structure-graph) summarises them. Chunks and document nodes extend the same namespace:
 
 | Node / property | Meaning |
 |---|---|
 | `doc:SourceDocument` | The file. `doc:fileName`, `doc:relativePath`, `doc:sha256`, `doc:mediaType`, `doc:byteSize`, `doc:pageCount`, `doc:escalatedCrops`, `doc:parserRevision`, `doc:chunkCount`, `doc:embeddingModel`, `doc:embeddingDimensions`, `doc:ingestedAt`. |
 | `doc:Chunk` | A retrieval unit. `doc:chunkIndex`, `doc:text`, `doc:headerPath`, `doc:sourceElement` (the DoCO elements it was built from), `doc:sourceDocument`, `doc:embedding` (an `@vector`). |
-| `doc:sourceDocument` | On every element, chunk, mention and relation: the document it came from, and the tag a re-ingest retracts by. |
+| `doc:sourceDocument` | On every structure node, chunk, mention and relation: the document it came from, and the tag a re-ingest retracts by. A table cell carries none; it is retracted through the table that contains it. |
 | `doc:Mention` | A span of a chunk naming an entity: `nif:beginIndex`, `nif:endIndex`, `nif:anchorOf`, `nif:referenceContext` (the chunk), `nif:entity`, `doc:sourceElement`, `doc:extractedBy` (`gazetteer` or `llm`). |
 | `doc:Relation` | A reified statement: `rdf:subject`, `rdf:predicate`, `rdf:object`, `doc:excerpt`, `doc:verdict` (`valid`, `repaired`, `rejected`), `doc:asserted`, `doc:originalPredicate`, `doc:repairNote`, `doc:rejectionReason`, `doc:sourceChunk`. |
 | `doc:Entity` | An entity minted because no `--entities` source knew it: `schema:name`, `skos:altLabel`, `doc:nerLabel`, plus attributes the ontology admits, and `doc:offModel true` when its class was not in the ontology. Known entities keep their IRI and get no node. |
 
-Document IRIs are `<base-iri><relative path>`, elements `<document>/element/<n>`, chunks `<document>/chunk/<n>`, mentions `<chunk>/mention/<n>`, relations `<document>/relation/<n>`, minted entities `<base-iri>entity/<hash of the name>`.
+Document IRIs are `<base-iri><relative path>`, structure nodes `<document>-element-<n>` (and `-section-`, `-table-`, `-cell-`…), chunks `<document>-chunk-<n>`, mentions `<chunk>-mention-<n>`, relations `<document>-relation-<n>`, minted entities `<base-iri>entity/<hash of the name>`. Nothing minted adds a `/`, `#` or `:` to the document IRI, so a document's nodes cost no namespace of their own — see [IRIs](../unstructured/concepts/what-gets-built.md#iris).
 
 The full walkthrough, including a cross-ledger query over the entities graph and the documents graph, is in [Entities and relations](../unstructured/concepts/entities-and-relations.md).

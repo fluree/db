@@ -11,7 +11,7 @@ PREFIX doc: <https://ns.flur.ee/doc#>
 PREFIX nif: <http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#>
 
 SELECT ?el ?page ?box ?start ?end WHERE {
-  <urn:fluree:doc:msa-2024.pdf/chunk/97> doc:sourceElement ?el .
+  <urn:fluree:doc:msa-2024.pdf-chunk-97> doc:sourceElement ?el .
   ?el doc:pageIndex ?page ; doc:bbox ?box ;
       nif:beginIndex ?start ; nif:endIndex ?end .
 }

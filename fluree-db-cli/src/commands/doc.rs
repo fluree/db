@@ -500,9 +500,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
 
     let inputs = collect_inputs(&args.paths)?;
     if inputs.is_empty() {
-        return Err(CliError::Usage(
-            "no supported documents found (pdf, md, html, docx, pptx, png, jpg)".into(),
-        ));
+        return Err(CliError::Usage(format!(
+            "no supported documents found ({})",
+            fluree_db_doc::parse::SUPPORTED_EXTENSIONS
+        )));
     }
 
     let cache = (!args.no_cache).then(|| DocCache::new(cache_root(dirs)));
@@ -799,6 +800,9 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 "!".yellow()
             );
             totals.unescalated += 1;
+        }
+        for note in &doc.parsed.notes {
+            println!("    {} {note}", "!".yellow());
         }
         totals.ingested += 1;
         totals.chunks += doc.chunks.len();

@@ -3988,12 +3988,13 @@ mod tests {
 pub enum DocAction {
     /// Parse documents into a ledger: DoCO structure graph, retrieval chunks, embeddings, and the vector + full-text indexes over them
     ///
-    /// Reads PDF, Markdown, HTML, DOCX, PPTX and images. Parsing is
-    /// deterministic and local; with `[doc.vlm]` (or `[doc.llm]`) configured,
-    /// pages the parser could not read are escalated to that vision model.
-    /// With `[doc.embedding]` configured every chunk is embedded. Parses and
-    /// model readings are cached under `.fluree/cache/doc/`, so a re-run only
-    /// pays for what changed.
+    /// Reads PDF, Markdown, HTML, DOCX, PPTX, XLSX, WebVTT and SubRip
+    /// transcripts, email (.eml, .msg) and images. Parsing is deterministic
+    /// and local; with `[doc.vlm]` (or `[doc.llm]`) configured, pages the
+    /// parser could not read are escalated to that vision model. With
+    /// `[doc.embedding]` configured every chunk is embedded. Parses and model
+    /// readings are cached under `.fluree/cache/doc/`, so a re-run only pays
+    /// for what changed.
     ///
     /// Examples:
     ///   fluree doc ingest ./contracts --ledger contracts

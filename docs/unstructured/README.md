@@ -2,7 +2,7 @@
 
 Unstructured documents in, a knowledge graph out — from the command line, with nothing to run but the Fluree CLI.
 
-`fluree doc ingest ./contracts` reads PDFs, Word and PowerPoint files, Markdown, HTML and scans, and writes each one into a Fluree ledger as three connected layers: the document's **structure** (sections, paragraphs, lists, tables cell by cell, each with character offsets and, for PDFs, page and bounding box), **retrieval chunks** cut along that structure, and an **embedding** per chunk. `fluree doc search` then answers a question with chunks that carry their section path, their source file and the exact elements they came from.
+`fluree doc ingest ./contracts` reads PDFs, Word, PowerPoint and Excel files, Markdown, HTML, meeting transcripts, email and scans, and writes each one into a Fluree ledger as three connected layers: the document's **structure** (sections, paragraphs, lists, tables cell by cell, each with character offsets and, for PDFs, page and bounding box), **retrieval chunks** cut along that structure, and an **embedding** per chunk. `fluree doc search` then answers a question with chunks that carry their section path, their source file and the exact elements they came from.
 
 Give it an ontology and the entities you already have — `--model ./ontology.ttl --entities people` — and it adds a fourth layer: every **mention** of a known entity, under the IRI it already has, and the **relations** the text states, each checked against the ontology and kept with its evidence. A ledger of documents and a ledger of people then join on the same nodes.
 

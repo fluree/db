@@ -5105,7 +5105,7 @@ fn doc_ingest_markdown_then_search_then_skip_unchanged() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("urn:fluree:doc:hr/onboarding.md/chunk/0"))
+        .stdout(predicate::str::contains("urn:fluree:doc:hr/onboarding.md-chunk-0"))
         .stdout(predicate::str::contains("Onboarding Guide"));
 
     // Full-text search joins the hit back to its file and section path.
@@ -5124,7 +5124,7 @@ fn doc_ingest_markdown_then_search_then_skip_unchanged() {
         .stdout(predicate::str::contains("hr/onboarding.md"))
         .stdout(predicate::str::contains("Onboarding Guide"))
         .stdout(predicate::str::contains(
-            "urn:fluree:doc:hr/onboarding.md/chunk/0",
+            "urn:fluree:doc:hr/onboarding.md-chunk-0",
         ));
 
     // Same bytes, same parser, same (absent) embedding model: nothing to do.
@@ -5158,6 +5158,56 @@ fn doc_ingest_markdown_then_search_then_skip_unchanged() {
         .success()
         .stdout(predicate::str::contains("1"))
         .stdout(predicate::str::contains("2").not());
+}
+
+/// Table cells are the one node the engine does not stamp with its
+/// document; re-ingest reaches them through their table. A changed table
+/// must leave none of its old cells behind, and none of their values.
+#[test]
+fn doc_ingest_reingest_retracts_the_cells_of_a_changed_table() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    let table = |rows: &[(&str, &str)]| {
+        let mut md = String::from("# Rates\n\n| Region | Rate |\n| --- | --- |\n");
+        for (region, rate) in rows {
+            md.push_str(&format!("| {region} | {rate} |\n"));
+        }
+        md
+    };
+    let ingest = || {
+        fluree_cmd(&tmp)
+            .args(["doc", "ingest", "docs", "-l", "rates"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("1 ingested"));
+    };
+    let cells = r"PREFIX doc: <https://ns.flur.ee/doc#>
+        SELECT ?c ?v WHERE { ?c a doc:TableCell ; doc:cellValue ?v }";
+
+    std::fs::write(
+        docs.join("rates.md"),
+        table(&[("North", "4.5"), ("South", "3.9"), ("West", "5.1")]),
+    )
+    .unwrap();
+    ingest();
+    fluree_cmd(&tmp)
+        .args(["query", "rates", "-e", cells])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(6 rows"));
+
+    std::fs::write(docs.join("rates.md"), table(&[("East", "2.2")])).unwrap();
+    ingest();
+    fluree_cmd(&tmp)
+        .args(["query", "rates", "-e", cells])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(2 rows"))
+        .stdout(predicate::str::contains("East"))
+        .stdout(predicate::str::contains("North").not())
+        .stdout(predicate::str::contains("5.1").not());
 }
 
 #[test]
@@ -5386,7 +5436,7 @@ fn doc_ingest_extracts_entities_and_relations_grounded_on_model_and_gazetteer() 
         .stdout(predicate::str::contains(r#""https://example.org/org/acme""#).count(2))
         .stdout(predicate::str::contains(r#""gazetteer""#).count(2))
         .stdout(predicate::str::contains(r#""Jane Doe""#).count(1))
-        .stdout(predicate::str::contains("urn:fluree:doc:memo.md/element/"));
+        .stdout(predicate::str::contains("urn:fluree:doc:memo.md-element-"));
 
     // The new entity is minted once, typed by the model, with its attribute.
     fluree_cmd(&tmp)
@@ -5614,7 +5664,7 @@ fn doc_ingest_reingest_keeps_triples_the_pipeline_did_not_write() {
             r#"{"@context":{"ex":"https://example.org/","rdfs":"http://www.w3.org/2000/01/rdf-schema#"},
                 "insert":[
                   {"@id":"urn:fluree:doc:memo.md","ex:trust":0.9},
-                  {"@id":"urn:fluree:doc:memo.md/relation/0",
+                  {"@id":"urn:fluree:doc:memo.md-relation-0",
                    "ex:reviewedConfidence":1.0,"rdfs:comment":"checked by hand"}]}"#,
         ])
         .assert()

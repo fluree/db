@@ -41,10 +41,10 @@ A chunk's fused score is the mean of its confidences over both methods, a method
 $ fluree doc search "paramount lien on Reserve Bank assets" -l fed -n 2
  1. 0.527  fin_fed_stmts.pdf  … / l. Federal Reserve Notes  vector 0.53 #10 · text 11.1 #1
     Federal Reserve notes are the circulating currency of the United States. These notes … must be fully collateralized…
-    urn:fluree:doc:fin_fed_stmts.pdf/chunk/66
+    urn:fluree:doc:fin_fed_stmts.pdf-chunk-66
  2. 0.282  fin_fed_stmts.pdf  … / i. Allowance for Credit Losses  vector 0.56 #1
     FASB ASC 326, Financial Instruments – Credit Losses provides the updated methodology…
-    urn:fluree:doc:fin_fed_stmts.pdf/chunk/61
+    urn:fluree:doc:fin_fed_stmts.pdf-chunk-61
 (2 result(s), hybrid, 1913 ms)
 ```
 
@@ -55,7 +55,7 @@ This query names the answer's words but not its meaning: the vector lane alone h
 ```
  1. 0.812  msa-2024.pdf  Master Services Agreement / 12. Term and Termination
     Either party may terminate this Agreement for convenience on ninety (90) days' written notice…
-    urn:fluree:doc:msa-2024.pdf/chunk/97
+    urn:fluree:doc:msa-2024.pdf-chunk-97
 (1 result(s), vector, 41 ms)
 ```
 

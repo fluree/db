@@ -35,8 +35,12 @@ pub struct ExtractionStamp {
     pub relations: usize,
 }
 
+/// `{document}-chunk-{n}`. Like the engine's `{document}-element-{n}`, it
+/// adds no `/`, `#` or `:` to the document IRI: Fluree encodes an IRI's
+/// namespace (everything up to the last of those) once per distinct value,
+/// so a delimiter here would cost a namespace per document.
 pub fn chunk_iri(doc_iri: &str, index: usize) -> String {
-    format!("{doc_iri}/chunk/{index}")
+    format!("{doc_iri}-chunk-{index}")
 }
 
 /// The `doc:SourceDocument` node: file facts plus what the run produced.
@@ -105,7 +109,12 @@ pub fn chunk_nodes(doc_iri: &str, chunks: &[Chunk], embeddings: Option<&[Vec<f32
 }
 
 /// The structure graph, the document node, the chunks and whatever
-/// extraction added, as one JSON-LD transaction under the shared context.
+/// extraction added, as one JSON-LD transaction.
+///
+/// The context is the engine's own with this pipeline's merged over it.
+/// The engine's carries the prefixes and `@id` coercions its graph is
+/// written in; replacing it would store a coerced reference as a string,
+/// and a prefix this crate does not know as an IRI of that scheme.
 pub fn transaction(
     doco_json: &str,
     document: Value,
@@ -121,8 +130,15 @@ pub fn transaction(
     graph.push(document);
     graph.extend(chunks);
     graph.extend(extra);
+    let mut context = match doco.get("@context") {
+        Some(Value::Object(engine)) => engine.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Value::Object(ours) = vocab::context() {
+        context.extend(ours);
+    }
     Ok(json!({
-        "@context": vocab::context(),
+        "@context": context,
         "@graph": graph,
     }))
 }
@@ -139,19 +155,24 @@ const OWNED_NAMESPACES: [&str; 3] = [vocab::DOC_NS, vocab::NIF_NS, vocab::PO_NS]
 
 /// The predicates this pipeline writes from namespaces it does not own, so
 /// they have to be named one at a time: `rdf:type` on every node it mints,
-/// the reification triple on a relation node, and the label both the
-/// relation emitter and the structure emitter write.
+/// the reification triple on a relation node, the label both the relation
+/// emitter and the structure emitter write, and the Dublin Core terms the
+/// structure emitter puts on its root from what the file declares.
 ///
 /// Anything outside [`OWNED_NAMESPACES`] and this list is somebody else's
 /// and survives re-ingest. Kept honest by
 /// `every_emitted_predicate_is_owned`.
-fn owned_terms() -> [String; 5] {
+fn owned_terms() -> [String; 9] {
     [
         format!("{}type", vocab::RDF_NS),
         format!("{}subject", vocab::RDF_NS),
         format!("{}predicate", vocab::RDF_NS),
         format!("{}object", vocab::RDF_NS),
         format!("{}label", vocab::RDFS_NS),
+        format!("{}title", vocab::DCTERMS_NS),
+        format!("{}creator", vocab::DCTERMS_NS),
+        format!("{}created", vocab::DCTERMS_NS),
+        format!("{}modified", vocab::DCTERMS_NS),
     ]
 }
 
@@ -178,6 +199,8 @@ fn expand_owned(predicate: &str) -> String {
         ("rdfs:", vocab::RDFS_NS),
         ("skos:", vocab::SKOS_NS),
         ("schema:", vocab::SCHEMA_NS),
+        ("dcterms:", vocab::DCTERMS_NS),
+        ("foaf:", vocab::FOAF_NS),
         ("f:", vocab::FLUREE_NS),
         ("xsd:", vocab::XSD_NS),
     ] {
@@ -189,9 +212,14 @@ fn expand_owned(predicate: &str) -> String {
 }
 
 /// SPARQL UPDATE that retracts everything a previous extraction of this
-/// document wrote: every element and chunk stamped with it, and the
-/// document node itself. Re-extraction is retract-then-insert, never a
-/// diff; the earlier extraction stays queryable at its commit.
+/// document wrote: every node stamped with it, the table cells those hold,
+/// and the document node itself. Re-extraction is retract-then-insert,
+/// never a diff; the earlier extraction stays queryable at its commit.
+///
+/// Cells are the one node the engine does not stamp: a cell is always one
+/// `po:contains` below its stamped table, and cells are most of a
+/// table-heavy graph. The hop is bounded to `doc:TableCell` so a node
+/// someone else linked into the structure is not taken with it.
 ///
 /// The sweep is scoped to the predicates this pipeline emits
 /// ([`is_owned_predicate`]). It used to be `DELETE { ?s ?p ?o }` with no
@@ -212,16 +240,20 @@ pub fn retract_update(doc_iri: &str) -> String {
     clauses.push(format!("?p IN ({terms})"));
     format!(
         "PREFIX doc: <{ns}>\n\
+         PREFIX po: <{po}>\n\
          DELETE {{ ?s ?p ?o }}\n\
          WHERE {{\n  \
            {{\n    \
              {{ ?s doc:sourceDocument <{iri}> . ?s ?p ?o }}\n    \
+             UNION\n    \
+             {{ ?x doc:sourceDocument <{iri}> . ?x po:contains ?s . ?s a doc:TableCell . ?s ?p ?o }}\n    \
              UNION\n    \
              {{ VALUES ?s {{ <{iri}> }} ?s ?p ?o }}\n  \
            }}\n  \
            FILTER ( {filter} )\n\
          }}",
         ns = vocab::DOC_NS,
+        po = vocab::PO_NS,
         iri = doc_iri,
         filter = clauses.join(" || ")
     )
@@ -325,9 +357,12 @@ mod tests {
     #[test]
     fn retract_update_is_bounded_to_the_predicates_this_pipeline_writes() {
         let update = retract_update("urn:fluree:doc:memo.md");
-        // Both branches of the sweep survive: stamped nodes and the
-        // document node itself.
+        // All three branches of the sweep survive: stamped nodes, the
+        // unstamped cells they hold, and the document node itself.
         assert!(update.contains("?s doc:sourceDocument <urn:fluree:doc:memo.md>"));
+        assert!(update.contains(
+            "?x doc:sourceDocument <urn:fluree:doc:memo.md> . ?x po:contains ?s . ?s a doc:TableCell"
+        ));
         assert!(update.contains("VALUES ?s { <urn:fluree:doc:memo.md> }"));
         // ?p is no longer free.
         for ns in OWNED_NAMESPACES {
@@ -365,6 +400,9 @@ mod tests {
             "rdfs:label",
             "@type",
             "http://www.w3.org/1999/02/22-rdf-syntax-ns#object",
+            // What a file declares about itself, on the structure root.
+            "dcterms:title",
+            "http://purl.org/dc/terms/created",
         ] {
             assert!(is_owned_predicate(owned), "{owned} should be swept");
         }
@@ -376,6 +414,9 @@ mod tests {
             "skos:altLabel",
             "rdfs:comment",
             "rdf:value",
+            // Dublin Core is owned term by term, not as a namespace.
+            "dcterms:subject",
+            "foaf:name",
         ] {
             assert!(!is_owned_predicate(foreign), "{foreign} should survive");
         }
@@ -394,34 +435,31 @@ mod tests {
         };
         use crate::parse::{parse_bytes, ParseOptions, SourceKind};
 
-        let doc_iri = "urn:fluree:doc:guard.md";
+        let doc_iri = "urn:fluree:doc:guard.html";
+        // HTML rather than Markdown: it also declares a title and an author,
+        // which the engine writes on its root in Dublin Core.
         let source = "\
-# Heading
-
-Jane Doe joined Acme, with a [link](https://example.org/x).
-
-- first item
-- second item
-
-| Name | Role |
-| --- | --- |
-| Jane Doe | CTO |
-
-## Subheading
-
-Closing paragraph.
+<html><head><title>Guard</title><meta name=\"author\" content=\"Jane Doe\"></head><body>
+<h1>Heading</h1>
+<p>Jane Doe joined Acme, with a <a href=\"https://example.org/x\">link</a>.</p>
+<ul><li>first item</li><li>second item</li></ul>
+<table><tr><th>Name</th><th>Role</th></tr><tr><td>Jane Doe</td><td>CTO</td></tr></table>
+<h2>Subheading</h2>
+<p>Closing paragraph.</p>
+</body></html>
 ";
         let parsed = parse_bytes(
             source.as_bytes().to_vec(),
-            SourceKind::Markdown,
+            SourceKind::Html,
             "guard",
             &ParseOptions {
                 base_iri: doc_iri.into(),
                 doc_iri: doc_iri.into(),
+                source_name: Some("guard.html".into()),
                 vlm: None,
             },
         )
-        .expect("markdown parses");
+        .expect("html parses");
         let chunks = chunk_doco(&parsed.doco, &ChunkConfig::default()).expect("chunks");
         assert!(!chunks.is_empty(), "the fixture must produce a chunk");
 
@@ -466,10 +504,10 @@ Closing paragraph.
 
         let meta = DocumentMeta {
             doc_iri: doc_iri.into(),
-            file_name: "guard.md".into(),
-            relative_path: "guard.md".into(),
+            file_name: "guard.html".into(),
+            relative_path: "guard.html".into(),
             sha256: "0".repeat(64),
-            media_type: "text/markdown".into(),
+            media_type: "text/html".into(),
             byte_size: source.len() as u64,
             pages: 1,
             escalated_crops: 0,
@@ -499,15 +537,53 @@ Closing paragraph.
         )
         .expect("transaction");
 
-        // The sweep reaches the document node and every node stamped with
-        // it; nothing else. Check exactly those.
+        // The sweep reaches the document node, every node stamped with it,
+        // and the table cells those contain; nothing else. Check exactly
+        // those.
+        let nodes = tx["@graph"].as_array().expect("@graph");
+        let id_of = |n: &Value| n["@id"].as_str().map(str::to_string);
+        let stamped: std::collections::BTreeSet<String> = nodes
+            .iter()
+            .filter(|n| n.get(vocab::SOURCE_DOCUMENT).is_some() || n["@id"] == doc_iri)
+            .filter_map(id_of)
+            .collect();
+        let cells: std::collections::BTreeSet<String> = nodes
+            .iter()
+            .filter(|n| stamped.contains(&id_of(n).unwrap_or_default()))
+            .filter_map(|n| n.get("po:contains").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|child| {
+                nodes
+                    .iter()
+                    .any(|n| n["@id"] == *child && n["@type"] == "doc:TableCell")
+            })
+            .map(str::to_string)
+            .collect();
+        assert!(!cells.is_empty(), "the guard fixture must emit table cells");
+
+        // Every node of the structure graph is one of those: a node the
+        // sweep cannot reach outlives every re-ingest of its document.
+        let structure: Value = serde_json::from_str(&parsed.doco).expect("doco is JSON");
+        let unreached: Vec<String> = structure["@graph"]
+            .as_array()
+            .expect("@graph")
+            .iter()
+            .filter_map(id_of)
+            .filter(|id| !stamped.contains(id) && !cells.contains(id))
+            .collect();
+        assert!(
+            unreached.is_empty(),
+            "re-ingest would leave these structure nodes behind — stamp them \
+             or reach them in retract_update: {unreached:?}"
+        );
+
         let mut seen: std::collections::BTreeSet<String> = Default::default();
         let mut leaked: Vec<String> = Vec::new();
-        for node in tx["@graph"].as_array().expect("@graph") {
+        for node in nodes {
             let map = node.as_object().expect("node");
-            let is_document = map.get("@id").and_then(Value::as_str) == Some(doc_iri);
-            let is_stamped = map.contains_key(vocab::SOURCE_DOCUMENT);
-            if !is_document && !is_stamped {
+            let id = map.get("@id").and_then(Value::as_str).unwrap_or_default();
+            if !stamped.contains(id) && !cells.contains(id) {
                 continue;
             }
             for key in map.keys() {
@@ -539,8 +615,13 @@ Closing paragraph.
             "rdf:subject",  // the reification triple
             "nif:isString", // structure elements
             "po:contains",  // the structure spine
+            "po:containsAsHeader",
             "rdfs:label",
             "doc:xhtmlTag",
+            "doc:cellValue", // table cells, reached through their table
+            "dcterms:title", // what the file declares, on the root
+            "dcterms:creator",
+            "doc:sourceName",
         ] {
             assert!(
                 seen.contains(required),
@@ -555,20 +636,20 @@ Closing paragraph.
         let chunks = vec![Chunk {
             header_path: vec!["A".into(), "B".into()],
             text: "body".into(),
-            source_ids: vec!["urn:x/element/1".into()],
+            source_ids: vec!["urn:x-element-1".into()],
             spans: Vec::new(),
         }];
         let emb = vec![vec![0.5f32, 0.25]];
         let nodes = chunk_nodes("urn:x", &chunks, Some(&emb));
-        assert_eq!(nodes[0]["@id"], "urn:x/chunk/0");
+        assert_eq!(nodes[0]["@id"], "urn:x-chunk-0");
         assert_eq!(nodes[0]["doc:headerPath"], "A / B");
         assert_eq!(nodes[0]["doc:embedding"]["@type"], "@vector");
-        assert_eq!(nodes[0]["doc:sourceElement"][0], "urn:x/element/1");
+        assert_eq!(nodes[0]["doc:sourceElement"][0], "urn:x-element-1");
     }
 
     #[test]
     fn transaction_merges_graphs() {
-        let doco = r#"{"@context":{},"@graph":[{"@id":"e0","@type":"doco:Document"}]}"#;
+        let doco = r#"{"@context":{},"@graph":[{"@id":"e0","@type":"foaf:Document"}]}"#;
         let tx = transaction(
             doco,
             json!({"@id":"d"}),
@@ -584,6 +665,39 @@ Closing paragraph.
             .collect();
         assert_eq!(ids, vec!["e0", "d", "c0", "m0"]);
         assert_eq!(tx["@context"]["doc"], vocab::DOC_NS);
+    }
+
+    /// The engine's graph is written in its own context. Every term it
+    /// defines must reach the transaction as it defined it: a lost `@id`
+    /// coercion stores a reference as a string, and a lost prefix stores
+    /// `foaf:Document` as an IRI of the scheme `foaf`.
+    #[test]
+    fn transaction_keeps_the_engines_context() {
+        let doco = fluree_doc_model::to_doco(
+            &[fluree_doc_model::Element::new(
+                "doco:Paragraph",
+                "Text.",
+                "rust",
+                "layout",
+            )],
+            &fluree_doc_model::DocoOptions {
+                base_iri: "urn:x".into(),
+                ..Default::default()
+            },
+        );
+        let engine: Value = serde_json::from_str(&doco).unwrap();
+        let engine = engine["@context"].as_object().expect("engine context");
+        assert!(
+            engine.contains_key("foaf") && engine.contains_key("po:containsAsHeader"),
+            "the fixture no longer exercises the terms this guards: {engine:?}"
+        );
+        let tx = transaction(&doco, json!({"@id":"d"}), vec![], vec![]).unwrap();
+        for (term, definition) in engine {
+            assert_eq!(
+                &tx["@context"][term], definition,
+                "the transaction redefines or drops the engine's `{term}`"
+            );
+        }
     }
 
     #[test]

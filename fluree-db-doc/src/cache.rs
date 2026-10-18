@@ -46,6 +46,8 @@ struct ParseMeta {
     escalated_crops: usize,
     #[serde(default)]
     escalation_skipped: Option<String>,
+    #[serde(default)]
+    notes: Vec<String>,
 }
 
 /// Bumped when the way an extraction is asked changes without the prompt
@@ -87,6 +89,7 @@ impl DocCache {
             elements: meta.elements,
             escalated_crops: meta.escalated_crops,
             escalation_skipped: meta.escalation_skipped,
+            notes: meta.notes,
             from_cache: true,
         })
     }
@@ -99,6 +102,7 @@ impl DocCache {
             elements: doc.elements,
             escalated_crops: doc.escalated_crops,
             escalation_skipped: doc.escalation_skipped.clone(),
+            notes: doc.notes.clone(),
         };
         // Write into place last so a torn write never reads as a hit.
         fs::write(dir.join("text.txt"), &doc.text)?;
@@ -191,6 +195,7 @@ mod tests {
             elements: 3,
             escalated_crops: 1,
             escalation_skipped: None,
+            notes: vec!["page 2 unread".into()],
             from_cache: false,
         };
         assert!(cache.load_parse("abc", "fp").is_none());
@@ -199,6 +204,7 @@ mod tests {
         assert!(hit.from_cache);
         assert_eq!(hit.text, "hello");
         assert_eq!(hit.pages, 2);
+        assert_eq!(hit.notes, doc.notes);
         assert!(cache.load_parse("abc", "other").is_none());
         fs::remove_dir_all(dir).ok();
     }
