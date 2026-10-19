@@ -323,6 +323,7 @@ fn apply_range_filter(flakes: &mut Vec<Flake>, test: RangeTest, match_val: &Rang
 fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
     // Object bounds (post-filter) — used by datetime resolution (`ledger#time > target`).
     if let Some(bounds) = opts.object_bounds.as_ref() {
+        let bounds = bounds.prepare();
         flakes.retain(|f| bounds.matches(&f.o, &f.dt));
     }
 
@@ -1042,6 +1043,68 @@ mod tests {
             ..after
         };
         assert!(after.matches(&day, &Sid::xsd_string()));
+    }
+
+    /// Prepared bounds answer exactly as the bounds do: the string bound is
+    /// read as each temporal kind once and reused, including for a second
+    /// object of one kind and for objects of several kinds.
+    #[test]
+    fn test_prepared_bounds_answer_as_the_bounds_do() {
+        use crate::temporal::{Date, DateTime, Time};
+        let s = |v: &str| FlakeValue::String(v.to_string());
+        let dt = |v: &str| FlakeValue::DateTime(Box::new(DateTime::parse(v).unwrap()));
+        let values: Vec<(FlakeValue, Sid)> = vec![
+            (
+                dt("2026-01-01T10:00:00Z"),
+                Sid::new(fluree_vocab::namespaces::XSD, "dateTime"),
+            ),
+            (
+                dt("2026-03-01T10:00:00Z"),
+                Sid::new(fluree_vocab::namespaces::XSD, "dateTime"),
+            ),
+            (
+                FlakeValue::Date(Box::new(Date::parse("2026-01-01").unwrap())),
+                Sid::new(fluree_vocab::namespaces::XSD, "date"),
+            ),
+            (
+                FlakeValue::Time(Box::new(Time::parse("10:00:00").unwrap())),
+                Sid::new(fluree_vocab::namespaces::XSD, "time"),
+            ),
+            (s("2026-01-01T10:00:00Z"), Sid::xsd_string()),
+            (
+                s("2026-01-01"),
+                Sid::new(fluree_vocab::namespaces::RDF, "langString"),
+            ),
+            (FlakeValue::Long(5), Sid::xsd_integer()),
+        ];
+        let ordered = |b: ObjectBounds| ObjectBounds {
+            temporal_string_ordering: true,
+            ..b
+        };
+        for bounds in [
+            ordered(ObjectBounds::new().with_upper(s("2026-02-01T00:00:00Z"), false)),
+            ordered(ObjectBounds::new().with_lower(s("2026-01-01"), true)),
+            ordered(
+                ObjectBounds::new()
+                    .with_lower(s("09:00:00"), false)
+                    .with_upper(s("11:00:00"), true),
+            ),
+            ordered(ObjectBounds::new().with_upper(dt("2026-02-01T00:00:00Z"), false)),
+            ObjectBounds::new()
+                .with_lower(s("2026-01-01T10:00:00Z"), true)
+                .with_upper(s("2026-01-01T10:00:00Z"), true),
+        ] {
+            let prepared = bounds.prepare();
+            for _ in 0..2 {
+                for (value, dt) in &values {
+                    assert_eq!(
+                        prepared.matches(value, dt),
+                        bounds.matches(value, dt),
+                        "{bounds:?} on {value:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Sorted-vec overlay that records the bounds each walk received and

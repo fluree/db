@@ -1420,6 +1420,10 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Prepared once per batch: a string bound ordered against temporal
+        // rows is parsed once per temporal kind, not per row.
+        let object_bounds = self.object_bounds.clone();
+        let object_bounds = object_bounds.as_ref().map(ObjectBounds::prepare);
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1506,7 +1510,7 @@ impl BinaryScanOperator {
                 }
             }
 
-            if let Some(bounds) = &self.object_bounds {
+            if let Some(bounds) = &object_bounds {
                 let Some(val) = decoded_o.as_ref() else {
                     return Err(QueryError::Internal(
                         "object bounds require object decoding".to_string(),
@@ -1908,6 +1912,7 @@ impl BinaryScanOperator {
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
+            let bounds = bounds.prepare();
             flakes.retain(|f| bounds.matches(&f.o, &f.dt));
         }
 

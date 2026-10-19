@@ -991,6 +991,7 @@ fn binary_range_eq_v3(
     resolved.retain(|f| flake_matches_range_eq(f, match_val));
 
     if let Some(bounds) = &opts.object_bounds {
+        let bounds = bounds.prepare();
         resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
@@ -1604,6 +1605,7 @@ fn binary_range_bounded_v3(
     resolved.retain(|f| f.s >= start_bound.s && f.s < end_bound.s);
 
     if let Some(bounds) = &opts.object_bounds {
+        let bounds = bounds.prepare();
         resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
@@ -1657,6 +1659,7 @@ fn overlay_only_flakes_bounded(
 
     // Apply options after lifecycle resolution.
     if let Some(ref bounds) = opts.object_bounds {
+        let bounds = bounds.prepare();
         resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {

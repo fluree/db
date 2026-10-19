@@ -3,6 +3,7 @@
 //! These types define the query interface (what to match, how to compare,
 //! query options) and are independent of the underlying index implementation.
 
+use std::cell::OnceCell;
 use std::sync::{Arc, LazyLock};
 
 use crate::o_type::OType;
@@ -222,16 +223,18 @@ impl ObjectBounds {
     /// - Temporal types are only comparable within the same kind (Date vs Date, etc.)
     /// - A string bound compares only against an `xsd:string` object
     /// - Other types require exact type match
+    ///
+    /// To test many objects, [`Self::prepare`] the bounds once.
     #[inline]
     pub fn matches(&self, value: &FlakeValue, dt: &Sid) -> bool {
-        self.matches_object(value, || crate::datatypes::is_xsd_string_datatype(dt))
+        self.matches_object(value, || crate::datatypes::is_xsd_string_datatype(dt), None)
     }
 
     /// [`Self::matches`] for a binary-index row, whose datatype is its
     /// `o_type`.
     #[inline]
     pub fn matches_encoded(&self, value: &FlakeValue, o_type: OType) -> bool {
-        self.matches_object(value, || o_type == OType::XSD_STRING)
+        self.matches_object(value, || o_type == OType::XSD_STRING, None)
     }
 
     /// [`Self::matches`] for a number, whose datatype the bounds never
@@ -240,16 +243,31 @@ impl ObjectBounds {
     /// a non-`xsd:string` object, so it can only fail a string bound.
     #[inline]
     pub fn matches_number(&self, value: &FlakeValue) -> bool {
-        self.matches_object(value, || false)
+        self.matches_object(value, || false, None)
+    }
+
+    /// The bounds set up to test many objects: a string bound that orders a
+    /// temporal object is read as each temporal kind once, not once per
+    /// object.
+    pub fn prepare(&self) -> PreparedBounds<'_> {
+        PreparedBounds {
+            bounds: self,
+            lexicals: Default::default(),
+        }
     }
 
     // Forced: under fat LTO the generic body otherwise stays a call per
     // bound, which cost a numeric range scan ~2% (release A/B).
     #[inline(always)]
-    fn matches_object(&self, value: &FlakeValue, is_xsd_string: impl Fn() -> bool) -> bool {
+    fn matches_object(
+        &self,
+        value: &FlakeValue,
+        is_xsd_string: impl Fn() -> bool,
+        lexicals: Option<&BoundLexicals>,
+    ) -> bool {
         // Check lower bound
         if let Some((lower, inclusive)) = &self.lower {
-            match self.class_cmp(value, lower, &is_xsd_string) {
+            match self.class_cmp(value, lower, &is_xsd_string, lexicals.map(|l| &l[0])) {
                 None => return false, // Incompatible types
                 Some(std::cmp::Ordering::Less) => return false,
                 Some(std::cmp::Ordering::Equal) if !inclusive => return false,
@@ -259,7 +277,7 @@ impl ObjectBounds {
 
         // Check upper bound
         if let Some((upper, inclusive)) = &self.upper {
-            match self.class_cmp(value, upper, &is_xsd_string) {
+            match self.class_cmp(value, upper, &is_xsd_string, lexicals.map(|l| &l[1])) {
                 None => return false, // Incompatible types
                 Some(std::cmp::Ordering::Greater) => return false,
                 Some(std::cmp::Ordering::Equal) if !inclusive => return false,
@@ -285,6 +303,7 @@ impl ObjectBounds {
         value: &FlakeValue,
         bound: &FlakeValue,
         is_xsd_string: &impl Fn() -> bool,
+        lexicals: Option<&[OnceCell<Option<FlakeValue>>; TEMPORAL_KINDS]>,
     ) -> Option<std::cmp::Ordering> {
         // Numeric class: all numeric types are comparable
         if value.is_numeric() && bound.is_numeric() {
@@ -310,7 +329,20 @@ impl ObjectBounds {
         // a tagged or otherwise-typed literal is a term of its own type.
         let plain = || !matches!(value, FlakeValue::String(_)) || is_xsd_string();
         if self.temporal_string_ordering && plain() {
-            if let Some(ordering) = temporal::cmp_with_lexical(value, bound) {
+            let ordering = match (lexicals, bound) {
+                // A temporal object against a string bound: the bound read as
+                // the object's kind, parsed on the kind's first object.
+                (Some(cells), FlakeValue::String(lexical)) => {
+                    temporal_kind(value).and_then(|kind| {
+                        cells[kind]
+                            .get_or_init(|| temporal::lexical_as_kind_of(value, lexical))
+                            .as_ref()
+                            .and_then(|parsed| value.temporal_cmp(parsed))
+                    })
+                }
+                _ => temporal::cmp_with_lexical(value, bound),
+            };
+            if let Some(ordering) = ordering {
                 return Some(ordering);
             }
         }
@@ -358,6 +390,56 @@ impl ObjectBounds {
     /// Returns true if no bounds are set
     pub fn is_empty(&self) -> bool {
         self.lower.is_none() && self.upper.is_none()
+    }
+}
+
+/// The temporal kinds a string can be read as: `DateTime`, `Date`, `Time`
+/// and the five gregorian ones.
+const TEMPORAL_KINDS: usize = 8;
+
+/// A string bound read as each temporal kind, `[lower, upper][kind]`.
+type BoundLexicals = [[OnceCell<Option<FlakeValue>>; TEMPORAL_KINDS]; 2];
+
+/// Index of a temporal value's kind in [`BoundLexicals`].
+fn temporal_kind(value: &FlakeValue) -> Option<usize> {
+    Some(match value {
+        FlakeValue::DateTime(_) => 0,
+        FlakeValue::Date(_) => 1,
+        FlakeValue::Time(_) => 2,
+        FlakeValue::GYear(_) => 3,
+        FlakeValue::GYearMonth(_) => 4,
+        FlakeValue::GMonth(_) => 5,
+        FlakeValue::GDay(_) => 6,
+        FlakeValue::GMonthDay(_) => 7,
+        _ => return None,
+    })
+}
+
+/// [`ObjectBounds`] ready to test many objects ([`ObjectBounds::prepare`]):
+/// it answers exactly as the bounds do, reading a string bound as each
+/// temporal kind once ([`temporal::lexical_as_kind_of`]) instead of once per
+/// temporal object.
+pub struct PreparedBounds<'a> {
+    bounds: &'a ObjectBounds,
+    lexicals: BoundLexicals,
+}
+
+impl PreparedBounds<'_> {
+    /// [`ObjectBounds::matches`].
+    #[inline]
+    pub fn matches(&self, value: &FlakeValue, dt: &Sid) -> bool {
+        self.bounds.matches_object(
+            value,
+            || crate::datatypes::is_xsd_string_datatype(dt),
+            Some(&self.lexicals),
+        )
+    }
+
+    /// [`ObjectBounds::matches_encoded`].
+    #[inline]
+    pub fn matches_encoded(&self, value: &FlakeValue, o_type: OType) -> bool {
+        self.bounds
+            .matches_object(value, || o_type == OType::XSD_STRING, Some(&self.lexicals))
     }
 }
 

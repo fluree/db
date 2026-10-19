@@ -1734,18 +1734,35 @@ pub fn cmp_with_lexical(
         (held, FlakeValue::String(s)) => (held, s.as_str(), false),
         _ => return None,
     };
-    let ord = match held {
-        FlakeValue::DateTime(v) => v.as_ref().cmp(&DateTime::parse(lexical).ok()?),
-        FlakeValue::Time(v) => v.as_ref().cmp(&Time::parse(lexical).ok()?),
-        FlakeValue::Date(v) => v.as_ref().cmp(&Date::parse(lexical).ok()?),
-        FlakeValue::GYear(v) => v.as_ref().cmp(&GYear::parse(lexical).ok()?),
-        FlakeValue::GYearMonth(v) => v.as_ref().cmp(&GYearMonth::parse(lexical).ok()?),
-        FlakeValue::GMonth(v) => v.as_ref().cmp(&GMonth::parse(lexical).ok()?),
-        FlakeValue::GDay(v) => v.as_ref().cmp(&GDay::parse(lexical).ok()?),
-        FlakeValue::GMonthDay(v) => v.as_ref().cmp(&GMonthDay::parse(lexical).ok()?),
-        _ => return None,
-    };
+    let ord = held.temporal_cmp(&lexical_as_kind_of(held, lexical)?)?;
     Some(if flipped { ord.reverse() } else { ord })
+}
+
+/// `lexical` read as a value of `held`'s temporal kind: the one reading
+/// [`cmp_with_lexical`] orders by. A caller comparing many values against
+/// one lexical parses it once per kind with this and orders with
+/// `held.temporal_cmp(&parsed)`, which is the same comparison. `None` when
+/// `held` is not one of these kinds or the lexical does not parse as it.
+pub fn lexical_as_kind_of(
+    held: &crate::value::FlakeValue,
+    lexical: &str,
+) -> Option<crate::value::FlakeValue> {
+    use crate::value::FlakeValue;
+    Some(match held {
+        FlakeValue::DateTime(_) => FlakeValue::DateTime(Box::new(DateTime::parse(lexical).ok()?)),
+        FlakeValue::Time(_) => FlakeValue::Time(Box::new(Time::parse(lexical).ok()?)),
+        FlakeValue::Date(_) => FlakeValue::Date(Box::new(Date::parse(lexical).ok()?)),
+        FlakeValue::GYear(_) => FlakeValue::GYear(Box::new(GYear::parse(lexical).ok()?)),
+        FlakeValue::GYearMonth(_) => {
+            FlakeValue::GYearMonth(Box::new(GYearMonth::parse(lexical).ok()?))
+        }
+        FlakeValue::GMonth(_) => FlakeValue::GMonth(Box::new(GMonth::parse(lexical).ok()?)),
+        FlakeValue::GDay(_) => FlakeValue::GDay(Box::new(GDay::parse(lexical).ok()?)),
+        FlakeValue::GMonthDay(_) => {
+            FlakeValue::GMonthDay(Box::new(GMonthDay::parse(lexical).ok()?))
+        }
+        _ => return None,
+    })
 }
 
 /// Fold a Cypher temporal constructor with a constant lexical argument into a
