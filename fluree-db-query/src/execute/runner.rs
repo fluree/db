@@ -721,6 +721,8 @@ pub struct ContextConfig<'a, 'b> {
     /// set only by the graph-source browse-crawl path. See
     /// [`ExecutionContext::trust_fk_refs`].
     pub trust_fk_refs: bool,
+    /// See [`ExecutionContext::path_pair_limit`].
+    pub path_pair_limit: Option<usize>,
     /// Binary columnar index store for `BinaryScanOperator`.
     ///
     /// This is the explicit path — separate from `LedgerSnapshot.range_provider` which
@@ -903,6 +905,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     if config.trust_fk_refs {
         ctx = ctx.with_trust_fk_refs(true);
+    }
+    if let Some(limit) = config.path_pair_limit {
+        ctx = ctx.with_path_pair_limit(limit);
     }
     if let Some(store) = config.binary_store {
         ctx = ctx.with_binary_store(store, config.binary_g_id);

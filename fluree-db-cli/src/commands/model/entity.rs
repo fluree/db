@@ -6,10 +6,9 @@
 //! form fields can be generated from it, and access policies stay thin
 //! class-verb grants because the shape owns the property surface.
 //!
-//! Enforcement note: Fluree runs SHACL at transaction time once any shapes
-//! exist in a ledger (reject mode by default — the "shapes-exist"
-//! heuristic; a config graph can override per graph). Defining an entity is
-//! therefore not just documentation: it activates validation for its class.
+//! Enforcement note: Fluree runs SHACL at transaction time only where the
+//! ledger config enables it (`f:shaclEnabled true`, ledger-wide or per graph).
+//! Defining an entity does not by itself activate validation for its class.
 
 use std::collections::HashMap;
 
@@ -332,9 +331,10 @@ async fn run_define(
 
     println!("\nDefined. Shape written to '{dataset}'.");
     println!(
-        "note: SHACL validation is ACTIVE once shapes exist (reject mode by default) —\n\
-         \x20     transactions violating this shape will be rejected. Existing data is\n\
-         \x20     not retro-validated; `fluree validate` produces a full report."
+        "note: shapes are enforced only where the ledger config enables SHACL\n\
+         \x20     (f:shaclEnabled true); there, transactions violating this shape are\n\
+         \x20     rejected. Existing data is not retro-validated; `fluree validate`\n\
+         \x20     produces a full report."
     );
     println!(
         "next: fluree model access enable {dataset} --profile write --class {entity}\n\

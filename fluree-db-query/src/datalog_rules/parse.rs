@@ -4,10 +4,10 @@
 //! The body goes through the same parser and lowering as a query's `WHERE`
 //! clause; the heads are parsed here. See docs/design/rules-engine.md.
 
-use super::{rule_iri, validate, DatalogRule, HeadTerm, RuleBody, RuleHead};
+use super::{rule_iri, validate, DatalogRule, HeadTerm, RuleBody, RuleFootprint, RuleHead};
 use crate::error::{QueryError, Result};
 use crate::ir::reasoning::ReasoningConfig;
-use crate::ir::{Pattern, Query, QueryOutput, Ref, Term, TriplePattern};
+use crate::ir::{Query, QueryOutput, Ref, Term, TriplePattern};
 use crate::lang_support::SparqlRuleParts;
 use crate::parse::ast::UnresolvedQuery;
 use crate::parse::policy::resolve_parse_policy;
@@ -273,59 +273,15 @@ fn build_rule(
     query.order_binds.clear();
     query.grouping = None;
 
-    let mut depends_on = Vec::new();
-    collect_predicates(&query.patterns, &mut depends_on);
-    let generates = heads
-        .iter()
-        .filter_map(|h| match &h.predicate {
-            HeadTerm::Sid(sid) => Some(sid.clone()),
-            _ => None,
-        })
-        .collect();
-
+    let footprint = RuleFootprint::of(&query, &heads, snapshot);
     Ok(DatalogRule {
         id,
         name: label,
         body: RuleBody { query, vars },
         heads,
-        depends_on,
-        generates,
+        footprint,
         source: Arc::from(source),
     })
-}
-
-/// Constant predicates a body reads, for the execution-order heuristic.
-fn collect_predicates(patterns: &[Pattern], out: &mut Vec<Sid>) {
-    for pattern in patterns {
-        match pattern {
-            Pattern::Triple(tp) => {
-                if let Ref::Sid(p) = &tp.p {
-                    if !out.contains(p) {
-                        out.push(p.clone());
-                    }
-                }
-            }
-            Pattern::EdgeAnnotation { edge, body, .. }
-            | Pattern::AnnotationTarget { edge, body, .. } => {
-                if let Ref::Sid(p) = &edge.p {
-                    if !out.contains(p) {
-                        out.push(p.clone());
-                    }
-                }
-                collect_predicates(body, out);
-            }
-            Pattern::Union(branches) => {
-                for branch in branches {
-                    collect_predicates(branch, out);
-                }
-            }
-            Pattern::Graph { patterns, .. }
-            | Pattern::DefaultGraphSource { patterns }
-            | Pattern::Exists(patterns) => collect_predicates(patterns, out),
-            Pattern::Subquery(sub) => collect_predicates(&sub.patterns, out),
-            _ => {}
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
