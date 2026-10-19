@@ -1281,8 +1281,10 @@ the same way a query's `FROM` does: the ledger's own address (`mydb`,
 `mydb:main`, `urn:fluree:mydb:main`) names its default graph, `mydb:main#config`
 or its URN names the config graph, and a registered graph IRI names that graph.
 A graph the ledger does not have contributes nothing, so `WHERE` over it binds
-nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). Another
-ledger's address, or an address with a time pin, is refused with a 400.
+nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). That
+includes an IRI that also reads as another ledger's address (`urn:g1`,
+`other:main`). An address that can only name another ledger (`other`,
+`other@t:1`), or an address with a time pin, is refused with a 400.
 
 A `GRAPH <iri>` block in the `WHERE` or in a template, and an `INSERT DATA` /
 `DELETE DATA` quad, read the address the same way: `mydb:main` is the default

@@ -2860,8 +2860,11 @@ async fn stream_where_into_accumulator(
     // default graph, `L#config` or its URN the config graph, and a registered
     // IRI its graph. A graph the ledger does not have is `None`: it contributes
     // nothing (SPARQL 1.1 Update §3.1.3, Query §13.2), so a WHERE over it binds
-    // nothing. Another ledger, or a time pin, is a caller error: the WHERE
-    // reads this ledger as it stands.
+    // nothing. That includes an IRI that also reads as another ledger's
+    // address (`urn:g1`, `ex:g`): it is a graph IRI too, and one this ledger
+    // has no graph under. Only a definite address of another ledger (`other`,
+    // no scheme), or a time pin, is a caller error: the WHERE reads this
+    // ledger as it stands.
     let target_ledger = &ledger.snapshot.ledger_id;
     let where_graph = |iri: &str| -> Result<Option<GraphId>> {
         let member = MemberRef::parse(iri)
@@ -2874,7 +2877,9 @@ async fn stream_where_into_accumulator(
         }
         match TargetLedger::new(target_ledger, &graph_names).resolve(iri, &member, false) {
             Ok(graph) => Ok(Some(graph.g_id)),
-            Err(TargetError::GraphNotFound(_)) => Ok(None),
+            Err(
+                TargetError::GraphNotFound(_) | TargetError::CrossLedger { also_iri: true, .. },
+            ) => Ok(None),
             Err(TargetError::CrossLedger { named, .. }) => Err(TransactError::Parse(format!(
                 "WHERE dataset graph <{iri}> names ledger '{named}', but an update's WHERE \
                  reads only its own ledger ('{target_ledger}')"

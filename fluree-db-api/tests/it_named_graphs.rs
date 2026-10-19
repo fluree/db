@@ -5269,8 +5269,11 @@ enum WhereUpdate<'a> {
 /// binds nothing (SPARQL 1.1 Update §3.1.3, Query §13.2). An unknown graph
 /// used to read the real default graph, so a DELETE emptied it; a
 /// multi-`USING` dropped the ledger's address; JSON-LD refused
-/// `"from": "L:main"` as an undefined prefix. Another ledger, or a
-/// pinned address, is refused.
+/// `"from": "L:main"` as an undefined prefix. An IRI that also reads as
+/// another ledger's address (`urn:g1`, `ex:g`, `w-other-ledger:main`) is a
+/// graph IRI too, one the ledger has no graph under, so it contributes
+/// nothing, as a SPARQL `USING` of it did on `main`. An address that can only
+/// name another ledger (`w-other-ledger`), or a pinned address, is refused.
 #[tokio::test]
 async fn update_where_dataset_references_resolve_in_the_transactions_ledger() {
     use WhereExpect::{Counts, Refused};
@@ -5304,12 +5307,31 @@ async fn update_where_dataset_references_resolve_in_the_transactions_ledger() {
         ("USING the ledger's URN", delete_using("USING <URN>"), Counts([0, 1, 0])),
         ("USING <L#config>", delete_using("USING <LEDGER#config>"), Counts([2, 1, 0])),
         ("USING the config URN", delete_using("USING <URN#config>"), Counts([2, 1, 0])),
-        ("another ledger", delete_using("USING <w-other-ledger:main>"), Refused("names ledger")),
+        ("another ledger", delete_using("USING <w-other-ledger>"), Refused("names ledger")),
         ("a pinned address", delete_using("USING <LEDGER@t:1>"), Refused("pins a time")),
         (
             "USING NAMED another ledger",
-            delete_using("USING NAMED <w-other-ledger:main>"),
+            delete_using("USING NAMED <w-other-ledger>"),
             Refused("names ledger"),
+        ),
+        ("USING <urn:g1>, a graph the ledger lacks", delete_using("USING <urn:g1>"), Counts([2, 1, 0])),
+        (
+            "USING an IRI that also reads as another ledger",
+            delete_using("USING <w-other-ledger:main>"),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "USING NAMED <eg:g>, a graph the ledger lacks",
+            format!(
+                "{ex}DELETE {{ ?s ex:v ?o }} USING NAMED <eg:g> \
+                 WHERE {{ GRAPH <eg:g> {{ ?s ex:v ?o }} }}"
+            ),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "USING NAMED an IRI that also reads as another ledger",
+            delete_using("USING NAMED <w-other-ledger:main>"),
+            Counts([2, 1, 0]),
         ),
     ];
     let v = json!({"@id": "?s", "ex:v": "?o"});
@@ -5352,13 +5374,28 @@ async fn update_where_dataset_references_resolve_in_the_transactions_ledger() {
         ),
         (
             "another ledger",
-            json!({"from": "w-other-ledger:main", "where": v, "delete": v}),
+            json!({"from": "w-other-ledger", "where": v, "delete": v}),
             Refused("names ledger"),
         ),
         (
             "a pinned address",
             json!({"from": "LEDGER@t:1", "where": v, "delete": v}),
             Refused("pins a time"),
+        ),
+        (
+            "from <urn:g1>, a graph the ledger lacks",
+            json!({"from": "urn:g1", "where": v, "delete": v}),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "from an IRI that also reads as another ledger",
+            json!({"from": "w-other-ledger:main", "where": v, "delete": v}),
+            Counts([2, 1, 0]),
+        ),
+        (
+            "fromNamed <urn:g1>, a graph the ledger lacks",
+            json!({"fromNamed": ["urn:g1"], "where": [["graph", "urn:g1", v]], "delete": v}),
+            Counts([2, 1, 0]),
         ),
     ];
 
