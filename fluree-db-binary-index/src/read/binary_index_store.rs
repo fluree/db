@@ -2357,6 +2357,42 @@ impl BinaryIndexStore {
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
     }
 
+    /// The `Sid` of the persisted subject `s_id`: what
+    /// [`Self::find_subject_sid`] gives for its IRI, else
+    /// [`Self::encode_iri`]. The one recipe for decoding a persisted subject.
+    ///
+    /// `find_subject_sid` looks the IRI's canonical key up in the reverse
+    /// dictionary. When that key is `s_id`'s own, the lookup is skipped: the
+    /// key is `s_id`'s forward entry, which the reverse dictionary holds too,
+    /// so the lookup could only confirm it (and with no reverse dictionary,
+    /// `encode_iri` gives the same `Sid`). Any other split takes the lookup:
+    /// a full-IRI namespace, or a canonical prefix that maps to another code
+    /// than the one `s_id` was stored under.
+    pub fn persisted_subject_sid(&self, s_id: u64) -> io::Result<Sid> {
+        let iri = self.resolve_subject_iri(s_id)?;
+        if let Some(sid) = self.subject_sid_from_own_key(s_id, &iri) {
+            return Ok(sid);
+        }
+        Ok(self
+            .find_subject_sid(&iri)?
+            .unwrap_or_else(|| self.encode_iri(&iri)))
+    }
+
+    /// `Sid(code, suffix)` when `iri`'s canonical split is `s_id`'s own key:
+    /// the prefix is the one `s_id`'s namespace code stands for, and maps back
+    /// to that code. `None` otherwise.
+    fn subject_sid_from_own_key(&self, s_id: u64, iri: &str) -> Option<Sid> {
+        let ns_code = fluree_db_core::subject_id::SubjectId::from_u64(s_id).ns_code();
+        if namespaces::is_full_iri(ns_code) {
+            return None;
+        }
+        let (prefix, suffix) = canonical_split(iri, self.ns_split_mode);
+        let own_prefix = self.dicts.namespace_codes.get(&ns_code)?;
+        (own_prefix.as_str() == prefix
+            && self.dicts.namespace_reverse.get(prefix) == Some(&ns_code))
+        .then(|| Sid::new(ns_code, suffix))
+    }
+
     /// Translate a `Sid` to `p_id` via the predicate reverse map.
     ///
     /// Returns `None` if the namespace code is unknown or the predicate
@@ -3247,12 +3283,7 @@ impl BinaryGraphView {
         }
         // Persisted forward-pack lookup; charge before the I/O.
         self.charge_dict_touch()?;
-        let iri = self.store.resolve_subject_iri(s_id)?;
-        if let Some(sid) = self.store.find_subject_sid(&iri)? {
-            Ok(sid)
-        } else {
-            Ok(self.store.encode_iri(&iri))
-        }
+        self.store.persisted_subject_sid(s_id)
     }
 
     pub fn store(&self) -> &BinaryIndexStore {
@@ -5382,6 +5413,143 @@ pub(crate) mod tests {
             assert!(err.to_string().contains("no namespace prefix for code=102"));
             let missing = SubjectId::new(namespaces::OVERFLOW, 999).as_u64();
             assert!(view.resolve_subject_iri(missing).is_err());
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
+    /// A store whose namespace maps are exactly `codes` and `reverse`, whose
+    /// forward subject packs hold `subjects` (`(ns_code, local_id, suffix)`),
+    /// and whose reverse tree holds those keys when `with_reverse_tree`.
+    fn store_with_subjects(
+        codes: &[(u16, &str)],
+        reverse: &[(&str, u16)],
+        subjects: &[(u16, u64, &str)],
+        with_reverse_tree: bool,
+    ) -> (BinaryIndexStore, PathBuf) {
+        let cache_dir = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+        store.dicts.namespace_codes = Arc::new(
+            codes
+                .iter()
+                .map(|&(code, prefix)| (code, prefix.to_string()))
+                .collect(),
+        );
+        store.dicts.namespace_reverse = Arc::new(
+            reverse
+                .iter()
+                .map(|&(prefix, code)| (prefix.to_string(), code))
+                .collect(),
+        );
+        let mut by_ns: std::collections::BTreeMap<u16, Vec<(u64, &[u8])>> = Default::default();
+        for &(ns_code, local_id, suffix) in subjects {
+            by_ns
+                .entry(ns_code)
+                .or_default()
+                .push((local_id, suffix.as_bytes()));
+        }
+        for (ns_code, entries) in by_ns {
+            let bytes =
+                encode_forward_pack(&entries, KIND_SUBJECT_FWD, ns_code, 256 * 1024).unwrap();
+            store.dicts.subject_forward_packs.insert(
+                ns_code,
+                ForwardPackReader::from_memory(vec![Arc::from(bytes.into_boxed_slice())]).unwrap(),
+            );
+        }
+        if with_reverse_tree {
+            let mut entries: Vec<ReverseEntry> = subjects
+                .iter()
+                .map(|&(ns_code, local_id, suffix)| ReverseEntry {
+                    key: crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes()),
+                    id: SubjectId::new(ns_code, local_id).as_u64(),
+                })
+                .collect();
+            // The tree is searched by key, so it is built in key order.
+            entries.sort_by(|a, b| a.key.cmp(&b.key));
+            store.dicts.subject_reverse_tree = Some(Arc::new(build_reverse_reader(entries)));
+        }
+        (store, cache_dir)
+    }
+
+    /// The recipe `persisted_subject_sid` replaces, with every lookup.
+    fn subject_sid_by_reverse_lookup(store: &BinaryIndexStore, s_id: u64) -> Sid {
+        let iri = store.resolve_subject_iri(s_id).unwrap();
+        store
+            .find_subject_sid(&iri)
+            .unwrap()
+            .unwrap_or_else(|| store.encode_iri(&iri))
+    }
+
+    /// `persisted_subject_sid` skips the reverse lookup only when the IRI's
+    /// canonical key is the subject's own, and gives what the lookup gives
+    /// in every case: the own key; a prefix registered after the subject,
+    /// longer than the one it was stored under; the EMPTY and OVERFLOW
+    /// full-IRI namespaces; one prefix under two codes; no reverse tree.
+    #[test]
+    fn persisted_subject_sid_skips_only_its_own_key_lookup() {
+        let ex = "http://ex.org/";
+        let ex_a = "http://ex.org/a/";
+        let dup = "http://dup.org/";
+        let codes = [
+            (namespaces::EMPTY, ""),
+            (5, ex),
+            (9, ex_a),
+            (6, dup),
+            (7, dup),
+        ];
+        // One prefix under two codes: the reverse map names 6.
+        let reverse = [("", namespaces::EMPTY), (ex, 5), (ex_a, 9), (dup, 6)];
+        let subjects = [
+            // Stored under its canonical key.
+            (5, 1, "x"),
+            // Stored under `ex` before `ex_a` was registered: its canonical
+            // split is now `ex_a` + "b", code 9, not the 5 it carries.
+            (5, 2, "a/b"),
+            // A full IRI in the EMPTY namespace, and in OVERFLOW.
+            (namespaces::EMPTY, 3, "http://elsewhere.org/q"),
+            (namespaces::OVERFLOW, 4, "http://overflow.org/r"),
+            // Stored under the code the reverse map does not name for `dup`.
+            (7, 5, "z"),
+        ];
+        let s = |ns_code: u16, local: u64| SubjectId::new(ns_code, local).as_u64();
+        // (subject, the Sid, whether the reverse lookup is skipped)
+        let cases = [
+            (s(5, 1), Sid::new(5, "x"), true),
+            (s(5, 2), Sid::new(9, "b"), false),
+            (
+                s(namespaces::EMPTY, 3),
+                Sid::new(namespaces::EMPTY, "http://elsewhere.org/q"),
+                false,
+            ),
+            (
+                s(namespaces::OVERFLOW, 4),
+                Sid::new(namespaces::OVERFLOW, "http://overflow.org/r"),
+                false,
+            ),
+            (s(7, 5), Sid::new(6, "z"), false),
+        ];
+        for with_reverse_tree in [true, false] {
+            let (store, cache_dir) =
+                store_with_subjects(&codes, &reverse, &subjects, with_reverse_tree);
+            for (s_id, want, skipped) in &cases {
+                let iri = store.resolve_subject_iri(*s_id).unwrap();
+                let label = format!("{iri} (reverse tree: {with_reverse_tree})");
+                let by_lookup = subject_sid_by_reverse_lookup(&store, *s_id);
+                assert_eq!(
+                    store.persisted_subject_sid(*s_id).unwrap(),
+                    by_lookup,
+                    "{label}"
+                );
+                assert_eq!(
+                    store.subject_sid_from_own_key(*s_id, &iri).is_some(),
+                    *skipped,
+                    "{label}: lookup skipped"
+                );
+                // Without a reverse tree a full IRI can't be found as one, so
+                // it encodes by its canonical split instead.
+                if with_reverse_tree || *skipped {
+                    assert_eq!(&by_lookup, want, "{label}");
+                }
+            }
             let _ = std::fs::remove_dir_all(cache_dir);
         }
     }
