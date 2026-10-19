@@ -223,6 +223,39 @@ fn sparql_cases() -> Vec<Case> {
                 &["at_dt1"],
             )
         },
+        // A typed temporal bound orders a plain `xsd:string` row by reading
+        // it as a value of that type, on the index too (beside the temporal
+        // slice); a tagged or custom-typed string is a term of its own type
+        // and is not read as one.
+        Case {
+            string_seek: false,
+            ..case(
+                "string rows < typed dateTime",
+                AT,
+                &[r#"?o < "2026-01-02T00:00:00Z"^^xsd:dateTime"#],
+                &["at_dt1", "at_s"],
+            )
+        },
+        Case {
+            string_seek: false,
+            ..case(
+                "tagged and typed rows < typed date",
+                "?s ex:pdp ?o",
+                &[r#"?o < "2026-02-01"^^xsd:date"#],
+                &["pd_d", "pd_s"],
+            )
+        },
+        // `@fulltext` and JSON values are their own datatypes: never equal
+        // to, nor ordered against, a plain string.
+        case(
+            "fulltext =",
+            "?s ex:pftp ?o",
+            &[r#"?o = "Hello World""#],
+            &["pfs"],
+        ),
+        case("fulltext <", "?s ex:pftp ?o", &[r#"?o < "Z""#], &["pfs"]),
+        case("json =", "?s ex:pjp ?o", &[r#"?o = '{"a":1}'"#], &["pjs"]),
+        case("json <", "?s ex:pjp ?o", &[r#"?o < "~""#], &["pjs"]),
         // Other value classes against a plain string: a boolean, an IRI, a
         // number and a tagged string are neither equal nor ordered.
         case("mixed classes =", MIX, &[r#"?o = "a""#], &["m_plain"]),
@@ -397,6 +430,14 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
         {"@id": "ex:q0", "ex:q": "base"},
         {"@id": "ex:ft", "ex:ftp": {"@value": "a", "@type": "@fulltext"}},
         {"@id": "ex:ft_plain", "ex:ftp": "a"},
+        {"@id": "ex:pft", "ex:pftp": {"@value": "Hello World", "@type": "@fulltext"}},
+        {"@id": "ex:pfs", "ex:pftp": "Hello World"},
+        {"@id": "ex:pj", "ex:pjp": {"@value": {"a": 1}, "@type": "@json"}},
+        {"@id": "ex:pjs", "ex:pjp": "{\"a\":1}"},
+        {"@id": "ex:pd_en", "ex:pdp": {"@value": "2026-01-01", "@language": "en"}},
+        {"@id": "ex:pd_t", "ex:pdp": {"@value": "2026-01-01", "@type": "ex:T"}},
+        {"@id": "ex:pd_s", "ex:pdp": "2026-01-01"},
+        {"@id": "ex:pd_d", "ex:pdp": {"@value": "2026-01-01", "@type": "xsd:date"}},
         {"@id": "ex:at_dt1", "@type": "ex:Decision",
          "ex:at": {"@value": "2026-01-01T10:00:00Z", "@type": "xsd:dateTime"}},
         {"@id": "ex:at_dt2", "@type": "ex:Decision",
@@ -592,6 +633,71 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
             }
         }
 
+        // The string builtins read `@fulltext` and JSON values as text, on
+        // both lanes; only comparison is term-exact.
+        let text = |rows: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = rows.iter().map(|r| (*r).to_string()).collect();
+            v.sort();
+            v
+        };
+        for (body, want) in [
+            (
+                r#"SELECT ?s WHERE { ?s ex:pftp ?o FILTER(CONTAINS(?o, "World")) }"#,
+                text(&["pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s WHERE { ?s ex:pftp ?o FILTER(STRSTARTS(?o, "Hello")) }"#,
+                text(&["pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s WHERE { ?s ex:pftp ?o FILTER(REGEX(?o, "^hello", "i")) }"#,
+                text(&["pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s (SUBSTR(?o, 1, 5) AS ?x) WHERE { ?s ex:pftp ?o }"#,
+                text(&["Hello", "Hello", "pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s (STRLEN(?o) AS ?x) WHERE { ?s ex:pftp ?o }"#,
+                text(&["11", "11", "pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s (CONCAT(?o, "!") AS ?x) WHERE { ?s ex:pftp ?o }"#,
+                text(&["Hello World!", "Hello World!", "pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s (STRBEFORE(?o, " ") AS ?x) WHERE { ?s ex:pftp ?o }"#,
+                text(&["Hello", "Hello", "pfs", "pft"]),
+            ),
+            (
+                r#"SELECT ?s WHERE { ?s ex:pjp ?o FILTER(CONTAINS(?o, "a")) }"#,
+                text(&["pj", "pjs"]),
+            ),
+            (
+                r#"SELECT ?s WHERE { ?s ex:pjp ?o FILTER(CONTAINS(STR(?o), "a")) }"#,
+                text(&["pj", "pjs"]),
+            ),
+            (
+                r#"SELECT ?s (STR(?o) AS ?x) WHERE { ?s ex:pjp ?o }"#,
+                text(&[r#"{"a":1}"#, r#"{"a":1}"#, "pj", "pjs"]),
+            ),
+            // A JSON value bound by BIND stays `rdf:JSON`.
+            (
+                r#"SELECT ?s (DATATYPE(?x) AS ?d) WHERE { ?s ex:pjp ?o BIND(?o AS ?x) }"#,
+                text(&[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON",
+                    "pj",
+                    "pjs",
+                    "xsd:string",
+                ]),
+            ),
+        ] {
+            let got = sparql(&fluree, &view, body).await;
+            if got != want {
+                failures.push(format!("{phase}: {body} got {got:?}, want {want:?}"));
+            }
+        }
+
         if phase == "mixed" {
             for (body, want) in [
                 (
@@ -669,6 +775,59 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
             let got = names(&query_jsonld_formatted(&fluree, &view, &q).await.unwrap());
             if !got.is_empty() {
                 failures.push(format!("{phase}: json-ld {filters:?} got {got:?}"));
+            }
+        }
+    }
+
+    // The integer `=` seek (`FILTER(?v = 7)`) seeks one numeric type only
+    // when every leaflet of the predicate holds that type, and skips
+    // leaflets of other predicates by `p_const`. Leaflets never span two
+    // predicates in POST (every writer cuts them at a `p_id` change), so the
+    // skip cannot hide a row. Pinned with two-row leaflets: the predicate's
+    // double `7.0` must still answer an integer `= 7`, indexed and with the
+    // double arriving in novelty over an all-integer index.
+    let id = "it/string-filter-pushdown-uniform:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let seed = json!({"@context": {"ex": EX, "xsd": "http://www.w3.org/2001/XMLSchema#"},
+    "@graph": [
+        {"@id": "ex:a", "ex:aa": "x"},
+        {"@id": "ex:i1", "ex:v": 1}, {"@id": "ex:i2", "ex:v": 2},
+        {"@id": "ex:i3", "ex:v": 3}, {"@id": "ex:i7", "ex:v": 7},
+        {"@id": "ex:d7", "ex:v": {"@value": "7.0", "@type": "xsd:double"}},
+        {"@id": "ex:z", "ex:zz": "y"},
+        {"@id": "ex:u1", "ex:u": 1}, {"@id": "ex:u2", "ex:u": 2},
+        {"@id": "ex:u3", "ex:u": 3}, {"@id": "ex:u7", "ex:u": 7}
+    ]});
+    fluree.insert(ledger, &seed).await.unwrap();
+    let tiny = ReindexOptions::default().with_indexer_config(
+        fluree_db_indexer::IndexerConfig::default()
+            .with_leaflet_rows(2)
+            .with_leaflets_per_leaf(2),
+    );
+    fluree.reindex(id, tiny).await.unwrap();
+    let head = fluree.ledger(id).await.unwrap();
+    fluree
+        .insert(
+            head,
+            &json!({"@context": {"ex": EX, "xsd": "http://www.w3.org/2001/XMLSchema#"},
+                "@id": "ex:ud7", "ex:u": {"@value": "7.0", "@type": "xsd:double"}}),
+        )
+        .await
+        .unwrap();
+    let view = fluree.ledger(id).await.unwrap();
+    for (p, want) in [("ex:v", vec!["d7", "i7"]), ("ex:u", vec!["u7", "ud7"])] {
+        let pushed = format!("SELECT ?s WHERE {{ ?s {p} ?o FILTER(?o = 7) }}");
+        let evaluated = format!("SELECT ?s WHERE {{ ?s {p} ?o FILTER(?o = 7 || false) }}");
+        set_fast_paths_disabled(true);
+        let generic = sparql(&fluree, &view, &pushed).await;
+        set_fast_paths_disabled(false);
+        for (shape, got) in [
+            ("pushed", sparql(&fluree, &view, &pushed).await),
+            ("evaluated", sparql(&fluree, &view, &evaluated).await),
+            ("fast paths off", generic),
+        ] {
+            if got != want {
+                failures.push(format!("uniform {p} {shape}: got {got:?}, want {want:?}"));
             }
         }
     }
