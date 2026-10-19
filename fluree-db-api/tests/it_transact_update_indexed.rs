@@ -530,6 +530,14 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
 /// next incremental and full index builds. A retraction that survives the
 /// fold names the value as the base stores it, so storage does not read it
 /// as a retraction of some other term.
+///
+/// The sequences cover every one- and two-op sequence over the stored
+/// spelling and another, so each first and last op is tried with the same
+/// term and with another term of the value, either way round; every
+/// three-op sequence whose first and last ops spell it differently; and
+/// longer ones. The one- and two-op sequences also run as separate
+/// requests, one commit per op: a `DELETE DATA` naming the index's spelling
+/// of a value novelty holds under another names that stored fact.
 #[tokio::test]
 async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
     const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
@@ -548,17 +556,39 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
         ],
     ];
     // (true = INSERT DATA, false = DELETE DATA, spelling)
-    let sequences: [&[(bool, usize)]; 9] = [
-        &[(true, 2)],
-        &[(false, 0), (true, 1), (false, 1)],
-        &[(false, 0), (false, 1)],
-        &[(false, 0), (true, 1)],
-        &[(true, 1), (false, 1)],
-        &[(true, 1), (false, 1), (true, 2)],
-        &[(true, 1), (true, 2)],
-        &[(false, 0), (true, 1), (false, 1), (true, 2)],
-        &[(true, 1), (false, 1), (true, 2), (false, 2)],
-    ];
+    let mut sequences: Vec<Vec<(bool, usize)>> = Vec::new();
+    let mut push = |ops: Vec<(bool, usize)>| {
+        if !sequences.contains(&ops) {
+            sequences.push(ops);
+        }
+    };
+    let ops = [true, false];
+    for a in ops {
+        for x in [0, 1] {
+            push(vec![(a, x)]);
+            for b in ops {
+                for y in [0, 1] {
+                    push(vec![(a, x), (b, y)]);
+                }
+            }
+        }
+    }
+    for a in ops {
+        for m in ops {
+            for b in ops {
+                for (x, y) in [(0, 1), (1, 0)] {
+                    push(vec![(a, x), (m, 2), (b, y)]);
+                }
+            }
+        }
+    }
+    for longer in [
+        vec![(true, 2)],
+        vec![(false, 0), (true, 1), (false, 1), (true, 2)],
+        vec![(true, 1), (false, 1), (true, 2), (false, 2)],
+    ] {
+        push(longer);
+    }
     #[derive(Clone, Copy, Debug)]
     enum Base {
         Absent,
@@ -582,7 +612,11 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
     let mut case = 0;
     for spellings in &values {
         for base in [Base::Absent, Base::Novelty, Base::Indexed] {
-            for ops in sequences {
+            for (ops, split) in sequences
+                .iter()
+                .flat_map(|ops| [(ops, false), (ops, true)])
+                .filter(|(ops, split)| !split || ops.len() <= 2)
+            {
                 case += 1;
                 let ledger_id = &format!("it/multiop-last-op-{case}:main");
                 let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -615,7 +649,7 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                 } else {
                     fluree
                 };
-                let update = ops
+                let op_texts: Vec<String> = ops
                     .iter()
                     .map(|(insert, n)| {
                         format!(
@@ -624,15 +658,22 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                             spellings[*n]
                         )
                     })
-                    .collect::<Vec<_>>()
-                    .join(" ;\n");
-                fluree
-                    .graph(ledger_id)
-                    .transact()
-                    .sparql_update(&format!("{PFX}{update}"))
-                    .commit()
-                    .await
-                    .expect("update");
+                    .collect();
+                let update = op_texts.join(" ;\n");
+                let requests = if split {
+                    op_texts.clone()
+                } else {
+                    vec![update.clone()]
+                };
+                for request in requests {
+                    fluree
+                        .graph(ledger_id)
+                        .transact()
+                        .sparql_update(&format!("{PFX}{request}"))
+                        .commit()
+                        .await
+                        .expect("update");
+                }
                 let want = if ops.last().expect("an op").0 {
                     "1"
                 } else {
@@ -663,14 +704,23 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                 // the next build (#2090), so a value it holds and asserts
                 // under another subtype reads twice before then, as after an
                 // `INSERT DATA` of that subtype alone.
-                let two_terms_in_novelty = matches!(base, Base::Novelty) && want == "1";
+                // So can two spellings that separate requests assert.
+                let asserted: std::collections::HashSet<usize> = ops
+                    .iter()
+                    .filter(|(insert, _)| *insert)
+                    .map(|(_, n)| *n)
+                    .collect();
+                let two_terms_in_novelty = want == "1"
+                    && (matches!(base, Base::Novelty)
+                        || (split && !matches!(base, Base::Indexed) && asserted.len() > 1));
                 let unbuilt_ok = |n: &String| n == want || (two_terms_in_novelty && n == "2");
                 let got = [in_process, reloaded, incremental, rebuilt];
                 if !got[..2].iter().all(unbuilt_ok) || got[2..].iter().any(|n| n != want) {
                     failures.push(format!(
-                        "{base:?} base, {}: values in process, reloaded, after an incremental \
-                         build, after a rebuild = {got:?}; expected {want} each{}",
+                        "{base:?} base, {}{}: values in process, reloaded, after an \
+                         incremental build, after a rebuild = {got:?}; expected {want} each{}",
                         update.replace('\n', " "),
+                        if split { " (one request per op)" } else { "" },
                         if two_terms_in_novelty {
                             " (2 before a build)"
                         } else {
