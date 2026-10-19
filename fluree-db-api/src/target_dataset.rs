@@ -42,57 +42,69 @@ pub struct InTarget {
 /// graph, or the graph the address names; a keyword or a registered IRI names
 /// that graph; another ledger's address is a 400. An IRI `graphs` does not
 /// hold is left to loading, which reports a graph the ledger does not have
-/// (404). With no `graphs` (a surface that cannot read the registry), a
-/// reference that also reads as an address may still be a graph of the
-/// target, so it is left to loading as well.
+/// (404). With no `graphs` (a surface that cannot read the registry: the CLI
+/// against a remote server), text that reads both as a graph IRI and as
+/// another ledger's address (`other:main`) is that address, as a surface with
+/// no target reads it: nothing says it is a graph of the target.
 pub fn resolve_in_target(
     target: &LedgerId,
     graphs: Option<GraphLookup<'_>>,
     written: &str,
 ) -> Result<InTarget> {
-    // The target's id exactly as it stands is its own address with no pin and
-    // no graph: its default graph, whatever the registry holds (resolution's
-    // step 0). Recognized as is, so the id is not parsed a second time. An id
-    // has exactly one `:`; one stored before the current grammar may also
-    // hold `@`, `#` or `://`, which a dataset position reads otherwise, so
-    // such an id takes the full parse.
-    if written == target.as_str() && !written.contains(['@', '#']) && !written.contains("://") {
-        debug_assert!(MemberRef::parse(written).is_ok_and(|member| member
-            .address()
-            .is_some_and(|a| a.id() == target && a.at().is_none() && a.graph().is_default())));
-        return Ok(InTarget {
-            graph: GraphSel::Default,
-            at: None,
-            own_address: true,
-        });
+    if let Some(own) = own_id_as_written(target, written) {
+        return Ok(own);
     }
-    let member = MemberRef::parse(written).map_err(|e| {
-        ApiError::invalid_query(format!("<{written}> is not a graph of this ledger: {e}"))
-    })?;
+    let member = MemberRef::parse(written).map_err(|e| not_a_graph(written, e))?;
+    resolve_member_in_target(target, graphs, written, &member)
+}
+
+/// The target's id exactly as it stands is its own address with no pin and
+/// no graph: its default graph, whatever the registry holds (resolution's
+/// step 0). Recognized as is, so the id is not parsed a second time. An id
+/// has exactly one `:`; one stored before the current grammar may also hold
+/// `@`, `#` or `://`, which a dataset position reads otherwise, so such an id
+/// takes the full parse.
+fn own_id_as_written(target: &LedgerId, written: &str) -> Option<InTarget> {
+    if written != target.as_str() || written.contains(['@', '#']) || written.contains("://") {
+        return None;
+    }
+    debug_assert!(MemberRef::parse(written).is_ok_and(|member| member
+        .address()
+        .is_some_and(|a| a.id() == target && a.at().is_none() && a.graph().is_default())));
+    Some(InTarget {
+        graph: GraphSel::Default,
+        at: None,
+        own_address: true,
+    })
+}
+
+fn not_a_graph(written: &str, e: impl std::fmt::Display) -> ApiError {
+    ApiError::invalid_query(format!("<{written}> is not a graph of this ledger: {e}"))
+}
+
+/// [`resolve_in_target`] for a reference the caller has already parsed.
+fn resolve_member_in_target(
+    target: &LedgerId,
+    graphs: Option<GraphLookup<'_>>,
+    written: &str,
+    member: &MemberRef,
+) -> Result<InTarget> {
     let at = member.address().and_then(|a| a.at().cloned());
     let own_address = member.address().is_some_and(|a| a.id() == target);
     let none = |_: &str| -> Option<GraphId> { None };
     let lookup: GraphLookup<'_> = graphs.unwrap_or(&none);
-    let graph_iri = |iri: &str| {
-        GraphIri::parse(iri).map(GraphSel::Named).map_err(|e| {
-            ApiError::invalid_query(format!("<{written}> is not a graph of this ledger: {e}"))
-        })
-    };
-    match TargetLedger::new(target, &lookup).resolve(written, &member, at.is_some()) {
+    match TargetLedger::new(target, &lookup).resolve(written, member, at.is_some()) {
         Ok(graph) => Ok(InTarget {
             graph: graph.graph,
             at,
             own_address,
         }),
         Err(TargetError::GraphNotFound(iri)) => Ok(InTarget {
-            graph: graph_iri(&iri)?,
+            graph: GraphIri::parse(&iri)
+                .map(GraphSel::Named)
+                .map_err(|e| not_a_graph(written, e))?,
             at,
             own_address,
-        }),
-        Err(TargetError::CrossLedger { also_iri: true, .. }) if graphs.is_none() => Ok(InTarget {
-            graph: graph_iri(written)?,
-            at: None,
-            own_address: false,
         }),
         Err(TargetError::CrossLedger {
             named,
@@ -375,13 +387,19 @@ fn is_own_address(written: &str, target: &LedgerId) -> bool {
         .is_some_and(|address| address.is_own_address(target))
 }
 
-/// Whether `written` can only be an address, and of a ledger other than
-/// `target` (text that also reads as a graph IRI is not certain to be).
-fn names_another_ledger(written: &str, target: &LedgerId) -> bool {
-    matches!(
-        MemberRef::parse(written),
-        Ok(MemberRef::Dataset(DatasetRef::Address(address))) if address.id() != target
-    )
+/// Whether `member` names a ledger other than `target`: an address that can
+/// be nothing else (`other`, `other@t:1`), or, when the target's registry is
+/// unknown, text that also reads as a graph IRI (`other:main`), since with no
+/// registry to hold it as a graph the address is the reading a surface with
+/// no target gives it.
+fn names_another_ledger(member: &MemberRef, target: &LedgerId, registry_known: bool) -> bool {
+    match member {
+        MemberRef::Dataset(DatasetRef::Address(address)) => address.id() != target,
+        MemberRef::Dataset(DatasetRef::Ambiguous { address, .. }) => {
+            !registry_known && address.id() != target
+        }
+        MemberRef::Dataset(DatasetRef::GraphIri(_)) | MemberRef::Keyword(_) => false,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -400,19 +418,29 @@ struct Sources<'a> {
 
 impl Sources<'_> {
     /// Resolve one source, or `None` when it names another ledger the
-    /// position may name (it then stays as written).
+    /// position may name (it then stays as written). The source is parsed
+    /// once, here, and every reading below takes the parsed reference.
     fn source(&mut self, written: &str) -> Result<Option<InTarget>> {
+        if let Some(own) = own_id_as_written(self.target, written) {
+            return Ok(Some(own));
+        }
+        let member = match MemberRef::parse(written) {
+            Ok(member) => member,
+            // Text that is no reference stays as written where another ledger
+            // may stand, for the dataset lane to report.
+            Err(_) if self.scope == Scope::AnyLedger => return Ok(None),
+            Err(e) => return Err(not_a_graph(written, e)),
+        };
         if self.scope == Scope::AnyLedger {
             let registered = self.graphs.is_some_and(|graphs| graphs(written).is_some());
-            let other_ledger = MemberRef::parse(written)
-                .map(|m| m.address().is_some_and(|a| a.id() != self.target))
-                .unwrap_or(true);
+            let other_ledger = member.address().is_some_and(|a| a.id() != self.target);
             if other_ledger && !registered {
-                self.names_other_ledger |= names_another_ledger(written, self.target);
+                self.names_other_ledger |=
+                    names_another_ledger(&member, self.target, self.graphs.is_some());
                 return Ok(None);
             }
         }
-        resolve_in_target(self.target, self.graphs, written).map(Some)
+        resolve_member_in_target(self.target, self.graphs, written, &member).map(Some)
     }
 
     fn normalize(&mut self, value: &JsonValue) -> Result<JsonValue> {

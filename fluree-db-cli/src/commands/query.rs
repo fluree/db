@@ -1839,6 +1839,7 @@ fn route_query(
     };
     let target = endpoint.id();
     let local = matches!(path, EndpointPath::LocalView);
+    let registry_known = graphs.is_some();
 
     match query_format {
         detect::QueryFormat::Sparql => {
@@ -1846,7 +1847,11 @@ fn route_query(
             let lookup = graphs.unwrap_or(&none);
             let resolver = TargetLedger::new(target, &lookup);
             // A reference the endpoint's path cannot read. One that does not
-            // parse is left to the path's own error.
+            // parse is left to the path's own error. Text that is both a
+            // graph IRI and another ledger's address (`other:main`) is a graph
+            // of the endpoint only when its registry says so; with no registry
+            // here (a remote endpoint), the address is the reading, as on a
+            // surface with no target, and the connection path reads it.
             let leaves = |written: &str| -> bool {
                 let Ok(member) = MemberRef::parse(written) else {
                     return false;
@@ -1855,7 +1860,9 @@ fn route_query(
                 match resolver.resolve(written, &member, pinned) {
                     Ok(_) => local && pinned,
                     Err(TargetError::GraphNotFound(_)) => false,
-                    Err(TargetError::CrossLedger { also_iri, .. }) => local || !also_iri,
+                    Err(TargetError::CrossLedger { also_iri, .. }) => {
+                        local || !also_iri || !registry_known
+                    }
                 }
             };
             let Some(ast) = fluree_db_api::parse_sparql(content).ast else {
@@ -2574,6 +2581,12 @@ mod tests {
 
     /// A remote ledger route resolves a reference against its own graph
     /// registry, so only a reference that names another ledger leaves it.
+    /// The CLI holds no registry for a remote ledger, so text that reads both
+    /// as a graph IRI and as another ledger's address (`other:main`,
+    /// `urn:x`) is that address, as on a surface with no target, and leaves
+    /// too: kept on the route, `other:main` was a 400 "Ledger mismatch". A
+    /// graph with such a name stays on the route named through the ledger
+    /// (`mydb:main#urn:x`).
     #[test]
     fn remote_routing_sends_only_another_ledger_to_the_connection() {
         let remote =
@@ -2582,24 +2595,48 @@ mod tests {
             "SELECT ?s FROM <mydb:main#config> WHERE { ?s ?p ?o }",
             "SELECT ?s FROM <mydb:main@t:1> WHERE { ?s ?p ?o }",
             "SELECT ?s FROM <http://ex.org/g> WHERE { ?s ?p ?o }",
-            "SELECT ?s FROM NAMED <urn:x> WHERE { GRAPH ?g { ?s ?p ?o } }",
+            "SELECT ?s FROM NAMED <mydb:main#urn:x> WHERE { GRAPH ?g { ?s ?p ?o } }",
         ] {
             assert!(!remote(QueryFormat::Sparql, q), "ledger route: {q}");
         }
-        for q in [
-            "SELECT ?s FROM <warehouse-orders> WHERE { ?s ?p ?o }",
-            "SELECT ?s FROM <mydb:feature-x@t:1> WHERE { ?s ?p ?o }",
+        for from in [
+            "warehouse-orders",
+            "other@t:1",
+            "other:main",
+            "other:main@t:1",
+            "urn:fluree:other:main",
+            "other:main#config",
+            "other:main#http://ex.org/g",
+            "mydb:feature-x",
+            "mydb:feature-x@t:1",
+            "urn:x",
         ] {
-            assert!(remote(QueryFormat::Sparql, q), "connection: {q}");
+            for q in [
+                format!("SELECT ?s FROM <{from}> WHERE {{ ?s ?p ?o }}"),
+                format!("SELECT ?s FROM NAMED <{from}> WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }}"),
+            ] {
+                assert!(remote(QueryFormat::Sparql, &q), "connection: {q}");
+            }
+            for body in [
+                serde_json::json!({"from": from, "select": ["?s"]}),
+                serde_json::json!({"from": {"@id": from}, "select": ["?s"]}),
+                serde_json::json!({"from": ["mydb", from], "select": ["?s"]}),
+                serde_json::json!({"fromNamed": [from], "select": ["?s"]}),
+            ] {
+                assert!(
+                    remote(QueryFormat::JsonLd, &body.to_string()),
+                    "connection: {body}"
+                );
+            }
         }
-        assert!(!remote(
-            QueryFormat::JsonLd,
-            r#"{"from":"mydb:main#config","select":["?s"]}"#
-        ));
-        assert!(remote(
-            QueryFormat::JsonLd,
-            r#"{"from":{"@id":"warehouse-orders"},"select":["?s"]}"#
-        ));
+        for body in [
+            r#"{"from":"mydb:main#config","select":["?s"]}"#,
+            r#"{"from":"mydb","select":["?s"]}"#,
+            r#"{"from":"urn:fluree:mydb:main","select":["?s"]}"#,
+            r#"{"fromNamed":["mydb:main#urn:x"],"select":["?s"]}"#,
+        ] {
+            assert!(!remote(QueryFormat::JsonLd, body), "ledger route: {body}");
+        }
     }
 
     /// `--remote --at` pins the ledger path, as every `--at` spelling; an
