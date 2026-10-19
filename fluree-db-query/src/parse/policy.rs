@@ -4,6 +4,7 @@
 //! This replaces separate `(context, path_aliases, strict)` parameter lists
 //! with a single `&JsonLdParseCtx`.
 
+use super::graph_name::GraphNameEnv;
 use super::PathAliasMap;
 use fluree_graph_json_ld::{
     details_with_policy, details_with_vocab_policy, expand_iri_with_policy, ContextEntry,
@@ -11,6 +12,7 @@ use fluree_graph_json_ld::{
 };
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Parse-time policy flags for JSON-LD parsing.
 ///
@@ -40,6 +42,16 @@ pub struct JsonLdParseCtx {
     /// Names the query's own dataset (`fromNamed`) spells; see
     /// [`Self::graph_name`].
     pub dataset_names: HashSet<String>,
+    /// What resolves a graph name beyond the `@context`
+    /// ([`super::graph_name`]): an update's ledger and `fromNamed` aliases.
+    pub graph_names: GraphNameEnv,
+    /// How many graph scopes (`["graph", …]` or a node-level `@graph`)
+    /// enclose the pattern being parsed. A `default` selector cannot leave
+    /// one, so it is refused inside.
+    pub(crate) enclosing_graphs: AtomicU32,
+    /// Whether a `"@graph": "default"` resolved to the ledger's default
+    /// graph by name ([`GraphNameEnv::default_by_name`]).
+    reads_ledger_default: AtomicBool,
 }
 
 impl JsonLdParseCtx {
@@ -53,6 +65,9 @@ impl JsonLdParseCtx {
             path_aliases,
             policy,
             dataset_names: HashSet::new(),
+            graph_names: GraphNameEnv::default(),
+            enclosing_graphs: AtomicU32::new(0),
+            reads_ledger_default: AtomicBool::new(false),
         }
     }
 
@@ -83,6 +98,40 @@ impl JsonLdParseCtx {
         }
         self.expand_id(raw)
             .map_or_else(|_| raw.to_string(), |(iri, _)| iri)
+    }
+
+    /// The same context, resolving graph names with `env` (an update's
+    /// ledger and `fromNamed` aliases).
+    #[must_use]
+    pub fn with_graph_names(mut self, env: GraphNameEnv) -> Self {
+        self.graph_names = env;
+        self
+    }
+
+    /// Run `parse` with one more enclosing graph scope.
+    pub(crate) fn in_graph_scope<T>(&self, parse: impl FnOnce() -> T) -> T {
+        self.enclosing_graphs.fetch_add(1, Ordering::Relaxed);
+        let out = parse();
+        self.enclosing_graphs.fetch_sub(1, Ordering::Relaxed);
+        out
+    }
+
+    /// Whether any graph scope encloses the pattern being parsed.
+    pub(crate) fn in_any_graph_scope(&self) -> bool {
+        self.enclosing_graphs.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether the parsed `where` reads the ledger's default graph by name
+    /// ([`GraphNameEnv::default_by_name`]), so the WHERE dataset must carry
+    /// `urn:default`.
+    pub fn reads_ledger_default(&self) -> bool {
+        self.reads_ledger_default.load(Ordering::Relaxed)
+    }
+
+    /// Record that a `where` pattern reads the ledger's default graph by
+    /// name.
+    pub(crate) fn note_reads_ledger_default(&self) {
+        self.reads_ledger_default.store(true, Ordering::Relaxed);
     }
 
     /// Expand a subject `@id` value (uses `@base`, not `@vocab`).

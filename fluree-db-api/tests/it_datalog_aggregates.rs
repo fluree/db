@@ -470,3 +470,82 @@ async fn sum_and_having_work_in_a_rule_subquery() {
         vec![("a1".to_string(), "Long(120)".to_string())]
     );
 }
+
+/// Under `rdfs` without `owl2rl`, a rule body counts only the stored
+/// employee while the query's own `COUNT` also counts the manager, so a
+/// counting program is refused. With `owl2rl` the rule's count is the query's.
+#[tokio::test]
+async fn a_count_under_rdfs_without_owl2rl_is_refused() {
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {
+                "@id": "ex:Manager",
+                "http://www.w3.org/2000/01/rdf-schema#subClassOf": {"@id": "ex:Employee"}
+            },
+            {"@id": "ex:ann", "@type": "ex:Manager"},
+            {"@id": "ex:cy", "@type": "ex:Employee"}
+        ]
+    });
+    let (fluree, ledger) = load(
+        "datalog/agg-rewrite-modes:main",
+        &data,
+        Storage::NoveltyOnly,
+    )
+    .await;
+    let rule = json!({
+        "@id": "ex:headcountRule",
+        "@context": {"ex": "http://example.org/"},
+        "where": [["query", {
+            "@context": {"ex": "http://example.org/"},
+            "select": ["(as (count ?e) ?n)"],
+            "where": {"@id": "?e", "@type": "ex:Employee"}
+        }]],
+        "insert": {"@id": "ex:acme", "ex:headcount": "?n"}
+    });
+    let query = |reasoning: &Value, select: Value, where_: Value| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": select,
+            "where": where_,
+            "reasoning": reasoning,
+            "rules": [rule.clone()]
+        })
+    };
+    let headcount = |reasoning: &Value| {
+        query(
+            reasoning,
+            json!("?n"),
+            json!({"@id": "ex:acme", "ex:headcount": "?n"}),
+        )
+    };
+    let employees = |reasoning: &Value| {
+        query(
+            reasoning,
+            json!(["(as (count ?e) ?m)"]),
+            json!({"@id": "?e", "@type": "ex:Employee"}),
+        )
+    };
+
+    let without = json!(["rdfs", "datalog"]);
+    let err = query_jsonld(&fluree, &ledger, &headcount(&without))
+        .await
+        .expect_err("a count under a query rewrite");
+    let message = err.to_string();
+    assert!(
+        message.contains("ex:headcountRule")
+            && message.contains("an aggregate")
+            && message.contains("rdfs reasoning is on without owl2rl"),
+        "{message}"
+    );
+
+    let with = json!(["rdfs", "owl2rl", "datalog"]);
+    assert_eq!(
+        rows(&fluree, &ledger, &headcount(&with)).await,
+        vec![json!(2)]
+    );
+    assert_eq!(
+        rows(&fluree, &ledger, &employees(&with)).await,
+        vec![json!([2])]
+    );
+}

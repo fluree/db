@@ -449,3 +449,168 @@ async fn named_graph_rules_work_over_an_index() {
         ]
     );
 }
+
+/// With a named graph as the query's default graph, the rules run against
+/// that graph and their conclusions are its facts, over novelty and over a
+/// published index.
+#[tokio::test]
+async fn rules_run_over_a_named_graph_as_the_default_graph() {
+    use crate::support::{instances_sharing_storage, rebuild_and_publish_index};
+
+    for indexed in [false, true] {
+        let ledger_id = format!("datalog/graphs-as-default-{indexed}:main");
+        let (writer, reader) = instances_sharing_storage();
+        writer
+            .stage_owned(genesis_ledger(&writer, &ledger_id))
+            .upsert_turtle(
+                "@prefix ex: <http://example.org/> .
+                 ex:x ex:parent ex:y .
+                 GRAPH ex:side { ex:a ex:parent ex:b . ex:b ex:parent ex:c . }",
+            )
+            .execute()
+            .await
+            .expect("seed");
+        if indexed {
+            rebuild_and_publish_index(&writer, &ledger_id).await;
+        }
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": {"@id": ledger_id, "graph": "http://example.org/side"},
+            "select": ["?x", "?z"],
+            "where": {"@id": "?x", "ex:ancestor": "?z"},
+            "reasoning": "datalog",
+            "rules": [
+                {
+                    "@context": {"ex": "http://example.org/"},
+                    "where": {"@id": "?x", "ex:parent": "?y"},
+                    "insert": {"@id": "?x", "ex:ancestor": {"@id": "?y"}}
+                },
+                {
+                    "@context": {"ex": "http://example.org/"},
+                    "where": [
+                        {"@id": "?x", "ex:parent": "?y"},
+                        {"@id": "?y", "ex:ancestor": "?z"}
+                    ],
+                    "insert": {"@id": "?x", "ex:ancestor": {"@id": "?z"}}
+                }
+            ]
+        });
+        let rows = reader
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .expect("query");
+        let mut rows = normalize_rows(&rows);
+        rows.sort_by_key(ToString::to_string);
+        assert_eq!(
+            rows,
+            vec![
+                json!(["ex:a", "ex:b"]),
+                json!(["ex:a", "ex:c"]),
+                json!(["ex:b", "ex:c"])
+            ],
+            "indexed: {indexed}"
+        );
+    }
+}
+
+/// A stored rule serves every query on the ledger, so a head that names
+/// `ex:inferred` must also work for a query whose default graph is
+/// `ex:inferred`: there it derives into the graph the rules run against, as
+/// a head with no graph does.
+#[tokio::test]
+async fn a_stored_head_naming_the_query_graph_derives_into_it() {
+    let ledger_id = "datalog/graphs-head-is-query-graph:main";
+    let (fluree, ledger) = trig_ledger(ledger_id).await;
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .
+             GRAPH ex:inferred { ex:p ex:parent ex:q . ex:q ex:parent ex:r . }",
+        )
+        .execute()
+        .await
+        .expect("inferred-graph data")
+        .ledger;
+    let rules_graph = "http://example.org/rules";
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "insert": [["graph", rules_graph, {
+                    "@id": "http://example.org/grandparentRule",
+                    "f:rule": {
+                        "@type": "f:sparql",
+                        "@value": "PREFIX ex: <http://example.org/> \
+                                   CONSTRUCT { GRAPH ex:inferred { ?x ex:grandparent ?z } } \
+                                   WHERE { ?x ex:parent ?y . ?y ex:parent ?z }"
+                    }
+                }]]
+            }),
+        )
+        .await
+        .expect("rule into the rules graph")
+        .ledger;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:cfg:main>      rdf:type          f:LedgerConfig .
+                <urn:cfg:main>      f:datalogDefaults <urn:cfg:datalog> .
+                <urn:cfg:datalog>   f:datalogEnabled  true .
+                <urn:cfg:datalog>   f:rulesSource     <urn:cfg:rules-ref> .
+                <urn:cfg:rules-ref> rdf:type          f:GraphRef ;
+                                    f:graphSource     <urn:cfg:rules-src> .
+                <urn:cfg:rules-src> f:graphSelector   <{rules_graph}> .
+            }}
+            "
+        ))
+        .execute()
+        .await
+        .expect("f:rulesSource config");
+
+    assert_eq!(
+        datalog_rows_from(
+            &fluree,
+            json!(ledger_id),
+            json!([["graph", "http://example.org/inferred", {"@id": "?x", "ex:grandparent": "?z"}]])
+        )
+        .await,
+        grandparents()
+    );
+    assert_eq!(
+        datalog_rows_from(
+            &fluree,
+            json!({"@id": ledger_id, "graph": "http://example.org/inferred"}),
+            json!({"@id": "?x", "ex:grandparent": "?z"})
+        )
+        .await,
+        vec![json!(["ex:p", "ex:r"])]
+    );
+}
+
+/// Sorted rows of a datalog query over the dataset `from`.
+async fn datalog_rows_from(fluree: &Fluree, from: Value, where_: Value) -> Vec<Value> {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?x", "?z"],
+        "where": where_,
+        "reasoning": "datalog"
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("query");
+    let mut rows = normalize_rows(&rows);
+    rows.sort_by_key(ToString::to_string);
+    rows
+}

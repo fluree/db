@@ -147,7 +147,9 @@ Re-asserting the same `(subject, property, value)` triple that already exists is
 In addition to constraints stored in the ledger, a transaction can
 supply **inline unique-property declarations** via the
 `opts.uniqueProperties` field. The properties are enforced only for
-that one transaction; the list itself never persists.
+that one transaction; the list itself never persists. The field is read
+wherever the transaction is sent: over HTTP, through the embedded API,
+and by the CLI in local mode. It must be an array of IRI strings.
 
 ```json
 {

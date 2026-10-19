@@ -487,10 +487,11 @@ async fn resolve_evaluation_time(
 }
 
 /// The named graphs rule heads derive into: the SID a derived fact carries
-/// for each, and the graph its facts are routed to.
+/// for each (none for the graph the rules run against), and the graph its
+/// facts are routed to.
 #[derive(Default)]
 struct HeadGraphs {
-    sids: HashMap<Arc<str>, Sid>,
+    sids: HashMap<Arc<str>, Option<Sid>>,
     ids: HashMap<Sid, GraphId>,
 }
 
@@ -498,7 +499,9 @@ impl HeadGraphs {
     /// Resolve every head graph against the ledger. A head may derive only
     /// into a user named graph that exists: the overlay can serve facts only
     /// for a graph the ledger can address, and the system graphs hold
-    /// metadata rather than data.
+    /// metadata rather than data. A head naming the graph the rules run
+    /// against derives into it as a head with no graph does, so a stored
+    /// rule serves queries over that graph and over the default graph alike.
     fn resolve(rule_set: &DatalogRuleSet, db: GraphDbRef<'_>) -> Result<Self> {
         let mut graphs = Self::default();
         for rule in rule_set.iter_in_order() {
@@ -526,15 +529,13 @@ impl HeadGraphs {
                     return Err(refuse("a system graph, which rules cannot write"));
                 }
                 if g_id == db.g_id {
-                    return Err(refuse(
-                        "the graph the rules run against; leave the graph out to derive \
-                         into it",
-                    ));
+                    graphs.sids.insert(iri.clone(), None);
+                    continue;
                 }
                 let sid = IriEncoder::encode_iri(db.snapshot, iri)
                     .ok_or_else(|| refuse("whose IRI cannot be encoded"))?;
                 graphs.ids.insert(sid.clone(), g_id);
-                graphs.sids.insert(iri.clone(), sid);
+                graphs.sids.insert(iri.clone(), Some(sid));
             }
         }
         Ok(graphs)
@@ -971,7 +972,7 @@ impl HeadSink<'_, '_> {
                     continue;
                 };
                 if let Some(graph) = &head.graph {
-                    flake.g = state.head_graphs.sids.get(graph).cloned();
+                    flake.g = state.head_graphs.sids.get(graph).cloned().flatten();
                 }
                 self.instantiated += 1;
                 if !state.seen.insert(fact_key(&flake)) {

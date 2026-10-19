@@ -397,8 +397,21 @@ WHERE {
 
 **What absence means.** A negation matches when nothing matches it in the
 data the rules run over: the queried snapshot's default graph, OWL 2 RL
-entailments when that mode is on, and the conclusions of other rules. It is
-a statement about that data, not about the world.
+entailments of the stored data when that mode is on, and the conclusions of
+other rules. It is a statement about that data, not about the world. OWL 2
+RL runs once, before the rules, so it entails nothing from their
+conclusions: with `ex:Manager rdfs:subClassOf ex:Employee`, a rule that
+derives a manager does not make them an employee to another rule.
+
+**`rdfs` and `owl2ql` need `owl2rl`.** Those modes widen the query's own
+patterns rather than adding facts, and rule bodies run without them. A rule
+that negates or counts would read an entailment the query sees as absent and
+contradict the query's answer, so under `rdfs` or `owl2ql` a program with
+such a rule is refused, naming the rule, unless `owl2rl` is also on. OWL 2
+RL materializes those entailments, so rules and the query read the same
+facts. A positive program still runs under `rdfs` or `owl2ql` alone, but
+its bodies see only stored facts, so it can derive less than the query's
+patterns match.
 
 **Negated facts are complete first.** Fluree runs a rule that negates
 something only after every rule that can derive what it negates has
@@ -462,6 +475,8 @@ facts that depend on its own conclusions; the program is rejected with the
 cycle named (`ex:a -agg-> ex:b -> ex:a`). If the reasoning budget runs out
 before an aggregating rule finishes, or OWL 2 RL is capped or fails before
 it runs, the query fails rather than derive a count over part of its input.
+Under `rdfs` or `owl2ql`, an aggregating rule needs `owl2rl`, as a negating
+one does (see [Negation](#negation)).
 
 **Groups.** A group exists only when some solution falls in it, so an
 account with no transactions gets no `ex:txnCount` fact, not a zero. Without
@@ -506,6 +521,11 @@ other rules that read it. A rule reading `GRAPH ex:inferred { … }` runs after
 the rules that derive into it, so a program can stage results in one graph
 and build on them in another, and a recursive rule can reach its closure
 inside a named graph. The same triple derived into two graphs is two facts.
+
+A query whose default graph is a named graph runs the rules against that
+graph. A head naming that graph then derives into it as a head with no graph
+does, so a stored rule deriving into `ex:inferred` serves queries over the
+default graph and over `ex:inferred` alike.
 
 The graph is fixed: a variable graph is rejected. It must be a user named
 graph the ledger already has — transact data into it to create it — and not
@@ -769,7 +789,10 @@ This means:
   that commit's time. Set it explicitly with `"reasoningTime":
   "2026-06-01T00:00:00Z"` (JSON-LD) or `# PRAGMA reasoning-time:
   2026-06-01T00:00:00Z` (SPARQL), for example to ask what was overdue on a
-  given day. A snapshot with no commit of its own (an empty ledger, or
+  given day. Time travel by `@iso:` lands on the last commit at or before
+  the instant it names and evaluates at that commit's time, not at the
+  instant; pass the same instant as `reasoningTime` to evaluate at it. A
+  snapshot with no commit of its own (an empty ledger, or
   uncommitted changes) has no time to default to, so a program that calls
   either function fails there unless the query sets one. The time used is
   reported as `evaluation_time` in the tracked response's `reasoning` block,
@@ -780,9 +803,13 @@ This means:
   rule is re-evaluated every pass and can keep deriving new values until the
   budget stops it; Fluree logs a warning naming the rule.
 - **The dependency analysis is conservative.** A variable predicate
-  (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`) or a variable-predicate
-  head counts as reading or writing every predicate, which can merge rules
-  into a larger recursive group. That costs speed, never correctness.
+  (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`), a negated property
+  set (`!(ex:p)`) or a variable-predicate head counts as reading or writing
+  every predicate, which can merge rules into a larger recursive group. That
+  costs speed, never correctness. A negation or aggregate over such a read is
+  refused, though: it reads every predicate, the rule's own conclusions
+  included, so there is no order in which what it negates or counts is
+  complete.
 - **Termination is guaranteed** by a maximum number of passes per group of
   rules and by the shared reasoning budget — a maximum derived-fact count, a
   maximum memory estimate for the derived facts, and a maximum wall-clock
@@ -825,10 +852,11 @@ When both OWL 2 RL and Datalog are enabled:
   it derives, not the size of everything derived so far. A rule with two such
   patterns (`?x ex:ancestor ?y . ?y ex:ancestor ?z`) runs twice per pass. A
   rule that reads its group's conclusions inside a `UNION`, `EXISTS`,
-  subquery or property path re-runs its whole `WHERE` clause every pass
-  instead: it derives the same facts, more slowly. So does a recursive rule
-  that calls a function whose result changes between calls (`NOW()`,
-  `STRUUID()`, …) or reads a value's transaction metadata (`t`, `op`).
+  `GRAPH` block, subquery or property path re-runs its whole `WHERE` clause
+  every pass instead: it derives the same facts, more slowly. So does a
+  recursive rule that calls a function whose result changes between calls
+  (`RAND()`, `STRUUID()`, …) or reads a value's transaction metadata (`t`,
+  `op`). `NOW()` and `TODAY()` return one time per run, so they don't.
 - **A transitive closure runs as one traversal.** A recursive rule that is
   alone in its group and has the shape of a transitive closure is evaluated
   in a single pass as a property path instead of iterating, and derives the

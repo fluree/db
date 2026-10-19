@@ -476,3 +476,24 @@ async fn a_historical_query_evaluates_at_its_own_commit_time() {
         "{latest} is not the second commit's time"
     );
 }
+
+/// A requested time at the top level beside a mode in `opts` runs the mode
+/// at that time. Any top-level reasoning key used to make the top level the
+/// only source, dropping the mode in silence (fluree/db#1883).
+#[tokio::test]
+async fn a_top_level_time_beside_an_opts_mode_runs_that_mode() {
+    let (fluree, ledger) = overdue_ledger("datalog/contract-time-opts-mode:main").await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?x",
+        "where": {"@id": "?x", "@type": "ex:Overdue"},
+        "reasoningTime": "2026-06-01T00:00:00Z",
+        "opts": {"reasoning": "datalog"}
+    });
+    let rows = query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("format");
+    assert_eq!(sorted(&rows), vec![json!("ex:early")]);
+}
