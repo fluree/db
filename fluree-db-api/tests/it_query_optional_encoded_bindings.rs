@@ -2342,6 +2342,10 @@ async fn geo_search_reads_one_graph() {
 
 const OBJECT_COUNT_SITE: &str = "predicate_object_count";
 const OBJECT_COUNT_UNION_SITE: &str = "predicate_object_count_union";
+const TOPK_SITES: (&str, &str) = (
+    "group_by_object_count_topk",
+    "group_by_object_count_topk_union",
+);
 
 /// What the bound-object count must do for a query.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2367,25 +2371,41 @@ fn check_object_count_routing(
     before: usize,
     lane: ObjectCount,
 ) {
-    let one = stamps(store, before, OBJECT_COUNT_SITE);
-    let union = stamps(store, before, OBJECT_COUNT_UNION_SITE);
+    check_count_routing(
+        failures,
+        label,
+        store,
+        before,
+        (OBJECT_COUNT_SITE, OBJECT_COUNT_UNION_SITE),
+        lane,
+    );
+}
+
+/// [`check_object_count_routing`] for any count lane with a one-graph site
+/// (stamped `proceed` when planned, a decline at open) and a union site.
+fn check_count_routing(
+    failures: &mut Failures,
+    label: &str,
+    store: &SpanStore,
+    before: usize,
+    (one_site, union_site): (&str, &str),
+    lane: ObjectCount,
+) {
+    let one = stamps(store, before, one_site);
+    let union = stamps(store, before, union_site);
     let one_answered =
         one.iter().any(|o| o == "proceed") && !one.iter().any(|o| o == "fallback:gate_declined");
     failures.eq(
         one_answered,
         lane == ObjectCount::One,
-        &format!("{label}: `{OBJECT_COUNT_SITE}` answered ({one:?})"),
+        &format!("{label}: `{one_site}` answered ({one:?})"),
     );
     let want: Vec<String> = match lane {
         ObjectCount::One => vec![],
         ObjectCount::Union(_) => vec!["proceed".to_string()],
         ObjectCount::UnionDeclines(reason, _) => vec![format!("fallback:{reason}")],
     };
-    failures.eq(
-        union,
-        want,
-        &format!("{label}: `{OBJECT_COUNT_UNION_SITE}` stamps"),
-    );
+    failures.eq(union, want, &format!("{label}: `{union_site}` stamps"));
     if let ObjectCount::Union(Some(plan)) | ObjectCount::UnionDeclines(_, Some(plan)) = lane {
         let plans: Vec<String> = store.all_events()[before..]
             .iter()
@@ -2406,7 +2426,9 @@ fn check_object_count_routing(
 /// in the default graph, c `U` in g2. Only g3 has `ex:flag`. `ex:n 1`: a holds
 /// it as an integer and a double in g2, b as an integer in g2 and g3, c as a
 /// double in g3. `ex:q 5`: f's list `(5 5 7)` in g2 and g's plain 5 in g3;
-/// `ex:r 5`: f's list `(5 5)` in g2 only. `ex:m 1`: h's decimal `1.0` in g2,
+/// `ex:r 5`: f's list `(5 5)` in g2 only. `ex:w 5`: u's and v's lists `(5 5)`
+/// in g2, whose rows POST orders `(o_i, s)` as u, v, u, v (or v, u, v, u), so
+/// one subject's rows are not together. `ex:m 1`: h's decimal `1.0` in g2,
 /// i's integer `1` in g3. `ex:zz`, only in g2 and committed later, so that no
 /// leaf of g3 can span it: k's `6`, and f's list `(5 5)`.
 #[tokio::test(flavor = "current_thread")]
@@ -2421,6 +2443,8 @@ async fn object_count_over_one_graph_and_a_union() {
             ex:b ex:kind ex:T ; ex:n 1 .
             ex:c ex:kind ex:U .
             ex:f ex:q ( 5 5 7 ) ; ex:r ( 5 5 ) .
+            ex:u ex:w ( 5 5 ) .
+            ex:v ex:w ( 5 5 ) .
             ex:h ex:m 1.0 .
         }
         GRAPH <urn:g3> {
@@ -2518,13 +2542,19 @@ async fn object_count_over_one_graph_and_a_union() {
             "D9 FROM g2 + g3, a list repeating the object, merged",
             count("", from23, "ex:q 5"),
             n("2"),
-            ObjectCount::UnionDeclines("list_rows_in_post", None),
+            ObjectCount::Union(Some("merge")),
         ),
         (
-            "D10 FROM g2 + g3, a list repeating the object, one member",
+            "D10 FROM g2 + g3, a list repeating the object (g2 only)",
             count("", from23, "ex:r 5"),
             n("1"),
-            ObjectCount::UnionDeclines("list_rows_in_post", None),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D15 FROM g2 + g3, two lists repeating the object: rows out of subject order",
+            count("", from23, "ex:w 5"),
+            n("2"),
+            ObjectCount::UnionDeclines("list_rows_in_post", Some("merge")),
         ),
         (
             "D11 FROM g2 + g3, a bare number with a decimal slice",
@@ -2539,10 +2569,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(Some("single")),
         ),
         (
-            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf",
+            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf: one member's rows, merged",
             count("", from23, "ex:zz 5"),
             n("1"),
-            ObjectCount::UnionDeclines("list_rows_in_post", Some("single")),
+            ObjectCount::Union(Some("merge")),
         ),
         (
             "D12 FROM NAMED g2 alone: an empty default graph",
@@ -2621,6 +2651,71 @@ async fn object_count_over_one_graph_and_a_union() {
         check_object_count_routing(&mut failures, label, &store, before, lane);
     }
 
+    // The grouped twin: `GROUP BY ?o` with `COUNT(?s)`, top k. Over a union
+    // its dedup key is the row `(?s, ?o)`, so a group counts the distinct
+    // subjects holding that object in some member, and two datatypes of one
+    // number are two groups.
+    let topk = |prologue: &str, ds: &str, pred: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?o (COUNT(?s) AS ?n) {ds} \
+             WHERE {{ ?s {pred} ?o }} GROUP BY ?o ORDER BY DESC(?n) LIMIT 5"
+        )
+    };
+    let topk_cases: Vec<(&str, String, Rows, ObjectCount)> = vec![
+        (
+            "T0 one graph: FROM g2",
+            topk("", "FROM <urn:g2>", "ex:kind"),
+            rows(&[&["T", "2"], &["U", "1"]]),
+            ObjectCount::One,
+        ),
+        (
+            "T1 FROM g2 + g3: a triple in both counts once",
+            topk("", from23, "ex:kind"),
+            rows(&[&["T", "3"], &["U", "1"]]),
+            ObjectCount::Union(None),
+        ),
+        (
+            "T2 union default graph",
+            topk(UNION_PRAGMA, "", "ex:kind"),
+            rows(&[&["T", "4"], &["U", "1"]]),
+            ObjectCount::Union(None),
+        ),
+        (
+            "T3 FROM g2 + g3, a number's two datatypes are two groups",
+            topk("", from23, "ex:n"),
+            rows(&[&["1", "2"], &["1.0E0", "2"]]),
+            ObjectCount::Union(None),
+        ),
+        (
+            "T4 FROM g2 + g3, list rows",
+            topk("", from23, "ex:q"),
+            rows(&[&["5", "2"], &["7", "1"]]),
+            ObjectCount::UnionDeclines("list_rows_in_post", None),
+        ),
+        (
+            "T5 FROM g2 + g3, decimal objects (arena handles)",
+            topk("", from23, "ex:m"),
+            // The general plan writes the decimal `1.0` as "1".
+            rows(&[&["1", "1"], &["1", "1"]]),
+            ObjectCount::UnionDeclines("arena_type", None),
+        ),
+        (
+            "T6 FROM NAMED g2 alone: an empty default graph",
+            topk("", "FROM NAMED <urn:g2>", "ex:kind"),
+            rows(&[]),
+            ObjectCount::Union(None),
+        ),
+    ];
+    for (label, query, want, lane) in topk_cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match run(query).await {
+            Ok(json) => failures.eq(sparql_rows(&json, &["o", "n"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        check_count_routing(&mut failures, label, &store, before, TOPK_SITES, lane);
+    }
+
     // Under the kill switch the planner builds no count lane; the union site
     // says so, and the one-graph site stays silent, as it always has.
     drop(switch);
@@ -2657,6 +2752,35 @@ async fn object_count_over_one_graph_and_a_union() {
                 &format!("{label}: (one-graph, union) stamps"),
             );
         }
+        for (label, ds, want, union_stamps) in [
+            (
+                "K3 top-k, FROM g2 + g3 under the kill switch",
+                from23,
+                rows(&[&["T", "3"], &["U", "1"]]),
+                vec!["fallback:kill_switch"],
+            ),
+            (
+                "K4 top-k, FROM g2 under the kill switch",
+                "FROM <urn:g2>",
+                rows(&[&["T", "2"], &["U", "1"]]),
+                vec![],
+            ),
+        ] {
+            let (store, _guard) = init_test_tracing();
+            let before = store.all_events().len();
+            match run(topk("", ds, "ex:kind")).await {
+                Ok(json) => failures.eq(sparql_rows(&json, &["o", "n"]), want, label),
+                Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+            }
+            failures.eq(
+                (
+                    stamps(&store, before, TOPK_SITES.0),
+                    stamps(&store, before, TOPK_SITES.1),
+                ),
+                (vec![], union_stamps.into_iter().map(String::from).collect()),
+                &format!("{label}: (one-graph, union) stamps"),
+            );
+        }
     }
     let _switch = crate::support::FAST_PATH_SWITCH.read().await;
 
@@ -2683,6 +2807,25 @@ async fn object_count_over_one_graph_and_a_union() {
         label,
         &store,
         before,
+        ObjectCount::UnionDeclines("novelty", None),
+    );
+    let label = "N2 top-k, FROM g2 + g3, novelty in g2";
+    let (store, _guard) = init_test_tracing();
+    let before = store.all_events().len();
+    match run(topk("", from23, "ex:kind")).await {
+        Ok(json) => failures.eq(
+            sparql_rows(&json, &["o", "n"]),
+            rows(&[&["T", "4"], &["U", "1"]]),
+            label,
+        ),
+        Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+    }
+    check_count_routing(
+        &mut failures,
+        label,
+        &store,
+        before,
+        TOPK_SITES,
         ObjectCount::UnionDeclines("novelty", None),
     );
     failures.assert_none();

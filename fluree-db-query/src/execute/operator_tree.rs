@@ -3085,6 +3085,24 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
+    //
+    // Over a default graph of several graphs (or of none) the operator groups
+    // the union, which answers to the kill switch: under it, the union site
+    // says so here, since no operator is built to say it at open.
+    if fast_paths_globally_disabled
+        && !planning.is_history()
+        && !trailing_values
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+        && detect_predicate_group_by_object_count_topk(query).is_some()
+    {
+        stamp_fast_path(
+            crate::fast_group_count_firsts::GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+        );
+    }
     if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)

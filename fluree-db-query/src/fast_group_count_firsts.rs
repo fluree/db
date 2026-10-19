@@ -2,12 +2,13 @@ use crate::binding::Binding;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
+    allow_cursor_fast_path, build_psot_cursor_for_predicate, normalize_pred_sid,
     subject_ref_to_s_id,
 };
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::index_scope::{IndexScope, MemberSet};
 use crate::ir::triple::{Ref, Term};
+use crate::merged_cursor::{is_graph_scoped_arena, MergeDecline, MergedRangeCursor};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -39,11 +40,6 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // Shared free functions
 // ---------------------------------------------------------------------------
-
-#[inline]
-fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
-    fast_path_store(ctx).is_none()
-}
 
 #[inline]
 fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
@@ -86,6 +82,11 @@ pub struct PredicateGroupCountFirstsOperator {
     results_v6: Option<Vec<(u16, u64, i64)>>,
     /// Next result to emit
     pos: usize,
+    /// The graph whose view decodes the results.
+    emit_g_id: GraphId,
+    /// Emit IRI objects decoded: over several graphs no graph view exists
+    /// downstream to decode an encoded subject against.
+    decode_refs: bool,
     /// Temporal mode captured at planner-time for the fallback per-row scan.
     mode: crate::temporal_mode::TemporalMode,
 }
@@ -110,25 +111,47 @@ impl PredicateGroupCountFirstsOperator {
             fallback: None,
             results_v6: None,
             pos: 0,
+            emit_g_id: 0,
+            decode_refs: false,
             mode,
         }
     }
 
+    /// The grouped count over a default graph of several graphs, stamped at its
+    /// own site; `None` (with the reason stamped) to fall back.
+    fn group_union(&self, ctx: &ExecutionContext<'_>, set: &MemberSet<'_>) -> Option<TopKGroups> {
+        let outcome = if set.all_current() {
+            match group_count_union(
+                set,
+                &self.predicate,
+                self.limit,
+                &ctx.tracker,
+                &ctx.cancellation,
+            ) {
+                Ok(outcome) => outcome,
+                // As on one graph: what the V6 path can't give falls back.
+                Err(_) => Err(FastPathFallback::GateDeclined),
+            }
+        } else {
+            Err(FastPathFallback::Novelty)
+        };
+        stamp_fast_path(
+            GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE,
+            match outcome {
+                Ok(_) => FastPathOutcome::Proceed,
+                Err(reason) => FastPathOutcome::Fallback(reason),
+            },
+        );
+        outcome.ok()
+    }
+
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         use crate::dataset_operator::DatasetOperator;
-        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
         use crate::ir::AggregateFn;
         use crate::limit::LimitOperator;
         use crate::sort::{SortDirection, SortOperator, SortSpec};
-
-        // The plan stamped `Proceed` when the detector matched; a decline at
-        // open is stamped here, so planned and executed can be told apart.
-        stamp_fast_path(
-            "group_by_object_count_topk",
-            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
-        );
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -197,37 +220,60 @@ impl Operator for PredicateGroupCountFirstsOperator {
         self.pos = 0;
         self.fallback = None;
 
-        if should_fallback(ctx) {
-            return self.open_fallback(ctx).await;
-        }
-
-        // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
-        //
-        // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if !crate::fast_path_common::overlay_has_novelty(ctx) {
-            if let Some(binary_index_store) = ctx.binary_store.as_ref() {
-                match group_count_v6(
-                    binary_index_store,
-                    ctx.binary_g_id,
+        let mut one_graph_answered = false;
+        let grouped = match ctx.index_scope() {
+            // One graph whose index alone answers for it. A grouping the V6
+            // path can't give falls back.
+            Some(IndexScope::One(member)) if member.index_is_current() => {
+                let grouped = group_count_v6(
+                    member.store(),
+                    member.g_id(),
                     &self.predicate,
                     self.limit,
                     &ctx.cancellation,
-                ) {
-                    Ok(v6_results) => {
-                        self.results_v6 = Some(v6_results);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        // V6 path couldn't handle it — fall through to V5 or fallback.
-                    }
+                )
+                .ok();
+                if grouped.is_some() {
+                    one_graph_answered = true;
+                    self.emit_g_id = member.g_id();
+                    self.decode_refs = false;
                 }
+                grouped
             }
+            Some(IndexScope::Union(set)) => {
+                let grouped = self.group_union(ctx, &set);
+                // Any member's view decodes the results: the merge declines
+                // arena types, the one kind of value a graph scopes.
+                self.emit_g_id = set.members()[0].g_id();
+                self.decode_refs = true;
+                grouped
+            }
+            // A default graph of none has no group.
+            Some(IndexScope::Empty) => {
+                stamp_fast_path(
+                    GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE,
+                    FastPathOutcome::Proceed,
+                );
+                Some(Vec::new())
+            }
+            _ => None,
+        };
+        // The plan stamped `Proceed` when the detector matched; the one-graph
+        // lane's decline at open is stamped here, so planned and executed can
+        // be told apart, whether the union lane or the general plan answers.
+        if !one_graph_answered {
+            stamp_fast_path(
+                GROUP_BY_OBJECT_COUNT_TOPK_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
         }
-
-        // V5 leaf-scanning fast-path removed. Fall back to generic scan/aggregate.
-        // TODO: V3 leaflet fast-path for group-count-firsts (port boundary-equality
-        // optimization to V3 column-based format).
-        self.open_fallback(ctx).await
+        match grouped {
+            Some(rows) => {
+                self.results_v6 = Some(rows);
+                Ok(())
+            }
+            None => self.open_fallback(ctx).await,
+        }
     }
 
     async fn next_batch(
@@ -256,7 +302,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
         let binary_index_store = ctx.binary_store.as_ref().ok_or_else(|| {
             QueryError::Internal("V6 group-count results but no V6 store".to_string())
         })?;
-        let g_id = ctx.binary_g_id;
+        let g_id = self.emit_g_id;
         let p_id = resolve_predicate_id_v6(&self.predicate, binary_index_store)?;
         let view = fluree_db_binary_index::BinaryGraphView::with_novelty(
             Arc::clone(binary_index_store),
@@ -274,7 +320,14 @@ impl Operator for PredicateGroupCountFirstsOperator {
             self.pos += 1;
 
             if o_type == OType::IRI_REF.as_u16() {
-                col_o.push(Binding::encoded_sid(o_key));
+                col_o.push(if self.decode_refs {
+                    Binding::sid(
+                        view.resolve_subject_sid(o_key)
+                            .map_err(|e| QueryError::Internal(format!("V6 subject: {e}")))?,
+                    )
+                } else {
+                    Binding::encoded_sid(o_key)
+                });
             } else {
                 let val = view
                     .decode_value(o_type, o_key, p_id)
@@ -451,6 +504,14 @@ impl PredicateObjectCountFirstsOperator {
 /// `fast-path outcome` site of the bound-object count over one graph, stamped
 /// `Proceed` by the planner and a decline at open.
 const PREDICATE_OBJECT_COUNT_SITE: &str = "predicate_object_count";
+
+/// `fast-path outcome` site of the grouped object count over one graph,
+/// stamped `Proceed` by the planner and a decline at open.
+const GROUP_BY_OBJECT_COUNT_TOPK_SITE: &str = "group_by_object_count_topk";
+
+/// `fast-path outcome` site of the grouped object count over a default graph
+/// of several graphs, or of none.
+pub(crate) const GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE: &str = "group_by_object_count_topk_union";
 
 /// `fast-path outcome` site of the bound-object count over a default graph of
 /// several graphs, or of none.
@@ -991,24 +1052,7 @@ pub(crate) fn group_count_v6(
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
     let cmp = cmp_v2_for_order(RunSortOrder::Post);
 
-    let min_key = RunRecordV2 {
-        s_id: SubjectId(0),
-        o_key: 0,
-        p_id,
-        t: 0,
-        o_i: 0,
-        o_type: 0,
-        g_id,
-    };
-    let max_key = RunRecordV2 {
-        s_id: SubjectId(u64::MAX),
-        o_key: u64::MAX,
-        p_id,
-        t: 0,
-        o_i: u32::MAX,
-        o_type: u16::MAX,
-        g_id,
-    };
+    let (min_key, max_key) = post_predicate_bounds(g_id, p_id);
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
 
     // Streaming run-length: POST order (p_id, o_type, o_key, …) makes every
@@ -1838,47 +1882,76 @@ fn compute_group_by_object_star_topk(
 // Counts over a default graph of several graphs
 // ---------------------------------------------------------------------------
 
-/// Whether `o_type`'s `o_key` is a handle into an arena per graph, so equal
-/// keys in two members need not be one value.
-// TODO(r6-d): replace with `merged_cursor::is_graph_scoped_arena` once MC is merged.
-fn is_graph_scoped_arena(o_type: u16) -> bool {
-    use fluree_db_core::DecodeKind;
-    matches!(
-        OType::from_u16(o_type).decode_kind(),
-        DecodeKind::NumBigArena | DecodeKind::VectorArena | DecodeKind::SpatialArena
+/// The identity two rows of `?s <p> <o>` share when a default graph of several
+/// graphs counts them once: the general plan's union dedup key
+/// (`BatchDeduper`), which is the emitted row. With the predicate and the
+/// object constant, the row is `?s` alone, so a subject holding the object
+/// under two slices (a bare number's datatypes), or as two items of one list,
+/// is one solution.
+///
+/// The union count reads identity from here and nowhere else. Dedup on fact
+/// identity instead would return `(o_type, o_key, o_i, s_id)`; rows then
+/// arrive in POST order already, and no source ever declines for order.
+type UnionCountKey = u64;
+
+#[inline]
+fn union_count_key(s_id: u64, _o_type: u16, _o_key: u64, _o_i: u32) -> UnionCountKey {
+    s_id
+}
+
+/// The decline a lane stamps for a merge that cannot give the exact union.
+fn merge_fallback(decline: MergeDecline) -> FastPathFallback {
+    match decline {
+        MergeDecline::ArenaType { .. } => FastPathFallback::ArenaType,
+        MergeDecline::ListRows {
+            order: RunSortOrder::Post,
+        } => FastPathFallback::ListRowsInPost,
+        MergeDecline::Novelty => FastPathFallback::Novelty,
+        // No outcome names these yet (`NoBranch` is coming with MC's tip).
+        MergeDecline::ListRows { .. } | MergeDecline::NoBranch => FastPathFallback::GateDeclined,
+    }
+}
+
+/// Rows of one or more POST slices, a batch at a time, in [`union_count_key`]
+/// order. A batch carries `s_id`, `o_type`, `o_key` and `o_i`.
+pub(crate) trait KeyedRows {
+    /// The next batch; `Ok(Err(reason))` when the source cannot give the exact
+    /// rows; `Ok(Ok(None))` when drained.
+    fn next_rows(&mut self) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>>;
+}
+
+/// The key of a batch's row.
+#[inline]
+fn row_key(batch: &ColumnBatch, row: usize) -> UnionCountKey {
+    union_count_key(
+        batch.s_id.get(row),
+        batch.o_type.get_or(row, 0),
+        batch.o_key.get_or(row, 0),
+        batch.o_i.get_or(row, LIST_INDEX_NONE),
     )
 }
 
-/// Subject ids in ascending order, a batch at a time: the rows of one slice
-/// `(p, o_type, o_key)` in POST, read from the members that hold it, each fact
-/// once.
-pub(crate) trait SortedSubjects {
-    /// The next batch; `Ok(Err(reason))` when the source cannot give the exact
-    /// rows (a list row in POST, an arena type); `Ok(Ok(None))` when drained.
-    fn next_subjects(
-        &mut self,
-    ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>>;
-}
-
-/// The number of distinct subject ids across `sources`, each ascending.
+/// The number of distinct [`union_count_key`]s across `sources`.
 ///
-/// A bare number reads one slice per numeric datatype. Over several graphs the
-/// general plan counts a subject once however many slices hold it: the
-/// pattern's predicate and object are constants, so the dedup key is `?s`
-/// alone. The slices' counts therefore do not sum.
-fn count_distinct_subjects<S: SortedSubjects>(
+/// A k-way merge: each source must give its keys in ascending order. A slice
+/// read in POST does, unless list rows put a key out of order (POST keys a
+/// slice's rows by `(o_i, s)`). The merge checks every source's order as it
+/// reads and declines (`ListRowsInPost`) at the first key that falls, so it
+/// never counts a run it cannot see whole.
+fn count_distinct_keys<S: KeyedRows>(
     sources: Vec<S>,
 ) -> Result<std::result::Result<u64, FastPathFallback>> {
     struct Head<S> {
         source: S,
         batch: ColumnBatch,
         row: usize,
+        key: UnionCountKey,
     }
-    fn refill<S: SortedSubjects>(
+    fn refill<S: KeyedRows>(
         source: &mut S,
     ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
         loop {
-            match source.next_subjects()? {
+            match source.next_rows()? {
                 Ok(Some(batch)) if batch.row_count == 0 => {}
                 other => return Ok(other),
             }
@@ -1888,11 +1961,15 @@ fn count_distinct_subjects<S: SortedSubjects>(
     let mut heads = Vec::with_capacity(sources.len());
     for mut source in sources {
         match refill(&mut source)? {
-            Ok(Some(batch)) => heads.push(Head {
-                source,
-                batch,
-                row: 0,
-            }),
+            Ok(Some(batch)) => {
+                let key = row_key(&batch, 0);
+                heads.push(Head {
+                    source,
+                    batch,
+                    row: 0,
+                    key,
+                });
+            }
             Ok(None) => {}
             Err(reason) => return Ok(Err(reason)),
         }
@@ -1900,17 +1977,17 @@ fn count_distinct_subjects<S: SortedSubjects>(
     let mut count = 0u64;
     let mut last = None;
     // Few sources (slices times members): a scan of the heads picks the next.
-    while let Some((i, s_id)) = heads
+    while let Some(i) = heads
         .iter()
         .enumerate()
-        .map(|(i, head)| (i, head.batch.s_id.get(head.row)))
-        .min_by_key(|&(_, s_id)| s_id)
+        .min_by_key(|(_, head)| head.key)
+        .map(|(i, _)| i)
     {
-        if last != Some(s_id) {
-            count += 1;
-            last = Some(s_id);
-        }
         let head = &mut heads[i];
+        if last != Some(head.key) {
+            count += 1;
+            last = Some(head.key);
+        }
         head.row += 1;
         if head.row == head.batch.row_count {
             match refill(&mut head.source)? {
@@ -1920,10 +1997,16 @@ fn count_distinct_subjects<S: SortedSubjects>(
                 }
                 Ok(None) => {
                     heads.swap_remove(i);
+                    continue;
                 }
                 Err(reason) => return Ok(Err(reason)),
             }
         }
+        let key = row_key(&head.batch, head.row);
+        if key < head.key {
+            return Ok(Err(FastPathFallback::ListRowsInPost));
+        }
+        head.key = key;
     }
     Ok(Ok(count))
 }
@@ -1946,25 +2029,26 @@ type Slices = Vec<(u16, Option<u64>)>;
 enum UnionCountPlan {
     /// No member's index holds a row of any slice.
     Zero,
-    /// One member holds the only slice any member holds: its rows count as one
-    /// graph's do, except that list rows, which the union collapses, decline.
+    /// One member holds the only slice any member holds: its row count, when
+    /// its rows hold no list row (two items of one list can share a key).
     Single {
         g_id: GraphId,
         o_type: u16,
         o_key: u64,
     },
-    /// Several `(member, slice)` pairs: count the distinct subjects across them.
+    /// Several `(member, slice)` pairs: count the distinct keys across them.
     Merge(Vec<SliceHolders>),
 }
 
-impl UnionCountPlan {
-    fn label(&self) -> &'static str {
-        match self {
-            UnionCountPlan::Zero => "zero",
-            UnionCountPlan::Single { .. } => "single",
-            UnionCountPlan::Merge(_) => "merge",
-        }
-    }
+/// Which way a union count went (`zero`, `single`: one member's row count,
+/// `merge`), so a test can tell them apart; all three proceed at the site.
+fn stamp_union_count_plan(plan: &'static str) {
+    tracing::debug!(
+        target: crate::fast_path_outcome::FAST_PATH_TARGET,
+        site = PREDICATE_OBJECT_COUNT_UNION_SITE,
+        plan,
+        "union count plan",
+    );
 }
 
 /// Plan a bound-object count over a default graph of several graphs, from each
@@ -2011,6 +2095,21 @@ fn plan_union_count(
     })
 }
 
+/// The POST key range of predicate `p_id`: every object, list index and
+/// subject.
+fn post_predicate_bounds(g_id: GraphId, p_id: u32) -> (RunRecordV2, RunRecordV2) {
+    let key = |s_id, o_type, o_key, o_i| RunRecordV2 {
+        s_id: SubjectId(s_id),
+        o_key,
+        p_id,
+        t: 0,
+        o_i,
+        o_type,
+        g_id,
+    };
+    (key(0, 0, 0, 0), key(u64::MAX, u16::MAX, u64::MAX, u32::MAX))
+}
+
 /// The POST key range of one slice `(p, o_type, o_key)`: every list index and
 /// subject.
 fn post_slice_bounds(
@@ -2050,12 +2149,10 @@ fn index_may_hold(
         .is_empty()
 }
 
-/// The subjects of one slice in one graph's index. POST keys a slice's rows by
-/// `(o_i, s)`, so without list rows they come in subject order; a list row
-/// declines (`ListRowsInPost`), since it can repeat a fact out of order.
-struct SliceSubjects(BinaryCursor);
+/// The rows of one slice in one graph's index, in POST order.
+struct SliceRows(BinaryCursor);
 
-impl SliceSubjects {
+impl SliceRows {
     fn open(
         store: &Arc<BinaryIndexStore>,
         g_id: GraphId,
@@ -2066,7 +2163,11 @@ impl SliceSubjects {
     ) -> Option<Self> {
         let (min, max) = post_slice_bounds(g_id, p_id, o_type, o_key);
         let projection = ColumnProjection {
-            output: ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OI)),
+            output: [ColumnId::SId, ColumnId::OType, ColumnId::OKey, ColumnId::OI]
+                .into_iter()
+                .fold(ColumnSet::EMPTY, |set, col| {
+                    set.union(ColumnSet::single(col))
+                }),
             internal: ColumnSet::EMPTY,
         };
         // A cursor returns whole leaflets, and its first and last can hold
@@ -2092,37 +2193,23 @@ impl SliceSubjects {
     }
 }
 
-impl SortedSubjects for SliceSubjects {
-    fn next_subjects(
-        &mut self,
-    ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
-        let Some(batch) = self
+impl KeyedRows for SliceRows {
+    fn next_rows(&mut self) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
+        Ok(Ok(self
             .0
             .next_batch()
-            .map_err(|e| QueryError::from_io("slice cursor", e))?
-        else {
-            return Ok(Ok(None));
-        };
-        let has_list_row = !matches!(batch.o_i, fluree_db_binary_index::ColumnData::AbsentDefault)
-            && (0..batch.row_count)
-                .any(|row| batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE);
-        Ok(if has_list_row {
-            Err(FastPathFallback::ListRowsInPost)
-        } else {
-            Ok(Some(batch))
-        })
+            .map_err(|e| QueryError::from_io("slice cursor", e))?))
     }
 }
 
 /// `COUNT(?s)` over `?s <p> <o>` in a default graph of several graphs, every
-/// member current: the distinct subjects holding the object in some member,
-/// which is what the general plan counts (its dedup key is `?s` alone).
+/// member current: the distinct [`union_count_key`]s of the rows holding the
+/// object in some member, which is what the general plan counts.
 ///
 /// Each member contributes its own slices of the object (a bare number has one
 /// per numeric datatype it observed). With no member's manifest holding any,
-/// the count is 0; with one `(member, slice)` pair, that member counts it as
-/// one graph does, declining on list rows; otherwise a merge of every pair's
-/// subjects counts the distinct ones.
+/// the count is 0; with one `(member, slice)` pair whose rows hold no list row,
+/// that member's row count; otherwise the merge of every pair's rows.
 fn count_bound_object_union(
     snapshot: &LedgerSnapshot,
     set: &MemberSet<'_>,
@@ -2177,60 +2264,154 @@ fn count_bound_object_union(
         Ok(plan) => plan,
         Err(reason) => return Ok(Err(reason)),
     };
-    // Which way the count went, so a test can tell the one-member count from
-    // the merge (both proceed at the site).
-    tracing::debug!(
-        target: crate::fast_path_outcome::FAST_PATH_TARGET,
-        site = PREDICATE_OBJECT_COUNT_UNION_SITE,
-        plan = plan.label(),
-        "union count plan",
-    );
     let to_t = |g_id: GraphId| {
         set.members()
             .iter()
             .find(|m| m.g_id() == g_id)
             .map_or(store.max_t(), crate::index_scope::IndexMember::to_t)
     };
-    match plan {
-        UnionCountPlan::Zero => Ok(Ok(0)),
+    let pairs: Vec<(GraphId, u16, u64)> = match plan {
+        UnionCountPlan::Zero => {
+            stamp_union_count_plan("zero");
+            return Ok(Ok(0));
+        }
         UnionCountPlan::Single {
             g_id,
             o_type,
             o_key,
-        } => count_object_key_v6(
+        } => {
+            match count_object_key_v6(
+                store,
+                g_id,
+                p_id,
+                o_type,
+                o_key,
+                cancellation,
+                ListRows::Decline,
+            )? {
+                Ok(count) => {
+                    stamp_union_count_plan("single");
+                    return Ok(Ok(count));
+                }
+                // List rows can share a key, so the row count is not the
+                // answer: read the rows through the merge instead.
+                Err(FastPathFallback::ListRowsInPost) => vec![(g_id, o_type, o_key)],
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        UnionCountPlan::Merge(slices) => slices
+            .iter()
+            .flat_map(|slice| {
+                slice
+                    .members
+                    .iter()
+                    .map(move |&g_id| (g_id, slice.o_type, slice.o_key))
+            })
+            .collect(),
+    };
+    stamp_union_count_plan("merge");
+    let mut sources = Vec::with_capacity(pairs.len());
+    for (g_id, o_type, o_key) in pairs {
+        check_cancelled(cancellation)?;
+        sources.extend(SliceRows::open(
             store,
             g_id,
+            to_t(g_id),
             p_id,
             o_type,
             o_key,
-            cancellation,
-            ListRows::Decline,
-        ),
-        UnionCountPlan::Merge(slices) => {
-            let mut sources = Vec::new();
-            for slice in &slices {
-                for &g_id in &slice.members {
-                    check_cancelled(cancellation)?;
-                    sources.extend(SliceSubjects::open(
-                        store,
-                        g_id,
-                        to_t(g_id),
-                        p_id,
-                        slice.o_type,
-                        slice.o_key,
-                    ));
-                }
+        ));
+    }
+    Ok(count_distinct_keys(sources)?.map(|n| n as i64))
+}
+
+/// The groups a grouped object count keeps, best first: `(o_type, o_key, count)`.
+type TopKGroups = Vec<(u16, u64, i64)>;
+
+/// `GROUP BY ?o` with `COUNT(?s)` over `?s <p> ?o`, the best `limit` groups,
+/// in a default graph of several graphs, every member current.
+///
+/// One merged read of the predicate's POST range across the members gives
+/// each fact `(s, o)` once, in object order. The general plan's union dedup
+/// keys on the emitted row `(?s, ?o)`, which is that fact, so a group's merged
+/// rows are its solutions and their run is its count. The merge declines on
+/// list rows (they can repeat a fact out of adjacency in POST) and on
+/// arena-typed objects (a handle names no value across members, and handle
+/// order is not value order).
+fn group_count_union(
+    set: &MemberSet<'_>,
+    predicate: &Ref,
+    limit: usize,
+    tracker: &fluree_db_core::Tracker,
+    cancellation: &QueryCancellation,
+) -> Result<std::result::Result<TopKGroups, FastPathFallback>> {
+    let p_id = resolve_predicate_id_v6(predicate, set.store())?;
+    let (min, max) = post_predicate_bounds(set.members()[0].g_id(), p_id);
+    let projection = ColumnProjection {
+        output: ColumnSet::single(ColumnId::OType).union(ColumnSet::single(ColumnId::OKey)),
+        internal: ColumnSet::EMPTY,
+    };
+    let mut cursor = match MergedRangeCursor::new(
+        set,
+        RunSortOrder::Post,
+        &min,
+        &max,
+        fluree_db_binary_index::BinaryFilter::default(),
+        projection,
+    ) {
+        Ok(cursor) => cursor.with_tracker(tracker),
+        Err(decline) => return Ok(Err(merge_fallback(decline))),
+    };
+
+    let mut heap: BinaryHeap<GroupTopK> =
+        BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(limit));
+    let mut cur: Option<(u16, u64)> = None;
+    let mut run: i64 = 0;
+    loop {
+        check_cancelled(cancellation)?;
+        let batch = match cursor.next_batch()? {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
+            Err(decline) => return Ok(Err(merge_fallback(decline))),
+        };
+        for row in 0..batch.row_count {
+            let group = (batch.o_type.get(row), batch.o_key.get(row));
+            if cur == Some(group) {
+                run += 1;
+            } else {
+                offer_topk(
+                    &mut heap,
+                    limit,
+                    GroupTopK {
+                        count: run,
+                        o_type: cur.map_or(0, |c| c.0),
+                        o_key: cur.map_or(0, |c| c.1),
+                    },
+                );
+                cur = Some(group);
+                run = 1;
             }
-            Ok(count_distinct_subjects(sources)?.map(|n| n as i64))
         }
     }
+    offer_topk(
+        &mut heap,
+        limit,
+        GroupTopK {
+            count: run,
+            o_type: cur.map_or(0, |c| c.0),
+            o_key: cur.map_or(0, |c| c.1),
+        },
+    );
+    Ok(Ok(heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|g| (g.o_type, g.o_key, g.count))
+        .collect()))
 }
 
 #[cfg(test)]
 mod union_count_tests {
-    use super::{
-        count_distinct_subjects, plan_union_count, SliceHolders, SortedSubjects, UnionCountPlan,
-    };
+    use super::{count_distinct_keys, plan_union_count, KeyedRows, SliceHolders, UnionCountPlan};
     use crate::error::Result;
     use crate::fast_path_outcome::FastPathFallback;
     use fluree_db_binary_index::{ColumnBatch, ColumnData};
@@ -2246,8 +2427,8 @@ mod union_count_tests {
         Batches(batches.iter().map(|b| Ok(b.to_vec())).collect())
     }
 
-    impl SortedSubjects for Batches {
-        fn next_subjects(
+    impl KeyedRows for Batches {
+        fn next_rows(
             &mut self,
         ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
             Ok(match self.0.pop_front() {
@@ -2264,7 +2445,7 @@ mod union_count_tests {
     }
 
     fn distinct(sources: Vec<Batches>) -> std::result::Result<u64, FastPathFallback> {
-        count_distinct_subjects(sources).expect("no I/O in a test source")
+        count_distinct_keys(sources).expect("no I/O in a test source")
     }
 
     #[test]
@@ -2293,6 +2474,25 @@ mod union_count_tests {
             ]),
             Ok(4)
         );
+    }
+
+    /// A source whose key falls (list rows in POST, which order a slice by
+    /// `(o_i, s)`) can hide a repeat from the merge: the count declines.
+    #[test]
+    fn a_key_out_of_order_declines_the_count() {
+        // Two items of one list for subject 9, a plain row for subject 4.
+        assert_eq!(
+            distinct(vec![source(&[&[9, 9, 4]])]),
+            Err(FastPathFallback::ListRowsInPost)
+        );
+        // Across a batch boundary too.
+        assert_eq!(
+            distinct(vec![source(&[&[3, 9]]), source(&[&[5], &[2]])]),
+            Err(FastPathFallback::ListRowsInPost)
+        );
+        // A repeated key keeps the order: one list holding the value twice for
+        // one subject, which is one solution.
+        assert_eq!(distinct(vec![source(&[&[9, 9], &[9]])]), Ok(1));
     }
 
     #[test]
