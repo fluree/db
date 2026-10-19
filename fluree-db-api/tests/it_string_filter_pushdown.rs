@@ -49,6 +49,9 @@ impl Drop for FastPathGuard {
     }
 }
 
+/// Writes the `i`th FILTER `f` of a case into a query body.
+type Shape = fn(usize, &str) -> String;
+
 /// One FILTER shape over `?s <pattern> ?o`.
 struct Case {
     name: &'static str,
@@ -451,14 +454,14 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
             // The query as written, and three evaluated oracles that do not
             // share its plan: none of these shapes is range-safe, so the
             // comparison runs in the FILTER evaluator, not the scan.
-            let oracles: [(&str, fn(usize, &str) -> String); 3] = [
+            let oracles: [(&str, Shape); 3] = [
                 ("&& BOUND", |_, f| format!(" FILTER(({f}) && BOUND(?o))")),
                 ("|| false", |_, f| format!(" FILTER(({f}) || false)")),
                 ("BIND", |i, f| {
                     format!(" BIND(({f}) AS ?keep{i}) FILTER(?keep{i})")
                 }),
             ];
-            let body = |shape: fn(usize, &str) -> String| -> String {
+            let body = |shape: Shape| -> String {
                 let filters: String = c
                     .filters
                     .iter()
@@ -657,10 +660,7 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
                 failures.push(format!("{phase}: {body} got {got:?}"));
             }
         }
-        for filters in [
-            [r#"(> ?o 1)"#, r#"(> ?o "a")"#],
-            [r#"(> ?o "a")"#, r#"(> ?o 1)"#],
-        ] {
+        for filters in [["(> ?o 1)", r#"(> ?o "a")"#], [r#"(> ?o "a")"#, "(> ?o 1)"]] {
             let q = jsonld_query(json!([
                 {"@id": "?s", "ex:p": "?o"},
                 ["filter", filters[0]],
