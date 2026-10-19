@@ -965,7 +965,7 @@ fn binary_range_eq_v3(
 
             // Fast path filters/limits.
             if let Some(bounds) = &opts.object_bounds {
-                if !bounds.matches(&flake.o) {
+                if !bounds.matches(&flake.o, &flake.dt) {
                     continue;
                 }
             }
@@ -991,7 +991,7 @@ fn binary_range_eq_v3(
     resolved.retain(|f| flake_matches_range_eq(f, match_val));
 
     if let Some(bounds) = &opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
+        resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
@@ -1575,7 +1575,7 @@ fn binary_range_bounded_v3(
             }
 
             if let Some(bounds) = &opts.object_bounds {
-                if !bounds.matches(&flake.o) {
+                if !bounds.matches(&flake.o, &flake.dt) {
                     continue;
                 }
             }
@@ -1604,7 +1604,7 @@ fn binary_range_bounded_v3(
     resolved.retain(|f| f.s >= start_bound.s && f.s < end_bound.s);
 
     if let Some(bounds) = &opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
+        resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
@@ -1657,7 +1657,7 @@ fn overlay_only_flakes_bounded(
 
     // Apply options after lifecycle resolution.
     if let Some(ref bounds) = opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
+        resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
@@ -1764,11 +1764,11 @@ fn overlay_only_flakes(
                 }
             }
 
-            // Object bounds are a pure function of `o`, which a fact and its
-            // retraction share, so this prunes whole facts rather than
-            // splitting one — see the note above.
+            // Object bounds are a pure function of the object term (`o` and
+            // `dt`), which a fact and its retraction share, so this prunes
+            // whole facts rather than splitting one — see the note above.
             if let Some(ref bounds) = opts.object_bounds {
-                if !bounds.matches(&flake.o) {
+                if !bounds.matches(&flake.o, &flake.dt) {
                     return;
                 }
             }

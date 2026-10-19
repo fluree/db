@@ -30,7 +30,9 @@ use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{
+    DatatypeDictId, GraphId, IndexType, OType, ObjectBounds, Sid, BATCHED_JOIN_SIZE,
+};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -2251,7 +2253,7 @@ impl NestedLoopJoinOperator {
         let val = store
             .decode_value_v3(o_type, o_key, p_id, g_id)
             .map_err(|e| QueryError::Internal(format!("decode_value_v3 (batched bounds): {e}")))?;
-        Ok(bounds.matches(&val))
+        Ok(bounds.matches_encoded(&val, OType::from_u16(o_type)))
     }
 
     /// Object-bounds check for an injected novelty assert. Ids minted in dict
@@ -2270,7 +2272,7 @@ impl NestedLoopJoinOperator {
             return Ok(true);
         };
         let val = decode_overlay_object(ctx, store, dict_overlay.as_ref(), p_id, o_type, o_key)?;
-        Ok(bounds.matches(&val))
+        Ok(bounds.matches_encoded(&val, OType::from_u16(o_type)))
     }
 
     /// Phase 5: Assemble scattered results into output batches in left-row order.
@@ -3433,7 +3435,7 @@ fn batched_subject_probe_binary_uncharged(
                                 ))
                             })?;
                         if let Some(bounds) = params.object_bounds {
-                            if !bounds.matches(&decoded) {
+                            if !bounds.matches_encoded(&decoded, OType::from_u16(o_type_val)) {
                                 continue;
                             }
                         }
@@ -3483,7 +3485,7 @@ fn batched_subject_probe_binary_uncharged(
                         op.o_key,
                     )?;
                     if let Some(bounds) = params.object_bounds {
-                        if !bounds.matches(&decoded) {
+                        if !bounds.matches_encoded(&decoded, OType::from_u16(op.o_type)) {
                             return Ok(());
                         }
                     }
@@ -3696,7 +3698,7 @@ fn batched_subject_star_spot_uncharged(
                                 ))
                             })?;
                         if let Some(bounds) = predicate.object_bounds {
-                            if !bounds.matches(&decoded) {
+                            if !bounds.matches_encoded(&decoded, OType::from_u16(o_type_val)) {
                                 continue;
                             }
                         }
@@ -3758,7 +3760,7 @@ fn batched_subject_star_spot_uncharged(
                         op.o_key,
                     )?;
                     if let Some(bounds) = predicate.object_bounds {
-                        if !bounds.matches(&decoded) {
+                        if !bounds.matches_encoded(&decoded, OType::from_u16(op.o_type)) {
                             return Ok(());
                         }
                     }

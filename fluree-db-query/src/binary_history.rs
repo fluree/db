@@ -403,7 +403,7 @@ impl BinaryHistoryScanOperator {
                         return;
                     }
                     if let Some(bounds) = object_bounds {
-                        if !bounds.matches(&f.o) {
+                        if !bounds.matches(&f.o, &f.dt) {
                             return;
                         }
                     }
