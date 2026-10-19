@@ -460,10 +460,29 @@ fn not_loaded<T>(result: fluree_db_api::Result<T>, what: &str) -> String {
     }
 }
 
-/// A ledger whose index this process has not loaded (the state a store that
-/// failed to load leaves: the ledger's index `t`, no store, no range
-/// provider) refuses every write before its first read, rather than failing
-/// inside one with an error that reads as the request's fault.
+/// The ledger as this process holds it when its binary store failed to load
+/// (`ledger_manager` logs "continuing without"): the snapshot at the index's
+/// `t`, no range provider, no store, and dictionaries seeded from novelty
+/// alone.
+async fn unloaded(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .expect("ledger record");
+    let ledger =
+        fluree_db_api::LedgerState::load_with_store(fluree.content_store(ledger_id), record)
+            .await
+            .expect("load without the store");
+    assert!(ledger.index_t() > 0 && ledger.snapshot.range_provider.is_none());
+    ledger
+}
+
+/// A ledger whose index this process has not loaded refuses every write
+/// before its first read, rather than failing inside one with an error that
+/// reads as the request's fault, or committing without the checks that need
+/// the index.
 #[tokio::test]
 async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -473,12 +492,6 @@ async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
         .await
         .unwrap();
     let indexed = rebuild(&fluree, id).await;
-    let unloaded = || {
-        let mut ledger = indexed.clone();
-        ledger.binary_store = None;
-        std::sync::Arc::make_mut(&mut ledger.snapshot).range_provider = None;
-        ledger
-    };
     let plain = json!({"@context": ctx(), "@graph": [{"@id": "ex:p", "ex:name": "x"}]});
     let update = json!({
         "@context": ctx(),
@@ -486,12 +499,35 @@ async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
         "insert": {"@id": "?s", "ex:name": "y"}
     });
     let results = [
-        ("insert", fluree.insert(unloaded(), &plain).await.map(drop)),
-        ("upsert", fluree.upsert(unloaded(), &plain).await.map(drop)),
-        ("update", fluree.update(unloaded(), &update).await.map(drop)),
+        (
+            "insert",
+            fluree
+                .insert(unloaded(&fluree, id).await, &plain)
+                .await
+                .map(drop),
+        ),
+        (
+            "upsert",
+            fluree
+                .upsert(unloaded(&fluree, id).await, &plain)
+                .await
+                .map(drop),
+        ),
+        (
+            "update",
+            fluree
+                .update(unloaded(&fluree, id).await, &update)
+                .await
+                .map(drop),
+        ),
         (
             "vector insert",
-            insert_state(&fluree, unloaded(), vec![node("c", "embedding", 3)]).await,
+            insert_state(
+                &fluree,
+                unloaded(&fluree, id).await,
+                vec![node("c", "embedding", 3)],
+            )
+            .await,
         ),
     ];
     for (what, result) in results {
@@ -499,7 +535,7 @@ async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
         assert!(msg.contains("is not loaded"), "{what}: {msg}");
     }
     // The committers' first read: the write's policy context.
-    let ledger = unloaded();
+    let ledger = unloaded(&fluree, id).await;
     not_loaded(
         fluree_db_api::build_transact_policy_context(
             &fluree,
@@ -513,6 +549,44 @@ async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
         "policy context",
     );
     assert_eq!(t(&fluree, id).await, indexed.t(), "nothing committed");
+}
+
+/// Without its index loaded, this process cannot count the datatypes the
+/// ledger holds; admitting a write past the limit would leave a ledger that
+/// can never be indexed. The write is refused, and the ledger still indexes.
+#[tokio::test]
+async fn a_datatype_past_the_limit_is_refused_while_the_index_is_not_loaded() {
+    use fluree_db_transact::datatype_limit::MAX_NON_RESERVED_DATATYPES as MAX;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "vector-lengths/not-loaded-datatypes:main";
+    let datatypes = |range: std::ops::Range<usize>| {
+        let nodes: Vec<_> = range
+            .map(|i| {
+                json!({
+                    "@id": format!("ex:s{i}"),
+                    "ex:p": {"@value": format!("v{i}"), "@type": format!("ex:U{i}")}
+                })
+            })
+            .collect();
+        json!({"@context": {"ex": EX}, "@graph": nodes})
+    };
+    create(&fluree, id).await;
+    let h = handle(&fluree, id).await;
+    fluree
+        .stage(&h)
+        .insert(&datatypes(0..MAX))
+        .execute()
+        .await
+        .expect("every datatype the ledger can hold");
+    rebuild(&fluree, id).await;
+    not_loaded(
+        fluree
+            .insert(unloaded(&fluree, id).await, &datatypes(MAX..MAX + 1))
+            .await
+            .map(drop),
+        "a datatype past the limit",
+    );
+    rebuild(&fluree, id).await;
 }
 
 /// A ledger whose attached index is older than the index its novelty starts
