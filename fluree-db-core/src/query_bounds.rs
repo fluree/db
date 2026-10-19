@@ -243,7 +243,9 @@ impl ObjectBounds {
         self.matches_object(value, || false)
     }
 
-    #[inline]
+    // Forced: under fat LTO the generic body otherwise stays a call per
+    // bound, which cost a numeric range scan ~2% (release A/B).
+    #[inline(always)]
     fn matches_object(&self, value: &FlakeValue, is_xsd_string: impl Fn() -> bool) -> bool {
         // Check lower bound
         if let Some((lower, inclusive)) = &self.lower {
@@ -277,7 +279,7 @@ impl ObjectBounds {
     /// - **String**: an `xsd:string` value only (`is_xsd_string`)
     /// - **Same type**: Always comparable
     /// - **Different type classes**: Incompatible (returns None)
-    #[inline]
+    #[inline(always)]
     fn class_cmp(
         &self,
         value: &FlakeValue,
