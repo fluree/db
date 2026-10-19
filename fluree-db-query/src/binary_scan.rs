@@ -1178,10 +1178,15 @@ impl BinaryScanOperator {
         if let Some(sid) = self.sid_cache.get(&s_id) {
             return Ok(sid.clone());
         }
+        let iri = self
+            .store()
+            .resolve_subject_iri(s_id)
+            .map_err(|e| QueryError::Internal(format!("resolve s_id={s_id}: {e}")))?;
         let sid = self
             .store()
-            .persisted_subject_sid(s_id)
-            .map_err(|e| QueryError::Internal(format!("resolve s_id={s_id}: {e}")))?;
+            .find_subject_sid(&iri)
+            .map_err(|e| QueryError::Internal(format!("find_subject_sid: {e}")))?
+            .unwrap_or_else(|| self.store().encode_iri(&iri));
         self.sid_cache.insert(s_id, sid.clone());
         Ok(sid)
     }
