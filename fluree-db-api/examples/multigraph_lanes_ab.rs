@@ -26,6 +26,12 @@
 //! - `mg3`: `FROM <ledger> FROM <urn:g1> FROM <urn:g2>`;
 //! - `mgu`: the union default graph (`# PRAGMA union-default-graph`), all four.
 //!
+//! One-graph floors, each on a ledger of its own whose default graph holds the
+//! deduplicated union of a union scope's graphs, read with no dataset: what the
+//! scope costs through today's one-graph lanes when its data is one graph.
+//! `f2` is `mg`'s, `f2d` is `mgd`'s, `f3` is `mg3`'s and `fu` is `mgu`'s. Only
+//! the ledgers the selected scenarios read are built.
+//!
 //! Instructions retired are read from the process (`proc_pid_rusage`) on
 //! macOS; elsewhere the instruction columns report wall-clock nanoseconds per
 //! query instead. Allocations are counted by a wrapping global allocator.
@@ -128,30 +134,47 @@ fn subject(ttl: &mut String, prefix: &str, i: usize) {
     }
 }
 
-/// g0 (`d…`), g1 (`s0…s2999`), g2 (`s1500…s2999` again, then `t0…t1499`),
-/// g3 (`u0…u2999`).
-fn fixture_trig() -> String {
+/// A run of subjects: `prefix` numbered `from..to`.
+type Subjects = (&'static str, usize, usize);
+
+/// The runs of subjects each graph holds (`None`: the default graph).
+type Graphs = &'static [(Option<&'static str>, &'static [Subjects])];
+
+const D: Subjects = ("d", 0, N);
+const S: Subjects = ("s", 0, N);
+const S_UPPER: Subjects = ("s", N / 2, N);
+const T: Subjects = ("t", 0, N / 2);
+const U: Subjects = ("u", 0, N);
+
+/// g0 holds `d…`, g1 `s…`, g2 the upper half of `s…` again (identical
+/// triples) and `t…`, g3 `u…`.
+const MULTIGRAPH: Graphs = &[
+    (None, &[D]),
+    (Some("urn:g1"), &[S]),
+    (Some("urn:g2"), &[S_UPPER, T]),
+    (Some("urn:g3"), &[U]),
+];
+const FLOOR_MG: Graphs = &[(None, &[S, T])];
+const FLOOR_MGD: Graphs = &[(None, &[S, U])];
+const FLOOR_MG3: Graphs = &[(None, &[D, S, T])];
+const FLOOR_MGU: Graphs = &[(None, &[D, S, T, U])];
+
+fn trig(graphs: Graphs) -> String {
     let mut trig = String::with_capacity(N * 4 * 200);
     trig.push_str("@prefix ex: <http://example.org/> .\n");
-    for i in 0..N {
-        subject(&mut trig, "d", i);
+    for (graph, runs) in graphs {
+        if let Some(iri) = graph {
+            let _ = writeln!(trig, "GRAPH <{iri}> {{");
+        }
+        for (prefix, from, to) in *runs {
+            for i in *from..*to {
+                subject(&mut trig, prefix, i);
+            }
+        }
+        if graph.is_some() {
+            trig.push_str("}\n");
+        }
     }
-    trig.push_str("GRAPH <urn:g1> {\n");
-    for i in 0..N {
-        subject(&mut trig, "s", i);
-    }
-    trig.push_str("}\nGRAPH <urn:g2> {\n");
-    for i in N / 2..N {
-        subject(&mut trig, "s", i);
-    }
-    for i in 0..N / 2 {
-        subject(&mut trig, "t", i);
-    }
-    trig.push_str("}\nGRAPH <urn:g3> {\n");
-    for i in 0..N {
-        subject(&mut trig, "u", i);
-    }
-    trig.push_str("}\n");
     trig
 }
 
@@ -192,19 +215,64 @@ const SHAPES: &[(&str, &str, usize)] = &[
     ),
 ];
 
-/// (scope, prologue, dataset clause)
-const SCOPES: &[(&str, &str, &str)] = &[
-    ("sg", "", ""),
-    ("g1", "", "FROM <urn:g1>"),
-    ("mg", "", "FROM <urn:g1> FROM <urn:g2>"),
-    ("mgd", "", "FROM <urn:g1> FROM <urn:g3>"),
-    (
+/// A scope: its name, the ledger it reads and what that ledger holds, and the
+/// query's prologue and dataset clause.
+struct Scope {
+    name: &'static str,
+    ledger: &'static str,
+    graphs: Graphs,
+    prologue: &'static str,
+    dataset: &'static str,
+}
+
+const fn scope(name: &'static str, prologue: &'static str, dataset: &'static str) -> Scope {
+    Scope {
+        name,
+        ledger: LEDGER,
+        graphs: MULTIGRAPH,
+        prologue,
+        dataset,
+    }
+}
+
+const fn floor(name: &'static str, ledger: &'static str, graphs: Graphs) -> Scope {
+    Scope {
+        name,
+        ledger,
+        graphs,
+        prologue: "",
+        dataset: "",
+    }
+}
+
+const SCOPES: &[Scope] = &[
+    scope("sg", "", ""),
+    scope("g1", "", "FROM <urn:g1>"),
+    scope("mg", "", "FROM <urn:g1> FROM <urn:g2>"),
+    scope("mgd", "", "FROM <urn:g1> FROM <urn:g3>"),
+    scope(
         "mg3",
         "",
         "FROM <ab/multigraph-lanes:main> FROM <urn:g1> FROM <urn:g2>",
     ),
-    ("mgu", "# PRAGMA union-default-graph: true\n", ""),
+    scope("mgu", "# PRAGMA union-default-graph: true\n", ""),
+    floor("f2", "ab/floor-mg:main", FLOOR_MG),
+    floor("f2d", "ab/floor-mgd:main", FLOOR_MGD),
+    floor("f3", "ab/floor-mg3:main", FLOOR_MG3),
+    floor("fu", "ab/floor-mgu:main", FLOOR_MGU),
 ];
+
+/// The snapshot of the ledger `scope` reads.
+fn snapshot_of<'a, 'f>(
+    snapshots: &'a [(&str, GraphSnapshot<'f>)],
+    scope: &Scope,
+) -> &'a GraphSnapshot<'f> {
+    &snapshots
+        .iter()
+        .find(|(ledger, _)| *ledger == scope.ledger)
+        .expect("every selected scope's ledger is built")
+        .1
+}
 
 fn main() {
     let mut filters: Vec<String> = std::env::args().skip(1).collect();
@@ -230,40 +298,57 @@ fn main() {
     // The connection spawns its workers on the runtime it is built in.
     let _runtime = rt.enter();
 
-    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
-    let snapshot: GraphSnapshot<'_> = rt.block_on(async {
-        fluree.create_ledger(LEDGER).await.expect("create ledger");
-        let handle = fluree.ledger_cached(LEDGER).await.expect("ledger");
-        fluree
-            .stage(&handle)
-            .upsert_turtle(&fixture_trig())
-            .execute()
-            .await
-            .expect("seed");
-        fluree
-            .reindex(LEDGER, ReindexOptions::default())
-            .await
-            .expect("index");
-        fluree.disconnect_ledger(LEDGER).await;
-        fluree.graph(LEDGER).load().await.expect("load")
-    });
-
-    let scenarios: Vec<(String, String, usize)> = SCOPES
+    // (name, scope, query, iterations per repetition)
+    let scenarios: Vec<(String, &Scope, String, usize)> = SCOPES
         .iter()
-        .flat_map(|(scope, prologue, ds)| {
+        .flat_map(|scope| {
             SHAPES.iter().map(move |(shape, body, iters)| {
-                let query = format!("{prologue}{PREFIXES}{}", body.replace("{ds}", ds));
-                (format!("{scope}_{shape}"), query, *iters)
+                let query = format!(
+                    "{}{PREFIXES}{}",
+                    scope.prologue,
+                    body.replace("{ds}", scope.dataset)
+                );
+                (format!("{}_{shape}", scope.name), scope, query, *iters)
             })
         })
-        .filter(|(name, _, _)| wanted(name))
+        .filter(|(name, ..)| wanted(name))
         .collect();
     assert!(!scenarios.is_empty(), "no scenario matches {filters:?}");
+
+    // Build only the ledgers the selected scenarios read.
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let mut snapshots: Vec<(&str, GraphSnapshot<'_>)> = Vec::new();
+    for (_, scope, ..) in &scenarios {
+        if snapshots.iter().any(|(ledger, _)| *ledger == scope.ledger) {
+            continue;
+        }
+        let snapshot = rt.block_on(async {
+            fluree
+                .create_ledger(scope.ledger)
+                .await
+                .expect("create ledger");
+            let handle = fluree.ledger_cached(scope.ledger).await.expect("ledger");
+            fluree
+                .stage(&handle)
+                .upsert_turtle(&trig(scope.graphs))
+                .execute()
+                .await
+                .expect("seed");
+            fluree
+                .reindex(scope.ledger, ReindexOptions::default())
+                .await
+                .expect("index");
+            fluree.disconnect_ledger(scope.ledger).await;
+            fluree.graph(scope.ledger).load().await.expect("load")
+        });
+        snapshots.push((scope.ledger, snapshot));
+    }
 
     if std::env::var_os("AB_DIGEST").is_some() {
         use std::hash::{Hash, Hasher};
         println!("scenario\trows\tdigest");
-        for (name, query, _) in &scenarios {
+        for (name, scope, query, _) in &scenarios {
+            let snapshot = snapshot_of(&snapshots, scope);
             let json = rt
                 .block_on(async { snapshot.query().sparql(query).execute_formatted().await })
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -282,7 +367,8 @@ fn main() {
     println!(
         "scenario\titers\t{COUNTER}_per_query_median\t{COUNTER}_min\t{COUNTER}_max\tallocs_per_query\tbytes_per_query\trows"
     );
-    for (name, query, iters) in &scenarios {
+    for (name, scope, query, iters) in &scenarios {
+        let snapshot = snapshot_of(&snapshots, scope);
         let run = || -> usize {
             rt.block_on(async {
                 let result = snapshot
