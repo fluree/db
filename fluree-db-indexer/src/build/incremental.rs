@@ -1070,26 +1070,8 @@ pub async fn incremental_index(
                         delta_orders.push(order);
                         continue;
                     } else {
-                        let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
-                        for run in runs {
-                            let bytes = content_store.get(&run.cid).await.map_err(|e| {
-                                IndexerError::StorageRead(format!("pool delta run: {e}"))
-                            })?;
-                            let (_, run_events) =
-                                fluree_db_binary_index::format::pool_delta::decode_delta_run(
-                                    &bytes,
-                                )
-                                .map_err(|e| {
-                                    IndexerError::StorageRead(format!("pool delta run: {e}"))
-                                })?;
-                            events.extend(with_replacements(
-                                run_events
-                                    .into_iter()
-                                    .filter(|e| promote.binary_search(&e.g_id).is_err())
-                                    .map(delta_record)
-                                    .collect(),
-                            ));
-                        }
+                        let mut events =
+                            delta_run_events(content_store.as_ref(), runs, &promote).await?;
                         let purge_markers = records.iter().filter(|&&(_, op)| op == OP_PURGE);
                         events.extend(with_replacements(
                             records
@@ -4323,6 +4305,169 @@ pub async fn incremental_index(
         fuel: None,
         fence: None,
     })
+}
+
+/// Fold every pooled secondary order's delta runs into its base without new
+/// commits, for a ledger whose delta would otherwise wait for its next
+/// write. The root keeps its `t`, GSPO, dictionaries and stats; the runs and
+/// the leaves they replace become garbage. `None` when the root holds no
+/// delta.
+pub async fn compact_pool_deltas(
+    content_store: Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<Option<IndexResult>> {
+    let base_root_id = record.index_head_id.clone().ok_or(IndexerError::NoIndex)?;
+    let root_bytes = content_store
+        .get(&base_root_id)
+        .await
+        .map_err(|e| IndexerError::StorageRead(format!("index root: {e}")))?;
+    let base_root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes)
+        .map_err(|e| IndexerError::StorageRead(format!("index root: {e}")))?;
+    let Some(pool) = base_root.pool.as_ref() else {
+        return Ok(None);
+    };
+    let mut tasks = Vec::new();
+    for (order, runs) in pool.deltas.iter().filter(|(_, runs)| !runs.is_empty()) {
+        let order = *order;
+        let branch_cid = pool
+            .orders
+            .iter()
+            .find(|(o, _)| *o == order)
+            .map(|(_, cid)| cid.clone())
+            .ok_or_else(|| {
+                IndexerError::IncrementalAbort(format!("pooled tree has no {order:?} branch"))
+            })?;
+        let events = delta_run_events(content_store.as_ref(), runs, &[]).await?;
+        let (mut sorted, mut superseded) = split_lifecycles(events, order);
+        let cmp = cmp_v2_for_order(order);
+        sorted.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+        superseded.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+        tasks.push(Phase2Task {
+            seq: tasks.len(),
+            target: TreeTarget::Pool,
+            purge: Arc::new(Vec::new()),
+            order,
+            sorted_records: sorted.iter().map(|&(rec, _)| rec).collect(),
+            sorted_ops: sorted.iter().map(|&(_, op)| op).collect(),
+            sorted_superseded: superseded.iter().map(|&(rec, _)| rec).collect(),
+            sorted_superseded_ops: superseded.iter().map(|&(_, op)| op).collect(),
+            kind: Phase2TaskKind::NamedExisting { branch_cid },
+        });
+    }
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let orders = tasks.len();
+    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
+    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
+    let config_ref = &config;
+    let outputs: Vec<Phase2TaskOutput> = stream::iter(tasks)
+        .map(|task| {
+            let content_store = content_store.clone();
+            let tracker = tracker.clone();
+            let upload_budget = Arc::clone(&upload_budget);
+            async move {
+                execute_phase2_task(
+                    task,
+                    config_ref,
+                    content_store,
+                    tracker,
+                    upload_budget,
+                    upload_buffer,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(config.incremental_max_concurrency.max(1))
+        .try_collect()
+        .await?;
+
+    let mut root_builder = IncrementalRootBuilder::from_old_root(base_root.clone(), ledger_id);
+    let mut new_leaves = 0usize;
+    for output in outputs {
+        let Phase2TaskUpdate::Branch { branch_cid } = output.update else {
+            return Err(IndexerError::IncrementalAbort(
+                "pooled compaction produced no branch".into(),
+            ));
+        };
+        new_leaves += output.new_leaf_count;
+        root_builder.set_pool_branch(output.order, branch_cid);
+        root_builder.clear_pool_delta(output.order);
+        root_builder.add_replaced_cids(output.replaced_leaf_cids);
+        root_builder.add_replaced_cids(output.replaced_sidecar_cids);
+    }
+    root_builder.set_prev_index(Some(BinaryPrevIndexRef {
+        t: base_root.index_t,
+        id: base_root_id,
+    }));
+    let (mut root, replaced_cids) = root_builder.build();
+    super::root_assembly::attach_garbage_manifest(
+        content_store.as_ref(),
+        &mut root,
+        ledger_id,
+        &replaced_cids,
+    )
+    .await?;
+    let root_bytes = root.encode();
+    let root_id = content_store
+        .put(ContentKind::IndexRoot, &root_bytes)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    cache_artifact_bytes(&*content_store, &root_id, &root_bytes, "index_root");
+    tracing::info!(
+        ledger_id,
+        %root_id,
+        index_t = root.index_t,
+        orders,
+        new_leaves,
+        replaced = replaced_cids.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "pooled delta compacted"
+    );
+    Ok(Some(IndexResult {
+        root_id,
+        index_t: root.index_t,
+        ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
+        stats: IndexStats {
+            flake_count: 0,
+            leaf_count: new_leaves,
+            branch_count: orders,
+            total_bytes: root_bytes.len(),
+        },
+        fuel: None,
+        fence: None,
+    }))
+}
+
+/// A pooled secondary order's delta runs read back as the windows they
+/// recorded, ready to fold into one merge (see [`with_replacements`]),
+/// without the events of the graphs in `leaving` (sorted).
+async fn delta_run_events(
+    content_store: &dyn ContentStore,
+    runs: &[fluree_db_binary_index::PoolDeltaRun],
+    leaving: &[fluree_db_core::GraphId],
+) -> Result<Events> {
+    let mut events = Events::new();
+    for run in runs {
+        let bytes = content_store
+            .get(&run.cid)
+            .await
+            .map_err(|e| IndexerError::StorageRead(format!("pool delta run: {e}")))?;
+        let (_, run_events) = fluree_db_binary_index::format::pool_delta::decode_delta_run(&bytes)
+            .map_err(|e| IndexerError::StorageRead(format!("pool delta run: {e}")))?;
+        events.extend(with_replacements(
+            run_events
+                .into_iter()
+                .filter(|e| leaving.binary_search(&e.g_id).is_err())
+                .map(delta_record)
+                .collect(),
+        ));
+    }
+    Ok(events)
 }
 
 // ============================================================================

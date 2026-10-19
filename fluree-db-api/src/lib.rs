@@ -144,6 +144,8 @@ pub use admin::{
     GraphSourceDropReport,
     // Index maintenance
     IndexStatusResult,
+    MaintainIndexOptions,
+    MaintainIndexResult,
     OrphanInstance,
     OrphanSweepReport,
     ReindexOptions,

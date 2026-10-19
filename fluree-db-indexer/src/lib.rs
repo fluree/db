@@ -440,6 +440,24 @@ pub async fn build_incremental_index_for_record(
     .await
 }
 
+/// Fold a ledger's pooled delta runs into their bases at its current index
+/// `t`, with no new commits; `None` when its index holds no delta. The
+/// result publishes at an unchanged `t`, which needs an equal-`t` publish.
+pub async fn compact_pool_deltas_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<Option<IndexResult>> {
+    build::incremental::compact_pool_deltas(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
 /// Incremental index from an existing FIR6 root.
 ///
 /// Loads the existing `IndexRoot`, resolves only new commits, merges

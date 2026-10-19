@@ -2719,3 +2719,228 @@ ex:g3 { ex:c ex:refers ex:e2 ; ex:ctx ex:d3 . }
     }
     assert_eq!(pending.1, indexed.1, "JSON-LD GROUP BY");
 }
+
+/// What the delta tests read: a value range (pooled POST), an object alone
+/// (pooled OPST), `GRAPH ?g` over every pooled order, and g2 at a past `t`.
+async fn pooled_answers(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    past_t: i64,
+) -> Vec<Vec<String>> {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let mut out = Vec::new();
+    for q in [
+        "SELECT ?s ?v WHERE { GRAPH ex:g2 { ?s ex:val ?v FILTER(?v > 5) } }",
+        "SELECT ?s ?p WHERE { GRAPH ex:g3 { ?s ?p 30 } }",
+        "SELECT ?g ?s ?v WHERE { GRAPH ?g { ?s ex:val ?v } }",
+    ] {
+        out.push(select(fluree, &ledger, &format!("{PREFIXES}{q}")).await);
+    }
+    out.push(objects_at(fluree, &ledger, ledger_id, "g2", Some(past_t)).await);
+    out
+}
+
+/// An idle ledger's pooled delta folds into its base on request, at the same
+/// `t`: answers are unchanged at every `t`, every order still agrees with
+/// GSPO, the runs become garbage, and a second call finds nothing to do.
+/// With writes pending the call indexes them first. Through the background
+/// indexer, and without one as a scheduled function would run it.
+#[tokio::test]
+async fn maintenance_folds_an_idle_pooled_delta_into_its_base() {
+    use fluree_db_api::MaintainIndexOptions;
+    use fluree_db_binary_index::RunSortOrder;
+    let secondary = [
+        RunSortOrder::SpotG,
+        RunSortOrder::PsotG,
+        RunSortOrder::PostG,
+        RunSortOrder::OpstG,
+    ];
+    for with_indexer in [true, false] {
+        let db_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let ledger_id = "test/pool-maintain:main";
+        let (fluree, ledger) =
+            import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+        let first_t = ledger.t();
+        drop(ledger);
+        let fluree = if with_indexer {
+            fluree
+        } else {
+            drop(fluree);
+            FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+                .without_indexing()
+                .build()
+                .expect("build file-backed Fluree")
+        };
+        let mode = if with_indexer { "indexer" } else { "direct" };
+
+        sparql_update(
+            &fluree,
+            ledger_id,
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA { GRAPH ex:g2 { ex:z ex:label \"Z\" . ex:z ex:val 20 . }
+                           GRAPH ex:g3 { ex:w ex:val 30 . } }",
+        )
+        .await;
+        let t_added = fluree.ledger(ledger_id).await.unwrap().t();
+        sparql_update(
+            &fluree,
+            ledger_id,
+            "PREFIX ex: <http://example.org/>
+             DELETE DATA { GRAPH ex:g2 { ex:z ex:label \"Z\" . } }",
+        )
+        .await;
+        let (root, _) = index_and_reload(&fluree, ledger_id).await;
+        let pool = root.pool.as_ref().expect("pooled");
+        for order in secondary {
+            assert!(
+                !pool.delta(order).is_empty(),
+                "{mode}: {order:?} has a delta"
+            );
+        }
+        let before = pooled_answers(&fluree, ledger_id, t_added).await;
+
+        let result = fluree
+            .maintain_index(ledger_id, MaintainIndexOptions::default())
+            .await
+            .expect("maintain");
+        assert!(!result.built && result.compacted, "{mode}: {result:?}");
+        assert_eq!(result.index_t, root.index_t, "{mode}: same t");
+        let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+        let compacted = IndexRoot::decode(
+            &store
+                .get(result.root_id.as_ref().expect("root"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let compacted_pool = compacted.pool.as_ref().expect("pooled");
+        for order in secondary {
+            assert!(compacted_pool.delta(order).is_empty(), "{mode}: {order:?}");
+        }
+        let garbage: fluree_db_indexer::GarbageRecord = serde_json::from_slice(
+            &store
+                .get(&compacted.garbage.as_ref().expect("garbage").id)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            root.pool_delta_runs()
+                .all(|run| garbage.garbage.contains(&run.cid.to_string())),
+            "{mode}: compacted runs are garbage"
+        );
+        assert_eq!(
+            pooled_answers(&fluree, ledger_id, t_added).await,
+            before,
+            "{mode}"
+        );
+        let ledger = fluree.ledger(ledger_id).await.unwrap();
+        assert_pooled_orders_agree(&ledger, first_t, mode);
+
+        let again = fluree
+            .maintain_index(ledger_id, MaintainIndexOptions::default())
+            .await
+            .expect("maintain again");
+        assert!(!again.built && !again.compacted, "{mode}: {again:?}");
+
+        // Pending writes are indexed, and the run they add folded in.
+        sparql_update(
+            &fluree,
+            ledger_id,
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA { GRAPH ex:g1 { ex:q ex:val 40 . } }",
+        )
+        .await;
+        let head_t = fluree.ledger(ledger_id).await.unwrap().t();
+        let pending = fluree
+            .maintain_index(ledger_id, MaintainIndexOptions::default())
+            .await
+            .expect("maintain pending");
+        assert!(pending.built && pending.compacted, "{mode}: {pending:?}");
+        assert_eq!(pending.index_t, head_t, "{mode}");
+        let indexed = IndexRoot::decode(
+            &store
+                .get(pending.root_id.as_ref().expect("root"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for order in secondary {
+            assert!(
+                indexed.pool.as_ref().unwrap().delta(order).is_empty(),
+                "{mode}: {order:?} after the build"
+            );
+        }
+        let ledger = fluree.ledger(ledger_id).await.unwrap();
+        assert_eq!(
+            select(
+                &fluree,
+                &ledger,
+                &format!("{PREFIXES}SELECT ?s WHERE {{ GRAPH ex:g1 {{ ?s ex:val 40 }} }}")
+            )
+            .await,
+            vec!["s=http://example.org/q"],
+            "{mode}"
+        );
+        assert_pooled_orders_agree(&ledger, first_t, mode);
+    }
+}
+
+/// A server's housekeeping folds the pooled delta of a ledger that has not
+/// moved since its last tick, so an idle ledger does not keep its delta until
+/// the next write.
+#[tokio::test]
+async fn housekeeping_compacts_an_idle_ledgers_pooled_delta() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-idle:main";
+    let (fluree, ledger) =
+        import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    let first_t = ledger.t();
+    drop((fluree, ledger));
+    let fluree = Arc::new(
+        FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(std::time::Duration::from_millis(50))
+            .build()
+            .expect("build file-backed Fluree"),
+    );
+    sparql_update(
+        &fluree,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g2 { ex:z ex:val 20 . } GRAPH ex:g3 { ex:w ex:val 30 . } }",
+    )
+    .await;
+    let t_added = fluree.ledger(ledger_id).await.unwrap().t();
+    let (root, _) = index_and_reload(&fluree, ledger_id).await;
+    assert!(!root.pool.as_ref().unwrap().deltas.is_empty());
+    let before = pooled_answers(&fluree, ledger_id, t_added).await;
+
+    assert!(fluree.start_lifecycle_housekeeping(None));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let head = fluree
+            .nameservice()
+            .lookup(&fluree_db_core::LedgerId::parse(ledger_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .index_head_id
+            .unwrap();
+        let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+        let current = IndexRoot::decode(&store.get(&head).await.unwrap()).unwrap();
+        if current.pool.as_ref().unwrap().deltas.is_empty() {
+            assert_eq!(current.index_t, root.index_t);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the idle ledger's delta was not compacted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(pooled_answers(&fluree, ledger_id, t_added).await, before);
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    assert_pooled_orders_agree(&ledger, first_t, "idle compaction");
+}

@@ -13,11 +13,14 @@
 //! the name and deletes whatever the create wrote. A branch create that has
 //! not confirmed its listing for as long is rolled back the same way.
 //!
-//! With an interval set, it also runs the orphan sweep.
+//! With an interval set, it also runs the orphan sweep. And a ledger whose
+//! commits and index have not moved since the last tick has its pooled delta
+//! folded into its base, once per index root: otherwise the delta would wait
+//! for the ledger's next write.
 
-use crate::admin::{DropMode, DropStatus};
+use crate::admin::{DropMode, DropStatus, PoolCompaction};
 use crate::Fluree;
-use fluree_db_core::{InstanceId, LedgerName};
+use fluree_db_core::{ContentId, InstanceId, LedgerId, LedgerName};
 use fluree_db_indexer::Housekeeping;
 use fluree_db_nameservice::{lifecycle, BindingState, DroppedState, Fence, NameServiceError};
 use std::collections::HashMap;
@@ -59,6 +62,9 @@ pub struct HousekeepingOptions {
     /// long, and a branch create that has left its listing unconfirmed this
     /// long, timed by this process.
     pub abandoned_create_after: Duration,
+    /// Fold the pooled delta of a ledger idle since the last tick into its
+    /// base.
+    pub compact_idle_pool_deltas: bool,
 }
 
 impl Default for HousekeepingOptions {
@@ -66,6 +72,7 @@ impl Default for HousekeepingOptions {
         Self {
             orphan_sweep_interval: None,
             abandoned_create_after: ABANDONED_CREATE_AFTER,
+            compact_idle_pool_deltas: true,
         }
     }
 }
@@ -80,11 +87,21 @@ struct Seen {
 
 type Observed = HashMap<Unfinished, Seen>;
 
+/// A ledger's position at the last tick, and the index root whose pooled
+/// delta was last looked at.
+#[derive(Clone, Debug)]
+struct IndexSeen {
+    commit_t: i64,
+    head: ContentId,
+    checked: Option<ContentId>,
+}
+
 struct LifecycleHousekeeping {
     fluree: Weak<Fluree>,
     options: HousekeepingOptions,
     previous: parking_lot::Mutex<Observed>,
     last_sweep: parking_lot::Mutex<Instant>,
+    indexes: parking_lot::Mutex<HashMap<LedgerId, IndexSeen>>,
 }
 
 #[async_trait::async_trait]
@@ -124,10 +141,56 @@ impl Housekeeping for LifecycleHousekeeping {
             Err(e) => warn!(error = %e, "lifecycle housekeeping: cannot list the nameservice"),
         }
         self.sweep_if_due(&fluree).await;
+        self.compact_idle_pool_deltas(&fluree).await;
     }
 }
 
 impl LifecycleHousekeeping {
+    async fn compact_idle_pool_deltas(&self, fluree: &Fluree) {
+        if !self.options.compact_idle_pool_deltas {
+            return;
+        }
+        let records = match fluree.nameservice().all_records().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(error = %e, "idle pool compaction: cannot list the nameservice");
+                return;
+            }
+        };
+        let previous = std::mem::take(&mut *self.indexes.lock());
+        let mut seen = HashMap::new();
+        for record in records.into_iter().filter(|r| !r.retracted) {
+            let Some(head) = record.index_head_id.clone() else {
+                continue;
+            };
+            let before = previous.get(&record.ledger_id);
+            let mut checked = before.and_then(|b| b.checked.clone());
+            let idle = record.index_t >= record.commit_t
+                && before.is_some_and(|b| b.commit_t == record.commit_t && b.head == head);
+            if idle && checked.as_ref() != Some(&head) {
+                match fluree.compact_pool_deltas(&record.ledger_id).await {
+                    // The new root is seen, and checked, on later ticks.
+                    Ok(PoolCompaction::Compacted) => {}
+                    Ok(PoolCompaction::NoDelta) => checked = Some(head.clone()),
+                    // Tried again on the next idle tick.
+                    Ok(PoolCompaction::Deferred) => {}
+                    Err(e) => {
+                        warn!(ledger_id = %record.ledger_id, error = %e, "idle pool compaction failed");
+                    }
+                }
+            }
+            seen.insert(
+                record.ledger_id,
+                IndexSeen {
+                    commit_t: record.commit_t,
+                    head,
+                    checked,
+                },
+            );
+        }
+        *self.indexes.lock() = seen;
+    }
+
     async fn sweep_if_due(&self, fluree: &Fluree) {
         let Some(interval) = self.options.orphan_sweep_interval else {
             return;
@@ -353,6 +416,7 @@ impl Fluree {
             options,
             previous: parking_lot::Mutex::default(),
             last_sweep: parking_lot::Mutex::new(Instant::now()),
+            indexes: parking_lot::Mutex::default(),
         })
     }
 
