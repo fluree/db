@@ -1185,12 +1185,7 @@ async fn index_branch(fluree: &support::MemoryFluree, ledger_id: &str) {
     )
     .await
     .expect("branch index rebuild");
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index(ledger_id, built.index_t, &built.root_id)
-        .await
-        .unwrap();
+    crate::support::publish_built_index(fluree, ledger_id, built.index_t, &built.root_id).await;
 }
 
 /// A fast-forward merge must not publish the source's index root as the
@@ -1372,12 +1367,7 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
         .put_with_id(&source_root, &root_bytes)
         .await
         .unwrap();
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index("mydb:main", source.index_t, &source_root)
-        .await
-        .unwrap();
+    crate::support::publish_built_index(&fluree, "mydb:main", source.index_t, &source_root).await;
     fluree
         .ledger_manager()
         .unwrap()
@@ -1506,12 +1496,8 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
             assert_eq!(root.graph_iris[1], "urn:fluree:mydb:main#config");
             assert!(SharedResolverState::from_index_root(&root).is_ok());
         }
-        fluree
-            .publisher()
-            .unwrap()
-            .publish_index("mydb:main", result.index_t, &result.root_id)
-            .await
-            .unwrap();
+        crate::support::publish_built_index(&fluree, "mydb:main", result.index_t, &result.root_id)
+            .await;
     }
 }
 
