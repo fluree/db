@@ -1715,6 +1715,37 @@ impl Date {
     }
 }
 
+/// The order of a temporal value and a plain string read as a lexical form
+/// of its kind, either way round: a value held as a string (a temporal
+/// lexical the index keeps in its string dictionary) against a typed
+/// constant, or a typed value against a string constant. `None` when neither
+/// pairing applies or the string does not parse. The FILTER evaluator's `<`,
+/// `<=`, `>`, `>=` and the scan's object bounds both order through this, so
+/// the pushed and the evaluated comparison cannot drift apart.
+pub fn cmp_with_lexical(
+    a: &crate::value::FlakeValue,
+    b: &crate::value::FlakeValue,
+) -> Option<Ordering> {
+    use crate::value::FlakeValue;
+    let (held, lexical, flipped) = match (a, b) {
+        (FlakeValue::String(s), held) => (held, s.as_str(), true),
+        (held, FlakeValue::String(s)) => (held, s.as_str(), false),
+        _ => return None,
+    };
+    let ord = match held {
+        FlakeValue::DateTime(v) => v.as_ref().cmp(&DateTime::parse(lexical).ok()?),
+        FlakeValue::Time(v) => v.as_ref().cmp(&Time::parse(lexical).ok()?),
+        FlakeValue::Date(v) => v.as_ref().cmp(&Date::parse(lexical).ok()?),
+        FlakeValue::GYear(v) => v.as_ref().cmp(&GYear::parse(lexical).ok()?),
+        FlakeValue::GYearMonth(v) => v.as_ref().cmp(&GYearMonth::parse(lexical).ok()?),
+        FlakeValue::GMonth(v) => v.as_ref().cmp(&GMonth::parse(lexical).ok()?),
+        FlakeValue::GDay(v) => v.as_ref().cmp(&GDay::parse(lexical).ok()?),
+        FlakeValue::GMonthDay(v) => v.as_ref().cmp(&GMonthDay::parse(lexical).ok()?),
+        _ => return None,
+    };
+    Some(if flipped { ord.reverse() } else { ord })
+}
+
 /// Fold a Cypher temporal constructor with a constant lexical argument into a
 /// typed value: `date('2024-01-01')`, `datetime('…')`, `localdatetime('…')`,
 /// `time('…')`, `duration('P1D')`. Returns `None` when `func` (expected

@@ -3,7 +3,7 @@
 //! These types define the query interface (what to match, how to compare,
 //! query options) and are independent of the underlying index implementation.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::o_type::OType;
 use crate::sid::Sid;
@@ -152,19 +152,49 @@ pub struct ObjectBounds {
     pub temporal_string_ordering: bool,
 }
 
-/// The temporal `o_type`s a string can be parsed as, for
-/// [`ObjectBounds::temporal_string_ordering`]. Durations have no total order
-/// and are never coerced.
-const STRING_ORDERED_TEMPORALS: [OType; 8] = [
-    OType::XSD_DATE,
-    OType::XSD_TIME,
-    OType::XSD_DATE_TIME,
-    OType::XSD_G_YEAR,
-    OType::XSD_G_YEAR_MONTH,
-    OType::XSD_G_MONTH,
-    OType::XSD_G_DAY,
-    OType::XSD_G_MONTH_DAY,
-];
+/// A value of each temporal type a string bound can order against, keyed by
+/// its `o_type`. [`ObjectBounds::string_bound_otypes`] asks
+/// [`temporal::cmp_with_lexical`] itself whether a string reaches rows of
+/// each type, so the slices a scan seeks cannot drift from the comparison
+/// the rows then get. Durations have no total order and are never coerced.
+static TEMPORAL_SAMPLES: LazyLock<Vec<(OType, FlakeValue)>> = LazyLock::new(|| {
+    vec![
+        (
+            OType::XSD_DATE,
+            FlakeValue::Date(Box::new(temporal::Date::parse("2000-01-01").unwrap())),
+        ),
+        (
+            OType::XSD_TIME,
+            FlakeValue::Time(Box::new(temporal::Time::parse("00:00:00").unwrap())),
+        ),
+        (
+            OType::XSD_DATE_TIME,
+            FlakeValue::DateTime(Box::new(
+                temporal::DateTime::parse("2000-01-01T00:00:00Z").unwrap(),
+            )),
+        ),
+        (
+            OType::XSD_G_YEAR,
+            FlakeValue::GYear(Box::new(temporal::GYear::parse("2000").unwrap())),
+        ),
+        (
+            OType::XSD_G_YEAR_MONTH,
+            FlakeValue::GYearMonth(Box::new(temporal::GYearMonth::parse("2000-01").unwrap())),
+        ),
+        (
+            OType::XSD_G_MONTH,
+            FlakeValue::GMonth(Box::new(temporal::GMonth::parse("--01").unwrap())),
+        ),
+        (
+            OType::XSD_G_DAY,
+            FlakeValue::GDay(Box::new(temporal::GDay::parse("---01").unwrap())),
+        ),
+        (
+            OType::XSD_G_MONTH_DAY,
+            FlakeValue::GMonthDay(Box::new(temporal::GMonthDay::parse("--01-01").unwrap())),
+        ),
+    ]
+});
 
 impl ObjectBounds {
     /// Create empty bounds (no filtering)
@@ -277,7 +307,7 @@ impl ObjectBounds {
         // dict) with a temporal datatype annotation (e.g. gYear values
         // in bulk-imported data). Ordering only.
         if self.temporal_string_ordering {
-            if let Some(ordering) = Self::try_coerce_temporal_string_cmp(value, bound) {
+            if let Some(ordering) = temporal::cmp_with_lexical(value, bound) {
                 return Some(ordering);
             }
         }
@@ -297,13 +327,11 @@ impl ObjectBounds {
     /// every string bound parses as. A binary-index scan seeks these slices
     /// rather than reading every type the predicate holds.
     pub fn string_bound_otypes(&self) -> Option<Vec<OType>> {
-        let strings: Vec<&str> = [&self.lower, &self.upper]
+        let strings: Vec<&FlakeValue> = [&self.lower, &self.upper]
             .into_iter()
             .flatten()
-            .filter_map(|(v, _)| match v {
-                FlakeValue::String(s) => Some(s.as_str()),
-                _ => None,
-            })
+            .map(|(v, _)| v)
+            .filter(|v| matches!(v, FlakeValue::String(_)))
             .collect();
         if strings.is_empty() {
             return None;
@@ -311,92 +339,22 @@ impl ObjectBounds {
         let mut otypes = vec![OType::XSD_STRING];
         if self.temporal_string_ordering {
             otypes.extend(
-                STRING_ORDERED_TEMPORALS
-                    .into_iter()
-                    .filter(|ot| strings.iter().all(|s| parses_as_temporal(s, *ot))),
+                TEMPORAL_SAMPLES
+                    .iter()
+                    .filter(|(_, sample)| {
+                        strings
+                            .iter()
+                            .all(|s| temporal::cmp_with_lexical(sample, s).is_some())
+                    })
+                    .map(|(ot, _)| *ot),
             );
         }
         Some(otypes)
     }
 
-    /// Try to compare a temporal FlakeValue against a String by parsing the
-    /// string as the matching temporal type.
-    fn try_coerce_temporal_string_cmp(
-        a: &FlakeValue,
-        b: &FlakeValue,
-    ) -> Option<std::cmp::Ordering> {
-        match (a, b) {
-            (FlakeValue::String(s), FlakeValue::GYear(g)) => {
-                temporal::GYear::parse(s).ok().map(|p| p.cmp(g.as_ref()))
-            }
-            (FlakeValue::GYear(g), FlakeValue::String(s)) => {
-                temporal::GYear::parse(s).ok().map(|p| g.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::GYearMonth(g)) => temporal::GYearMonth::parse(s)
-                .ok()
-                .map(|p| p.cmp(g.as_ref())),
-            (FlakeValue::GYearMonth(g), FlakeValue::String(s)) => temporal::GYearMonth::parse(s)
-                .ok()
-                .map(|p| g.as_ref().cmp(&p)),
-            (FlakeValue::String(s), FlakeValue::GMonth(g)) => {
-                temporal::GMonth::parse(s).ok().map(|p| p.cmp(g.as_ref()))
-            }
-            (FlakeValue::GMonth(g), FlakeValue::String(s)) => {
-                temporal::GMonth::parse(s).ok().map(|p| g.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::GDay(g)) => {
-                temporal::GDay::parse(s).ok().map(|p| p.cmp(g.as_ref()))
-            }
-            (FlakeValue::GDay(g), FlakeValue::String(s)) => {
-                temporal::GDay::parse(s).ok().map(|p| g.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::GMonthDay(g)) => temporal::GMonthDay::parse(s)
-                .ok()
-                .map(|p| p.cmp(g.as_ref())),
-            (FlakeValue::GMonthDay(g), FlakeValue::String(s)) => temporal::GMonthDay::parse(s)
-                .ok()
-                .map(|p| g.as_ref().cmp(&p)),
-            (FlakeValue::String(s), FlakeValue::DateTime(d)) => {
-                temporal::DateTime::parse(s).ok().map(|p| p.cmp(d.as_ref()))
-            }
-            (FlakeValue::DateTime(d), FlakeValue::String(s)) => temporal::DateTime::parse(s)
-                .ok()
-                .map(|p| d.as_ref().cmp(&p)),
-            (FlakeValue::String(s), FlakeValue::Date(d)) => {
-                temporal::Date::parse(s).ok().map(|p| p.cmp(d.as_ref()))
-            }
-            (FlakeValue::Date(d), FlakeValue::String(s)) => {
-                temporal::Date::parse(s).ok().map(|p| d.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::Time(t)) => {
-                temporal::Time::parse(s).ok().map(|p| p.cmp(t.as_ref()))
-            }
-            (FlakeValue::Time(t), FlakeValue::String(s)) => {
-                temporal::Time::parse(s).ok().map(|p| t.as_ref().cmp(&p))
-            }
-            _ => None,
-        }
-    }
-
     /// Returns true if no bounds are set
     pub fn is_empty(&self) -> bool {
         self.lower.is_none() && self.upper.is_none()
-    }
-}
-
-/// Whether `s` parses as the temporal type `ot`, the test
-/// [`ObjectBounds::try_coerce_temporal_string_cmp`] applies to a row of it.
-fn parses_as_temporal(s: &str, ot: OType) -> bool {
-    match ot {
-        OType::XSD_DATE => temporal::Date::parse(s).is_ok(),
-        OType::XSD_TIME => temporal::Time::parse(s).is_ok(),
-        OType::XSD_DATE_TIME => temporal::DateTime::parse(s).is_ok(),
-        OType::XSD_G_YEAR => temporal::GYear::parse(s).is_ok(),
-        OType::XSD_G_YEAR_MONTH => temporal::GYearMonth::parse(s).is_ok(),
-        OType::XSD_G_MONTH => temporal::GMonth::parse(s).is_ok(),
-        OType::XSD_G_DAY => temporal::GDay::parse(s).is_ok(),
-        OType::XSD_G_MONTH_DAY => temporal::GMonthDay::parse(s).is_ok(),
-        _ => false,
     }
 }
 
