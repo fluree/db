@@ -8,7 +8,7 @@ use crate::fast_path_common::{
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::index_scope::{IndexScope, MemberSet};
 use crate::ir::triple::{Ref, Term};
-use crate::merged_cursor::{is_graph_scoped_arena, MergeDecline, MergedRangeCursor};
+use crate::merged_cursor::{MergeDecline, MergedRangeCursor};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -745,9 +745,16 @@ fn count_bound_object_v6(
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
     // A bare number counts every numeric datatype holding an equal value: one
-    // (o_type, o_key) per datatype the predicate carries. A slice that needs
-    // the decoded-value filter declines to the generic count.
-    if let Term::Value(value @ (FlakeValue::Long(_) | FlakeValue::Double(_))) = object {
+    // (o_type, o_key) per datatype the predicate carries, and the NumBig
+    // arena's handles for it. A slice that needs the decoded-value filter
+    // declines to the generic count.
+    if let Term::Value(
+        value @ (FlakeValue::Long(_)
+        | FlakeValue::Double(_)
+        | FlakeValue::Decimal(_)
+        | FlakeValue::BigInt(_)),
+    ) = object
+    {
         // This path reads the index at its max_t, so arena handles are current.
         let slices = crate::binary_scan::untyped_numeric_slices(
             store,
@@ -2056,8 +2063,11 @@ fn stamp_union_count_plan(plan: &'static str) {
 /// decoded-value filter) and whether a member's index may hold a slice
 /// (`may_hold`: false only when no leaf of its POST branch overlaps the slice).
 ///
-/// Declines `ArenaType` for a slice whose key is an arena handle, or that has
-/// no key: neither names one value across members.
+/// A NumBig slice's key is a handle into its own member's arena: each member
+/// translates the value itself, and each `(member, slice)` pair is read in
+/// that member, so a handle is never compared across members. Declines
+/// `ArenaType` for a slice with no key (a whole `o_type`, which only the
+/// decoded-value filter can narrow).
 fn plan_union_count(
     member_slices: impl IntoIterator<Item = (GraphId, Slices)>,
     mut may_hold: impl FnMut(GraphId, u16, u64) -> bool,
@@ -2065,7 +2075,7 @@ fn plan_union_count(
     let mut slices: Vec<SliceHolders> = Vec::new();
     for (g_id, member_slices) in member_slices {
         for (o_type, o_key) in member_slices {
-            let Some(o_key) = o_key.filter(|_| !is_graph_scoped_arena(o_type)) else {
+            let Some(o_key) = o_key else {
                 return Err(FastPathFallback::ArenaType);
             };
             if !may_hold(g_id, o_type, o_key) {
@@ -2220,44 +2230,49 @@ fn count_bound_object_union(
 ) -> Result<std::result::Result<i64, FastPathFallback>> {
     let store = set.store();
     let p_id = resolve_predicate_id_v6(predicate, store)?;
-    let member_slices: Vec<(GraphId, Slices)> =
-        if let Term::Value(value @ (FlakeValue::Long(_) | FlakeValue::Double(_))) = object {
-            let mut out = Vec::with_capacity(set.members().len());
-            for member in set.members() {
-                let g_id = member.g_id();
-                let slices = crate::binary_scan::untyped_numeric_slices(
-                    store,
-                    g_id,
-                    Some(p_id),
-                    crate::binary_scan::observed_datatypes(stats_view, g_id, p_id),
-                    value,
-                    true,
-                )
-                .ok_or_else(|| QueryError::Internal("non-finite numeric constant".to_string()))?;
-                out.push((
-                    g_id,
-                    slices
-                        .into_iter()
-                        .map(|(ot, ok)| (ot.as_u16(), ok))
-                        .collect(),
-                ));
-            }
-            out
-        } else {
-            // Every other object is one term with one key in every member:
-            // subject and string ids are ledger-wide, and a value that would
-            // need an arena handle does not translate (an error: fallback).
-            // With no novelty, a translation miss means no member holds it.
-            let Some((o_type, o_key)) =
-                translate_term_to_v6(object, snapshot, store, p_id, set.members()[0].g_id())?
-            else {
-                return Ok(Ok(0));
-            };
-            set.members()
-                .iter()
-                .map(|m| (m.g_id(), vec![(o_type, Some(o_key))]))
-                .collect()
+    let member_slices: Vec<(GraphId, Slices)> = if let Term::Value(
+        value @ (FlakeValue::Long(_)
+        | FlakeValue::Double(_)
+        | FlakeValue::Decimal(_)
+        | FlakeValue::BigInt(_)),
+    ) = object
+    {
+        let mut out = Vec::with_capacity(set.members().len());
+        for member in set.members() {
+            let g_id = member.g_id();
+            let slices = crate::binary_scan::untyped_numeric_slices(
+                store,
+                g_id,
+                Some(p_id),
+                crate::binary_scan::observed_datatypes(stats_view, g_id, p_id),
+                value,
+                true,
+            )
+            .ok_or_else(|| QueryError::Internal("non-finite numeric constant".to_string()))?;
+            out.push((
+                g_id,
+                slices
+                    .into_iter()
+                    .map(|(ot, ok)| (ot.as_u16(), ok))
+                    .collect(),
+            ));
+        }
+        out
+    } else {
+        // Every other object is one term with one key in every member:
+        // subject and string ids are ledger-wide, and a value that would
+        // need an arena handle does not translate (an error: fallback).
+        // With no novelty, a translation miss means no member holds it.
+        let Some((o_type, o_key)) =
+            translate_term_to_v6(object, snapshot, store, p_id, set.members()[0].g_id())?
+        else {
+            return Ok(Ok(0));
         };
+        set.members()
+            .iter()
+            .map(|m| (m.g_id(), vec![(o_type, Some(o_key))]))
+            .collect()
+    };
     let plan = match plan_union_count(member_slices, |g_id, o_type, o_key| {
         index_may_hold(store, g_id, p_id, o_type, o_key)
     }) {
@@ -2596,23 +2611,49 @@ mod union_count_tests {
     }
 
     #[test]
-    fn arena_slices_decline() {
+    fn arena_slices() {
         let all = |_: u16, _: u16, _: u64| true;
         let big = OType::NUM_BIG_OVERFLOW.as_u16();
-        let vector = OType::VECTOR.as_u16();
-        for slices in [
-            vec![(big, Some(0))],
-            vec![(vector, Some(3))],
-            // A whole o_type left to the value filter: NumBig.
-            vec![(INT, Some(1)), (big, None)],
-        ] {
-            assert_eq!(
-                plan_union_count(vec![(1, vec![]), (2, slices.clone())], all),
-                Err(FastPathFallback::ArenaType),
-                "{slices:?}"
-            );
-        }
-        // A key that is no handle is fine even with no rows anywhere.
+        // Each member's own handle for the value: handle 0 in both arenas is a
+        // slice of each member, read there, never compared across them.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![(big, Some(0))]), (2, vec![(big, Some(0))])],
+                all
+            ),
+            Ok(UnionCountPlan::Merge(vec![SliceHolders {
+                o_type: big,
+                o_key: 0,
+                members: smallvec![1, 2]
+            }]))
+        );
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![]), (2, vec![(big, Some(4)), (INT, Some(1))])],
+                all
+            ),
+            Ok(UnionCountPlan::Merge(vec![
+                SliceHolders {
+                    o_type: big,
+                    o_key: 4,
+                    members: smallvec![2]
+                },
+                SliceHolders {
+                    o_type: INT,
+                    o_key: 1,
+                    members: smallvec![2]
+                },
+            ]))
+        );
+        // A whole o_type left to the value filter declines.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![]), (2, vec![(INT, Some(1)), (big, None)])],
+                all
+            ),
+            Err(FastPathFallback::ArenaType),
+        );
+        // A key with no rows anywhere is no slice.
         assert_eq!(
             plan_union_count(vec![(1, vec![(INT, Some(1))])], |_, _, _| false),
             Ok(UnionCountPlan::Zero)

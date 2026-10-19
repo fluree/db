@@ -2557,10 +2557,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::UnionDeclines("list_rows_in_post", Some("merge")),
         ),
         (
-            "D11 FROM g2 + g3, a bare number with a decimal slice",
+            "D11 FROM g2 + g3, a bare number with a decimal slice: each member's own handle",
             count("", from23, "ex:m 1"),
             n("2"),
-            ObjectCount::UnionDeclines("arena_type", None),
+            ObjectCount::Union(Some("merge")),
         ),
         (
             "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf",
@@ -2828,6 +2828,187 @@ async fn object_count_over_one_graph_and_a_union() {
         TOPK_SITES,
         ObjectCount::UnionDeclines("novelty", None),
     );
+    failures.assert_none();
+}
+
+/// A bare decimal or big integer as the bound object of `COUNT(?s)`. It
+/// matches every numeric datatype that holds the value exactly: an integer, a
+/// double, and the NumBig arena's decimals and big integers, which each graph
+/// numbers in its own arena.
+///
+/// Both count lanes read their slices from one shared function. Over a union,
+/// each member translates the value into its own arena. Every case is checked
+/// with fast paths on (the lane that answered) and off (the general plan),
+/// against the same hand-written answer. A typed decimal is the control: the
+/// count detector takes no datatype-constrained object, so neither lane runs.
+///
+/// g1: a `1.5`, b `1.50`, c `"1.5"^^xsd:double`, e `2`, and h a big integer.
+/// g2: a `1.5`, f `1.5`, j `3.25`, and i the same big integer as an
+/// `xsd:nonNegativeInteger`.
+#[tokio::test(flavor = "current_thread")]
+async fn numeric_object_count_over_one_graph_and_a_union() {
+    let ledger_id = "it/numeric-object-count:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        GRAPH <urn:g1> {
+            ex:a ex:price 1.5 .
+            ex:b ex:price 1.50 .
+            ex:c ex:price "1.5"^^xsd:double .
+            ex:e ex:price 2 .
+            ex:h ex:serial 123456789012345678901234567890 .
+        }
+        GRAPH <urn:g2> {
+            ex:a ex:price 1.5 .
+            ex:f ex:price 1.5 .
+            ex:j ex:price 3.25 .
+            ex:i ex:serial "123456789012345678901234567890"^^xsd:nonNegativeInteger .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    let count = |ds: &str, triple: &str| {
+        format!(
+            "{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             SELECT (COUNT(?s) AS ?n) {ds} WHERE {{ ?s {triple} }}"
+        )
+    };
+    let (g1, g2, both) = (
+        "FROM <urn:g1>",
+        "FROM <urn:g2>",
+        "FROM <urn:g1> FROM <urn:g2>",
+    );
+    let big = "ex:serial 123456789012345678901234567890";
+    // (label, query, answer, lane: `None` for neither lane)
+    let cases: Vec<(&str, String, &str, Option<ObjectCount>)> = vec![
+        (
+            "1.5, g1: 1.5, 1.50 and the double",
+            count(g1, "ex:price 1.5"),
+            "3",
+            Some(ObjectCount::One),
+        ),
+        (
+            "1.5, g2",
+            count(g2, "ex:price 1.5"),
+            "2",
+            Some(ObjectCount::One),
+        ),
+        (
+            "1.5, g1 + g2: a in both",
+            count(both, "ex:price 1.5"),
+            "4",
+            Some(ObjectCount::Union(None)),
+        ),
+        (
+            "3.25, g1: in no arena of g1",
+            count(g1, "ex:price 3.25"),
+            "0",
+            Some(ObjectCount::One),
+        ),
+        (
+            "3.25, g2",
+            count(g2, "ex:price 3.25"),
+            "1",
+            Some(ObjectCount::One),
+        ),
+        (
+            "3.25, g1 + g2: g2 only",
+            count(both, "ex:price 3.25"),
+            "1",
+            Some(ObjectCount::Union(None)),
+        ),
+        (
+            "2.0, g1: the integer 2",
+            count(g1, "ex:price 2.0"),
+            "1",
+            Some(ObjectCount::One),
+        ),
+        (
+            "2.0, g1 + g2",
+            count(both, "ex:price 2.0"),
+            "1",
+            Some(ObjectCount::Union(None)),
+        ),
+        (
+            "big integer, g1",
+            count(g1, big),
+            "1",
+            Some(ObjectCount::One),
+        ),
+        (
+            "big integer, g2: as nonNegativeInteger",
+            count(g2, big),
+            "1",
+            Some(ObjectCount::One),
+        ),
+        (
+            "big integer, g1 + g2: two subjects",
+            count(both, big),
+            "2",
+            Some(ObjectCount::Union(None)),
+        ),
+        (
+            "typed decimal, g1 + g2: neither lane",
+            count(both, "ex:price \"1.5\"^^xsd:decimal"),
+            "3",
+            None,
+        ),
+    ];
+    let mut failures = Failures::default();
+    let run = |query: String| {
+        let fluree = &fluree;
+        let handle = &handle;
+        async move {
+            db(handle)
+                .await
+                .query(fluree)
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    {
+        let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+        for (label, query, want, lane) in &cases {
+            let (store, _guard) = init_test_tracing();
+            let before = store.all_events().len();
+            match run(query.clone()).await {
+                Ok(json) => failures.eq(sparql_rows(&json, &["n"]), rows(&[&[want]]), label),
+                Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+            }
+            match lane {
+                Some(lane) => {
+                    check_object_count_routing(&mut failures, label, &store, before, *lane);
+                }
+                None => failures.eq(
+                    (
+                        stamps(&store, before, OBJECT_COUNT_SITE),
+                        stamps(&store, before, OBJECT_COUNT_UNION_SITE),
+                    ),
+                    (vec![], vec![]),
+                    &format!("{label}: (one-graph, union) stamps"),
+                ),
+            }
+        }
+    }
+    // The general plan gives the same answers.
+    {
+        let _switch = crate::support::FAST_PATH_SWITCH.write().await;
+        let _restore = FastPathSwitchRestore;
+        fluree_db_api::set_fast_paths_disabled(true);
+        for (label, query, want, _) in &cases {
+            match run(query.clone()).await {
+                Ok(json) => failures.eq(
+                    sparql_rows(&json, &["n"]),
+                    rows(&[&[want]]),
+                    &format!("{label}, fast paths off"),
+                ),
+                Err(e) => failures
+                    .0
+                    .push(format!("{label}, fast paths off: query failed: {e}")),
+            }
+        }
+    }
     failures.assert_none();
 }
 
