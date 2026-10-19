@@ -44,6 +44,8 @@ Fluree exposes two query styles over HTTP:
 
 A `from` string or object, or a SPARQL `FROM`, that names a different ledger than the one in the URL, in any spelling, is rejected with a "Ledger mismatch" error (see [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger)). A JSON-LD array `from`, or a `fromNamed`, may name other ledgers, as on `POST /query`; each is read under the caller's access rights.
 
+SPARQL dataset IRIs are expanded against the query's prologue first: prefixed names, and relative IRIs against `BASE`. A ledger address that names its branch or a time (`my_db:main`, `mydb@t:3`) is no relative IRI, so `BASE` leaves it as written. A bare name (`mydb`) is a relative IRI, as `data.ttl` is, and `BASE` resolves it, so a query that declares a `BASE` names a ledger with its branch (`mydb:main`).
+
 ### The ledger's own address in a graph position
 
 Wherever a query or an update names a graph of the ledger it reads or writes, one table decides which graph the name is. That covers `GRAPH <iri>` in a query or in an update's `WHERE`, an update template's `GRAPH <iri>`, an `INSERT DATA` / `DELETE DATA` quad, a TriG block (in a transaction or a bulk import), `WITH`, and the JSON-LD forms (top-level `graph`, a node's `@graph`, `["graph", …]`). A dataset clause on a ledger-scoped surface (`FROM`, `FROM NAMED`, `USING`, `USING NAMED`, JSON-LD `from` / `fromNamed`) reads the ledger's own address and `mydb:main#<graph IRI>` the same way, and differs only as the list above says: another ledger's address is refused there, and a query's `FROM` may carry a time.

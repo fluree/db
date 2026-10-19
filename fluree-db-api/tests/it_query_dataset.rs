@@ -3981,6 +3981,63 @@ async fn connection_dataset_iris_expand_against_the_prologue() {
     assert_eq!(rows["results"]["bindings"].as_array().unwrap().len(), 2);
 }
 
+/// Under a declared `BASE`, a ledger address that names its branch or a time
+/// is no relative IRI reference (`n_m:main`, `nm@t:1`: RFC 3986 keeps a `:`
+/// out of a relative reference's first segment), so the dataset reads it as
+/// written; BASE-resolved, it named no ledger. A bare name is a relative
+/// reference, like `data.ttl`, so BASE resolves it, as SPARQL specifies.
+#[tokio::test]
+async fn base_leaves_a_ledger_address_with_a_branch_or_time_as_written() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_two_commit_ledger(&fluree).await;
+    let ledger = genesis_ledger(&fluree, "n_m:main");
+    fluree
+        .insert(
+            ledger,
+            &json!({"@id": "http://example.org/ns/bo", "http://schema.org/name": "Bo"}),
+        )
+        .await
+        .expect("seed n_m");
+
+    let names = |from: &str| {
+        let sparql = format!(
+            "BASE <http://example.org/base/> PREFIX schema: <http://schema.org/> \
+             SELECT ?name FROM <{from}> WHERE {{ ?s schema:name ?name }}"
+        );
+        let fluree = &fluree;
+        async move {
+            let rows = fluree
+                .query_from()
+                .sparql(&sparql)
+                .format(fluree_db_api::FormatterConfig::sparql_json())
+                .execute_formatted()
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut names: Vec<String> = rows["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .iter()
+                .map(|row| row["name"]["value"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            Ok::<_, String>(names)
+        }
+    };
+    for (from, want) in [
+        ("nm@t:1", vec!["Alice"]),
+        ("n_m:main", vec!["Bo"]),
+        ("n_m:main@t:1", vec!["Bo"]),
+    ] {
+        assert_eq!(names(from).await, Ok(strings(&want)), "FROM <{from}>");
+    }
+    let bare = names("nm").await.expect_err("a bare name is BASE-resolved");
+    assert!(bare.contains("http://example.org/base/nm"), "{bare}");
+}
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| (*s).to_string()).collect()
+}
+
 /// A JSON-LD query on a view reads that view's ledger, whole, at the view's
 /// time. A dataset member naming anything else was ignored and the query
 /// answered from the view: another ledger or one that does not exist, and

@@ -694,6 +694,22 @@ impl DatasetRef {
         TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag))
     }
 
+    /// Whether `s`, a SPARQL dataset IRI as written and not absolute, is a
+    /// ledger address that names its branch or a time (`my_db:main`,
+    /// `mydb@t:3`, `tenant/db:main#config`), which a declared `BASE` leaves
+    /// as written: no relative IRI reference a query would mean is spelled
+    /// that way (RFC 3986 §4.2 keeps a `:` out of a relative reference's
+    /// first segment). A bare name (`mydb`, `mydb#config`) is also a relative
+    /// reference (`data.ttl` is one), so a `BASE` resolves it, as SPARQL
+    /// specifies; with a `BASE`, a ledger is named with its branch. An address
+    /// with a known pin tag and a bad value stays as written too, so the pin's
+    /// own error reports it.
+    pub fn is_address_with_branch_or_time(s: &str) -> bool {
+        let text = AddressText::split(s);
+        text.before_graph().contains(':')
+            && (LedgerRef::parse(s).is_ok() || text.pin().is_some_and(Self::is_known_pin))
+    }
+
     /// The address reading, when there is one.
     pub fn address(&self) -> Option<&LedgerRef> {
         match self {
