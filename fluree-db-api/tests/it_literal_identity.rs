@@ -981,6 +981,160 @@ async fn typed_literal_constants_in_expressions_keep_their_datatype() {
         .await;
 }
 
+/// A datatype IRI in a namespace the ledger has never registered.
+const UNSEEN_DT: &str = "http://nowhere.example/T";
+
+/// `STRDT` and a typed literal in an expression build their literal for any
+/// datatype IRI (SPARQL 1.1 §17.4.2.9), including one in a namespace the
+/// ledger has never registered. A BIND of either used to fail the whole query
+/// with "Unknown datatype IRI" (#1765). The literal is its own term: equal to
+/// itself, to nothing stored, and `DATATYPE` names the IRI whether the
+/// literal was bound first or not. JSON-LD's `strdt` is the twin.
+#[tokio::test]
+async fn unseen_datatype_literal_from_an_expression_is_a_term() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/unseen-datatype-expression:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+        {"@id": "ex:s1", "ex:p": "a"},
+        {"@id": "ex:s2", "ex:p": {"@value": "a", "@type": "http://example.org/ns/custom"}}
+    ]});
+    fluree.insert(ledger, &data).await.unwrap();
+
+    let t = format!("<{UNSEEN_DT}>");
+    let cases: Vec<(&str, String, Value)> = vec![
+        (
+            "STRDT in a BIND",
+            format!(
+                r#"SELECT ?x (DATATYPE(?x) AS ?d) (STR(?x) AS ?l)
+                   WHERE {{ BIND(STRDT("a", {t}) AS ?x) }}"#
+            ),
+            json!([[{"@value": "a", "@type": UNSEEN_DT}, UNSEEN_DT, "a"]]),
+        ),
+        (
+            "a typed literal in a BIND",
+            format!(r#"SELECT (DATATYPE(?x) AS ?d) WHERE {{ BIND("a"^^{t} AS ?x) }}"#),
+            json!([[UNSEEN_DT]]),
+        ),
+        (
+            "STRDT over a stored value",
+            format!(
+                r#"SELECT (DATATYPE(?x) AS ?d) (STR(?x) AS ?l)
+                   WHERE {{ ex:s1 ex:p ?v BIND(STRDT(?v, {t}) AS ?x) }}"#
+            ),
+            json!([[UNSEEN_DT, "a"]]),
+        ),
+        (
+            "the literal is sameTerm and = to itself",
+            format!(
+                r#"SELECT (sameTerm(?x, ?y) AS ?same) (?x = ?y AS ?eq)
+                   WHERE {{ BIND(STRDT("a", {t}) AS ?x) BIND("a"^^{t} AS ?y) }}"#
+            ),
+            json!([[true, true]]),
+        ),
+        (
+            "it matches nothing stored",
+            format!(
+                r#"SELECT ?s WHERE {{ ?s ex:p ?o BIND(STRDT("a", {t}) AS ?x)
+                   FILTER(sameTerm(?o, ?x) || ?o = ?x) }}"#
+            ),
+            json!([]),
+        ),
+        (
+            "DATATYPE of the bound literal is the IRI",
+            format!(
+                r#"SELECT (DATATYPE(?x) = {t} AS ?eq) (sameTerm(DATATYPE(?x), {t}) AS ?same)
+                   WHERE {{ BIND(STRDT("a", {t}) AS ?x) }}"#
+            ),
+            json!([[true, true]]),
+        ),
+        (
+            "an absolute IRI a JSON-LD @type would refuse",
+            r#"SELECT (DATATYPE(?x) AS ?d) (DATATYPE(?y) AS ?e)
+               WHERE { BIND(STRDT("a", <bad:datatype>) AS ?x) BIND("a"^^<bad:datatype> AS ?y) }"#
+                .to_string(),
+            json!([["bad:datatype", "bad:datatype"]]),
+        ),
+        (
+            "DATATYPE of the literal, bound or not, joins as one term",
+            format!(
+                r#"SELECT ?a WHERE {{ ex:s1 ex:p ?v BIND(DATATYPE(STRDT(?v, {t})) AS ?d)
+                     {{ SELECT ?d ?a WHERE {{ ex:s1 ex:p ?w BIND(STRDT(?w, {t}) AS ?y)
+                                             BIND(DATATYPE(?y) AS ?d) BIND(1 AS ?a) }} }} }}"#
+            ),
+            json!([[1]]),
+        ),
+        (
+            "DATATYPE of a VALUES literal joins DATATYPE(STRDT(..))",
+            format!(
+                r#"SELECT ?a WHERE {{ VALUES ?x {{ "a"^^{t} }} BIND(DATATYPE(?x) AS ?d)
+                     {{ SELECT ?d ?a WHERE {{ BIND(DATATYPE(STRDT("a", {t})) AS ?d) BIND(1 AS ?a) }} }} }}"#
+            ),
+            json!([[1]]),
+        ),
+        (
+            "DATATYPE of the literal, bound or not, prints one way",
+            format!(
+                r#"PREFIX nw: <http://nowhere.example/>
+                   SELECT ?bound ?unbound WHERE {{ ex:s1 ex:p ?v BIND(STRDT(?v, {t}) AS ?x)
+                     BIND(DATATYPE(?x) AS ?bound) BIND(DATATYPE(STRDT(?v, {t})) AS ?unbound) }}"#
+            ),
+            json!([["nw:T", "nw:T"]]),
+        ),
+    ];
+    let jl = |bind: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "select": ["?d", "?l"],
+               "where": [{"@id": "ex:s1", "ex:p": "?v"},
+                         ["bind", "?x", bind, "?d", "(datatype ?x)", "?l", "(str ?x)"]]})
+    };
+    let jl_cases = [
+        ("json-ld strdt", format!(r#"(strdt ?v "{UNSEEN_DT}")"#)),
+        (
+            "json-ld str-dt over an iri",
+            format!(r#"(str-dt ?v (iri "{UNSEEN_DT}"))"#),
+        ),
+    ];
+
+    for phase in ["novelty", "indexed"] {
+        if phase == "indexed" {
+            fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+        }
+        let view = fluree.ledger(id).await.unwrap();
+        assert_eq!(
+            view.snapshot.range_provider.is_some(),
+            phase == "indexed",
+            "{phase}: setup"
+        );
+        for (name, body, expected) in &cases {
+            let got = sparql(&fluree, &view, body).await;
+            assert_eq!(&got, expected, "{phase}: {name}");
+        }
+        for (name, bind) in &jl_cases {
+            let got = query_jsonld_formatted(&fluree, &view, &jl(bind))
+                .await
+                .unwrap_or_else(|e| panic!("{phase}: {name}: {e}"));
+            assert_eq!(got, json!([[UNSEEN_DT, "a"]]), "{phase}: {name}");
+        }
+        let forms = json!({
+            "@context": {"ex": "http://example.org/ns/", "nw": "http://nowhere.example/"},
+            "select": ["?bound", "?unbound"],
+            "where": [{"@id": "ex:s1", "ex:p": "?v"},
+                      ["bind", "?x", format!(r#"(strdt ?v "{UNSEEN_DT}")"#),
+                       "?bound", "(datatype ?x)",
+                       "?unbound", format!(r#"(datatype (strdt ?v "{UNSEEN_DT}"))"#)]]
+        });
+        let got = query_jsonld_formatted(&fluree, &view, &forms)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            json!([["nw:T", "nw:T"]]),
+            "{phase}: json-ld DATATYPE forms"
+        );
+    }
+}
+
 /// Every flake in `id`'s commits, head first.
 async fn committed_flakes(fluree: &fluree_db_api::Fluree, id: &str) -> Vec<fluree_db_core::Flake> {
     let store = fluree.content_store(id);
@@ -1022,6 +1176,12 @@ async fn check_reads(
 /// lookup by the literal finds what was written: before and after an index
 /// build and a reindex at the same `t`, and after a reload. A DELETE of a
 /// literal no fact can carry retracts nothing and registers nothing.
+///
+/// An update that builds the literal stores the same term as a direct insert
+/// of it: SPARQL `STRDT`, a SPARQL typed literal and JSON-LD `str-dt` each
+/// write one predicate before the direct insert, and a DELETE that builds the
+/// literal with `STRDT` retracts the stored fact. SPARQL `STRDT` with
+/// `<bad:datatype>` stores the term SPARQL `INSERT DATA` stores.
 #[tokio::test]
 async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1051,6 +1211,48 @@ async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
     let graph = || fluree.graph(id);
     graph()
         .transact()
+        .sparql_update(&format!(
+            r#"{CTX} INSERT {{ ?s ex:p ?x }}
+               WHERE {{ ?s a ex:C . BIND(STRDT("a", <http://nowhere.example/T>) AS ?x) }}"#
+        ))
+        .commit()
+        .await
+        .expect("SPARQL STRDT update");
+    graph()
+        .transact()
+        .sparql_update(&format!(
+            r#"{CTX} INSERT {{ ?s ex:q ?x }}
+               WHERE {{ ?s a ex:C . BIND("b"^^<http://typed.example/U> AS ?x) }}"#
+        ))
+        .commit()
+        .await
+        .expect("SPARQL typed-literal update");
+    graph()
+        .transact()
+        .update(&json!({
+            "@context": ctx,
+            "where": [
+                {"@id": "?s", "@type": "ex:C"},
+                ["bind", "?x", "(str-dt \"c\" \"urn:example:dt\")"]
+            ],
+            "insert": {"@id": "?s", "ex:r": "?x"}
+        }))
+        .commit()
+        .await
+        .expect("JSON-LD str-dt update");
+    graph()
+        .transact()
+        .sparql_update(&format!(
+            r#"{CTX} INSERT {{ ?s ex:t ?x }}
+               WHERE {{ ?s a ex:C . BIND(STRDT("d", <bad:datatype>) AS ?x) }}"#
+        ))
+        .commit()
+        .await
+        .expect("SPARQL STRDT update with <bad:datatype>");
+    // The direct-insert twin, written after the updates registered the
+    // namespaces.
+    graph()
+        .transact()
         .insert(&json!({"@context": ctx, "@id": "ex:d",
             "ex:p": {"@value": "a", "@type": "http://nowhere.example/T"},
             "ex:q": {"@value": "b", "@type": "http://typed.example/U"},
@@ -1078,6 +1280,15 @@ async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
         ))
         .commit()
         .await;
+    graph()
+        .transact()
+        .sparql_update(&format!(
+            r#"{CTX} DELETE {{ ex:a ex:p ?x }}
+               WHERE {{ BIND(STRDT("a", <http://nowhere.example/T>) AS ?x) }}"#
+        ))
+        .commit()
+        .await
+        .expect("DELETE of a stored literal built by STRDT");
 
     let empty_dt: Vec<String> = committed_flakes(&fluree, id)
         .await
@@ -1099,24 +1310,24 @@ async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
 
     let reads: [(&str, &str, Value); 6] = [
         (
-            "a lookup by the literal finds it (http IRI)",
+            "STRDT and the direct insert are one term",
             r#"SELECT ?s WHERE { ?s ex:p "a"^^<http://nowhere.example/T> } ORDER BY ?s"#,
-            json!([["ex:d"]]),
+            json!([["ex:b"], ["ex:d"]]),
         ),
         (
-            "a lookup by the literal finds it (second namespace)",
+            "a typed literal and the direct insert are one term",
             r#"SELECT ?s WHERE { ?s ex:q "b"^^<http://typed.example/U> } ORDER BY ?s"#,
-            json!([["ex:d"]]),
+            json!([["ex:a"], ["ex:b"], ["ex:d"]]),
         ),
         (
-            "a lookup by the literal finds it (urn IRI)",
+            "JSON-LD str-dt and the direct insert are one term",
             r#"SELECT ?s WHERE { ?s ex:r "c"^^<urn:example:dt> } ORDER BY ?s"#,
-            json!([["ex:d"]]),
+            json!([["ex:a"], ["ex:b"], ["ex:d"]]),
         ),
         (
-            "a lookup by the literal finds it (an IRI JSON-LD refuses)",
+            "SPARQL STRDT and INSERT DATA are one term (an IRI JSON-LD refuses)",
             r#"SELECT ?s WHERE { ?s ex:t "d"^^<bad:datatype> } ORDER BY ?s"#,
-            json!([["ex:d"]]),
+            json!([["ex:a"], ["ex:b"], ["ex:d"]]),
         ),
         (
             "one stored term per predicate",
@@ -1158,4 +1369,79 @@ async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
         "reindexed at the same t, reloaded",
     )
     .await;
+}
+
+/// A datatype name with no scheme (`"T"`) splits to the empty prefix, so
+/// every write stores it under the EMPTY namespace: a JSON-LD insert, SPARQL
+/// `INSERT DATA`, JSON-LD `str-dt` and SPARQL `STRDT` all store the one term,
+/// and a lookup by it finds all four.
+#[tokio::test]
+async fn a_datatype_name_with_no_scheme_is_one_term_on_every_write_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/bare-datatype-name:main";
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    fluree.create_ledger(id).await.unwrap();
+    let graph = || fluree.graph(id);
+    graph()
+        .transact()
+        .insert(&json!({"@context": ctx, "@id": "ex:d", "ex:p": {"@value": "x", "@type": "T"}}))
+        .commit()
+        .await
+        .expect("JSON-LD insert");
+    graph()
+        .transact()
+        .sparql_update(r#"PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:e ex:p "x"^^<T> }"#)
+        .commit()
+        .await
+        .expect("SPARQL INSERT DATA");
+    graph()
+        .transact()
+        .update(&json!({"@context": ctx,
+            "where": [["bind", "?x", "(str-dt \"x\" \"T\")"]],
+            "insert": {"@id": "ex:u", "ex:p": "?x"}}))
+        .commit()
+        .await
+        .expect("JSON-LD str-dt update");
+    graph()
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT { ex:v ex:p ?x } WHERE { BIND(STRDT("x", <T>) AS ?x) }"#,
+        )
+        .commit()
+        .await
+        .expect("SPARQL STRDT update");
+
+    let dts: Vec<_> = committed_flakes(&fluree, id)
+        .await
+        .into_iter()
+        .filter(|f| f.p.name.as_ref() == "p")
+        .map(|f| f.dt)
+        .collect();
+    assert_eq!(dts.len(), 4, "{dts:?}");
+    assert!(
+        dts.iter()
+            .all(|dt| dt.namespace_code == fluree_vocab::namespaces::EMPTY
+                && dt.name.as_ref() == "T"),
+        "{dts:?}"
+    );
+    let view = fluree.ledger(id).await.unwrap();
+    assert_eq!(
+        sparql(
+            &fluree,
+            &view,
+            "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ex:p ?o }"
+        )
+        .await,
+        json!([[1]])
+    );
+    let found = query_jsonld_formatted(
+        &fluree,
+        &view,
+        &json!({"@context": ctx, "select": "?s", "orderBy": "?s",
+                "where": {"@id": "?s", "ex:p": {"@value": "x", "@type": "T"}}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(found, json!(["ex:d", "ex:e", "ex:u", "ex:v"]));
 }

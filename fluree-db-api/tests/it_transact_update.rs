@@ -1179,6 +1179,9 @@ async fn update_where_bind_error_handling_invalid_iri() {
     }
 }
 
+/// A `str-dt` datatype string that looks like a compact IRI with an undefined
+/// prefix refuses the update with the error a JSON-LD insert of the same
+/// `@type` gives.
 #[tokio::test]
 async fn update_where_bind_error_handling_invalid_datatype_iri() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1216,13 +1219,77 @@ async fn update_where_bind_error_handling_invalid_datatype_iri() {
         )
         .await;
 
-    assert!(run_err.is_err(), "expected runtime bind error");
+    assert!(run_err.is_err(), "expected the compact-IRI guard's error");
     if let Err(err) = run_err {
         assert!(
-            err.to_string().contains("Unknown datatype IRI"),
+            err.to_string()
+                .contains("Unresolved compact IRI 'bad:datatype'"),
             "unexpected error: {err}"
         );
     }
+}
+
+/// An update that binds `str-dt` with a datatype in a namespace the ledger
+/// has never registered stores the literal as the same term a direct insert
+/// of it stores; the bind used to fail the update with "Unknown datatype IRI"
+/// (#1765).
+#[tokio::test]
+async fn update_where_bind_str_dt_with_an_unseen_datatype_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:unseen-dt-iri");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {"id": "ex:error", "ex:text": "Abcdefg"}
+            }),
+        )
+        .await
+        .expect("seed");
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id": "?s", "ex:text": "?text"},
+                    ["bind", "?lit", "(str-dt ?text \"urn:example:dt\")"]
+                ],
+                "insert": {"id": "?s", "ex:typed": "?lit"}
+            }),
+        )
+        .await
+        .expect("str-dt with an unseen datatype IRI");
+    let direct = fluree
+        .insert(
+            updated.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "@id": "ex:direct",
+                "ex:typed": {"@value": "Abcdefg", "@type": "urn:example:dt"}
+            }),
+        )
+        .await
+        .expect("direct insert of the same literal");
+
+    let both = support::query_jsonld(
+        &fluree,
+        &direct.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:typed": {"@value": "Abcdefg", "@type": "urn:example:dt"}},
+            "orderBy": "?s"
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&direct.ledger.snapshot)
+    .expect("format");
+    assert_eq!(both, json!(["ex:direct", "ex:error"]));
 }
 
 #[tokio::test]

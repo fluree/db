@@ -318,7 +318,7 @@ fn parse_query_body(
         query.options.having = having;
         query.options.aggregates = having_aggregates;
         parse_top_level_values(obj, ctx, &mut query)?;
-        where_clause::resolve_atoms_outside_where(&mut query, ctx);
+        where_clause::resolve_atoms_outside_where(&mut query, ctx)?;
         // `ask` is true when a solution remains after `offset` and `limit`
         // (`limit: 0` is false); one is enough, so the limit is at most 1.
         query.options.offset = options::parse_offset(obj)?;
@@ -411,7 +411,7 @@ fn parse_query_body(
     query.options = opts;
     // SELECT computations and HAVING parse without the `@context`; give them
     // the same compact-IRI resolution the WHERE clause gets.
-    where_clause::resolve_atoms_outside_where(&mut query, ctx);
+    where_clause::resolve_atoms_outside_where(&mut query, ctx)?;
 
     // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
     if query.options.order_by.is_empty() && !query.options.group_by.is_empty() {
