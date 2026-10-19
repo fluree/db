@@ -5267,14 +5267,16 @@ fn leaf_rows_for(order: RunSortOrder, config: &IndexerConfig) -> usize {
 const DELTA_MAX_RUNS: usize = 64;
 
 /// Delta events a pooled secondary order may hold however small its base.
-const DELTA_MIN_EVENTS: u64 = 50_000;
+const DELTA_MIN_EVENTS: u64 = 16_000;
 
-/// A delta may hold up to its base's live rows divided by this.
-const DELTA_BASE_SHARE: u64 = 4;
+/// A delta may hold up to its base's live rows divided by this. A scan
+/// merges every delta event in its range row by row, so the delta stays
+/// small beside the rows it reads.
+const DELTA_BASE_SHARE: u64 = 16;
 
 /// Delta events a pooled secondary order holds at most, however large its
-/// base: readers keep each order's delta in memory.
-const DELTA_MAX_EVENTS: u64 = 250_000;
+/// base: what a broad scan merges, and what readers keep in memory.
+const DELTA_MAX_EVENTS: u64 = 64_000;
 
 /// Whether a pooled secondary order should fold its delta runs, and this
 /// window's events, into its base rather than append the window as a run:
@@ -5667,7 +5669,7 @@ mod placement_tests {
         let below = (DELTA_MIN_EVENTS - 10) as usize;
         assert!(!compact_delta(&[run(10)], below, 0, false));
         assert!(compact_delta(&[run(11)], below, 0, false), "small base");
-        let base = 4 * (DELTA_MIN_EVENTS + 100);
+        let base = DELTA_BASE_SHARE * (DELTA_MIN_EVENTS + 100);
         assert!(
             !compact_delta(&[run(110)], below, base, false),
             "base share"
