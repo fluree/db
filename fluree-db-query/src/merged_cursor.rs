@@ -129,6 +129,8 @@ impl MergedRangeCursor {
     /// A merge of `set`'s members over `[min, max]` (inclusive, in `order`),
     /// each read with `filter`. Output batches carry `projection`'s columns;
     /// the inputs read the identity columns as well, which the merge needs.
+    /// With no column (an empty projection), a batch is a row count alone and
+    /// the merge records nothing to gather: what a counting lane reads.
     ///
     /// Members whose index holds no leaf in the range are left out. Declines
     /// [`MergeDecline::Novelty`] unless every member is current, and
@@ -239,14 +241,14 @@ impl MergedRangeCursor {
                 return Ok(Err(decline));
             }
             self.runs.clear();
-            match self.order {
+            let rows = match self.order {
                 RunSortOrder::Spot => self.merge_round::<Spot>(),
                 RunSortOrder::Psot => self.merge_round::<Psot>(),
                 RunSortOrder::Post => self.merge_round::<Post>(),
                 RunSortOrder::Opst => self.merge_round::<Opst>(),
-            }
-            if !self.runs.is_empty() {
-                return Ok(Ok(Some(self.gather())));
+            };
+            if rows > 0 {
+                return Ok(Ok(Some(self.gather(rows))));
             }
             if self.inputs.iter().all(|input| input.done) {
                 return Ok(Ok(None));
@@ -301,8 +303,10 @@ impl MergedRangeCursor {
     }
 
     /// Merge the inputs' current batches until one of them is used up,
-    /// recording the rows to emit in `self.runs`.
-    fn merge_round<O: MergeOrder>(&mut self) {
+    /// recording the rows to emit in `self.runs` when a column is wanted.
+    /// Returns how many rows it emits.
+    fn merge_round<O: MergeOrder>(&mut self) -> usize {
+        let record = self.output != ColumnSet::EMPTY;
         let Self {
             inputs, runs, last, ..
         } = self;
@@ -320,7 +324,12 @@ impl MergedRangeCursor {
                 list_rows: input.list_rows,
             })
             .collect();
-        let mut out = Emitted { runs, last };
+        let mut out = Emitted {
+            runs,
+            last,
+            record,
+            rows: 0,
+        };
         match lanes.as_mut_slice() {
             [] => {}
             [only] => {
@@ -337,11 +346,13 @@ impl MergedRangeCursor {
         for (i, pos) in positions {
             inputs[i].pos = pos;
         }
+        out.rows
     }
 
-    /// The batch of this round's runs, column by column.
-    fn gather(&self) -> ColumnBatch {
-        let row_count: usize = self.runs.iter().map(|r| r.to - r.from).sum();
+    /// The batch of this round's `row_count` rows, gathered column by column
+    /// from its runs; a row count alone when no column is wanted (no runs
+    /// were recorded).
+    fn gather(&self, row_count: usize) -> ColumnBatch {
         let inputs = &self.inputs;
         let runs = &self.runs;
         let wants = |col| self.output.contains(col);
@@ -406,6 +417,11 @@ impl Lane<'_> {
 struct Emitted<'a> {
     runs: &'a mut Vec<Run>,
     last: &'a mut Option<FactKey>,
+    /// Record runs to gather from. Without an output column, rows are only
+    /// counted.
+    record: bool,
+    /// The rows emitted this round.
+    rows: usize,
 }
 
 impl Emitted<'_> {
@@ -415,7 +431,10 @@ impl Emitted<'_> {
     fn one(&mut self, lane: &Lane<'_>, row: usize, key: Key) {
         let fact = key.fact();
         if *self.last != Some(fact) {
-            push_run(self.runs, lane.input, row, row + 1);
+            if self.record {
+                push_run(self.runs, lane.input, row, row + 1);
+            }
+            self.rows += 1;
             *self.last = Some(fact);
         }
     }
@@ -438,7 +457,10 @@ impl Emitted<'_> {
             from += 1;
         }
         if from < to {
-            push_run(self.runs, lane.input, from, to);
+            if self.record {
+                push_run(self.runs, lane.input, from, to);
+            }
+            self.rows += to - from;
             *self.last = Some(Key::at(lane.batch, to - 1).fact());
         }
     }
@@ -1308,6 +1330,33 @@ mod tests {
                     let out = drain(&mut merge(order, batches))
                         .unwrap_or_else(|d| panic!("{order:?} k={k} seed={seed}: {d:?}"));
                     assert_is_the_union(order, &members, &out);
+                    // Counting alone (no output column) emits as many rows,
+                    // over leaflets cut differently.
+                    let batches = members
+                        .iter()
+                        .map(|rows| split_leaflets(&mut rng, rows))
+                        .collect();
+                    let (min, max) = full_range();
+                    let mut counting = MergedRangeCursor::from_batches(
+                        order,
+                        batches,
+                        &min,
+                        &max,
+                        ColumnProjection {
+                            output: ColumnSet::EMPTY,
+                            internal: ColumnSet::EMPTY,
+                        },
+                    );
+                    let mut counted = 0;
+                    while let Some(batch) = counting.next_batch().unwrap().unwrap() {
+                        assert!(batch.row_count > 0 && batch.s_id.is_absent());
+                        counted += batch.row_count;
+                    }
+                    assert_eq!(
+                        counted,
+                        out.len(),
+                        "{order:?} k={k} seed={seed}: count only"
+                    );
                 }
             }
         }
