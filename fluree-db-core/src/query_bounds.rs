@@ -192,12 +192,14 @@ impl ObjectBounds {
     /// - Temporal types are only comparable within the same kind (Date vs Date, etc.)
     /// - A string bound compares only against an `xsd:string` object
     /// - Other types require exact type match
+    #[inline]
     pub fn matches(&self, value: &FlakeValue, dt: &Sid) -> bool {
         self.matches_object(value, || crate::datatypes::is_xsd_string_datatype(dt))
     }
 
     /// [`Self::matches`] for a binary-index row, whose datatype is its
     /// `o_type`.
+    #[inline]
     pub fn matches_encoded(&self, value: &FlakeValue, o_type: OType) -> bool {
         self.matches_object(value, || o_type == OType::XSD_STRING)
     }
@@ -206,10 +208,12 @@ impl ObjectBounds {
     /// consult: a numeric bound orders every numeric type by value, and a
     /// string bound admits no number. Anything else passed here is treated as
     /// a non-`xsd:string` object, so it can only fail a string bound.
+    #[inline]
     pub fn matches_number(&self, value: &FlakeValue) -> bool {
         self.matches_object(value, || false)
     }
 
+    #[inline]
     fn matches_object(&self, value: &FlakeValue, is_xsd_string: impl Fn() -> bool) -> bool {
         // Check lower bound
         if let Some((lower, inclusive)) = &self.lower {
@@ -243,6 +247,7 @@ impl ObjectBounds {
     /// - **String**: an `xsd:string` value only (`is_xsd_string`)
     /// - **Same type**: Always comparable
     /// - **Different type classes**: Incompatible (returns None)
+    #[inline]
     fn class_cmp(
         &self,
         value: &FlakeValue,
@@ -252,6 +257,14 @@ impl ObjectBounds {
         // Numeric class: all numeric types are comparable
         if value.is_numeric() && bound.is_numeric() {
             return value.numeric_cmp(bound);
+        }
+
+        // String class, ahead of the rest as the common case for a string
+        // bound: the bound is the `xsd:string` term, and a tagged or
+        // otherwise-typed string shares its value but not its type. No
+        // coercion applies between two strings.
+        if let (FlakeValue::String(v), FlakeValue::String(b)) = (value, bound) {
+            return is_xsd_string().then(|| v.as_str().cmp(b.as_str()));
         }
 
         // Temporal class: same temporal type only
@@ -269,17 +282,13 @@ impl ObjectBounds {
             }
         }
 
-        match (value, bound) {
-            // The bound is the `xsd:string` term; a tagged or otherwise-typed
-            // string shares its value but not its type.
-            (FlakeValue::String(_), FlakeValue::String(_)) if !is_xsd_string() => None,
-            // Same type: use standard comparison
-            _ if std::mem::discriminant(value) == std::mem::discriminant(bound) => {
-                Some(value.cmp(bound))
-            }
-            // Incompatible types
-            _ => None,
+        // Same type: use standard comparison
+        if std::mem::discriminant(value) == std::mem::discriminant(bound) {
+            return Some(value.cmp(bound));
         }
+
+        // Incompatible types
+        None
     }
 
     /// The `o_type`s a stored object needs to satisfy these bounds when a
