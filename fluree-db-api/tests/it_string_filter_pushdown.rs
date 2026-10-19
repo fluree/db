@@ -95,6 +95,9 @@ const fn evaluated(
 
 const P: &str = "?s ex:p ?o";
 const WHEN: &str = "?s ex:when ?o";
+const AT: &str = "?s ex:at ?o";
+const MIX: &str = "?s ex:mix ?o";
+const DECISION: &str = "?s a ex:Decision ; ex:at ?o";
 const A: &[&str] = &["plain", "xs"];
 
 fn sparql_cases() -> Vec<Case> {
@@ -146,6 +149,90 @@ fn sparql_cases() -> Vec<Case> {
             &["b_en", "en", "fr", "num", "other"],
         ),
         evaluated("= a tagged constant", &[r#"?o = "a"@en"#], &["en"]),
+        // A plain string against typed dateTime, date and time values: the
+        // ordering operators read the string as a value of the row's kind
+        // (where it parses as one), `=` never does, and `>= && <=` with one
+        // string is two orderings, not an `=`.
+        case(
+            "dateTime < string",
+            AT,
+            &[r#"?o < "2026-01-02T00:00:00Z""#],
+            &["at_dt1", "at_s"],
+        ),
+        case(
+            "dateTime <= string",
+            AT,
+            &[r#"?o <= "2026-01-02T00:00:00Z""#],
+            &["at_dt1", "at_s"],
+        ),
+        case(
+            "dateTime > string",
+            AT,
+            &[r#"?o > "2026-01-01T12:00:00Z""#],
+            &["at_dt2"],
+        ),
+        case(
+            "dateTime >= string",
+            AT,
+            &[r#"?o >= "2026-01-01T10:00:00Z""#],
+            &["at_dt1", "at_dt2", "at_s"],
+        ),
+        case(
+            "dateTime = string",
+            AT,
+            &[r#"?o = "2026-01-01T10:00:00Z""#],
+            &["at_s"],
+        ),
+        case(
+            "dateTime >= && <= one string",
+            AT,
+            &[r#"?o >= "2026-01-01T10:00:00Z" && ?o <= "2026-01-01T10:00:00Z""#],
+            &["at_dt1", "at_s"],
+        ),
+        case(
+            "date < string",
+            AT,
+            &[r#"?o < "2026-01-02""#],
+            &["at_d", "at_s"],
+        ),
+        case("time < string", AT, &[r#"?o < "11:00:00""#], &["at_t"]),
+        // solo's decision pager (fluree-lambda-identity `store.rs`): the
+        // standalone form is pushed, the paging form is evaluated (`=` is
+        // false there, so only the strictly earlier decision comes back).
+        // Pushed into the join's per-subject probes of `ex:at`, which check
+        // the bound row by row; there is no POST range to seek.
+        Case {
+            string_seek: false,
+            ..case(
+                "pager <",
+                DECISION,
+                &[r#"?o < "2026-01-02T10:00:00Z""#],
+                &["at_dt1"],
+            )
+        },
+        Case {
+            pattern: DECISION,
+            ..evaluated(
+                "pager || =",
+                &[
+                    r#"?o < "2026-01-02T10:00:00Z" || (?o = "2026-01-02T10:00:00Z" && STR(?s) < "http://example.org/ns/at_dt2")"#,
+                ],
+                &["at_dt1"],
+            )
+        },
+        // Other value classes against a plain string: a boolean, an IRI, a
+        // number and a tagged string are neither equal nor ordered.
+        case("mixed classes =", MIX, &[r#"?o = "a""#], &["m_plain"]),
+        case("mixed classes <", MIX, &[r#"?o < "b""#], &["m_plain"]),
+        case("mixed classes >", MIX, &[r#"?o > """#], &["m_plain"]),
+        Case {
+            pattern: MIX,
+            ..evaluated(
+                "mixed classes !=",
+                &[r#"?o != "a""#],
+                &["m_en", "m_iri", "m_num", "m_yes"],
+            )
+        },
     ]
 }
 
@@ -306,7 +393,20 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
         {"@id": "ex:mar", "ex:when": {"@value": "2026-03-01", "@type": "xsd:date"}},
         {"@id": "ex:q0", "ex:q": "base"},
         {"@id": "ex:ft", "ex:ftp": {"@value": "a", "@type": "@fulltext"}},
-        {"@id": "ex:ft_plain", "ex:ftp": "a"}
+        {"@id": "ex:ft_plain", "ex:ftp": "a"},
+        {"@id": "ex:at_dt1", "@type": "ex:Decision",
+         "ex:at": {"@value": "2026-01-01T10:00:00Z", "@type": "xsd:dateTime"}},
+        {"@id": "ex:at_dt2", "@type": "ex:Decision",
+         "ex:at": {"@value": "2026-01-02T10:00:00Z", "@type": "xsd:dateTime"}},
+        {"@id": "ex:at_d", "ex:at": {"@value": "2026-01-01", "@type": "xsd:date"}},
+        {"@id": "ex:at_t", "ex:at": {"@value": "10:00:00", "@type": "xsd:time"}},
+        {"@id": "ex:at_s", "ex:at": "2026-01-01T10:00:00Z"},
+        {"@id": "ex:at_en", "ex:at": {"@value": "2026-01-01T10:00:00Z", "@language": "en"}},
+        {"@id": "ex:m_plain", "ex:mix": "a"},
+        {"@id": "ex:m_en", "ex:mix": {"@value": "a", "@language": "en"}},
+        {"@id": "ex:m_yes", "ex:mix": true},
+        {"@id": "ex:m_num", "ex:mix": 5},
+        {"@id": "ex:m_iri", "ex:mix": {"@id": "ex:target"}}
     ]});
     fluree.insert(ledger, &seed).await.unwrap();
 
@@ -348,20 +448,26 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
         let db = graphdb_from_ledger(&view);
 
         for c in sparql_cases() {
-            let filters = |wrap: bool| -> String {
-                c.filters
+            // The query as written, and three evaluated oracles that do not
+            // share its plan: none of these shapes is range-safe, so the
+            // comparison runs in the FILTER evaluator, not the scan.
+            let oracles: [(&str, fn(usize, &str) -> String); 3] = [
+                ("&& BOUND", |_, f| format!(" FILTER(({f}) && BOUND(?o))")),
+                ("|| false", |_, f| format!(" FILTER(({f}) || false)")),
+                ("BIND", |i, f| {
+                    format!(" BIND(({f}) AS ?keep{i}) FILTER(?keep{i})")
+                }),
+            ];
+            let body = |shape: fn(usize, &str) -> String| -> String {
+                let filters: String = c
+                    .filters
                     .iter()
-                    .map(|f| {
-                        if wrap {
-                            format!(" FILTER(({f}) && BOUND(?o))")
-                        } else {
-                            format!(" FILTER({f})")
-                        }
-                    })
-                    .collect()
+                    .enumerate()
+                    .map(|(i, f)| shape(i, f))
+                    .collect();
+                format!("SELECT ?s WHERE {{ {}{} }}", c.pattern, filters)
             };
-            let q = format!("SELECT ?s WHERE {{ {}{} }}", c.pattern, filters(false));
-            let twin = format!("SELECT ?s WHERE {{ {}{} }}", c.pattern, filters(true));
+            let q = body(|_, f| format!(" FILTER({f})"));
             let want = expect(c.expected, phase);
             let what = format!("{phase}: sparql {}", c.name);
 
@@ -370,14 +476,10 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
                 .await
                 .unwrap();
             if pushes_bounds(&plan) != c.pushed {
-                failures.push(format!("{what}: pushed = {}, want {}", !c.pushed, c.pushed));
-            }
-            let twin_plan = fluree
-                .explain_sparql(&db, &format!("{PREFIX}{twin}"))
-                .await
-                .unwrap();
-            if pushes_bounds(&twin_plan) {
-                failures.push(format!("{what}: the evaluated twin was pushed"));
+                failures.push(format!(
+                    "{what}: pushed = {}, want {}: {}",
+                    !c.pushed, c.pushed, plan["plan"]["physical"]
+                ));
             }
 
             let (got, proceeded) = routed(&store, sparql(&fluree, &view, &q)).await;
@@ -398,9 +500,19 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
             if generic != want {
                 failures.push(format!("{what}: fast paths off got {generic:?}"));
             }
-            let evaluated = sparql(&fluree, &view, &twin).await;
-            if evaluated != want {
-                failures.push(format!("{what}: evaluated twin got {evaluated:?}"));
+            for (oracle, shape) in oracles {
+                let twin = body(shape);
+                let twin_plan = fluree
+                    .explain_sparql(&db, &format!("{PREFIX}{twin}"))
+                    .await
+                    .unwrap();
+                if pushes_bounds(&twin_plan) {
+                    failures.push(format!("{what}: the {oracle} oracle was pushed"));
+                }
+                let evaluated = sparql(&fluree, &view, &twin).await;
+                if evaluated != want {
+                    failures.push(format!("{what}: {oracle} oracle got {evaluated:?}"));
+                }
             }
         }
 
@@ -543,6 +655,20 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
             let got = sparql(&fluree, &view, body).await;
             if !got.is_empty() {
                 failures.push(format!("{phase}: {body} got {got:?}"));
+            }
+        }
+        for filters in [
+            [r#"(> ?o 1)"#, r#"(> ?o "a")"#],
+            [r#"(> ?o "a")"#, r#"(> ?o 1)"#],
+        ] {
+            let q = jsonld_query(json!([
+                {"@id": "?s", "ex:p": "?o"},
+                ["filter", filters[0]],
+                ["filter", filters[1]]
+            ]));
+            let got = names(&query_jsonld_formatted(&fluree, &view, &q).await.unwrap());
+            if !got.is_empty() {
+                failures.push(format!("{phase}: json-ld {filters:?} got {got:?}"));
             }
         }
     }
