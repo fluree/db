@@ -2435,10 +2435,10 @@ async fn object_count_over_one_graph_and_a_union() {
     // A second commit: a reindex replays commits in order and numbers each
     // predicate when it first sees it, so `ex:zz` sorts after every predicate
     // of g3 in POST, and no leaf of g3 spans it.
-    let later = r#"
+    let later = r"
         @prefix ex: <http://example.org/> .
         GRAPH <urn:g2> { ex:k ex:zz 6 . ex:f ex:zz ( 5 5 ) . }
-    "#;
+    ";
     let (fluree, handle) = indexed_trig_commits(ledger_id, &[trig, later]).await;
     // The union lane answers to the kill switch: no test may flip it mid-case.
     let switch = crate::support::FAST_PATH_SWITCH.read().await;
@@ -2665,8 +2665,8 @@ async fn object_count_over_one_graph_and_a_union() {
     fluree
         .stage(&handle)
         .upsert_turtle(
-            r#"@prefix ex: <http://example.org/> .
-               GRAPH <urn:g2> { ex:j ex:kind ex:T . }"#,
+            r"@prefix ex: <http://example.org/> .
+               GRAPH <urn:g2> { ex:j ex:kind ex:T . }",
         )
         .execute()
         .await
