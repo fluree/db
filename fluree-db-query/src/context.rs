@@ -309,6 +309,12 @@ pub struct ExecutionContext<'a> {
     /// present-but-dangling FK differs (templated vs omitted). Read only for the
     /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
     pub trust_fk_refs: bool,
+    /// Most pairs a property path may compute before returning its first
+    /// row — one whose endpoints are both free or both constant; past it the
+    /// path fails with [`QueryError::ResourceLimit`]. `None` (the default)
+    /// leaves only the per-traversal visited-node cap. Datalog sets it for a
+    /// transitive-closure rule, which iterates instead when the path hits it.
+    pub path_pair_limit: Option<usize>,
     /// Optional binary columnar index store for fast local-file scans.
     ///
     /// When present, scan operators use the binary cursor path for queries
@@ -522,6 +528,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: false,
             cypher_vocab: None,
             trust_fk_refs: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -582,6 +589,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: false,
             cypher_vocab: None,
             trust_fk_refs: false,
+            path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -646,6 +654,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: false,
             cypher_vocab: None,
             trust_fk_refs: false,
+            path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -699,6 +708,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: false,
             cypher_vocab: None,
             trust_fk_refs: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -751,6 +761,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: false,
             cypher_vocab: None,
             trust_fk_refs: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -805,6 +816,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: false,
             cypher_vocab: None,
             trust_fk_refs: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -996,6 +1008,12 @@ impl<'a> ExecutionContext<'a> {
     /// `QueryExecutionOptions::trust_fk_refs` on the graph-source crawl path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// See [`ExecutionContext::path_pair_limit`].
+    pub fn with_path_pair_limit(mut self, limit: usize) -> Self {
+        self.path_pair_limit = Some(limit);
         self
     }
 
@@ -1500,6 +1518,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1563,6 +1582,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1622,6 +1642,7 @@ impl<'a> ExecutionContext<'a> {
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
             dict_novelty: Self::extract_dict_novelty(graph.snapshot),

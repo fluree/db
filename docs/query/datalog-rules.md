@@ -504,40 +504,55 @@ find items liked by mutual friends.
 
 ### Fixpoint evaluation
 
-Rules execute in a **fixpoint loop**:
+Before evaluating, Fluree works out which rules can see which other rules'
+conclusions. A rule depends on another when its `WHERE` clause can match a
+fact the other rule's head derives. Rules that depend on each other, directly
+or through a cycle, form a **recursive group**; every other rule stands alone.
 
-1. Every rule body is evaluated by the query engine against the current data
-   (base + previously derived facts).
-2. The heads are instantiated for each solution; new facts are collected.
-3. If any new facts were produced, go back to step 1 with the expanded fact set.
-4. When no new facts are produced (fixpoint reached), the loop terminates.
+Evaluation then proceeds in dependency order:
+
+1. A rule that cannot see its own conclusions runs **once**, after every rule
+   it reads from has finished.
+2. A recursive group runs its rules repeatedly, each pass over the base data
+   plus everything derived so far, until a pass derives nothing new. After
+   the first pass, a rule re-reads only what its group derived in the
+   previous pass wherever its `WHERE` clause allows it (see
+   [Performance considerations](#performance-considerations)).
+3. Groups that do not read each other's conclusions are evaluated together.
 
 This means:
 - **Recursive rules work.** A rule can produce facts that trigger itself again.
 - **Rule chaining works.** Rule A can produce facts that trigger Rule B, and
-  vice versa.
-- **Termination is guaranteed** by a maximum fixpoint-iteration bound and by
-  the shared reasoning budget — a maximum derived-fact count, a maximum
-  memory estimate for the derived facts, and a maximum wall-clock time, the
-  same budget OWL2-RL uses. The fact ceiling is checked before each derived
-  fact is kept, so a run returns at most that many and a single round cannot
-  overshoot. The budget bounds the derived facts, not a rule body's
-  intermediate binding rows: each body is evaluated in full before its heads
-  are instantiated, so a body matching far more rows than it derives facts can
-  exceed the memory estimate while running. Hitting the budget stops early and
-  marks the result `capped` in the tracked response's `reasoning` block.
+  vice versa; the order rules are written or stored in does not matter.
+- **Rules downstream of a recursion see its complete result.** A rule that
+  reads a recursive relation runs once, after that relation stops growing,
+  instead of re-running every pass.
+- **Volatile functions run once per materialization in a non-recursive rule.**
+  A rule calling `NOW()`, `RAND()`, `UUID()` / `STRUUID()` or `BNODE()`
+  derives from a single evaluation. Inside a recursive group such a rule is
+  re-evaluated every pass and can keep deriving new values until the budget
+  stops it; Fluree logs a warning naming the rule.
+- **The dependency analysis is conservative.** A variable predicate
+  (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`) or a variable-predicate
+  head counts as reading or writing every predicate, which can merge rules
+  into a larger recursive group. That costs speed, never correctness.
+- **Termination is guaranteed** by a maximum number of passes per group of
+  rules and by the shared reasoning budget — a maximum derived-fact count, a
+  maximum memory estimate for the derived facts, and a maximum wall-clock
+  time, the same budget OWL2-RL uses. The fact ceiling is checked before each
+  derived fact is kept, so a run returns at most that many and a single pass
+  cannot overshoot. A rule's heads are instantiated as its body's rows
+  arrive, so reaching the budget also stops the body that reached it. Work an
+  operator does before it returns its first row (a sort, a grouping, or a
+  property path with both ends free) runs in full and is not counted against
+  the memory estimate. Hitting the budget stops early and
+  marks the result `capped` in the tracked response's `reasoning` block; which
+  partial facts a capped run keeps depends on evaluation order. The block's
+  `iterations` field counts passes across all groups.
   Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
   `f:reasoningMaxMemoryMb` (ledger
   config), `"reasoningBudget"` (query), or `FLUREE_REASONING_MAX_FACTS` /
   `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB` (server).
-
-### Execution order
-
-Rules are ordered before the fixpoint by a lightweight heuristic (fewest
-predicate dependencies first). Because the fixpoint re-runs every rule each
-iteration until no new facts are produced, this ordering only affects how
-quickly the fixpoint converges — never the final set of derived facts. Rule
-chaining (rule A's output feeding rule B) works regardless of the order.
 
 ### Interaction with OWL 2 RL
 
@@ -552,6 +567,30 @@ When both OWL 2 RL and Datalog are enabled:
 - **Rule bodies are planned queries.** They take the same index lanes and join
   ordering as any query, so the usual query advice applies: put a selective
   pattern in the body, and prefer bound predicates.
+- **Write recursive reads as plain triple patterns.** After a recursive
+  group's first pass, a rule runs once for each top-level triple pattern that
+  can match its group's conclusions, with that pattern limited to the facts
+  the group derived in the previous pass. Each pass then costs roughly what
+  it derives, not the size of everything derived so far. A rule with two such
+  patterns (`?x ex:ancestor ?y . ?y ex:ancestor ?z`) runs twice per pass. A
+  rule that reads its group's conclusions inside a `UNION`, `EXISTS`,
+  subquery or property path re-runs its whole `WHERE` clause every pass
+  instead: it derives the same facts, more slowly. So does a recursive rule
+  that calls a function whose result changes between calls (`NOW()`,
+  `STRUUID()`, …) or reads a value's transaction metadata (`t`, `op`).
+- **A transitive closure runs as one traversal.** A recursive rule that is
+  alone in its group and has the shape of a transitive closure is evaluated
+  in a single pass as a property path instead of iterating, and derives the
+  same facts. With `ex:ancestor` in the head (`?x ex:ancestor ?z`), the
+  shapes are `?x ex:parent ?y . ?y ex:ancestor ?z`,
+  `?x ex:ancestor ?y . ?y ex:parent ?z` and
+  `?x ex:ancestor ?y . ?y ex:ancestor ?z`; the step pattern may also be
+  written in reverse (`?y ex:parent ?x`). The body must be exactly those two
+  patterns. A path follows only IRI-valued objects, so the
+  `?x ex:ancestor ?y . ?y ex:parent ?z` shape iterates instead while
+  `ex:parent` has a literal object. A path that would compute more pairs than
+  the budget still has room for also iterates instead, so the budget bounds
+  these rules like any other.
 - **Budget limits apply.** The same time / fact / memory budgets as OWL 2 RL
   materialization apply to Datalog execution (default: 30s and 1M derived
   facts, with a memory ceiling derived from the fact ceiling).

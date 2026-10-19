@@ -40,6 +40,36 @@ use crate::error::Result;
 use crate::view::{ConfigReasoningBudget, ReasoningModePrecedence};
 use crate::GovernanceOptions;
 
+/// Test-only fault injection for [`resolve_ledger_config`]: while a guard
+/// from [`arm`](config_read_fault::arm) is alive, every config read on this
+/// thread fails, as a storage error would, so a test sees each caller's
+/// mapping of the failure.
+#[cfg(test)]
+pub(crate) mod config_read_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+
+    pub(crate) fn arm() -> Guard {
+        ARMED.with(|armed| armed.set(true));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|armed| armed.set(false));
+        }
+    }
+}
+
 // ============================================================================
 // Public: Privileged config read
 // ============================================================================
@@ -56,6 +86,12 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    #[cfg(test)]
+    if config_read_fault::armed() {
+        return Err(crate::error::ApiError::internal(
+            "injected config read failure",
+        ));
+    }
     let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
         return Ok(None);
     };
@@ -96,32 +132,55 @@ async fn resolve_config_sid(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<Sid>> {
-    // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
-    // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
-    // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
-    // lookup below resolves an object IRI that is absent from the dictionary,
-    // which drops the bound-object filter and full-scans the rdf:type predicate
-    // over the (growing) novelty overlay on EVERY transaction and query —
-    // O(novelty) per call once an index is attached. The overlay check only
-    // applies when the overlay is a `Novelty`; for other overlay types we fall
-    // through and run the scan (correctness over speed).
+    let config_sids = ledger_config_subjects(snapshot, overlay, to_t).await?;
+    if config_sids.len() > 1 {
+        tracing::warn!(
+            count = config_sids.len(),
+            "Multiple f:LedgerConfig resources found in config graph — using first by IRI order"
+        );
+    }
+    Ok(config_sids.into_iter().next())
+}
+
+/// Whether the config graph may hold data: false only when neither the
+/// novelty overlay nor the base index has any flake in it. The overlay check
+/// applies when the overlay is a `Novelty`; for other overlay types, and for
+/// an index root without per-graph stats, the answer is conservatively true.
+/// NOTE: `graph_registry` always *registers* the reserved config graph (via
+/// `new_for_ledger`), so registry presence is NOT a data signal.
+pub(crate) fn config_graph_may_hold_data(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+) -> bool {
     let overlay_has_config_graph = overlay
         .as_any()
         .downcast_ref::<Novelty>()
         .is_none_or(|novelty| novelty.segment_count(CONFIG_GRAPH_ID) > 0);
-    // Base index has config-graph data only if per-graph stats report flakes for
-    // CONFIG_GRAPH_ID. NOTE: `graph_registry` always *registers* the reserved
-    // config graph (via `new_for_ledger`), so registry presence is NOT a data
-    // signal. When per-graph stats are absent (old/pre-index root) we
-    // conservatively assume config may exist and run the scan.
     let base_has_config_graph = match snapshot.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
         Some(graphs) => graphs
             .iter()
             .any(|g| g.g_id == CONFIG_GRAPH_ID && g.flakes > 0),
         None => true,
     };
-    if !overlay_has_config_graph && !base_has_config_graph {
-        return Ok(None);
+    overlay_has_config_graph || base_has_config_graph
+}
+
+/// Every `f:LedgerConfig` subject in the config graph as-of `to_t`, ordered by
+/// decoded IRI (the first is the one the reader uses).
+pub(crate) async fn ledger_config_subjects(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Vec<Sid>> {
+    // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
+    // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
+    // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
+    // lookup below resolves an object IRI that is absent from the dictionary,
+    // which drops the bound-object filter and full-scans the rdf:type predicate
+    // over the (growing) novelty overlay on EVERY transaction and query —
+    // O(novelty) per call once an index is attached.
+    if !config_graph_may_hold_data(snapshot, overlay) {
+        return Ok(Vec::new());
     }
 
     // Encode rdf:type (namespace code 3) and f:LedgerConfig (namespace code 7).
@@ -130,47 +189,582 @@ async fn resolve_config_sid(
         Some(sid) => sid,
         None => {
             tracing::warn!("Failed to encode rdf:type IRI — config graph unavailable");
-            return Ok(None);
+            return Ok(Vec::new());
         }
     };
     let config_type_sid = match snapshot.encode_iri(config_iris::LEDGER_CONFIG) {
         Some(sid) => sid,
         None => {
             tracing::warn!("Failed to encode f:LedgerConfig IRI — config graph unavailable");
-            return Ok(None);
+            return Ok(Vec::new());
         }
     };
 
     // Query: ?s rdf:type f:LedgerConfig at CONFIG_GRAPH_ID
-    let config_sids =
-        find_instances_of_type(snapshot, overlay, to_t, &rdf_type_sid, &config_type_sid).await?;
+    let mut config_sids = find_instances_of_type(
+        snapshot,
+        overlay,
+        to_t,
+        CONFIG_GRAPH_ID,
+        &rdf_type_sid,
+        &config_type_sid,
+    )
+    .await?;
 
-    if config_sids.is_empty() {
-        return Ok(None);
+    // Several config resources: order by decoded IRI (the first is used).
+    if config_sids.len() > 1 {
+        config_sids.sort_by_cached_key(|sid| {
+            snapshot
+                .decode_sid(sid)
+                .unwrap_or_else(|| format!("<unknown:{sid:?}>"))
+        });
     }
+    Ok(config_sids)
+}
 
-    // If multiple config resources exist, sort by decoded IRI and use the first.
-    let config_sid = if config_sids.len() == 1 {
-        config_sids[0].clone()
-    } else {
-        tracing::warn!(
-            count = config_sids.len(),
-            "Multiple f:LedgerConfig resources found in config graph — using first by IRI order"
-        );
-        let mut with_iris: Vec<(String, Sid)> = config_sids
-            .into_iter()
-            .map(|sid| {
-                let iri = snapshot
-                    .decode_sid(&sid)
-                    .unwrap_or_else(|| format!("<unknown:{sid:?}>"));
-                (iri, sid)
-            })
-            .collect();
-        with_iris.sort_by(|(a, _), (b, _)| a.cmp(b));
-        with_iris.into_iter().next().unwrap().1
+// ============================================================================
+// Public: Config diagnostics
+// ============================================================================
+
+/// A problem in a ledger's config graph that the reader resolves
+/// deterministically but that means the config does not say what its writer
+/// meant. Reported in ledger info (`configDiagnostics`); transactions do not
+/// fail on them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigDiagnostic {
+    /// What kind of problem.
+    pub code: ConfigDiagnosticCode,
+    /// A sentence for people.
+    pub message: String,
+    /// The config nodes concerned, by IRI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+/// The kinds of [`ConfigDiagnostic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigDiagnosticCode {
+    /// Several `f:LedgerConfig` subjects; the one whose IRI sorts lowest is used.
+    MultipleLedgerConfigs,
+    /// A single-valued setting-group pointer has several values; the
+    /// non-empty group whose IRI sorts lowest is used.
+    AmbiguousPointer,
+    /// A setting group sets nothing in the config graph, so it reads as absent.
+    EmptyGroup,
+    /// An empty setting group's node has `f:` fields in another graph, where
+    /// the config reader never looks (typically a nested config group written
+    /// to the default graph).
+    StrandedFields,
+    /// Shapes exist but no config enables SHACL, so they are not enforced.
+    ShaclNotConfigured,
+    /// Several `f:GraphConfig` overrides target one graph; only one is used.
+    DuplicateGraphOverride,
+}
+
+/// Whether the group node `group_sid`, named by `pointer_iri`, sets nothing.
+async fn group_is_empty(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    pointer_iri: &str,
+    group_sid: &Sid,
+) -> Result<bool> {
+    Ok(match pointer_iri {
+        config_iris::POLICY_DEFAULTS => read_policy_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::SHACL_DEFAULTS => read_shacl_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::REASONING_DEFAULTS => {
+            read_reasoning_fields(snapshot, overlay, to_t, group_sid)
+                .await?
+                .is_empty()
+        }
+        config_iris::DATALOG_DEFAULTS => read_datalog_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::TRANSACT_DEFAULTS => read_transact_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::FULL_TEXT_DEFAULTS => read_fulltext_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::SERVING_DEFAULTS => read_serving_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::QUERY_DEFAULTS => read_query_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        _ => false,
+    })
+}
+
+/// Examine a ledger's config graph for degenerate state: several
+/// `f:LedgerConfig` subjects, ambiguous group pointers, empty groups (and the
+/// fields stranded in other graphs that emptied them), and shapes that no
+/// config enables. Diagnostics only: it reads, never repairs, and costs a few
+/// bounded lookups per config node, so it belongs to ledger info, not the
+/// transaction path.
+pub async fn diagnose(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Vec<ConfigDiagnostic>> {
+    let mut out = Vec::new();
+    let iri = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .unwrap_or_else(|| format!("<unknown:{sid:?}>"))
     };
 
-    Ok(Some(config_sid))
+    let config_sids = ledger_config_subjects(snapshot, overlay, to_t).await?;
+    if config_sids.len() > 1 {
+        out.push(ConfigDiagnostic {
+            code: ConfigDiagnosticCode::MultipleLedgerConfigs,
+            message: format!(
+                "{} f:LedgerConfig subjects in the config graph; only {} is used",
+                config_sids.len(),
+                iri(&config_sids[0])
+            ),
+            subjects: config_sids.iter().map(iri).collect(),
+        });
+    }
+
+    // The config node and its per-graph override nodes carry group pointers.
+    let mut config_nodes: Vec<Sid> = config_sids.first().cloned().into_iter().collect();
+    if let (Some(config_sid), Some(overrides)) = (
+        config_sids.first(),
+        try_encode(snapshot, config_iris::GRAPH_OVERRIDES),
+    ) {
+        for binding in
+            query_config_predicate(snapshot, overlay, to_t, config_sid, &overrides).await?
+        {
+            if let Some(sid) = binding.as_sid() {
+                config_nodes.push(sid.clone());
+            }
+        }
+    }
+    for node in &config_nodes {
+        for pointer in crate::config_vocab::GROUP_POINTERS {
+            let candidates = read_group_candidates(snapshot, overlay, to_t, node, pointer).await?;
+            if candidates.len() > 1 {
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::AmbiguousPointer,
+                    message: format!(
+                        "{} on {} has {} values; a setting group has one (use upsert, or delete \
+                         the old value)",
+                        pointer,
+                        iri(node),
+                        candidates.len()
+                    ),
+                    subjects: candidates.iter().map(iri).collect(),
+                });
+            }
+            for group in &candidates {
+                if !group_is_empty(snapshot, overlay, to_t, pointer, group).await? {
+                    continue;
+                }
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::EmptyGroup,
+                    message: format!(
+                        "the {pointer} group {} sets nothing in the config graph, so it reads as \
+                         absent",
+                        iri(group)
+                    ),
+                    subjects: vec![iri(group)],
+                });
+            }
+        }
+    }
+
+    // A per-graph override the reader skips: no `f:targetGraph` in the config
+    // graph (typically written to another graph with its groups).
+    for node in config_nodes.iter().skip(1) {
+        if read_iri_field(snapshot, overlay, to_t, node, config_iris::TARGET_GRAPH)
+            .await?
+            .is_none()
+        {
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::EmptyGroup,
+                message: format!(
+                    "the f:graphOverrides entry {} has no f:targetGraph in the config graph, so \
+                     it is skipped",
+                    iri(node)
+                ),
+                subjects: vec![iri(node)],
+            });
+        }
+    }
+
+    // Config fields stranded outside the config graph, on any config node:
+    // the config subject, a per-graph override, a setting group, a source or
+    // any node they link to, whether or not the node sets anything in the
+    // config graph.
+    if let Some(root) = config_sids.first() {
+        for node in reachable_config_nodes(snapshot, overlay, to_t, root).await? {
+            let stranded = graphs_with_config_fields(snapshot, overlay, to_t, &node).await?;
+            if stranded.is_empty() {
+                continue;
+            }
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::StrandedFields,
+                message: format!(
+                    "config node {} has config fields in {}, not in the config graph, where \
+                     they are not read; move them into the config graph (see the repair recipe \
+                     in docs/ledger-config/writing-config.md)",
+                    iri(&node),
+                    stranded.join(", ")
+                ),
+                subjects: vec![iri(&node)],
+            });
+        }
+    }
+
+    // The conventional config subject (`urn:fluree:<ledger>:config:ledger`)
+    // with config fields outside the config graph while the config graph does
+    // not hold it: a whole config written to the wrong graph. Transactions
+    // refuse that write; data written before may hold it.
+    let conventional = crate::config_vocab::conventional_config_subject(&snapshot.ledger_id);
+    if let Some(subject) = snapshot.encode_iri(&conventional) {
+        if !config_sids.contains(&subject) {
+            let stranded = graphs_with_config_fields(snapshot, overlay, to_t, &subject).await?;
+            if !stranded.is_empty() {
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::StrandedFields,
+                    message: format!(
+                        "the config subject {conventional} has config fields in {}, and the \
+                         config graph does not type it f:LedgerConfig, so none of them is read; \
+                         write the config into the config graph (see the repair recipe in \
+                         docs/ledger-config/writing-config.md)",
+                        stranded.join(", ")
+                    ),
+                    subjects: vec![conventional],
+                });
+            }
+        }
+    }
+
+    if let Some(config) = resolve_ledger_config(snapshot, overlay, to_t).await? {
+        let mut by_target: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for graph in &config.graph_overrides {
+            *by_target.entry(graph.target_graph.as_str()).or_default() += 1;
+        }
+        for (target, count) in by_target.into_iter().filter(|(_, n)| *n > 1) {
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::DuplicateGraphOverride,
+                message: format!(
+                    "{count} f:GraphConfig overrides target {target}; only one of them is \
+                     used, so merge them into one"
+                ),
+                subjects: vec![target.to_string()],
+            });
+        }
+    }
+
+    if let Some(diagnostic) = shapes_without_enforcement(snapshot, overlay, to_t).await? {
+        out.push(diagnostic);
+    }
+    Ok(out)
+}
+
+/// The config graph's nodes reachable from the config subject `root` through
+/// config edges ([`crate::config_vocab::CONFIG_EDGES`]) asserted in the config
+/// graph, `root` first. The config graph is small; it is read once.
+async fn reachable_config_nodes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    root: &Sid,
+) -> Result<Vec<Sid>> {
+    let edges: Vec<Sid> = crate::config_vocab::CONFIG_EDGES
+        .iter()
+        .filter_map(|iri| try_encode(snapshot, iri))
+        .collect();
+    let flakes = fluree_db_core::range_with_overlay(
+        snapshot,
+        CONFIG_GRAPH_ID,
+        overlay,
+        fluree_db_core::IndexType::Spot,
+        fluree_db_core::RangeTest::Eq,
+        fluree_db_core::RangeMatch::new(),
+        fluree_db_core::RangeOptions {
+            to_t: Some(to_t),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut out: Vec<Sid> = vec![root.clone()];
+    let mut seen: HashSet<Sid> = out.iter().cloned().collect();
+    let mut next = 0;
+    while next < out.len() {
+        let node = out[next].clone();
+        next += 1;
+        for flake in flakes
+            .iter()
+            .filter(|f| f.s == node && edges.contains(&f.p))
+        {
+            if let fluree_db_core::FlakeValue::Ref(target) = &flake.o {
+                if seen.insert(target.clone()) {
+                    out.push(target.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The graphs other than the config graph where `node` has config fields
+/// ([`crate::config_vocab::is_config_field`]).
+async fn graphs_with_config_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    node: &Sid,
+) -> Result<Vec<String>> {
+    let mut graphs: Vec<(fluree_db_core::GraphId, String)> = vec![(
+        fluree_db_core::DEFAULT_GRAPH_ID,
+        "the default graph".to_string(),
+    )];
+    graphs.extend(
+        snapshot
+            .graph_registry
+            .iter_entries()
+            .filter(|(g_id, _)| *g_id >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+            .map(|(g_id, iri)| (g_id, format!("graph <{iri}>"))),
+    );
+    let mut found = Vec::new();
+    for (g_id, label) in graphs {
+        let mut vars = VarRegistry::new();
+        let p = vars.get_or_insert("?p");
+        let o = vars.get_or_insert("?o");
+        let pattern = TriplePattern::new(Ref::Sid(node.clone()), Ref::Var(p), Term::Var(o));
+        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
+        let batches = execute_pattern(db, &vars, pattern).await?;
+        let has_config_field = batches.iter().any(|batch| {
+            (0..batch.len()).any(|row| {
+                batch
+                    .get(row, p)
+                    .and_then(|b| b.as_sid())
+                    .is_some_and(crate::config_vocab::is_config_field)
+            })
+        });
+        if has_config_field {
+            found.push(label);
+        }
+    }
+    Ok(found)
+}
+
+/// "Shapes present; SHACL enforcement not configured": SHACL is off for
+/// every graph (ledger-wide and each graph override) and the shapes source
+/// holds at least one `sh:NodeShape` or `sh:PropertyShape`. A config that
+/// enables SHACL for one graph only is configured.
+async fn shapes_without_enforcement(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<ConfigDiagnostic>> {
+    let config = resolve_ledger_config(snapshot, overlay, to_t).await?;
+    unenforced_shapes(snapshot, overlay, to_t, config.as_ref()).await
+}
+
+/// The SHACL target predicates: a subject with one is a shape the compiler
+/// enforces where SHACL is on, typed `sh:NodeShape` or not.
+const SHAPE_TARGETS: [&str; 4] = [
+    fluree_vocab::shacl::TARGET_CLASS,
+    fluree_vocab::shacl::TARGET_NODE,
+    fluree_vocab::shacl::TARGET_SUBJECTS_OF,
+    fluree_vocab::shacl::TARGET_OBJECTS_OF,
+];
+
+/// Whether the ledger may hold a SHACL shape, decided in memory, without
+/// reading the index: its index stats count instances of `sh:NodeShape` or
+/// `sh:PropertyShape` or uses of a target predicate (an untyped shape), or
+/// its novelty asserts one of those in the default graph. An index without
+/// class or property stats counts as holding none. A gate for checks that
+/// would otherwise read the ledger.
+#[cfg(feature = "shacl")]
+pub(crate) fn may_hold_shapes(
+    snapshot: &LedgerSnapshot,
+    novelty: &dyn OverlayProvider,
+    to_t: i64,
+) -> bool {
+    let shape_types: Vec<Sid> = [
+        fluree_vocab::shacl::NODE_SHAPE,
+        fluree_vocab::shacl::PROPERTY_SHAPE,
+    ]
+    .iter()
+    .filter_map(|iri| snapshot.encode_iri_strict(iri))
+    .collect();
+    let targets: Vec<Sid> = SHAPE_TARGETS
+        .iter()
+        .filter_map(|iri| snapshot.encode_iri_strict(iri))
+        .collect();
+    if shape_types.is_empty() && targets.is_empty() {
+        return false;
+    }
+    let stats = snapshot.stats.as_ref();
+    let indexed = stats
+        .and_then(|stats| stats.classes.as_ref())
+        .is_some_and(|classes| {
+            classes
+                .iter()
+                .any(|class| class.count > 0 && shape_types.contains(&class.class_sid))
+        })
+        || stats
+            .and_then(|stats| stats.properties.as_ref())
+            .is_some_and(|properties| {
+                properties.iter().any(|property| {
+                    property.count > 0
+                        && targets.iter().any(|target| {
+                            target.namespace_code == property.sid.0
+                                && *target.name == *property.sid.1
+                        })
+                })
+            });
+    if indexed {
+        return true;
+    }
+    let targeted = targets.into_iter().any(|target| {
+        let mut asserted = false;
+        novelty.for_each_overlay_flake(
+            fluree_db_core::DEFAULT_GRAPH_ID,
+            fluree_db_core::IndexType::Psot,
+            Some(&fluree_db_core::Flake::min_for_predicate(target.clone())),
+            Some(&fluree_db_core::Flake::max_for_predicate(target)),
+            false,
+            to_t,
+            &mut |flake| asserted |= flake.op,
+        );
+        asserted
+    });
+    if targeted {
+        return true;
+    }
+    let Some(rdf_type) = snapshot.encode_iri_strict(RDF_TYPE_IRI) else {
+        return false;
+    };
+    shape_types.into_iter().any(|shape_type| {
+        let shape_type = fluree_db_core::FlakeValue::Ref(shape_type);
+        let mut asserted = false;
+        novelty.for_each_overlay_flake(
+            fluree_db_core::DEFAULT_GRAPH_ID,
+            fluree_db_core::IndexType::Post,
+            Some(&fluree_db_core::Flake::min_for_predicate_object(
+                rdf_type.clone(),
+                shape_type.clone(),
+            )),
+            Some(&fluree_db_core::Flake::max_for_predicate_object(
+                rdf_type.clone(),
+                shape_type,
+            )),
+            false,
+            to_t,
+            &mut |flake| asserted |= flake.op,
+        );
+        asserted
+    })
+}
+
+/// [`shapes_without_enforcement`] under an already-resolved `config`.
+pub(crate) async fn unenforced_shapes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    config: Option<&LedgerConfig>,
+) -> Result<Option<ConfigDiagnostic>> {
+    let enabled = config.is_some_and(|c| {
+        std::iter::once(None)
+            .chain(
+                c.graph_overrides
+                    .iter()
+                    .map(|graph| Some(graph.target_graph.as_str())),
+            )
+            .any(|graph| {
+                merge_shacl_opts(&resolve_effective_config(c, graph), None, None)
+                    .is_some_and(|shacl| shacl.enabled)
+            })
+    });
+    if enabled {
+        return Ok(None);
+    }
+    // SHACL switched off on purpose (`f:shaclEnabled false`, ledger-wide or
+    // for a graph) is the ledger's posture, not a gap to report.
+    let switched_off = config.is_some_and(|c| {
+        std::iter::once(c.shacl.as_ref())
+            .chain(c.graph_overrides.iter().map(|graph| graph.shacl.as_ref()))
+            .any(|shacl| shacl.is_some_and(|shacl| shacl.enabled == Some(false)))
+    });
+    if switched_off {
+        return Ok(None);
+    }
+    // The configured shapes graph when it is a local one, else the default
+    // graph (a cross-ledger source is not examined here).
+    let source = config
+        .and_then(|c| c.shacl.as_ref())
+        .and_then(|s| s.shapes_source.as_ref());
+    let g_id = match source {
+        Some(src) if src.ledger.is_some() => return Ok(None),
+        Some(src) => match src.graph_selector.as_deref() {
+            None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+            Some(sel) if sel == config_iris::DEFAULT_GRAPH => {
+                Some(fluree_db_core::DEFAULT_GRAPH_ID)
+            }
+            Some(sel) => snapshot.graph_registry.graph_id_for_iri(sel),
+        },
+        None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+    };
+    let (Some(g_id), Some(rdf_type)) = (g_id, try_encode(snapshot, RDF_TYPE_IRI)) else {
+        return Ok(None);
+    };
+    let diagnostic = || ConfigDiagnostic {
+        code: ConfigDiagnosticCode::ShaclNotConfigured,
+        message: "shapes present; SHACL enforcement not configured (shapes are enforced \
+                  only where the ledger config sets f:shaclEnabled true)"
+            .to_string(),
+        subjects: Vec::new(),
+    };
+    for shape_type in [
+        fluree_vocab::shacl::NODE_SHAPE,
+        fluree_vocab::shacl::PROPERTY_SHAPE,
+    ] {
+        let Some(type_sid) = try_encode(snapshot, shape_type) else {
+            continue;
+        };
+        let shapes =
+            find_instances_of_type(snapshot, overlay, to_t, g_id, &rdf_type, &type_sid).await?;
+        if !shapes.is_empty() {
+            return Ok(Some(diagnostic()));
+        }
+    }
+    // An untyped shape: a subject with a target predicate.
+    for target in SHAPE_TARGETS {
+        let Some(target) = snapshot.encode_iri(target) else {
+            continue;
+        };
+        let used = fluree_db_core::range_with_overlay(
+            snapshot,
+            g_id,
+            overlay,
+            fluree_db_core::IndexType::Psot,
+            fluree_db_core::RangeTest::Eq,
+            fluree_db_core::RangeMatch::predicate(target),
+            fluree_db_core::RangeOptions {
+                to_t: Some(to_t),
+                flake_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if !used.is_empty() {
+            return Ok(Some(diagnostic()));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve only the serving posture (`f:servingDefaults`), skipping the other
@@ -491,8 +1085,8 @@ pub struct EffectiveShaclConfig {
 /// Compute effective SHACL settings from resolved config, honoring a
 /// transaction-requested validation mode under override control.
 ///
-/// Returns `None` if no SHACL config section is present. When `None`,
-/// callers fall back to the shapes-exist heuristic (see `stage_with_config_shacl`).
+/// Returns `None` if no SHACL config section is present, which means SHACL is
+/// off for the graph: shapes alone never enable validation.
 ///
 /// `requested_mode` is the transaction's `opts.validationMode`
 /// (`TxnOpts::validation_mode`); `server_identity` is the auth-layer-verified
@@ -777,11 +1371,12 @@ impl MergeableGroup for FullTextDefaults {
 // Internal: Privileged query helpers
 // ============================================================================
 
-/// Query for subjects of a given rdf:type at the config graph.
+/// Query for subjects of a given rdf:type in graph `g_id`.
 async fn find_instances_of_type(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
+    g_id: fluree_db_core::GraphId,
     rdf_type_sid: &Sid,
     type_sid: &Sid,
 ) -> Result<Vec<Sid>> {
@@ -796,7 +1391,7 @@ async fn find_instances_of_type(
 
     // Eager materialization: config resolver needs concrete Sid/Lit bindings,
     // not late-materialized EncodedSid/EncodedLit from binary scans.
-    let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
+    let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
     let batches = execute_pattern(db, &vars, pattern).await?;
 
     let mut results = Vec::new();
@@ -853,6 +1448,8 @@ async fn query_config_predicate(
 /// Unlike `policy_builder::resolve_iri_to_sid`, this returns `None` instead
 /// of an error — missing config predicates are normal (unconfigured fields).
 fn try_encode(snapshot: &LedgerSnapshot, iri: &str) -> Option<Sid> {
+    #[cfg(test)]
+    crate::config_vocab::read_recorder::note(iri);
     snapshot.encode_iri(iri)
 }
 
@@ -904,6 +1501,72 @@ async fn read_ref_field(
         }
     }
     Ok(None)
+}
+
+/// The values of a single-valued setting-group pointer (`f:shaclDefaults`
+/// and the like) on `subject_sid`, as candidates for the group it names.
+///
+/// Written as documented a pointer has one value. Several values (a config
+/// re-inserted rather than upserted, say) are ordered by decoded IRI, the rule
+/// [`resolve_config_sid`] applies to several `f:LedgerConfig` subjects, so the
+/// choice is deterministic; they are reported by [`diagnose`] and logged here
+/// (rate-limited: the config is resolved on every transaction).
+async fn read_group_candidates(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Vec<Sid>> {
+    let Some(pred_sid) = try_encode(snapshot, pred_iri) else {
+        return Ok(Vec::new());
+    };
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    let mut sids: Vec<Sid> = bindings
+        .iter()
+        .filter_map(|b| b.as_sid().cloned())
+        .collect();
+    if sids.len() > 1 {
+        sids.sort_by_cached_key(|sid| snapshot.decode_sid(sid).unwrap_or_default());
+        sids.dedup();
+        if sids.len() > 1 {
+            warn_degenerate_config(pred_iri);
+        }
+    }
+    Ok(sids)
+}
+
+/// Log a degenerate config (an ambiguous group pointer) at most once per
+/// thousand occurrences: config is resolved on every transaction, so an
+/// unthrottled warning would repeat on every write. [`diagnose`] reports the
+/// details on demand (ledger info `configDiagnostics`).
+fn warn_degenerate_config(pointer_iri: &str) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(1000)
+    {
+        tracing::warn!(
+            pointer = pointer_iri,
+            "ledger config has several values for a single-valued setting-group pointer; \
+             using the non-empty group whose IRI sorts lowest (see ledger info \
+             configDiagnostics)"
+        );
+    }
+}
+
+/// Log a config node the reader skips at most once per thousand occurrences:
+/// the config is resolved on every transaction, so an unthrottled warning
+/// would repeat on every write. [`diagnose`] reports it on demand (ledger
+/// info `configDiagnostics`).
+fn warn_degenerate_node(what: &'static str) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(1000)
+    {
+        tracing::warn!("{what} (see ledger info configDiagnostics)");
+    }
 }
 
 /// Read an IRI-valued field and decode to its IRI string.
@@ -1098,8 +1761,7 @@ async fn read_policy_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<PolicyDefaults>> {
-    // Follow f:policyDefaults ref to the group subject
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1108,15 +1770,26 @@ async fn read_policy_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_policy_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
+/// The fields of one `PolicyDefaults` group node.
+async fn read_policy_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<PolicyDefaults> {
     let default_allow = read_bool_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::DEFAULT_ALLOW,
     )
     .await?;
@@ -1124,7 +1797,7 @@ async fn read_policy_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::POLICY_SOURCE,
     )
     .await?;
@@ -1132,18 +1805,18 @@ async fn read_policy_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         fluree_vocab::policy_iris::POLICY_CLASS,
     )
     .await?;
-    let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
-    Ok(Some(PolicyDefaults {
+    Ok(PolicyDefaults {
         default_allow,
         policy_source,
         policy_class,
         override_control,
-    }))
+    })
 }
 
 /// Read SHACL defaults from a parent subject.
@@ -1153,7 +1826,7 @@ async fn read_shacl_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<ShaclDefaults>> {
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1162,15 +1835,26 @@ async fn read_shacl_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_shacl_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
+/// The fields of one `ShaclDefaults` group node.
+async fn read_shacl_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<ShaclDefaults> {
     let enabled = read_bool_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::SHACL_ENABLED,
     )
     .await?;
@@ -1178,19 +1862,19 @@ async fn read_shacl_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::SHAPES_SOURCE,
     )
     .await?;
-    let validation_mode = read_validation_mode(snapshot, overlay, to_t, &group_sid).await?;
-    let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+    let validation_mode = read_validation_mode(snapshot, overlay, to_t, group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
-    Ok(Some(ShaclDefaults {
+    Ok(ShaclDefaults {
         enabled,
         shapes_source,
         validation_mode,
         override_control,
-    }))
+    })
 }
 
 /// Read reasoning defaults from a parent subject.
@@ -1200,7 +1884,7 @@ async fn read_reasoning_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<ReasoningDefaults>> {
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1209,16 +1893,27 @@ async fn read_reasoning_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_reasoning_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
-    let modes = read_reasoning_modes_field(snapshot, overlay, to_t, &group_sid).await?;
+/// The fields of one `ReasoningDefaults` group node.
+async fn read_reasoning_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<ReasoningDefaults> {
+    let modes = read_reasoning_modes_field(snapshot, overlay, to_t, group_sid).await?;
     let schema_source = read_graph_source_ref(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::SCHEMA_SOURCE,
     )
     .await?;
@@ -1226,16 +1921,16 @@ async fn read_reasoning_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::FOLLOW_OWL_IMPORTS,
     )
     .await?;
-    let ontology_import_map = read_ontology_import_map(snapshot, overlay, to_t, &group_sid).await?;
+    let ontology_import_map = read_ontology_import_map(snapshot, overlay, to_t, group_sid).await?;
     let max_facts = read_budget_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::REASONING_MAX_FACTS,
     )
     .await?;
@@ -1243,7 +1938,7 @@ async fn read_reasoning_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::REASONING_MAX_SECONDS,
     )
     .await?;
@@ -1251,13 +1946,13 @@ async fn read_reasoning_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::REASONING_MAX_MEMORY_MB,
     )
     .await?;
-    let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
-    Ok(Some(ReasoningDefaults {
+    Ok(ReasoningDefaults {
         modes,
         schema_source,
         follow_owl_imports,
@@ -1266,7 +1961,7 @@ async fn read_reasoning_defaults(
         max_seconds,
         max_memory_mb,
         override_control,
-    }))
+    })
 }
 
 /// Read a non-negative integer budget field; negative values are rejected
@@ -1370,7 +2065,7 @@ async fn read_datalog_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<DatalogDefaults>> {
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1379,15 +2074,26 @@ async fn read_datalog_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_datalog_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
+/// The fields of one `DatalogDefaults` group node.
+async fn read_datalog_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<DatalogDefaults> {
     let enabled = read_bool_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::DATALOG_ENABLED,
     )
     .await?;
@@ -1395,7 +2101,7 @@ async fn read_datalog_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::RULES_SOURCE,
     )
     .await?;
@@ -1403,18 +2109,18 @@ async fn read_datalog_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::ALLOW_QUERY_TIME_RULES,
     )
     .await?;
-    let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
-    Ok(Some(DatalogDefaults {
+    Ok(DatalogDefaults {
         enabled,
         rules_source,
         allow_query_time_rules,
         override_control,
-    }))
+    })
 }
 
 /// Read serving defaults from the LedgerConfig subject.
@@ -1427,7 +2133,7 @@ async fn read_serving_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<ServingDefaults>> {
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1436,23 +2142,28 @@ async fn read_serving_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_serving_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
-    let serve_query = read_bool_field(
-        snapshot,
-        overlay,
-        to_t,
-        &group_sid,
-        config_iris::SERVE_QUERY,
-    )
-    .await?;
+/// The fields of one `ServingDefaults` group node.
+async fn read_serving_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<ServingDefaults> {
+    let serve_query =
+        read_bool_field(snapshot, overlay, to_t, group_sid, config_iris::SERVE_QUERY).await?;
     let serve_blocks = read_bool_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::SERVE_BLOCKS,
     )
     .await?;
@@ -1460,16 +2171,16 @@ async fn read_serving_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::PUBLIC_VISIBILITY,
     )
     .await?;
 
-    Ok(Some(ServingDefaults {
+    Ok(ServingDefaults {
         serve_query,
         serve_blocks,
         public_visibility,
-    }))
+    })
 }
 
 /// Read query defaults from the LedgerConfig subject.
@@ -1482,7 +2193,7 @@ async fn read_query_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<QueryDefaults>> {
-    let Some(group_sid) = read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1490,20 +2201,33 @@ async fn read_query_defaults(
         config_iris::QUERY_DEFAULTS,
     )
     .await?
-    else {
-        return Ok(None);
-    };
+    {
+        let group = read_query_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `QueryDefaults` group node.
+async fn read_query_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<QueryDefaults> {
     let union_default_graph = read_bool_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::UNION_DEFAULT_GRAPH,
     )
     .await?;
-    Ok(Some(QueryDefaults {
+    Ok(QueryDefaults {
         union_default_graph,
-    }))
+    })
 }
 
 /// Read transact defaults from a parent subject (LedgerConfig or GraphConfig).
@@ -1517,7 +2241,7 @@ async fn read_transact_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<TransactDefaults>> {
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1526,15 +2250,26 @@ async fn read_transact_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_transact_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
+/// The fields of one `TransactDefaults` group node.
+async fn read_transact_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<TransactDefaults> {
     let unique_enabled = read_bool_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::UNIQUE_ENABLED,
     )
     .await?;
@@ -1542,17 +2277,17 @@ async fn read_transact_defaults(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::CONSTRAINTS_SOURCE,
     )
     .await?;
-    let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
-    Ok(Some(TransactDefaults {
+    Ok(TransactDefaults {
         unique_enabled,
         constraints_sources,
         override_control,
-    }))
+    })
 }
 
 /// Read a plain string field (e.g., BCP-47 language tag) from a subject.
@@ -1592,7 +2327,7 @@ async fn read_fulltext_defaults(
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<FullTextDefaults>> {
-    let group_sid = match read_ref_field(
+    for group_sid in read_group_candidates(
         snapshot,
         overlay,
         to_t,
@@ -1601,15 +2336,26 @@ async fn read_fulltext_defaults(
     )
     .await?
     {
-        Some(sid) => sid,
-        None => return Ok(None),
-    };
+        let group = read_fulltext_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
 
+/// The fields of one `FullTextDefaults` group node.
+async fn read_fulltext_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<FullTextDefaults> {
     let default_language = read_string_field(
         snapshot,
         overlay,
         to_t,
-        &group_sid,
+        group_sid,
         config_iris::DEFAULT_LANGUAGE,
     )
     .await?;
@@ -1619,7 +2365,7 @@ async fn read_fulltext_defaults(
     let mut properties = Vec::new();
     if let Some(pred_sid) = pred_sid {
         let bindings =
-            query_config_predicate(snapshot, overlay, to_t, &group_sid, &pred_sid).await?;
+            query_config_predicate(snapshot, overlay, to_t, group_sid, &pred_sid).await?;
         for binding in bindings {
             if let Some(prop_sid) = binding.as_sid() {
                 let target = read_iri_field(
@@ -1633,20 +2379,20 @@ async fn read_fulltext_defaults(
                 match target {
                     Some(iri) => properties.push(FullTextProperty { target: iri }),
                     None => {
-                        tracing::warn!("FullTextProperty node without f:target — skipping");
+                        warn_degenerate_node("FullTextProperty node without f:target — skipping");
                     }
                 }
             }
         }
     }
 
-    let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
-    Ok(Some(FullTextDefaults {
+    Ok(FullTextDefaults {
         default_language,
         properties,
         override_control,
-    }))
+    })
 }
 
 /// Read per-graph config overrides (`f:graphOverrides`).
@@ -1687,7 +2433,7 @@ async fn read_single_graph_config(
         match read_iri_field(snapshot, overlay, to_t, gc_sid, config_iris::TARGET_GRAPH).await? {
             Some(iri) => iri,
             None => {
-                tracing::warn!("GraphConfig without f:targetGraph — skipping");
+                warn_degenerate_node("GraphConfig without f:targetGraph — skipping");
                 return Ok(None);
             }
         };
