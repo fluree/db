@@ -33,9 +33,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::fast_path_common::{
-    collect_subjects_for_predicate_set, fast_path_store, try_normalize_pred_sid,
-};
+use crate::execute::fast_paths_disabled;
+use crate::fast_path_common::{extend_subjects_for_predicate_set, try_normalize_pred_sid};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::index_scope::{IndexMember, IndexScope, MemberSet};
 use fluree_db_core::Sid;
 
 /// Filter rows from a batch using two-valued logic.
@@ -105,14 +106,72 @@ struct ExistsSemijoinCache {
     subjects_by_key: FxHashMap<ExistsSemijoinKey, FxHashSet<u64>>,
 }
 
-fn allow_exists_semijoin_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    fast_path_store(ctx).is_some()
-}
-
 /// `fast-path outcome` site name for the EXISTS semijoin cache. This path has
 /// no `FastPathOperator` to stamp for it, so the cache build stamps its own
 /// verdict once per FILTER `open()`.
 const EXISTS_SEMIJOIN_SITE: &str = "exists_semijoin";
+
+/// `fast-path outcome` site of the cache over a default graph of several
+/// graphs, or of none. It stamps apart from [`EXISTS_SEMIJOIN_SITE`] so a test
+/// can tell which of the two read a scope.
+const EXISTS_SEMIJOIN_UNION_SITE: &str = "exists_semijoin_union";
+
+/// The graphs a cache entry's subject set is read from: the FILTER's scope.
+enum SubjectSource<'a> {
+    /// One graph whose index alone answers for it.
+    One(IndexMember<'a>),
+    /// A default graph of several graphs of one ledger, the index alone
+    /// answering for each. `EXISTS { ?x <p> ?o }` holds when some member has a
+    /// triple `(x, p, _)`, so the set is the union of the members' sets:
+    /// subject ids are ledger-wide, and a set ignores duplicates.
+    Union(MemberSet<'a>),
+    /// A default graph of none: no subject has any predicate.
+    Empty,
+}
+
+impl<'a> SubjectSource<'a> {
+    /// The source for `ctx`'s scope. `Err` is why the cache over several
+    /// graphs declined, which its site stamps. `None` where no cache reads the
+    /// scope, as before: one graph with novelty, or no index scope.
+    fn of(ctx: &'a ExecutionContext<'_>) -> Option<std::result::Result<Self, FastPathFallback>> {
+        Some(match ctx.index_scope()? {
+            IndexScope::One(member) if member.index_is_current() => Ok(SubjectSource::One(member)),
+            IndexScope::One(_) => return None,
+            // The union lanes answer to the differential's kill switch; the
+            // one-graph cache never has.
+            IndexScope::Union(_) | IndexScope::Empty if fast_paths_disabled() => {
+                Err(FastPathFallback::KillSwitch)
+            }
+            IndexScope::Union(set) if !set.all_current() => Err(FastPathFallback::Novelty),
+            IndexScope::Union(set) => Ok(SubjectSource::Union(set)),
+            IndexScope::Empty => Ok(SubjectSource::Empty),
+        })
+    }
+
+    fn site(&self) -> &'static str {
+        match self {
+            SubjectSource::One(_) => EXISTS_SEMIJOIN_SITE,
+            SubjectSource::Union(_) | SubjectSource::Empty => EXISTS_SEMIJOIN_UNION_SITE,
+        }
+    }
+
+    /// The subjects with a triple of predicate `p_id` in the source.
+    fn subjects(&self, p_id: u32) -> Result<FxHashSet<u64>> {
+        let mut out = FxHashSet::default();
+        match self {
+            SubjectSource::One(member) => {
+                extend_subjects_for_predicate_set(member.store(), member.g_id(), p_id, &mut out)?;
+            }
+            SubjectSource::Union(set) => {
+                for member in set.members() {
+                    extend_subjects_for_predicate_set(set.store(), member.g_id(), p_id, &mut out)?;
+                }
+            }
+            SubjectSource::Empty => {}
+        }
+        Ok(out)
+    }
+}
 
 /// Collect `(subject_var, predicate, object_var)` for every hoistable
 /// `EXISTS { ?s <p> ?o }` in `expr`.
@@ -177,9 +236,11 @@ fn build_exists_semijoin_cache(
     schema: &[VarId],
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<ExistsSemijoinCache>> {
-    if !allow_exists_semijoin_fast_path(ctx) {
+    let Some(source) = SubjectSource::of(ctx) else {
         return Ok(None);
-    }
+    };
+    // Every scope arm reads this store: `index_scope` admits a member only
+    // when it is read through the context's store.
     let Some(store) = ctx.binary_store.as_ref() else {
         return Ok(None);
     };
@@ -189,6 +250,16 @@ fn build_exists_semijoin_cache(
     if exists_nodes.is_empty() {
         return Ok(None);
     }
+    let source = match source {
+        Ok(source) => source,
+        Err(reason) => {
+            stamp_fast_path(
+                EXISTS_SEMIJOIN_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+            return Ok(None);
+        }
+    };
 
     // Only cache EXISTS nodes whose correlated var is actually present in the batch schema.
     let schema_vars: HashSet<VarId> = schema.iter().copied().collect();
@@ -230,23 +301,17 @@ fn build_exists_semijoin_cache(
             continue;
         };
 
-        let subjects = collect_subjects_for_predicate_set(store, ctx.binary_g_id, p_id)?;
-        cache.subjects_by_key.insert(key, subjects);
+        cache.subjects_by_key.insert(key, source.subjects(p_id)?);
     }
 
     if cache.subjects_by_key.is_empty() {
-        crate::fast_path_outcome::stamp_fast_path(
-            EXISTS_SEMIJOIN_SITE,
-            crate::fast_path_outcome::FastPathOutcome::Fallback(
-                crate::fast_path_outcome::FastPathFallback::GateDeclined,
-            ),
+        stamp_fast_path(
+            source.site(),
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
         );
         Ok(None)
     } else {
-        crate::fast_path_outcome::stamp_fast_path(
-            EXISTS_SEMIJOIN_SITE,
-            crate::fast_path_outcome::FastPathOutcome::Proceed,
-        );
+        stamp_fast_path(source.site(), FastPathOutcome::Proceed);
         Ok(Some(cache))
     }
 }
@@ -453,9 +518,14 @@ fn try_eval_simple_exists_semijoin(
     };
     let s_id = match binding {
         // The cache holds persisted subject ids, and with the cache built
-        // (no live novelty) an encoded subject carries one — the common
-        // case on an indexed ledger, so it must not drop to the per-row path.
+        // (no live novelty in any graph it read) an encoded subject carries
+        // one — the common case on an indexed ledger, so it must not drop to
+        // the per-row path.
         Binding::EncodedSid { s_id, .. } => Some(*s_id),
+        // No subject is in an empty set: skip the dictionary lookup.
+        Binding::Sid { .. } if subjects.is_empty() => None,
+        // A decoded subject (what the members of a default graph of several
+        // graphs bind) costs one dictionary lookup.
         Binding::Sid { sid, .. } => store
             .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
             .map_err(|e| crate::error::QueryError::Internal(format!("sid->s_id: {e}")))?,

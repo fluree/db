@@ -698,10 +698,24 @@ pub fn collect_subjects_for_predicate_set(
     g_id: GraphId,
     p_id: u32,
 ) -> Result<FxHashSet<u64>> {
+    let mut out: FxHashSet<u64> = FxHashSet::default();
+    extend_subjects_for_predicate_set(store, g_id, p_id, &mut out)?;
+    Ok(out)
+}
+
+/// Add the distinct subject IDs of a predicate in one graph (PSOT) to `out`.
+///
+/// For a set over several graphs: each graph's subjects go into one set, with
+/// no per-graph set to build and merge.
+pub fn extend_subjects_for_predicate_set(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    out: &mut FxHashSet<u64>,
+) -> Result<()> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_only();
 
-    let mut out: FxHashSet<u64> = FxHashSet::default();
     let mut prev: Option<u64> = None;
 
     for leaf_entry in leaves {
@@ -725,7 +739,7 @@ pub fn collect_subjects_for_predicate_set(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
