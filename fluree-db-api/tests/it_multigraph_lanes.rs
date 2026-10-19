@@ -15,7 +15,7 @@ mod span_capture;
 #[path = "support/multigraph.rs"]
 mod multigraph;
 
-use multigraph::{check, Fixture, State, Surface, SCOPES, SHAPES};
+use multigraph::{assert_routing, check, Fixture, Graphs, Shape, State, Surface, SCOPES, SHAPES};
 
 /// Every shape, scope and surface over fixture A in `state`.
 async fn every_scope_answers_by_hand(state: State) {
@@ -57,4 +57,64 @@ async fn fixture_a_with_novelty_in_g2() {
 #[tokio::test(flavor = "current_thread")]
 async fn fixture_a_read_below_its_index() {
     every_scope_answers_by_hand(State::Indexed2).await;
+}
+
+// ---------------------------------------------------------------------------
+// Lane B: the cyclic join (`Shape::Triangle`).
+
+const CYCLIC: &str = "cyclic_bgp";
+const CYCLIC_UNION: &str = "cyclic_bgp_union";
+
+/// The triangle in every scope and surface of fixture A in `state`, answered
+/// by hand and by the general plan, and routed by scope: the union variant
+/// answers a default graph of several graphs, and of none; the one-graph
+/// lane answers one graph; neither runs inside `GRAPH` (its inner plan is
+/// seeded, and the planner builds the cyclic operator only for an unseeded
+/// pattern list) or over two ledgers.
+async fn triangle_routes_by_scope(state: State) {
+    let fx = Fixture::build(state).await;
+    let mut failures = Vec::new();
+    let mut runs = 0;
+    for &scope in SCOPES {
+        if !scope.applies(state) {
+            continue;
+        }
+        for surface in [Surface::Sparql, Surface::JsonLd] {
+            if !scope.supports(surface) {
+                continue;
+            }
+            let run = check(&fx, scope, Shape::Triangle, surface, &mut failures).await;
+            let (must_fire, must_not_fire): (&[&str], &[&str]) = match scope.graphs() {
+                Graphs::G1G2 | Graphs::G0G1G2 | Graphs::Empty => (&[CYCLIC_UNION], &[CYCLIC]),
+                Graphs::G0 | Graphs::G1 => (&[CYCLIC], &[CYCLIC_UNION]),
+                Graphs::G2 | Graphs::PerNamedGraph | Graphs::G0Other => {
+                    (&[], &[CYCLIC, CYCLIC_UNION])
+                }
+            };
+            assert_routing(&run, must_fire, must_not_fire, &mut failures);
+            runs += 1;
+        }
+    }
+    assert!(runs > 0, "no scope ran");
+    assert!(
+        failures.is_empty(),
+        "{} of {runs} runs failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triangle_lanes_indexed() {
+    triangle_routes_by_scope(State::Indexed).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triangle_lanes_with_novelty_in_g2() {
+    triangle_routes_by_scope(State::Novelty).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn triangle_lanes_read_below_the_index() {
+    triangle_routes_by_scope(State::Indexed2).await;
 }
