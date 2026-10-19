@@ -522,6 +522,11 @@ the rules that derive into it, so a program can stage results in one graph
 and build on them in another, and a recursive rule can reach its closure
 inside a named graph. The same triple derived into two graphs is two facts.
 
+A query whose default graph is a named graph runs the rules against that
+graph. A head naming that graph then derives into it as a head with no graph
+does, so a stored rule deriving into `ex:inferred` serves queries over the
+default graph and over `ex:inferred` alike.
+
 The graph is fixed: a variable graph is rejected. It must be a user named
 graph the ledger already has — transact data into it to create it — and not
 the default graph (`urn:default`; leave the graph out instead) or a system
