@@ -22,9 +22,13 @@ use std::sync::Arc;
 /// Refuse a commit on `base` that holds a vector the ledger cannot store.
 ///
 /// `graph_ids` maps each named graph `base` holds to its id; `iri` names a
-/// property or graph in the refusal. Runs under the ledger's write lock
-/// against the authoritative base, so writes re-based over one another
-/// cannot store two lengths.
+/// property or graph in the refusal.
+///
+/// A commit lands only on the base it was checked against. The handle path
+/// holds the ledger's write lock; `commit()`, which holds none, checks that
+/// the base is the published head (`verify_sequencing`) and publishes with a
+/// compare-and-set on that head. A write staged on an older base, or racing
+/// another on the same one, fails instead of storing a second length.
 pub fn check_commit(
     base: &LedgerState,
     flakes: &[Flake],
