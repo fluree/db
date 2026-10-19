@@ -12,17 +12,32 @@
 //! named graph first written after the build, or the default graph of a
 //! ledger whose indexed data all sits in named graphs.
 //!
-//! Background indexing is off: these tests drive each build themselves, and
-//! a background build racing them would make the outcome timing-dependent.
+//! A graph the base index holds nothing for can also have an order with no
+//! leaves. Bulk import wrote a SPOT with no leaves for a graph it had no quads
+//! for, and an incremental build then left that SPOT empty while writing the
+//! next window's facts to the other three orders, so reads by subject missed
+//! them. Import now writes no such order, and an incremental build treats one
+//! as holding no facts.
+//!
+//! Background indexing is off in all but
+//! `background_indexing_keeps_deleted_facts_deleted`: these tests drive each
+//! build themselves, and a background build racing them would make the outcome
+//! timing-dependent. That one is about the background indexer, and holds it
+//! under its soft threshold until one window has both writes.
 
 use crate::support;
-use fluree_db_api::{Fluree, FlureeBuilder, LedgerState};
+use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, LedgerState, TransactResult};
+use fluree_db_binary_index::format::branch::{build_branch_bytes, read_branch_from_bytes};
+use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::IndexRoot;
+use fluree_db_core::{ContentId, ContentKind};
 use serde_json::{json, Value as JsonValue};
 use std::path::Path;
 
 const EX: &str = "http://example.org/ns/";
 const G1: &str = "http://example.org/g1";
 const G2: &str = "http://example.org/g2";
+const G3: &str = "http://example.org/g3";
 
 #[derive(Clone, Copy, Debug)]
 enum Base {
@@ -46,6 +61,17 @@ fn fluree_at(dir: &Path) -> Fluree {
 }
 
 async fn sparql(fluree: &Fluree, ledger: LedgerState, body: &str) -> LedgerState {
+    commit_sparql(fluree, ledger, body, None).await.ledger
+}
+
+/// Commit a SPARQL update; `index_config`, when given, decides whether the
+/// commit starts a background build (the server default otherwise).
+async fn commit_sparql(
+    fluree: &Fluree,
+    ledger: LedgerState,
+    body: &str,
+    index_config: Option<IndexConfig>,
+) -> TransactResult {
     let text = format!("PREFIX ex: <{EX}>\n{body}");
     let parsed = fluree_db_sparql::parse_sparql(&text);
     assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
@@ -56,13 +82,14 @@ async fn sparql(fluree: &Fluree, ledger: LedgerState, body: &str) -> LedgerState
         fluree_db_transact::TxnOpts::default(),
     )
     .expect("lower");
-    fluree
-        .stage_owned(ledger)
-        .txn(txn)
+    let mut stage = fluree.stage_owned(ledger).txn(txn);
+    if let Some(config) = index_config {
+        stage = stage.index_config(config);
+    }
+    stage
         .execute()
         .await
         .unwrap_or_else(|e| panic!("{text}: {e}"))
-        .ledger
 }
 
 /// `body` inside `GRAPH <graph> { … }`, or bare for the default graph.
@@ -98,11 +125,22 @@ async fn build(fluree: &Fluree, id: &str, build: Build) {
 
 /// `ex:s ex:p ?o` over the dataset `from`, sorted.
 async fn objects(fluree: &Fluree, ledger_id: &str, from: &str) -> Vec<String> {
+    select_o(
+        fluree,
+        ledger_id,
+        from,
+        json!({"@id": "ex:s", "ex:p": "?o"}),
+    )
+    .await
+}
+
+/// `?o` for the pattern `pattern` over the dataset `from`, sorted.
+async fn select_o(fluree: &Fluree, ledger_id: &str, from: &str, pattern: JsonValue) -> Vec<String> {
     let q = json!({
         "@context": {"ex": EX},
         "from": from,
         "select": ["?o"],
-        "where": {"@id": "ex:s", "ex:p": "?o"}
+        "where": pattern
     });
     let ledger = fluree.ledger(ledger_id).await.expect("load");
     let result = fluree.query_connection(&q).await.expect("query");
@@ -331,12 +369,15 @@ fn padding(graph: Option<&str>, tag: &str, count: usize) -> String {
     in_graph(graph, &body)
 }
 
-/// The same window, indexed by the background indexer on its own, with the
-/// production defaults: no build is driven here. A large write keeps the
-/// indexer busy while the insert and the delete commit, so its next build
-/// takes both in one window.
+/// The same window, indexed by the background indexer on its own: no build is
+/// driven here. The indexer is held by its soft threshold, which starts a
+/// build only from a commit that leaves novelty at or over it (and catch-up
+/// sweeps, which ignore it, are off). The insert and the delete stay under it
+/// and the next commit crosses it, so the one build after the seed's takes
+/// both in one window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn background_indexing_keeps_deleted_facts_deleted() {
+    const SOFT_THRESHOLD: usize = 100_000;
     for target in [None, Some(G1)] {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = format!(
@@ -344,49 +385,342 @@ async fn background_indexing_keeps_deleted_facts_deleted() {
             target.map_or("default", |g| &g[g.len() - 2..])
         );
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_config(
+                fluree_db_indexer::IndexerConfig::default().with_catchup_sweeps(false),
+            )
+            .with_indexing_thresholds(SOFT_THRESHOLD, 100 * SOFT_THRESHOLD)
             .build()
             .expect("file fluree");
+        let config = fluree.default_index_config();
         let ledger = fluree.create_ledger(&id).await.expect("create");
-        let ledger = sparql(
+
+        // The base index: data in `G2` only.
+        let seed = commit_sparql(
             &fluree,
             ledger,
-            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "seed", 10)),
+            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "seed", 2_000)),
+            Some(config.clone()),
         )
         .await;
-        wait_for_index_t(&fluree, &id, ledger.t()).await;
+        assert!(seed.indexing.needed, "{id}: the seed must start a build");
+        wait_for_index_t(&fluree, &id, seed.ledger.t()).await;
         let ledger = fluree.ledger(&id).await.expect("reload");
-        let ledger = sparql(
-            &fluree,
-            ledger,
-            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "busy", 20_000)),
-        )
-        .await;
 
         let fact = in_graph(target, "ex:s ex:p \"x\"");
-        let ledger = sparql(&fluree, ledger, &format!("INSERT DATA {{ {fact} }}")).await;
-        let t_insert = ledger.t();
-        let ledger = sparql(&fluree, ledger, &format!("DELETE DATA {{ {fact} }}")).await;
-        let t_delete = ledger.t();
-        drop(ledger);
-        let index_t = fluree
-            .nameservice()
-            .lookup(&id)
-            .await
-            .expect("nameservice lookup")
-            .expect("ledger record")
-            .index_t;
+        let insert = commit_sparql(
+            &fluree,
+            ledger,
+            &format!("INSERT DATA {{ {fact} }}"),
+            Some(config.clone()),
+        )
+        .await;
+        let delete = commit_sparql(
+            &fluree,
+            insert.ledger,
+            &format!("DELETE DATA {{ {fact} }}"),
+            Some(config.clone()),
+        )
+        .await;
+        for (write, status) in [("insert", &insert.indexing), ("delete", &delete.indexing)] {
+            assert!(
+                !status.needed,
+                "{id}: the {write} left {} bytes of novelty, over the threshold, \
+                 so a build may have started without the other write",
+                status.novelty_size
+            );
+        }
+        let cross = commit_sparql(
+            &fluree,
+            delete.ledger,
+            &format!("INSERT DATA {{ {} }}", padding(Some(G2), "cross", 2_000)),
+            Some(config),
+        )
+        .await;
         assert!(
-            index_t < t_insert,
-            "{id}: the insert was indexed before the delete committed (index_t {index_t}), \
-             so no build covers both"
+            cross.indexing.needed,
+            "{id}: this commit must start the build"
         );
-        wait_for_index_t(&fluree, &id, t_delete).await;
+        wait_for_index_t(&fluree, &id, cross.ledger.t()).await;
 
         let from = from_alias(&id, target, None);
         assert_eq!(
             objects(&fluree_at(dir.path()), &id, &from).await,
             Vec::<String>::new(),
             "{id}: after the background build"
+        );
+    }
+}
+
+/// A ledger bulk-imported from a TriG file whose one quad is in `G2`, with an
+/// empty `GRAPH <G3> { }` block: the import has no quads for the default graph
+/// or `G3`.
+async fn imported_ledger(dir: &Path, id: &str) -> Fluree {
+    let data = tempfile::tempdir().expect("tempdir");
+    let trig = data.path().join("named.trig");
+    std::fs::write(
+        &trig,
+        format!(
+            "@prefix ex: <{EX}> .\nGRAPH <{G2}> {{ ex:a ex:q \"base\" . }}\nGRAPH <{G3}> {{ }}\n"
+        ),
+    )
+    .expect("write TriG");
+    let fluree = fluree_at(dir);
+    fluree
+        .create(id)
+        .import(&trig)
+        .threads(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("import");
+    fluree
+}
+
+/// The published index's `t` and root.
+async fn published_root(fluree: &Fluree, id: &str) -> (i64, IndexRoot) {
+    let record = fluree
+        .nameservice()
+        .lookup(id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record");
+    let root_id = record.index_head_id.expect("a published index");
+    let bytes = fluree.content_store(id).get(&root_id).await.expect("root");
+    (
+        record.index_t,
+        IndexRoot::decode(&bytes).expect("decode root"),
+    )
+}
+
+/// Every `(g_id, order)` in the published root whose branch has no leaves.
+async fn orders_without_leaves(fluree: &Fluree, id: &str) -> Vec<(u16, RunSortOrder)> {
+    let (_, root) = published_root(fluree, id).await;
+    let store = fluree.content_store(id);
+    let mut empty: Vec<(u16, RunSortOrder)> = root
+        .default_graph_orders
+        .iter()
+        .filter(|o| o.leaves.is_empty())
+        .map(|o| (0, o.order))
+        .collect();
+    for ng in &root.named_graphs {
+        for (order, cid) in &ng.orders {
+            let bytes = store.get(cid).await.expect("branch");
+            if read_branch_from_bytes(&bytes)
+                .expect("decode branch")
+                .leaves
+                .is_empty()
+            {
+                empty.push((ng.g_id, *order));
+            }
+        }
+    }
+    empty
+}
+
+/// The `g_id` of `graph`, or 0 for the default graph.
+async fn graph_id(fluree: &Fluree, id: &str, graph: Option<&str>) -> u16 {
+    match graph {
+        None => 0,
+        Some(iri) => fluree
+            .ledger(id)
+            .await
+            .expect("load")
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .expect("a registered graph"),
+    }
+}
+
+/// Give `g_id` a SPOT branch with no leaves, built from `branch_bytes`.
+async fn empty_spot(
+    fluree: &Fluree,
+    id: &str,
+    root: &mut IndexRoot,
+    g_id: u16,
+    branch_bytes: Vec<u8>,
+) {
+    use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
+    let spot = RunSortOrder::Spot;
+    if g_id == 0 {
+        root.default_graph_orders.retain(|o| o.order != spot);
+        root.default_graph_orders.push(DefaultGraphOrder {
+            order: spot,
+            leaves: Vec::new(),
+        });
+        return;
+    }
+    let cid = fluree
+        .content_store(id)
+        .put(ContentKind::IndexBranch, &branch_bytes)
+        .await
+        .expect("put branch");
+    match root.named_graphs.iter_mut().find(|ng| ng.g_id == g_id) {
+        Some(ng) => {
+            ng.orders.retain(|(order, _)| *order != spot);
+            ng.orders.push((spot, cid));
+        }
+        None => root.named_graphs.push(NamedGraphRouting {
+            g_id,
+            orders: vec![(spot, cid)],
+        }),
+    }
+}
+
+/// Publish `root` as the index at `t`.
+async fn publish_root(fluree: &Fluree, id: &str, t: i64, root: &IndexRoot) {
+    let root_id: ContentId = fluree
+        .content_store(id)
+        .put(ContentKind::IndexRoot, &root.encode())
+        .await
+        .expect("put root");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal(id, t, &root_id)
+        .await
+        .expect("publish index");
+}
+
+async fn incremental_build(
+    fluree: &Fluree,
+    id: &str,
+) -> Result<fluree_db_indexer::IndexResult, fluree_db_indexer::IndexerError> {
+    let record = fluree
+        .nameservice()
+        .lookup(id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record");
+    fluree_db_indexer::build_incremental_index_for_record(
+        fluree.content_store(id),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+}
+
+/// Bulk import writes no order without leaves, so after an import with no
+/// quads for the default graph or `G3`, the next build takes their first facts
+/// incrementally. So does a root from an import that still wrote a SPOT with
+/// no leaves for each.
+#[tokio::test]
+async fn graphs_an_import_left_empty_take_facts_incrementally() {
+    for older_import in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = format!("it/delete-survives-import-{older_import}:main");
+        let fluree = imported_ledger(dir.path(), &id).await;
+        assert_eq!(
+            orders_without_leaves(&fluree, &id).await,
+            [],
+            "{id}: the import wrote an order with no leaves"
+        );
+        if older_import {
+            let (t, mut root) = published_root(&fluree, &id).await;
+            let mut expected = Vec::new();
+            for graph in [None, Some(G3)] {
+                let g_id = graph_id(&fluree, &id, graph).await;
+                let bytes = build_branch_bytes(RunSortOrder::Spot, g_id, &[]);
+                empty_spot(&fluree, &id, &mut root, g_id, bytes).await;
+                expected.push((g_id, RunSortOrder::Spot));
+            }
+            publish_root(&fluree, &id, t, &root).await;
+            assert_eq!(orders_without_leaves(&fluree, &id).await, expected);
+        }
+
+        let ledger = fluree.ledger(&id).await.expect("load");
+        let ledger = sparql(
+            &fluree,
+            ledger,
+            &format!("INSERT DATA {{ ex:s ex:p \"x\" . GRAPH <{G3}> {{ ex:s ex:p \"x\" }} }}"),
+        )
+        .await;
+        drop(ledger);
+        build(&fluree, &id, Build::Incremental).await;
+        for graph in [None, Some(G3)] {
+            assert_eq!(
+                current(&fluree, dir.path(), &id, graph).await,
+                ["\"x\""],
+                "{id}: {graph:?} by subject"
+            );
+        }
+    }
+}
+
+/// An index in which a graph has facts in PSOT, POST and OPST but none in
+/// SPOT, as an incremental build wrote after an import left the graph a SPOT
+/// with no leaves: it kept that SPOT empty and wrote the window's facts to the
+/// other three orders, so reads by subject missed them. The next build refuses
+/// to extend that index and falls back to a full rebuild, which restores SPOT.
+#[tokio::test]
+async fn facts_missing_from_spot_are_rebuilt() {
+    // The SPOT branch as every writer writes one, which the root alone
+    // identifies; and one the root can't, which the build only finds empty
+    // once it fetches it (the reserved header word set).
+    let written = |g_id: u16| build_branch_bytes(RunSortOrder::Spot, g_id, &[]);
+    let unrecognized = |g_id: u16| {
+        let mut bytes = written(g_id);
+        bytes[12] = 1;
+        bytes
+    };
+    let cases: [(Option<&str>, &dyn Fn(u16) -> Vec<u8>); 3] = [
+        (None, &written),
+        (Some(G3), &written),
+        (Some(G3), &unrecognized),
+    ];
+    for (case, (graph, spot_bytes)) in cases.into_iter().enumerate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = format!("it/delete-survives-spot-{case}:main");
+        let fluree = imported_ledger(dir.path(), &id).await;
+        let fact = |o: &str| {
+            format!(
+                "INSERT DATA {{ {} }}",
+                in_graph(graph, &format!("ex:s ex:p \"{o}\""))
+            )
+        };
+        let ledger = fluree.ledger(&id).await.expect("load");
+        drop(sparql(&fluree, ledger, &fact("x")).await);
+
+        let built = incremental_build(&fluree, &id)
+            .await
+            .expect("incremental build");
+        let bytes = fluree
+            .content_store(&id)
+            .get(&built.root_id)
+            .await
+            .expect("root");
+        let mut root = IndexRoot::decode(&bytes).expect("decode root");
+        let g_id = graph_id(&fluree, &id, graph).await;
+        empty_spot(&fluree, &id, &mut root, g_id, spot_bytes(g_id)).await;
+        publish_root(&fluree, &id, built.index_t, &root).await;
+        let from = from_alias(&id, graph, None);
+        let fresh = fluree_at(dir.path());
+        assert_eq!(
+            objects(&fresh, &id, &from).await,
+            Vec::<String>::new(),
+            "{id}: by subject, before"
+        );
+        assert_eq!(
+            select_o(&fresh, &id, &from, json!({"@id": "?s", "ex:p": "?o"})).await,
+            ["\"x\""],
+            "{id}: by predicate, before"
+        );
+
+        let ledger = fluree.ledger(&id).await.expect("load");
+        drop(sparql(&fluree, ledger, &fact("y")).await);
+        let refused = incremental_build(&fluree, &id).await;
+        assert!(
+            matches!(
+                refused,
+                Err(fluree_db_indexer::IndexerError::IncrementalAbort(_))
+            ),
+            "{id}: {refused:?}"
+        );
+        support::build_and_publish_index(&fluree, &id).await;
+        assert_eq!(
+            current(&fluree, dir.path(), &id, graph).await,
+            ["\"x\"", "\"y\""],
+            "{id}: by subject, after"
         );
     }
 }
