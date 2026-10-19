@@ -7,6 +7,9 @@
 //! it brought in, and the server must end up with the merged data and a
 //! complete commit history.
 //!
+//! The same harness checks that `fluree info` of a tracked ledger shows the
+//! config diagnostics the server reports.
+//!
 //! Like `track_headers_seam.rs`, this compiles only with the `server`
 //! feature, which is a default feature of this crate.
 
@@ -161,4 +164,47 @@ async fn publish_and_push_carry_merges() {
     );
     // Adds erin and the second merge on the line, plus feature's dave.
     assert_eq!(remote_commit_count(&server).await, 7);
+}
+
+/// `fluree info` of a tracked ledger prints the config diagnostics in the
+/// server's ledger info, as it does for a local ledger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn info_of_a_tracked_ledger_prints_config_diagnostics() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/fluree/create", server.url))
+        .json(&json!({ "ledger": "mydb" }))
+        .send()
+        .await
+        .expect("create");
+    assert!(response.status().is_success(), "create failed");
+
+    let home = TempDir::new().unwrap();
+    fluree(&home, &["init"]).await;
+    fluree(&home, &["remote", "add", "origin", &server.url]).await;
+    fluree(&home, &["track", "add", "mydb", "--remote", "origin"]).await;
+    let info = fluree(&home, &["info", "mydb"]).await;
+    assert!(!info.contains("Config diagnostics"), "{info}");
+
+    // A shape, and no config that enables SHACL.
+    let response = client
+        .post(format!("{}/v1/fluree/insert/mydb:main", server.url))
+        .json(&json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "sh": "http://www.w3.org/ns/shacl#"
+            },
+            "@id": "ex:PersonShape",
+            "@type": "sh:NodeShape",
+            "sh:targetClass": { "@id": "ex:Person" }
+        }))
+        .send()
+        .await
+        .expect("insert");
+    assert!(response.status().is_success(), "insert failed");
+
+    let info = fluree(&home, &["info", "mydb"]).await;
+    assert!(info.contains("Config diagnostics:"), "{info}");
+    assert!(info.contains("shapes present"), "{info}");
 }

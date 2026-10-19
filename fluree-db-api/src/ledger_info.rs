@@ -116,6 +116,15 @@ pub struct LedgerInfo {
     /// Virtual-only source metadata (identifying only — NEVER credentials).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+
+    /// Native-only: degenerate state in the ledger's config graph (see
+    /// [`crate::config_resolver::diagnose`]). Omitted when there is none.
+    #[serde(
+        rename = "configDiagnostics",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub config_diagnostics: Vec<crate::config_resolver::ConfigDiagnostic>,
 }
 
 impl LedgerInfo {
@@ -664,6 +673,22 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         }
     });
 
+    // 7. Config diagnostics: degenerate config-graph state, omitted when clean.
+    // Informational: a failure to compute them is logged, not surfaced.
+    let config_diagnostics = match crate::config_resolver::diagnose(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await
+    {
+        Ok(diagnostics) => diagnostics,
+        Err(e) => {
+            tracing::warn!(error = %e, "ledger config diagnostics unavailable");
+            Vec::new()
+        }
+    };
+
     Ok(LedgerInfo {
         ledger_id: None,
         t: None,
@@ -676,6 +701,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         nameservice,
         index,
         source: None,
+        config_diagnostics,
     }
     .into_json())
 }
@@ -1549,6 +1575,8 @@ pub fn build_virtual_ledger_info(
         nameservice: Some(gs_record_to_jsonld(record)),
         index: None,
         source: Some(source),
+        // A graph source has no config graph.
+        config_diagnostics: Vec::new(),
     }
 }
 
