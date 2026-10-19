@@ -409,6 +409,50 @@ async fn sparql_update_rejects_ill_typed_literal() {
     }
 }
 
+/// The JSON-LD twin: an insert and a delete, with a `where` or without one,
+/// refuse an ill-typed literal written as a constant, as SPARQL does, even
+/// when a Turtle write stored that literal. A delete removes it through a
+/// variable instead (`datatypes.md`).
+#[tokio::test]
+async fn jsonld_transactions_reject_ill_typed_literal() {
+    let fluree = memory_fluree();
+    let ledger_id = "typed-literal-index:reject-jsonld";
+    let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .insert_turtle(
+            ledger,
+            &format!("<{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date> ."),
+        )
+        .await
+        .expect("Turtle keeps the ill-typed literal");
+    let node = json!({
+        "@id": format!("{EX}a"),
+        format!("{EX}date"): {"@value": "1990-00-00", "@type": format!("{XSD}date")}
+    });
+    let txns = [
+        ("insert", json!({"insert": node.clone()})),
+        ("delete", json!({"delete": node.clone()})),
+        (
+            "delete with a where",
+            json!({"where": {"@id": format!("{EX}a"), format!("{EX}date"): "?o"}, "delete": node}),
+        ),
+    ];
+    for (what, txn) in txns {
+        let err = fluree
+            .graph(ledger_id)
+            .transact()
+            .update(&txn)
+            .commit()
+            .await
+            .map(|r| r.receipt.flake_count)
+            .expect_err(what);
+        assert!(
+            err.to_string().contains("date"),
+            "{what}: error should name the datatype: {err}"
+        );
+    }
+}
+
 /// `datatypes.md`: a stored ill-typed literal, which a DELETE cannot name as
 /// a constant, is replaced by an upsert of its property, over novelty and
 /// once indexed. The upsert retracts it as stored.
