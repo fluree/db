@@ -654,11 +654,11 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
                 text(&["pfs", "pft"]),
             ),
             (
-                r#"SELECT ?s (SUBSTR(?o, 1, 5) AS ?x) WHERE { ?s ex:pftp ?o }"#,
+                "SELECT ?s (SUBSTR(?o, 1, 5) AS ?x) WHERE { ?s ex:pftp ?o }",
                 text(&["Hello", "Hello", "pfs", "pft"]),
             ),
             (
-                r#"SELECT ?s (STRLEN(?o) AS ?x) WHERE { ?s ex:pftp ?o }"#,
+                "SELECT ?s (STRLEN(?o) AS ?x) WHERE { ?s ex:pftp ?o }",
                 text(&["11", "11", "pfs", "pft"]),
             ),
             (
@@ -678,12 +678,12 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
                 text(&["pj", "pjs"]),
             ),
             (
-                r#"SELECT ?s (STR(?o) AS ?x) WHERE { ?s ex:pjp ?o }"#,
+                "SELECT ?s (STR(?o) AS ?x) WHERE { ?s ex:pjp ?o }",
                 text(&[r#"{"a":1}"#, r#"{"a":1}"#, "pj", "pjs"]),
             ),
             // A JSON value bound by BIND stays `rdf:JSON`.
             (
-                r#"SELECT ?s (DATATYPE(?x) AS ?d) WHERE { ?s ex:pjp ?o BIND(?o AS ?x) }"#,
+                "SELECT ?s (DATATYPE(?x) AS ?d) WHERE { ?s ex:pjp ?o BIND(?o AS ?x) }",
                 text(&[
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON",
                     "pj",
