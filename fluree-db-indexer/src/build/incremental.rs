@@ -429,8 +429,9 @@ enum Phase2TaskUpdate {
     Named {
         branch_cid: ContentId,
     },
-    /// A fresh branch with nothing to hold: the graph keeps no branch for
-    /// this order, and the next build sees it as fresh again.
+    /// A fresh branch with nothing to hold: the root keeps what it had for
+    /// this order (no branch, or one with no leaves), which the next build
+    /// again finds no base facts in.
     Unchanged,
 }
 
@@ -438,6 +439,9 @@ struct Phase2TaskOutput {
     seq: usize,
     g_id: u16,
     order: RunSortOrder,
+    /// The task merged into a base branch with leaves, rather than building
+    /// fresh. A graph's four tasks must agree ([`check_base_facts_agree`]).
+    base_facts: bool,
     update: Phase2TaskUpdate,
     replaced_leaf_cids: Vec<ContentId>,
     replaced_sidecar_cids: Vec<ContentId>,
@@ -546,6 +550,7 @@ async fn execute_phase2_task(
                 seq,
                 g_id,
                 order,
+                base_facts: true,
                 update: Phase2TaskUpdate::Default {
                     leaf_entries: meta.leaf_entries,
                 },
@@ -588,6 +593,7 @@ async fn execute_phase2_task(
                 seq,
                 g_id,
                 order,
+                base_facts: true,
                 update: Phase2TaskUpdate::Named { branch_cid },
                 replaced_leaf_cids: meta.replaced_leaf_cids,
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
@@ -608,9 +614,9 @@ async fn execute_phase2_task(
             )?;
             let new_leaf_count = fresh.new_leaf_blobs.len();
             let update = if fresh.leaf_entries.is_empty() {
-                // Every fact in the window netted to no row and no history.
-                // Publishing the empty branch would register a branch with no
-                // leaves, which routes no later novelty anywhere.
+                // Every fact in the window netted to no row and no history. A
+                // root lists no order with no leaves, so the empty branch
+                // isn't published.
                 Phase2TaskUpdate::Unchanged
             } else {
                 upload_leaf_blobs(
@@ -646,6 +652,7 @@ async fn execute_phase2_task(
                 seq,
                 g_id,
                 order,
+                base_facts: false,
                 update,
                 replaced_leaf_cids: Vec::new(),
                 replaced_sidecar_cids: Vec::new(),
@@ -901,6 +908,7 @@ pub async fn incremental_index(
     let mut phase2_outputs: Vec<Phase2TaskOutput> =
         phase2_results.into_iter().collect::<Result<Vec<_>>>()?;
     phase2_outputs.sort_unstable_by_key(|output| output.seq);
+    check_base_facts_agree(&phase2_outputs)?;
 
     // Fact identities the SPOT merges matched against existing base rows.
     // Phase 3b derives materialized-state stat deltas from this: an assert of
@@ -4757,18 +4765,29 @@ async fn upload_leaf_blobs(
     Ok(())
 }
 
-/// Refuse a base root in which a graph has some of the four orders but not
-/// all of them.
+/// Refuse a base root in which a graph has base facts in some of the four
+/// orders but not all of them.
 ///
-/// Every writer builds a graph's four orders from one fact set, so a graph has
-/// all of them or none. A missing order would take the fresh path here and be
-/// built from this window's novelty alone, without the graph's base facts.
-/// Aborting falls back to a full rebuild, which builds every order from the
-/// commits.
+/// A graph's four orders hold one fact set, so they have facts in all of them
+/// or none. An order without them takes the fresh path and is built from this
+/// window's novelty alone, without the graph's base facts. Aborting falls back
+/// to a full rebuild, which builds every order from the commits.
+///
+/// An order with no leaves holds no facts, the same as a missing one. Bulk
+/// import used to write such an order: a SPOT with no leaves for a graph it had
+/// no quads for, such as the default graph of a TriG file whose quads are all
+/// in named graphs, or a named graph from an empty `GRAPH` block. An
+/// incremental build then used to leave that SPOT empty while writing the
+/// window's facts to the other three orders, which this refuses. The default
+/// graph's leaves are inline in the root. A named graph's are in its branches,
+/// but a branch with no leaves is exactly `build_branch_bytes(order, g_id, &[])`
+/// (the decoder reads one branch version, and every writer builds branches with
+/// that function), so its CID identifies it without a fetch.
 fn check_order_sets(
     default_graph_orders: &[fluree_db_binary_index::format::index_root::DefaultGraphOrder],
     named_graphs: &[fluree_db_binary_index::format::index_root::NamedGraphRouting],
 ) -> Result<()> {
+    use fluree_db_binary_index::format::branch::build_branch_bytes;
     let mut all = RunSortOrder::all_build_orders().to_vec();
     all.sort_unstable();
     let complete = |mut orders: Vec<RunSortOrder>| {
@@ -4776,21 +4795,59 @@ fn check_order_sets(
         orders.dedup();
         orders.is_empty() || orders == all
     };
-    let default_orders = default_graph_orders.iter().map(|o| o.order).collect();
+    let default_orders = default_graph_orders
+        .iter()
+        .filter(|o| !o.leaves.is_empty())
+        .map(|o| o.order)
+        .collect();
+    let named_orders = |ng: &fluree_db_binary_index::format::index_root::NamedGraphRouting| {
+        ng.orders
+            .iter()
+            .filter(|(order, cid)| {
+                *cid != ContentId::new(
+                    ContentKind::IndexBranch,
+                    &build_branch_bytes(*order, ng.g_id, &[]),
+                )
+            })
+            .map(|(order, _)| *order)
+            .collect()
+    };
     let partial = if complete(default_orders) {
         named_graphs
             .iter()
-            .find(|ng| !complete(ng.orders.iter().map(|(o, _)| *o).collect()))
+            .find(|ng| !complete(named_orders(ng)))
             .map(|ng| ng.g_id)
     } else {
         Some(0)
     };
     match partial {
         Some(g_id) => Err(IndexerError::IncrementalAbort(format!(
-            "base root has some but not all sort orders for graph {g_id}"
+            "base root has facts in some but not all sort orders for graph {g_id}"
         ))),
         None => Ok(()),
     }
+}
+
+/// Refuse a window in which a graph's four tasks disagree on whether the base
+/// holds facts for it: some merged into a branch with leaves while others were
+/// built fresh.
+///
+/// [`check_order_sets`] sees this from the root alone for every branch a
+/// writer produces. This is the backstop for one it can't see, a branch with
+/// no leaves but other bytes, once Phase 2 has fetched and decoded it. It runs
+/// after the tasks, so an abort here leaves this build's uploads unreferenced,
+/// as an abort in Phase 3 does.
+fn check_base_facts_agree(outputs: &[Phase2TaskOutput]) -> Result<()> {
+    let mut base_facts: std::collections::BTreeMap<u16, bool> = std::collections::BTreeMap::new();
+    for output in outputs {
+        if *base_facts.entry(output.g_id).or_insert(output.base_facts) != output.base_facts {
+            return Err(IndexerError::IncrementalAbort(format!(
+                "base root has facts in some but not all sort orders for graph {}",
+                output.g_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build a fresh V3 branch from pure novelty, for a graph (default or
@@ -5291,36 +5348,131 @@ mod warm_tests {
         }
     }
 
-    /// Every graph in a base root has all four orders or none.
+    /// Every graph in a base root has facts in all four orders or none, and an
+    /// order with no leaves has none.
     #[test]
     fn partial_order_root_is_refused() {
+        use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
         use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
-        let default = |orders: &[RunSortOrder]| -> Vec<DefaultGraphOrder> {
+        let leaf = LeafEntry {
+            first_key: record(1, 1),
+            last_key: record(1, 1),
+            row_count: 1,
+            leaf_cid: ContentId::new(ContentKind::IndexLeaf, b"leaf"),
+            sidecar_cid: None,
+        };
+        // Each order with `leaves` leaves.
+        let default = |orders: &[(RunSortOrder, usize)]| -> Vec<DefaultGraphOrder> {
             orders
                 .iter()
-                .map(|&order| DefaultGraphOrder {
+                .map(|&(order, leaves)| DefaultGraphOrder {
                     order,
-                    leaves: Vec::new(),
+                    leaves: vec![leaf.clone(); leaves],
                 })
                 .collect()
         };
-        let branch = ContentId::new(ContentKind::IndexBranch, b"branch");
-        let named = |orders: &[RunSortOrder]| NamedGraphRouting {
+        // Each order with a branch that has leaves (`true`) or none (`false`),
+        // the latter written as every writer writes one.
+        let named = |orders: &[(RunSortOrder, bool)]| NamedGraphRouting {
             g_id: 3,
-            orders: orders.iter().map(|&o| (o, branch.clone())).collect(),
+            orders: orders
+                .iter()
+                .map(|&(order, leaves)| {
+                    let bytes = if leaves {
+                        b"branch".to_vec()
+                    } else {
+                        build_branch_bytes(order, 3, &[])
+                    };
+                    (order, ContentId::new(ContentKind::IndexBranch, &bytes))
+                })
+                .collect(),
         };
-        let all = RunSortOrder::all_build_orders();
-        let some = &all[..2];
+        let [spot, psot, post, opst] = [
+            RunSortOrder::Spot,
+            RunSortOrder::Psot,
+            RunSortOrder::Post,
+            RunSortOrder::Opst,
+        ];
 
-        assert!(check_order_sets(&[], &[]).is_ok());
-        assert!(check_order_sets(&default(all), &[named(all)]).is_ok());
-        for (defaults, named_graphs) in [(default(some), vec![]), (default(all), vec![named(some)])]
-        {
+        for (defaults, named_graphs) in [
+            (default(&[]), vec![]),
+            (
+                default(&[(spot, 1), (psot, 1), (post, 1), (opst, 1)]),
+                vec![named(&[
+                    (spot, true),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
+            // No facts anywhere: what bulk import wrote for a graph it had no
+            // quads for, or a rebuild for a graph that netted to nothing.
+            (default(&[(spot, 0)]), vec![named(&[(spot, false)])]),
+            (
+                default(&[(spot, 0), (psot, 0), (post, 0), (opst, 0)]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, false),
+                    (post, false),
+                    (opst, false),
+                ])],
+            ),
+        ] {
+            assert!(check_order_sets(&defaults, &named_graphs).is_ok());
+        }
+        for (defaults, named_graphs) in [
+            (default(&[(spot, 1), (psot, 1)]), vec![]),
+            // SPOT left with no leaves while the window's facts went to the
+            // other three orders.
+            (
+                default(&[(spot, 0), (psot, 1), (post, 1), (opst, 1)]),
+                vec![],
+            ),
+            (default(&[]), vec![named(&[(spot, true), (psot, true)])]),
+            (
+                default(&[]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
+        ] {
             assert!(matches!(
                 check_order_sets(&defaults, &named_graphs),
                 Err(IndexerError::IncrementalAbort(_))
             ));
         }
+    }
+
+    /// A graph whose tasks disagree on whether the base holds its facts is an
+    /// abort; agreement either way is fine.
+    #[test]
+    fn tasks_that_disagree_on_base_facts_are_refused() {
+        let output = |g_id: u16, base_facts: bool| Phase2TaskOutput {
+            seq: 0,
+            g_id,
+            order: RunSortOrder::Spot,
+            base_facts,
+            update: Phase2TaskUpdate::Unchanged,
+            replaced_leaf_cids: Vec::new(),
+            replaced_sidecar_cids: Vec::new(),
+            new_leaf_count: 0,
+            fetch_stats: Phase2FetchStatsSnapshot::default(),
+            matched: Vec::new(),
+        };
+        assert!(check_base_facts_agree(&[
+            output(0, true),
+            output(0, true),
+            output(3, false),
+            output(3, false),
+        ])
+        .is_ok());
+        assert!(matches!(
+            check_base_facts_agree(&[output(0, true), output(3, false), output(3, true)]),
+            Err(IndexerError::IncrementalAbort(_))
+        ));
     }
 
     fn cache_leaflet(
