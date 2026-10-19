@@ -504,16 +504,29 @@ fn advance<O: MergeOrder>(
 fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitted<'_>) {
     let (mut head_a, mut head_b) = (a.head(), b.head());
     loop {
-        // The smaller head emits; `a` on a tie.
-        if O::cmp(&head_b, &head_a) == Ordering::Less {
-            match advance::<O>(b, head_b, Some(&head_a), out) {
+        match O::cmp(&head_b, &head_a) {
+            Ordering::Less => match advance::<O>(b, head_b, Some(&head_a), out) {
                 Some(next) => head_b = next,
                 None => return,
-            }
-        } else {
-            match advance::<O>(a, head_a, Some(&head_b), out) {
+            },
+            Ordering::Greater => match advance::<O>(a, head_a, Some(&head_b), out) {
                 Some(next) => head_a = next,
                 None => return,
+            },
+            // One row both members hold, the commonest where they overlap:
+            // `a` emits it and `b` steps past its copy, which would be
+            // dropped as a repeat.
+            Ordering::Equal => {
+                let next_a = advance::<O>(a, head_a, Some(&head_b), out);
+                b.pos += 1;
+                if b.pos == b.end {
+                    return;
+                }
+                head_b = b.head();
+                match next_a {
+                    Some(next) => head_a = next,
+                    None => return,
+                }
             }
         }
     }
