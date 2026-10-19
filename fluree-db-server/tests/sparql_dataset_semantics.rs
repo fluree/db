@@ -1293,3 +1293,115 @@ async fn ledger_route_reserved_keyword_addresses_name_the_reserved_graphs() {
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// A ledger route waits for its path ledger's `min-t` before it reads that
+/// ledger's graph registry to resolve the dataset, in both languages and on
+/// the query, stream and explain routes, and the wait is the path ledger's
+/// own: every reference on the route resolves in it. Here the route's cached
+/// head is one commit behind; that commit, made through another instance on
+/// the same storage, registers `urn:g1`, a graph IRI that also reads as a
+/// ledger address. Read before the wait, the registry misread it: in a JSON-LD
+/// `from` a 400 "Ledger mismatch", in `fromNamed` a ledger to load and a 404.
+/// The SPARQL route waited on a ledger named `urn:g1` instead of its own,
+/// which does not exist: a 404.
+#[tokio::test]
+async fn ledger_routes_wait_for_the_path_ledgers_min_t_before_resolving_the_dataset() {
+    let (tmp, state) = test_state().await;
+    let app = build_router(state);
+    let writer = fluree_db_api::FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("a second instance on the route's storage");
+    let select = |dataset: (&str, JsonValue), graph: bool| {
+        let pattern = serde_json::json!({"@id": "?s", "ex:name": "?n"});
+        let mut q = serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "select": ["?n"],
+            "where": if graph { serde_json::json!([["graph", "urn:g1", pattern]]) } else { pattern },
+        });
+        q[dataset.0] = dataset.1;
+        q.to_string()
+    };
+    let sparql = "PREFIX ex: <http://ex.org/> SELECT ?n FROM <urn:g1> WHERE { ?s ex:name ?n }";
+    let cases: Vec<(&str, &str, String)> = vec![
+        (
+            "query",
+            "application/json",
+            select(("from", serde_json::json!("urn:g1")), false),
+        ),
+        (
+            "query",
+            "application/json",
+            select(("fromNamed", serde_json::json!(["urn:g1"])), true),
+        ),
+        ("query", "application/sparql-query", sparql.to_string()),
+        (
+            "stream/query",
+            "application/json",
+            select(("from", serde_json::json!("urn:g1")), false),
+        ),
+        (
+            "stream/query",
+            "application/sparql-query",
+            sparql.to_string(),
+        ),
+        (
+            "explain",
+            "application/json",
+            select(("from", serde_json::json!("urn:g1")), false),
+        ),
+    ];
+    for (i, (route, content_type, body)) in cases.into_iter().enumerate() {
+        let ledger = format!("mint{i}:main");
+        let (status, _) = post(
+            &app,
+            "/v1/fluree/create",
+            "application/json",
+            serde_json::json!({ "ledger": ledger }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create {ledger}");
+        let (status, _) = post(
+            &app,
+            &format!("/v1/fluree/upsert/{ledger}"),
+            "application/trig",
+            "@prefix ex: <http://ex.org/> .\nex:d ex:name \"D\" .\n".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "t=1 on {ledger}");
+        let head = writer.ledger(&ledger).await.expect("the writer loads t=1");
+        writer
+            .stage_owned(head)
+            .upsert_turtle("@prefix ex: <http://ex.org/> .\n<urn:g1> { ex:g ex:name \"G\" . }\n")
+            .execute()
+            .await
+            .expect("t=2 registers urn:g1");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/{route}/{ledger}"))
+                    .header("content-type", content_type)
+                    .header("fluree-min-t", "2")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{route} {content_type} {body}: {text}"
+        );
+        if route != "explain" {
+            assert!(
+                text.contains("\"G\"") && !text.contains("\"D\""),
+                "{route} {content_type} {body}: {text}"
+            );
+        }
+    }
+}

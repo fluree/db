@@ -321,8 +321,13 @@ async fn stream_query_inner(
             })
             .unwrap_or(false);
 
-        // Freshness barrier parity with /query (header / `@t:` min-t).
-        let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+        // Freshness barrier parity with /query (header / `@t:` min-t): the
+        // path ledger's, before its registry resolves the dataset.
+        let min_t = crate::routes::query::path_ledger_min_t(
+            &path,
+            headers.min_t,
+            collect_sparql_min_t_requirements(None, &sparql, Some(&ledger))?,
+        );
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
 
         if qc_opts.has_any_policy_inputs() || has_dataset {
@@ -343,12 +348,9 @@ async fn stream_query_inner(
                 );
                 let clause = crate::routes::query::resolved_sparql_dataset(parsed.ast.as_ref())?
                     .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
-                let registry = crate::routes::query::scope_registry(&state, &path.id).await;
+                let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
                 crate::routes::query::ledger_scoped_sparql_dataset_spec(
-                    &path.id,
-                    &clause,
-                    None,
-                    registry.as_ref(),
+                    &path.id, &clause, None, &registry,
                 )?
             } else {
                 fluree_db_api::DatasetSpec::new().with_default(fluree_db_api::GraphSource::ledger(
@@ -403,12 +405,17 @@ async fn stream_query_inner(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
-        let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
-            crate::routes::query::scope_registry(&state, &path.id).await
-        } else {
-            None
-        };
-        normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
+        if fluree_db_api::jsonld_names_dataset(&query_json) {
+            crate::routes::query::await_path_ledger_min_t_for_jsonld(
+                &state,
+                &path,
+                &headers,
+                &query_json,
+            )
+            .await?;
+            let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
+            normalize_ledger_scoped_from(&path.id, &registry, &mut query_json)?;
+        }
         inject_headers_into_query(&mut query_json, &headers);
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let plan_options =

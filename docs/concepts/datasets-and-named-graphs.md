@@ -44,6 +44,8 @@ Fluree exposes two query styles over HTTP:
 
 A `from` string or object, or a SPARQL `FROM`, that names a different ledger than the one in the URL, in any spelling, is rejected with a "Ledger mismatch" error (see [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger)). A JSON-LD array `from`, or a `fromNamed`, may name other ledgers, as on `POST /query`; each is read under the caller's access rights.
 
+On a ledger-scoped request, `Fluree-Min-T` (or `opts.min-t`) waits for the URL's ledger, and the wait comes before the request's dataset is resolved in that ledger, so a graph registered by the awaited commit is found.
+
 SPARQL dataset IRIs are expanded against the query's prologue first: prefixed names, and relative IRIs against `BASE`. A ledger address that names its branch or a time (`my_db:main`, `mydb@t:3`) is no relative IRI, so `BASE` leaves it as written. A bare name (`mydb`) is a relative IRI, as `data.ttl` is, and `BASE` resolves it, so a query that declares a `BASE` names a ledger with its branch (`mydb:main`).
 
 ### The ledger's own address in a graph position

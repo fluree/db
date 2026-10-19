@@ -1138,9 +1138,13 @@ pub async fn query_ledger(
         }
 
         let identity = headers.identity.clone();
-        let mut min_t_requirements =
-            collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
-        path.merge_pin_min_t(&mut min_t_requirements);
+        // The path ledger's wait, before the dataset is resolved against its
+        // graph registry (`execute_sparql_ledger`).
+        let min_t_requirements = path_ledger_min_t(
+            &path,
+            headers.min_t,
+            collect_sparql_min_t_requirements(None, &sparql, Some(&ledger))?,
+        );
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
         return execute_sparql_ledger(
             &state,
@@ -1224,13 +1228,14 @@ pub async fn query_ledger(
     }
 
     // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's ledger,
-    // rejecting attempts to target a different ledger than the URL.
-    let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
-        scope_registry(&state, &path.id).await
-    } else {
-        None
-    };
-    normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
+    // rejecting attempts to target a different ledger than the URL. The path
+    // ledger's min-t is awaited first, so its registry is at least as new as
+    // the commit the request waits for.
+    if fluree_db_api::jsonld_names_dataset(&query_json) {
+        await_path_ledger_min_t_for_jsonld(&state, &path, &headers, &query_json).await?;
+        let registry = scope_registry(&state, &path.id).await?;
+        normalize_ledger_scoped_from(&path.id, &registry, &mut query_json)?;
+    }
     pin_jsonld_dataset(&path, &mut query_json)?;
 
     // Inject header values into query opts
@@ -1651,13 +1656,13 @@ pub async fn explain_ledger(
         }
 
         // Ledger-scoped endpoint: resolve `from` / `fromNamed` in the path's
-        // ledger, rejecting attempts to target a different ledger than the URL.
-        let registry = if fluree_db_api::jsonld_names_dataset(&query_json) {
-            scope_registry(&state, &path.id).await
-        } else {
-            None
-        };
-        normalize_ledger_scoped_from(&path.id, registry.as_ref(), &mut query_json)?;
+        // ledger, rejecting attempts to target a different ledger than the URL,
+        // once the path ledger's min-t is met (see `query_ledger`).
+        if fluree_db_api::jsonld_names_dataset(&query_json) {
+            await_path_ledger_min_t_for_jsonld(&state, &path, &headers, &query_json).await?;
+            let registry = scope_registry(&state, &path.id).await?;
+            normalize_ledger_scoped_from(&path.id, &registry, &mut query_json)?;
+        }
         pin_jsonld_dataset(&path, &mut query_json)?;
 
         // Inject header values into query opts
@@ -2278,13 +2283,10 @@ fn collect_jsonld_time_min_t(value: &JsonValue, requirements: &mut BTreeMap<Stri
     }
 }
 
-pub(crate) fn collect_jsonld_min_t_requirements(
-    headers: &FlureeHeaders,
-    query: &JsonValue,
-    default_ledger: Option<&str>,
-) -> Result<BTreeMap<String, i64>> {
+/// The numeric pins of a JSON-LD body's dataset (`from`, `fromNamed`, `to`),
+/// by the ledger each names.
+fn collect_jsonld_pin_min_t(query: &JsonValue) -> BTreeMap<String, i64> {
     let mut requirements = BTreeMap::new();
-
     if let Some(from) = query.get("from") {
         collect_jsonld_time_min_t(from, &mut requirements);
     }
@@ -2294,6 +2296,15 @@ pub(crate) fn collect_jsonld_min_t_requirements(
     if let Some(to) = query.get("to") {
         collect_jsonld_time_min_t(to, &mut requirements);
     }
+    requirements
+}
+
+pub(crate) fn collect_jsonld_min_t_requirements(
+    headers: &FlureeHeaders,
+    query: &JsonValue,
+    default_ledger: Option<&str>,
+) -> Result<BTreeMap<String, i64>> {
+    let mut requirements = collect_jsonld_pin_min_t(query);
 
     let explicit_min_t = min_t_from_opts(query.get("opts"))?.or(headers.min_t);
     if let Some(min_t) = explicit_min_t {
@@ -2380,6 +2391,56 @@ pub(crate) fn collect_sparql_min_t_requirements(
     Ok(requirements)
 }
 
+/// The read-after-write requirement a ledger route waits on before it reads
+/// its path ledger's graph registry to resolve the request's dataset.
+///
+/// Every dataset reference on a ledger route resolves in the path's ledger,
+/// so the request's `min-t` (the header, a `# PRAGMA`, or a JSON-LD body's
+/// `opts.min-t`), a pinned path, and a numeric pin on the ledger's own
+/// address in the dataset (`dataset_pins`, by the ledger each names) are all
+/// that ledger's, and only a pin on its own address counts: a graph IRI that
+/// also reads as a ledger address (`urn:g1`) names no ledger here. Awaited
+/// before the registry is read, a graph the awaited commit registered
+/// resolves as that graph rather than as a missing one.
+pub(crate) fn path_ledger_min_t(
+    path: &PathLedger,
+    min_t: Option<i64>,
+    dataset_pins: BTreeMap<String, i64>,
+) -> BTreeMap<String, i64> {
+    let ledger = path.id.as_str();
+    let mut requirements = BTreeMap::new();
+    for (named, t) in dataset_pins {
+        if fluree_db_api::LedgerId::parse(&named).is_ok_and(|id| id == path.id) {
+            merge_min_t_requirement(&mut requirements, ledger, t);
+        }
+    }
+    if let Some(min_t) = min_t {
+        merge_min_t_requirement(&mut requirements, ledger, min_t);
+    }
+    if let Some(PathPin {
+        spec: TimeSpec::AtT(t),
+        ..
+    }) = &path.pin
+    {
+        merge_min_t_requirement(&mut requirements, ledger, *t);
+    }
+    requirements
+}
+
+/// [`path_ledger_min_t`] for a JSON-LD body, awaited. The body's other
+/// ledgers (a `fromNamed` naming one) are awaited once its dataset is
+/// resolved, from the resolved body; the path ledger's wait is met by then.
+pub(crate) async fn await_path_ledger_min_t_for_jsonld(
+    state: &AppState,
+    path: &PathLedger,
+    headers: &FlureeHeaders,
+    query: &JsonValue,
+) -> Result<()> {
+    let min_t = min_t_from_opts(query.get("opts"))?.or(headers.min_t);
+    let requirements = path_ledger_min_t(path, min_t, collect_jsonld_pin_min_t(query));
+    await_query_min_t_requirements(state, requirements).await
+}
+
 /// Resolve a ledger-scoped JSON-LD query's dataset in the path's ledger
 /// ([`fluree_db_api::resolve_jsonld_dataset_in_target`], reading the keys the
 /// engine's parser reads): a graph of the ledger, named by keyword or IRI,
@@ -2390,7 +2451,7 @@ pub(crate) fn collect_sparql_min_t_requirements(
 /// stay as written for the dataset to load.
 pub(crate) fn normalize_ledger_scoped_from(
     target: &fluree_db_api::LedgerId,
-    registry: Option<&ScopeRegistry>,
+    registry: &ScopeRegistry,
     query: &mut JsonValue,
 ) -> Result<()> {
     with_graph_lookup(registry, |graphs| {
@@ -2463,7 +2524,7 @@ mod ledger_scoped_from_tests {
     fn bare_config_from_is_rewritten_as_a_graph_selector() {
         for selector in ["config", "txn-meta", "default"] {
             let mut q = json!({"from": selector, "select": ["?s"], "where": []});
-            normalize_ledger_scoped_from(&id("books:main"), Some(&registry(&[])), &mut q)
+            normalize_ledger_scoped_from(&id("books:main"), &registry(&[]), &mut q)
                 .expect("normalize");
             assert_eq!(
                 q["from"],
@@ -2543,7 +2604,7 @@ mod ledger_scoped_from_tests {
     #[test]
     fn normalize_from_txn_meta_string_rewrites_to_object() {
         let mut q = json!({"select": ["*"], "from": "txn-meta"});
-        normalize_ledger_scoped_from(&id("myledger:main"), Some(&registry(&[])), &mut q).unwrap();
+        normalize_ledger_scoped_from(&id("myledger:main"), &registry(&[]), &mut q).unwrap();
         assert_eq!(
             q.get("from").unwrap(),
             &json!({"@id": "myledger:main", "graph": "txn-meta"})
@@ -2554,8 +2615,8 @@ mod ledger_scoped_from_tests {
     #[test]
     fn normalize_from_different_ledger_errors() {
         let mut q = json!({"select": ["*"], "from": "other:main"});
-        let err = normalize_ledger_scoped_from(&id("myledger:main"), Some(&registry(&[])), &mut q)
-            .unwrap_err();
+        let err =
+            normalize_ledger_scoped_from(&id("myledger:main"), &registry(&[]), &mut q).unwrap_err();
         assert!(err.to_string().contains("Ledger mismatch"));
     }
 
@@ -2576,7 +2637,7 @@ mod ledger_scoped_from_tests {
             "urn:fluree:b2x:main#config",
         ] {
             let mut q = json!({"from": own});
-            normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+            normalize_ledger_scoped_from(&target, &reg, &mut q).unwrap();
             assert_eq!(q["from"], json!(own), "{own}");
         }
         for (graph, as_graph) in [
@@ -2587,7 +2648,7 @@ mod ledger_scoped_from_tests {
             ("http://ex.org/not-yet", "http://ex.org/not-yet"),
         ] {
             let mut q = json!({"from": graph, "fromNamed": [graph]});
-            normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+            normalize_ledger_scoped_from(&target, &reg, &mut q).unwrap();
             assert_eq!(
                 q["from"],
                 json!({"@id": "b2x:main", "graph": as_graph}),
@@ -2602,14 +2663,14 @@ mod ledger_scoped_from_tests {
         for other in ["other:main", "other", "urn:fluree:other:main#config"] {
             // A single `from` must name this ledger...
             let mut q = json!({ "from": other });
-            let err = normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap_err();
+            let err = normalize_ledger_scoped_from(&target, &reg, &mut q).unwrap_err();
             assert!(
                 err.to_string().contains("Ledger mismatch"),
                 "{other}: {err}"
             );
             // ...while a `from` array and `fromNamed` may name other ledgers too.
             let mut q = json!({ "from": ["b2x", other], "fromNamed": [other] });
-            normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+            normalize_ledger_scoped_from(&target, &reg, &mut q).unwrap();
             assert_eq!(
                 q,
                 json!({ "from": ["b2x", other], "fromNamed": [other] }),
@@ -2636,11 +2697,11 @@ mod ledger_scoped_from_tests {
         let target = id("b2x:main");
         let reg = registry(&["http://ex.org/g"]);
         let mut q = json!({"from": "b2x", "opts": {"from": "other:main"}});
-        let err = normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap_err();
+        let err = normalize_ledger_scoped_from(&target, &reg, &mut q).unwrap_err();
         assert!(err.to_string().contains("Ledger mismatch"), "{err}");
 
         let mut q = json!({"opts": {"fromNamed": ["http://ex.org/g"]}});
-        normalize_ledger_scoped_from(&target, Some(&reg), &mut q).unwrap();
+        normalize_ledger_scoped_from(&target, &reg, &mut q).unwrap();
         assert_eq!(
             q["opts"]["fromNamed"],
             json!([{"@id": "b2x:main", "graph": "http://ex.org/g", "alias": "http://ex.org/g"}])
@@ -3104,33 +3165,28 @@ impl ScopeRegistry {
     }
 }
 
-/// Run `f` with a borrowed lookup into `registry`, or with none when the route
-/// cannot read one (proxy storage: references then resolve by address alone,
-/// and loading reports a graph that does not exist).
+/// Run `f` with a borrowed lookup into `registry`.
 pub(crate) fn with_graph_lookup<R>(
-    registry: Option<&ScopeRegistry>,
+    registry: &ScopeRegistry,
     f: impl FnOnce(Option<fluree_db_api::GraphLookup<'_>>) -> R,
 ) -> R {
-    match registry {
-        Some(registry) => f(Some(&|iri: &str| registry.graph_id(iri))),
-        None => f(None),
-    }
+    f(Some(&|iri: &str| registry.graph_id(iri)))
 }
 
 /// The path ledger's [`ScopeRegistry`]: its cached head's graph names, found
 /// by the path's id as parsed. Nothing else of the head is read here; the
-/// query's own load reads the rest.
+/// query's own load reads the rest. A proxy-storage peer reads it the same
+/// way: its queries load through the same cached handle. A ledger that does
+/// not exist (a graph source, or nothing) has no named graphs; any other
+/// failure to read the head fails the request, as loading it would.
 pub(crate) async fn scope_registry(
     state: &AppState,
     target: &fluree_db_api::LedgerId,
-) -> Option<ScopeRegistry> {
-    if state.config.is_proxy_storage_mode() {
-        return None;
-    }
+) -> Result<ScopeRegistry> {
     match state.fluree.ledger_handle(target).await {
-        Ok(handle) => Some(ScopeRegistry::Ledger(handle.graph_names().await)),
-        Err(e) if e.is_not_found() => Some(ScopeRegistry::Empty),
-        Err(_) => None,
+        Ok(handle) => Ok(ScopeRegistry::Ledger(handle.graph_names().await)),
+        Err(e) if e.is_not_found() => Ok(ScopeRegistry::Empty),
+        Err(e) => Err(ServerError::Api(e)),
     }
 }
 
@@ -3149,7 +3205,7 @@ fn dataset_reference_error(e: ApiError) -> ServerError {
 /// [`fluree_db_api::resolve_in_target`] against the route's registry.
 pub(crate) fn resolve_scoped_reference(
     target: &fluree_db_api::LedgerId,
-    registry: Option<&ScopeRegistry>,
+    registry: &ScopeRegistry,
     written: &str,
 ) -> Result<fluree_db_api::InTarget> {
     with_graph_lookup(registry, |graphs| {
@@ -3188,7 +3244,7 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
     target: &fluree_db_api::LedgerId,
     clause: &fluree_db_sparql::ResolvedDatasetClause,
     pin: Option<&PathPin>,
-    registry: Option<&ScopeRegistry>,
+    registry: &ScopeRegistry,
 ) -> Result<DatasetSpec> {
     let member = |graph: GraphSel| {
         GraphSource::ledger(fluree_db_api::LedgerRef::new(target.clone()).with_graph(graph))
@@ -3733,8 +3789,8 @@ async fn execute_sparql_ledger(
                 (Some(_), _) => {
                     let clause = resolved_sparql_dataset(parsed.ast.as_ref())?
                         .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
-                    let registry = scope_registry(state, &path.id).await;
-                    ledger_scoped_sparql_dataset_spec(&path.id, &clause, pin, registry.as_ref())?
+                    let registry = scope_registry(state, &path.id).await?;
+                    ledger_scoped_sparql_dataset_spec(&path.id, &clause, pin, &registry)?
                 }
                 (None, Some(pin)) => pinned_ledger_spec(&path.id, pin),
                 (None, None) => {
