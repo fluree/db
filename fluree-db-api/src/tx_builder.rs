@@ -1370,6 +1370,7 @@ impl Fluree {
                     core.policy.as_ref(),
                     Some(tracker),
                     input.skolem_txn_id,
+                    None,
                 )
                 .await?;
             // Answer the trailing RETURN against the final virtual state
@@ -1410,6 +1411,7 @@ impl Fluree {
                     Some(index_config),
                     core.policy.as_ref(),
                     Some(tracker),
+                    None,
                 )
                 .await?
             } else {
@@ -1464,6 +1466,7 @@ impl Fluree {
                     Some(index_config),
                     tracker_ref,
                     core.policy.as_ref(),
+                    None,
                 )
                 .await?;
             let commit_opts = self.maybe_spawn_txn_upload(
@@ -1509,6 +1512,7 @@ impl Fluree {
                     Some(index_config),
                     tracker_ref,
                     core.policy.as_ref(),
+                    None,
                 )
                 .await?;
             let commit_opts = self.maybe_spawn_txn_upload(
@@ -1557,6 +1561,7 @@ impl Fluree {
         tracker_ref: Option<&Tracker>,
         index_config: &IndexConfig,
         policy: Option<&PolicyContext>,
+        request: Option<&crate::tx::RequestGovernance>,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         let ledger_id = ledger_state.ledger_id().to_string();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
@@ -1575,12 +1580,13 @@ impl Fluree {
                     _ => TxnType::Update,
                 };
                 let stage_result = self
-                    .stage_transaction_from_txns(
+                    .stage_txns_governed(
                         ledger_state,
                         txns,
                         Some(index_config),
                         policy,
                         tracker_ref,
+                        request,
                     )
                     .await?;
                 Ok((stage_result, txn_type, commit_opts_base.clone()))
@@ -1600,6 +1606,7 @@ impl Fluree {
                         Some(index_config),
                         tracker_ref,
                         policy,
+                        request,
                     )
                     .await?;
                 Ok((stage_result, TxnType::Insert, commit_opts))
@@ -1612,7 +1619,7 @@ impl Fluree {
                     store_raw_txn,
                 );
                 let stage_result = self
-                    .stage_rdf_text_tracked(
+                    .stage_rdf_text_governed(
                         ledger_state,
                         *txn_type,
                         text,
@@ -1620,6 +1627,7 @@ impl Fluree {
                         Some(index_config),
                         tracker_ref,
                         policy,
+                        request,
                     )
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
@@ -1632,7 +1640,7 @@ impl Fluree {
                     store_raw_txn,
                 );
                 let stage_result = self
-                    .stage_transaction_tracked(
+                    .stage_transaction_governed(
                         ledger_state,
                         *txn_type,
                         txn_json,
@@ -1640,6 +1648,7 @@ impl Fluree {
                         Some(index_config),
                         tracker_ref,
                         policy,
+                        request,
                     )
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
@@ -1659,6 +1668,7 @@ impl Fluree {
                         Some(index_config),
                         tracker_ref,
                         policy,
+                        request,
                     )
                     .await?;
                 Ok((stage_result, op.txn_type(), commit_opts))
@@ -1676,10 +1686,11 @@ impl Fluree {
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
         policy: Option<&PolicyContext>,
+        request: Option<&crate::tx::RequestGovernance>,
     ) -> Result<StageResult> {
         match op.write {
             GraphWrite::Sync { allow_empty } => {
-                self.stage_sync_transaction_tracked(
+                self.stage_sync_governed(
                     ledger,
                     &op.graph,
                     op.payload,
@@ -1688,11 +1699,12 @@ impl Fluree {
                     index_config,
                     tracker,
                     policy,
+                    request,
                 )
                 .await
             }
             GraphWrite::Insert => {
-                self.stage_graph_insert_tracked(
+                self.stage_graph_insert_governed(
                     ledger,
                     &op.graph,
                     op.payload,
@@ -1700,6 +1712,7 @@ impl Fluree {
                     index_config,
                     tracker,
                     policy,
+                    request,
                 )
                 .await
             }
@@ -1738,19 +1751,27 @@ impl Fluree {
         // subjects records no subject set, which the ring reads as touching
         // everything: a stage computed before it stages again rather than
         // re-basing over it unvalidated. That is a shape, the class
-        // hierarchy shapes target through, or anything in a named graph,
-        // where shapes and the ledger's config live. Attachment changes also
-        // affect a delete's cascade beyond its own subjects: an upsert can
-        // attach an annotation while its unchanged base edge cancels out of
-        // the staged flakes, leaving only the annotation subject here.
+        // hierarchy shapes target through, a property's uniqueness
+        // declaration (`f:enforceUnique`, which uniqueness reads from the
+        // data as well as from a constraints source), or anything in a named
+        // graph, where shapes and the ledger's config live. Attachment
+        // changes also affect a delete's cascade beyond its own subjects: an
+        // upsert can attach an annotation while its unchanged base edge
+        // cancels out of the staged flakes, leaving only the annotation
+        // subject here.
+        let enforce_unique = fluree_vocab::config_iris::ENFORCE_UNIQUE
+            .strip_prefix(fluree_vocab::fluree::DB)
+            .expect("a Fluree vocabulary IRI");
         let changes_dependencies = staged.iter().any(|flake| {
-            use fluree_vocab::namespaces::{RDFS, SHACL};
+            use fluree_vocab::namespaces::{FLUREE_DB, RDFS, SHACL};
             flake.g.is_some()
                 || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
                 || flake.p.namespace_code == SHACL
                 || matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o) if o.namespace_code == SHACL)
                 || (flake.p.namespace_code == RDFS
                     && matches!(flake.p.name.as_ref(), "subClassOf" | "subPropertyOf"))
+                || (flake.p.namespace_code == FLUREE_DB
+                    && flake.p.name.as_ref() == enforce_unique)
         });
         let touched: Option<Arc<FxHashSet<Sid>>> = (!changes_dependencies
             && staged.len() <= crate::ledger_manager::MAX_FOOTPRINT_FLAKES)
@@ -2399,6 +2420,7 @@ impl Fluree {
                             tracker_ref,
                             &index_config,
                             None,
+                            None,
                         )
                         .await?;
                     let stage_us = stage_started.elapsed().as_micros() as u64;
@@ -2442,6 +2464,7 @@ impl Fluree {
                                 tracker_ref,
                                 &index_config,
                                 None,
+                                None,
                             )
                             .await?;
                         (write_guard, stage_result, txn_type, commit_opts)
@@ -2456,6 +2479,7 @@ impl Fluree {
                             &commit_opts_base,
                             tracker_ref,
                             &index_config,
+                            None,
                             None,
                         )
                         .await?;

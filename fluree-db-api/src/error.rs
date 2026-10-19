@@ -258,6 +258,13 @@ pub enum ApiError {
     #[error("Ledger configuration error: {0}")]
     LedgerConfig(String),
 
+    /// The ledger config could not be read (a storage or read failure).
+    /// Nothing in the request is wrong, and a retry can succeed. The same
+    /// condition on a transaction's staging lanes is
+    /// [`TransactError::ConfigUnavailable`](fluree_db_transact::TransactError::ConfigUnavailable).
+    #[error("Ledger config unavailable: {0}")]
+    ConfigUnavailable(String),
+
     /// A materialize pass's subject accumulator outgrew its memory budget.
     ///
     /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
@@ -750,6 +757,10 @@ impl ApiError {
             // released), or a vector the index cannot store beside the
             // property's others. Permanent either way.
             ApiError::Transact(TE::DatatypeLimitExceeded { .. } | TE::InvalidVector(_)) => 422,
+            // The ledger config could not be read: a storage failure, whichever
+            // lane read it. Nothing in the request is wrong, and it is not
+            // capacity pressure, so not a 503.
+            ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => 500,
             ApiError::Transact(_) => 400,
 
             ApiError::Indexer(e) => {
@@ -909,6 +920,9 @@ impl ApiError {
             ApiError::Transact(TE::IndexNotLoaded(_)) => errors::INDEX_NOT_LOADED,
             // The generic code, the one its flattened 422 carries.
             ApiError::Transact(TE::InvalidVector(_)) => errors::INVALID_TRANSACTION,
+            ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => {
+                errors::STORAGE_READ
+            }
             ApiError::Transact(_) => errors::INVALID_TRANSACTION,
 
             ApiError::InvalidLedgerId(_)
@@ -1039,7 +1053,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 47
+    const VARIANTS: usize = 48
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + cfg!(feature = "iceberg") as usize;
@@ -1325,6 +1339,23 @@ mod tests {
             ),
             (ApiError::Json(json), 500, INTERNAL),
             (ApiError::ledger_config("x"), 500, CONFIG),
+            // A ledger config read failure, from the API's own reads (the
+            // policy context, a query's config) and from a staging lane.
+            (ApiError::ConfigUnavailable("x".into()), 500, STORAGE_READ),
+            (
+                ApiError::Transact(TE::ConfigUnavailable("x".into())),
+                500,
+                STORAGE_READ,
+            ),
+            (
+                ApiError::Transact(TE::RequestOverrideRefused {
+                    setting: "opts.shapes".into(),
+                    graph: "default".into(),
+                    control: "f:OverrideNone".into(),
+                }),
+                400,
+                INVALID_TRANSACTION,
+            ),
             (
                 ApiError::MaterializeMemoryBudget {
                     table: "t".into(),
@@ -1397,6 +1428,7 @@ mod tests {
                 | ApiError::Json(_)
                 | ApiError::Config(_)
                 | ApiError::LedgerConfig(_)
+                | ApiError::ConfigUnavailable(_)
                 | ApiError::MaterializeMemoryBudget { .. }
                 | ApiError::OntologyImport(_)
                 | ApiError::Format(_)

@@ -253,6 +253,7 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         | SubmissionError::NoveltyDeltaTooLarge { message }
         | SubmissionError::DatatypeLimitExceeded { message }
         | SubmissionError::CommitNotFound { message }
+        | SubmissionError::ConfigUnavailable { message }
         | SubmissionError::CommitContention { message }
         | SubmissionError::IndexNotLoaded { message } => message.capacity(),
         SubmissionError::KeyCollision
@@ -1580,6 +1581,12 @@ mod tests {
             message: "d".into()
         }
         .is_settled());
+        // A config read failure is decided before commit construction too:
+        // settled, so a keyed retry re-executes the submission.
+        assert!(SubmissionError::ConfigUnavailable {
+            message: "c".into()
+        }
+        .is_settled());
         // Refused before staging read anything; retryable like the novelty
         // refusals, so settled for the same reason.
         assert!(SubmissionError::IndexNotLoaded {
@@ -1635,6 +1642,18 @@ mod tests {
         assert!(matches!(
             f(ApiError::Transact(TransactError::EmptyTransaction)),
             SubmissionError::Execution { status: 400, .. }
+        ));
+        // A config read failure keeps its identity through the flattening,
+        // from the staging lanes and from the policy context alike.
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::ConfigUnavailable(
+                "read failed".into()
+            ))),
+            SubmissionError::ConfigUnavailable { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::ConfigUnavailable("read failed".into())),
+            SubmissionError::ConfigUnavailable { .. }
         ));
     }
 
