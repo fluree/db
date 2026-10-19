@@ -277,15 +277,9 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
         }
     }
 
-    let result = writer.finish()?;
-    // A graph whose log nets to no row and no history (only retractions of
-    // facts never asserted) has nothing to index: publish no branch for it, as
+    // A graph whose log nets to no row and no history publishes no branch, as
     // for a graph with no records at all.
-    let graph_results = if result.leaf_infos.is_empty() {
-        Vec::new()
-    } else {
-        vec![result]
-    };
+    let graph_results: Vec<GraphIndexResult> = writer.finish()?.into_iter().collect();
 
     // Reclaim the cascade's final-pass intermediates (a full zstd copy of
     // this order) now that the merge has consumed them, instead of carrying
@@ -480,14 +474,21 @@ impl PersistingLeafWriter {
         Ok(wrote_row)
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<GraphIndexResult> {
+    /// The graph's result, or `None` when the writer produced no leaf. A graph
+    /// with nothing to hold (no records, or only retractions of facts never
+    /// asserted) is left out of the root, so a root never lists an order with
+    /// no leaves.
+    pub(crate) fn finish(mut self) -> io::Result<Option<GraphIndexResult>> {
         // `finish()` flushes the trailing leaf into the completed-leaves buffer;
         // persist that final batch (everything prior was drained per-push).
         let final_batch = self.inner.finish()?;
         for info in final_batch {
             self.persisted.push(persist_leaf(&self.graph_dir, info)?);
         }
-        build_graph_index_result(self.g_id, self.order, self.graph_dir, self.persisted)
+        if self.persisted.is_empty() {
+            return Ok(None);
+        }
+        build_graph_index_result(self.g_id, self.order, self.graph_dir, self.persisted).map(Some)
     }
 }
 
