@@ -1691,6 +1691,47 @@ mod tests {
         assert!(matches!(result, Err(TransactError::EmptyTransaction)));
     }
 
+    /// A view on a base whose index this process has not loaded, built
+    /// without staging as merge, rebase and revert build one, is refused
+    /// before any check reads that index.
+    #[tokio::test]
+    async fn build_commit_refuses_a_base_whose_index_is_not_loaded() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        let ns_registry = NamespaceRegistry::from_db(&snapshot);
+        let base = LedgerState::new(snapshot, Novelty::new(1));
+        let flake = Flake::new(
+            Sid::new(1, "ex:alice"),
+            Sid::new(1, "ex:name"),
+            FlakeValue::String("Alice".to_string()),
+            Sid::new(fluree_vocab::namespaces::XSD, "string"),
+            2,
+            true,
+            None,
+        );
+        let view = StagedLedger::new(base, vec![flake], &HashMap::new()).unwrap();
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
+        match build_commit(
+            view,
+            ns_registry,
+            None,
+            None,
+            &config,
+            CommitOpts::default(),
+        )
+        .await
+        {
+            Err(TransactError::IndexNotLoaded(msg)) => {
+                assert!(msg.contains("index (t=1) is not loaded"), "{msg}");
+            }
+            Err(e) => panic!("expected an index-not-loaded refusal, got: {e}"),
+            Ok(_) => panic!("a commit on an index this process has not loaded was built"),
+        }
+    }
+
     #[tokio::test]
     async fn test_commit_sequence() {
         let storage = MemoryStorage::new();
