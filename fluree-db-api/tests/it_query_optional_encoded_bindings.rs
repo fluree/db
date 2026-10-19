@@ -2020,7 +2020,7 @@ async fn cyclic_union_lane_declines_arena_objects() {
         ["b2", "b1", "t1", big],
         ["b2", "b2", "t1", big],
     ] {
-        union.push(row.iter().map(|s| s.to_string()).collect());
+        union.push(row.iter().map(ToString::to_string).collect());
     }
     union.sort();
     // (label, query, the answer, the site and the outcome it must stamp)
