@@ -745,7 +745,10 @@ This means:
   that commit's time. Set it explicitly with `"reasoningTime":
   "2026-06-01T00:00:00Z"` (JSON-LD) or `# PRAGMA reasoning-time:
   2026-06-01T00:00:00Z` (SPARQL), for example to ask what was overdue on a
-  given day. A snapshot with no commit of its own (an empty ledger, or
+  given day. Time travel by `@iso:` lands on the last commit at or before
+  the instant it names and evaluates at that commit's time, not at the
+  instant; pass the same instant as `reasoningTime` to evaluate at it. A
+  snapshot with no commit of its own (an empty ledger, or
   uncommitted changes) has no time to default to, so a program that calls
   either function fails there unless the query sets one. The time used is
   reported as `evaluation_time` in the tracked response's `reasoning` block,
@@ -756,9 +759,13 @@ This means:
   rule is re-evaluated every pass and can keep deriving new values until the
   budget stops it; Fluree logs a warning naming the rule.
 - **The dependency analysis is conservative.** A variable predicate
-  (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`) or a variable-predicate
-  head counts as reading or writing every predicate, which can merge rules
-  into a larger recursive group. That costs speed, never correctness.
+  (`?s ?p ?o`), a zero-length path (`ex:p*`, `ex:p?`), a negated property
+  set (`!(ex:p)`) or a variable-predicate head counts as reading or writing
+  every predicate, which can merge rules into a larger recursive group. That
+  costs speed, never correctness. A negation or aggregate over such a read is
+  refused, though: it reads every predicate, the rule's own conclusions
+  included, so there is no order in which what it negates or counts is
+  complete.
 - **Termination is guaranteed** by a maximum number of passes per group of
   rules and by the shared reasoning budget — a maximum derived-fact count, a
   maximum memory estimate for the derived facts, and a maximum wall-clock
@@ -801,10 +808,11 @@ When both OWL 2 RL and Datalog are enabled:
   it derives, not the size of everything derived so far. A rule with two such
   patterns (`?x ex:ancestor ?y . ?y ex:ancestor ?z`) runs twice per pass. A
   rule that reads its group's conclusions inside a `UNION`, `EXISTS`,
-  subquery or property path re-runs its whole `WHERE` clause every pass
-  instead: it derives the same facts, more slowly. So does a recursive rule
-  that calls a function whose result changes between calls (`NOW()`,
-  `STRUUID()`, …) or reads a value's transaction metadata (`t`, `op`).
+  `GRAPH` block, subquery or property path re-runs its whole `WHERE` clause
+  every pass instead: it derives the same facts, more slowly. So does a
+  recursive rule that calls a function whose result changes between calls
+  (`RAND()`, `STRUUID()`, …) or reads a value's transaction metadata (`t`,
+  `op`). `NOW()` and `TODAY()` return one time per run, so they don't.
 - **A transitive closure runs as one traversal.** A recursive rule that is
   alone in its group and has the shape of a transitive closure is evaluated
   in a single pass as a property path instead of iterating, and derives the

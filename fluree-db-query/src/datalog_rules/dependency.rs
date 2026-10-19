@@ -600,8 +600,16 @@ impl RuleDependencies {
                     }) else {
                         continue;
                     };
+                    // A read of every predicate is the analysis's limit, not
+                    // something the rule wrote, so say what read it and
+                    // which of its facts close the cycle.
                     let facts = match negated.predicate {
-                        PredicateFootprint::Any => write.describe(&iri),
+                        PredicateFootprint::Any => format!(
+                            "{} (a variable predicate, a `*` or `?` path, a negated property \
+                             set, or another read the analysis cannot narrow), among them {}",
+                            negated.describe(&iri),
+                            write.describe(&iri)
+                        ),
                         _ => negated.describe(&iri),
                     };
                     let mut cycle = vec![name(consumer)];

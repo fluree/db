@@ -321,6 +321,37 @@ async fn negation_through_a_cycle_is_rejected_with_the_cycle() {
     );
 }
 
+/// A negation over a read of every predicate (here a `*` path) observes the
+/// rule's own head, so it is refused. The error says what read every
+/// predicate and which facts close the cycle, rather than naming only the
+/// rule's head as if the rule negated it.
+#[tokio::test]
+async fn negation_over_a_read_of_every_predicate_names_the_read() {
+    let ledger = ledger_with(
+        "datalog/negation-any-read:main",
+        graph(vec![typed("n1", "Node"), edge("n0", "edge", "n1")]),
+    )
+    .await;
+    let rules = sparql_rules(
+        &ledger,
+        &["CONSTRUCT { ?n a ex:Flag } WHERE { ?n a ex:Node \
+           FILTER NOT EXISTS { ex:n0 (ex:edge/ex:link)* ?n } }"
+            .to_string()],
+    );
+    let err = dependencies_run(&ledger, &rules, &ReasoningBudget::unlimited())
+        .await
+        .expect_err("a negation over every predicate observes its own head");
+    let message = err.to_string();
+    assert!(
+        message.contains(
+            "negates facts of any predicate (a variable predicate, a `*` or `?` path, a \
+             negated property set, or another read the analysis cannot narrow), among them \
+             rdf:type http://example.org/Flag facts"
+        ),
+        "{message}"
+    );
+}
+
 /// A variable a negation shares with the rest of the body must be bound by a
 /// positive pattern; here `?y` is mentioned only inside two negations.
 #[tokio::test]
@@ -719,4 +750,101 @@ async fn negation_under_a_ledger_default_rdfs_is_refused() {
             && message.contains("rdfs reasoning is on without owl2rl"),
         "{message}"
     );
+}
+
+/// At the `t` of a commit that retracted the stored copy of a fact the rules
+/// derive again, the derived fact still holds: a negation over it does not
+/// match, and a count includes it. The asserted copy sits in novelty or in a
+/// published index; the retraction is in novelty.
+#[tokio::test]
+async fn a_fact_retracted_at_the_query_t_is_still_negated_and_counted() {
+    use crate::support::{instances_sharing_storage, rebuild_and_publish_index};
+
+    let ctx = json!({"ex": "http://example.org/"});
+    for indexed in [false, true] {
+        let ledger_id = format!("datalog/negation-retracted-at-t-{indexed}:main");
+        let (writer, reader) = instances_sharing_storage();
+        writer
+            .insert(
+                crate::support::genesis_ledger(&writer, &ledger_id),
+                &graph(vec![
+                    typed("a", "Person"),
+                    typed("c", "Person"),
+                    edge("a", "friend", "b"),
+                    edge("a", "knows", "b"),
+                ]),
+            )
+            .await
+            .expect("seed");
+        if indexed {
+            rebuild_and_publish_index(&writer, &ledger_id).await;
+        }
+        let ledger = reader.ledger(&ledger_id).await.expect("reader load");
+        let ledger = reader
+            .update(
+                ledger,
+                &json!({"@context": ctx, "delete": edge("a", "knows", "b")}),
+            )
+            .await
+            .expect("retract")
+            .ledger;
+
+        let rules = json!([
+            {
+                "@context": ctx,
+                "where": {"@id": "?x", "ex:friend": "?y"},
+                "insert": {"@id": "?x", "ex:knows": {"@id": "?y"}}
+            },
+            {
+                "@context": ctx,
+                "where": [
+                    {"@id": "?x", "@type": "ex:Person"},
+                    ["not-exists", {"@id": "?x", "ex:knows": "?y"}]
+                ],
+                "insert": {"@id": "?x", "@type": "ex:Loner"}
+            },
+            {
+                "@context": ctx,
+                "where": [["query", {
+                    "@context": ctx,
+                    "select": ["?x", "(as (count ?y) ?n)"],
+                    "where": {"@id": "?x", "ex:knows": "?y"},
+                    "groupBy": ["?x"]
+                }]],
+                "insert": {"@id": "?x", "ex:knowsCount": "?n"}
+            }
+        ]);
+        let rows = |select: Value, where_: Value| {
+            let query = json!({
+                "@context": ctx,
+                "select": select,
+                "where": where_,
+                "reasoning": "datalog",
+                "rules": rules.clone()
+            });
+            let (reader, ledger) = (&reader, &ledger);
+            async move {
+                let rows = query_jsonld(reader, ledger, &query)
+                    .await
+                    .expect("query")
+                    .to_jsonld(&ledger.snapshot)
+                    .expect("format");
+                sorted(&rows)
+            }
+        };
+        assert_eq!(
+            rows(json!("?x"), json!({"@id": "?x", "@type": "ex:Loner"})).await,
+            vec![json!("ex:c")],
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            rows(
+                json!(["?x", "?n"]),
+                json!({"@id": "?x", "ex:knowsCount": "?n"})
+            )
+            .await,
+            vec![json!(["ex:a", 1])],
+            "indexed: {indexed}"
+        );
+    }
 }
