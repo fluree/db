@@ -696,8 +696,7 @@ impl BinaryIndexStore {
                 None => pending.push((*order, cids, 0, Vec::new())),
             }
         }
-        // Every order's missing runs at once: a store near the run cap
-        // otherwise waits on each read in turn.
+        // Every order's missing runs at once.
         let fetches: Vec<(usize, ContentId)> = pending
             .iter()
             .enumerate()
@@ -712,7 +711,7 @@ impl BinaryIndexStore {
                     let bytes = cs.get(&cid).await.map_err(storage_io_error)?;
                     Ok::<_, io::Error>((i, crate::format::pool_delta::decode_delta_run(&bytes)?.1))
                 })
-                .buffered(32)
+                .buffered(crate::format::pool_delta::RUN_FETCH_WIDTH)
                 .try_collect()
                 .await?
         };

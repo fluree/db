@@ -15,6 +15,10 @@ use std::io;
 use crate::format::run_record::RunSortOrder;
 use crate::read::types::OverlayOp;
 
+/// Delta runs read at once, across every order a reader loads or a build
+/// folds: a store near the run cap otherwise waits on each read in turn.
+pub const RUN_FETCH_WIDTH: usize = 32;
+
 const MAGIC: &[u8; 4] = b"FPD1";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 1 + 4;

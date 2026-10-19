@@ -1042,6 +1042,30 @@ pub async fn incremental_index(
         let base_rows: u64 =
             base_pool.map_or(0, |p| p.members.iter().map(|m| u64::from(m.rows)).sum());
         delta_window = records.iter().chain(&superseded).copied().collect();
+        // A secondary order appends the window as a delta run, unless its runs
+        // have outgrown their bounds or a graph is leaving the pool: then the
+        // runs and the window merge into its base at once. The runs of every
+        // order that merges are read together.
+        let window_events = records.len() + superseded.len();
+        let mut folding = match base_pool {
+            Some(pool) => {
+                let folds: Vec<_> = RunSortOrder::pool_build_orders()
+                    .iter()
+                    .filter(|&&order| {
+                        order != RunSortOrder::Gspo
+                            && compact_delta(
+                                pool.delta(order),
+                                window_events,
+                                base_rows,
+                                !promote.is_empty(),
+                            )
+                    })
+                    .map(|&order| (order, pool.delta(order)))
+                    .collect();
+                delta_run_events(content_store.as_ref(), &folds, &promote).await?
+            }
+            None => Vec::new(),
+        };
         for &order in RunSortOrder::pool_build_orders() {
             let cmp = cmp_v2_for_order(order);
             let (mut sorted, mut sorted_superseded) = (records.clone(), superseded.clone());
@@ -1057,21 +1081,12 @@ pub async fn incremental_index(
                                 "pooled tree has no {order:?} branch"
                             ))
                         })?;
-                    // GSPO merges every window. A secondary order appends the
-                    // window as a delta run, unless its runs have outgrown
-                    // their bounds or a graph is leaving the pool: then the
-                    // runs and the window merge into its base at once.
-                    let runs = pool.delta(order);
-                    let window_events = records.len() + superseded.len();
+                    // GSPO merges every window.
+                    let fold = folding.iter_mut().find(|(o, _)| *o == order);
                     if order == RunSortOrder::Gspo {
                         Phase2TaskKind::NamedExisting { branch_cid }
-                    } else if !compact_delta(runs, window_events, base_rows, !promote.is_empty()) {
-                        // Written once the GSPO merge has resolved the window.
-                        delta_orders.push(order);
-                        continue;
-                    } else {
-                        let mut events =
-                            delta_run_events(content_store.as_ref(), runs, &promote).await?;
+                    } else if let Some((_, runs_events)) = fold {
+                        let mut events = std::mem::take(runs_events);
                         let purge_markers = records.iter().filter(|&&(_, op)| op == OP_PURGE);
                         events.extend(with_replacements(
                             records
@@ -1087,6 +1102,10 @@ pub async fn incremental_index(
                         sorted_superseded = earlier;
                         root_builder.clear_pool_delta(order);
                         Phase2TaskKind::NamedExisting { branch_cid }
+                    } else {
+                        // Written once the GSPO merge has resolved the window.
+                        delta_orders.push(order);
+                        continue;
                     }
                 }
                 (None, Some(facts)) => Phase2TaskKind::Folded {
@@ -4329,9 +4348,14 @@ pub async fn compact_pool_deltas(
     let Some(pool) = base_root.pool.as_ref() else {
         return Ok(None);
     };
+    let deltas: Vec<_> = pool
+        .deltas
+        .iter()
+        .filter(|(_, runs)| !runs.is_empty())
+        .map(|(order, runs)| (*order, runs.as_slice()))
+        .collect();
     let mut tasks = Vec::new();
-    for (order, runs) in pool.deltas.iter().filter(|(_, runs)| !runs.is_empty()) {
-        let order = *order;
+    for (order, events) in delta_run_events(content_store.as_ref(), &deltas, &[]).await? {
         let branch_cid = pool
             .orders
             .iter()
@@ -4340,7 +4364,6 @@ pub async fn compact_pool_deltas(
             .ok_or_else(|| {
                 IndexerError::IncrementalAbort(format!("pooled tree has no {order:?} branch"))
             })?;
-        let events = delta_run_events(content_store.as_ref(), runs, &[]).await?;
         let (mut sorted, mut superseded) = split_lifecycles(events, order);
         let cmp = cmp_v2_for_order(order);
         sorted.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
@@ -4443,31 +4466,45 @@ pub async fn compact_pool_deltas(
     }))
 }
 
-/// A pooled secondary order's delta runs read back as the windows they
+/// Pooled secondary orders' delta runs read back as the windows they
 /// recorded, ready to fold into one merge (see [`with_replacements`]),
-/// without the events of the graphs in `leaving` (sorted).
+/// without the events of the graphs in `leaving` (sorted). Every order's runs
+/// are read at once, and each order's events stay in run order.
 async fn delta_run_events(
     content_store: &dyn ContentStore,
-    runs: &[fluree_db_binary_index::PoolDeltaRun],
+    orders: &[(RunSortOrder, &[fluree_db_binary_index::PoolDeltaRun])],
     leaving: &[fluree_db_core::GraphId],
-) -> Result<Events> {
-    let mut events = Events::new();
-    for run in runs {
-        let bytes = content_store
-            .get(&run.cid)
-            .await
-            .map_err(|e| IndexerError::StorageRead(format!("pool delta run: {e}")))?;
-        let (_, run_events) = fluree_db_binary_index::format::pool_delta::decode_delta_run(&bytes)
-            .map_err(|e| IndexerError::StorageRead(format!("pool delta run: {e}")))?;
-        events.extend(with_replacements(
-            run_events
+) -> Result<Vec<(RunSortOrder, Events)>> {
+    let mut out: Vec<(RunSortOrder, Events)> = orders
+        .iter()
+        .map(|&(order, _)| (order, Events::new()))
+        .collect();
+    let fetches: Vec<(usize, ContentId)> = orders
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (_, runs))| runs.iter().map(move |run| (i, run.cid.clone())))
+        .collect();
+    let mut runs = stream::iter(fetches)
+        .map(|(i, cid)| async move {
+            let bytes = content_store
+                .get(&cid)
+                .await
+                .map_err(|e| IndexerError::StorageRead(format!("pool delta run: {e}")))?;
+            let (_, events) = fluree_db_binary_index::format::pool_delta::decode_delta_run(&bytes)
+                .map_err(|e| IndexerError::StorageRead(format!("pool delta run: {e}")))?;
+            Ok::<_, IndexerError>((i, events))
+        })
+        .buffered(fluree_db_binary_index::format::pool_delta::RUN_FETCH_WIDTH);
+    while let Some((i, events)) = runs.try_next().await? {
+        out[i].1.extend(with_replacements(
+            events
                 .into_iter()
                 .filter(|e| leaving.binary_search(&e.g_id).is_err())
                 .map(delta_record)
                 .collect(),
         ));
     }
-    Ok(events)
+    Ok(out)
 }
 
 // ============================================================================
