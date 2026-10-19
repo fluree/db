@@ -57,6 +57,24 @@ Each mode has exactly one accepted string (case-insensitive):
 | `"datalog"` | Datalog rule execution |
 | `"none"` | Disable all reasoning |
 
+### Inside `opts`
+
+The reasoning keys (`reasoning`, `rules`, `ontology`, `reasoningBudget` and
+`reasoningTime`) can also go inside the query's `opts` object. Each key is
+read from the top level when it is there and from `opts` otherwise, so
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "ex:p": "?o"},
+  "reasoningBudget": {"maxFacts": 20000000},
+  "opts": {"reasoning": "datalog"}
+}
+```
+
+runs datalog under that budget. When both carry the same key, the top
+level's value is used.
+
 ## Default behavior
 
 Reasoning is **opt-in**. When the `reasoning` key is absent from a query, no
