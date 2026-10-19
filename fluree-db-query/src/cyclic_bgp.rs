@@ -602,15 +602,21 @@ impl<O: Copy + Eq + std::hash::Hash + Ord> RelationIdx<O> {
             .unwrap_or(0)
     }
 
-    /// Whether any row is exactly `(s, o)`. The object range is sorted by
-    /// subject, so this is a hash lookup plus a binary search.
-    fn contains_pair(&self, s: u64, o: &O) -> bool {
+    /// How many rows are exactly `(s, o)`: a pair stored twice (two list
+    /// items with the same value) is two rows, and the join takes it twice,
+    /// as the subject and object scans of the other edges do. The object
+    /// range is sorted by subject, so this is a hash lookup plus a binary
+    /// search, and a step per repeat.
+    fn pair_count(&self, s: u64, o: &O) -> usize {
         let Some(&(lo, hi)) = self.by_object.get(o) else {
-            return false;
+            return 0;
         };
-        self.obj_order[lo as usize..hi as usize]
-            .binary_search_by_key(&s, |&i| self.rows[i as usize].0)
-            .is_ok()
+        let range = &self.obj_order[lo as usize..hi as usize];
+        let first = range.partition_point(|&i| self.rows[i as usize].0 < s);
+        range[first..]
+            .iter()
+            .take_while(|&&i| self.rows[i as usize].0 == s)
+            .count()
     }
 
     fn distinct_subjects(&self) -> usize {
@@ -2355,11 +2361,7 @@ impl CyclicBgpOperator {
         let s_pos = self.var_pos(rel.edge.subject);
         let o_pos = self.var_pos(rel.edge.object);
         match (assigned[s_pos], assigned[o_pos]) {
-            (Some(s), Some(o)) => rel
-                .contains_pair(s, &o)
-                .then_some((s, o))
-                .into_iter()
-                .collect(),
+            (Some(s), Some(o)) => vec![(s, o); rel.pair_count(s, &o)],
             (Some(s), None) => rel.subject_rows(s).to_vec(),
             (None, Some(o)) => rel.object_subjects(&o).map(|s| (s, o)).collect(),
             (None, None) => rel.rows.clone(),
@@ -2451,12 +2453,9 @@ impl CyclicBgpOperator {
         let s_pos = self.var_pos(rel.edge.subject);
         let o_pos = self.var_pos(rel.edge.object);
         match (assigned[s_pos], assigned[o_pos]) {
-            (Some(s), Some(o)) => s.ref_s_id().map_or_else(Vec::new, |s_id| {
-                rel.contains_pair(s_id, &o)
-                    .then_some((s_id, o))
-                    .into_iter()
-                    .collect()
-            }),
+            (Some(s), Some(o)) => s
+                .ref_s_id()
+                .map_or_else(Vec::new, |s_id| vec![(s_id, o); rel.pair_count(s_id, &o)]),
             (Some(s), None) => s
                 .ref_s_id()
                 .map(|s_id| rel.subject_rows(s_id).to_vec())
@@ -3401,10 +3400,10 @@ mod tests {
     }
 
     /// Over several graphs an edge's rows are a set: a row two members hold,
-    /// or one member holds twice as list items, is kept once. Every index
-    /// over the set then agrees on that row's multiplicity; over the bag the
-    /// pair test (`contains_pair`) counted it once while the subject and
-    /// object scans counted it twice.
+    /// or one member holds twice as list items, is kept once. Over one graph
+    /// they are a bag, and every index over the relation counts a repeated
+    /// row as often as it is stored: the pair count as the subject and object
+    /// scans do.
     #[test]
     fn set_union_keeps_each_edge_once_across_and_within_members() {
         let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
@@ -3420,12 +3419,16 @@ mod tests {
         let rel = ref_rel(edge, &rows);
         assert_eq!(rel.subject_rows(1).iter().filter(|r| r.1 == 2).count(), 1);
         assert_eq!(rel.object_subjects(&2).filter(|&s| s == 1).count(), 1);
-        assert!(rel.contains_pair(1, &2));
+        assert_eq!(rel.pair_count(1, &2), 1);
 
-        // The bag's indexes disagree on it, which the set removes.
+        // Over the bag every index counts the repeat three times.
         let rel = ref_rel(edge, &bag);
         assert_eq!(rel.subject_rows(1).iter().filter(|r| r.1 == 2).count(), 3);
         assert_eq!(rel.object_subjects(&2).filter(|&s| s == 1).count(), 3);
+        assert_eq!(rel.pair_count(1, &2), 3);
+        assert_eq!(rel.pair_count(1, &3), 1);
+        assert_eq!(rel.pair_count(4, &2), 0);
+        assert_eq!(rel.pair_count(1, &9), 0);
     }
 
     /// Encoded objects are kept once per term: equal identity collapses,
