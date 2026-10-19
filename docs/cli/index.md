@@ -16,7 +16,7 @@ fluree index [LEDGER]
 
 ## Description
 
-Performs incremental indexing when possible — merges only new commits into the existing index. Falls back to a full rebuild if incremental indexing isn't possible (e.g., no prior index exists).
+Performs incremental indexing when possible — merges only new commits into the existing index. Falls back to a full rebuild if incremental indexing isn't possible (e.g., no prior index exists). Then folds the delta that writes to small shared named graphs leave into the index, as the server's [`POST /index`](../indexing-and-search/background-indexing.md#index-maintenance-without-a-long-running-indexer) does.
 
 Run this after transactions to clear the novelty layer and speed up queries. For routine use this is preferred over `reindex`, which always rebuilds from scratch.
 
@@ -35,6 +35,8 @@ fluree index mydb
 ```
 Indexed mydb to t=15 (root: bafyreig...)
 ```
+
+`; pooled delta compacted` follows when the run folded a delta in.
 
 ## When to Use
 

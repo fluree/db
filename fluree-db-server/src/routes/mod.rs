@@ -127,6 +127,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Deletes instance folders nothing references: storage-wide.
         .route("/dropped/sweep", post(ledger::sweep_orphans))
         .route("/reindex", post(ledger::reindex))
+        // Indexes pending commits and compacts the pooled delta, for
+        // deployments without a long-running indexer.
+        .route("/index", post(ledger::index))
         // Reclaims index artifacts no index chain references. Deletes storage
         // and holds the ledger against indexing, so it is admin-gated and
         // runs where the indexer does.

@@ -300,6 +300,40 @@ A sweep is ledger-wide rather than per-branch, because dictionary blobs are shar
 
 `POST /v1/fluree/reindex` rebuilds the index but does not reclaim anything by itself. A reindex now participates in the GC chain like any incremental build, so ordinary retention applies to the roots it supersedes; a sweep is only needed for artifacts orphaned by an earlier version.
 
+## Index Maintenance Without a Long-Running Indexer
+
+Where no server runs continuously, such as a function invoked per request,
+nothing indexes in the background. Call `POST /index` on a schedule instead:
+it indexes the ledger's pending commits, then folds the delta that writes to
+small shared named graphs leave (see
+[Named graph placement](../ledger-config/setting-groups.md)) into the index.
+With nothing to do it costs a nameservice lookup and one index root read.
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/index \
+  -H "Content-Type: application/json" -d '{"ledger":"mydb:main"}'
+```
+
+```json
+{"ledger_id": "mydb:main", "index_t": 42, "root_id": "bagh...", "built": true, "compacted": true}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger` | Ledger alias |
+| `compact` | Fold the delta in once the index is current. Default `true` |
+| `timeout-ms` | Wait at most this long for the build |
+
+`built` and `compacted` report what the call did. A compaction keeps the
+index `t` and the data the same; only the layout changes. It is skipped while
+an index build is queued or running, and the next call sees it.
+
+A long-running server does the same for an idle ledger on its indexer's
+periodic tick (`catchup_interval`, default 300 s): once a ledger's commits and
+index have not changed since the previous tick, its delta is folded in, so an
+idle ledger does not keep it until its next write. `fluree index` runs the
+same maintenance locally. Admin-protected, like `/reindex`.
+
 ## Troubleshooting
 
 ### High indexing lag

@@ -3,7 +3,7 @@ use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::wire::ReindexResponse;
-use fluree_db_api::{Fluree, ReindexOptions};
+use fluree_db_api::{Fluree, MaintainIndexOptions, ReindexOptions};
 
 /// What an index build produced.
 pub struct IndexOutcome {
@@ -11,11 +11,11 @@ pub struct IndexOutcome {
     pub root_id: String,
 }
 
-/// Run incremental indexing for a ledger.
+/// Run incremental indexing for a ledger, then fold its pooled delta into
+/// its base.
 ///
-/// Uses `build_index_for_ledger` which tries incremental indexing first
-/// (merges only new commits into the existing index), falling back to
-/// a full rebuild when incremental isn't possible.
+/// Indexes only new commits when it can, falling back to a full rebuild
+/// when incremental isn't possible.
 pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(ledger, dirs)?;
     let fluree = build_fluree(dirs).await?;
@@ -27,10 +27,21 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
     }
 
     eprintln!("  {} indexing {}...", "index:".cyan().bold(), alias);
-    let result = index_ledger(&fluree, &ledger_id).await?;
+    let result = fluree
+        .maintain_index(&ledger_id, MaintainIndexOptions::default())
+        .await
+        .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
+    let root = result
+        .root_id
+        .map_or_else(|| "none".to_string(), |id| id.to_string());
+    let compacted = if result.compacted {
+        "; pooled delta compacted"
+    } else {
+        ""
+    };
     println!(
-        "Indexed {} to t={} (root: {})",
-        alias, result.index_t, result.root_id
+        "Indexed {} to t={} (root: {root}){compacted}",
+        alias, result.index_t
     );
     Ok(())
 }

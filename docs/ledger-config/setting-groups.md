@@ -389,6 +389,12 @@ which keeps the index compact and makes queries across many graphs fast. A
 graph that grows large, or builds up a long history of changes, moves to
 trees of its own.
 
+Writes to shared graphs keep one of those trees current at every build; the
+others take the build's changes as a small delta and fold it in periodically,
+which keeps a build's writes small. A server folds an idle ledger's delta on
+its periodic indexer tick, and `POST /index` or `fluree index` does it on
+demand (see [Background Indexing](../indexing-and-search/background-indexing.md#index-maintenance-without-a-long-running-indexer)).
+
 On `f:LedgerConfig`, `f:graphPlacement` is the default for every user named
 graph; an `f:GraphConfig` override sets it for one graph. The default graph
 and the system graphs always have trees of their own, and overrides naming
