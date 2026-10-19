@@ -16,8 +16,14 @@ use super::helpers::{binding_is_temporal, check_arity, parse_datetime_from_bindi
 use super::value::ComparableValue;
 use crate::parse::UnresolvedDatatypeConstraint;
 
-pub fn eval_now(args: &[Expression]) -> Result<Option<ComparableValue>> {
+pub fn eval_now(
+    args: &[Expression],
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
     check_arity(args, 0, "NOW")?;
+    if let Some(pinned) = ctx.and_then(|c| c.evaluation_time.clone()) {
+        return Ok(Some(ComparableValue::DateTime(pinned)));
+    }
     let now = Utc::now();
     let formatted = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let parsed = FlureeDateTime::parse(&formatted)
@@ -26,11 +32,16 @@ pub fn eval_now(args: &[Expression]) -> Result<Option<ComparableValue>> {
 }
 
 /// Current UTC calendar date — Cypher's zero-arg `date()`.
-pub fn eval_today(args: &[Expression]) -> Result<Option<ComparableValue>> {
+pub fn eval_today(
+    args: &[Expression],
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
     check_arity(args, 0, "date")?;
-    Ok(Some(ComparableValue::Date(
-        fluree_db_core::temporal::Date::today_utc(),
-    )))
+    let today = match ctx.and_then(|c| c.evaluation_time.as_ref()) {
+        Some(pinned) => fluree_db_core::temporal::Date::from_naive(pinned.instant().date_naive()),
+        None => fluree_db_core::temporal::Date::today_utc(),
+    };
+    Ok(Some(ComparableValue::Date(today)))
 }
 
 pub fn eval_year<R: RowAccess>(

@@ -102,6 +102,12 @@ pub struct ReasoningModes {
     /// binds first on ordinary data and this one only catches facts that are
     /// abnormally large.
     pub max_memory_mb: Option<u64>,
+
+    /// The time `NOW()` and `TODAY()` return in datalog rule bodies. `None`
+    /// uses the commit time of the queried snapshot. Query key
+    /// `"reasoningTime"` / SPARQL `# PRAGMA reasoning-time:`, an ISO 8601
+    /// datetime.
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
 }
 
 impl ReasoningModes {
@@ -290,7 +296,25 @@ impl ReasoningModes {
             modes.max_memory_mb = max_memory_mb;
         }
 
+        // Like the budget, the evaluation time enables no mode by itself.
+        if let Some(time) = query.get("reasoningTime") {
+            modes.evaluation_time = Self::parse_evaluation_time(time)?;
+        }
+
         Ok(modes)
+    }
+
+    /// Parse a `"reasoningTime"` value: an ISO 8601 datetime string.
+    pub fn parse_evaluation_time(
+        value: &serde_json::Value,
+    ) -> Result<Option<fluree_db_core::temporal::DateTime>, String> {
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) => fluree_db_core::temporal::DateTime::parse(s)
+                .map(Some)
+                .map_err(|e| format!("reasoningTime must be an ISO 8601 datetime: {e}")),
+            _ => Err("reasoningTime must be an ISO 8601 datetime string".to_string()),
+        }
     }
 
     /// Parse a `"reasoningBudget"` JSON object.
