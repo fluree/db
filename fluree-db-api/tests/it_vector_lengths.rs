@@ -725,9 +725,15 @@ async fn push_keeps_one_length() {
     );
     let too_long_push = "vector-lengths/push-long:main";
     create(&fluree, too_long_push).await;
-    refused(
+    // The length is known (3) when the long vector arrives; it is still too
+    // long, not of the wrong length.
+    let msg = refused(
         push(&fluree, too_long_push, &[&first, &too_long]).await,
         "65,536 elements by push",
+    );
+    assert_eq!(
+        msg,
+        "<http://example.org/embedding>: vector dims 65536 exceeds the maximum of 65535"
     );
 
     let later = "vector-lengths/push-later:main";

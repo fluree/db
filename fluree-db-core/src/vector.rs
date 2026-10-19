@@ -38,12 +38,13 @@ where
     if len == 0 {
         return Err(VectorError::Empty);
     }
+    // Too long before mismatched: no stored length could admit it.
+    let stored = u16::try_from(len).map_err(|_| VectorError::TooLong { len })?;
     let dims = match dims {
-        Some(expected) if usize::from(expected) != len => {
+        Some(expected) if expected != stored => {
             return Err(VectorError::LengthMismatch { expected, len });
         }
-        Some(expected) => expected,
-        None => u16::try_from(len).map_err(|_| VectorError::TooLong { len })?,
+        _ => stored,
     };
     for (index, value) in elements.enumerate() {
         if !value.is_finite() {
@@ -83,12 +84,15 @@ mod tests {
         assert_eq!(check_vector_f64(None, &longest), Ok(u16::MAX));
         assert_eq!(check_vector_f64(Some(u16::MAX), &longest), Ok(u16::MAX));
         let too_long = vec![0.5; MAX_VECTOR_DIMS + 1];
-        assert_eq!(
-            check_vector_f64(None, &too_long),
-            Err(VectorError::TooLong {
-                len: MAX_VECTOR_DIMS + 1
-            })
-        );
+        for dims in [None, Some(3), Some(u16::MAX)] {
+            assert_eq!(
+                check_vector_f64(dims, &too_long),
+                Err(VectorError::TooLong {
+                    len: MAX_VECTOR_DIMS + 1
+                }),
+                "{dims:?}"
+            );
+        }
     }
 
     #[test]
