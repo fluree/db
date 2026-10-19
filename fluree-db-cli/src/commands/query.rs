@@ -496,6 +496,9 @@ pub async fn run(
     // routes to the connection-scoped path. A plain same-endpoint query is left
     // on the single-target path below.
     let endpoint_id = target_endpoint_id(&target);
+    // The endpoint ledger's head, when routing loaded it: the local path then
+    // reads it instead of loading the ledger again.
+    let mut endpoint_head = None;
     let route = if force_connection {
         Route::Connection(None)
     } else {
@@ -529,8 +532,11 @@ pub async fn run(
                 (EndpointPath::LedgerRoute, EndpointGraphs::Unknown)
             }
         };
-        graphs
-            .with_lookup(|graphs| route_query(query_format, &content, &endpoint_id, path, graphs))?
+        let route = graphs.with_lookup(|graphs| {
+            route_query(query_format, &content, &endpoint_id, path, graphs)
+        })?;
+        endpoint_head = graphs.into_head();
+        route
     };
     if let Route::Connection(rewritten) = route {
         let content = rewritten.unwrap_or(content);
@@ -973,6 +979,7 @@ pub async fn run(
                 return run_local_ndjson_stream(
                     &fluree,
                     &alias,
+                    endpoint_head,
                     &content,
                     query_format,
                     at,
@@ -988,12 +995,21 @@ pub async fn run(
             // that previously occurred before the lazy graph query loaded its own view.
             let load_started = Instant::now();
             tracing::debug!(target: "fluree::open", ledger = %alias, "CLI database view load starting");
-            let view = match at {
-                Some(at_str) => {
+            // The head routing loaded, if it loaded one, is the view's head.
+            let view = match (at, &endpoint_head) {
+                (Some(at_str), head) => {
                     let spec = parse_time_spec(at_str)?;
-                    fluree.db_at_with_default_context(&alias, spec).await?
+                    match head {
+                        Some(head) => {
+                            fluree
+                                .db_at_with_default_context_from_handle(head, spec)
+                                .await?
+                        }
+                        None => fluree.db_at_with_default_context(&alias, spec).await?,
+                    }
                 }
-                None => fluree.db_with_default_context(&alias).await?,
+                (None, Some(head)) => fluree.db_with_default_context_from_handle(head).await?,
+                (None, None) => fluree.db_with_default_context(&alias).await?,
             };
             tracing::debug!(
                 target: "fluree::open",
@@ -1321,6 +1337,7 @@ fn inject_remote_time_travel_jsonld(
 async fn run_local_ndjson_stream(
     fluree: &fluree_db_api::Fluree,
     alias: &str,
+    head: Option<fluree_db_api::LedgerHandle>,
     content: &str,
     query_format: detect::QueryFormat,
     at: Option<&str>,
@@ -1358,7 +1375,11 @@ async fn run_local_ndjson_stream(
         // Owned ledger state for the producer; a planning view carrying the
         // ledger's default context so PREFIX/@context-less queries still resolve
         // prefixes (parity with the buffered local path's db_with_default_context).
-        let ledger_state = fluree.ledger(alias).await?;
+        let ledger_state = match head {
+            // The head routing already loaded.
+            Some(head) => head.snapshot().await.to_ledger_state(),
+            None => fluree.ledger(alias).await?,
+        };
         let planning_view = GraphDb::from_ledger_state(&ledger_state)
             .with_default_context(fluree.get_default_context(alias).await?);
         let plan = fluree.plan_stream_query(&planning_view, &input).await?;
@@ -1759,9 +1780,11 @@ fn print_footer(total_rows: usize, limit: Option<usize>, elapsed: std::time::Dur
 
 /// The endpoint ledger's graph registry, as the router can read it.
 enum EndpointGraphs {
-    /// A ledger the local store holds: its cached head's graph names, where
-    /// each reference is one lookup (nothing is copied).
-    Ledger(fluree_db_api::GraphNames),
+    /// A ledger the local store holds: its loaded head, and that head's graph
+    /// names, where each reference is one lookup (nothing is copied). A query
+    /// that stays on the endpoint reads this head, so choosing the route costs
+    /// no second load ([`EndpointGraphs::into_head`]).
+    Ledger(fluree_db_api::LedgerHandle, fluree_db_api::GraphNames),
     /// An endpoint with no named graphs (a graph source).
     Empty,
     /// Nothing to read here: a remote ledger, a query that names no dataset,
@@ -1772,15 +1795,25 @@ enum EndpointGraphs {
 impl EndpointGraphs {
     async fn of_local(fluree: &fluree_db_api::Fluree, alias: &str) -> Self {
         match fluree.ledger_cached(alias).await {
-            // Only the graph names: the query's own load reads the rest.
-            Ok(handle) => Self::Ledger(handle.graph_names().await),
+            Ok(handle) => {
+                let names = handle.graph_names().await;
+                Self::Ledger(handle, names)
+            }
             Err(_) => Self::Unknown,
+        }
+    }
+
+    /// The head the router loaded, for the endpoint's own path to read.
+    fn into_head(self) -> Option<fluree_db_api::LedgerHandle> {
+        match self {
+            Self::Ledger(handle, _) => Some(handle),
+            Self::Empty | Self::Unknown => None,
         }
     }
 
     fn with_lookup<R>(&self, f: impl FnOnce(Option<fluree_db_api::GraphLookup<'_>>) -> R) -> R {
         match self {
-            Self::Ledger(names) => f(Some(&|iri: &str| names.graph_id_for_iri(iri))),
+            Self::Ledger(_, names) => f(Some(&|iri: &str| names.graph_id_for_iri(iri))),
             Self::Empty => f(Some(&|_: &str| None)),
             Self::Unknown => f(None),
         }

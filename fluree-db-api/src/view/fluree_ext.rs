@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::view::{GraphDb, ReasoningModePrecedence};
 use crate::{
-    config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, LedgerView, Result,
-    TimeSpec,
+    config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, LedgerHandle, LedgerView,
+    Result, TimeSpec,
 };
 use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::ids::GraphId;
@@ -204,6 +204,19 @@ impl Fluree {
         span: &tracing::Span,
     ) -> Result<GraphDb> {
         let handle = self.ledger_cached(ledger_id).await?;
+        self.graph_db_of_head(&handle, include_default_context, span)
+            .await
+    }
+
+    /// A view of `handle`'s head: the loaded state, with its binary index
+    /// store attached when the load did not attach it (a `Fluree` with no
+    /// ledger cache), and the ledger's default context when asked for.
+    async fn graph_db_of_head(
+        &self,
+        handle: &LedgerHandle,
+        include_default_context: bool,
+        span: &tracing::Span,
+    ) -> Result<GraphDb> {
         let mut snapshot = handle.snapshot().await;
 
         // If no binary store attached but nameservice has an index address,
@@ -558,6 +571,79 @@ impl Fluree {
             .await?;
         let view = Self::select_graph(view, address.graph())?;
         self.resolve_and_attach_config(view).await
+    }
+
+    /// [`db_with_default_context`](Self::db_with_default_context) for the
+    /// ledger a handle from [`ledger_cached`](Self::ledger_cached) holds: the
+    /// view is built from that head, which is not loaded a second time. A
+    /// caller that reads the head before it decides how to query (the CLI
+    /// routes a query on its graph names) loads the ledger once, also on a
+    /// `Fluree` with no ledger cache, where every `ledger_cached` is a load.
+    pub async fn db_with_default_context_from_handle(
+        &self,
+        handle: &LedgerHandle,
+    ) -> Result<GraphDb> {
+        let span = tracing::debug_span!(
+            "ledger_view_load",
+            ledger_id = handle.id().as_str(),
+            cold_binary_store = tracing::field::Empty,
+        );
+        let view = async {
+            let span = tracing::Span::current();
+            self.graph_db_of_head(handle, true, &span).await
+        }
+        .instrument(span)
+        .await?;
+        self.resolve_and_attach_config(view).await
+    }
+
+    /// [`db_at_with_default_context`](Self::db_at_with_default_context) for
+    /// the ledger `handle` holds: the time resolves against that head, and a
+    /// time at the head reads it, without loading the ledger again (see
+    /// [`db_with_default_context_from_handle`](Self::db_with_default_context_from_handle)).
+    /// An earlier time loads that snapshot, as `db_at` does.
+    pub async fn db_at_with_default_context_from_handle(
+        &self,
+        handle: &LedgerHandle,
+        spec: TimeSpec,
+    ) -> Result<GraphDb> {
+        let ledger_id = handle.id().as_str();
+        let view = match spec {
+            TimeSpec::Latest => {
+                let span = tracing::debug_span!(
+                    "ledger_view_load",
+                    ledger_id = ledger_id,
+                    cold_binary_store = tracing::field::Empty,
+                );
+                async {
+                    let span = tracing::Span::current();
+                    self.graph_db_of_head(handle, false, &span).await
+                }
+                .instrument(span)
+                .await?
+            }
+            spec => {
+                let t = match spec {
+                    TimeSpec::AtT(t) => t,
+                    spec => {
+                        let head = handle.snapshot().await.to_ledger_state();
+                        time_resolve::resolve_time_spec(&head, &spec).await?
+                    }
+                };
+                let snapshot = handle.snapshot().await;
+                if t == snapshot.t {
+                    graph_db_from_cached_head(snapshot)
+                } else {
+                    self.load_graph_db_historical(ledger_id, t).await?
+                }
+            }
+        };
+        let view = self.resolve_and_attach_config(view).await?;
+        Ok(if view.default_context.is_none() {
+            view.with_default_context(self.get_default_context(ledger_id).await?)
+        } else {
+            view
+        })
     }
 
     /// Like [`db_at()`](Self::db_at) but includes the ledger's default context.
