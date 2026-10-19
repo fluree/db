@@ -444,25 +444,33 @@ pub async fn build_transact_policy_context(
         .and_then(|r| r.policy.as_ref())
         .and_then(|p| p.policy_source.as_ref());
 
-    // Cross-ledger ontology (f:schemaSource with f:ledger): resolve once so
-    // f:onClass / f:onProperty expansion sees the model ledger's hierarchy.
-    let cross_ledger_schema = match resolved
-        .as_ref()
-        .and_then(|r| r.reasoning.as_ref())
-        .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
-    {
-        Some(reasoning) => {
-            let ledger_id = snapshot.ledger_id.clone();
-            let mut schema_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
-            crate::cross_ledger::resolve_schema_closure_bundle(reasoning, snapshot, &mut schema_ctx)
+    // Cross-ledger ontology (f:schemaSource with f:ledger), so f:onClass /
+    // f:onProperty expansion sees the model ledger's hierarchy. Resolved only
+    // where a policy context is built from it: a write that runs without
+    // policy never depends on the model ledger being there.
+    let cross_ledger_schema = || async {
+        match resolved
+            .as_ref()
+            .and_then(|r| r.reasoning.as_ref())
+            .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
+        {
+            Some(reasoning) => {
+                let ledger_id = snapshot.ledger_id.clone();
+                let mut schema_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
+                crate::cross_ledger::resolve_schema_closure_bundle(
+                    reasoning,
+                    snapshot,
+                    &mut schema_ctx,
+                )
                 .await
                 .map_err(|e| {
                     crate::error::ApiError::config(format!(
                         "cross-ledger f:schemaSource resolution failed: {e}"
                     ))
-                })?
+                })
+            }
+            None => Ok(None),
         }
-        None => None,
     };
 
     if let Some(source) = source.filter(|s| s.ledger.is_some()) {
@@ -493,7 +501,7 @@ pub async fn build_transact_policy_context(
             // in D's default graph — the probe searches [0] only.
             &[0],
             restrictions,
-            cross_ledger_schema.clone(),
+            cross_ledger_schema().await?,
         )
         .await?;
         return Ok(Some(policy_ctx));
@@ -517,7 +525,7 @@ pub async fn build_transact_policy_context(
         to_t,
         &effective_opts,
         &policy_graphs,
-        cross_ledger_schema,
+        cross_ledger_schema().await?,
     )
     .await?;
     Ok(Some(policy_ctx))
@@ -578,8 +586,8 @@ pub(crate) async fn resolve_ledger_config_cached(
     resolve_ledger_config_raw(snapshot, overlay, to_t).await
 }
 
-/// Uncached resolve, `Arc`-wrapping the result and mapping the error into the
-/// config-failure shape `build_transact_policy_context` reports.
+/// Uncached resolve, `Arc`-wrapping the result. A failure to read the config
+/// is [`ApiError::ConfigUnavailable`](crate::error::ApiError::ConfigUnavailable).
 async fn resolve_ledger_config_raw(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
@@ -587,9 +595,7 @@ async fn resolve_ledger_config_raw(
 ) -> Result<Option<Arc<LedgerConfig>>> {
     match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
         Ok(opt) => Ok(opt.map(Arc::new)),
-        Err(e) => Err(crate::error::ApiError::config(format!(
-            "Failed to load ledger config while resolving transaction policy: {e}"
-        ))),
+        Err(e) => Err(crate::error::ApiError::ConfigUnavailable(e.to_string())),
     }
 }
 
@@ -646,11 +652,7 @@ pub(crate) async fn resolve_policy_graphs_from_config(
     {
         Ok(Some(c)) => c,
         Ok(None) => return Ok(vec![0]),
-        Err(e) => {
-            return Err(crate::error::ApiError::config(format!(
-                "Failed to load ledger config while resolving f:policySource: {e}"
-            )));
-        }
+        Err(e) => return Err(crate::error::ApiError::ConfigUnavailable(e.to_string())),
     };
     let resolved = crate::config_resolver::resolve_effective_config(&config, None);
     let source = resolved
