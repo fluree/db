@@ -1013,6 +1013,7 @@ impl IndexRoot {
             has_annotations: self.has_annotations,
             needs_link_reindex: self.has_annotations && self.term_dict.is_none(),
             has_list_meta: self.has_list_meta,
+            prev_index: self.prev_index.as_ref().map(|prev| prev.id.clone()),
         })
     }
 
@@ -1887,6 +1888,10 @@ mod tests {
             t: 4,
             ..Default::default()
         });
+        root.prev_index = Some(BinaryPrevIndexRef {
+            t: 7,
+            id: ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"replaced root"),
+        });
         let bytes = root.encode();
 
         let view = |s: &LedgerSnapshot| {
@@ -1916,6 +1921,11 @@ mod tests {
             LedgerSnapshot::new_meta(decoded.take_snapshot_metadata().unwrap()).unwrap();
         assert_eq!(view(&from_root), view(&from_bytes));
         assert!(from_root.stats.is_some() && from_root.schema.is_some());
+        let replaced = root.prev_index.map(|prev| prev.id);
+        assert_eq!(
+            (&from_root.prev_index, &from_bytes.prev_index),
+            (&replaced, &replaced)
+        );
         assert!(
             decoded.stats.is_none() && decoded.schema.is_none(),
             "stats and schema move into the snapshot rather than being copied"

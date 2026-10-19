@@ -34,7 +34,7 @@ use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
-use fluree_db_ledger::{DecodedIndexRoot, LedgerState, TypeErasedStore};
+use fluree_db_ledger::{DecodedIndexRoot, InstalledIndex, LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
@@ -630,17 +630,10 @@ impl LedgerHandle {
 
     /// Get state metrics for update planning
     ///
-    /// Returns (t, index_t, index_head_id) needed for UpdatePlan::plan()
-    pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
+    /// Returns the `t` and installed index needed for UpdatePlan::plan()
+    pub async fn state_metrics(&self) -> (i64, InstalledIndex) {
         let state = self.inner.state.read().await;
-        (
-            state.t(),
-            state.index_t(),
-            state
-                .ns_record
-                .as_ref()
-                .and_then(|r| r.index_head_id.clone()),
-        )
+        (state.t(), state.installed_index())
     }
 
     /// The bits of the instance the cached state belongs to; see
@@ -657,13 +650,15 @@ impl LedgerHandle {
     }
 
     /// Check if cached state is fresh vs remote watermark: stale when the
-    /// remote index is newer, or another root at the same `t`.
+    /// remote index replaces the installed one (see
+    /// [`InstalledIndex::is_replaced_by`]).
     pub async fn check_freshness(&self, remote: &RemoteWatermark) -> FreshnessCheck {
-        let (_, local_index_t, local_index_id) = self.state_metrics().await;
-        let replaced = remote.index_t == local_index_t
-            && remote.index_head_id.is_some()
-            && remote.index_head_id != local_index_id;
-        if remote.index_t > local_index_t || replaced {
+        let (_, local) = self.state_metrics().await;
+        let stale = match &remote.index_head_id {
+            Some(id) => local.is_replaced_by(remote.index_t, id),
+            None => remote.index_t > local.t,
+        };
+        if stale {
             FreshnessCheck::Stale
         } else {
             FreshnessCheck::Current
@@ -689,7 +684,7 @@ impl LedgerHandle {
         index_id: &ContentId,
         cs: Arc<dyn ContentStore>,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let span = tracing::debug_span!(
             "index_install",
@@ -706,7 +701,7 @@ impl LedgerHandle {
         index_id: &ContentId,
         cs: Arc<dyn ContentStore>,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
@@ -771,9 +766,13 @@ impl LedgerHandle {
             // apply_loaded_db: validates, trims novelty, retires the
             // dictionary entries the indexed commits introduced.
             let phase = Instant::now();
-            state
+            let installed = state
                 .apply_loaded_db(db, Some(index_id))
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
+            if !installed {
+                // Already installed, or the root the installed one replaced.
+                return Ok(false);
+            }
             let apply_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
 
@@ -830,13 +829,11 @@ impl LedgerHandle {
                 install_us = install_started.elapsed().as_micros() as u64,
                 "index install"
             );
-            Ok::<(), ApiError>(())
+            Ok::<bool, ApiError>(true)
         };
         install
             .instrument(tracing::debug_span!("index_install_lock"))
-            .await?;
-
-        Ok(())
+            .await
     }
 }
 
@@ -2252,27 +2249,15 @@ impl UpdatePlan {
     ///
     /// # Arguments
     /// * `local_t` - Local ledger's current t (max of index + novelty)
-    /// * `local_index_t` - Local ledger's indexed t (db.t)
-    /// * `local_index_id` - Local ledger's current index CID (if any)
+    /// * `local_index` - Local ledger's installed index
     /// * `ns` - Fresh nameservice record
-    pub fn plan(
-        local_t: i64,
-        local_index_t: i64,
-        local_index_id: Option<&ContentId>,
-        ns: &NsRecord,
-    ) -> Self {
-        // An index the record names that the cached state has not installed.
-        // Valid whenever the record's index is newer than the local one, or
-        // another root at the same `t` (a compaction or reindex replaced it):
-        // the index covers a prefix of commits, so it applies equally to a
-        // local state at, ahead of, or behind the record's commit head.
-        let index_advance = match (&ns.index_head_id, local_index_id) {
-            (Some(ns_idx), Some(local_idx))
-                if ns_idx != local_idx && ns.index_t >= local_index_t =>
-            {
-                Some((ns_idx.clone(), ns.index_t))
-            }
-            (Some(ns_idx), None) if ns.index_t > local_index_t => {
+    pub fn plan(local_t: i64, local_index: &InstalledIndex, ns: &NsRecord) -> Self {
+        // An index the record names that replaces the installed one (see
+        // `InstalledIndex::is_replaced_by`). The index covers a prefix of
+        // commits, so it applies equally to a local state at, ahead of, or
+        // behind the record's commit head.
+        let index_advance = match &ns.index_head_id {
+            Some(ns_idx) if local_index.is_replaced_by(ns.index_t, ns_idx) => {
                 Some((ns_idx.clone(), ns.index_t))
             }
             _ => None,
@@ -2456,15 +2441,15 @@ impl LedgerManager {
         }
 
         // Get local state metrics for planning
-        let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;
+        let (local_t, local_index) = handle.state_metrics().await;
 
         // Plan the update action
-        let plan = UpdatePlan::plan(local_t, local_index_t, local_index_id.as_ref(), &ns_record);
+        let plan = UpdatePlan::plan(local_t, &local_index, &ns_record);
 
         tracing::debug!(
             alias = %input.ledger_id,
             local_t = local_t,
-            local_index_t = local_index_t,
+            local_index_t = local_index.t,
             ns_commit_t = ns_record.commit_t,
             ns_index_t = ns_record.index_t,
             ?plan,
@@ -2498,10 +2483,14 @@ impl LedgerManager {
                     "notify: applying index update (incremental)"
                 );
                 let cs = cs_for_record().await?;
-                handle
+                let installed = handle
                     .apply_index_v2(&index_head_id, cs, self.config.leaflet_cache.clone())
                     .await?;
-                Ok(NotifyResult::IndexUpdated)
+                Ok(if installed {
+                    NotifyResult::IndexUpdated
+                } else {
+                    NotifyResult::Current
+                })
             }
 
             UpdatePlan::CommitCatchUp {
@@ -2668,7 +2657,7 @@ impl LedgerManager {
                 _ => return None,
             }
         };
-        let (t, _, _) = handle.state_metrics().await;
+        let (t, _) = handle.state_metrics().await;
         Some(t)
     }
 }
@@ -2879,6 +2868,14 @@ mod tests {
         ContentId::new(ContentKind::Commit, label.as_bytes())
     }
 
+    fn installed(t: i64, id: Option<&ContentId>) -> InstalledIndex {
+        InstalledIndex {
+            t,
+            id: id.cloned(),
+            replaced: None,
+        }
+    }
+
     fn make_index_cid(label: &str) -> ContentId {
         use fluree_db_core::ContentKind;
         ContentId::new(ContentKind::IndexRoot, label.as_bytes())
@@ -2914,7 +2911,7 @@ mod tests {
         // Local t == ns.commit_t, index unchanged -> Noop
         let idx_cid = make_index_cid("index:8");
         let ns = make_ns_record(10, 8, Some(make_cid("commit:10")), Some(idx_cid.clone()));
-        let plan = UpdatePlan::plan(10, 8, Some(&idx_cid), &ns);
+        let plan = UpdatePlan::plan(10, &installed(8, Some(&idx_cid)), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -2922,7 +2919,7 @@ mod tests {
     fn test_update_plan_noop_when_commit_t_matches_no_index() {
         // Local t == ns.commit_t, no index on either side -> Noop
         let ns = make_ns_record(5, 0, Some(make_cid("commit:5")), None);
-        let plan = UpdatePlan::plan(5, 0, None, &ns);
+        let plan = UpdatePlan::plan(5, &installed(0, None), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -2933,7 +2930,7 @@ mod tests {
         let idx_cid = make_index_cid("index:5");
         let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(idx_cid.clone()));
         // Local: index_t=5, but t()=10 due to novelty
-        let plan = UpdatePlan::plan(10, 5, Some(&idx_cid), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&idx_cid)), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -2948,7 +2945,7 @@ mod tests {
         );
         let local_idx = make_index_cid("index:5");
         // Local: t()=10, index_t=5
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
     }
 
@@ -2959,7 +2956,7 @@ mod tests {
         let ns_idx = make_index_cid("index:5-compacted");
         let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(ns_idx.clone()));
         assert_eq!(
-            UpdatePlan::plan(10, 5, Some(&local_idx), &ns),
+            UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns),
             UpdatePlan::IndexOnly {
                 index_head_id: ns_idx.clone(),
                 index_t: 5
@@ -2968,7 +2965,7 @@ mod tests {
         // Commits behind as well: caught up, and the root installed after.
         let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(ns_idx.clone()));
         assert!(matches!(
-            UpdatePlan::plan(10, 5, Some(&local_idx), &ns),
+            UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns),
             UpdatePlan::CommitCatchUp {
                 gap: 1,
                 index_update: Some((ref id, 5)),
@@ -2978,9 +2975,25 @@ mod tests {
         // The installed root is current.
         let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(local_idx.clone()));
         assert_eq!(
-            UpdatePlan::plan(10, 5, Some(&local_idx), &ns),
+            UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns),
             UpdatePlan::Noop
         );
+        // Nor is the root the installed one replaced, which a record read
+        // before the replacement still names.
+        let compacted = InstalledIndex {
+            t: 5,
+            id: Some(ns_idx.clone()),
+            replaced: Some(local_idx.clone()),
+        };
+        assert_eq!(UpdatePlan::plan(10, &compacted, &ns), UpdatePlan::Noop);
+        let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(local_idx));
+        assert!(matches!(
+            UpdatePlan::plan(10, &compacted, &ns),
+            UpdatePlan::CommitCatchUp {
+                index_update: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2993,7 +3006,7 @@ mod tests {
             Some(make_index_cid("index:10")),
         );
         // Local: t()=10, no index
-        let plan = UpdatePlan::plan(10, 0, None, &ns);
+        let plan = UpdatePlan::plan(10, &installed(0, None), &ns);
         assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
     }
 
@@ -3002,7 +3015,7 @@ mod tests {
         // ns.commit_t == local.t() + 1 -> CommitCatchUp with gap=1
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert!(matches!(
             plan,
             UpdatePlan::CommitCatchUp {
@@ -3021,7 +3034,7 @@ mod tests {
         let local_idx = make_index_cid("index:2");
         let ns_idx = make_index_cid("index:61");
         let ns = make_ns_record(66, 61, Some(make_cid("commit:66")), Some(ns_idx.clone()));
-        let plan = UpdatePlan::plan(67, 2, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(67, &installed(2, Some(&local_idx)), &ns);
         assert_eq!(
             plan,
             UpdatePlan::IndexOnly {
@@ -3033,7 +3046,7 @@ mod tests {
         // Same lag with no index advance stays a no-op.
         let ns = make_ns_record(66, 2, Some(make_cid("commit:66")), Some(local_idx.clone()));
         assert_eq!(
-            UpdatePlan::plan(67, 2, Some(&local_idx), &ns),
+            UpdatePlan::plan(67, &installed(2, Some(&local_idx)), &ns),
             UpdatePlan::Noop
         );
     }
@@ -3048,7 +3061,7 @@ mod tests {
             Some(make_cid("commit:20")),
             Some(make_index_cid("index:15")),
         );
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert_eq!(plan, UpdatePlan::Reload);
     }
 
@@ -3057,7 +3070,7 @@ mod tests {
         // ns.commit_t a few ahead -> CommitCatchUp (gap <= MAX_INCREMENTAL_COMMITS)
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(13, 5, Some(make_cid("commit:13")), Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert!(matches!(
             plan,
             UpdatePlan::CommitCatchUp {
@@ -3079,7 +3092,7 @@ mod tests {
             Some(make_cid("commit:11")),
             Some(make_index_cid("index:10")),
         );
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         match plan {
             UpdatePlan::CommitCatchUp {
                 gap: 1,
@@ -3099,7 +3112,7 @@ mod tests {
         // next install. Stale record, nothing to do — never a reload.
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(5, 5, Some(make_cid("commit:5")), Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert_eq!(plan, UpdatePlan::Noop);
     }
 
@@ -3108,7 +3121,7 @@ mod tests {
         // ns.commit_t == local.t() + 1 but no commit_head_id -> Reload (safety)
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(11, 5, None, Some(local_idx.clone()));
-        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        let plan = UpdatePlan::plan(10, &installed(5, Some(&local_idx)), &ns);
         assert_eq!(plan, UpdatePlan::Reload);
     }
 

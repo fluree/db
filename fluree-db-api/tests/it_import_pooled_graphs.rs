@@ -2958,11 +2958,12 @@ async fn cached_state(
 
 /// A root compacted at the same `t` reaches other connections: a reader that
 /// cached the ledger before the compaction adopts it on refresh, by itself or
-/// with a commit that landed after it, which it keeps.
+/// with a commit that landed after it, which it keeps; a record read before
+/// the compaction does not take it back.
 #[tokio::test]
 async fn cached_readers_adopt_a_root_compacted_at_the_same_t() {
     use fluree_db_api::{
-        FreshnessCheck, MaintainIndexOptions, NotifyResult, RefreshOpts, RemoteWatermark,
+        FreshnessCheck, MaintainIndexOptions, NotifyResult, NsNotify, RefreshOpts, RemoteWatermark,
     };
     let db_dir = tempfile::tempdir().unwrap();
     let data_dir = tempfile::tempdir().unwrap();
@@ -2991,6 +2992,8 @@ async fn cached_readers_adopt_a_root_compacted_at_the_same_t() {
     for reader in [&index_only, &catch_up] {
         reader.ledger_cached(ledger_id).await.expect("cache ledger");
     }
+    let id = fluree_db_core::LedgerId::parse(ledger_id).unwrap();
+    let before = writer.nameservice().lookup(&id).await.unwrap().unwrap();
     let compacted = writer
         .maintain_index(ledger_id, MaintainIndexOptions::default())
         .await
@@ -3024,6 +3027,29 @@ async fn cached_readers_adopt_a_root_compacted_at_the_same_t() {
     let state = cached_state(&index_only, ledger_id).await;
     assert_eq!(state.head_index_id.as_ref(), Some(&compacted_root));
     assert_eq!(state.index_t(), root.index_t);
+
+    // The record read before the compaction names the root it replaced: the
+    // reader does not step back to it, nor a peer watermark mark it stale.
+    let stale = index_only
+        .ledger_manager()
+        .unwrap()
+        .notify(NsNotify {
+            ledger_id: id.clone(),
+            record: Some(before.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale, NotifyResult::Current);
+    let state = cached_state(&index_only, ledger_id).await;
+    assert_eq!(state.head_index_id.as_ref(), Some(&compacted_root));
+    let stale_watermark = RemoteWatermark {
+        index_head_id: before.index_head_id.clone(),
+        ..watermark
+    };
+    assert_eq!(
+        handle.check_freshness(&stale_watermark).await,
+        FreshnessCheck::Current
+    );
 
     sparql_update(
         &writer,

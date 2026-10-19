@@ -73,6 +73,8 @@ pub struct LedgerSnapshotMetadata {
     /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
     /// canonical contract.
     pub has_list_meta: Option<bool>,
+    /// The root this index's root replaced, by its `prev_index` link.
+    pub prev_index: Option<ContentId>,
 }
 
 /// Database value at a specific point in time.
@@ -173,6 +175,8 @@ pub struct LedgerSnapshot {
     /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
     /// canonical contract.
     pub has_list_meta: Option<bool>,
+    /// The root this index's root replaced, by its `prev_index` link.
+    pub prev_index: Option<ContentId>,
 }
 
 impl Clone for LedgerSnapshot {
@@ -195,6 +199,7 @@ impl Clone for LedgerSnapshot {
             has_annotations: self.has_annotations,
             needs_link_reindex: self.needs_link_reindex,
             has_list_meta: self.has_list_meta,
+            prev_index: self.prev_index.clone(),
         }
     }
 }
@@ -253,6 +258,7 @@ impl LedgerSnapshot {
             // An empty snapshot has no indexed rows, so "no list rows" is
             // exact — everything lives in novelty, which tracks its own bit.
             has_list_meta: Some(false),
+            prev_index: None,
         }
     }
 
@@ -291,6 +297,7 @@ impl LedgerSnapshot {
             has_annotations: meta.has_annotations,
             needs_link_reindex: meta.needs_link_reindex,
             has_list_meta: meta.has_list_meta,
+            prev_index: meta.prev_index,
         })
     }
 
@@ -990,10 +997,21 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         None
     };
 
-    if flags & FLAG_HAS_PREV_INDEX != 0 {
+    let prev_index = if flags & FLAG_HAS_PREV_INDEX != 0 {
         let _t = read_i64(bytes, &mut pos)?;
-        skip_cid(bytes, &mut pos)?;
-    }
+        let len = read_u16(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, len, "prev index cid")?;
+        let id = ContentId::from_bytes(&bytes[pos..pos + len]).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("prev index cid: {e}"),
+            )
+        })?;
+        pos += len;
+        Some(id)
+    } else {
+        None
+    };
     if flags & FLAG_HAS_GARBAGE != 0 {
         skip_cid(bytes, &mut pos)?;
     }
@@ -1037,6 +1055,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         has_annotations,
         needs_link_reindex: has_annotations && !has_term_dict_section,
         has_list_meta,
+        prev_index,
     })
 }
 
@@ -1099,6 +1118,7 @@ mod tests {
             has_annotations: false,
             needs_link_reindex: false,
             has_list_meta: None,
+            prev_index: None,
         })
         .unwrap();
 
