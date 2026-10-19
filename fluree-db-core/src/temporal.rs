@@ -1721,7 +1721,9 @@ impl Date {
 /// constant, or a typed value against a string constant. `None` when neither
 /// pairing applies or the string does not parse. The FILTER evaluator's `<`,
 /// `<=`, `>`, `>=` and the scan's object bounds both order through this, so
-/// the pushed and the evaluated comparison cannot drift apart.
+/// the pushed and the evaluated comparison cannot drift apart. Both pass it a
+/// string only when the string is a plain `xsd:string` term: a tagged or
+/// otherwise-typed literal is a term of its own type, not a temporal lexical.
 pub fn cmp_with_lexical(
     a: &crate::value::FlakeValue,
     b: &crate::value::FlakeValue,

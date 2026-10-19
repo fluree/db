@@ -144,11 +144,11 @@ pub struct ObjectBounds {
     /// For `?x < 100`, use `(100, false)`. For `?x <= 100`, use `(100, true)`.
     pub upper: Option<(FlakeValue, bool)>,
     /// Whether a string bound orders a temporal object, and a temporal bound
-    /// a string object, by parsing the string as that temporal type (a
-    /// gYear stored as a string, a date compared with `"2026-01-01"`).
-    /// SPARQL's `<`, `<=`, `>` and `>=` compare that way; `=` never equates
-    /// a string with a temporal. So bounds that came from an `=` leave it
-    /// off.
+    /// an `xsd:string` object, by reading the string as a value of that
+    /// temporal type (a date compared with `"2026-01-01"`), as the FILTER
+    /// evaluator's `<`, `<=`, `>` and `>=` do; `=` never equates a string
+    /// with a temporal. So bounds that came from an `=` leave it off. A
+    /// tagged or otherwise-typed string is never read as a temporal.
     pub temporal_string_ordering: bool,
 }
 
@@ -302,11 +302,12 @@ impl ObjectBounds {
             return value.temporal_cmp(bound);
         }
 
-        // Cross-type: String vs temporal — try to parse string as the
-        // temporal type. This handles values stored as LEX_ID (string
-        // dict) with a temporal datatype annotation (e.g. gYear values
-        // in bulk-imported data). Ordering only.
-        if self.temporal_string_ordering {
+        // Cross-type: a plain string vs a temporal, the string read as a
+        // value of that temporal type. Ordering only. A string bound is
+        // always the `xsd:string` term; a stored string must be one too, as
+        // a tagged or otherwise-typed literal is a term of its own type.
+        let plain = || !matches!(value, FlakeValue::String(_)) || is_xsd_string();
+        if self.temporal_string_ordering && plain() {
             if let Some(ordering) = temporal::cmp_with_lexical(value, bound) {
                 return Some(ordering);
             }
