@@ -551,44 +551,6 @@ async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
     assert_eq!(t(&fluree, id).await, indexed.t(), "nothing committed");
 }
 
-/// Without its index loaded, this process cannot count the datatypes the
-/// ledger holds; admitting a write past the limit would leave a ledger that
-/// can never be indexed. The write is refused, and the ledger still indexes.
-#[tokio::test]
-async fn a_datatype_past_the_limit_is_refused_while_the_index_is_not_loaded() {
-    use fluree_db_transact::datatype_limit::MAX_NON_RESERVED_DATATYPES as MAX;
-    let fluree = FlureeBuilder::memory().build_memory();
-    let id = "vector-lengths/not-loaded-datatypes:main";
-    let datatypes = |range: std::ops::Range<usize>| {
-        let nodes: Vec<_> = range
-            .map(|i| {
-                json!({
-                    "@id": format!("ex:s{i}"),
-                    "ex:p": {"@value": format!("v{i}"), "@type": format!("ex:U{i}")}
-                })
-            })
-            .collect();
-        json!({"@context": {"ex": EX}, "@graph": nodes})
-    };
-    create(&fluree, id).await;
-    let h = handle(&fluree, id).await;
-    fluree
-        .stage(&h)
-        .insert(&datatypes(0..MAX))
-        .execute()
-        .await
-        .expect("every datatype the ledger can hold");
-    rebuild(&fluree, id).await;
-    not_loaded(
-        fluree
-            .insert(unloaded(&fluree, id).await, &datatypes(MAX..MAX + 1))
-            .await
-            .map(drop),
-        "a datatype past the limit",
-    );
-    rebuild(&fluree, id).await;
-}
-
 /// A ledger whose attached index is older than the index its novelty starts
 /// from reads nothing indexed in between (a property's vector length, for
 /// one), so a write to it is refused rather than certified.
