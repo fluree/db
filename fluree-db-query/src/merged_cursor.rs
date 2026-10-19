@@ -1173,7 +1173,8 @@ mod tests {
 
     /// k = 2, 3 and 5 (past the heap threshold), random members over a small
     /// universe so they overlap, cut into leaflets of 1 to 7 rows. SPOT and
-    /// PSOT carry list rows, repeated values included; POST and OPST don't.
+    /// PSOT carry list rows, a value repeated within one member's list and
+    /// across members included; POST and OPST don't.
     #[test]
     fn random_members_merge_to_the_set_union() {
         let objects = [(STR, 10), (STR, 11), (IRI, 3), (INT, 7)];
@@ -1195,6 +1196,12 @@ mod tests {
                                             NO_LIST
                                         };
                                         rows.push((s, p, o_type, o_key, o_i));
+                                        // A list that repeats the value
+                                        // within this member.
+                                        if lists && rng.below(6) == 0 {
+                                            let again = 3 + rng.below(3) as u32;
+                                            rows.push((s, p, o_type, o_key, again));
+                                        }
                                     }
                                 }
                             }
