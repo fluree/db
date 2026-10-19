@@ -753,6 +753,10 @@ name = "annotation_planner"
 harness = false
 
 [[bench]]
+name = "datalog_fixpoint"
+harness = false
+
+[[bench]]
 name = "annotation_varlength_probe"
 harness = false
 
