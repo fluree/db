@@ -6,8 +6,10 @@
 //! its vectors against that length before the write: `build_commit`, push,
 //! and bulk import, whose vector pool applies the same rule as it reads.
 //!
-//! Pull and clone do not check. They copy a history that already exists on
-//! the remote.
+//! Pull, clone and restore (from a `.flpack` archive) do not check. They
+//! create no commits: they copy a ledger's existing commits, and its index,
+//! byte for byte, so the copy holds what the source holds and refuses what
+//! the source refuses.
 
 use crate::commit::binary_store;
 use crate::error::{Result, TransactError};

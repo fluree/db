@@ -1071,3 +1071,44 @@ async fn a_ledger_already_holding_two_lengths_moves_by_export_and_import() {
         vec![("default".to_string(), 3)]
     );
 }
+
+/// Restore, like pull and clone, creates no commits: it copies a ledger's
+/// commits and index as they are. A ledger an earlier release left with two
+/// lengths on one property restores whole, and the copy refuses what its
+/// source refuses.
+#[tokio::test]
+async fn a_restored_copy_refuses_what_its_source_refuses() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vector-lengths-4.2.3/storage");
+    let db_dir = tempfile::tempdir().unwrap();
+    copy_dir(&fixture, db_dir.path());
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger("ex:main", true, &mut archive)
+        .await
+        .expect("archive the fixture");
+    let restored = fluree
+        .restore_ledger("ex-restored", &mut std::io::Cursor::new(archive))
+        .await
+        .expect("a two-length ledger restores");
+    assert_eq!((restored.index_t, restored.commit_t), (Some(1), 2));
+
+    let id = "ex-restored:main";
+    let copy = fluree.ledger(id).await.unwrap();
+    let source = fluree.ledger("ex:main").await.unwrap();
+    assert_eq!(
+        vector_lengths(&fluree, &copy, &["default"]).await,
+        vector_lengths(&fluree, &source, &["default"]).await,
+        "the copy holds the source's vectors"
+    );
+    insert(&fluree, id, vec![node("c", "other", 2)])
+        .await
+        .expect("a write that holds no vector of ex:embedding");
+    refused(
+        insert(&fluree, id, vec![node("c", "embedding", 4)]).await,
+        "a third length on the copy",
+    );
+}
