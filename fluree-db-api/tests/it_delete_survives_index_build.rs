@@ -654,21 +654,18 @@ async fn graphs_an_import_left_empty_take_facts_incrementally() {
 /// to extend that index and falls back to a full rebuild, which restores SPOT.
 #[tokio::test]
 async fn facts_missing_from_spot_are_rebuilt() {
-    // The SPOT branch as every writer writes one, which the root alone
-    // identifies; and one the root can't, which the build only finds empty
-    // once it fetches it (the reserved header word set).
-    let written = |g_id: u16| build_branch_bytes(RunSortOrder::Spot, g_id, &[]);
-    let unrecognized = |g_id: u16| {
-        let mut bytes = written(g_id);
-        bytes[12] = 1;
+    // The SPOT branch with no leaves as every writer writes one, which the
+    // root alone identifies (`recognized`); or with the reserved header word
+    // set, which the build only finds empty once it fetches it.
+    let spot_bytes = |g_id: u16, recognized: bool| {
+        let mut bytes = build_branch_bytes(RunSortOrder::Spot, g_id, &[]);
+        if !recognized {
+            bytes[12] = 1;
+        }
         bytes
     };
-    let cases: [(Option<&str>, &dyn Fn(u16) -> Vec<u8>); 3] = [
-        (None, &written),
-        (Some(G3), &written),
-        (Some(G3), &unrecognized),
-    ];
-    for (case, (graph, spot_bytes)) in cases.into_iter().enumerate() {
+    let cases = [(None, true), (Some(G3), true), (Some(G3), false)];
+    for (case, (graph, recognized)) in cases.into_iter().enumerate() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = format!("it/delete-survives-spot-{case}:main");
         let fluree = imported_ledger(dir.path(), &id).await;
@@ -691,7 +688,7 @@ async fn facts_missing_from_spot_are_rebuilt() {
             .expect("root");
         let mut root = IndexRoot::decode(&bytes).expect("decode root");
         let g_id = graph_id(&fluree, &id, graph).await;
-        empty_spot(&fluree, &id, &mut root, g_id, spot_bytes(g_id)).await;
+        empty_spot(&fluree, &id, &mut root, g_id, spot_bytes(g_id, recognized)).await;
         publish_root(&fluree, &id, built.index_t, &root).await;
         let from = from_alias(&id, graph, None);
         let fresh = fluree_at(dir.path());
