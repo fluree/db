@@ -2279,8 +2279,9 @@ struct SubjectDelta {
     has_retract: bool,
     /// Classes asserted via rdf:type in this transaction.
     asserted_classes: Vec<Sid>,
-    /// (p, o, dt) of this subject's retractions, for full-removal detection.
-    retracts: Vec<(Sid, FlakeValue, Sid)>,
+    /// Predicate and fact identity ([`FactIdentity`]) of this subject's
+    /// retractions, for full-removal detection.
+    retracts: HashSet<(Sid, FactTerm)>,
 }
 
 /// Both sides of each restated pair (see
@@ -2360,6 +2361,7 @@ async fn enforce_modify_policies(
     if needs_classes || needs_lifecycle {
         // Gather per-subject deltas from the staged batch.
         let mut deltas: HashMap<(GraphId, Sid), SubjectDelta> = HashMap::new();
+        let ids = FactIdentity::new(ledger);
         for flake in flakes {
             let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
             let d = deltas.entry((g_id, flake.s.clone())).or_default();
@@ -2376,7 +2378,7 @@ async fn enforce_modify_policies(
                 d.has_retract = true;
                 if needs_lifecycle {
                     d.retracts
-                        .push((flake.p.clone(), flake.o.clone(), flake.dt.clone()));
+                        .insert((flake.p.clone(), ids.in_graph(Some(g_id), flake)));
                 }
             }
         }
@@ -2502,11 +2504,15 @@ async fn classify_subject_lifecycle(
         // Update so no create/delete grant is consumed by a no-op.
         return Ok(WriteVerb::Update);
     }
+    // By fact identity: a retraction names a fact as the stored-fact read
+    // resolves it, which can be another term of the fact than this read
+    // returns (an indexed `x^^xsd:integer` read here, retracted as the
+    // `x^^xsd:nonNegativeInteger` written since the build).
+    let ids = FactIdentity::new(ledger);
     let fully_retracted = pre_flakes.iter().filter(|f| f.op).all(|pre| {
         delta
             .retracts
-            .iter()
-            .any(|(p, o, dt)| p == &pre.p && o == &pre.o && dt == &pre.dt)
+            .contains(&(pre.p.clone(), ids.in_graph(Some(g_id), pre)))
     });
     Ok(if fully_retracted {
         WriteVerb::Delete

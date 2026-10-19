@@ -1075,6 +1075,113 @@ async fn a_permitted_delete_of_an_absent_value_commits_nothing() {
     }
 }
 
+/// The identity may view everything, and `verb` an `ex:Thing` and nothing
+/// else.
+async fn view_all_and(ledger: &LedgerState, verb: &str) -> PolicyContext {
+    policy(
+        ledger,
+        GovernanceOptions {
+            policy: Some(json!([
+                {
+                    "@id": "http://example.org/ns/viewAll",
+                    "f:action": "f:view",
+                    "f:allow": true
+                },
+                {
+                    "@id": "http://example.org/ns/verbOnThing",
+                    "f:onClass": [{"@id": "http://example.org/ns/Thing"}],
+                    "f:action": verb,
+                    "f:allow": true
+                }
+            ])),
+            default_allow: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A write-verb policy tells a subject's full removal by fact identity, as
+/// storage holds the facts. An indexed `x^^xsd:integer` with
+/// `x^^xsd:nonNegativeInteger` written since the build is one stored fact:
+/// the pre-state read returns the indexed term, and the removal retracts the
+/// newer one. Removing every fact of the subject (with a language-tagged
+/// value and a list beside it) is a delete, so a delete-only grant permits
+/// it and an update-only grant does not, on SPARQL and JSON-LD. Never
+/// indexed, both terms are read and retracted. Each attempt has a ledger of
+/// its own, read cold, with no background indexer.
+#[tokio::test]
+async fn a_full_removal_is_a_delete_whichever_term_names_a_fact() {
+    let mut failures = Vec::new();
+    for indexed in [false, true] {
+        for surface in ["SPARQL", "JSON-LD"] {
+            for (verb, permitted) in [("f:update", false), ("f:delete", true)] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().to_string_lossy().to_string();
+                let open = || {
+                    FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("file fluree")
+                };
+                let id = "it/delete-stored-lifecycle:main";
+                let fluree = open();
+                let ledger = fluree.create_ledger(id).await.expect("create");
+                // A language tag and list positions are part of a fact's
+                // identity, so the removal has to name those as stored too.
+                let seed = json!({
+                    "@context": ctx(),
+                    "@id": "ex:s",
+                    "@type": "ex:Thing",
+                    "ex:p": {"@value": BIG, "@type": "xsd:integer"},
+                    "ex:label": {"@value": "Al", "@language": "en"},
+                    "ex:scores": {"@list": [1, 2]}
+                });
+                fluree.insert(ledger, &seed).await.expect("seed");
+                if indexed {
+                    support::rebuild_and_publish_index(&fluree, id).await;
+                }
+                let fluree = open();
+                let ledger = fluree.ledger(id).await.expect("ledger");
+                assert_eq!(ledger.snapshot.range_provider.is_some(), indexed);
+                let since =
+                    format!("INSERT DATA {{ ex:s ex:p \"{BIG}\"^^xsd:nonNegativeInteger }}");
+                sparql_update(&fluree, ledger, &since).await;
+                let fluree = open();
+                let ledger = fluree.ledger(id).await.expect("ledger");
+                let policy = view_all_and(&ledger, verb).await;
+                let r = if surface == "SPARQL" {
+                    sparql_update_as(&fluree, ledger, "DELETE WHERE { ex:s ?p ?o }", policy).await
+                } else {
+                    let txn = json!({
+                        "@context": ctx(),
+                        "where": {"@id": "ex:s", "?p": "?o"},
+                        "delete": {"@id": "ex:s", "?p": "?o"}
+                    });
+                    fluree
+                        .stage_owned(ledger)
+                        .update(&txn)
+                        .policy(policy)
+                        .execute()
+                        .await
+                };
+                let what = format!("{surface} under {verb} alone, indexed={indexed}");
+                match (permitted, r) {
+                    (false, r) => failures.extend(not_refused(r, &what)),
+                    (true, Err(e)) => failures.push(format!("{what}: {e}")),
+                    (true, Ok(r)) => {
+                        let left = facts(&fluree, &r.ledger).await;
+                        if !left.is_empty() {
+                            failures.push(format!("{what}: left {left:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // =============================================================================
 // Modify policy judges a restated value the identity cannot view
 // =============================================================================
