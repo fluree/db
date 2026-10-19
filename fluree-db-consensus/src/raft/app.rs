@@ -1437,13 +1437,16 @@ mod tests {
         // resolution falls back to Minimal — confirming the absent-
         // entry path delivers commit_id / commit_t without panicking.
         match rx.wait(WAIT).await.expect("receive") {
-            WaiterOutcome::Applied(AppliedReceipt::Minimal {
-                commit_id,
-                commit_t,
-            }) => {
-                assert_eq!(commit_id, cid(42));
-                assert_eq!(commit_t, 10);
-            }
+            WaiterOutcome::Applied(receipt) => match *receipt {
+                AppliedReceipt::Minimal {
+                    commit_id,
+                    commit_t,
+                } => {
+                    assert_eq!(commit_id, cid(42));
+                    assert_eq!(commit_t, 10);
+                }
+                other => panic!("expected Applied(Minimal), got {other:?}"),
+            },
             other => panic!("expected Applied(Minimal), got {other:?}"),
         }
     }
@@ -1478,13 +1481,16 @@ mod tests {
             .unwrap();
 
         match ticket.wait(WAIT).await.expect("the waiter must resolve") {
-            WaiterOutcome::Applied(AppliedReceipt::Minimal {
-                commit_id,
-                commit_t,
-            }) => {
-                assert_eq!(commit_id, cid(42));
-                assert_eq!(commit_t, 10);
-            }
+            WaiterOutcome::Applied(receipt) => match *receipt {
+                AppliedReceipt::Minimal {
+                    commit_id,
+                    commit_t,
+                } => {
+                    assert_eq!(commit_id, cid(42));
+                    assert_eq!(commit_t, 10);
+                }
+                other => panic!("expected Applied(Minimal), got {other:?}"),
+            },
             other => panic!("expected Applied(Minimal), got {other:?}"),
         }
         assert_eq!(
@@ -1578,10 +1584,13 @@ mod tests {
             .unwrap();
 
         match rx.wait(WAIT).await.expect("receive") {
-            WaiterOutcome::Applied(AppliedReceipt::Transact(r)) => {
-                assert_eq!(r.commit_id, cid(42));
-                assert_eq!(r.commit_t, 10);
-            }
+            WaiterOutcome::Applied(receipt) => match *receipt {
+                AppliedReceipt::Transact(r) => {
+                    assert_eq!(r.commit_id, cid(42));
+                    assert_eq!(r.commit_t, 10);
+                }
+                other => panic!("expected Applied(Transact), got {other:?}"),
+            },
             other => panic!("expected Applied(Transact), got {other:?}"),
         }
         assert_eq!(staged.len(), 0, "adapter must take from the map");

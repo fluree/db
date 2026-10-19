@@ -330,17 +330,16 @@ async fn optional_in_a_jsonld_rule_body_is_rejected_by_name() {
 }
 
 #[tokio::test]
-async fn bang_exists_is_rejected_like_not_exists() {
+async fn bang_exists_negates_like_not_exists() {
     // #1786's defect class has two spellings. `NOT EXISTS { … }` lowers to
     // `Exists { negated: true }`; `!EXISTS { … }` lowers to `Not` wrapping a
-    // plain `Exists`. The first cut of the monotonicity walk matched only the
-    // first, so negation reached the fixpoint through the second — inside the
-    // change that closes #1786. In a fixpoint that is unsound, not merely
-    // unsupported: if the head predicate appears in the negated pattern, the
-    // answer depends on which round evaluated it, and is then cached.
+    // plain `Exists`. Negation is now supported, but only stratified, so the
+    // second spelling must be seen as negation too: applied over facts the
+    // rule cannot derive, and refused over its own conclusions, where the
+    // answer would depend on evaluation order.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = claims_ledger(&fluree, "rules/reject/bang-exists").await;
-    let message = rejection(
+    let ledger = claims_ledger(&fluree, "rules/bang-exists").await;
+    let pairs = trusted_pairs(
         &fluree,
         &ledger,
         json!([{
@@ -351,8 +350,23 @@ async fn bang_exists_is_rejected_like_not_exists() {
         }]),
     )
     .await;
+    assert_eq!(pairs, vec![json!(["ex:carol", "ex:dave"])]);
+
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?a ex:trustedKnows ?b } \
+                       WHERE { ?a ex:knows ?b . FILTER(!EXISTS { ?b ex:trustedKnows ?c }) }"
+        }]),
+    )
+    .await;
     assert!(
-        message.contains("NOT EXISTS"),
+        message.contains(
+            "negates http://example.org/trustedKnows facts, which depend on its own conclusions"
+        ),
         "unexpected rejection message: {message}"
     );
 }
@@ -502,10 +516,11 @@ async fn double_negated_exists_stays_allowed() {
 }
 
 #[tokio::test]
-async fn subquery_aggregate_in_a_rule_body_is_rejected() {
-    // The docs promise "subqueries without aggregates"; the walk recursed into
-    // a subquery's patterns but never looked at its own GROUP BY, so an
-    // aggregating sub-SELECT computed counts inside the fixpoint.
+async fn subquery_aggregate_over_its_own_conclusions_is_rejected() {
+    // An aggregating sub-SELECT used to compute counts inside the fixpoint,
+    // over facts still being derived. Aggregates are now stratified: a rule
+    // may count only what is complete before it runs, so counting its own
+    // head predicate is refused, naming the cycle.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = claims_ledger(&fluree, "rules/reject/subquery-group-by").await;
     let message = rejection(
@@ -515,13 +530,15 @@ async fn subquery_aggregate_in_a_rule_body_is_rejected() {
             "@type": "f:sparql",
             "@value": "PREFIX ex: <http://example.org/> \
                        CONSTRUCT { ?a ex:trustedKnows ?b } \
-                       WHERE { { SELECT ?a (COUNT(?b) AS ?n) WHERE { ?a ex:knows ?b } \
+                       WHERE { { SELECT ?a (COUNT(?b) AS ?n) WHERE { ?a ex:trustedKnows ?b } \
                                  GROUP BY ?a } ?a ex:knows ?b }"
         }]),
     )
     .await;
     assert!(
-        message.contains("GROUP BY") && message.contains("subquery"),
+        message.contains(
+            "aggregates http://example.org/trustedKnows facts, which depend on its own conclusions"
+        ),
         "unexpected rejection message: {message}"
     );
 }
@@ -600,27 +617,32 @@ async fn head_var_bound_only_in_a_filter_is_rejected() {
 }
 
 #[tokio::test]
-async fn not_exists_in_a_rule_body_is_rejected_not_ignored() {
+async fn not_exists_in_a_rule_body_is_applied_not_ignored() {
     // Issue #1786: `["not-exists", …]` used to be silently ignored, so the
-    // rule derived as if the negation were not there. Now it is rejected.
+    // rule derived as if the negation were not there. It was then rejected;
+    // now it is evaluated. Bob knows Carol, who knows Dave, so the pair
+    // through Carol is excluded.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = claims_ledger(&fluree, "rules/reject/not-exists").await;
-    let message = rejection(
+    let ledger = claims_ledger(&fluree, "rules/not-exists").await;
+    let pairs = trusted_pairs(
         &fluree,
         &ledger,
         json!([{
             "@context": {"ex": "http://example.org/"},
             "where": [
                 {"@id": "?a", "ex:knows": {"@id": "?b"}},
-                ["not-exists", {"@id": "?a", "ex:blocked": {"@id": "?b"}}]
+                ["not-exists", {"@id": "?b", "ex:knows": {"@id": "ex:dave"}}]
             ],
             "insert": {"@id": "?a", "ex:trustedKnows": {"@id": "?b"}}
         }]),
     )
     .await;
-    assert!(
-        message.contains("NOT EXISTS"),
-        "must name the construct: {message}"
+    assert_eq!(
+        pairs,
+        vec![
+            json!(["ex:alice", "ex:bob"]),
+            json!(["ex:carol", "ex:dave"])
+        ]
     );
 }
 

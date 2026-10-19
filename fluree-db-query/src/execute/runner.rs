@@ -709,6 +709,9 @@ pub struct ContextConfig<'a, 'b> {
     /// `@vocab` prefix a Cypher query was lowered against (from
     /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return (see
+    /// [`ExecutionContext::evaluation_time`]).
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, the injected true-wildcard crawl scan renders R2RML
     /// `RefObjectMap` objects by templating the parent IRI from the child row's
     /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
@@ -788,6 +791,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             derived_facts: diag.facts_derived as u64,
             iterations: diag.iterations as u64,
             duration_ms: diag.duration.as_millis() as u64,
+            capped_rules: diag.capped_rules.clone(),
+            pending_rules: diag.pending_rules.clone(),
+            evaluation_time: diag.evaluation_time.clone(),
         });
     }
 
@@ -803,15 +809,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
 
     // Dataset execution scans through per-graph `GraphRef`s, not the
     // top-level context overlay — splice the derived-facts overlay into
-    // every ref matching the primary execution view, or datalog / OWL2-RL
-    // derived facts are invisible to dataset queries.
+    // every ref matching the primary execution view, and every named graph
+    // of the same ledger a rule derived into, or datalog / OWL2-RL derived
+    // facts are invisible to dataset queries.
     let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
-        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
-            db.snapshot.ledger_id.as_str(),
-            db.g_id,
-            db.t,
-            effective_overlay,
-        )),
+        (Some(ds), Some(reasoning)) => {
+            let mut graphs = vec![db.g_id];
+            graphs.extend(reasoning.derived().graph_ids().filter(|g| *g != db.g_id));
+            Some(ds.with_overlay_for_graphs(
+                db.snapshot.ledger_id.as_str(),
+                &graphs,
+                db.t,
+                effective_overlay,
+            ))
+        }
         _ => None,
     };
 
@@ -894,6 +905,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(vocab) = config.cypher_vocab.clone() {
         ctx.cypher_vocab = Some(vocab);
     }
+    ctx.evaluation_time = config.evaluation_time.clone();
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);
     }

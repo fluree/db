@@ -981,6 +981,7 @@ mod tests {
                 "reasoning-max-facts" | "reasoning-max-seconds" | "reasoning-max-memory-mb" => {
                     ("10", false, None, false, false, None)
                 }
+                "reasoning-time" => ("2026-01-01T00:00:00Z", false, None, false, false, None),
                 "include-system-facts" | "union-default-graph" => {
                     ("true", false, None, false, false, None)
                 }
