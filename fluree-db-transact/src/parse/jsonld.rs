@@ -781,15 +781,17 @@ fn parse_update_where_default_graph_iris(
     // `"txn-meta"` is refused.
     let resolve_single = |item: &Value| -> Result<String> {
         let resolved = resolve_graph_selector_value_for_update(item, from_named_aliases);
-        match &resolved {
-            Value::String(s) if s == "default" => Ok(fluree_db_core::DEFAULT_GRAPH_IRI.to_string()),
-            Value::String(s) if s == "txn-meta" => Err(TransactError::Parse(
+        use fluree_db_core::GraphSel;
+        match resolved.as_str().and_then(GraphSel::bare_keyword) {
+            Some(GraphSel::Default) => Ok(fluree_db_core::DEFAULT_GRAPH_IRI.to_string()),
+            Some(GraphSel::TxnMeta) => Err(TransactError::Parse(
                 "from: \"txn-meta\" is not currently supported as a default graph selector in updates"
                     .to_string(),
             )),
             // A dataset reference, not a node id: a prefix the context defines
-            // expands, and anything else is kept as written for the update to
-            // resolve (`"from": "mydb:main"` names the ledger's default graph).
+            // expands, and anything else (`config` included) is kept as written
+            // for the update to resolve (`"from": "mydb:main"` names the
+            // ledger's default graph).
             _ => expand_update_graph_iri(&resolved, context, false),
         }
     };

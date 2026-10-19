@@ -219,21 +219,29 @@ pub(crate) async fn validate_staged_config(
 /// one of this ledger's system graphs on a branch other than `ledger_id`'s:
 /// `urn:fluree:<name>:<branch>#config` or `…#txn-meta`. A branch's system
 /// graphs are named for the branch, so on another branch they are ordinary
-/// graphs, never its configuration or commit metadata.
+/// graphs, never its configuration or commit metadata. The IRI is read by the
+/// address grammar's own lexer and parser, and the role by the one keyword
+/// table.
 pub(crate) fn other_branch_system_graph<'i>(
     iri: &'i str,
     ledger_id: &str,
 ) -> Option<(&'i str, &'i str)> {
-    let (name, own_branch) = ledger_id.rsplit_once(':')?;
-    let rest = iri
-        .strip_prefix("urn:fluree:")?
-        .strip_prefix(name)?
-        .strip_prefix(':')?;
-    let (branch, role) = rest.split_once('#')?;
-    (matches!(role, "config" | "txn-meta")
-        && !branch.is_empty()
-        && !branch.contains(':')
-        && branch != own_branch)
+    use fluree_db_core::{AddressText, GraphSel, LedgerId, LedgerRef};
+    let text = AddressText::split(iri);
+    let role = text.graph()?;
+    if !text.is_urn()
+        || text.pin().is_some()
+        || !matches!(
+            GraphSel::bare_keyword(role),
+            Some(GraphSel::Config | GraphSel::TxnMeta)
+        )
+    {
+        return None;
+    }
+    let (_, branch) = text.ledger().split_once(':')?;
+    let address = LedgerRef::parse(iri).ok()?;
+    let own = LedgerId::parse(ledger_id).ok()?;
+    (address.id().name() == own.name() && address.id().branch() != own.branch())
         .then_some((branch, role))
 }
 

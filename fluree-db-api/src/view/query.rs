@@ -1376,7 +1376,8 @@ impl Fluree {
     /// i.e. it excuses itself precisely when an explicit `FROM`/`FROM NAMED`
     /// clause is in play. Admitting a fully-spelled reserved IRI here restores
     /// parity with the connection path, where `load_view_from_source` resolves
-    /// a source through `db()` → `parse_graph_ref` and has always accepted
+    /// a source through `db()`, which parses it as a typed address and selects
+    /// its graph through the one keyword table, and has always accepted
     /// `#config`/`#txn-meta`.
     ///
     /// "Explicitly" is load-bearing: this ledger's `urn:fluree:{ledger}#config`

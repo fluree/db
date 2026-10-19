@@ -2715,7 +2715,7 @@ async fn fql_within_ledger_from_named_dataset_parity() {
 /// `8d8870ba1` in PR #1462 as a review finding. That commit applied
 /// `single_db_user_graph_id`'s `>= FIRST_USER_GRAPH_ID` ENUMERATION filter to
 /// this ADDRESSING surface. The connection path — which resolves a `FROM`
-/// source through `db()`/`parse_graph_ref` — never had the filter, so the same
+/// source through `db()` — never had the filter, so the same
 /// IRI resolved on one surface and was refused on the other. The negative half
 /// Policy is the access control, on the surface the reversal actually opens.
 ///
