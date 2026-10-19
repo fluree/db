@@ -50,7 +50,9 @@ decomposition:
 2. **Per-clause staging loop** — each write clause becomes one or two sub-`Txn`s
    seeded with the current row table (a `VALUES` join), staged against the
    current virtual state via the full staging pipeline (policy, SHACL,
-   uniqueness — per-clause validation, the same semantics choice D-10 made):
+   uniqueness — per-clause validation, the same semantics choice D-10 made;
+   the config, shapes and constraints enforced are read once, from the state
+   before the statement, and the config checks run once on its result):
    - **CREATE**: one Txn; created-entity columns extend the row table as
      skolem IRIs (`_:fdb-{clause_skolem}-{row}-{label}` — solution order equals
      `VALUES` row order, pinned by test).

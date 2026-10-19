@@ -355,6 +355,15 @@ async fn writable(ledger: &str) -> (TempDir, Arc<AppState>) {
                             "graphql:publicShape": { "@id": "ex:PersonShape" },
                             "f:graphqlEnableMutations": true,
                             "f:graphqlIriBase": "http://example.org/"
+                        },
+                        {
+                            "@id": "urn:config:main",
+                            "@type": "f:LedgerConfig",
+                            "@graph": "config",
+                            "f:shaclDefaults": {
+                                "@id": "urn:config:shacl",
+                                "f:shaclEnabled": true
+                            }
                         }
                     ]
                 })

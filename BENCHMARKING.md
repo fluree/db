@@ -90,6 +90,7 @@ this table, so it is the one that rots. Add a row when you add a bench file.
 | `fluree-db-api` | `query_overlay_matrix.rs` | The same query shapes at four ledger conditions — base / overlay / cached / novelty — so the columnar+novelty merge lane and a cached handle's steady state after background indexing have coverage |
 | `fluree-db-api` | `annotation_hydration.rs` | `inject_annotations` hydration cost: index scan vs sealed annotation arena |
 | `fluree-db-api` | `annotation_planner.rs` | Planner direction for `f:reifies*` edge-annotation queries: arena-informed row counts vs HLL-only stats |
+| `fluree-db-api` | `datalog_fixpoint.rs` | Datalog rule materialization on the first reasoning query after a commit: linear and nonlinear transitive closures (evaluated as paths), an iterated linear recursion, and recursion feeding non-recursive rules |
 | `fluree-db-query` | `vector_math.rs` | SIMD vs scalar dot/L2/cosine micro-bench |
 | `fluree-db-spatial` | `spatial_bench.rs` | S2 covering build + within/intersects/radius latency |
 
