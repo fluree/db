@@ -41,6 +41,18 @@ pub enum FastPathFallback {
     /// The operator's runtime gate declined (overlay novelty, time-travel,
     /// non-root policy, multi-ledger, or a shape the fast path can't answer).
     GateDeclined,
+    /// A lane over several graphs met an arena-backed object type (NumBig,
+    /// vector), whose encoded key names a value only within one graph.
+    ArenaType,
+    /// A lane over several graphs met list rows in POST order, where the rows
+    /// of one fact are not adjacent.
+    ListRowsInPost,
+    /// The lane needs the index alone to answer, and novelty (or a predicate
+    /// that only novelty holds) stands in the way.
+    Novelty,
+    /// The graphs of a scope are not all read through one store and its
+    /// dictionaries.
+    StoreMismatch,
 }
 
 impl FastPathOutcome {
@@ -50,6 +62,12 @@ impl FastPathOutcome {
             FastPathOutcome::Proceed => "proceed",
             FastPathOutcome::Fallback(FastPathFallback::KillSwitch) => "fallback:kill_switch",
             FastPathOutcome::Fallback(FastPathFallback::GateDeclined) => "fallback:gate_declined",
+            FastPathOutcome::Fallback(FastPathFallback::ArenaType) => "fallback:arena_type",
+            FastPathOutcome::Fallback(FastPathFallback::ListRowsInPost) => {
+                "fallback:list_rows_in_post"
+            }
+            FastPathOutcome::Fallback(FastPathFallback::Novelty) => "fallback:novelty",
+            FastPathOutcome::Fallback(FastPathFallback::StoreMismatch) => "fallback:store_mismatch",
         }
     }
 }

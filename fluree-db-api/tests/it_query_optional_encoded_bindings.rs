@@ -1814,10 +1814,12 @@ async fn partitioned_group_by_reads_one_graph() {
     failures.assert_none();
 }
 
-/// A cyclic BGP (the cyclic-join lane, gated by `allow_cursor_fast_path`).
-/// Cycle a→b→c→a spans all three graphs; cycle p→q→r→p lies inside g2. The
-/// lane read `binary_g_id`'s graph alone: nothing over the union (whose
-/// `binary_g_id` is the default graph's), and nothing under `FROM g3 + g2`.
+/// A cyclic BGP (the cyclic-join lane). Cycle a→b→c→a spans all three
+/// graphs; cycle p→q→r→p lies inside g2. The one-graph lane read
+/// `binary_g_id`'s graph alone: nothing over the union (whose `binary_g_id` is
+/// the default graph's), and nothing under `FROM g3 + g2`. It answers one
+/// graph only; its union variant answers a default graph of several graphs,
+/// or of none.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_lane_reads_one_graph() {
     let trig = r"
@@ -1827,6 +1829,9 @@ async fn cyclic_lane_reads_one_graph() {
         GRAPH <urn:g3> { ex:c ex:knows ex:a . }
     ";
     let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-graphs:main", trig).await;
+    // The union variant answers only with the kill switch off, which other
+    // tests in this binary turn on; hold it off across these queries.
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
     let tri = |prologue: &str, ds: &str| {
         format!(
             "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
@@ -1879,8 +1884,22 @@ async fn cyclic_lane_reads_one_graph() {
             false,
         ),
     ];
+    // Every scope here that is not one graph is the union variant's.
+    let union_cases: Vec<LaneCase> = cases
+        .iter()
+        .cloned()
+        .map(|(label, query, vars, want, one_graph)| (label, query, vars, want, !one_graph))
+        .collect();
     let mut failures = Failures::default();
     check_lane_cases(&fluree, &handle, "cyclic_bgp", cases, &mut failures).await;
+    check_lane_cases(
+        &fluree,
+        &handle,
+        "cyclic_bgp_union",
+        union_cases,
+        &mut failures,
+    )
+    .await;
     failures.assert_none();
 }
 
@@ -2329,7 +2348,8 @@ async fn geo_search_over_a_default_graph_of_none() {
 /// grouped count reach the same single-graph lanes the SPARQL tests pin; over
 /// the union they must stand down and read every graph. A ledger holding the
 /// same facts in its default graph alone is the oracle, and shows each lane
-/// runs there.
+/// runs there. The cycle's union variant answers the union: its edge p2→p3
+/// is in two graphs and closes the cycle once.
 #[tokio::test(flavor = "current_thread")]
 async fn cypher_lanes_over_the_union_default_graph() {
     let union_id = "it/cypher-lanes-union:main";
@@ -2344,7 +2364,8 @@ async fn cypher_lanes_over_the_union_default_graph() {
     };
     let d = "ex:p1 a ex:Person ; ex:knows ex:p2 ; ex:dept ex:Sales .";
     let g2 = "ex:p2 a ex:Person ; ex:knows ex:p3 ; ex:dept ex:Ops . ex:p5 ex:dept ex:Sales .";
-    let g3 = "ex:p3 a ex:Person ; ex:knows ex:p1 ; ex:dept ex:Sales . ex:p4 a ex:Person .";
+    let g3 = "ex:p3 a ex:Person ; ex:knows ex:p1 ; ex:dept ex:Sales . ex:p4 a ex:Person . \
+              ex:p2 ex:knows ex:p3 .";
     let config = format!(
         "GRAPH <urn:fluree:{union_id}#config> {{ \
          <urn:config:main> a f:LedgerConfig ; f:queryDefaults <urn:config:query> . \
@@ -2375,18 +2396,21 @@ async fn cypher_lanes_over_the_union_default_graph() {
     let person = "`http://example.org/Person`";
     let knows = "`http://example.org/knows`";
     let dept = "`http://example.org/dept`";
-    // (label, Cypher, the lane's routing site, the answer)
-    let cases: Vec<(&str, String, &str, Rows)> = vec![
+    // (label, Cypher, the one-graph lane's routing site, its union variant's
+    // site where it has one, the answer)
+    let cases: Vec<(&str, String, &str, Option<&str>, Rows)> = vec![
         (
             "count of a label",
             format!("MATCH (n:{person}) RETURN count(n) AS c"),
             "whole-graph scalar aggregates",
+            None,
             rows(&[&["4"]]),
         ),
         (
             "a triangle",
             format!("MATCH (a)-[:{knows}]->(b)-[:{knows}]->(c)-[:{knows}]->(a) RETURN a, b, c"),
             "cyclic_bgp",
+            Some("cyclic_bgp_union"),
             rows(&[
                 &["p1", "p2", "p3"],
                 &["p2", "p3", "p1"],
@@ -2397,6 +2421,7 @@ async fn cypher_lanes_over_the_union_default_graph() {
             "a count per related node",
             format!("MATCH (n)-[:{dept}]->(d) RETURN d, count(n) AS c"),
             "partitioned_group_by",
+            None,
             rows(&[&["Ops", "1"], &["Sales", "3"]]),
         ),
     ];
@@ -2404,7 +2429,7 @@ async fn cypher_lanes_over_the_union_default_graph() {
     // Other tests in this binary turn the process-wide kill switch on; the
     // read side keeps it off for these queries unless the environment set it.
     let _switch = crate::support::FAST_PATH_SWITCH.read().await;
-    for (label, cypher, site, want) in cases {
+    for (label, cypher, site, union_site, want) in cases {
         for (scope, handle, must_fire) in [("union", &union, false), ("merged", &merged, true)] {
             let (store, _guard) = init_test_tracing();
             let before = store.all_events().len();
@@ -2424,6 +2449,12 @@ async fn cypher_lanes_over_the_union_default_graph() {
             }
             let fired = stamps(&store, before, site).iter().any(|o| o == "proceed");
             failures.eq(fired, must_fire, &format!("{label}: `{site}` ran"));
+            if let Some(union_site) = union_site {
+                let fired = stamps(&store, before, union_site)
+                    .iter()
+                    .any(|o| o == "proceed");
+                failures.eq(fired, !must_fire, &format!("{label}: `{union_site}` ran"));
+            }
         }
     }
     failures.assert_none();

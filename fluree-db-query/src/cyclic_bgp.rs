@@ -7,12 +7,15 @@
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
+use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey,
-    fast_path_store, normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan,
-    ProbeLanePlan, ProbeOps, PsotSubjectSeek, RowFate, SharedOverlayOps,
+    build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey, normalize_pred_sid,
+    parallel_map_pooled, subject_probe_lane_plan, ProbeLanePlan, ProbeOps, PsotSubjectSeek,
+    RowFate, SharedOverlayOps,
 };
+use crate::fast_path_outcome::{FastPathFallback, FastPathOutcome};
+use crate::index_scope::{overlay_carries_novelty, IndexMember, IndexScope, MemberSet, ScopeKind};
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -25,7 +28,7 @@ use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{PropertyStatData, StatsView};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const OUTPUT_BATCH_SIZE: usize = 1024;
 const DEFAULT_MAX_PREDICATE_ROWS: u64 = 10_000_000;
@@ -259,11 +262,17 @@ struct RawEdgeRow {
 ///   per-ledger and doesn't fit `EncodedLit`) still have `(o_type, o_key)` as
 ///   their full term identity within one store view: `o_key` is the interned
 ///   lexical form and `o_type` names the datatype. Every relation in one
-///   operator is scanned from the one `(ctx.binary_store, ctx.binary_g_id)`
-///   pair — the fast path never opens multi-ledger (`allow_cursor_fast_path`)
-///   — so a per-ledger id never meets another ledger's. These rows decode at
-///   emit ([`EncObj::to_binding`]) into the same materialized `Binding::Lit`
-///   the fallback scan produces, so nothing per-ledger leaves the operator.
+///   operator is scanned through one store: one graph, or the graphs of one
+///   ledger that [`IndexScope::Union`] certifies share it and its dictionary
+///   novelty — the lane never opens over several ledgers — so a per-ledger id
+///   never meets another ledger's. These rows decode at emit
+///   ([`EncObj::to_binding`]) into the same materialized `Binding::Lit` the
+///   fallback scan produces, so nothing per-ledger leaves the operator.
+///
+/// Across graphs the keys stay one term each except for the arena-backed
+/// o_types (NumBig, vector), whose `o_key` is a handle into a per-graph,
+/// per-predicate arena; the lane declines those over several graphs
+/// ([`is_arena_o_type`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum EncIdentity {
     Ref(u64),
@@ -413,6 +422,93 @@ impl EncObj {
             None,
         ))
     }
+
+    /// The decoded `Binding` an eager scan builds for this object, which is
+    /// what a member of a default graph of several graphs emits: the value
+    /// through `view`, then [`materialized_object_binding`].
+    fn decoded_binding(self, view: &BinaryGraphView) -> Result<Binding> {
+        let val = view
+            .decode_value(self.o_type, self.o_key, self.p_id)
+            .map_err(|e| {
+                QueryError::dictionary_lookup(format!(
+                    "cyclic bgp emit decode: o_type={}, o_key={}, p_id={}: {e}",
+                    self.o_type, self.o_key, self.p_id
+                ))
+            })?;
+        Ok(materialized_object_binding(
+            view.store(),
+            self.o_type,
+            self.p_id,
+            val,
+            None,
+            None,
+        ))
+    }
+}
+
+/// The decoded `Binding` an eager scan builds for a subject: its `Sid`
+/// through `view`, which memoizes it, so a vertex that closes many cycles is
+/// looked up once per open.
+fn decoded_subject(view: &BinaryGraphView, s_id: u64) -> Result<Binding> {
+    view.resolve_subject_sid(s_id)
+        .map(Binding::sid)
+        .map_err(|e| QueryError::from_io("resolve_subject_sid", e))
+}
+
+/// Whether `o_type`'s `o_key` is a handle into a per-graph, per-predicate
+/// arena (NumBig, vector; spatial, which no reader decodes yet), so that
+/// equal keys in two graphs need not be one value.
+fn is_arena_o_type(o_type: u16) -> bool {
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::NumBigArena | DecodeKind::VectorArena | DecodeKind::SpatialArena
+    )
+}
+
+/// Sort `rows` by `(subject, object)` and drop repeats: the set of an edge's
+/// rows over a default graph of several graphs, which the fallback's
+/// `BatchDeduper` also keeps once each, list index or not. Each member's rows
+/// arrive grouped by subject, and a full scan of a ref predicate arrives
+/// sorted, so the stable sort's run detection merges the members' runs
+/// rather than sorting from scratch.
+fn set_union<O: Ord>(rows: &mut Vec<(u64, O)>) {
+    rows.sort();
+    rows.dedup();
+}
+
+/// One graph a relation load reads: the member, and the context its cursors
+/// run under, which carries that graph's novelty and `t` (for a member of a
+/// default graph of several graphs, the context `DatasetOperator` gives it).
+/// `probe_ops` holds the member's resolved novelty per edge once probes are
+/// planned ([`CyclicBgpOperator::plan_probes`]).
+struct MemberRead<'c, 'a> {
+    ctx: &'c ExecutionContext<'a>,
+    member: IndexMember<'c>,
+    probe_ops: Vec<Option<SharedOverlayOps>>,
+}
+
+impl<'c, 'a> MemberRead<'c, 'a> {
+    fn new(ctx: &'c ExecutionContext<'a>, member: IndexMember<'c>) -> Self {
+        Self {
+            ctx,
+            member,
+            probe_ops: Vec::new(),
+        }
+    }
+}
+
+/// How the lane's rows leave it.
+enum Emit {
+    /// One graph: the encoded bindings that graph's scan emits. The view
+    /// decodes the string-dictionary objects that have no encoded form
+    /// (EncodedObject mode only).
+    Encoded(Option<BinaryGraphView>),
+    /// A default graph of several graphs: the decoded bindings
+    /// `DatasetOperator`'s members emit there, since that scope has no graph
+    /// view to decode an encoded id against downstream. The view reads only
+    /// the ledger-wide dictionaries (subjects, strings): the arena types it
+    /// could not decode are declined while loading.
+    Decoded(BinaryGraphView),
 }
 
 /// Relation index over subject-grouped `(subject, object)` edge rows.
@@ -561,9 +657,14 @@ struct EncodedSquareWedgeState {
     current: Option<EncodedProbeWedgeCursor>,
 }
 
-/// Routing stamp of the cyclic-join lane, recorded at open: `proceed` when the
-/// lane answers, a fallback when the generic join plan does.
+/// Routing stamp of the cyclic-join lane over one graph, recorded at open:
+/// `proceed` when the lane answers, a fallback when the generic join plan does.
 pub(crate) const CYCLIC_BGP_SITE: &str = "cyclic_bgp";
+
+/// Routing stamp of the cyclic-join lane over a default graph of several
+/// graphs of one ledger, or of none ([`IndexScope::Union`],
+/// [`IndexScope::Empty`]), recorded at open. Its fallbacks say why.
+pub(crate) const CYCLIC_BGP_UNION_SITE: &str = "cyclic_bgp_union";
 
 pub(crate) struct CyclicBgpOperator {
     plan: CyclicBgpPlan,
@@ -583,14 +684,29 @@ pub(crate) struct CyclicBgpOperator {
     used_fast_path: bool,
     raw_relation_rows: usize,
     pruned_relation_rows: usize,
-    /// Emit-side decoder for non-reserved string-dictionary objects
-    /// (novelty-aware). Set when the encoded fast path opens; `None` in
-    /// RefOnly mode and on the fallback path.
-    emit_view: Option<BinaryGraphView>,
+    /// How many graphs the lane reads: 1, or a union's members; 0 before open
+    /// and over a default graph of none.
+    graphs: usize,
+    /// How rows leave the lane. Set when the fast path opens; `Encoded(None)`
+    /// in one-graph RefOnly mode and on the fallback path.
+    emit: Emit,
+    /// The first reason the lane stood down, stamped on the union site.
+    decline: OnceLock<FastPathFallback>,
 }
 
 impl CyclicBgpOperator {
     fn log_fast_path_bail(&self, reason: &'static str, edge: Option<&CyclicEdge>) {
+        self.decline_with(FastPathFallback::GateDeclined, reason, edge);
+    }
+
+    /// Stand the lane down for `fallback`, logging `reason`.
+    fn decline_with(
+        &self,
+        fallback: FastPathFallback,
+        reason: &'static str,
+        edge: Option<&CyclicEdge>,
+    ) {
+        let _ = self.decline.set(fallback);
         tracing::debug!(
             reason,
             shape = self.plan.shape_name(),
@@ -643,7 +759,9 @@ impl CyclicBgpOperator {
             used_fast_path: false,
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
-            emit_view: None,
+            graphs: 0,
+            emit: Emit::Encoded(None),
+            decline: OnceLock::new(),
         }
     }
 
@@ -670,9 +788,34 @@ impl CyclicBgpOperator {
         }
     }
 
+    /// The predicate's id in the member's store: `Ok(None)` for no rows (a
+    /// predicate the store and the member's novelty both lack), `Err(())`
+    /// when the lane must stand down (a predicate only novelty holds, which
+    /// has no base rows to scan).
+    fn member_p_id(
+        &self,
+        read: &MemberRead<'_, '_>,
+        edge: &CyclicEdge,
+    ) -> Result<std::result::Result<Option<(fluree_db_core::Sid, u32)>, ()>> {
+        let store = read.member.store();
+        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
+        Ok(match store.sid_to_p_id(&pred_sid) {
+            Some(p_id) => Ok(Some((pred_sid, p_id))),
+            None if overlay_carries_novelty(read.member.overlay()) => {
+                self.decline_with(
+                    FastPathFallback::Novelty,
+                    "novelty-only-predicate",
+                    Some(edge),
+                );
+                Err(())
+            }
+            None => Ok(None),
+        })
+    }
+
     fn scan_ref_relation(
         &self,
-        ctx: &ExecutionContext<'_>,
+        read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
     ) -> Result<Option<Vec<(u64, u64)>>> {
         let span = tracing::debug_span!(
@@ -682,22 +825,16 @@ impl CyclicBgpOperator {
             rows = tracing::field::Empty,
         );
         let _guard = span.enter();
-        let Some(store) = ctx.binary_store.as_ref() else {
-            self.log_fast_path_bail("missing-binary-store", Some(edge));
-            return Ok(None);
-        };
-        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-            if crate::fast_path_common::overlay_has_novelty(ctx) {
-                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
-                return Ok(None);
-            }
-            return Ok(Some(Vec::new()));
+        let store = read.member.store();
+        let (pred_sid, p_id) = match self.member_p_id(read, edge)? {
+            Ok(Some(pred)) => pred,
+            Ok(None) => return Ok(Some(Vec::new())),
+            Err(()) => return Ok(None),
         };
         let mut cursor = match build_psot_cursor_for_predicate(
-            ctx,
+            read.ctx,
             store,
-            ctx.binary_g_id,
+            read.member.g_id(),
             pred_sid,
             p_id,
             cursor_projection_sid_otype_okey(),
@@ -733,7 +870,7 @@ impl CyclicBgpOperator {
 
     fn scan_relation(
         &self,
-        ctx: &ExecutionContext<'_>,
+        read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
     ) -> Result<Option<Vec<(u64, EncObj)>>> {
         let span = tracing::debug_span!(
@@ -743,22 +880,16 @@ impl CyclicBgpOperator {
             rows = tracing::field::Empty,
         );
         let _guard = span.enter();
-        let Some(store) = ctx.binary_store.as_ref() else {
-            self.log_fast_path_bail("missing-binary-store", Some(edge));
-            return Ok(None);
-        };
-        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-            if crate::fast_path_common::overlay_has_novelty(ctx) {
-                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
-                return Ok(None);
-            }
-            return Ok(Some(Vec::new()));
+        let store = read.member.store();
+        let (pred_sid, p_id) = match self.member_p_id(read, edge)? {
+            Ok(Some(pred)) => pred,
+            Ok(None) => return Ok(Some(Vec::new())),
+            Err(()) => return Ok(None),
         };
         let mut cursor = match build_psot_cursor_for_predicate(
-            ctx,
+            read.ctx,
             store,
-            ctx.binary_g_id,
+            read.member.g_id(),
             pred_sid,
             p_id,
             cursor_projection_sid_otype_okey(),
@@ -789,8 +920,29 @@ impl CyclicBgpOperator {
                 }
             }
         }
+        self.encode_raw_rows(edge, raw_rows, &span)
+    }
+
+    /// Encode a relation's raw rows for the join, or `None` (logged) for a
+    /// row it cannot carry: an object the edge's mode cannot bind, or, over
+    /// several graphs, an arena-backed object, whose key names a value only
+    /// in its own graph.
+    fn encode_raw_rows(
+        &self,
+        edge: &CyclicEdge,
+        raw_rows: Vec<RawEdgeRow>,
+        span: &tracing::Span,
+    ) -> Result<Option<Vec<(u64, EncObj)>>> {
         let mut rows = Vec::with_capacity(raw_rows.len());
         for raw in raw_rows {
+            if self.graphs > 1 && is_arena_o_type(raw.o_type) {
+                self.decline_with(
+                    FastPathFallback::ArenaType,
+                    "arena-object-over-several-graphs",
+                    Some(edge),
+                );
+                return Ok(None);
+            }
             let Some(object) = self.encode_object_for_edge(edge, raw) else {
                 self.log_fast_path_bail("unsupported-object-binding", Some(edge));
                 return Ok(None);
@@ -807,7 +959,7 @@ impl CyclicBgpOperator {
     /// probed subject).
     fn scan_relation_for_subjects(
         &self,
-        ctx: &ExecutionContext<'_>,
+        read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
         subjects: &FxHashSet<u64>,
         overlay_ops: Option<&SharedOverlayOps>,
@@ -820,17 +972,11 @@ impl CyclicBgpOperator {
             rows = tracing::field::Empty,
         );
         let _guard = span.enter();
-        let Some(store) = ctx.binary_store.as_ref() else {
-            self.log_fast_path_bail("missing-binary-store", Some(edge));
-            return Ok(None);
-        };
-        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-            if crate::fast_path_common::overlay_has_novelty(ctx) {
-                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
-                return Ok(None);
-            }
-            return Ok(Some(Vec::new()));
+        let store = read.member.store();
+        let p_id = match self.member_p_id(read, edge)? {
+            Ok(Some((_, p_id))) => p_id,
+            Ok(None) => return Ok(Some(Vec::new())),
+            Err(()) => return Ok(None),
         };
 
         let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
@@ -839,7 +985,7 @@ impl CyclicBgpOperator {
         // One amortized monotonic pass over the predicate's PSOT leaves instead
         // of a fresh cursor per subject. None means the PSOT branch is
         // unavailable, never "no rows" — decline rather than dropping rows.
-        let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, ctx.binary_g_id, p_id)
+        let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, read.member.g_id(), p_id)
         else {
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
             return Ok(None);
@@ -882,16 +1028,7 @@ impl CyclicBgpOperator {
             }
         }
 
-        let mut rows = Vec::with_capacity(raw_rows.len());
-        for raw in raw_rows {
-            let Some(object) = self.encode_object_for_edge(edge, raw) else {
-                self.log_fast_path_bail("unsupported-object-binding", Some(edge));
-                return Ok(None);
-            };
-            rows.push((raw.subject, object));
-        }
-        span.record("rows", rows.len() as u64);
-        Ok(Some(rows))
+        self.encode_raw_rows(edge, raw_rows, &span)
     }
 
     /// O(1) upper bound on the frontier size for `var`: the smallest distinct
@@ -1018,7 +1155,7 @@ impl CyclicBgpOperator {
     /// probed subject).
     fn scan_ref_relation_for_subjects(
         &self,
-        ctx: &ExecutionContext<'_>,
+        read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
         subjects: &FxHashSet<u64>,
         overlay_ops: Option<&SharedOverlayOps>,
@@ -1031,17 +1168,11 @@ impl CyclicBgpOperator {
             rows = tracing::field::Empty,
         );
         let _guard = span.enter();
-        let Some(store) = ctx.binary_store.as_ref() else {
-            self.log_fast_path_bail("missing-binary-store", Some(edge));
-            return Ok(None);
-        };
-        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-            if crate::fast_path_common::overlay_has_novelty(ctx) {
-                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
-                return Ok(None);
-            }
-            return Ok(Some(Vec::new()));
+        let store = read.member.store();
+        let p_id = match self.member_p_id(read, edge)? {
+            Ok(Some((_, p_id))) => p_id,
+            Ok(None) => return Ok(Some(Vec::new())),
+            Err(()) => return Ok(None),
         };
 
         let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
@@ -1050,7 +1181,7 @@ impl CyclicBgpOperator {
         // One amortized monotonic pass over the predicate's PSOT leaves instead
         // of a fresh cursor per subject. None means the PSOT branch is
         // unavailable, never "no rows" — decline rather than dropping rows.
-        let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, ctx.binary_g_id, p_id)
+        let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, read.member.g_id(), p_id)
         else {
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
             return Ok(None);
@@ -1101,30 +1232,217 @@ impl CyclicBgpOperator {
         Ok(Some(rows))
     }
 
-    fn open_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        if !allow_cursor_fast_path(ctx) {
+    /// Open the lane over the scope `ctx` reads, or decline: the site to
+    /// stamp and its outcome.
+    ///
+    /// - [`IndexScope::One`]: the one-graph lane, its site and behavior
+    ///   unchanged.
+    /// - [`IndexScope::Union`]: the union variant ([`Self::open_union`]).
+    /// - [`IndexScope::Empty`]: the union variant answers nothing, reading no
+    ///   index.
+    ///
+    /// The union variant sits behind the fast-path kill switch, so the
+    /// general plan stays a differential oracle for it; the one-graph lane
+    /// does not, as before.
+    fn open_fast_path(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<(&'static str, FastPathOutcome)> {
+        let scope = ctx.index_scope();
+        if let Some(IndexScope::One(member)) = scope {
+            self.graphs = 1;
+            let mut reads = [MemberRead::new(ctx, member)];
+            let fast = self.open_reads(ctx, &mut reads)?;
+            return Ok((
+                CYCLIC_BGP_SITE,
+                proceed_if(fast, FastPathFallback::GateDeclined),
+            ));
+        }
+        if !matches!(ctx.scope_kind(), ScopeKind::Union | ScopeKind::Empty) {
             self.log_fast_path_bail("context-unsupported", None);
-            return Ok(false);
+            return Ok((
+                CYCLIC_BGP_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            ));
+        }
+        if crate::execute::fast_paths_disabled() {
+            return Ok((
+                CYCLIC_BGP_UNION_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+            ));
+        }
+        let outcome = match scope {
+            Some(IndexScope::Union(set)) => self.open_union(ctx, &set)?,
+            Some(IndexScope::Empty) => {
+                // A default graph of none holds no edges.
+                self.used_fast_path = true;
+                FastPathOutcome::Proceed
+            }
+            _ => {
+                self.log_fast_path_bail("context-unsupported", None);
+                // No index scope for the default graph of several graphs: a
+                // policy that filters, a history range, no store, or members
+                // that do not share this store and its dictionary novelty.
+                let shared_store_only =
+                    ctx.binary_store.is_some() && !ctx.is_history_range() && ctx.allow_unfiltered();
+                FastPathOutcome::Fallback(if shared_store_only {
+                    FastPathFallback::StoreMismatch
+                } else {
+                    FastPathFallback::GateDeclined
+                })
+            }
+        };
+        Ok((CYCLIC_BGP_UNION_SITE, outcome))
+    }
+
+    /// The union variant over a default graph of several graphs of one
+    /// ledger: every edge's relation is read from each member, under the
+    /// context `DatasetOperator` gives that member (its graph, novelty and
+    /// `t`), and kept as a set ([`set_union`]), which is what the general
+    /// plan's per-pattern `BatchDeduper` keeps. A triangle over set-valued
+    /// relations is itself a set: each solution fixes the one row each edge
+    /// contributes.
+    fn open_union(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        set: &MemberSet<'_>,
+    ) -> Result<FastPathOutcome> {
+        let store_mismatch = |op: &Self, reason| {
+            op.decline_with(FastPathFallback::StoreMismatch, reason, None);
+            Ok(FastPathOutcome::Fallback(FastPathFallback::StoreMismatch))
+        };
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return store_mismatch(self, "union-without-member-graphs");
+        };
+        if graphs.len() != set.members().len() {
+            return store_mismatch(self, "union-member-count");
+        }
+        let member_ctxs: Vec<ExecutionContext<'_>> =
+            graphs.iter().map(|g| ctx.with_graph_ref(g)).collect();
+        let mut reads = Vec::with_capacity(member_ctxs.len());
+        for (member_ctx, certified) in member_ctxs.iter().zip(set.members()) {
+            // Each member reads one graph through the union's store, as the
+            // scope certified it.
+            match member_ctx.index_scope() {
+                Some(IndexScope::One(member))
+                    if Arc::ptr_eq(member.store(), set.store())
+                        && member.g_id() == certified.g_id()
+                        && member.to_t() == certified.to_t() =>
+                {
+                    reads.push(MemberRead::new(member_ctx, member));
+                }
+                _ => return store_mismatch(self, "union-member-outside-its-store"),
+            }
+        }
+        // Novelty is translated per member. The ids translation mints for
+        // datatypes only novelty holds come from the runtime dictionaries, so
+        // the members' encoded objects compare only through one set of them.
+        let novelty = reads
+            .iter()
+            .any(|read| overlay_carries_novelty(read.member.overlay()));
+        let dicts = |read: &MemberRead<'_, '_>| {
+            read.ctx
+                .runtime_small_dicts
+                .map(|d| d as *const fluree_db_core::RuntimeSmallDicts)
+        };
+        if novelty && !reads.windows(2).all(|w| dicts(&w[0]) == dicts(&w[1])) {
+            return store_mismatch(self, "union-members-runtime-dicts");
         }
 
+        self.graphs = reads.len();
+        // Subjects and strings are ledger-wide, so one view serves every
+        // member; the member's graph only names the view.
+        self.emit = Emit::Decoded(
+            set.store()
+                .graph_with_novelty(reads[0].member.g_id(), reads[0].ctx.dict_novelty.clone())
+                .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                .with_tracker(ctx.tracker.clone()),
+        );
+        let fast = self.open_reads(ctx, &mut reads)?;
+        let reason = self
+            .decline
+            .get()
+            .copied()
+            .unwrap_or(FastPathFallback::GateDeclined);
+        Ok(proceed_if(fast, reason))
+    }
+
+    /// Load the relations over `reads` and plan the join, in the plan's mode.
+    fn open_reads(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        reads: &mut [MemberRead<'_, '_>],
+    ) -> Result<bool> {
         match self.join_mode {
-            CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx),
+            CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx, reads),
             CyclicJoinMode::EncodedObject => {
-                // Emit-side decoder for string-dictionary objects: same view
-                // construction as `ExecutionContext::graph_view`, against the
-                // one `(store, g_id)` pair the relation scans below read.
-                self.emit_view = ctx.binary_store.as_ref().map(|store| {
-                    store
-                        .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
-                        .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-                        .with_tracker(ctx.tracker.clone())
-                });
-                self.open_encoded_fast_path(ctx)
+                if let Emit::Encoded(view) = &mut self.emit {
+                    // Emit-side decoder for string-dictionary objects: same
+                    // view construction as `ExecutionContext::graph_view`,
+                    // against the one graph the relation scans below read.
+                    let member = &reads[0].member;
+                    *view = Some(
+                        member
+                            .store()
+                            .graph_with_novelty(member.g_id(), ctx.dict_novelty.clone())
+                            .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                            .with_tracker(ctx.tracker.clone()),
+                    );
+                }
+                self.open_encoded_fast_path(ctx, reads)
             }
         }
     }
 
-    /// Per-edge probe eligibility under the active overlay.
+    /// The relation of `edge` over `reads`, each read by `scan`: one graph's
+    /// rows as its scan gives them, several graphs' as a set. `None` when a
+    /// scan declines, or when the set passes the row cap.
+    fn load_relation<O: Ord>(
+        &self,
+        reads: &[MemberRead<'_, '_>],
+        edge: &CyclicEdge,
+        mut scan: impl FnMut(&MemberRead<'_, '_>) -> Result<Option<Vec<(u64, O)>>>,
+    ) -> Result<Option<Vec<(u64, O)>>> {
+        let mut rows: Vec<(u64, O)> = Vec::new();
+        for read in reads {
+            let Some(part) = scan(read)? else {
+                return Ok(None);
+            };
+            if rows.is_empty() {
+                rows = part;
+            } else {
+                rows.extend(part);
+            }
+        }
+        if reads.len() > 1 {
+            set_union(&mut rows);
+            if rows.len() as u64 > max_predicate_rows() {
+                self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
+                return Ok(None);
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    /// Plan each member's probes ([`Self::compute_probe_overlay_state`]),
+    /// keeping its ops in its read. Probes run only if every member allows
+    /// them; the second value is each edge's novelty rows over all members,
+    /// which the probe gate counts as scan cost.
+    fn plan_probes(&self, reads: &mut [MemberRead<'_, '_>]) -> Result<(bool, Vec<u64>)> {
+        let mut allowed = true;
+        let mut novelty_rows = vec![0u64; self.plan.edges.len()];
+        for read in reads.iter_mut() {
+            let (member_allowed, ops) = self.compute_probe_overlay_state(read)?;
+            allowed &= member_allowed;
+            for (rows, ops) in novelty_rows.iter_mut().zip(&ops) {
+                *rows += ops.as_ref().map_or(0, |ops| ops.len() as u64);
+            }
+            read.probe_ops = ops;
+        }
+        Ok((allowed, novelty_rows))
+    }
+
+    /// Per-edge probe eligibility under one member's overlay.
     ///
     /// Overlay-free HEAD keeps plain probes everywhere (`ops = None` for
     /// every edge). With novelty present, probing stays allowed when every
@@ -1136,22 +1454,20 @@ impl CyclicBgpOperator {
     /// the seek reads latest base state with no replay.
     fn compute_probe_overlay_state(
         &self,
-        ctx: &ExecutionContext<'_>,
+        read: &MemberRead<'_, '_>,
     ) -> Result<(bool, Vec<Option<SharedOverlayOps>>)> {
         let n = self.plan.edges.len();
-        if fast_path_store(ctx).is_some() {
+        if read.member.index_is_current() {
             return Ok((true, vec![None; n]));
         }
-        let Some(store) = ctx.binary_store.as_ref() else {
-            return Ok((false, vec![None; n]));
-        };
-        if ctx.to_t < store.max_t() {
+        let store = read.member.store();
+        if read.member.to_t() < store.max_t() {
             return Ok((false, vec![None; n]));
         }
         let mut ops_per_edge = Vec::with_capacity(n);
         for edge in self.plan.edges.iter() {
             let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
-            match subject_probe_lane_plan(ctx, store, &pred_sid)? {
+            match subject_probe_lane_plan(read.ctx, store, &pred_sid)? {
                 ProbeLanePlan::Clean => ops_per_edge.push(None),
                 ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
                 ProbeLanePlan::Decline => {
@@ -1173,7 +1489,7 @@ impl CyclicBgpOperator {
     fn select_bounded_probe(
         &self,
         remaining: &[usize],
-        edge_probe_ops: &[Option<SharedOverlayOps>],
+        novelty_rows: &[u64],
         size_bound: impl Fn(VarId) -> Option<usize>,
         materialize_frontier: impl Fn(VarId) -> Option<FxHashSet<u64>>,
     ) -> Option<(usize, FxHashSet<u64>)> {
@@ -1212,10 +1528,7 @@ impl CyclicBgpOperator {
             // Stats exclude novelty; count the edge's overlay ops into the
             // scan-cost side so novelty-heavy edges don't look cheaper to
             // scan than they are.
-            let estimate = estimate
-                + edge_probe_ops[edge_idx]
-                    .as_ref()
-                    .map_or(0, |ops| ops.len() as u64);
+            let estimate = estimate + novelty_rows[edge_idx];
             if !should_probe_edge(frontier.len(), Some(estimate)) {
                 tracing::debug!(
                     predicate = ?edge.predicate,
@@ -1278,14 +1591,16 @@ impl CyclicBgpOperator {
         })
     }
 
-    fn open_ref_fast_path_parallel(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
+    fn open_ref_fast_path_parallel(&mut self, reads: &[MemberRead<'_, '_>]) -> Result<bool> {
         tracing::debug!(
             edges = self.plan.edges.len(),
             "cyclic cascade: parallel full scan of all edges (no probe can engage)"
         );
         let edges: Vec<CyclicEdge> = self.plan.edges.to_vec();
         let results = parallel_map_pooled(edges, |edge| {
-            Ok(self.scan_ref_relation(ctx, &edge)?.map(|rows| {
+            let rows =
+                self.load_relation(reads, &edge, |read| self.scan_ref_relation(read, &edge))?;
+            Ok(rows.map(|rows| {
                 let span = tracing::debug_span!(
                     "cyclic_index_build",
                     predicate = %predicate_display(&edge.predicate),
@@ -1320,14 +1635,15 @@ impl CyclicBgpOperator {
         Ok(true)
     }
 
-    fn open_encoded_fast_path_parallel(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
+    fn open_encoded_fast_path_parallel(&mut self, reads: &[MemberRead<'_, '_>]) -> Result<bool> {
         tracing::debug!(
             edges = self.plan.edges.len(),
             "cyclic cascade: parallel full scan of all edges (no probe can engage)"
         );
         let edges: Vec<CyclicEdge> = self.plan.edges.to_vec();
         let results = parallel_map_pooled(edges, |edge| {
-            Ok(self.scan_relation(ctx, &edge)?.map(|rows| {
+            let rows = self.load_relation(reads, &edge, |read| self.scan_relation(read, &edge))?;
+            Ok(rows.map(|rows| {
                 let span = tracing::debug_span!(
                     "cyclic_index_build",
                     predicate = %predicate_display(&edge.predicate),
@@ -1369,15 +1685,20 @@ impl CyclicBgpOperator {
     /// frontier and the probe-vs-scan gate passes) or fall back to a full scan
     /// of the cheapest remaining edge. Probed relations are subject-restricted
     /// semi-joins; `prune_relations` re-establishes global consistency after.
-    fn open_ref_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        let (probing_allowed, edge_probe_ops) = self.compute_probe_overlay_state(ctx)?;
+    fn open_ref_fast_path(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        reads: &mut [MemberRead<'_, '_>],
+    ) -> Result<bool> {
+        let (probing_allowed, novelty_rows) = self.plan_probes(reads)?;
+        let reads: &[MemberRead<'_, '_>] = reads;
         if !probing_allowed {
             tracing::debug!(
                 "cyclic cascade: bounded probes disabled (off-HEAD or overlay unmergeable)"
             );
         }
         if self.parallel_scan_eligible(probing_allowed) {
-            return self.open_ref_fast_path_parallel(ctx);
+            return self.open_ref_fast_path_parallel(reads);
         }
         let mut remaining: Vec<usize> = (0..self.plan.edges.len()).collect();
         let mut relations: Vec<RefRelationIndex> = Vec::with_capacity(remaining.len());
@@ -1389,7 +1710,7 @@ impl CyclicBgpOperator {
             let probe = if probing_allowed && !relations.is_empty() {
                 self.select_bounded_probe(
                     &remaining,
-                    &edge_probe_ops,
+                    &novelty_rows,
                     |var| Self::ref_frontier_size_bound(&relations, var),
                     |var| Self::ref_frontier_for_var(&relations, var),
                 )
@@ -1405,15 +1726,18 @@ impl CyclicBgpOperator {
                         frontier = frontier.len(),
                         "cyclic cascade: probing edge per-subject"
                     );
+                    let edge_idx = remaining[pos];
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
-                        match self.scan_ref_relation_for_subjects(
-                            ctx,
-                            edge,
-                            &frontier,
-                            edge_probe_ops[remaining[pos]].as_ref(),
-                        )? {
+                        match self.load_relation(reads, edge, |read| {
+                            self.scan_ref_relation_for_subjects(
+                                read,
+                                edge,
+                                &frontier,
+                                read.probe_ops[edge_idx].as_ref(),
+                            )
+                        })? {
                             Some(rows) => rows,
                             None => return Ok(false),
                         }
@@ -1429,7 +1753,9 @@ impl CyclicBgpOperator {
                         estimate = edge.estimate.unwrap_or(0),
                         "cyclic cascade: full-scanning edge"
                     );
-                    let rows = match self.scan_ref_relation(ctx, edge)? {
+                    let rows = match self
+                        .load_relation(reads, edge, |read| self.scan_ref_relation(read, edge))?
+                    {
                         Some(rows) => rows,
                         None => return Ok(false),
                     };
@@ -1471,15 +1797,20 @@ impl CyclicBgpOperator {
         Ok(true)
     }
 
-    fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        let (probing_allowed, edge_probe_ops) = self.compute_probe_overlay_state(ctx)?;
+    fn open_encoded_fast_path(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        reads: &mut [MemberRead<'_, '_>],
+    ) -> Result<bool> {
+        let (probing_allowed, novelty_rows) = self.plan_probes(reads)?;
+        let reads: &[MemberRead<'_, '_>] = reads;
         if !probing_allowed {
             tracing::debug!(
                 "cyclic cascade: bounded probes disabled (off-HEAD or overlay unmergeable)"
             );
         }
         if self.parallel_scan_eligible(probing_allowed) {
-            return self.open_encoded_fast_path_parallel(ctx);
+            return self.open_encoded_fast_path_parallel(reads);
         }
         let mut remaining: Vec<usize> = (0..self.plan.edges.len()).collect();
         let mut relations: Vec<RelationIndex> = Vec::with_capacity(remaining.len());
@@ -1491,7 +1822,7 @@ impl CyclicBgpOperator {
             let probe = if probing_allowed && !relations.is_empty() {
                 self.select_bounded_probe(
                     &remaining,
-                    &edge_probe_ops,
+                    &novelty_rows,
                     |var| Self::frontier_size_bound(&relations, var),
                     |var| self.frontier_for_var(&relations, var),
                 )
@@ -1507,15 +1838,18 @@ impl CyclicBgpOperator {
                         frontier = frontier.len(),
                         "cyclic cascade: probing edge per-subject"
                     );
+                    let edge_idx = remaining[pos];
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
-                        match self.scan_relation_for_subjects(
-                            ctx,
-                            edge,
-                            &frontier,
-                            edge_probe_ops[remaining[pos]].as_ref(),
-                        )? {
+                        match self.load_relation(reads, edge, |read| {
+                            self.scan_relation_for_subjects(
+                                read,
+                                edge,
+                                &frontier,
+                                read.probe_ops[edge_idx].as_ref(),
+                            )
+                        })? {
                             Some(rows) => rows,
                             None => return Ok(false),
                         }
@@ -1531,7 +1865,9 @@ impl CyclicBgpOperator {
                         estimate = edge.estimate.unwrap_or(0),
                         "cyclic cascade: full-scanning edge"
                     );
-                    let rows = match self.scan_relation(ctx, edge)? {
+                    let rows = match self
+                        .load_relation(reads, edge, |read| self.scan_relation(read, edge))?
+                    {
                         Some(rows) => rows,
                         None => return Ok(false),
                     };
@@ -2211,7 +2547,8 @@ impl CyclicBgpOperator {
     /// Materialize one fully-assigned row into the output columns. Vars that
     /// appear in subject position bind as plain `EncodedSid` (matching the
     /// scan path); object-only vars rebuild the late-materialized binding
-    /// (decoding non-reserved string-dict values through `emit_view`).
+    /// (decoding non-reserved string-dict values through the emit view).
+    /// Over several graphs both decode, as the members' scans do there.
     fn assignment_to_columns(
         &self,
         assignment: &[EncObj],
@@ -2221,13 +2558,18 @@ impl CyclicBgpOperator {
             let var = self.plan.vars[var_idx];
             let value = assignment[var_idx];
             let binding = if self.var_is_subject(var) {
-                Binding::encoded_sid(
-                    value
-                        .ref_s_id()
-                        .expect("subject-positioned cyclic vars only bind refs"),
-                )
+                let s_id = value
+                    .ref_s_id()
+                    .expect("subject-positioned cyclic vars only bind refs");
+                match &self.emit {
+                    Emit::Encoded(_) => Binding::encoded_sid(s_id),
+                    Emit::Decoded(view) => decoded_subject(view, s_id)?,
+                }
             } else {
-                value.to_binding(self.emit_view.as_ref())?
+                match &self.emit {
+                    Emit::Encoded(view) => value.to_binding(view.as_ref())?,
+                    Emit::Decoded(view) => value.decoded_binding(view)?,
+                }
             };
             cols[out_idx].push(binding);
         }
@@ -2359,10 +2701,19 @@ impl CyclicBgpOperator {
             .map_err(|e| QueryError::Internal(format!("cyclic bgp square wedge batch: {e}")))
     }
 
-    fn ref_assignment_to_columns(&self, assignment: &[u64], cols: &mut [Vec<Binding>]) {
+    fn ref_assignment_to_columns(
+        &self,
+        assignment: &[u64],
+        cols: &mut [Vec<Binding>],
+    ) -> Result<()> {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
-            cols[out_idx].push(Binding::encoded_sid(assignment[var_idx]));
+            let s_id = assignment[var_idx];
+            cols[out_idx].push(match &self.emit {
+                Emit::Encoded(_) => Binding::encoded_sid(s_id),
+                Emit::Decoded(view) => decoded_subject(view, s_id)?,
+            });
         }
+        Ok(())
     }
 
     fn next_ref_batch(&mut self) -> Result<Option<Batch>> {
@@ -2379,7 +2730,7 @@ impl CyclicBgpOperator {
                 if cols.is_empty() {
                     produced += 1;
                 } else {
-                    self.ref_assignment_to_columns(&assignment, &mut cols);
+                    self.ref_assignment_to_columns(&assignment, &mut cols)?;
                     produced += 1;
                 }
                 continue;
@@ -2449,6 +2800,15 @@ impl CyclicBgpOperator {
     }
 }
 
+/// `Proceed` when the lane opened, else a fallback for `reason`.
+fn proceed_if(fast: bool, reason: FastPathFallback) -> FastPathOutcome {
+    if fast {
+        FastPathOutcome::Proceed
+    } else {
+        FastPathOutcome::Fallback(reason)
+    }
+}
+
 fn average_bucket_size(rows: usize, distinct: usize) -> usize {
     if rows == 0 {
         0
@@ -2488,6 +2848,10 @@ impl Operator for CyclicBgpOperator {
         m.insert("max-predicate-rows".into(), max_predicate_rows().into());
         m.insert("object-only-values".into(), self.join_mode.as_str().into());
         m.insert("pruning".into(), "semi_join".into());
+        if self.graphs > 1 {
+            m.insert("default-graph-members".into(), self.graphs.into());
+            m.insert("relations".into(), "set_union".into());
+        }
         m.insert("driver-selection".into(), "pruned_bound_fanout".into());
         if let Some(state) = &self.square_wedge {
             m.insert("square-strategy".into(), "wedge_pair_hash".into());
@@ -2558,18 +2922,9 @@ impl Operator for CyclicBgpOperator {
                 "CyclicBgpOperator::open() called in invalid state".into(),
             ));
         }
-        let fast = self.open_fast_path(ctx)?;
-        crate::fast_path_outcome::stamp_fast_path(
-            CYCLIC_BGP_SITE,
-            if fast {
-                crate::fast_path_outcome::FastPathOutcome::Proceed
-            } else {
-                crate::fast_path_outcome::FastPathOutcome::Fallback(
-                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
-                )
-            },
-        );
-        if fast {
+        let (site, outcome) = self.open_fast_path(ctx)?;
+        crate::fast_path_outcome::stamp_fast_path(site, outcome);
+        if outcome == FastPathOutcome::Proceed {
             self.state = OperatorState::Open;
             return Ok(());
         }
@@ -2610,7 +2965,7 @@ impl Operator for CyclicBgpOperator {
         self.pending.clear();
         self.square_wedge = None;
         self.probed_edges = 0;
-        self.emit_view = None;
+        self.emit = Emit::Encoded(None);
         self.state = OperatorState::Closed;
     }
 }
@@ -3043,5 +3398,76 @@ mod tests {
         let remaining = vec![0, 2];
         let pos = CyclicBgpOperator::cheapest_remaining(&edges, &remaining);
         assert_eq!(remaining[pos], 2);
+    }
+
+    /// Over several graphs an edge's rows are a set: a row two members hold,
+    /// or one member holds twice as list items, is kept once. Every index
+    /// over the set then agrees on that row's multiplicity; over the bag the
+    /// pair test (`contains_pair`) counted it once while the subject and
+    /// object scans counted it twice.
+    #[test]
+    fn set_union_keeps_each_edge_once_across_and_within_members() {
+        let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
+        let op = operator_for(&triples);
+        let edge = &op.plan.edges[0];
+        // Member one holds (1, 2) as two list items and (1, 3); member two
+        // holds (1, 2) again and (4, 5).
+        let bag = [(1, 2), (1, 2), (1, 3), (1, 2), (4, 5)];
+        let mut rows = bag.to_vec();
+        set_union(&mut rows);
+        assert_eq!(rows, vec![(1, 2), (1, 3), (4, 5)]);
+
+        let rel = ref_rel(edge, &rows);
+        assert_eq!(rel.subject_rows(1).iter().filter(|r| r.1 == 2).count(), 1);
+        assert_eq!(rel.object_subjects(&2).filter(|&s| s == 1).count(), 1);
+        assert!(rel.contains_pair(1, &2));
+
+        // The bag's indexes disagree on it, which the set removes.
+        let rel = ref_rel(edge, &bag);
+        assert_eq!(rel.subject_rows(1).iter().filter(|r| r.1 == 2).count(), 3);
+        assert_eq!(rel.object_subjects(&2).filter(|&s| s == 1).count(), 3);
+    }
+
+    /// Encoded objects are kept once per term: equal identity collapses,
+    /// while a string and a ref that share an `o_key` stay two terms.
+    #[test]
+    fn set_union_of_encoded_objects_keys_on_term_identity() {
+        let string = |o_key| {
+            EncObj::encode(OType::XSD_STRING.as_u16(), o_key, 7).expect("xsd:string encodes")
+        };
+        let mut rows = vec![
+            (1, string(10)),
+            (1, EncObj::from_ref(10)),
+            (1, string(10)),
+            (1, EncObj::from_ref(10)),
+        ];
+        set_union(&mut rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, o)| o.ref_s_id() == Some(10))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn arena_o_types_are_the_per_graph_handles() {
+        for arena in [
+            OType::VECTOR,
+            OType::NUM_BIG_OVERFLOW,
+            OType::from_u16(0x800C),
+        ] {
+            assert!(is_arena_o_type(arena.as_u16()), "{arena:?}");
+        }
+        for ledger_wide in [
+            OType::IRI_REF,
+            OType::XSD_STRING,
+            OType::XSD_INTEGER,
+            OType::BLANK_NODE,
+            OType::from_u16(0x8008),
+        ] {
+            assert!(!is_arena_o_type(ledger_wide.as_u16()), "{ledger_wide:?}");
+        }
     }
 }
