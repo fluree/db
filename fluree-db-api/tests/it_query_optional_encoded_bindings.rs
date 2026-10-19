@@ -1814,21 +1814,23 @@ async fn partitioned_group_by_reads_one_graph() {
     failures.assert_none();
 }
 
-/// A cyclic BGP (the cyclic-join lane). Cycle a→b→c→a spans all three
-/// graphs; cycle p→q→r→p lies inside g2. The one-graph lane read
-/// `binary_g_id`'s graph alone: nothing over the union (whose `binary_g_id` is
-/// the default graph's), and nothing under `FROM g3 + g2`. It answers one
-/// graph only; its union variant answers a default graph of several graphs,
-/// or of none.
+/// Cycle a→b→c→a spans all three graphs; cycle p→q→r→p lies inside g2.
+const CYCLIC_LANE_TRIG: &str = r"
+    @prefix ex: <http://example.org/> .
+    ex:a ex:knows ex:b .
+    GRAPH <urn:g2> { ex:b ex:knows ex:c . ex:p ex:knows ex:q . ex:q ex:knows ex:r . ex:r ex:knows ex:p . }
+    GRAPH <urn:g3> { ex:c ex:knows ex:a . }
+";
+
+/// A cyclic BGP (the cyclic-join lane) over [`CYCLIC_LANE_TRIG`]. The
+/// one-graph lane read `binary_g_id`'s graph alone: nothing over the union
+/// (whose `binary_g_id` is the default graph's), and nothing under
+/// `FROM g3 + g2`. It answers one graph only; its union variant answers a
+/// default graph of several graphs, or of none.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_lane_reads_one_graph() {
-    let trig = r"
-        @prefix ex: <http://example.org/> .
-        ex:a ex:knows ex:b .
-        GRAPH <urn:g2> { ex:b ex:knows ex:c . ex:p ex:knows ex:q . ex:q ex:knows ex:r . ex:r ex:knows ex:p . }
-        GRAPH <urn:g3> { ex:c ex:knows ex:a . }
-    ";
-    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-graphs:main", trig).await;
+    let (fluree, handle) =
+        indexed_trig_ledger("it/cyclic-lane-graphs:main", CYCLIC_LANE_TRIG).await;
     // The union variant answers only with the kill switch off, which other
     // tests in this binary turn on; hold it off across these queries.
     let _switch = crate::support::FAST_PATH_SWITCH.read().await;
@@ -1900,6 +1902,78 @@ async fn cyclic_lane_reads_one_graph() {
         &mut failures,
     )
     .await;
+    failures.assert_none();
+}
+
+/// The cyclic join's union variant sits behind the fast-path kill switch, so
+/// the general plan stays its oracle: with the switch on, the variant stamps
+/// its own site `fallback:kill_switch` and the general plan answers. The
+/// one-graph lane is not behind the switch and still runs.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_stands_down_under_the_kill_switch() {
+    let (fluree, handle) =
+        indexed_trig_ledger("it/cyclic-lane-switch:main", CYCLIC_LANE_TRIG).await;
+    let tri = |ds: &str| {
+        format!(
+            "{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        )
+    };
+    let pqr = rows(&[&["p", "q", "r"], &["q", "r", "p"], &["r", "p", "q"]]);
+    // (label, query, the answer, the site and the outcome it must stamp)
+    let cases = [
+        (
+            "FROM g2 + g3",
+            tri("FROM <urn:g2> FROM <urn:g3>"),
+            pqr.clone(),
+            "cyclic_bgp_union",
+            "fallback:kill_switch",
+        ),
+        (
+            "FROM NAMED g2 alone",
+            tri("FROM NAMED <urn:g2>"),
+            rows(&[]),
+            "cyclic_bgp_union",
+            "fallback:kill_switch",
+        ),
+        (
+            "FROM g2 alone",
+            tri("FROM <urn:g2>"),
+            pqr,
+            "cyclic_bgp",
+            "proceed",
+        ),
+    ];
+    /// Turns the process-wide switch back off on every exit path.
+    struct SwitchedOn;
+    impl Drop for SwitchedOn {
+        fn drop(&mut self) {
+            fluree_db_api::set_fast_paths_disabled(false);
+        }
+    }
+    let mut failures = Failures::default();
+    let _switch = crate::support::FAST_PATH_SWITCH.write().await;
+    let _on = SwitchedOn;
+    fluree_db_api::set_fast_paths_disabled(true);
+    for (label, query, want, site, outcome) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["x", "y", "z"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, site),
+            vec![outcome.to_string()],
+            &format!("{label}: `{site}` stamps"),
+        );
+    }
     failures.assert_none();
 }
 
