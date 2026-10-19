@@ -656,11 +656,14 @@ impl LedgerHandle {
         other_activation(state.ns_record.as_ref(), record)
     }
 
-    /// Check if cached state is fresh vs remote watermark
+    /// Check if cached state is fresh vs remote watermark: stale when the
+    /// remote index is newer, or another root at the same `t`.
     pub async fn check_freshness(&self, remote: &RemoteWatermark) -> FreshnessCheck {
-        let local_index_t = self.index_t().await;
-
-        if remote.index_t > local_index_t {
+        let (_, local_index_t, local_index_id) = self.state_metrics().await;
+        let replaced = remote.index_t == local_index_t
+            && remote.index_head_id.is_some()
+            && remote.index_head_id != local_index_id;
+        if remote.index_t > local_index_t || replaced {
             FreshnessCheck::Stale
         } else {
             FreshnessCheck::Current
@@ -850,7 +853,8 @@ pub struct RemoteWatermark {
     pub commit_t: i64,
     /// Remote index_t value (used for freshness comparison)
     pub index_t: i64,
-    /// Remote index head CID (for potential future optimization)
+    /// Remote index head CID: at an equal `index_t`, a different one is a
+    /// replacement root (compaction, reindex)
     pub index_head_id: Option<ContentId>,
     /// When this watermark was last updated
     pub updated_at: Instant,
@@ -867,9 +871,9 @@ pub trait FreshnessSource: Send + Sync {
 /// Result of checking if cached state is fresh
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreshnessCheck {
-    /// Local index_t >= remote index_t
+    /// Local index_t >= remote index_t, and the same root at an equal t
     Current,
-    /// Remote index_t > local index_t, needs reload
+    /// Remote index_t > local index_t, or another root at the same t; needs reload
     Stale,
 }
 
@@ -2208,7 +2212,8 @@ pub enum UpdatePlan {
     Noop,
 
     /// Index advanced but commit_t unchanged
-    /// (ns.commit_t == local.t() BUT ns.index_t > local.index_t)
+    /// (ns.commit_t == local.t() BUT ns.index_t > local.index_t, or another
+    /// root at the same index_t)
     /// Action: reload index root, trim novelty to only commits > new index_t
     IndexOnly {
         /// New index head CID to load
@@ -2257,12 +2262,13 @@ impl UpdatePlan {
         ns: &NsRecord,
     ) -> Self {
         // An index the record names that the cached state has not installed.
-        // Valid whenever the record's index is newer than the local one: the
-        // index covers a prefix of commits, so it applies equally to a local
-        // state at, ahead of, or behind the record's commit head.
+        // Valid whenever the record's index is newer than the local one, or
+        // another root at the same `t` (a compaction or reindex replaced it):
+        // the index covers a prefix of commits, so it applies equally to a
+        // local state at, ahead of, or behind the record's commit head.
         let index_advance = match (&ns.index_head_id, local_index_id) {
             (Some(ns_idx), Some(local_idx))
-                if ns_idx != local_idx && ns.index_t > local_index_t =>
+                if ns_idx != local_idx && ns.index_t >= local_index_t =>
             {
                 Some((ns_idx.clone(), ns.index_t))
             }
@@ -2944,6 +2950,37 @@ mod tests {
         // Local: t()=10, index_t=5
         let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
         assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
+    }
+
+    #[test]
+    fn another_root_at_the_same_index_t_is_installed() {
+        // A compaction or reindex replaced the root at the cached index's t.
+        let local_idx = make_index_cid("index:5");
+        let ns_idx = make_index_cid("index:5-compacted");
+        let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(ns_idx.clone()));
+        assert_eq!(
+            UpdatePlan::plan(10, 5, Some(&local_idx), &ns),
+            UpdatePlan::IndexOnly {
+                index_head_id: ns_idx.clone(),
+                index_t: 5
+            }
+        );
+        // Commits behind as well: caught up, and the root installed after.
+        let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(ns_idx.clone()));
+        assert!(matches!(
+            UpdatePlan::plan(10, 5, Some(&local_idx), &ns),
+            UpdatePlan::CommitCatchUp {
+                gap: 1,
+                index_update: Some((ref id, 5)),
+                ..
+            } if *id == ns_idx
+        ));
+        // The installed root is current.
+        let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(local_idx.clone()));
+        assert_eq!(
+            UpdatePlan::plan(10, 5, Some(&local_idx), &ns),
+            UpdatePlan::Noop
+        );
     }
 
     #[test]

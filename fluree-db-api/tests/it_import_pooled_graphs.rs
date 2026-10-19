@@ -2944,3 +2944,108 @@ async fn housekeeping_compacts_an_idle_ledgers_pooled_delta() {
     let ledger = fluree.ledger(ledger_id).await.unwrap();
     assert_pooled_orders_agree(&ledger, first_t, "idle compaction");
 }
+
+async fn cached_state(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let handle = fluree
+        .ledger_cached(ledger_id)
+        .await
+        .expect("cached ledger");
+    handle.snapshot().await.to_ledger_state()
+}
+
+/// A root compacted at the same `t` reaches other connections: a reader that
+/// cached the ledger before the compaction adopts it on refresh, by itself or
+/// with a commit that landed after it, which it keeps.
+#[tokio::test]
+async fn cached_readers_adopt_a_root_compacted_at_the_same_t() {
+    use fluree_db_api::{
+        FreshnessCheck, MaintainIndexOptions, NotifyResult, RefreshOpts, RemoteWatermark,
+    };
+    let db_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let ledger_id = "test/pool-adopt:main";
+    let (fluree, ledger) =
+        import_trig(db_dir.path(), data_dir.path(), ledger_id, THREE_GRAPHS).await;
+    drop((fluree, ledger));
+    let connect = || {
+        FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("build file-backed Fluree")
+    };
+    let writer = connect();
+    sparql_update(
+        &writer,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g2 { ex:z ex:val 20 . } GRAPH ex:g3 { ex:w ex:val 30 . } }",
+    )
+    .await;
+    let (root, _) = index_and_reload(&writer, ledger_id).await;
+    assert!(!root.pool.as_ref().unwrap().deltas.is_empty());
+
+    let (index_only, catch_up) = (connect(), connect());
+    for reader in [&index_only, &catch_up] {
+        reader.ledger_cached(ledger_id).await.expect("cache ledger");
+    }
+    let compacted = writer
+        .maintain_index(ledger_id, MaintainIndexOptions::default())
+        .await
+        .expect("maintain");
+    assert!(compacted.compacted, "{compacted:?}");
+    assert_eq!(compacted.index_t, root.index_t);
+    let compacted_root = compacted.root_id.expect("root");
+
+    // A peer's watermark naming the new root marks the cached state stale.
+    let watermark = RemoteWatermark {
+        commit_t: root.index_t,
+        index_t: root.index_t,
+        index_head_id: Some(compacted_root.clone()),
+        updated_at: std::time::Instant::now(),
+    };
+    let handle = index_only.ledger_cached(ledger_id).await.unwrap();
+    assert_eq!(
+        handle.check_freshness(&watermark).await,
+        FreshnessCheck::Stale
+    );
+    let refreshed = index_only
+        .refresh(ledger_id, RefreshOpts::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed.action, NotifyResult::IndexUpdated);
+    assert_eq!(
+        handle.check_freshness(&watermark).await,
+        FreshnessCheck::Current
+    );
+    let state = cached_state(&index_only, ledger_id).await;
+    assert_eq!(state.head_index_id.as_ref(), Some(&compacted_root));
+    assert_eq!(state.index_t(), root.index_t);
+
+    sparql_update(
+        &writer,
+        ledger_id,
+        "PREFIX ex: <http://example.org/>
+         INSERT DATA { GRAPH ex:g2 { ex:v ex:val 50 . } }",
+    )
+    .await;
+    let refreshed = catch_up
+        .refresh(ledger_id, RefreshOpts::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed.action, NotifyResult::CommitsApplied { count: 1 });
+    let state = cached_state(&catch_up, ledger_id).await;
+    assert_eq!(state.head_index_id.as_ref(), Some(&compacted_root));
+    assert_eq!(
+        (state.index_t(), state.t()),
+        (root.index_t, root.index_t + 1)
+    );
+    let q = format!("{PREFIXES}SELECT ?s ?v WHERE {{ GRAPH ex:g2 {{ ?s ex:val ?v }} }}");
+    let want = select(&writer, &writer.ledger(ledger_id).await.unwrap(), &q).await;
+    assert!(want.iter().any(|row| row.contains("v=50")), "{want:?}");
+    assert_eq!(select(&catch_up, &state, &q).await, want);
+}

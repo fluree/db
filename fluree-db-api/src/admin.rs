@@ -2707,9 +2707,17 @@ impl crate::Fluree {
         self.publisher()?
             .publish_index_allow_equal_fenced(id, record.fence, result.index_t, &result.root_id)
             .await?;
-        // Same `t`, new root: a cached handle would keep reading the delta.
+        // Same `t`, new root: the cached state adopts it, keeping its novelty.
+        // One left on the old root would read runs the next sweep deletes.
         if let Some(ref lm) = self.ledger_manager {
-            lm.disconnect(id).await;
+            let notify = crate::ledger_manager::NsNotify {
+                ledger_id: id.clone(),
+                record: None,
+            };
+            if let Err(e) = lm.notify(notify).await {
+                warn!(ledger_id = %id, error = %e, "compacted root not adopted; dropping the cached ledger");
+                lm.disconnect(id).await;
+            }
         }
         info!(ledger_id = %id, index_t = result.index_t, root_id = %result.root_id, "pooled delta compacted and published");
         Ok(PoolCompaction::Compacted)
