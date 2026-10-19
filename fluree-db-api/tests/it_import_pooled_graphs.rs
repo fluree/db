@@ -2296,8 +2296,8 @@ fn assert_pooled_orders_agree(ledger: &fluree_db_api::LedgerState, first_t: i64,
     }
 }
 
-/// Alternating retractions and reassertions across 67 builds, through
-/// run-cap compaction (build 65) and a promotion's (build 67): the
+/// Alternating retractions and reassertions across 67 builds, through two
+/// run-cap compactions (builds 33 and 66) and a promotion's (build 67): the
 /// secondary orders agree with GSPO after every build.
 #[tokio::test]
 async fn pooled_orders_agree_with_gspo_through_compaction() {
@@ -2337,7 +2337,7 @@ async fn pooled_orders_agree_with_gspo_through_compaction() {
             .await;
         }
         let (root, ledger) = index_and_reload(&fluree, id).await;
-        if step == 64 || step == 66 {
+        if matches!(step, 32 | 65 | 66) {
             assert!(
                 root.pool
                     .as_ref()

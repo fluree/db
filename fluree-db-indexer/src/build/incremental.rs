@@ -5408,8 +5408,10 @@ fn leaf_rows_for(order: RunSortOrder, config: &IndexerConfig) -> usize {
     }
 }
 
-/// Most delta runs a pooled secondary order keeps before compacting them.
-const DELTA_MAX_RUNS: usize = 64;
+/// Most delta runs a pooled secondary order keeps before compacting them:
+/// loading a store fetches every run, and those fetches share the storage
+/// client's request slots with every other ledger's reads.
+const DELTA_MAX_RUNS: usize = 32;
 
 /// Delta events a pooled secondary order may hold however small its base.
 const DELTA_MIN_EVENTS: u64 = 16_000;
