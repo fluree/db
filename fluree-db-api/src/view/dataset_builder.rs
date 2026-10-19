@@ -5,6 +5,7 @@
 //! defaults are applied later, at the query-preparation choke point
 //! (`Fluree::complete_config_defaults`).
 
+use crate::view::fluree_ext::LedgerLoads;
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
 use fluree_db_core::VerifiedIdentity;
@@ -14,10 +15,10 @@ macro_rules! build_dataset_view_from_spec {
         $self:expr,
         $spec:expr,
         history_transform = $history_transform:expr,
-        load_view = $load_view:expr,
         apply_policy = $apply_policy:expr $(,)?
     ) => {{
         let spec = $spec;
+        let mut loads = LedgerLoads::default();
 
         // History/changes queries are a Fluree dataset extension.
         // In this mode, the "from" array specifies a (from,to) range on ONE ledger,
@@ -37,7 +38,7 @@ macro_rules! build_dataset_view_from_spec {
 
             // Load default graphs, applying per-source policy
             for source in &spec.default_graphs {
-                let view = ($load_view)(source).await?;
+                let view = $self.load_dataset_source(source, &mut loads).await?;
                 let view = ($apply_policy)(view, source).await?;
                 members.push(view.graph_source_id.clone());
                 // If this is a graph source, also register as a named graph
@@ -64,7 +65,7 @@ macro_rules! build_dataset_view_from_spec {
 
             // Load named graphs, applying per-source policy
             for source in &spec.named_graphs {
-                let view = ($load_view)(source).await?;
+                let view = $self.load_dataset_source(source, &mut loads).await?;
                 let view = ($apply_policy)(view, source).await?;
                 // Register under exactly ONE key: the dataset-local name the user
                 // wrote. When an alias is present it IS that name, and the
@@ -152,7 +153,6 @@ impl Fluree {
             self,
             spec,
             history_transform = |view| self.wrap_policy_defaults(view),
-            load_view = |source| self.load_view_from_source(source),
             apply_policy =
                 |view, source| self.maybe_apply_source_policy(view, source, server_identity),
         )
@@ -178,7 +178,6 @@ impl Fluree {
             self,
             spec,
             history_transform = |view| async { self.wrap_policy(view, opts).await },
-            load_view = |source| self.load_view_from_source(source),
             apply_policy = |view, source| self.apply_policy_with_override(view, source, opts),
         )
     }
@@ -245,40 +244,41 @@ impl Fluree {
         &self,
         source: &dataset::GraphSource,
     ) -> Result<GraphDb> {
-        let view = match &source.time_spec {
-            None => {
-                // Box the ledger-load future: the load chain (get_or_load →
-                // load → load_novelty → bulk_apply_commits) is deep, and in
-                // debug builds its inline future would balloon this frame — and
-                // every dispatcher frame above it that materializes this future
-                // before awaiting — pushing the plain `select *` connection
-                // query past the default ~2 MB worker stack (fluree/db#1408).
-                // Boxing keeps the load future's state on the heap so it costs
-                // O(1) stack here and in the callers above.
-                let result = Box::pin(self.db(&source.identifier)).await;
-                match result {
-                    Ok(v) => v,
-                    Err(ref e) if e.is_not_found() => {
-                        Box::pin(self.resolve_as_graph_source(&source.identifier)).await?
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
+        self.load_dataset_source(source, &mut LedgerLoads::default())
+            .await
+    }
+
+    /// [`Self::load_view_from_source`] for one source of a dataset whose
+    /// ledgers are loaded through `loads`, once per ledger and time (see
+    /// [`LedgerLoads`]).
+    async fn load_dataset_source(
+        &self,
+        source: &dataset::GraphSource,
+        loads: &mut LedgerLoads,
+    ) -> Result<GraphDb> {
+        // Box the ledger-load future: the load chain (get_or_load → load →
+        // load_novelty → bulk_apply_commits) is deep, and in debug builds its
+        // inline future would balloon this frame — and every dispatcher frame
+        // above it that materializes this future before awaiting — pushing the
+        // plain `select *` connection query past the default ~2 MB worker
+        // stack (fluree/db#1408). Boxing keeps the load future's state on the
+        // heap so it costs O(1) stack here and in the callers above.
+        let result =
+            Box::pin(self.db_in_dataset(&source.identifier, source.time_spec.as_ref(), loads))
+                .await;
+        let view = match result {
+            Ok(v) => v,
+            Err(ref e) if e.is_not_found() => match &source.time_spec {
+                None => Box::pin(self.resolve_as_graph_source(&source.identifier)).await?,
+                // A graph source reads the pinned table state; the pin rides
+                // the view to the R2RML provider, or is refused.
+                Some(time_spec) => {
+                    Box::pin(self.resolve_graph_source_at(&source.identifier, time_spec))
+                        .await?
+                        .ok_or_else(|| ApiError::NotFound(source.identifier.clone()))?
                 }
-            }
-            Some(time_spec) => {
-                match Box::pin(self.db_at(&source.identifier, time_spec.clone())).await {
-                    Ok(v) => v,
-                    Err(ref e) if e.is_not_found() => {
-                        // A graph source reads the pinned table state; the pin
-                        // rides the view to the R2RML provider, or is refused.
-                        Box::pin(self.resolve_graph_source_at(&source.identifier, time_spec))
-                            .await?
-                            .ok_or_else(|| ApiError::NotFound(source.identifier.clone()))?
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            },
+            Err(e) => return Err(e),
         };
 
         // Apply explicit graph selector if set.
