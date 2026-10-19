@@ -345,7 +345,7 @@ pub const fn is_post_desc_orderable(o_type: u16) -> bool {
 
 /// Construct min/max `RunRecordV2` keys spanning all rows for a predicate.
 #[inline]
-fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
+pub(crate) fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
     let min_key = RunRecordV2 {
         s_id: SubjectId(0),
         o_key: 0,

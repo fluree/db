@@ -25,19 +25,43 @@
 //! `Ok(None)` and the planned fallback (the generic scan + group + count
 //! pipeline, which applies per-flake policy filtering and honors novelty)
 //! runs instead.
+//!
+//! ## Over a default graph of several graphs
+//!
+//! A default graph of two or more graphs of one ledger is the set union of
+//! their triples: a predicate's count there is its number of distinct facts
+//! over the members, a list index aside, which is what the general plan's
+//! dedup leaves. [`count_by_predicate_union_operator`] reads every member's
+//! POST directory as above. A predicate that one member holds, without list
+//! rows, takes that member's count. Any other predicate, one that two members
+//! hold or one with list rows (two items of one `@list` can repeat a value),
+//! is counted by merging its PSOT rows across the members
+//! ([`MergedRangeCursor`]), which drops each repeated fact. The planner picks
+//! it for a scope of several graphs or of none; it stamps its own site
+//! ([`COUNT_BY_PREDICATE_UNION_SITE`]) and runs only when the index alone
+//! answers for every member.
 
 use crate::binding::{Batch, Binding};
 use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{fast_path_store, FastPathOperator};
+use crate::fast_path_common::{predicate_range_keys, FastPathOperator};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::index_scope::{IndexScope, MemberSet};
+use crate::merged_cursor::{MergeDecline, MergedRangeCursor};
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::format::column_block::ColumnId;
+use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
+use fluree_db_binary_index::{BinaryFilter, BinaryIndexStore, ColumnProjection, ColumnSet};
 use fluree_db_core::{FlakeValue, GraphId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// `fast-path outcome` site of the per-predicate count over a default graph
+/// of several graphs, or of none. It stamps apart from the one-graph
+/// operator's site so a test can tell which of the two answered.
+pub const COUNT_BY_PREDICATE_UNION_SITE: &str = "count_by_predicate_union";
 
 /// Build the per-predicate count operator. Emits `(pred, count)` rows from
 /// exact POST leaf-directory metadata when the fast-path gate holds; defers
@@ -58,39 +82,193 @@ pub fn stats_count_by_predicate_operator(
     FastPathOperator::with_schema(
         schema,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
+            let Some(IndexScope::One(member)) = ctx.index_scope() else {
                 return Ok(None);
             };
-            let Some(counts) = exact_count_by_predicate_post(store, ctx.binary_g_id)? else {
+            if !member.index_is_current() {
                 return Ok(None);
-            };
-
-            // SPARQL COUNT yields xsd:integer (§18.5.1.6); the materialized and
-            // streaming aggregate paths already tag it so — this per-predicate
-            // fast-path must match or a COUNT re-typed as xsd:long leaks (agg02).
-            let dt = WellKnownDatatypes::new().xsd_integer;
-            let mut pred_col: Vec<Binding> = Vec::with_capacity(counts.len());
-            let mut count_col: Vec<Binding> = Vec::with_capacity(counts.len());
-            for (p_id, count) in counts {
-                // Directory p_ids are persisted-store IDs by construction; an
-                // unresolvable one means the store and its directories
-                // disagree — fall back rather than emit a partial result.
-                let Some(iri) = store.resolve_predicate_iri(p_id) else {
-                    return Ok(None);
-                };
-                pred_col.push(Binding::sid(store.encode_iri(iri)));
-                count_col.push(Binding::lit(FlakeValue::Long(count), dt.clone()));
             }
-            let batch = Batch::new(batch_schema.clone(), vec![pred_col, count_col])
-                .map_err(|e| QueryError::execution(format!("stats count batch: {e}")))?;
-            Ok(Some(batch))
+            let store = member.store();
+            let Some(rows) = predicate_rows_post(store, member.g_id())? else {
+                return Ok(None);
+            };
+            let counts = rows.into_iter().map(|(p_id, rows)| (p_id, rows.rows));
+            predicate_count_batch(store, &batch_schema, counts)
         },
         fallback,
         "COUNT by predicate (directory)",
     )
 }
 
-/// Exact per-predicate row counts from POST leaf directories.
+/// Build the per-predicate count operator for a default graph of several
+/// graphs of one ledger, or of none (see the module docs). Defers to
+/// `fallback` when the scope is neither, when some member's index does not
+/// answer for it alone, or when a predicate's rows cannot be merged exactly;
+/// each decline over several graphs stamps its reason at
+/// [`COUNT_BY_PREDICATE_UNION_SITE`].
+pub fn count_by_predicate_union_operator(
+    pred_var: VarId,
+    count_var: VarId,
+    fallback: Option<BoxedOperator>,
+) -> FastPathOperator {
+    let schema: Arc<[VarId]> = Arc::from(vec![pred_var, count_var].into_boxed_slice());
+    let batch_schema = schema.clone();
+    FastPathOperator::with_schema(
+        schema,
+        move |ctx| match ctx.index_scope() {
+            Some(IndexScope::Union(set)) if !set.all_current() => {
+                Ok(union_declined(FastPathFallback::Novelty))
+            }
+            Some(IndexScope::Union(set)) => match count_by_predicate_union(&set)? {
+                Ok(counts) => predicate_count_batch(set.store(), &batch_schema, counts.into_iter()),
+                Err(reason) => Ok(union_declined(reason)),
+            },
+            // A default graph of none holds no predicate.
+            Some(IndexScope::Empty) => Batch::empty(batch_schema.clone())
+                .map(Some)
+                .map_err(|e| QueryError::execution(format!("stats count batch: {e}"))),
+            _ => Ok(None),
+        },
+        fallback,
+        COUNT_BY_PREDICATE_UNION_SITE,
+    )
+}
+
+/// Stamp why the count over several graphs declined; the operator then runs
+/// its fallback.
+fn union_declined(reason: FastPathFallback) -> Option<Batch> {
+    stamp_fast_path(
+        COUNT_BY_PREDICATE_UNION_SITE,
+        FastPathOutcome::Fallback(reason),
+    );
+    None
+}
+
+/// The `(predicate, count)` rows, or `None` when a predicate id does not
+/// resolve.
+fn predicate_count_batch(
+    store: &BinaryIndexStore,
+    schema: &Arc<[VarId]>,
+    counts: impl ExactSizeIterator<Item = (u32, i64)>,
+) -> Result<Option<Batch>> {
+    // SPARQL COUNT yields xsd:integer (§18.5.1.6); the materialized and
+    // streaming aggregate paths already tag it so — this per-predicate
+    // fast-path must match or a COUNT re-typed as xsd:long leaks (agg02).
+    let dt = WellKnownDatatypes::new().xsd_integer;
+    let mut pred_col: Vec<Binding> = Vec::with_capacity(counts.len());
+    let mut count_col: Vec<Binding> = Vec::with_capacity(counts.len());
+    for (p_id, count) in counts {
+        // Directory p_ids are persisted-store IDs by construction; an
+        // unresolvable one means the store and its directories
+        // disagree — fall back rather than emit a partial result.
+        let Some(iri) = store.resolve_predicate_iri(p_id) else {
+            return Ok(None);
+        };
+        pred_col.push(Binding::sid(store.encode_iri(iri)));
+        count_col.push(Binding::lit(FlakeValue::Long(count), dt.clone()));
+    }
+    let batch = Batch::new(schema.clone(), vec![pred_col, count_col])
+        .map_err(|e| QueryError::execution(format!("stats count batch: {e}")))?;
+    Ok(Some(batch))
+}
+
+/// Exact per-predicate counts over the union of `set`'s members, or why they
+/// cannot be had from the index.
+fn count_by_predicate_union(
+    set: &MemberSet<'_>,
+) -> Result<std::result::Result<Vec<(u32, i64)>, FastPathFallback>> {
+    let store = set.store();
+    // Per predicate: its rows summed over the members, whether any may be a
+    // list row, and how many members hold it.
+    let mut held: BTreeMap<u32, (PredicateRows, usize)> = BTreeMap::new();
+    for member in set.members() {
+        let Some(rows) = predicate_rows_post(store, member.g_id())? else {
+            return Ok(Err(FastPathFallback::GateDeclined));
+        };
+        for (p_id, rows) in rows {
+            let (sum, holders) = held.entry(p_id).or_default();
+            sum.rows += rows.rows;
+            sum.list_rows |= rows.list_rows;
+            *holders += 1;
+        }
+    }
+    let mut counts = Vec::with_capacity(held.len());
+    for (p_id, (rows, holders)) in held {
+        // One member's rows of one predicate are distinct facts unless two
+        // items of a list repeat a value.
+        let count = if holders == 1 && !rows.list_rows {
+            rows.rows
+        } else {
+            match distinct_facts(set, p_id) {
+                Ok(Ok(count)) => count,
+                Ok(Err(decline)) => return Ok(Err(union_fallback(decline))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "count by predicate over several graphs: merge failed; declining to generic scan");
+                    return Ok(Err(FastPathFallback::GateDeclined));
+                }
+            }
+        };
+        counts.push((p_id, count));
+    }
+    Ok(Ok(counts))
+}
+
+/// The fallback a merge's decline stamps.
+fn union_fallback(decline: MergeDecline) -> FastPathFallback {
+    match decline {
+        MergeDecline::ArenaType { .. } => FastPathFallback::ArenaType,
+        MergeDecline::Novelty => FastPathFallback::Novelty,
+        MergeDecline::ListRows {
+            order: RunSortOrder::Post,
+        } => FastPathFallback::ListRowsInPost,
+        MergeDecline::ListRows { .. } | MergeDecline::NoBranch => FastPathFallback::GateDeclined,
+    }
+}
+
+/// The number of distinct facts of predicate `p_id` over `set`'s members, a
+/// list index aside: its PSOT rows merged, where one fact's rows are adjacent.
+fn distinct_facts(
+    set: &MemberSet<'_>,
+    p_id: u32,
+) -> Result<std::result::Result<i64, MergeDecline>> {
+    // The range keys' graph is not compared; each member reads its own.
+    let (min, max) = predicate_range_keys(p_id, 0);
+    let count_only = ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: ColumnSet::EMPTY,
+    };
+    let mut merged = match MergedRangeCursor::new(
+        set,
+        RunSortOrder::Psot,
+        &min,
+        &max,
+        BinaryFilter::default(),
+        count_only,
+    ) {
+        Ok(merged) => merged,
+        Err(decline) => return Ok(Err(decline)),
+    };
+    let mut count = 0i64;
+    loop {
+        match merged.next_batch()? {
+            Ok(Some(batch)) => count += batch.row_count as i64,
+            Ok(None) => return Ok(Ok(count)),
+            Err(decline) => return Ok(Err(decline)),
+        }
+    }
+}
+
+/// One predicate's rows in one graph's POST directory.
+#[derive(Debug, Default, Clone, Copy)]
+struct PredicateRows {
+    rows: i64,
+    /// Some leaflet holding the predicate has a list row (`HAS_O_I`). A
+    /// leaflet of several predicates marks every one of them.
+    list_rows: bool,
+}
+
+/// Exact per-predicate row counts from POST leaf directories, with whether
+/// any of a predicate's rows may be a list row (the leaflet's `HAS_O_I` flag).
 ///
 /// Homogeneous leaflets (`p_const = Some(p)`) contribute `row_count` without
 /// any payload read; mixed-predicate leaflets decode only the `PId` column.
@@ -100,10 +278,10 @@ pub fn stats_count_by_predicate_operator(
 /// emptiness from absence or hard-failing on a transient IO fault. Declining is
 /// lossless here: this function only accumulates a local map and has emitted
 /// nothing, and a genuine IO fault will resurface in the generic scan.
-fn exact_count_by_predicate_post(
+fn predicate_rows_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
-) -> Result<Option<Vec<(u32, i64)>>> {
+) -> Result<Option<BTreeMap<u32, PredicateRows>>> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Post) else {
         return Ok(None);
     };
@@ -117,7 +295,7 @@ fn exact_count_by_predicate_post(
         },
     };
 
-    let mut counts: BTreeMap<u32, i64> = BTreeMap::new();
+    let mut counts: BTreeMap<u32, PredicateRows> = BTreeMap::new();
     for leaf_entry in &branch.leaves {
         let handle = match store.open_leaf_handle(
             &leaf_entry.leaf_cid,
@@ -135,8 +313,11 @@ fn exact_count_by_predicate_post(
             if entry.row_count == 0 {
                 continue;
             }
+            let list_rows = entry.flags & HAS_O_I != 0;
             if let Some(p) = entry.p_const {
-                *counts.entry(p).or_insert(0) += i64::from(entry.row_count);
+                let rows = counts.entry(p).or_default();
+                rows.rows += i64::from(entry.row_count);
+                rows.list_rows |= list_rows;
             } else {
                 let batch = match handle.load_columns(
                     leaflet_idx,
@@ -150,11 +331,13 @@ fn exact_count_by_predicate_post(
                     }
                 };
                 for row in 0..batch.row_count {
-                    *counts.entry(batch.p_id.get(row)).or_insert(0) += 1;
+                    let rows = counts.entry(batch.p_id.get(row)).or_default();
+                    rows.rows += 1;
+                    rows.list_rows |= list_rows;
                 }
             }
         }
     }
 
-    Ok(Some(counts.into_iter().collect()))
+    Ok(Some(counts))
 }
