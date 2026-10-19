@@ -566,7 +566,10 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
             wrong
         }
     };
-    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+    let fluree = FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .expect("build");
     fluree.create_ledger(LEDGER).await.expect("create");
     let insert = format!("{PFX}INSERT DATA {{ {} }}", triples(DT_NS, TIME_NS));
     fluree
@@ -577,9 +580,17 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
         .await
         .expect("insert");
     let in_process = run(fluree.clone()).await;
-    let reloaded = run(FlureeBuilder::file(path.clone()).build().expect("reload")).await;
+    let reloaded = run(FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .expect("reload"))
+    .await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
-    let indexed = run(FlureeBuilder::file(path).build().expect("reload")).await;
+    let indexed = run(FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .expect("reload"))
+    .await;
     let none: Vec<String> = Vec::new();
     assert_eq!(
         (in_process, reloaded, indexed),
@@ -626,7 +637,10 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
             wrong
         }
     };
-    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+    let fluree = FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .expect("build");
     fluree.create_ledger(LEDGER).await.expect("create");
     fluree
         .graph(LEDGER)
@@ -638,9 +652,17 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
         .await
         .expect("insert");
     let in_process = run(fluree.clone()).await;
-    let reloaded = run(FlureeBuilder::file(path.clone()).build().expect("reload")).await;
+    let reloaded = run(FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .expect("reload"))
+    .await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
-    let indexed = run(FlureeBuilder::file(path).build().expect("reload")).await;
+    let indexed = run(FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .expect("reload"))
+    .await;
     let none: Vec<String> = Vec::new();
     assert_eq!(
         (in_process, reloaded, indexed),
@@ -694,7 +716,10 @@ async fn a_cypher_constant_is_held_to_the_microsecond_for_ordering_too() {
     };
     let none: Vec<String> = Vec::new();
     {
-        let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+        let fluree = FlureeBuilder::file(path.clone())
+            .without_indexing()
+            .build()
+            .expect("build");
         let ledger = fluree.create_ledger(LEDGER).await.expect("create");
         let create =
             format!("CREATE (:Event {{at: datetime(\"{DT_NS}\"), t: time(\"{TIME_NS}\")}})");
@@ -709,7 +734,10 @@ async fn a_cypher_constant_is_held_to_the_microsecond_for_ordering_too() {
             "before a reload"
         );
     }
-    let fluree = FlureeBuilder::file(path).build().expect("reload");
+    let fluree = FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .expect("reload");
     let ledger = fluree.ledger(LEDGER).await.expect("ledger");
     assert_eq!(wrong(fluree, ledger).await, none, "after a reload");
 }

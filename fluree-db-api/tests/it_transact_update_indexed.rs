@@ -18,7 +18,7 @@
 use crate::support::{
     query_sparql, start_background_indexer_local, trigger_index_and_wait_outcome,
 };
-use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, ReindexOptions};
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest, Sid};
 
@@ -587,7 +587,10 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                 let ledger_id = &format!("it/multiop-last-op-{case}:main");
                 let tmp = tempfile::TempDir::new().expect("tempdir");
                 let path = tmp.path().to_string_lossy().to_string();
-                let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                let fluree = FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("build");
                 fluree.create_ledger(ledger_id).await.expect("create");
                 let seed = match base {
                     Base::Absent => format!("{PFX}INSERT DATA {{ ex:s ex:q \"keep\" }}"),
@@ -606,6 +609,7 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                 let fluree = if let Base::Indexed = base {
                     crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
                     FlureeBuilder::file(path.clone())
+                        .without_indexing()
                         .build()
                         .expect("cold reload")
                 } else {
@@ -634,15 +638,25 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                 } else {
                     "0"
                 };
-                let reload = || FlureeBuilder::file(path.clone()).build().expect("reload");
+                let reload = || {
+                    FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("reload")
+                };
                 let in_process = count(fluree, ledger_id.clone()).await;
                 let reloaded = count(reload(), ledger_id.clone()).await;
                 let incremental = {
                     crate::support::build_and_publish_index(&reload(), ledger_id).await;
                     count(reload(), ledger_id.clone()).await
                 };
+                // `reindex` replaces the index of the same `t` the
+                // incremental build published; `publish_index` would keep it.
                 let rebuilt = {
-                    crate::support::rebuild_and_publish_index(&reload(), ledger_id).await;
+                    reload()
+                        .reindex(ledger_id, ReindexOptions::default())
+                        .await
+                        .expect("full rebuild");
                     count(reload(), ledger_id.clone()).await
                 };
                 // Novelty holds each term of a value as its own fact until

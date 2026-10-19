@@ -23,7 +23,7 @@ use crate::support;
 use fluree_db_api::policy_builder::build_policy_context_from_opts;
 use fluree_db_api::{
     CommitRef, ConflictStrategy, Fluree, FlureeBuilder, GovernanceOptions, LedgerState,
-    PolicyContext, SyncGraphOpts, TransactResult,
+    PolicyContext, ReindexOptions, SyncGraphOpts, TransactResult,
 };
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
@@ -1943,6 +1943,7 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
 /// The values of `ex:s`'s `pred`, read cold from the ledger at `path`.
 async fn values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
     let fluree = FlureeBuilder::file(path.to_string())
+        .without_indexing()
         .build()
         .expect("reload");
     let ledger = fluree.ledger(id).await.expect("ledger");
@@ -2146,7 +2147,8 @@ async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
 /// the way storage does: a big integer by value, whatever XSD subtype either
 /// side holds it with. So a value both graphs hold, one in its index and the
 /// other since its last build, is a restatement: it stays in the destination,
-/// read in process, after a reload and after the next index build. Before,
+/// read in process, after a reload and after the next full index build (no
+/// background indexer, so the index state is the test's). Before,
 /// the destination's term was retracted and the source's asserted at one
 /// `t`, and the retraction won. Both directions (indexed destination,
 /// novelty source and the reverse), into a named graph and into the default
@@ -2214,7 +2216,10 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
                     } else {
                         (insert(Some(src), src_value), insert(dest, dest_value))
                     };
-                    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("build");
                     fluree.create_ledger(id).await.expect("create");
                     for (n, seed) in [first, second].iter().enumerate() {
                         fluree
@@ -2228,7 +2233,10 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
                             support::rebuild_and_publish_index(&fluree, id).await;
                         }
                     }
-                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_indexing()
+                        .build()
+                        .expect("reload");
                     let transfer = format!("{verb} {src} TO {}", dest.unwrap_or("DEFAULT"));
                     fluree
                         .graph(id)
@@ -2237,24 +2245,44 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
                         .commit()
                         .await
                         .expect("transfer");
-                    let reload = || FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let reload = || {
+                        FlureeBuilder::file(path.clone())
+                            .without_indexing()
+                            .build()
+                            .expect("reload")
+                    };
+                    // Read with no build since the transfer, after an
+                    // incremental build over the seeding's full one, and
+                    // after a full rebuild. The rebuild is published through
+                    // `reindex`, which replaces an index of the same `t`;
+                    // `publish_index` would keep the incremental one.
                     let mut got = vec![
                         count(fluree, id.clone(), dest).await,
                         count(reload(), id.clone(), dest).await,
                     ];
-                    let src_left = count(reload(), id.clone(), Some(src)).await;
-                    {
-                        let fluree = reload();
-                        support::build_and_publish_index(&fluree, id).await;
-                    }
+                    let mut src_left = vec![count(reload(), id.clone(), Some(src)).await];
+                    support::build_incrementally_and_publish_index(&reload(), id).await;
                     got.push(count(reload(), id.clone(), dest).await);
+                    // An incremental build can bring back a fact inserted and
+                    // retracted since its base in a graph the base holds
+                    // nothing for (#2118), which a MOVE source written since
+                    // the seeding's build is. A full rebuild cannot.
+                    if !(verb == "MOVE" && dest_indexed) {
+                        src_left.push(count(reload(), id.clone(), Some(src)).await);
+                    }
+                    reload()
+                        .reindex(id, ReindexOptions::default())
+                        .await
+                        .expect("full rebuild");
+                    got.push(count(reload(), id.clone(), dest).await);
+                    src_left.push(count(reload(), id.clone(), Some(src)).await);
                     let want_src = if verb == "MOVE" { "0" } else { "1" };
-                    if got.iter().any(|n| n != "1") || src_left != want_src {
+                    if got.iter().any(|n| n != "1") || src_left.iter().any(|n| n != want_src) {
                         failures.push(format!(
                             "{verb} of {src_value} onto {dest_value} ({} indexed) into {}: \
-                             destination values in process, reloaded, after an index build \
-                             = {got:?}, source values reloaded {src_left}; expected 1 each and \
-                             {want_src}",
+                             destination values in process, reloaded, after an incremental \
+                             and a full build = {got:?}, source values reloaded and after \
+                             the builds {src_left:?}; expected 1 each and {want_src}",
                             if dest_indexed {
                                 "destination"
                             } else {
@@ -2305,7 +2333,10 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
         {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().to_string_lossy().to_string();
-            let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("build");
             let name = format!("it/revert-subtype-{indexed}");
             let id = format!("{name}:main");
             fluree.create_ledger(&id).await.expect("create");
@@ -2330,7 +2361,10 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
                 format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
             )
             .await;
-            let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload");
             fluree
                 .revert_commits(
                     &name,
@@ -2345,7 +2379,10 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
                 .expect("revert");
             let after = values_of(&path, &id, "ex:p").await;
             support::build_and_publish_index(
-                &FlureeBuilder::file(path.clone()).build().expect("reload"),
+                &FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("reload"),
                 &id,
             )
             .await;
@@ -2361,7 +2398,10 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
         {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().to_string_lossy().to_string();
-            let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("build");
             let name = format!("it/merge-subtype-{indexed}");
             let id = format!("{name}:main");
             let dev = format!("{name}:dev");
@@ -2403,7 +2443,10 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
                 "INSERT DATA { ex:other ex:k \"o\" }".to_string(),
             )
             .await;
-            let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload");
             let report = fluree
                 .merge_branch(&name, "dev", None, ConflictStrategy::default())
                 .await
@@ -2411,7 +2454,10 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             assert!(!report.fast_forward, "the merge replays the branch");
             let after = values_of(&path, &id, "ex:p").await;
             support::build_and_publish_index(
-                &FlureeBuilder::file(path.clone()).build().expect("reload"),
+                &FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("reload"),
                 &id,
             )
             .await;
