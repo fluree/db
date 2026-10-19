@@ -692,9 +692,17 @@ async fn string_filter_comparisons_are_term_strict_on_every_lane() {
                 ]),
             ),
         ] {
-            let got = sparql(&fluree, &view, body).await;
-            if got != want {
-                failures.push(format!("{phase}: {body} got {got:?}, want {want:?}"));
+            // A query error is a failure to record, not a panic: on novelty a
+            // builtin refusing its argument fails the whole query.
+            let q = format!("{PREFIX}{body}");
+            match query_sparql(&fluree, &view, &q).await {
+                Ok(rows) => {
+                    let got = names(&rows.to_jsonld(&view.snapshot).expect("jsonld"));
+                    if got != want {
+                        failures.push(format!("{phase}: {body} got {got:?}, want {want:?}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{phase}: {body} failed: {e}")),
             }
         }
 
