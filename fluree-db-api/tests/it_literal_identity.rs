@@ -980,3 +980,182 @@ async fn typed_literal_constants_in_expressions_keep_their_datatype() {
         })
         .await;
 }
+
+/// Every flake in `id`'s commits, head first.
+async fn committed_flakes(fluree: &fluree_db_api::Fluree, id: &str) -> Vec<fluree_db_core::Flake> {
+    let store = fluree.content_store(id);
+    let mut next = fluree.ledger(id).await.unwrap().head_commit_id;
+    let mut flakes = Vec::new();
+    while let Some(cid) = next {
+        let bytes = store.get(&cid).await.unwrap();
+        let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
+        next = commit.parents.first().cloned();
+        flakes.extend(commit.flakes);
+    }
+    flakes
+}
+
+/// Run each `(name, query, expected)` SPARQL read against `id`, after
+/// checking the ledger reads from an index exactly when `indexed`.
+async fn check_reads(
+    fluree: &fluree_db_api::Fluree,
+    id: &str,
+    reads: &[(&str, &str, Value)],
+    indexed: bool,
+    phase: &str,
+) {
+    let view = fluree.ledger(id).await.unwrap();
+    assert_eq!(
+        view.snapshot.range_provider.is_some(),
+        indexed,
+        "{phase}: setup"
+    );
+    for (name, body, expected) in reads {
+        let got = sparql(fluree, &view, body).await;
+        assert_eq!(&got, expected, "{phase}: {name}");
+    }
+}
+
+/// A literal whose datatype is in a namespace the ledger has not registered
+/// is stored under the code the write gives that namespace, never under the
+/// EMPTY-namespace full-IRI form a query builds for an unseen datatype, so a
+/// lookup by the literal finds what was written: before and after an index
+/// build and a reindex at the same `t`, and after a reload. A DELETE of a
+/// literal no fact can carry retracts nothing and registers nothing.
+#[tokio::test]
+async fn an_unseen_datatype_literal_is_stored_under_its_namespace_code() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().to_string_lossy().to_string();
+    let open = || {
+        FlureeBuilder::file(path.clone())
+            .without_indexing()
+            .build()
+            .unwrap()
+    };
+    let id = "it/unseen-datatype-store:main";
+    const CTX: &str = "PREFIX ex: <http://example.org/ns/> ";
+    let ctx = json!({"ex": "http://example.org/ns/"});
+
+    let fluree = open();
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@graph": [
+                {"@id": "ex:a", "@type": "ex:C"},
+                {"@id": "ex:b", "@type": "ex:C"}
+            ]}),
+        )
+        .await
+        .unwrap();
+    let graph = || fluree.graph(id);
+    graph()
+        .transact()
+        .insert(&json!({"@context": ctx, "@id": "ex:d",
+            "ex:p": {"@value": "a", "@type": "http://nowhere.example/T"},
+            "ex:q": {"@value": "b", "@type": "http://typed.example/U"},
+            "ex:r": {"@value": "c", "@type": "urn:example:dt"}}))
+        .commit()
+        .await
+        .expect("direct insert");
+    // SPARQL writes any absolute IRI as a datatype, `<bad:datatype>`
+    // included, which a JSON-LD `@type` refuses as an unexpanded compact IRI.
+    graph()
+        .transact()
+        .sparql_update(&format!(
+            r#"{CTX} INSERT DATA {{ ex:d ex:t "d"^^<bad:datatype> }}"#
+        ))
+        .commit()
+        .await
+        .expect("SPARQL INSERT DATA");
+    // A DELETE of a literal no fact can carry: nothing to retract. Whether it
+    // commits an empty transaction or refuses one, it stores nothing.
+    let _ = graph()
+        .transact()
+        .sparql_update(&format!(
+            r#"{CTX} DELETE {{ ?s ex:p ?x }}
+               WHERE {{ ?s a ex:C . BIND(STRDT("a", <http://never.example/Z>) AS ?x) }}"#
+        ))
+        .commit()
+        .await;
+
+    let empty_dt: Vec<String> = committed_flakes(&fluree, id)
+        .await
+        .iter()
+        .filter(|f| f.dt.namespace_code == fluree_vocab::namespaces::EMPTY)
+        .map(|f| format!("{f:?}"))
+        .collect();
+    assert!(
+        empty_dt.is_empty(),
+        "EMPTY-namespace datatypes stored: {empty_dt:#?}"
+    );
+    let snapshot = fluree.ledger(id).await.unwrap().snapshot;
+    assert!(
+        snapshot
+            .encode_iri_strict("http://never.example/Z")
+            .is_none(),
+        "the DELETE registered a namespace"
+    );
+
+    let reads: [(&str, &str, Value); 6] = [
+        (
+            "a lookup by the literal finds it (http IRI)",
+            r#"SELECT ?s WHERE { ?s ex:p "a"^^<http://nowhere.example/T> } ORDER BY ?s"#,
+            json!([["ex:d"]]),
+        ),
+        (
+            "a lookup by the literal finds it (second namespace)",
+            r#"SELECT ?s WHERE { ?s ex:q "b"^^<http://typed.example/U> } ORDER BY ?s"#,
+            json!([["ex:d"]]),
+        ),
+        (
+            "a lookup by the literal finds it (urn IRI)",
+            r#"SELECT ?s WHERE { ?s ex:r "c"^^<urn:example:dt> } ORDER BY ?s"#,
+            json!([["ex:d"]]),
+        ),
+        (
+            "a lookup by the literal finds it (an IRI JSON-LD refuses)",
+            r#"SELECT ?s WHERE { ?s ex:t "d"^^<bad:datatype> } ORDER BY ?s"#,
+            json!([["ex:d"]]),
+        ),
+        (
+            "one stored term per predicate",
+            r#"SELECT ?p (COUNT(DISTINCT ?o) AS ?n)
+               WHERE { VALUES ?p { ex:p ex:q ex:r ex:t } ?s ?p ?o } GROUP BY ?p ORDER BY ?p"#,
+            json!([["ex:p", 1], ["ex:q", 1], ["ex:r", 1], ["ex:t", 1]]),
+        ),
+        (
+            "DATATYPE reads the IRI back",
+            r#"SELECT DISTINCT ?p (DATATYPE(?o) AS ?d)
+               WHERE { VALUES ?p { ex:p ex:q ex:r ex:t } ?s ?p ?o } ORDER BY ?p"#,
+            json!([
+                ["ex:p", "http://nowhere.example/T"],
+                ["ex:q", "http://typed.example/U"],
+                ["ex:r", "urn:example:dt"],
+                ["ex:t", "bad:datatype"]
+            ]),
+        ),
+    ];
+    check_reads(&fluree, id, &reads, false, "novelty").await;
+    fluree.disconnect().await;
+    drop(fluree);
+    let fluree = open();
+    check_reads(&fluree, id, &reads, false, "reloaded").await;
+    crate::support::build_and_publish_index(&fluree, id).await;
+    fluree.disconnect().await;
+    drop(fluree);
+    let fluree = open();
+    check_reads(&fluree, id, &reads, true, "indexed, reloaded").await;
+    fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+    fluree.disconnect().await;
+    drop(fluree);
+    let fluree = open();
+    check_reads(
+        &fluree,
+        id,
+        &reads,
+        true,
+        "reindexed at the same t, reloaded",
+    )
+    .await;
+}
