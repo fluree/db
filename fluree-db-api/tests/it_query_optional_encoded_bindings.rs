@@ -1596,18 +1596,25 @@ async fn correlation_across_two_default_graphs_of_one_ledger() {
 
 /// A TriG ledger, indexed, with no novelty.
 async fn indexed_trig_ledger(ledger_id: &str, trig: &str) -> (Fluree, LedgerHandle) {
+    indexed_trig_commits(ledger_id, &[trig]).await
+}
+
+/// A ledger of one commit per TriG document, indexed, with no novelty.
+async fn indexed_trig_commits(ledger_id: &str, trigs: &[&str]) -> (Fluree, LedgerHandle) {
     let fluree = FlureeBuilder::memory().build_memory();
     fluree
         .create_ledger(ledger_id)
         .await
         .expect("create ledger");
-    let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
-    fluree
-        .stage(&handle)
-        .upsert_turtle(trig)
-        .execute()
-        .await
-        .expect("seed TriG");
+    for trig in trigs {
+        let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+        fluree
+            .stage(&handle)
+            .upsert_turtle(trig)
+            .execute()
+            .await
+            .expect("seed TriG");
+    }
     rebuild_and_publish_index(&fluree, ledger_id).await;
     fluree.disconnect_ledger(ledger_id).await;
     let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
@@ -2330,6 +2337,354 @@ async fn geo_search_reads_one_graph() {
         &mut failures,
     )
     .await;
+    failures.assert_none();
+}
+
+const OBJECT_COUNT_SITE: &str = "predicate_object_count";
+const OBJECT_COUNT_UNION_SITE: &str = "predicate_object_count_union";
+
+/// What the bound-object count must do for a query.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ObjectCount {
+    /// The one-graph lane answers; the union lane stamps nothing.
+    One,
+    /// The union lane answers, by this plan when given (`zero`, `single`,
+    /// `merge`); the one-graph lane declines. A plan the manifest decides on a
+    /// fixture this small (it may hold one leaf per graph) is left unchecked.
+    Union(Option<&'static str>),
+    /// The union lane declines with this label, by this plan when given; the
+    /// general plan answers.
+    UnionDeclines(&'static str, Option<&'static str>),
+}
+
+/// Check one bound-object count's routing: the union site's stamps, and
+/// whether the one-graph lane (stamped `proceed` when planned, a decline at
+/// open) answered.
+fn check_object_count_routing(
+    failures: &mut Failures,
+    label: &str,
+    store: &SpanStore,
+    before: usize,
+    lane: ObjectCount,
+) {
+    let one = stamps(store, before, OBJECT_COUNT_SITE);
+    let union = stamps(store, before, OBJECT_COUNT_UNION_SITE);
+    let one_answered =
+        one.iter().any(|o| o == "proceed") && !one.iter().any(|o| o == "fallback:gate_declined");
+    failures.eq(
+        one_answered,
+        lane == ObjectCount::One,
+        &format!("{label}: `{OBJECT_COUNT_SITE}` answered ({one:?})"),
+    );
+    let want: Vec<String> = match lane {
+        ObjectCount::One => vec![],
+        ObjectCount::Union(_) => vec!["proceed".to_string()],
+        ObjectCount::UnionDeclines(reason, _) => vec![format!("fallback:{reason}")],
+    };
+    failures.eq(
+        union,
+        want,
+        &format!("{label}: `{OBJECT_COUNT_UNION_SITE}` stamps"),
+    );
+    if let ObjectCount::Union(Some(plan)) | ObjectCount::UnionDeclines(_, Some(plan)) = lane {
+        let plans: Vec<String> = store.all_events()[before..]
+            .iter()
+            .filter(|e| e.message() == "union count plan")
+            .filter_map(|e| e.fields.get("plan").cloned())
+            .collect();
+        failures.eq(plans, vec![plan.to_string()], &format!("{label}: plan"));
+    }
+}
+
+/// `COUNT(?s)` over `?s <p> <o>`: the bound-object count. Over one graph it
+/// counts that graph's rows; over a default graph of several graphs of one
+/// ledger it counts the distinct subjects holding the object in some member,
+/// as the general plan does (its dedup key is `?s` alone, the predicate and
+/// object being constants); over a default graph of none, 0.
+///
+/// Kinds: a and b `T` in g2, a (the identical triple) and d `T` in g3, e `T`
+/// in the default graph, c `U` in g2. Only g3 has `ex:flag`. `ex:n 1`: a holds
+/// it as an integer and a double in g2, b as an integer in g2 and g3, c as a
+/// double in g3. `ex:q 5`: f's list `(5 5 7)` in g2 and g's plain 5 in g3;
+/// `ex:r 5`: f's list `(5 5)` in g2 only. `ex:m 1`: h's decimal `1.0` in g2,
+/// i's integer `1` in g3. `ex:zz`, only in g2 and committed later, so that no
+/// leaf of g3 can span it: k's `6`, and f's list `(5 5)`.
+#[tokio::test(flavor = "current_thread")]
+async fn object_count_over_one_graph_and_a_union() {
+    let ledger_id = "it/object-count-graphs:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        ex:e ex:kind ex:T .
+        GRAPH <urn:g2> {
+            ex:a ex:kind ex:T ; ex:n 1 , "1.0e0"^^xsd:double .
+            ex:b ex:kind ex:T ; ex:n 1 .
+            ex:c ex:kind ex:U .
+            ex:f ex:q ( 5 5 7 ) ; ex:r ( 5 5 ) .
+            ex:h ex:m 1.0 .
+        }
+        GRAPH <urn:g3> {
+            ex:a ex:kind ex:T .
+            ex:d ex:kind ex:T ; ex:flag ex:on .
+            ex:b ex:n 1 .
+            ex:c ex:n "1.0e0"^^xsd:double .
+            ex:g ex:q 5 .
+            ex:i ex:m 1 .
+        }
+    "#;
+    // A second commit: a reindex replays commits in order and numbers each
+    // predicate when it first sees it, so `ex:zz` sorts after every predicate
+    // of g3 in POST, and no leaf of g3 spans it.
+    let later = r#"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g2> { ex:k ex:zz 6 . ex:f ex:zz ( 5 5 ) . }
+    "#;
+    let (fluree, handle) = indexed_trig_commits(ledger_id, &[trig, later]).await;
+    // The union lane answers to the kill switch: no test may flip it mid-case.
+    let switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let count = |prologue: &str, ds: &str, triple: &str| {
+        format!("{prologue}{PREFIXES}SELECT (COUNT(?s) AS ?n) {ds} WHERE {{ ?s {triple} }}")
+    };
+    let from23 = "FROM <urn:g2> FROM <urn:g3>";
+    let n = |v: &str| rows(&[&[v]]);
+    let cases: Vec<(&str, String, Rows, ObjectCount)> = vec![
+        (
+            "one graph: the default graph",
+            count("", "", "ex:kind ex:T"),
+            n("1"),
+            ObjectCount::One,
+        ),
+        (
+            "one graph: FROM g2",
+            count("", "FROM <urn:g2>", "ex:kind ex:T"),
+            n("2"),
+            ObjectCount::One,
+        ),
+        (
+            "one graph: FROM g2, a bare number is a bag of slices",
+            count("", "FROM <urn:g2>", "ex:n 1"),
+            n("3"),
+            ObjectCount::One,
+        ),
+        (
+            "D1 FROM g2 + g3: a triple in both counts once",
+            count("", from23, "ex:kind ex:T"),
+            n("3"),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D2 union default graph",
+            count(UNION_PRAGMA, "", "ex:kind ex:T"),
+            n("4"),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D3 FROM default + g2 + g3",
+            count("", &format!("FROM <{ledger_id}> {from23}"), "ex:kind ex:T"),
+            n("4"),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D4 FROM g2 + g3, a predicate only g3 holds",
+            count("", from23, "ex:flag ex:on"),
+            n("1"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "D5 FROM g2 + g3, an object only g2 holds",
+            count("", from23, "ex:kind ex:U"),
+            n("1"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "D6 FROM g2 + g3, a known IRI no graph holds as the object",
+            count("", from23, "ex:kind ex:on"),
+            n("0"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "D7 FROM g2 + g3, an IRI the ledger never saw",
+            count("", from23, "ex:kind ex:Nope"),
+            n("0"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "D8 FROM g2 + g3, a bare number: distinct subjects across slices",
+            count("", from23, "ex:n 1"),
+            n("3"),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D9 FROM g2 + g3, a list repeating the object, merged",
+            count("", from23, "ex:q 5"),
+            n("2"),
+            ObjectCount::UnionDeclines("list_rows_in_post", None),
+        ),
+        (
+            "D10 FROM g2 + g3, a list repeating the object, one member",
+            count("", from23, "ex:r 5"),
+            n("1"),
+            ObjectCount::UnionDeclines("list_rows_in_post", None),
+        ),
+        (
+            "D11 FROM g2 + g3, a bare number with a decimal slice",
+            count("", from23, "ex:m 1"),
+            n("2"),
+            ObjectCount::UnionDeclines("arena_type", None),
+        ),
+        (
+            "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf",
+            count("", from23, "ex:zz 6"),
+            n("1"),
+            ObjectCount::Union(Some("single")),
+        ),
+        (
+            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf",
+            count("", from23, "ex:zz 5"),
+            n("1"),
+            ObjectCount::UnionDeclines("list_rows_in_post", Some("single")),
+        ),
+        (
+            "D12 FROM NAMED g2 alone: an empty default graph",
+            count("", "FROM NAMED <urn:g2>", "ex:kind ex:T"),
+            n("0"),
+            ObjectCount::Union(None),
+        ),
+    ];
+    let mut failures = Failures::default();
+    let run = |query: String| {
+        let fluree = &fluree;
+        let handle = &handle;
+        async move {
+            db(handle)
+                .await
+                .query(fluree)
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    for (label, query, want, lane) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match run(query).await {
+            Ok(json) => failures.eq(sparql_rows(&json, &["n"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        check_object_count_routing(&mut failures, label, &store, before, lane);
+    }
+
+    // The JSON-LD twins.
+    let json_count = |from: JsonValue, opts: Option<JsonValue>| {
+        let mut q = json!({
+            "@context": {"ex": EX},
+            "from": from,
+            "select": ["(as (count ?s) ?n)"],
+            "where": [{"@id": "?s", "ex:kind": {"@id": "ex:T"}}]
+        });
+        if let Some(opts) = opts {
+            q["opts"] = opts;
+        }
+        q
+    };
+    for (label, query, want, lane) in [
+        (
+            "J1 JSON-LD, one graph: g2",
+            json_count(json!({"@id": ledger_id, "graph": "urn:g2"}), None),
+            n("2"),
+            ObjectCount::One,
+        ),
+        (
+            "J2 JSON-LD, FROM g2 + g3",
+            json_count(
+                json!([
+                    {"@id": ledger_id, "graph": "urn:g2"},
+                    {"@id": ledger_id, "graph": "urn:g3"}
+                ]),
+                None,
+            ),
+            n("3"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "J3 JSON-LD, opts.unionDefaultGraph",
+            json_count(json!(ledger_id), Some(json!({"unionDefaultGraph": true}))),
+            n("4"),
+            ObjectCount::Union(None),
+        ),
+    ] {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        let result = connection_jsonld(&fluree, ledger_id, &query).await;
+        failures.eq(jsonld_rows(&result), want, label);
+        check_object_count_routing(&mut failures, label, &store, before, lane);
+    }
+
+    // Under the kill switch the planner builds no count lane; the union site
+    // says so, and the one-graph site stays silent, as it always has.
+    drop(switch);
+    {
+        let _switch = crate::support::FAST_PATH_SWITCH.write().await;
+        let _restore = FastPathSwitchRestore;
+        fluree_db_api::set_fast_paths_disabled(true);
+        for (label, ds, want, union_stamps) in [
+            (
+                "K1 FROM g2 + g3 under the kill switch",
+                from23,
+                "3",
+                vec!["fallback:kill_switch"],
+            ),
+            (
+                "K2 FROM g2 under the kill switch",
+                "FROM <urn:g2>",
+                "2",
+                vec![],
+            ),
+        ] {
+            let (store, _guard) = init_test_tracing();
+            let before = store.all_events().len();
+            match run(count("", ds, "ex:kind ex:T")).await {
+                Ok(json) => failures.eq(sparql_rows(&json, &["n"]), n(want), label),
+                Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+            }
+            failures.eq(
+                (
+                    stamps(&store, before, OBJECT_COUNT_SITE),
+                    stamps(&store, before, OBJECT_COUNT_UNION_SITE),
+                ),
+                (vec![], union_stamps.into_iter().map(String::from).collect()),
+                &format!("{label}: (one-graph, union) stamps"),
+            );
+        }
+    }
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+
+    // Novelty in one member: the union lane declines, and says why. The
+    // answer counts j, which only novelty holds.
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               GRAPH <urn:g2> { ex:j ex:kind ex:T . }"#,
+        )
+        .execute()
+        .await
+        .expect("write to g2 after the index");
+    let label = "N1 FROM g2 + g3, novelty in g2";
+    let (store, _guard) = init_test_tracing();
+    let before = store.all_events().len();
+    match run(count("", from23, "ex:kind ex:T")).await {
+        Ok(json) => failures.eq(sparql_rows(&json, &["n"]), n("4"), label),
+        Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+    }
+    check_object_count_routing(
+        &mut failures,
+        label,
+        &store,
+        before,
+        ObjectCount::UnionDeclines("novelty", None),
+    );
     failures.assert_none();
 }
 

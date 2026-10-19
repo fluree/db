@@ -3123,6 +3123,24 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
+    //
+    // Over a default graph of several graphs (or of none) the operator counts
+    // the union, which answers to the kill switch: under it, the union site
+    // says so here, since no operator is built to say it at open.
+    if fast_paths_globally_disabled
+        && !planning.is_history()
+        && !trailing_values
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+        && detect_predicate_object_count(query).is_some()
+    {
+        stamp_fast_path(
+            crate::fast_group_count_firsts::PREDICATE_OBJECT_COUNT_UNION_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+        );
+    }
     if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);

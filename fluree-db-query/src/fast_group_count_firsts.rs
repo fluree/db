@@ -5,6 +5,8 @@ use crate::fast_path_common::{
     allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
     subject_ref_to_s_id,
 };
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::index_scope::{IndexScope, MemberSet};
 use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
@@ -14,6 +16,8 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::leaf::{
     decode_leaf_dir_v3_with_base, decode_leaf_header_v3, LeafletDirEntryV3,
 };
+use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
@@ -373,17 +377,9 @@ impl PredicateObjectCountFirstsOperator {
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         use crate::dataset_operator::DatasetOperator;
-        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
         use crate::ir::AggregateFn;
-
-        // As for the count top-k: the plan stamped `Proceed`; a decline at
-        // open is stamped here.
-        stamp_fast_path(
-            "predicate_object_count",
-            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
-        );
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -419,6 +415,60 @@ impl PredicateObjectCountFirstsOperator {
         self.fallback = Some(op);
         Ok(())
     }
+
+    /// The count over a default graph of several graphs, stamped at its own
+    /// site; `None` (with the reason stamped) to fall back.
+    fn count_union(&self, ctx: &ExecutionContext<'_>, set: &MemberSet<'_>) -> Option<i64> {
+        let outcome = if set.all_current() {
+            let first = set.members()[0].g_id();
+            let stats_view = object_count_stats_view(ctx, set.store(), first);
+            match count_bound_object_union(
+                ctx.active_snapshot,
+                set,
+                &self.predicate,
+                &self.object,
+                stats_view.as_deref(),
+                &ctx.cancellation,
+            ) {
+                Ok(outcome) => outcome,
+                // As on one graph: what the V6 path can't give falls back.
+                Err(_) => Err(FastPathFallback::GateDeclined),
+            }
+        } else {
+            Err(FastPathFallback::Novelty)
+        };
+        stamp_fast_path(
+            PREDICATE_OBJECT_COUNT_UNION_SITE,
+            match outcome {
+                Ok(_) => FastPathOutcome::Proceed,
+                Err(reason) => FastPathOutcome::Fallback(reason),
+            },
+        );
+        outcome.ok()
+    }
+}
+
+/// `fast-path outcome` site of the bound-object count over one graph, stamped
+/// `Proceed` by the planner and a decline at open.
+const PREDICATE_OBJECT_COUNT_SITE: &str = "predicate_object_count";
+
+/// `fast-path outcome` site of the bound-object count over a default graph of
+/// several graphs, or of none.
+pub(crate) const PREDICATE_OBJECT_COUNT_UNION_SITE: &str = "predicate_object_count_union";
+
+/// The stats view a bound-object count reads observed datatypes from. Built
+/// from the ledger's indexed stats, which hold every graph's.
+fn object_count_stats_view(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+) -> Option<Arc<fluree_db_core::StatsView>> {
+    crate::stats_cache::cached_stats_view_for_db(
+        fluree_db_core::GraphDbRef::new(ctx.active_snapshot, g_id, ctx.overlay(), ctx.to_t)
+            .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
+        Some(store),
+        false,
+    )
 }
 
 #[async_trait]
@@ -442,50 +492,48 @@ impl Operator for PredicateObjectCountFirstsOperator {
         self.emitted = false;
         self.fallback = None;
 
-        if should_fallback(ctx) {
-            return self.open_fallback(ctx).await;
-        }
-
-        // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
-        //
-        // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if !crate::fast_path_common::overlay_has_novelty(ctx) {
-            if let Some(binary_index_store) = ctx.binary_store.as_ref() {
-                let stats_view = crate::stats_cache::cached_stats_view_for_db(
-                    fluree_db_core::GraphDbRef::new(
-                        ctx.active_snapshot,
-                        ctx.binary_g_id,
-                        ctx.overlay(),
-                        ctx.to_t,
-                    )
-                    .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
-                    Some(binary_index_store),
-                    false,
-                );
-                match count_bound_object_v6(
+        let mut one_graph_answered = false;
+        let counted = match ctx.index_scope() {
+            // One graph whose index alone answers for it (no novelty, read at
+            // the index's `t`). A count the V6 path can't give falls back.
+            Some(IndexScope::One(member)) if member.index_is_current() => {
+                let stats_view = object_count_stats_view(ctx, member.store(), member.g_id());
+                count_bound_object_v6(
                     ctx.active_snapshot,
-                    binary_index_store,
-                    ctx.binary_g_id,
+                    member.store(),
+                    member.g_id(),
                     &self.predicate,
                     &self.object,
                     stats_view.as_deref(),
                     &ctx.cancellation,
-                ) {
-                    Ok(total) => {
-                        self.count = total;
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        // V6 path couldn't handle it — fall through to V5 or fallback.
-                    }
-                }
+                )
+                .ok()
+                .inspect(|_| one_graph_answered = true)
             }
+            Some(IndexScope::Union(set)) => self.count_union(ctx, &set),
+            // A default graph of none holds no triple.
+            Some(IndexScope::Empty) => {
+                stamp_fast_path(PREDICATE_OBJECT_COUNT_UNION_SITE, FastPathOutcome::Proceed);
+                Some(0)
+            }
+            _ => None,
+        };
+        // The plan stamped `Proceed` when the detector matched; the one-graph
+        // lane's decline at open is stamped here, so planned and executed can
+        // be told apart, whether the union lane or the general plan answers.
+        if !one_graph_answered {
+            stamp_fast_path(
+                PREDICATE_OBJECT_COUNT_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
         }
-
-        // V5 leaf-scanning fast-path removed. Fall back to generic scan/aggregate.
-        // TODO: V3 leaflet fast-path for predicate-object count (port boundary-equality
-        // optimization to V3 column-based format).
-        return self.open_fallback(ctx).await;
+        match counted {
+            Some(count) => {
+                self.count = count;
+                Ok(())
+            }
+            None => self.open_fallback(ctx).await,
+        }
     }
 
     async fn next_batch(
@@ -558,7 +606,9 @@ fn pid_prefix_v6_from_entry(entry: &LeafletDirEntryV3) -> (u32, u16, u64) {
     (rec.p_id, rec.o_type, rec.o_key)
 }
 
-/// Load a V3 leaflet's columns, using the `LeafletCache` when available.
+/// Load a V3 leaflet's columns, using the `LeafletCache` when available, and
+/// the list index too when `with_o_i`.
+#[allow(clippy::too_many_arguments)]
 fn load_v6_batch(
     leaf_bytes: &[u8],
     entry: &LeafletDirEntryV3,
@@ -567,9 +617,13 @@ fn load_v6_batch(
     cache: &Option<&Arc<fluree_db_binary_index::LeafletCache>>,
     leaf_id: u128,
     leaflet_idx: u32,
+    with_o_i: bool,
 ) -> Result<fluree_db_binary_index::ColumnBatch> {
     let mut needed = ColumnSet::EMPTY;
     needed.insert(ColumnId::OKey);
+    if with_o_i {
+        needed.insert(ColumnId::OI);
+    }
     if entry.o_type_const.is_none() {
         needed.insert(ColumnId::OType);
     }
@@ -648,7 +702,15 @@ fn count_bound_object_v6(
             let o_key = o_key.ok_or_else(|| {
                 QueryError::Internal("NumBig rows need the decoded-value filter".to_string())
             })?;
-            total += count_object_key_v6(store, g_id, p_id, o_type.as_u16(), o_key, cancellation)?;
+            total += one_graph_count(count_object_key_v6(
+                store,
+                g_id,
+                p_id,
+                o_type.as_u16(),
+                o_key,
+                cancellation,
+                ListRows::Count,
+            )?)?;
         }
         return Ok(total);
     }
@@ -662,10 +724,37 @@ fn count_bound_object_v6(
     else {
         return Ok(0);
     };
-    count_object_key_v6(store, g_id, p_id, target_o_type, target_o_key, cancellation)
+    one_graph_count(count_object_key_v6(
+        store,
+        g_id,
+        p_id,
+        target_o_type,
+        target_o_key,
+        cancellation,
+        ListRows::Count,
+    )?)
 }
 
-/// Rows of predicate `p_id` whose object is exactly `(target_o_type, target_o_key)`.
+/// What a row count does with list rows (`o_i` set).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListRows {
+    /// Count each row: one graph's solutions are a bag.
+    Count,
+    /// Stop at the first. Over several graphs the general plan collapses a
+    /// fact's list rows into one solution, which a row count cannot see in
+    /// POST, where they need not be adjacent.
+    Decline,
+}
+
+/// A one-graph count, which counts list rows and so never declines.
+fn one_graph_count(count: std::result::Result<i64, FastPathFallback>) -> Result<i64> {
+    count.map_err(|reason| {
+        QueryError::Internal(format!("a one-graph object count declined: {reason:?}"))
+    })
+}
+
+/// Rows of predicate `p_id` whose object is exactly `(target_o_type, target_o_key)`,
+/// or, under [`ListRows::Decline`], `ListRowsInPost` at the first list row.
 fn count_object_key_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -673,7 +762,8 @@ fn count_object_key_v6(
     target_o_type: u16,
     target_o_key: u64,
     cancellation: &QueryCancellation,
-) -> Result<i64> {
+    lists: ListRows,
+) -> Result<std::result::Result<i64, FastPathFallback>> {
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
@@ -784,10 +874,17 @@ fn count_object_key_v6(
             // satisfy the first two conditions while still containing rows for
             // *other* predicates that must be excluded — fall through to the
             // per-row scan in that case.
+            // A leaflet with list rows: under `Decline`, its rows of the
+            // target must be read to see whether one is a list row.
+            let check_o_i = lists == ListRows::Decline && entry.flags & HAS_O_I != 0;
             if prefix == target_prefix
                 && next_prefix == Some(target_prefix)
                 && entry.p_const == Some(p_id)
             {
+                // Every row is the target's, so the flag is the answer.
+                if check_o_i {
+                    return Ok(Err(FastPathFallback::ListRowsInPost));
+                }
                 total += entry.row_count as i64;
                 continue;
             }
@@ -801,6 +898,7 @@ fn count_object_key_v6(
                 leaf_id,
                 u32::try_from(i)
                     .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                check_o_i,
             )?;
 
             for row in 0..batch.row_count {
@@ -816,13 +914,16 @@ fn count_object_key_v6(
                     .o_type_const
                     .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                 if ot == target_o_type && batch.o_key.get(row) == target_o_key {
+                    if check_o_i && batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                        return Ok(Err(FastPathFallback::ListRowsInPost));
+                    }
                     total += 1;
                 }
             }
         }
     }
 
-    Ok(total)
+    Ok(Ok(total))
 }
 
 /// V6 fast-path: GROUP BY ?o COUNT(?s) for a predicate.
@@ -1002,6 +1103,7 @@ pub(crate) fn group_count_v6(
                 leaf_id,
                 u32::try_from(i)
                     .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                false,
             )?;
 
             for row in 0..batch.row_count {
@@ -1730,6 +1832,592 @@ fn compute_group_by_object_star_topk(
     Ok(Some(crate::binding::Batch::new(schema, cols).map_err(
         |e| QueryError::execution(format!("batch build: {e}")),
     )?))
+}
+
+// ---------------------------------------------------------------------------
+// Counts over a default graph of several graphs
+// ---------------------------------------------------------------------------
+
+/// Whether `o_type`'s `o_key` is a handle into an arena per graph, so equal
+/// keys in two members need not be one value.
+// TODO(r6-d): replace with `merged_cursor::is_graph_scoped_arena` once MC is merged.
+fn is_graph_scoped_arena(o_type: u16) -> bool {
+    use fluree_db_core::DecodeKind;
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::NumBigArena | DecodeKind::VectorArena | DecodeKind::SpatialArena
+    )
+}
+
+/// Subject ids in ascending order, a batch at a time: the rows of one slice
+/// `(p, o_type, o_key)` in POST, read from the members that hold it, each fact
+/// once.
+pub(crate) trait SortedSubjects {
+    /// The next batch; `Ok(Err(reason))` when the source cannot give the exact
+    /// rows (a list row in POST, an arena type); `Ok(Ok(None))` when drained.
+    fn next_subjects(
+        &mut self,
+    ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>>;
+}
+
+/// The number of distinct subject ids across `sources`, each ascending.
+///
+/// A bare number reads one slice per numeric datatype. Over several graphs the
+/// general plan counts a subject once however many slices hold it: the
+/// pattern's predicate and object are constants, so the dedup key is `?s`
+/// alone. The slices' counts therefore do not sum.
+fn count_distinct_subjects<S: SortedSubjects>(
+    sources: Vec<S>,
+) -> Result<std::result::Result<u64, FastPathFallback>> {
+    struct Head<S> {
+        source: S,
+        batch: ColumnBatch,
+        row: usize,
+    }
+    fn refill<S: SortedSubjects>(
+        source: &mut S,
+    ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
+        loop {
+            match source.next_subjects()? {
+                Ok(Some(batch)) if batch.row_count == 0 => {}
+                other => return Ok(other),
+            }
+        }
+    }
+
+    let mut heads = Vec::with_capacity(sources.len());
+    for mut source in sources {
+        match refill(&mut source)? {
+            Ok(Some(batch)) => heads.push(Head {
+                source,
+                batch,
+                row: 0,
+            }),
+            Ok(None) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    let mut count = 0u64;
+    let mut last = None;
+    // Few sources (slices times members): a scan of the heads picks the next.
+    while let Some((i, s_id)) = heads
+        .iter()
+        .enumerate()
+        .map(|(i, head)| (i, head.batch.s_id.get(head.row)))
+        .min_by_key(|&(_, s_id)| s_id)
+    {
+        if last != Some(s_id) {
+            count += 1;
+            last = Some(s_id);
+        }
+        let head = &mut heads[i];
+        head.row += 1;
+        if head.row == head.batch.row_count {
+            match refill(&mut head.source)? {
+                Ok(Some(batch)) => {
+                    head.batch = batch;
+                    head.row = 0;
+                }
+                Ok(None) => {
+                    heads.swap_remove(i);
+                }
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+    }
+    Ok(Ok(count))
+}
+
+/// One slice `(o_type, o_key)` of a bound object, and the members whose index
+/// may hold rows of it.
+#[derive(Debug, PartialEq)]
+struct SliceHolders {
+    o_type: u16,
+    o_key: u64,
+    members: smallvec::SmallVec<[GraphId; 4]>,
+}
+
+/// One member's slices of a bound object: `(o_type, o_key)`, with no key for a
+/// whole `o_type` left to the decoded-value filter.
+type Slices = Vec<(u16, Option<u64>)>;
+
+/// How to count `?s <p> <o>` over a default graph of several graphs.
+#[derive(Debug, PartialEq)]
+enum UnionCountPlan {
+    /// No member's index holds a row of any slice.
+    Zero,
+    /// One member holds the only slice any member holds: its rows count as one
+    /// graph's do, except that list rows, which the union collapses, decline.
+    Single {
+        g_id: GraphId,
+        o_type: u16,
+        o_key: u64,
+    },
+    /// Several `(member, slice)` pairs: count the distinct subjects across them.
+    Merge(Vec<SliceHolders>),
+}
+
+impl UnionCountPlan {
+    fn label(&self) -> &'static str {
+        match self {
+            UnionCountPlan::Zero => "zero",
+            UnionCountPlan::Single { .. } => "single",
+            UnionCountPlan::Merge(_) => "merge",
+        }
+    }
+}
+
+/// Plan a bound-object count over a default graph of several graphs, from each
+/// member's slices of the object (`None` key: a whole `o_type`, left to the
+/// decoded-value filter) and whether a member's index may hold a slice
+/// (`may_hold`: false only when no leaf of its POST branch overlaps the slice).
+///
+/// Declines `ArenaType` for a slice whose key is an arena handle, or that has
+/// no key: neither names one value across members.
+fn plan_union_count(
+    member_slices: impl IntoIterator<Item = (GraphId, Slices)>,
+    mut may_hold: impl FnMut(GraphId, u16, u64) -> bool,
+) -> std::result::Result<UnionCountPlan, FastPathFallback> {
+    let mut slices: Vec<SliceHolders> = Vec::new();
+    for (g_id, member_slices) in member_slices {
+        for (o_type, o_key) in member_slices {
+            let Some(o_key) = o_key.filter(|_| !is_graph_scoped_arena(o_type)) else {
+                return Err(FastPathFallback::ArenaType);
+            };
+            if !may_hold(g_id, o_type, o_key) {
+                continue;
+            }
+            match slices
+                .iter_mut()
+                .find(|s| (s.o_type, s.o_key) == (o_type, o_key))
+            {
+                Some(slice) => slice.members.push(g_id),
+                None => slices.push(SliceHolders {
+                    o_type,
+                    o_key,
+                    members: smallvec::smallvec![g_id],
+                }),
+            }
+        }
+    }
+    Ok(match slices.as_slice() {
+        [] => UnionCountPlan::Zero,
+        [only] if only.members.len() == 1 => UnionCountPlan::Single {
+            g_id: only.members[0],
+            o_type: only.o_type,
+            o_key: only.o_key,
+        },
+        _ => UnionCountPlan::Merge(slices),
+    })
+}
+
+/// The POST key range of one slice `(p, o_type, o_key)`: every list index and
+/// subject.
+fn post_slice_bounds(
+    g_id: GraphId,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+) -> (RunRecordV2, RunRecordV2) {
+    let key = |s_id, o_i| RunRecordV2 {
+        s_id: SubjectId(s_id),
+        o_key,
+        p_id,
+        t: 0,
+        o_i,
+        o_type,
+        g_id,
+    };
+    (key(0, 0), key(u64::MAX, u32::MAX))
+}
+
+/// Whether `g_id`'s index may hold rows of a slice: a leaf of its POST branch
+/// overlaps the slice's key range. Read from the branch manifest alone; a
+/// `false` proves the graph holds none (with no novelty to add).
+fn index_may_hold(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+) -> bool {
+    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Post) else {
+        return false;
+    };
+    let (min, max) = post_slice_bounds(g_id, p_id, o_type, o_key);
+    !branch
+        .find_leaves_in_range(&min, &max, cmp_v2_for_order(RunSortOrder::Post))
+        .is_empty()
+}
+
+/// The subjects of one slice in one graph's index. POST keys a slice's rows by
+/// `(o_i, s)`, so without list rows they come in subject order; a list row
+/// declines (`ListRowsInPost`), since it can repeat a fact out of order.
+struct SliceSubjects(BinaryCursor);
+
+impl SliceSubjects {
+    fn open(
+        store: &Arc<BinaryIndexStore>,
+        g_id: GraphId,
+        to_t: i64,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+    ) -> Option<Self> {
+        let (min, max) = post_slice_bounds(g_id, p_id, o_type, o_key);
+        let projection = ColumnProjection {
+            output: ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OI)),
+            internal: ColumnSet::EMPTY,
+        };
+        // A cursor returns whole leaflets, and its first and last can hold
+        // other objects' rows (or other predicates'): the filter keeps the
+        // slice's alone.
+        let slice = fluree_db_binary_index::BinaryFilter {
+            p_id: Some(p_id),
+            o_type: Some(o_type),
+            o_key: Some(o_key),
+            ..Default::default()
+        };
+        let mut cursor = crate::fast_path_common::build_range_cursor(
+            store,
+            g_id,
+            RunSortOrder::Post,
+            &min,
+            &max,
+            slice,
+            projection,
+        )?;
+        cursor.set_to_t(to_t);
+        Some(Self(cursor))
+    }
+}
+
+impl SortedSubjects for SliceSubjects {
+    fn next_subjects(
+        &mut self,
+    ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
+        let Some(batch) = self
+            .0
+            .next_batch()
+            .map_err(|e| QueryError::from_io("slice cursor", e))?
+        else {
+            return Ok(Ok(None));
+        };
+        let has_list_row = !matches!(batch.o_i, fluree_db_binary_index::ColumnData::AbsentDefault)
+            && (0..batch.row_count)
+                .any(|row| batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE);
+        Ok(if has_list_row {
+            Err(FastPathFallback::ListRowsInPost)
+        } else {
+            Ok(Some(batch))
+        })
+    }
+}
+
+/// `COUNT(?s)` over `?s <p> <o>` in a default graph of several graphs, every
+/// member current: the distinct subjects holding the object in some member,
+/// which is what the general plan counts (its dedup key is `?s` alone).
+///
+/// Each member contributes its own slices of the object (a bare number has one
+/// per numeric datatype it observed). With no member's manifest holding any,
+/// the count is 0; with one `(member, slice)` pair, that member counts it as
+/// one graph does, declining on list rows; otherwise a merge of every pair's
+/// subjects counts the distinct ones.
+fn count_bound_object_union(
+    snapshot: &LedgerSnapshot,
+    set: &MemberSet<'_>,
+    predicate: &Ref,
+    object: &Term,
+    stats_view: Option<&fluree_db_core::StatsView>,
+    cancellation: &QueryCancellation,
+) -> Result<std::result::Result<i64, FastPathFallback>> {
+    let store = set.store();
+    let p_id = resolve_predicate_id_v6(predicate, store)?;
+    let member_slices: Vec<(GraphId, Slices)> =
+        if let Term::Value(value @ (FlakeValue::Long(_) | FlakeValue::Double(_))) = object {
+            let mut out = Vec::with_capacity(set.members().len());
+            for member in set.members() {
+                let g_id = member.g_id();
+                let slices = crate::binary_scan::untyped_numeric_slices(
+                    store,
+                    g_id,
+                    Some(p_id),
+                    crate::binary_scan::observed_datatypes(stats_view, g_id, p_id),
+                    value,
+                    true,
+                )
+                .ok_or_else(|| QueryError::Internal("non-finite numeric constant".to_string()))?;
+                out.push((
+                    g_id,
+                    slices
+                        .into_iter()
+                        .map(|(ot, ok)| (ot.as_u16(), ok))
+                        .collect(),
+                ));
+            }
+            out
+        } else {
+            // Every other object is one term with one key in every member:
+            // subject and string ids are ledger-wide, and a value that would
+            // need an arena handle does not translate (an error: fallback).
+            // With no novelty, a translation miss means no member holds it.
+            let Some((o_type, o_key)) =
+                translate_term_to_v6(object, snapshot, store, p_id, set.members()[0].g_id())?
+            else {
+                return Ok(Ok(0));
+            };
+            set.members()
+                .iter()
+                .map(|m| (m.g_id(), vec![(o_type, Some(o_key))]))
+                .collect()
+        };
+    let plan = match plan_union_count(member_slices, |g_id, o_type, o_key| {
+        index_may_hold(store, g_id, p_id, o_type, o_key)
+    }) {
+        Ok(plan) => plan,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    // Which way the count went, so a test can tell the one-member count from
+    // the merge (both proceed at the site).
+    tracing::debug!(
+        target: crate::fast_path_outcome::FAST_PATH_TARGET,
+        site = PREDICATE_OBJECT_COUNT_UNION_SITE,
+        plan = plan.label(),
+        "union count plan",
+    );
+    let to_t = |g_id: GraphId| {
+        set.members()
+            .iter()
+            .find(|m| m.g_id() == g_id)
+            .map_or(store.max_t(), crate::index_scope::IndexMember::to_t)
+    };
+    match plan {
+        UnionCountPlan::Zero => Ok(Ok(0)),
+        UnionCountPlan::Single {
+            g_id,
+            o_type,
+            o_key,
+        } => count_object_key_v6(
+            store,
+            g_id,
+            p_id,
+            o_type,
+            o_key,
+            cancellation,
+            ListRows::Decline,
+        ),
+        UnionCountPlan::Merge(slices) => {
+            let mut sources = Vec::new();
+            for slice in &slices {
+                for &g_id in &slice.members {
+                    check_cancelled(cancellation)?;
+                    sources.extend(SliceSubjects::open(
+                        store,
+                        g_id,
+                        to_t(g_id),
+                        p_id,
+                        slice.o_type,
+                        slice.o_key,
+                    ));
+                }
+            }
+            Ok(count_distinct_subjects(sources)?.map(|n| n as i64))
+        }
+    }
+}
+
+#[cfg(test)]
+mod union_count_tests {
+    use super::{
+        count_distinct_subjects, plan_union_count, SliceHolders, SortedSubjects, UnionCountPlan,
+    };
+    use crate::error::Result;
+    use crate::fast_path_outcome::FastPathFallback;
+    use fluree_db_binary_index::{ColumnBatch, ColumnData};
+    use fluree_db_core::o_type::OType;
+    use smallvec::smallvec;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    /// Batches of subject ids, or a decline, in order.
+    struct Batches(VecDeque<std::result::Result<Vec<u64>, FastPathFallback>>);
+
+    fn source(batches: &[&[u64]]) -> Batches {
+        Batches(batches.iter().map(|b| Ok(b.to_vec())).collect())
+    }
+
+    impl SortedSubjects for Batches {
+        fn next_subjects(
+            &mut self,
+        ) -> Result<std::result::Result<Option<ColumnBatch>, FastPathFallback>> {
+            Ok(match self.0.pop_front() {
+                None => Ok(None),
+                Some(Err(reason)) => Err(reason),
+                Some(Ok(ids)) => {
+                    let mut batch = ColumnBatch::empty();
+                    batch.row_count = ids.len();
+                    batch.s_id = ColumnData::Block(Arc::from(ids));
+                    Ok(Some(batch))
+                }
+            })
+        }
+    }
+
+    fn distinct(sources: Vec<Batches>) -> std::result::Result<u64, FastPathFallback> {
+        count_distinct_subjects(sources).expect("no I/O in a test source")
+    }
+
+    #[test]
+    fn distinct_subjects_across_sorted_sources() {
+        assert_eq!(distinct(vec![]), Ok(0));
+        assert_eq!(distinct(vec![source(&[])]), Ok(0));
+        assert_eq!(distinct(vec![source(&[&[], &[1, 2], &[]])]), Ok(2));
+        // One source: a run split across batches is one subject.
+        assert_eq!(distinct(vec![source(&[&[1, 2, 2], &[2, 3]])]), Ok(3));
+        // Disjoint sources sum.
+        assert_eq!(
+            distinct(vec![source(&[&[1, 3]]), source(&[&[2, 4, 6]])]),
+            Ok(5)
+        );
+        // Overlapping sources count each subject once: {a, b} and {a, c}.
+        assert_eq!(
+            distinct(vec![source(&[&[10, 20]]), source(&[&[10], &[30]])]),
+            Ok(3)
+        );
+        // Three sources, all holding one subject, two of them ending early.
+        assert_eq!(
+            distinct(vec![
+                source(&[&[5]]),
+                source(&[&[5, 7], &[9]]),
+                source(&[&[1, 5]]),
+            ]),
+            Ok(4)
+        );
+    }
+
+    #[test]
+    fn a_declining_source_declines_the_count() {
+        let mut declining = source(&[&[1, 2]]);
+        declining.0.push_back(Err(FastPathFallback::ListRowsInPost));
+        assert_eq!(
+            distinct(vec![source(&[&[1, 2, 3]]), declining]),
+            Err(FastPathFallback::ListRowsInPost)
+        );
+        let at_start = Batches(VecDeque::from([Err(FastPathFallback::ArenaType)]));
+        assert_eq!(
+            distinct(vec![source(&[&[1]]), at_start]),
+            Err(FastPathFallback::ArenaType)
+        );
+    }
+
+    const INT: u16 = OType::XSD_INTEGER.as_u16();
+    const DBL: u16 = OType::XSD_DOUBLE.as_u16();
+    const IRI: u16 = OType::IRI_REF.as_u16();
+
+    #[test]
+    fn plan_from_member_slices_and_presence() {
+        let all = |_: u16, _: u16, _: u64| true;
+        // No slice in any member.
+        assert_eq!(
+            plan_union_count(vec![(1, vec![]), (2, vec![])], all),
+            Ok(UnionCountPlan::Zero)
+        );
+        // The slice in no member's index.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![(IRI, Some(7))]), (2, vec![(IRI, Some(7))])],
+                |_, _, _| false
+            ),
+            Ok(UnionCountPlan::Zero)
+        );
+        // One member holds it: counted as one graph.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![(IRI, Some(7))]), (2, vec![(IRI, Some(7))])],
+                |g, _, _| g == 2
+            ),
+            Ok(UnionCountPlan::Single {
+                g_id: 2,
+                o_type: IRI,
+                o_key: 7
+            })
+        );
+        // Both hold it: a merge.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![(IRI, Some(7))]), (2, vec![(IRI, Some(7))])],
+                all
+            ),
+            Ok(UnionCountPlan::Merge(vec![SliceHolders {
+                o_type: IRI,
+                o_key: 7,
+                members: smallvec![1, 2]
+            }]))
+        );
+        // A bare number: each member's own datatypes, one member per slice, is
+        // still a merge, since a subject can hold both slices.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![(INT, Some(1))]), (2, vec![(DBL, Some(9))])],
+                all
+            ),
+            Ok(UnionCountPlan::Merge(vec![
+                SliceHolders {
+                    o_type: INT,
+                    o_key: 1,
+                    members: smallvec![1]
+                },
+                SliceHolders {
+                    o_type: DBL,
+                    o_key: 9,
+                    members: smallvec![2]
+                },
+            ]))
+        );
+        // Two slices in one member, too.
+        assert_eq!(
+            plan_union_count(
+                vec![(1, vec![(INT, Some(1)), (DBL, Some(9))]), (2, vec![])],
+                all
+            ),
+            Ok(UnionCountPlan::Merge(vec![
+                SliceHolders {
+                    o_type: INT,
+                    o_key: 1,
+                    members: smallvec![1]
+                },
+                SliceHolders {
+                    o_type: DBL,
+                    o_key: 9,
+                    members: smallvec![1]
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn arena_slices_decline() {
+        let all = |_: u16, _: u16, _: u64| true;
+        let big = OType::NUM_BIG_OVERFLOW.as_u16();
+        let vector = OType::VECTOR.as_u16();
+        for slices in [
+            vec![(big, Some(0))],
+            vec![(vector, Some(3))],
+            // A whole o_type left to the value filter: NumBig.
+            vec![(INT, Some(1)), (big, None)],
+        ] {
+            assert_eq!(
+                plan_union_count(vec![(1, vec![]), (2, slices.clone())], all),
+                Err(FastPathFallback::ArenaType),
+                "{slices:?}"
+            );
+        }
+        // A key that is no handle is fine even with no rows anywhere.
+        assert_eq!(
+            plan_union_count(vec![(1, vec![(INT, Some(1))])], |_, _, _| false),
+            Ok(UnionCountPlan::Zero)
+        );
+    }
 }
 
 #[cfg(test)]
