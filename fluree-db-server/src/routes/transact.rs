@@ -206,6 +206,9 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::CommitNotFound { message } => {
             return ServerError::Api(ApiError::CommitNotFound(message.clone()));
         }
+        SubmissionError::ConfigUnavailable { message } => {
+            return ServerError::Api(ApiError::ConfigUnavailable(message.clone()));
+        }
         SubmissionError::CommitContention { message } => {
             return ServerError::CommitContention(message.clone());
         }
@@ -1479,7 +1482,7 @@ async fn sync_local(
             // writer sees policy-filtered counts and a run that would fail
             // policy / SHACL / uniqueness fails here too.
             let prepared = prepare_transaction_body(body_json, &headers)?;
-            let txn_opts = txn_opts_from_body(&prepared.body, &span)?;
+            let txn_opts = txn_opts_from_body(&prepared.body, &prepared.governance, &span)?;
             return dry_run_sync(
                 &state,
                 &ledger_id,
@@ -1893,7 +1896,15 @@ fn is_misrouted_cypher_envelope(body: &JsonValue) -> bool {
 /// `opts` block (`shapes`, `uniqueProperties`). Shared by the consensus
 /// submission path and the sync dry-run path so both stage under the same
 /// inline constraints.
-fn txn_opts_from_body(body: &JsonValue, span: &tracing::Span) -> Result<TxnOpts> {
+///
+/// Inline governance (`opts.shapes`, `opts.uniqueProperties`) is refused in a
+/// request carrying policy inputs (identity, policy class, inline policy or
+/// policy values): support in policy-scoped requests is a follow-up.
+fn txn_opts_from_body(
+    body: &JsonValue,
+    governance: &GovernanceOptions,
+    span: &tracing::Span,
+) -> Result<TxnOpts> {
     // Pick up `opts.shapes` and `opts.uniqueProperties` from the body
     // so inline SHACL shapes and unique-property constraints reach the
     // staging path. Other `TxnOpts` fields are not yet surfaced over
@@ -1926,6 +1937,12 @@ fn txn_opts_from_body(body: &JsonValue, span: &tracing::Span) -> Result<TxnOpts>
                 ));
             }
         }
+        if governance.has_any_policy_inputs() {
+            set_span_error_code(span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "inline request shapes are not supported in a policy-scoped request",
+            ));
+        }
         txn_opts.shapes = Some(shapes.clone());
     }
     if let Some(unique_props_raw) = body.get("opts").and_then(|o| o.get("uniqueProperties")) {
@@ -1954,6 +1971,13 @@ fn txn_opts_from_body(body: &JsonValue, span: &tracing::Span) -> Result<TxnOpts>
         // constraints" rather than an error — operators may build
         // the array dynamically and end up with zero entries.
         if !iris.is_empty() {
+            if governance.has_any_policy_inputs() {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "inline uniqueness constraints (opts.uniqueProperties) are not supported in \
+                     a policy-scoped request",
+                ));
+            }
             txn_opts.unique_properties = Some(iris);
         }
     }
@@ -2028,7 +2052,11 @@ pub(crate) async fn execute_transaction(
                 .inspect_err(|_| set_span_error_code(&span, "error:BadRequest"))?;
         }
 
-        let txn_opts = txn_opts_from_body(&prepared_transaction.body, &span)?;
+        let txn_opts = txn_opts_from_body(
+            &prepared_transaction.body,
+            &prepared_transaction.governance,
+            &span,
+        )?;
 
         // Every JSON-LD transaction goes through consensus. Policy context,
         // tracking, and execution are all handled by the submission layer;
@@ -2603,6 +2631,9 @@ mod tests {
             SubmissionError::CommitNotFound {
                 message: "No commit found with prefix: ffffffff".into(),
             },
+            SubmissionError::ConfigUnavailable {
+                message: "Ledger config unavailable: storage read failed".into(),
+            },
             SubmissionError::CommitContention {
                 message: "Commit contention: 16 commit attempts lost".into(),
             },
@@ -2626,6 +2657,7 @@ mod tests {
                     (422, errors::DATATYPE_LIMIT_EXCEEDED)
                 }
                 SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
+                SubmissionError::ConfigUnavailable { .. } => (500, errors::STORAGE_READ),
                 SubmissionError::CommitContention { .. } => (503, errors::COMMIT_CONTENTION),
             };
             let se = submission_error_to_server_error(variant);
