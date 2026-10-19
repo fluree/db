@@ -43,14 +43,15 @@
 //! disagreement this module exists to close.
 
 use super::run_record_v2::RunRecordV2;
+use fluree_db_core::same_t::op_order;
 
 /// Resolve one fact identity's chronological event sequence to its sidecar
 /// transitions, in place, and return its materialized row.
 ///
 /// `events` holds the identity's `(record, op)` events in any order (`op`:
-/// 1 = assert, 0 = retract). They are sorted by `(t, op)` — same-`t` ties
-/// walk retract-first, matching the same-`t` retract-wins resolution used
-/// by lifecycle dedup and the query overlay — and folded from
+/// 1 = assert, 0 = retract). They are sorted by
+/// [`op_order`](fluree_db_core::same_t::op_order) — a same-`t` pair walks
+/// retract-first, so the assertion holds, as in every lane — and folded from
 /// `base_present`: each op that changes presence is a transition, ops that
 /// repeat the current state are no-ops and vanish.
 ///
@@ -62,7 +63,7 @@ pub fn resolve_transitions(
     events: &mut Vec<(RunRecordV2, u8)>,
     base_present: bool,
 ) -> Option<RunRecordV2> {
-    events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
+    events.sort_unstable_by_key(|&(rec, op)| op_order(rec.t, op == 1));
     let mut present = base_present;
     let mut write = 0;
     for read in 0..events.len() {
@@ -173,15 +174,25 @@ mod tests {
         assert_eq!(ts(&events), vec![(5, 1), (6, 0)]);
     }
 
-    /// Same-`t` pairs walk deterministically (retract first, so the assert
-    /// lands final). One identity never actually reaches this layer with a
-    /// same-`t` pair: lifecycle dedup resolves the tie retract-wins before
-    /// the merge, and commits cannot emit both ops for one fact at one `t`.
+    /// A same-`t` pair walks retract-first, so the assertion holds. Commits
+    /// written before the staging fix hold such pairs; the full rebuild and
+    /// the incremental merge (which keeps the losing retraction as a
+    /// superseded event) both reach this walk with both ops.
     #[test]
     fn same_t_pair_walks_retract_first() {
         let mut events = vec![ev(5, 1), ev(5, 0)];
         let row = resolve_transitions(&mut events, true);
         assert_eq!(row.map(|r| r.t), Some(5));
         assert_eq!(ts(&events), vec![(5, 0)]);
+    }
+
+    /// Over an absent base, the pair's retraction is a no-op and its
+    /// assertion is the row.
+    #[test]
+    fn same_t_pair_over_absent_base_is_the_row() {
+        let mut events = vec![ev(5, 1), ev(5, 0)];
+        let row = resolve_transitions(&mut events, false);
+        assert_eq!(row.map(|r| r.t), Some(5));
+        assert!(events.is_empty());
     }
 }

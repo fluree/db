@@ -71,6 +71,7 @@ pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
 pub mod runtime_small_dicts;
+pub mod same_t;
 pub mod schema_hierarchy;
 pub mod serde;
 pub mod sid;

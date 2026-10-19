@@ -220,13 +220,15 @@ fn build_novelty_delta(
             let list_idx = flake.m.as_ref().and_then(|m| m.i);
             let triple_key = (flake.s.clone(), string_id, list_idx);
 
-            // Keep only the latest op (highest t)
+            // Keep only the latest op (highest t; at one t the assert,
+            // `fluree_db_core::same_t`)
             match latest_ops.entry(triple_key) {
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert((flake.t, flake.op, text));
                 }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if flake.t > e.get().0 {
+                    let &(t0, op0, _) = e.get();
+                    if fluree_db_core::same_t::supersedes((flake.t, flake.op), (t0, op0)) {
                         e.insert((flake.t, flake.op, text));
                     }
                 }
@@ -1225,7 +1227,8 @@ mod tests {
                     e.insert((flake.t, flake.op, text.clone()));
                 }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if flake.t > e.get().0 {
+                    let &(t0, op0, _) = e.get();
+                    if fluree_db_core::same_t::supersedes((flake.t, flake.op), (t0, op0)) {
                         e.insert((flake.t, flake.op, text.clone()));
                     }
                 }

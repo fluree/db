@@ -5,11 +5,13 @@
 //! can be checked against branch commits to detect overlapping changes.
 
 use crate::{trace_first_parent_commits_by_id, Result};
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
     load_commit_by_id, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
 };
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 
 /// Full identity of a fact — every [`Flake`] component except `t` and `op`,
@@ -17,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 /// ([`FlakeValue::index_keys_by_value`]): storage holds an integer too large
 /// for 64 bits as one fact whatever XSD subtype each op writes it with, so
 /// netting it per term would replay a retraction under one subtype and an
-/// assertion under another at one `t`, where storage keeps the retraction.
+/// assertion under another at one `t`, which a commit may not hold.
 ///
 /// This is deliberately NOT `Flake`'s own `Eq`/`Hash` (which ignore `g` by
 /// design — flake identity is graph-independent for index purposes). Netting
@@ -54,7 +56,10 @@ impl FactKey {
 ///
 /// Feed flakes in strictly **newest-first** order (reverse-chronological).
 /// Per fact the newest op wins: it is the fact's state at the range head,
-/// which is what replaying the range has to reproduce.
+/// which is what replaying the range has to reproduce. Within one commit
+/// (one `t`) a retraction and an assertion of one fact resolve to the
+/// assertion ([`fluree_db_core::same_t`]), whatever their order in the
+/// commit; commits written before the staging fix hold such pairs.
 ///
 /// The rule deliberately infers nothing about whether the fact existed
 /// before the range, because a commit stream cannot support that inference:
@@ -75,11 +80,20 @@ pub struct NetChangeAccumulator {
 
 impl NetChangeAccumulator {
     /// Record one flake. Flakes must arrive newest-first, so the first
-    /// occurrence of a fact is the one that decides its net op.
+    /// occurrence of a fact is the one that decides its net op, except that
+    /// a later occurrence at the same `t` replaces it when it holds there.
     pub fn push_newest_first(&mut self, flake: &Flake) {
-        self.map
-            .entry(FactKey::of(flake))
-            .or_insert_with(|| flake.clone());
+        match self.map.entry(FactKey::of(flake)) {
+            Entry::Vacant(e) => {
+                e.insert(flake.clone());
+            }
+            Entry::Occupied(mut e) => {
+                let cur = e.get();
+                if flake.t == cur.t && supersedes((flake.t, flake.op), (cur.t, cur.op)) {
+                    e.insert(flake.clone());
+                }
+            }
+        }
     }
 
     /// Every fact the range touched, represented by its newest in-range
@@ -248,12 +262,27 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
+    /// Both ops of one fact at the same `t` net to the assertion
+    /// (`fluree_db_core::same_t`), whatever their order in the commit.
     #[test]
-    fn same_commit_pair_nets_to_the_retract_via_reverse_iteration() {
-        // Both ops at the same t, chronological order assert-then-retract.
-        let out = net(&[flake("a", "v", 2, true), flake("a", "v", 2, false)]);
+    fn same_commit_pair_nets_to_the_assert_in_either_order() {
+        for pair in [
+            [flake("a", "v", 2, true), flake("a", "v", 2, false)],
+            [flake("a", "v", 2, false), flake("a", "v", 2, true)],
+        ] {
+            let out = net(&pair);
+            assert_eq!(out.len(), 1);
+            assert!(out[0].op);
+        }
+        // A newer commit still decides: a retract at t=3 after the pair.
+        let out = net(&[
+            flake("a", "v", 2, false),
+            flake("a", "v", 2, true),
+            flake("a", "v", 3, false),
+        ]);
         assert_eq!(out.len(), 1);
         assert!(!out[0].op);
+        assert_eq!(out[0].t, 3);
     }
 
     #[test]

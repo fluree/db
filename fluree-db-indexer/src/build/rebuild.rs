@@ -940,7 +940,8 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
                 // Iterate with dedup: next_deduped() returns the winning record
-                // per identity group (highest t wins). Feed assertions to collector.
+                // per identity group (highest t, and at one t the assert). Feed
+                // assertions to collector.
                 while let Some((winner, op)) = merge
                     .next_deduped()
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?

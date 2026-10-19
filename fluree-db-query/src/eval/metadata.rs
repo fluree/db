@@ -140,13 +140,10 @@ fn merge_latest_ref_objects(flakes: Vec<Flake>) -> Vec<Sid> {
             continue;
         };
         match latest.get(&obj) {
-            None => {
+            Some(&cur) if !fluree_db_core::same_t::supersedes((flake.t, flake.op), cur) => {}
+            _ => {
                 latest.insert(obj, (flake.t, flake.op));
             }
-            Some(&(t0, _)) if flake.t > t0 => {
-                latest.insert(obj, (flake.t, flake.op));
-            }
-            _ => {}
         }
     }
     let mut out: Vec<Sid> = latest

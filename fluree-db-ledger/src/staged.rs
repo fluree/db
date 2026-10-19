@@ -283,6 +283,12 @@ impl StagedLedger {
         &self.staged.store.flakes
     }
 
+    /// The staged flakes in SPOT order. Every staged flake carries one `t`
+    /// (see [`Self::new`]).
+    pub fn staged_flakes_spot(&self) -> impl Iterator<Item = &Flake> {
+        self.staged.spot.iter().map(|&id| self.staged.store.get(id))
+    }
+
     /// Each staged flake with the ledger graph id staging routed it to.
     pub fn staged_flakes_by_graph(&self) -> impl Iterator<Item = (GraphId, &Flake)> {
         self.staged

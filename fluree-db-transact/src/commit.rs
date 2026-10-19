@@ -19,12 +19,15 @@
 //! [`commit`] composes [`build_commit`] + [`StagedCommit::apply`] for
 //! the existing single-node transactional path.
 
+use crate::current_facts::FactIdentity;
 use crate::error::{Result, TransactError};
 use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentId, ContentKind, ContentStore, DictNovelty, Flake, Sid, TXN_META_GRAPH_ID,
+};
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{
@@ -557,6 +560,52 @@ pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>>
         })
 }
 
+/// Refuse a staged view holding a retraction and an assertion of one fact
+/// ([`FactIdentity`]) in one graph: every staged flake carries one `t`, and
+/// a commit built here may not hold such a pair (`fluree_db_core::same_t`).
+/// A view without both ops (most inserts and deletes) is passed over
+/// without a walk.
+fn check_no_same_t_pair(view: &StagedLedger) -> Result<()> {
+    let staged = view.staged_flakes();
+    if !(staged.iter().any(|f| f.op) && staged.iter().any(|f| !f.op)) {
+        return Ok(());
+    }
+    let ids = FactIdentity::new(view.base());
+    let Some(pair) = ids
+        .same_t_pairs(view.staged_flakes_spot())
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let snapshot = view.db();
+    let name = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .map_or_else(|| format!("{sid:?}"), |iri| format!("<{iri}>"))
+    };
+    let term = |f: &Flake| {
+        let mut term = format!("{:?}^^{}", f.o, name(&f.dt));
+        if let Some(m) = &f.m {
+            term.push_str(&format!(" {m:?}"));
+        }
+        term
+    };
+    let graph = pair.retraction.g.as_ref().map_or_else(
+        || "the default graph".to_string(),
+        |g| format!("graph {}", name(g)),
+    );
+    Err(TransactError::SameTPair {
+        fact: format!(
+            "{graph}, subject {}, predicate {}",
+            name(&pair.retraction.s),
+            name(&pair.retraction.p)
+        ),
+        retracted: term(pair.retraction),
+        asserted: term(pair.assertion),
+    })
+}
+
 /// Commit a staged transaction
 ///
 /// This function:
@@ -588,6 +637,12 @@ pub async fn build_commit(
     index_config: &IndexConfig,
     opts: CommitOpts,
 ) -> Result<StagedCommit> {
+    // 0. A commit built here may not hold a retraction and an assertion of
+    //    one fact at one `t`: staging cancels the two by fact identity, so a
+    //    pair is a staging defect, refused rather than written. Commits that
+    //    arrive whole (push, clone, restore, import) never pass through here.
+    check_no_same_t_pair(&view)?;
+
     // 1. Extract flakes from view
     let (mut base, flakes) = view.into_parts();
 

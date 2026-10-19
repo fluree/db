@@ -433,13 +433,11 @@ where
         latest
             .entry(other)
             .and_modify(|cur| {
-                // Tie-break on `op` at equal `t` so an assert (op = true)
-                // deterministically wins over a retract (op = false; false <
-                // true), matching the arena builder's `(t, op)` sort
-                // semantics. Without this, a novelty-only read and an
-                // arena-merged read could disagree when an edge is both
-                // asserted and retracted at the same `t`.
-                if (t, op) >= (cur.0, cur.1) {
+                // At equal `t` the assert holds (`same_t`), as in the arena
+                // builder's sort, so a novelty-only read and an arena-merged
+                // read agree when an edge is both asserted and retracted at
+                // the same `t`.
+                if fluree_db_core::same_t::supersedes((t, op), *cur) {
                     *cur = (t, op);
                 }
             })

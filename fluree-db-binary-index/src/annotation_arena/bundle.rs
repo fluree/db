@@ -44,6 +44,7 @@ use super::builder::{
     build_forward_leaves, build_reverse_leaves, ForwardLeafSummary, ReverseLeafSummary,
 };
 use super::format::{AnnotationForwardRow, AnnotationReverseRow};
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::{AnnotationStats, EdgeKey, Flake, Sid};
 use std::collections::HashMap;
 
@@ -166,15 +167,13 @@ pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -
         a.edge
             .cmp(&b.edge)
             .then_with(|| a.ann.cmp(&b.ann))
-            .then_with(|| a.t.cmp(&b.t))
-            .then_with(|| a.op.cmp(&b.op))
+            .then_with(|| op_order(a.t, a.op).cmp(&op_order(b.t, b.op)))
     });
     reverse_rows.sort_unstable_by(|a, b| {
         a.ann
             .cmp(&b.ann)
             .then_with(|| a.edge.cmp(&b.edge))
-            .then_with(|| a.t.cmp(&b.t))
-            .then_with(|| a.op.cmp(&b.op))
+            .then_with(|| op_order(a.t, a.op).cmp(&op_order(b.t, b.op)))
     });
 
     let stats = compute_stats(&forward_rows, &reverse_rows);
@@ -238,15 +237,13 @@ pub fn build_arenas_from_event_pairs(
         a.edge
             .cmp(&b.edge)
             .then_with(|| a.ann.cmp(&b.ann))
-            .then_with(|| a.t.cmp(&b.t))
-            .then_with(|| a.op.cmp(&b.op))
+            .then_with(|| op_order(a.t, a.op).cmp(&op_order(b.t, b.op)))
     });
     reverse_rows.sort_unstable_by(|a, b| {
         a.ann
             .cmp(&b.ann)
             .then_with(|| a.edge.cmp(&b.edge))
-            .then_with(|| a.t.cmp(&b.t))
-            .then_with(|| a.op.cmp(&b.op))
+            .then_with(|| op_order(a.t, a.op).cmp(&op_order(b.t, b.op)))
     });
 
     let stats = compute_stats(&forward_rows, &reverse_rows);

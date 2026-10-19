@@ -113,9 +113,11 @@ where
     }
 
     // The accumulator wants the range newest-change-first. For a replay
-    // that is the newest commit, last flake first. For an undo the inverse
-    // of the oldest commit is applied last, so the oldest commit's inverse
-    // comes first and each commit's own flakes keep their order.
+    // that is the newest commit first. For an undo the inverse of the
+    // oldest commit is applied last, so the oldest commit's inverse comes
+    // first. Within one commit order does not matter: the accumulator
+    // resolves a same-`t` retraction and assertion of one fact to the
+    // assertion, so undoing a commit that restated a fact keeps it.
     let mut acc = NetChangeAccumulator::default();
     match fold {
         Fold::Replay => {

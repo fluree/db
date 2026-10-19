@@ -137,9 +137,9 @@ fn unregistered_graphs(
 /// from commits written against other states, so it can name such a fact
 /// under a term `state` does not hold it under. An assertion of a fact
 /// `state` holds is dropped, as a restatement; a retraction is renamed to
-/// the stored fact, or dropped when `state` holds none. Otherwise storage
-/// could meet a retraction and an assertion of one fact at one `t`, and
-/// keep the retraction.
+/// the stored fact, or dropped when `state` holds none. Otherwise the commit
+/// could hold a retraction and an assertion of one fact at one `t`, which a
+/// commit may not hold (`build_commit` refuses it).
 ///
 /// Only those kinds are read, one read per slot they touch
 /// ([`CurrentFacts::named_by`]); any other change is returned as is.

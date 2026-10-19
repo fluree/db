@@ -171,14 +171,17 @@ fn apply_time_travel(
 /// Resolve assert/retract set-semantics among the untranslated overlay flakes.
 ///
 /// Untranslated flakes bypass the cursor's overlay merge, so we apply the same
-/// rule here: for each fact identity `(s, p, o, dt, m)` keep the highest-`t`
-/// flake and emit it only if it is an assertion. `Flake`'s `Eq`/`Hash` key on
-/// fact identity (ignoring `t`/`op`), so the map collapses each identity.
+/// rule here: for each fact identity `(s, p, o, dt, m)` keep the flake that
+/// holds (the highest `t`, and at one `t` the assertion:
+/// `fluree_db_core::same_t`) and emit it only if it is an assertion.
+/// `Flake`'s `Eq`/`Hash` key on fact identity (ignoring `t`/`op`), so the map
+/// collapses each identity.
 fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
     let mut latest: HashMap<Flake, Flake> = HashMap::with_capacity(flakes.len());
     for f in flakes {
         match latest.get(&f) {
-            Some(existing) if existing.t >= f.t => {}
+            Some(existing)
+                if !fluree_db_core::same_t::supersedes((f.t, f.op), (existing.t, existing.op)) => {}
             _ => {
                 latest.insert(f.clone(), f);
             }
