@@ -532,14 +532,8 @@ async fn graph_id(fluree: &Fluree, id: &str, graph: Option<&str>) -> u16 {
     }
 }
 
-/// Give `g_id` a SPOT branch with no leaves, built from `branch_bytes`.
-async fn empty_spot(
-    fluree: &Fluree,
-    id: &str,
-    root: &mut IndexRoot,
-    g_id: u16,
-    branch_bytes: Vec<u8>,
-) {
+/// Give `g_id` a SPOT branch with no leaves, as every writer writes one.
+async fn empty_spot(fluree: &Fluree, id: &str, root: &mut IndexRoot, g_id: u16) {
     use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
     let spot = RunSortOrder::Spot;
     if g_id == 0 {
@@ -552,7 +546,10 @@ async fn empty_spot(
     }
     let cid = fluree
         .content_store(id)
-        .put(ContentKind::IndexBranch, &branch_bytes)
+        .put(
+            ContentKind::IndexBranch,
+            &build_branch_bytes(spot, g_id, &[]),
+        )
         .await
         .expect("put branch");
     match root.named_graphs.iter_mut().find(|ng| ng.g_id == g_id) {
@@ -620,8 +617,7 @@ async fn graphs_an_import_left_empty_take_facts_incrementally() {
             let mut expected = Vec::new();
             for graph in [None, Some(G3)] {
                 let g_id = graph_id(&fluree, &id, graph).await;
-                let bytes = build_branch_bytes(RunSortOrder::Spot, g_id, &[]);
-                empty_spot(&fluree, &id, &mut root, g_id, bytes).await;
+                empty_spot(&fluree, &id, &mut root, g_id).await;
                 expected.push((g_id, RunSortOrder::Spot));
             }
             publish_root(&fluree, &id, t, &root).await;
@@ -654,20 +650,12 @@ async fn graphs_an_import_left_empty_take_facts_incrementally() {
 /// to extend that index and falls back to a full rebuild, which restores SPOT.
 #[tokio::test]
 async fn facts_missing_from_spot_are_rebuilt() {
-    // The SPOT branch with no leaves as every writer writes one, which the
-    // root alone identifies (`recognized`); or with the reserved header word
-    // set, which the build only finds empty once it fetches it.
-    let spot_bytes = |g_id: u16, recognized: bool| {
-        let mut bytes = build_branch_bytes(RunSortOrder::Spot, g_id, &[]);
-        if !recognized {
-            bytes[12] = 1;
-        }
-        bytes
-    };
-    let cases = [(None, true), (Some(G3), true), (Some(G3), false)];
-    for (case, (graph, recognized)) in cases.into_iter().enumerate() {
+    for graph in [None, Some(G3)] {
         let dir = tempfile::tempdir().expect("tempdir");
-        let id = format!("it/delete-survives-spot-{case}:main");
+        let id = format!(
+            "it/delete-survives-spot-{}:main",
+            graph.map_or("default", |g| &g[g.len() - 2..])
+        );
         let fluree = imported_ledger(dir.path(), &id).await;
         let fact = |o: &str| {
             format!(
@@ -688,7 +676,7 @@ async fn facts_missing_from_spot_are_rebuilt() {
             .expect("root");
         let mut root = IndexRoot::decode(&bytes).expect("decode root");
         let g_id = graph_id(&fluree, &id, graph).await;
-        empty_spot(&fluree, &id, &mut root, g_id, spot_bytes(g_id, recognized)).await;
+        empty_spot(&fluree, &id, &mut root, g_id).await;
         publish_root(&fluree, &id, built.index_t, &root).await;
         let from = from_alias(&id, graph, None);
         let fresh = fluree_at(dir.path());

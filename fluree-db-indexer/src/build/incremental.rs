@@ -4778,11 +4778,17 @@ async fn upload_leaf_blobs(
 /// no quads for, such as the default graph of a TriG file whose quads are all
 /// in named graphs, or a named graph from an empty `GRAPH` block. An
 /// incremental build then used to leave that SPOT empty while writing the
-/// window's facts to the other three orders, which this refuses. The default
-/// graph's leaves are inline in the root. A named graph's are in its branches,
-/// but a branch with no leaves is exactly `build_branch_bytes(order, g_id, &[])`
-/// (the decoder reads one branch version, and every writer builds branches with
-/// that function), so its CID identifies it without a fetch.
+/// window's facts to the other three orders, which this refuses.
+///
+/// The default graph's leaves are inline in the root. A named graph's are in
+/// its branches, but a branch with no leaves is exactly
+/// `build_branch_bytes(order, g_id, &[])` (the decoder reads one branch
+/// version, and every writer builds branches with that function), so its CID
+/// identifies it without a fetch. That costs a hash per branch, about as much
+/// as decoding the root, so it's done only for a named graph with some orders
+/// but not all, like the older import's. One with all four is taken as having
+/// facts in all four here, and [`check_base_facts_agree`] checks the graphs
+/// this window writes to once Phase 2 has fetched their branches.
 fn check_order_sets(
     default_graph_orders: &[fluree_db_binary_index::format::index_root::DefaultGraphOrder],
     named_graphs: &[fluree_db_binary_index::format::index_root::NamedGraphRouting],
@@ -4800,22 +4806,25 @@ fn check_order_sets(
         .filter(|o| !o.leaves.is_empty())
         .map(|o| o.order)
         .collect();
-    let named_orders = |ng: &fluree_db_binary_index::format::index_root::NamedGraphRouting| {
-        ng.orders
-            .iter()
-            .filter(|(order, cid)| {
-                *cid != ContentId::new(
-                    ContentKind::IndexBranch,
-                    &build_branch_bytes(*order, ng.g_id, &[]),
-                )
-            })
-            .map(|(order, _)| *order)
-            .collect()
+    let named_complete = |ng: &fluree_db_binary_index::format::index_root::NamedGraphRouting| {
+        complete(ng.orders.iter().map(|(order, _)| *order).collect())
+            || complete(
+                ng.orders
+                    .iter()
+                    .filter(|(order, cid)| {
+                        *cid != ContentId::new(
+                            ContentKind::IndexBranch,
+                            &build_branch_bytes(*order, ng.g_id, &[]),
+                        )
+                    })
+                    .map(|(order, _)| *order)
+                    .collect(),
+            )
     };
     let partial = if complete(default_orders) {
         named_graphs
             .iter()
-            .find(|ng| !complete(named_orders(ng)))
+            .find(|ng| !named_complete(ng))
             .map(|ng| ng.g_id)
     } else {
         Some(0)
@@ -4832,11 +4841,14 @@ fn check_order_sets(
 /// holds facts for it: some merged into a branch with leaves while others were
 /// built fresh.
 ///
-/// [`check_order_sets`] sees this from the root alone for every branch a
-/// writer produces. This is the backstop for one it can't see, a branch with
-/// no leaves but other bytes, once Phase 2 has fetched and decoded it. It runs
-/// after the tasks, so an abort here leaves this build's uploads unreferenced,
-/// as an abort in Phase 3 does.
+/// This is [`check_order_sets`] for a named graph with all four orders, which
+/// it leaves alone: whether each branch has leaves is known here, once Phase 2
+/// has fetched it, at no extra cost. An incremental build used to leave such a
+/// graph a SPOT with no leaves beside three orders that hold its facts, so the
+/// graph's next write is refused and the full rebuild restores SPOT; until then
+/// it's carried as it is, as an untouched graph always is. It runs after the
+/// tasks, so an abort here leaves this build's uploads unreferenced, as an
+/// abort in Phase 3 does.
 fn check_base_facts_agree(outputs: &[Phase2TaskOutput]) -> Result<()> {
     let mut base_facts: std::collections::BTreeMap<u16, bool> = std::collections::BTreeMap::new();
     for output in outputs {
@@ -5329,6 +5341,10 @@ mod warm_tests {
             )
             .await
             .unwrap_or_else(|e| panic!("g_id={g_id}: {e}"));
+            assert!(
+                !output.base_facts,
+                "g_id={g_id}: a branch with no leaves holds no base facts"
+            );
             let rows: u64 = match output.update {
                 Phase2TaskUpdate::Default { leaf_entries } => {
                     leaf_entries.iter().map(|e| e.row_count).sum()
@@ -5417,6 +5433,17 @@ mod warm_tests {
                     (opst, false),
                 ])],
             ),
+            // A named graph with all four orders is left to
+            // `check_base_facts_agree`, which sees its branches' leaves.
+            (
+                default(&[]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
         ] {
             assert!(check_order_sets(&defaults, &named_graphs).is_ok());
         }
@@ -5429,15 +5456,7 @@ mod warm_tests {
                 vec![],
             ),
             (default(&[]), vec![named(&[(spot, true), (psot, true)])]),
-            (
-                default(&[]),
-                vec![named(&[
-                    (spot, false),
-                    (psot, true),
-                    (post, true),
-                    (opst, true),
-                ])],
-            ),
+            (default(&[]), vec![named(&[(spot, false), (psot, true)])]),
         ] {
             assert!(matches!(
                 check_order_sets(&defaults, &named_graphs),
