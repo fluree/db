@@ -1270,6 +1270,10 @@ impl Operator for NestedLoopJoinOperator {
             "right".into(),
             crate::explain::format_pattern(&self.right_pattern).into(),
         );
+        // A FILTER pushed into the right side's probes, as a scan reports it.
+        if self.object_bounds.is_some() {
+            m.insert("object-bounds".into(), true.into());
+        }
         if let Some(d) = &self.hj_decision {
             d.write_details(&mut m);
         }
