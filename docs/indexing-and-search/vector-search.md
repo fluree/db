@@ -33,7 +33,9 @@ If you need higher precision (f64) or different vector formats (sparse, integer)
 
 ### Length
 
-A vector has 1 to 65,535 elements. In each graph, all the vectors a property holds have the same length: the length of the first vector the property received in that graph. Retracting vectors does not reset it, because the ledger keeps their history. A write that breaks either rule is refused with an `Invalid vector` error (HTTP 422, `err:db/InvalidTransaction`), and nothing in it is committed.
+A vector has 1 to 65,535 elements. In each graph, all the vectors a property holds have the same length: the length of the first vector the property received in that graph. Retracting vectors does not reset it, because the ledger keeps their history. A write that breaks either rule is refused with an `Invalid vector` error (HTTP 422, `err:db/InvalidTransaction`) that names the property, and the graph when it is a named graph, and nothing in it is committed.
+
+A bulk import (`fluree create --from`, the server's import upload) stops with the same `Invalid vector` error. Like an import that stops for any other reason, it keeps the commits it published at its last checkpoint, one every 50 chunks by default; an import that stops before its first checkpoint leaves the ledger with no commits.
 
 To keep embeddings of two lengths, such as those of two models, put them on two properties or in two graphs.
 

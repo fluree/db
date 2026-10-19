@@ -837,15 +837,16 @@ async fn push_keeps_one_length() {
     build_incremental(&fluree, later).await;
 }
 
-/// Import `ttl` into a new file-backed ledger.
+/// Import `data` (a file with extension `ext`) into a new file-backed ledger.
 async fn import(
     fluree: &fluree_db_api::Fluree,
     data_dir: &std::path::Path,
     ledger_id: &str,
-    ttl: &str,
-) -> Result<(), String> {
-    let path = data_dir.join(format!("{}.ttl", ledger_id.replace([':', '/'], "-")));
-    std::fs::write(&path, format!("{TURTLE_PREFIXES}{ttl}")).unwrap();
+    ext: &str,
+    data: &str,
+) -> Result<(), fluree_db_api::ImportError> {
+    let path = data_dir.join(format!("{}.{ext}", ledger_id.replace([':', '/'], "-")));
+    std::fs::write(&path, data).unwrap();
     fluree
         .create(ledger_id)
         .import(&path)
@@ -854,11 +855,21 @@ async fn import(
         .execute()
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
+}
+
+/// The message of an import's refusal: the `Invalid vector` a transaction of
+/// the same data gets.
+fn import_refused(result: Result<(), fluree_db_api::ImportError>, what: &str) -> String {
+    match result {
+        Err(fluree_db_api::ImportError::Invalid(TransactError::InvalidVector(msg))) => msg,
+        Err(e) => panic!("{what}: expected an invalid-vector refusal, got: {e}"),
+        Ok(()) => panic!("{what}: the import was accepted"),
+    }
 }
 
 /// Bulk import builds the index as it reads, and refuses what that index
-/// cannot store.
+/// cannot store with the refusal a transaction gets, naming the property and
+/// the graph, on every import format.
 #[tokio::test]
 async fn bulk_import_keeps_one_length() {
     let db_dir = tempfile::tempdir().unwrap();
@@ -872,33 +883,100 @@ async fn bulk_import_keeps_one_length() {
             lexical(len)
         )
     };
+    let turtle = |body: String| format!("{TURTLE_PREFIXES}{body}");
 
-    let err = import(
-        &fluree,
-        data_dir.path(),
-        "vector-lengths-import-two",
-        &format!("{}{}", triple("a", 3), triple("b", 2)),
-    )
-    .await
-    .expect_err("two lengths on one property");
-    assert!(err.contains("vector dims mismatch"), "{err}");
+    let msg = import_refused(
+        import(
+            &fluree,
+            data_dir.path(),
+            "vector-lengths-import-two",
+            "ttl",
+            &turtle(format!("{}{}", triple("a", 3), triple("b", 2))),
+        )
+        .await,
+        "two lengths on one property",
+    );
+    assert_eq!(
+        msg,
+        "<http://example.org/embedding>: vector dims mismatch: expected 3, got 2"
+    );
+    // A refused import publishes nothing: the ledger has no commits.
+    assert_eq!(
+        fluree
+            .ledger("vector-lengths-import-two:main")
+            .await
+            .unwrap()
+            .t(),
+        0
+    );
 
-    let err = import(
-        &fluree,
-        data_dir.path(),
-        "vector-lengths-import-long",
-        &triple("a", MAX_VECTOR_DIMS + 1),
-    )
-    .await
-    .expect_err("65,536 elements");
-    assert!(err.contains("65536"), "{err}");
+    let msg = import_refused(
+        import(
+            &fluree,
+            data_dir.path(),
+            "vector-lengths-import-long",
+            "ttl",
+            &turtle(triple("a", MAX_VECTOR_DIMS + 1)),
+        )
+        .await,
+        "65,536 elements",
+    );
+    assert_eq!(
+        msg,
+        "<http://example.org/embedding>: vector dims 65536 exceeds the maximum of 65535"
+    );
+
+    // A named graph keeps its own length, and the refusal names it.
+    let msg = import_refused(
+        import(
+            &fluree,
+            data_dir.path(),
+            "vector-lengths-import-trig",
+            "trig",
+            &format!(
+                "{TURTLE_PREFIXES}{}ex:g1 {{ {}{} }}\n",
+                triple("a", 2),
+                triple("b", 3),
+                triple("c", 4)
+            ),
+        )
+        .await,
+        "two lengths in a named graph",
+    );
+    assert_eq!(
+        msg,
+        "<http://example.org/embedding> in graph <http://example.org/g1>: \
+         vector dims mismatch: expected 3, got 4"
+    );
+
+    // JSON-LD, which the Cypher and CSV imports also feed.
+    let jsonld = json!({
+        "@context": ctx(),
+        "@graph": [node("a", "embedding", 3), node("b", "embedding", 2)]
+    });
+    let msg = import_refused(
+        import(
+            &fluree,
+            data_dir.path(),
+            "vector-lengths-import-jsonld",
+            "jsonld",
+            &jsonld.to_string(),
+        )
+        .await,
+        "two lengths in JSON-LD",
+    );
+    assert!(
+        msg.starts_with("<http://example.org/embedding>: vector dims mismatch"),
+        "{msg}"
+    );
 
     let id = "vector-lengths-import-ok:main";
     import(
         &fluree,
         data_dir.path(),
         "vector-lengths-import-ok",
-        &format!("{}{}", triple("a", 3), triple("b", 3)),
+        "ttl",
+        &turtle(format!("{}{}", triple("a", 3), triple("b", 3))),
     )
     .await
     .expect("one length");

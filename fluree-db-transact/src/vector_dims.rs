@@ -157,12 +157,21 @@ fn first_length_since_index(novelty: &Novelty, g_id: GraphId, p: &Sid) -> Option
 }
 
 fn refusal(flake: &Flake, iri: &impl Fn(&Sid) -> String, error: &VectorError) -> TransactError {
-    let graph = flake
-        .g
-        .as_ref()
-        .map(|g| format!(" in graph <{}>", iri(g)))
+    invalid_vector(&iri(&flake.p), flake.g.as_ref().map(iri).as_deref(), error)
+}
+
+/// The refusal of a vector of `property`, in the named graph `graph` (or the
+/// default graph), that the ledger cannot store. Every write path words it
+/// this way.
+pub(crate) fn invalid_vector(
+    property: &str,
+    graph: Option<&str>,
+    error: &VectorError,
+) -> TransactError {
+    let graph = graph
+        .map(|g| format!(" in graph <{g}>"))
         .unwrap_or_default();
-    TransactError::InvalidVector(format!("<{}>{graph}: {error}", iri(&flake.p)))
+    TransactError::InvalidVector(format!("<{property}>{graph}: {error}"))
 }
 
 #[cfg(test)]
