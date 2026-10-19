@@ -13,6 +13,13 @@
 //!
 //! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
 
+// `ExecutionContext::binary_g_id` is deprecated so that its readers are
+// listed: a lane takes its graph from `ExecutionContext::index_scope()`, which
+// says how many graphs it reads. Allowed here until #2075 makes the field
+// private. To list the readers, delete this line and run
+// `cargo check -p fluree-db-query --all-targets`.
+#![allow(deprecated)]
+
 pub mod aggregate;
 pub(crate) mod aggregate_complement_fold;
 pub mod annotation_edge_probe;
@@ -65,6 +72,7 @@ pub mod group_aggregate;
 pub mod groupby;
 pub mod hash_join;
 pub mod having;
+pub mod index_scope;
 pub mod ir;
 pub mod join;
 pub mod lang_support;

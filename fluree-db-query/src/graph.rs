@@ -255,6 +255,7 @@ impl GraphOperator {
     ) -> Result<()> {
         // Switch to the named graph context
         let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+        crate::fast_path_outcome::stamp_index_scope("graph", &graph_ctx);
 
         // Cross-ledger provenance for GRAPH patterns.
         //
@@ -512,6 +513,7 @@ impl GraphOperator {
         graph_iri: Arc<str>,
     ) -> Result<()> {
         let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+        crate::fast_path_outcome::stamp_index_scope("graph", &graph_ctx);
 
         let stamp_ledger_id: Option<Arc<str>> = match &ctx.dataset {
             Some(ds) if ds.spans_multiple_ledgers() => ds

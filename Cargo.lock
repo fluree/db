@@ -3746,6 +3746,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "smallvec",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

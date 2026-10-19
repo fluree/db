@@ -951,6 +951,8 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         }
     }
 
+    crate::fast_path_outcome::stamp_index_scope("query", &ctx);
+
     // A sub-query plans at run time; name the variables in its plan errors.
     run_operator_streaming(prepared.operator, &ctx, sink)
         .await

@@ -19,6 +19,7 @@
 //!   `range_with_overlay` core API, below the planner.
 
 use crate::binding::UnmatchedOptional;
+use crate::index_scope::ScopeKind;
 
 /// Whether a query is evaluating current state or full history.
 ///
@@ -80,20 +81,19 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
-    /// Whether the query's default graph is exactly one graph
-    /// ([`ActiveGraph::reads_one_graph`]): no dataset, or a default graph of one
-    /// member. The planner's twin of
-    /// [`ExecutionContext::reads_exactly_one_graph`], from the same definition:
-    /// a plan choice that reads one graph (the fused fast paths, the
-    /// partitioned GROUP BY) is made only under it, and each has a runtime
-    /// gate on the same definition that falls back. A choice that also needs
-    /// the graph's binary index and has no fallback (the geo index search)
-    /// gates on [`Self::reads_one_graph_index`]. `false` for a default graph of
-    /// none (`FROM NAMED` alone) as well as of several.
+    /// How many graphs the query's default graph reads ([`ScopeKind::of`]):
+    /// the planner's twin of [`ExecutionContext::scope_kind`], from the same
+    /// definition. A plan choice that reads one graph (the fused fast paths,
+    /// the partitioned GROUP BY) is made only under [`ScopeKind::One`], and
+    /// each has a runtime gate on the same definition that falls back. A
+    /// choice that also needs the graph's binary index and has no fallback
+    /// (the geo index search) gates on [`Self::reads_one_graph_index`].
     ///
-    /// [`ActiveGraph::reads_one_graph`]: crate::dataset::ActiveGraph::reads_one_graph
-    /// [`ExecutionContext::reads_exactly_one_graph`]: crate::context::ExecutionContext::reads_exactly_one_graph
-    pub one_graph: bool,
+    /// [`ScopeKind::None`] when the planner was never given its scope
+    /// ([`Self::with_dataset_scope`]), so such a plan reads no index.
+    ///
+    /// [`ExecutionContext::scope_kind`]: crate::context::ExecutionContext::scope_kind
+    pub index_scope_kind: ScopeKind,
     /// Whether the query's dataset spans ledgers. Such a dataset reads every
     /// graph through the range scan (the query path attaches no binary store),
     /// so [`Self::reads_one_graph_index`] is false whatever its default graph.
@@ -117,7 +117,7 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
-            one_graph: true,
+            index_scope_kind: ScopeKind::One,
             spans_ledgers: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
@@ -131,7 +131,7 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
-            one_graph: true,
+            index_scope_kind: ScopeKind::One,
             spans_ledgers: false,
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
@@ -162,13 +162,13 @@ impl PlanningContext {
 
     /// Plan for the query's default graph over `dataset` (`None`: the
     /// ledger's own default graph): [`Self::multi_default_graph`] when it has
-    /// two or more members, and [`Self::one_graph`] by the one definition the
-    /// runtime uses. Every entry point that runs a query over a dataset plans
-    /// through this.
+    /// two or more members, and [`Self::index_scope_kind`] by the one
+    /// definition the runtime uses. Every entry point that runs a query over a
+    /// dataset plans through this.
     pub fn with_dataset_scope(self, dataset: Option<&crate::dataset::DataSet<'_>>) -> Self {
         let mut planning =
             self.with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2));
-        planning.one_graph = crate::dataset::ActiveGraph::Default.reads_one_graph(dataset);
+        planning.index_scope_kind = ScopeKind::of(&crate::dataset::ActiveGraph::Default, dataset);
         planning.spans_ledgers =
             dataset.is_some_and(crate::dataset::DataSet::spans_multiple_ledgers);
         planning
@@ -179,13 +179,13 @@ impl PlanningContext {
     /// dataset does not span ledgers, and the query runs with a store
     /// (`has_store`, the store the planner was given). The same definition as
     /// the runtime's [`ExecutionContext::has_binary_store`]
-    /// ([`ActiveGraph::reads_one_graph_index`]), so such a lane is planned only
+    /// ([`ScopeKind::reads_one_graph_index`]), so such a lane is planned only
     /// where it can run.
     ///
     /// [`ExecutionContext::has_binary_store`]: crate::context::ExecutionContext::has_binary_store
-    /// [`ActiveGraph::reads_one_graph_index`]: crate::dataset::ActiveGraph::reads_one_graph_index
     pub fn reads_one_graph_index(&self, has_store: bool) -> bool {
-        has_store && self.one_graph && !self.spans_ledgers
+        self.index_scope_kind
+            .reads_one_graph_index(has_store, self.spans_ledgers)
     }
 
     /// Set the surface language's OPTIONAL null semantics (see

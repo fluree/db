@@ -7,6 +7,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::index_scope::{overlay_carries_novelty, IndexScope};
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::policy::PredicateCoverage;
@@ -3784,37 +3785,8 @@ pub fn term_to_ref_s_id(
         .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))
 }
 
-/// Check whether the execution context allows fast-path operators.
-///
-/// Fast paths are only valid when single-ledger, no `from_t`, root (or no)
-/// policy, and no uncommitted overlay. History mode is filtered at the
-/// planner level (in `execute::operator_tree::build_operator_tree_inner`),
-/// so this runtime gate doesn't repeat that check.
-#[inline]
-fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    fast_path_eligible_no_policy(ctx) && ctx.allow_unfiltered()
-}
-
-/// The non-policy half of [`allow_fast_path`]: one graph read, no `from_t`, no
-/// uncommitted overlay.
-///
-/// Fast paths read one graph's binary index (`binary_g_id`'s). A dataset can
-/// span several ledgers, or several graphs of one ledger whose
-/// `binary_g_id` names one member, so they are disabled unless the scope
-/// reads exactly one graph ([`ExecutionContext::reads_exactly_one_graph`]).
-/// History mode is filtered at the planner level, so this runtime gate
-/// doesn't repeat that check.
-///
-/// Split out so single-predicate O1 callers can reuse the structural conditions
-/// after discharging the view policy themselves via
-/// [`cursor_fast_path_for_predicate`] (an uncovered predicate is safe to read
-/// unfiltered).
-#[inline]
-fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    ctx.reads_exactly_one_graph() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
-}
-
-/// True when the overlay can still contribute flakes.
+/// True when the overlay can still contribute flakes
+/// ([`overlay_carries_novelty`]).
 ///
 /// `epoch()` is a monotonic mutation counter that never resets, so
 /// `epoch() == 0` means "never had novelty since this overlay was created" —
@@ -3826,55 +3798,55 @@ fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
 /// exactly this distinction; keep `epoch()` itself for cache keys only.
 #[inline]
 pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
-    match &ctx.overlay {
-        Some(o) => o.epoch() != 0 && !o.is_effectively_empty(),
-        None => false,
-    }
+    ctx.overlay.is_some_and(overlay_carries_novelty)
 }
 
-/// Combined fast-path eligibility: [`allow_fast_path`] + binary store present + `to_t == max_t`.
+/// The store a metadata fast path reads, when it may: the scope reads one
+/// graph ([`IndexScope::One`] from [`ExecutionContext::index_scope`]: a store,
+/// one graph, no `from_t`, root or no policy) whose index alone answers for it
+/// ([`IndexMember::index_is_current`]: no novelty, `to_t == max_t`). `None`
+/// otherwise.
 ///
-/// Returns the store reference if the fast path can proceed, `None` otherwise.
+/// A default graph of several graphs is not `One`: there `binary_g_id` names
+/// one member, which these lanes would read alone.
+///
+/// [`IndexMember::index_is_current`]: crate::index_scope::IndexMember::index_is_current
 #[inline]
 pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<BinaryIndexStore>> {
-    if !allow_fast_path(ctx) {
-        return None;
+    match ctx.index_scope()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
     }
-    let store = ctx.binary_store.as_ref()?;
-    if ctx.to_t != store.max_t() {
-        return None;
-    }
-    Some(store)
 }
 
 /// Like [`fast_path_store`] but with the view-policy clause **already
-/// discharged by the caller** — use only after [`cursor_fast_path_for_predicate`]
-/// returned [`PredicateFastPath::Allow`] for the operator's single scanned
-/// predicate. Same structural metadata-lane conditions otherwise: single-ledger,
-/// no `from_t`, overlay-free, store present, `to_t == max_t`.
+/// discharged by the caller** ([`ExecutionContext::index_scope_policy_cleared`])
+/// — use only after [`cursor_fast_path_for_predicate`] returned
+/// [`PredicateFastPath::Allow`] for the operator's single scanned predicate.
+/// Same structural metadata-lane conditions otherwise: one graph, no `from_t`,
+/// overlay-free, store present, `to_t == max_t`.
 #[inline]
 pub fn fast_path_store_policy_cleared<'a>(
     ctx: &'a ExecutionContext<'_>,
 ) -> Option<&'a Arc<BinaryIndexStore>> {
-    if !fast_path_eligible_no_policy(ctx) {
-        return None;
+    match ctx.index_scope_policy_cleared()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
     }
-    let store = ctx.binary_store.as_ref()?;
-    (ctx.to_t == store.max_t()).then_some(store)
 }
 
 /// Cursor-flavored fast-path gate (strategy (b)).
 ///
-/// Unlike [`allow_fast_path`], this does **not** reject uncommitted overlay or
+/// Unlike [`fast_path_store`], this does **not** reject uncommitted overlay or
 /// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
 /// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
-/// in and honors `to_t`, so those cases stay correct. It still requires one
-/// graph read ([`ExecutionContext::reads_exactly_one_graph`]: the cursor reads
+/// in and honors `to_t`, so those cases stay correct. It still requires a scope
+/// of one graph read through a store ([`IndexScope::One`]: the cursor reads
 /// `binary_g_id`'s graph), no `from_t`, and root (or no) policy; History mode
-/// is filtered at the planner level.
+/// is filtered at the planner level too.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    ctx.reads_exactly_one_graph() && !ctx.is_history_range() && ctx.allow_unfiltered()
+    matches!(ctx.index_scope(), Some(IndexScope::One(_)))
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned

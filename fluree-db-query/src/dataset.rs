@@ -413,45 +413,6 @@ pub enum ActiveGraph {
 }
 
 impl ActiveGraph {
-    /// Whether a scope with this active graph over `dataset` reads exactly one
-    /// graph: no dataset, a named graph the dataset holds, or a default graph
-    /// of exactly one member. A default graph of none (`FROM NAMED` alone) or
-    /// of several (the union default graph, several `FROM`s, of one ledger or
-    /// of several) does not.
-    ///
-    /// The one definition behind [`ExecutionContext::reads_exactly_one_graph`]
-    /// at run time and [`PlanningContext::one_graph`] at plan time, so a lane
-    /// the planner admits is a lane the runtime admits.
-    ///
-    /// [`ExecutionContext::reads_exactly_one_graph`]: crate::context::ExecutionContext::reads_exactly_one_graph
-    /// [`PlanningContext::one_graph`]: crate::temporal_mode::PlanningContext::one_graph
-    pub fn reads_one_graph(&self, dataset: Option<&DataSet<'_>>) -> bool {
-        match (dataset, self) {
-            (None, _) => true,
-            (Some(ds), ActiveGraph::Default) => ds.default_graphs().len() == 1,
-            (Some(ds), ActiveGraph::Named(iri)) => ds.named_graph(iri).is_some(),
-        }
-    }
-
-    /// Whether a scope with this active graph over `dataset` reads exactly one
-    /// graph through that graph's binary index: [`Self::reads_one_graph`], a
-    /// store attached (`has_store`), and a dataset that does not span ledgers.
-    /// A dataset spanning ledgers reads every graph, named ones included,
-    /// through the range scan: its bindings carry their ledger, which needs
-    /// decoded terms, so the query path attaches no store to it.
-    ///
-    /// The one definition behind [`ExecutionContext::has_binary_store`] at run
-    /// time and [`PlanningContext::reads_one_graph_index`] at plan time, for a
-    /// lane that has no fallback without the index (the geo index search).
-    ///
-    /// [`ExecutionContext::has_binary_store`]: crate::context::ExecutionContext::has_binary_store
-    /// [`PlanningContext::reads_one_graph_index`]: crate::temporal_mode::PlanningContext::reads_one_graph_index
-    pub fn reads_one_graph_index(&self, dataset: Option<&DataSet<'_>>, has_store: bool) -> bool {
-        has_store
-            && self.reads_one_graph(dataset)
-            && !dataset.is_some_and(DataSet::spans_multiple_ledgers)
-    }
-
     /// Create an active graph for a named graph
     pub fn named(iri: impl Into<Arc<str>>) -> Self {
         Self::Named(iri.into())
