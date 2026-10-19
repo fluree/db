@@ -571,12 +571,7 @@ async fn publish_root(fluree: &Fluree, id: &str, t: i64, root: &IndexRoot) {
         .put(ContentKind::IndexRoot, &root.encode())
         .await
         .expect("put root");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index_allow_equal(id, t, &root_id)
-        .await
-        .expect("publish index");
+    support::publish_built_index(fluree, id, t, &root_id).await;
 }
 
 async fn incremental_build(
