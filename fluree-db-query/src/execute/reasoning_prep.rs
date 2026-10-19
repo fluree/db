@@ -249,6 +249,31 @@ pub struct DerivedFactsOutcome {
     pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
+/// `rdfs` and `owl2ql` widen the query's own patterns, and rule bodies run
+/// without them, so a rule that negates or counts would read an entailment
+/// the query sees as absent and conclude what the query's answer contradicts.
+/// OWL 2 RL materializes those entailments where rules and query both read
+/// them, and the rewrite steps aside for it.
+fn refuse_non_monotone_rules_under_rewrites(
+    reasoning: &ReasoningModes,
+    rule_set: &crate::datalog_rules::DatalogRuleSet,
+) -> Result<()> {
+    if reasoning.owl2rl || !(reasoning.rdfs || reasoning.owl2ql) {
+        return Ok(());
+    }
+    let Some((rule, construct)) = rule_set.non_monotone_rules().first().copied() else {
+        return Ok(());
+    };
+    let mode = if reasoning.owl2ql { "owl2ql" } else { "rdfs" };
+    Err(crate::error::QueryError::InvalidQuery(format!(
+        "datalog rule {rule} uses {construct}, but {mode} reasoning is on without owl2rl. \
+         {mode} widens the query's patterns but not rule bodies, so the rule would read an \
+         entailed fact as absent and contradict the query's answer. Add \"owl2rl\" to the \
+         reasoning modes, which materializes those entailments for rules and query alike \
+         ({mode} may come from the ledger's f:reasoningDefaults)"
+    )))
+}
+
 /// Compute derived facts from OWL2-RL reasoning and/or user-defined datalog rules.
 ///
 /// - OWL2-RL materializes ontology entailments (cached by `reason_owl2rl`).
@@ -287,6 +312,8 @@ pub async fn compute_derived_facts(
     // Datalog: load the rule set first so its content can key the cache.
     let (rule_set, datalog_key) = if reasoning.datalog {
         let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
+        // Before the cache: its key leaves out rdfs and owl2ql.
+        refuse_non_monotone_rules_under_rewrites(reasoning, &rule_set)?;
         let key = overlay.content_version().map(|overlay_version| {
             let mut h = DefaultHasher::new();
             "datalog-v3".hash(&mut h);

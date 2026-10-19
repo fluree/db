@@ -397,8 +397,21 @@ WHERE {
 
 **What absence means.** A negation matches when nothing matches it in the
 data the rules run over: the queried snapshot's default graph, OWL 2 RL
-entailments when that mode is on, and the conclusions of other rules. It is
-a statement about that data, not about the world.
+entailments of the stored data when that mode is on, and the conclusions of
+other rules. It is a statement about that data, not about the world. OWL 2
+RL runs once, before the rules, so it entails nothing from their
+conclusions: with `ex:Manager rdfs:subClassOf ex:Employee`, a rule that
+derives a manager does not make them an employee to another rule.
+
+**`rdfs` and `owl2ql` need `owl2rl`.** Those modes widen the query's own
+patterns rather than adding facts, and rule bodies run without them. A rule
+that negates or counts would read an entailment the query sees as absent and
+contradict the query's answer, so under `rdfs` or `owl2ql` a program with
+such a rule is refused, naming the rule, unless `owl2rl` is also on. OWL 2
+RL materializes those entailments, so rules and the query read the same
+facts. A positive program still runs under `rdfs` or `owl2ql` alone, but
+its bodies see only stored facts, so it can derive less than the query's
+patterns match.
 
 **Negated facts are complete first.** Fluree runs a rule that negates
 something only after every rule that can derive what it negates has
@@ -462,6 +475,8 @@ facts that depend on its own conclusions; the program is rejected with the
 cycle named (`ex:a -agg-> ex:b -> ex:a`). If the reasoning budget runs out
 before an aggregating rule finishes, or OWL 2 RL is capped or fails before
 it runs, the query fails rather than derive a count over part of its input.
+Under `rdfs` or `owl2ql`, an aggregating rule needs `owl2rl`, as a negating
+one does (see [Negation](#negation)).
 
 **Groups.** A group exists only when some solution falls in it, so an
 account with no transactions gets no `ex:txnCount` fact, not a zero. Without

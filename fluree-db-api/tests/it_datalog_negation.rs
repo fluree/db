@@ -471,3 +471,252 @@ async fn the_whole_program_reference_refuses_negation() {
     .expect_err("the reference cannot evaluate negation");
     assert!(err.to_string().contains("negation"), "{err}");
 }
+
+/// `ex:Manager rdfs:subClassOf ex:Employee`. Ann is stored as a manager; bob
+/// becomes one through `ex:managerRule`. Both work at acme.
+async fn staffing_ledger(ledger_id: &str) -> (fluree_db_api::Fluree, MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = crate::support::genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .insert(
+            ledger,
+            &graph(vec![
+                json!({
+                    "@id": "ex:Manager",
+                    "http://www.w3.org/2000/01/rdf-schema#subClassOf": {"@id": "ex:Employee"}
+                }),
+                typed("ann", "Manager"),
+                edge("ann", "worksAt", "acme"),
+                edge("bob", "manages", "team1"),
+                edge("bob", "worksAt", "acme"),
+            ]),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    (fluree, ledger)
+}
+
+fn manager_rule() -> Value {
+    json!({
+        "@id": "ex:managerRule",
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "?x", "ex:manages": "?t"},
+        "insert": {"@id": "?x", "@type": "ex:Manager"}
+    })
+}
+
+/// Anyone working somewhere who is not an employee is a contractor.
+fn contractor_rule() -> Value {
+    json!({
+        "@id": "ex:contractorRule",
+        "@context": {"ex": "http://example.org/"},
+        "where": [
+            {"@id": "?x", "ex:worksAt": "?c"},
+            ["not-exists", {"@id": "?x", "@type": "ex:Employee"}]
+        ],
+        "insert": {"@id": "?x", "@type": "ex:Contractor"}
+    })
+}
+
+fn staffing_query(reasoning: Value, rules: Vec<Value>, classes: &[&str]) -> Value {
+    let where_: Vec<Value> = classes
+        .iter()
+        .map(|class| json!({"@id": "?x", "@type": format!("ex:{class}")}))
+        .collect();
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?x",
+        "where": where_,
+        "reasoning": reasoning,
+        "rules": rules
+    })
+}
+
+fn assert_refused_under(message: &str, mode: &str) {
+    assert!(
+        message.contains("ex:contractorRule")
+            && message.contains("negation")
+            && message.contains(&format!("{mode} reasoning is on without owl2rl")),
+        "{message}"
+    );
+}
+
+/// `rdfs` and `owl2ql` widen only the query's patterns, so a rule body reads
+/// ann, a stored manager, and bob, a derived one, as non-employees while the
+/// query reads both as employees. A program that negates is refused rather
+/// than answer that both are contractors because they are not employees. The
+/// cache key leaves those modes out, so a cached datalog-only run of the same
+/// rules must not answer for them.
+#[tokio::test]
+async fn negation_under_rdfs_or_owl2ql_without_owl2rl_is_refused() {
+    let (fluree, ledger) = staffing_ledger("datalog/negation-rewrite-modes:main").await;
+    let rules = vec![manager_rule(), contractor_rule()];
+    let rows = query_jsonld(
+        &fluree,
+        &ledger,
+        &staffing_query(json!("datalog"), rules.clone(), &["Contractor"]),
+    )
+    .await
+    .expect("datalog alone runs")
+    .to_jsonld(&ledger.snapshot)
+    .expect("format");
+    assert_eq!(sorted(&rows), vec![json!("ex:ann"), json!("ex:bob")]);
+
+    for mode in ["rdfs", "owl2ql"] {
+        let query = staffing_query(json!([mode, "datalog"]), rules.clone(), &["Contractor"]);
+        let err = query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect_err("a negation under a query rewrite");
+        assert_refused_under(&err.to_string(), mode);
+    }
+}
+
+/// With OWL 2 RL the entailments are facts that rule bodies read too, and the
+/// rewrite steps aside, so no one comes out both a contractor and an employee.
+#[tokio::test]
+async fn negation_under_rdfs_with_owl2rl_agrees_with_the_query() {
+    let (fluree, ledger) = staffing_ledger("datalog/negation-rewrite-owl2rl:main").await;
+    let rules = vec![manager_rule(), contractor_rule()];
+    let reasoning = json!(["rdfs", "owl2rl", "datalog"]);
+    let both = query_jsonld(
+        &fluree,
+        &ledger,
+        &staffing_query(
+            reasoning.clone(),
+            rules.clone(),
+            &["Contractor", "Employee"],
+        ),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("format");
+    assert_eq!(sorted(&both), Vec::<Value>::new());
+    let contractors = query_jsonld(
+        &fluree,
+        &ledger,
+        &staffing_query(reasoning, rules, &["Contractor"]),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("format");
+    assert!(
+        !sorted(&contractors).contains(&json!("ex:ann")),
+        "{contractors}"
+    );
+}
+
+/// A positive program under `rdfs` still runs: it can only derive less than
+/// the query would, never contradict it.
+#[tokio::test]
+async fn a_positive_program_under_rdfs_still_runs() {
+    let (fluree, ledger) = staffing_ledger("datalog/positive-rdfs:main").await;
+    let query = staffing_query(
+        json!(["rdfs", "datalog"]),
+        vec![manager_rule()],
+        &["Employee"],
+    );
+    let rows = query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("format");
+    assert_eq!(sorted(&rows), vec![json!("ex:ann"), json!("ex:bob")]);
+}
+
+/// The SPARQL twin, with the rule stored.
+#[tokio::test]
+async fn sparql_negation_under_rdfs_without_owl2rl_is_refused() {
+    let (fluree, ledger) = staffing_ledger("datalog/negation-rewrite-sparql:main").await;
+    let rule = json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "http://example.org/contractorRule",
+        "f:rule": {
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?x a ex:Contractor } WHERE { ?x ex:worksAt ?c \
+                       FILTER NOT EXISTS { ?x a ex:Employee } }"
+        }
+    });
+    let ledger = fluree.insert(ledger, &rule).await.expect("rule").ledger;
+    let err = query_sparql(
+        &fluree,
+        &ledger,
+        "# PRAGMA reasoning: rdfs datalog\nPREFIX ex: <http://example.org/>\n\
+         SELECT ?x WHERE { ?x a ex:Contractor }",
+    )
+    .await
+    .expect_err("a negation under a query rewrite");
+    let message = err.to_string();
+    assert!(
+        message.contains("http://example.org/contractorRule")
+            && message.contains("rdfs reasoning is on without owl2rl"),
+        "{message}"
+    );
+}
+
+/// The ledger's reasoning defaults reach a query that names no modes, and
+/// stored rules under a default `rdfs` are refused the same way.
+#[tokio::test]
+async fn negation_under_a_ledger_default_rdfs_is_refused() {
+    let ledger_id = "datalog/negation-rewrite-default:main";
+    let (fluree, ledger) = staffing_ledger(ledger_id).await;
+    let rules = json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@graph": [
+            {
+                "@id": "http://example.org/managerRule",
+                "f:rule": {
+                    "@type": "f:sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?x a ex:Manager } WHERE { ?x ex:manages ?t }"
+                }
+            },
+            {
+                "@id": "http://example.org/contractorRule",
+                "f:rule": {
+                    "@type": "f:sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?x a ex:Contractor } WHERE { ?x ex:worksAt ?c \
+                               FILTER NOT EXISTS { ?x a ex:Employee } }"
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger, &rules).await.expect("rules").ledger;
+    let config = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:rdfs, f:datalog .
+        }}
+        "
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("reasoning config")
+        .ledger;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?x",
+        "where": {"@id": "?x", "@type": "ex:Contractor"}
+    });
+    let err = query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect_err("a negation under the ledger's default rdfs");
+    let message = err.to_string();
+    assert!(
+        message.contains("http://example.org/contractorRule")
+            && message.contains("rdfs reasoning is on without owl2rl"),
+        "{message}"
+    );
+}

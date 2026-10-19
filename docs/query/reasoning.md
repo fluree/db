@@ -212,7 +212,13 @@ Enable RDFS + OWL 2 RL + Datalog together:
 ```
 
 OWL 2 RL facts are materialized first, then Datalog rules run over the
-combined base + OWL data, and finally RDFS query rewriting is applied.
+combined base + OWL data. OWL 2 RL materializes everything RDFS and OWL 2 QL
+query rewriting would add, so with `owl2rl` on the rewrite is skipped.
+
+Rule bodies don't use the `rdfs` and `owl2ql` rewrites. Under either mode
+without `owl2rl`, a program with a rule that negates or aggregates is
+refused: the rule would read an entailment the query sees as absent. Add
+`owl2rl`. See [Datalog rules](datalog-rules.md#negation).
 
 A rule that fails to parse or validate — a stored `f:rule` as much as a
 query-time one — fails the query with an error naming the rule and the
@@ -277,11 +283,14 @@ analytics with hypothetical sub-class chains.
 ## Interaction with ledger configuration
 
 If `f:reasoningDefaults` is set in the ledger configuration graph (see
-[Setting groups](../ledger-config/setting-groups.md)), those modes are the
-baseline for every query. The per-query `reasoning` parameter can:
+[Setting groups](../ledger-config/setting-groups.md)), those modes apply to
+every query that does not set `reasoning` itself. The per-query `reasoning`
+parameter can:
 
-- **Add modes** — the query modes are merged with the defaults.
-- **Disable all** — `"reasoning": "none"` overrides the defaults entirely.
+- **Replace them** — a query that sets `reasoning` runs its own modes
+  instead. The two are not merged, so a query that wants a default mode and
+  another lists both.
+- **Disable all** — `"reasoning": "none"` runs with no reasoning.
 
 The `f:overrideControl` setting on the ledger config determines whether
 query-time overrides are allowed. See
