@@ -10,7 +10,7 @@ use crate::{
     config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, LedgerView, Result,
     TimeSpec,
 };
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
     ContentId, ContentStore, DictNovelty, GraphSel, IndexType, LedgerRef, TargetLedger,
@@ -66,16 +66,9 @@ impl Fluree {
     /// both range queries and binary scans use the same graph.
     fn select_graph(view: GraphDb, sel: &GraphSel) -> Result<GraphDb> {
         let g_id: GraphId = {
-            let registry = &view.snapshot.graph_registry;
-            let store = view.binary_store.as_ref();
-            // Fallback for safety: if registry is missing an entry but a binary
-            // store has it (should not happen in a consistent ledger), use the store.
-            let lookup = |iri: &str| {
-                registry
-                    .graph_id_for_iri(iri)
-                    .or_else(|| store.and_then(|s| s.graph_id_for_iri(iri)))
-            };
-            TargetLedger::new(&view.snapshot.ledger_id, &lookup)
+            let names =
+                HeadGraphNames::new(&view.snapshot.graph_registry, view.binary_store.as_deref());
+            TargetLedger::new(&view.snapshot.ledger_id, &names)
                 .graph(sel)
                 .map_err(ApiError::from)?
                 .g_id

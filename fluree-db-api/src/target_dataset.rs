@@ -78,7 +78,7 @@ pub fn resolve_in_target(
             ApiError::invalid_query(format!("<{written}> is not a graph of this ledger: {e}"))
         })
     };
-    match TargetLedger::new(target, lookup).resolve(written, &member, at.is_some()) {
+    match TargetLedger::new(target, &lookup).resolve(written, &member, at.is_some()) {
         Ok(graph) => Ok(InTarget {
             graph: graph.graph,
             at,

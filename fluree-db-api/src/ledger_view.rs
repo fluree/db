@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::db::LedgerSnapshot;
 use fluree_db_core::{CommitId, ContentId};
 use fluree_db_ledger::{HeadTemporal, LedgerState, TypeErasedStore};
@@ -109,21 +109,6 @@ impl CommitRef {
     }
 }
 
-/// The graph id registered under `iri`: the snapshot's graph registry, then
-/// the binary index store's, the order every read path resolves a graph name
-/// in. A borrowed lookup: a request pays O(1) per reference however many
-/// graphs the ledger holds.
-fn graph_id_in(
-    snapshot: &LedgerSnapshot,
-    binary_store: Option<&BinaryIndexStore>,
-    iri: &str,
-) -> Option<fluree_db_core::GraphId> {
-    snapshot
-        .graph_registry
-        .graph_id_for_iri(iri)
-        .or_else(|| binary_store.and_then(|store| store.graph_id_for_iri(iri)))
-}
-
 /// A ledger head's graph names, read as [`LedgerView::graph_id_for_iri`]
 /// reads them, without the rest of a view: two shared handles, so taking one
 /// copies nothing ([`LedgerHandle::graph_names`](crate::LedgerHandle::graph_names)).
@@ -136,7 +121,13 @@ pub struct GraphNames {
 impl GraphNames {
     /// The graph id registered under `iri`, if any.
     pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
-        graph_id_in(&self.snapshot, self.binary_store.as_deref(), iri)
+        self.table().graph_id(iri)
+    }
+
+    /// These names as the table every reader resolves a graph name against
+    /// ([`HeadGraphNames`]).
+    pub fn table(&self) -> HeadGraphNames<'_> {
+        HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
     }
 }
 
@@ -208,12 +199,13 @@ impl LedgerView {
         }
     }
 
-    /// The graph id registered under `iri`: the snapshot's graph registry,
-    /// then the binary index store's, the order every read path resolves a
-    /// graph name in. A borrowed lookup: nothing is copied, so a request pays
-    /// O(1) per reference however many graphs the ledger holds.
+    /// The graph id registered under `iri`, read through [`HeadGraphNames`]:
+    /// the snapshot's graph registry, then the binary index store's. A
+    /// borrowed lookup: nothing is copied, so a request pays O(1) per
+    /// reference however many graphs the ledger holds.
     pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
-        graph_id_in(&self.snapshot, self.binary_store.as_deref(), iri)
+        HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
+            .graph_id(iri)
     }
 
     /// Get the ledger name (without branch suffix)

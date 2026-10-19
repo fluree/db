@@ -29,8 +29,7 @@ fn user_graphs(view: &GraphDb) -> impl Iterator<Item = (GraphId, Cow<'_, str>)> 
         .iter_entries()
         .filter(|(g_id, _)| *g_id >= FIRST_USER_GRAPH_ID)
         .filter_map(move |(g_id, iri)| {
-            let lookup = |iri: &str| registry.graph_id_for_iri(iri);
-            TargetLedger::new(ledger_id, &lookup)
+            TargetLedger::new(ledger_id, registry)
                 .enumeration_name(iri, g_id)
                 .map(|name| (g_id, name))
         })

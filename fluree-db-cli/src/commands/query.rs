@@ -1843,7 +1843,8 @@ fn route_query(
     match query_format {
         detect::QueryFormat::Sparql => {
             let none = |_: &str| None;
-            let resolver = TargetLedger::new(target, graphs.unwrap_or(&none));
+            let lookup = graphs.unwrap_or(&none);
+            let resolver = TargetLedger::new(target, &lookup);
             // A reference the endpoint's path cannot read. One that does not
             // parse is left to the path's own error.
             let leaves = |written: &str| -> bool {

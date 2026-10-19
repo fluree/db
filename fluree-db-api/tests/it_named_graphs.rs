@@ -4261,6 +4261,83 @@ async fn test_an_address_with_a_reserved_keyword_names_the_reserved_graph() {
     assert!(user_graph_iris(&fluree, ledger_id).await.is_empty());
 }
 
+/// On a branch made from an indexed ledger, the reserved slots hold the
+/// source's `urn:fluree:` IRIs, which the branch inherits. The branch's own
+/// address with `#config`, in any spelling, names the graph at the config slot
+/// in a write as in a read: the write lands in the graph `FROM
+/// <L:feature#config>` reads, and nothing is registered under the branch's
+/// own `urn:fluree:` IRI. Looked up by that IRI, the write registered a new
+/// graph the read never reached.
+#[tokio::test]
+async fn a_branch_of_an_indexed_ledger_writes_its_config_address_to_the_config_slot() {
+    use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ex = "PREFIX ex: <http://example.org/> ";
+    let ledger = fluree.create_ledger("rkb").await.expect("create");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               ex:s ex:v "default" .
+               GRAPH <urn:fluree:rkb:main#config> { ex:c ex:p "main config" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed main");
+    fluree
+        .reindex("rkb:main", fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index main");
+    fluree
+        .create_branch("rkb", "feature", None, None)
+        .await
+        .expect("branch");
+    let mut branch = fluree.ledger("rkb:feature").await.expect("load the branch");
+    assert_eq!(
+        branch
+            .snapshot
+            .graph_registry
+            .iri_for_graph_id(CONFIG_GRAPH_ID),
+        Some("urn:fluree:rkb:main#config"),
+        "the fixture: the branch's config slot holds its source's IRI"
+    );
+
+    for sparql in [
+        format!(r#"{ex}INSERT DATA {{ GRAPH <rkb:feature#config> {{ ex:c ex:p "quad" }} }}"#),
+        format!(
+            r#"{ex}INSERT {{ GRAPH <urn:fluree:rkb:feature#config> {{ ex:c ex:p "template" }} }} WHERE {{ }}"#
+        ),
+    ] {
+        branch = run_sparql_update(&fluree, branch, &sparql).await.ledger;
+    }
+    fluree
+        .update(
+            branch,
+            &json!({"@context": {"ex": "http://example.org/"}, "graph": "rkb:feature#config",
+                    "insert": {"@id": "ex:c", "ex:p": "top-level graph"}}),
+        )
+        .await
+        .expect("JSON-LD write through the config address");
+
+    assert_eq!(
+        graph_values(
+            &fluree,
+            "rkb:feature#config",
+            "http://example.org/c",
+            "http://example.org/p"
+        )
+        .await,
+        ["main config", "quad", "template", "top-level graph"]
+    );
+    assert!(
+        user_graph_iris(&fluree, "rkb:feature").await.is_empty(),
+        "nothing registered under the branch's own config IRI"
+    );
+}
+
 /// A graph an earlier version registered under the address with a reserved
 /// keyword stays reachable, and is listed, as `L#<address>#config`, while the
 /// address itself names the config graph in a query's `GRAPH` and `FROM`. As

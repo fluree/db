@@ -31,7 +31,7 @@
 //! let result = fluree.query_dataset(&dataset, &query).await?;
 //! ```
 
-use fluree_db_core::{LedgerId, VerifiedIdentity};
+use fluree_db_core::{AddressText, LedgerId, VerifiedIdentity};
 use fluree_db_sparql::ResolvedDatasetClause;
 use std::sync::Arc;
 
@@ -269,23 +269,16 @@ pub struct GraphSource {
 /// [`GraphSource::identifier`] for a member written `written`: an address is
 /// reported as `name[:branch][#graph]`, whatever its spelling (the
 /// `urn:fluree:` wrapper and the `@` pin removed, a bare name kept bare), and
-/// anything else is kept as written.
+/// anything else is kept as written. The parsed address does not keep its
+/// spelling, so this reads the text's spans, split where the grammar splits
+/// it ([`AddressText`]).
 fn identifier_of(written: &str, reference: &MemberRef) -> String {
     if reference.address().is_none() {
         return written.to_string();
     }
-    let body = written
-        .strip_prefix(fluree_db_core::LEDGER_URN_PREFIX)
-        .unwrap_or(written);
-    let (before_graph, graph) = match body.split_once('#') {
-        Some((before, graph)) => (before, Some(graph)),
-        None => (body, None),
-    };
-    match (before_graph.split_once('@'), graph) {
-        (Some((base, _pin)), Some(graph)) => format!("{base}#{graph}"),
-        (Some((base, _pin)), None) => base.to_string(),
-        (None, _) => body.to_string(),
-    }
+    AddressText::split(written)
+        .without_wrapper_or_pin()
+        .into_owned()
 }
 
 impl GraphSource {
@@ -408,16 +401,9 @@ impl GraphSource {
     /// still matches. `None` for a member with no pin in its text.
     pub(crate) fn unpinned_name(&self) -> Option<String> {
         self.address()?;
-        let written = self.written();
-        let (before_graph, graph) = match written.split_once('#') {
-            Some((before, graph)) => (before, Some(graph)),
-            None => (written, None),
-        };
-        let (base, _pin) = before_graph.split_once('@')?;
-        Some(match graph {
-            Some(graph) => format!("{base}#{graph}"),
-            None => base.to_string(),
-        })
+        let text = AddressText::split(self.written());
+        text.pin()?;
+        Some(text.unpinned().into_owned())
     }
 }
 

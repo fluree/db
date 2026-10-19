@@ -17,6 +17,7 @@ use crate::ir::{
     GraphMgmtOp, GraphSel, GraphTarget, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
+use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
@@ -730,17 +731,19 @@ pub async fn stage_with_graph_delta(
         // in this ledger through the one graph-position table: its own
         // address writes the default graph and registers nothing, and `L#<g>`
         // writes the graph `<g>`.
-        let graph_lookup = ledger_graph_lookup(&ledger);
+        let binary_store = ledger_binary_store(&ledger);
+        let graph_names =
+            HeadGraphNames::new(&ledger.snapshot.graph_registry, binary_store.as_deref());
         let write_table = |iri: &str| {
             write_graph(
-                &TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup),
+                &TargetLedger::new(&ledger.snapshot.ledger_id, &graph_names),
                 iri,
             )
         };
         // A graph name the JSON-LD parser kept as written only because it
         // reads as a ledger address must be an address of this ledger.
         if let Some(name) = txn.address_graph_names.iter().find(|name| {
-            !TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup).names_this_ledger(name)
+            !TargetLedger::new(&ledger.snapshot.ledger_id, &graph_names).names_this_ledger(name)
         }) {
             return Err(TransactError::Parse(format!(
                 "graph \"{name}\" is a compact IRI whose prefix the @context does not define \
@@ -904,7 +907,6 @@ pub async fn stage_with_graph_delta(
         // Every graph is resolved, and the upsert wave has read its slots:
         // release the table's borrow of the ledger.
         drop(generator);
-        drop(graph_lookup);
 
         // Graph-sync wave: retract every current fact of the target graph
         // (see [`Txn::sync_graph`]). The accumulator nets retract+assert of
@@ -1229,23 +1231,14 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
     Ok(())
 }
 
-/// The ledger's graph registry as a lookup: the snapshot's registry, then the
-/// binary index's graph dictionary, which can hold an entry the registry has
-/// not caught up with (the query path falls back the same way).
-fn ledger_graph_lookup(ledger: &LedgerState) -> impl Fn(&str) -> Option<GraphId> + Sync + '_ {
-    let binary_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>> =
-        ledger.binary_store.as_ref().and_then(|te| {
-            Arc::clone(&te.0)
-                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                .ok()
-        });
-    move |iri: &str| {
-        ledger
-            .snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .or_else(|| binary_store.as_ref().and_then(|s| s.graph_id_for_iri(iri)))
-    }
+/// The ledger's binary index store, when it has one. Its graph dictionary can
+/// hold an entry the snapshot's registry has not caught up with, so graph
+/// names are read through both ([`HeadGraphNames`]), as on the query path.
+fn ledger_binary_store(ledger: &LedgerState) -> Option<Arc<BinaryIndexStore>> {
+    ledger
+        .binary_store
+        .as_ref()
+        .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
 }
 
 /// Where a write to the graph IRI `iri` goes in the ledger `target` reads.
@@ -1500,8 +1493,10 @@ async fn stage_graph_mgmt(
     // reserved graph, which the guards below refuse. Any other IRI, the
     // address itself included, keeps registry semantics.
     {
-        let graph_lookup = ledger_graph_lookup(&ledger);
-        let this_ledger = TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup);
+        let binary_store = ledger_binary_store(&ledger);
+        let graph_names =
+            HeadGraphNames::new(&ledger.snapshot.graph_registry, binary_store.as_deref());
+        let this_ledger = TargetLedger::new(&ledger.snapshot.ledger_id, &graph_names);
         let registry_iri = |iri: &mut String| {
             if let Some(named) = this_ledger.graph_management_iri(iri) {
                 *iri = named;
@@ -1716,10 +1711,16 @@ async fn stage_graph_mgmt(
                             // there: an address of this ledger names its
                             // default graph (`DEFAULT`) or, through `#`, one
                             // of its graphs.
-                            let graph_lookup = ledger_graph_lookup(&ledger);
+                            let binary_store = ledger_binary_store(&ledger);
+                            let graph_names = HeadGraphNames::new(
+                                &ledger.snapshot.graph_registry,
+                                binary_store.as_deref(),
+                            );
                             let this_ledger =
-                                TargetLedger::new(&ledger.snapshot.ledger_id, &graph_lookup);
-                            if graph_lookup(iri).is_none() && this_ledger.names_this_ledger(iri) {
+                                TargetLedger::new(&ledger.snapshot.ledger_id, &graph_names);
+                            if graph_names.graph_id(iri).is_none()
+                                && this_ledger.names_this_ledger(iri)
+                            {
                                 return Err(TransactError::Parse(format!(
                                     "<{iri}> is an address of this ledger, not a graph to \
                                      create: name its default graph DEFAULT, and a named \
@@ -2850,13 +2851,8 @@ async fn stream_where_into_accumulator(
         };
 
     // Resolve IRI -> graph id, preferring the snapshot registry with a binary-store fallback.
-    let binary_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>> =
-        ledger.binary_store.as_ref().and_then(|te| {
-            Arc::clone(&te.0)
-                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                .ok()
-        });
-    let resolve_graph_id = ledger_graph_lookup(ledger);
+    let binary_store = ledger_binary_store(ledger);
+    let graph_names = HeadGraphNames::new(&ledger.snapshot.graph_registry, binary_store.as_deref());
 
     // A WHERE-dataset reference (`USING`, `USING NAMED`, `WITH`, JSON-LD
     // `from` / `fromNamed` / `graph`) resolves in this ledger through the table
@@ -2876,7 +2872,7 @@ async fn stream_where_into_accumulator(
                  as it stands; drop the pin"
             )));
         }
-        match TargetLedger::new(target_ledger, &resolve_graph_id).resolve(iri, &member, false) {
+        match TargetLedger::new(target_ledger, &graph_names).resolve(iri, &member, false) {
             Ok(graph) => Ok(Some(graph.g_id)),
             Err(TargetError::GraphNotFound(_)) => Ok(None),
             Err(TargetError::CrossLedger { named, .. }) => Err(TransactError::Parse(format!(
@@ -3049,7 +3045,7 @@ async fn stream_where_into_accumulator(
             .as_ref()
             .map(|store| store.graph_entries())
             .unwrap_or_default();
-        let target = TargetLedger::new(target_ledger, &resolve_graph_id);
+        let target = TargetLedger::new(target_ledger, &graph_names);
         for (g_id, iri) in ledger
             .snapshot
             .graph_registry
@@ -3091,9 +3087,9 @@ async fn stream_where_into_accumulator(
         // `GRAPH <iri>` in the ambient WHERE reads what the ledger's
         // graph-position table reads for `iri`, the table its templates write
         // through: one lookup per name the dataset holds no key for.
-        let resolve_graph_id = &resolve_graph_id;
+        let graph_names = &graph_names;
         runtime_dataset = runtime_dataset.with_name_resolver(move |name: &str| {
-            match TargetLedger::new(target_ledger, resolve_graph_id).graph_position(name) {
+            match TargetLedger::new(target_ledger, graph_names).graph_position(name) {
                 GraphPosition::Default => name_of_graph.get(&DEFAULT_GRAPH_ID).cloned(),
                 GraphPosition::Registered { g_id, .. } => name_of_graph.get(&g_id).cloned(),
                 GraphPosition::New(_) | GraphPosition::NotAGraph => None,
@@ -3122,7 +3118,7 @@ async fn stream_where_into_accumulator(
         }
     };
     let read = |iri: &str| named_reads.get(iri).copied();
-    let written = |iri: &str| resolve_graph_id(iri);
+    let written = |iri: &str| graph_names.graph_id(iri);
     let witnessed = witnessed_templates(
         &query_patterns,
         &txn.delete_templates,

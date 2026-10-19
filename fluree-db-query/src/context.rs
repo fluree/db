@@ -1461,11 +1461,12 @@ impl<'a> ExecutionContext<'a> {
         if self.explicit_dataset().is_some() {
             return None;
         }
-        let registry = &self.active_snapshot.graph_registry;
-        let lookup = |iri: &str| registry.graph_id_for_iri(iri);
         Some(
-            fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, &lookup)
-                .graph_position(iri),
+            fluree_db_core::TargetLedger::new(
+                &self.active_snapshot.ledger_id,
+                &self.active_snapshot.graph_registry,
+            )
+            .graph_position(iri),
         )
     }
 
@@ -1504,8 +1505,7 @@ impl<'a> ExecutionContext<'a> {
             return Vec::new();
         }
         let registry = &self.active_snapshot.graph_registry;
-        let lookup = |iri: &str| registry.graph_id_for_iri(iri);
-        let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, &lookup);
+        let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
         registry
             .iter_entries()
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)

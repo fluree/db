@@ -199,6 +199,68 @@ async fn update_positions_read_urn_default_as_the_default_graph() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// A graph an earlier version registered literally as `urn:default` (before
+/// the name was refused) does not shadow the default graph in an update's
+/// dataset positions. `WITH <urn:default>` reads the default graph and its
+/// template retracts from it, so one name reads and writes one graph; read
+/// through the registry first, the WHERE matched the legacy graph's facts and
+/// the DELETE retracted them from the default graph, where they are not. No
+/// write can register that name now, so the fixture renames `G1` in the
+/// ledger's registry, the shape such a ledger loads with.
+#[tokio::test]
+async fn a_legacy_urn_default_graph_does_not_shadow_the_default_graph() {
+    use fluree_db_core::graph_registry::{
+        config_graph_iri, txn_meta_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, FIRST_USER_GRAPH_ID,
+        TXN_META_GRAPH_ID,
+    };
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ex = "PREFIX ex: <http://example.org/> ";
+    let v = json!({"@id": "?s", "ex:v": "?o"});
+    let ctx = json!({"ex": "http://example.org/"});
+    let updates = [
+        Update::Sparql(format!(
+            "{ex}WITH <urn:default> DELETE {{ ?s ex:v ?o }} WHERE {{ ?s ex:v ?o }}"
+        )),
+        Update::Sparql(format!(
+            "{ex}DELETE {{ ?s ex:v ?o }} USING <urn:default> WHERE {{ ?s ex:v ?o }}"
+        )),
+        Update::JsonLd(json!({"@context": ctx, "graph": "urn:default", "where": v, "delete": v})),
+        Update::JsonLd(json!({"@context": ctx, "from": "urn:default", "where": v, "delete": v})),
+    ];
+    for (i, update) in updates.iter().enumerate() {
+        let ledger_id = format!("udl{i}:main");
+        let mut ledger = seed(&fluree, &ledger_id).await;
+        let g1 = ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(G1)
+            .expect("G1 is registered");
+        assert_eq!(g1, FIRST_USER_GRAPH_ID);
+        let (txn_meta, config) = (txn_meta_graph_iri(&ledger_id), config_graph_iri(&ledger_id));
+        std::sync::Arc::make_mut(&mut ledger.snapshot).graph_registry =
+            GraphRegistry::seed_from_entries(&[
+                (TXN_META_GRAPH_ID, txn_meta.as_str()),
+                (CONFIG_GRAPH_ID, config.as_str()),
+                (g1, "urn:default"),
+            ])
+            .expect("legacy registry");
+        let ledger = run(&fluree, ledger, update)
+            .await
+            .unwrap_or_else(|e| panic!("update {i}: {e}"));
+        let default = values(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/> SELECT ?o WHERE { ?s ex:v ?o }",
+        )
+        .await;
+        assert_eq!(
+            default,
+            strs(&[]),
+            "update {i} read and wrote the default graph"
+        );
+    }
+}
+
 /// A write that names a graph `urn:default` is refused, in each form that
 /// names a write graph, and leaves the ledger as it was.
 #[tokio::test]

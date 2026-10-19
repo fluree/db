@@ -34,8 +34,8 @@
 //! readings of a string that is lexically both, for the resolver to choose.
 
 use crate::graph_registry::{
-    validate_absolute_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI,
-    TXN_META_GRAPH_ID,
+    validate_absolute_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
+    DEFAULT_GRAPH_IRI, TXN_META_GRAPH_ID,
 };
 use crate::ids::GraphId;
 use crate::ledger_id::{
@@ -368,6 +368,102 @@ impl From<LedgerIdTimeSpec> for TimeSpec {
 // LedgerRef
 // ============================================================================
 
+/// Where an address's text splits: the `urn:fluree:` wrapper, the ledger
+/// (`name[:branch]`), the pin after the first `@` before any `#`, and the
+/// graph after the first `#`. Names and branches cannot contain `@` or `#`,
+/// so those two rules are the whole split. Every reader of an address's
+/// written parts goes through here, [`LedgerRef::parse`] and
+/// [`DatasetRef::parse`] included, so the rules have one home; a reader that
+/// needs the text as spelled (a bare name kept bare, a URN kept a URN), which
+/// a parsed [`LedgerRef`] does not keep, reads these spans instead of
+/// splitting the text again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddressText<'a> {
+    input: &'a str,
+    body: &'a str,
+    ledger: &'a str,
+    pin: Option<&'a str>,
+    graph: Option<&'a str>,
+}
+
+impl<'a> AddressText<'a> {
+    /// Split `input`. Nothing is validated: [`LedgerRef::parse`] does that.
+    pub fn split(input: &'a str) -> Self {
+        let body = input.strip_prefix(LEDGER_URN_PREFIX).unwrap_or(input);
+        let (before_graph, graph) = match body.split_once('#') {
+            Some((before, graph)) => (before, Some(graph)),
+            None => (body, None),
+        };
+        let (ledger, pin) = match before_graph.split_once('@') {
+            Some((ledger, pin)) => (ledger, Some(pin)),
+            None => (before_graph, None),
+        };
+        Self {
+            input,
+            body,
+            ledger,
+            pin,
+            graph,
+        }
+    }
+
+    /// Whether the text is written `urn:fluree:…`.
+    pub fn is_urn(&self) -> bool {
+        self.body.len() < self.input.len()
+    }
+
+    /// `name[:branch]` as written.
+    pub fn ledger(&self) -> &'a str {
+        self.ledger
+    }
+
+    /// The pin as written after its `@` (`t:3`), if there is one.
+    pub fn pin(&self) -> Option<&'a str> {
+        self.pin
+    }
+
+    /// The graph as written after its `#`, if there is one.
+    pub fn graph(&self) -> Option<&'a str> {
+        self.graph
+    }
+
+    /// The text before its `#` (wrapper and pin included).
+    pub fn before_graph(&self) -> &'a str {
+        match self.graph {
+            Some(graph) => &self.input[..self.input.len() - graph.len() - 1],
+            None => self.input,
+        }
+    }
+
+    /// The text with its pin removed, as written otherwise
+    /// (`urn:fluree:L@t:2#g` → `urn:fluree:L#g`).
+    pub fn unpinned(&self) -> Cow<'a, str> {
+        match self.pin {
+            None => Cow::Borrowed(self.input),
+            Some(_) => {
+                let wrapper = &self.input[..self.input.len() - self.body.len()];
+                Cow::Owned(self.joined(wrapper))
+            }
+        }
+    }
+
+    /// `name[:branch][#graph]` as written: the text without its
+    /// `urn:fluree:` wrapper and its pin. A bare name stays bare.
+    pub fn without_wrapper_or_pin(&self) -> Cow<'a, str> {
+        match self.pin {
+            None => Cow::Borrowed(self.body),
+            Some(_) => Cow::Owned(self.joined("")),
+        }
+    }
+
+    fn joined(&self, wrapper: &str) -> String {
+        match self.graph {
+            Some(graph) => format!("{wrapper}{}#{graph}", self.ledger),
+            None => format!("{wrapper}{}", self.ledger),
+        }
+    }
+}
+
 /// A parsed ledger (or graph-source) address: which ledger, at which time,
 /// which graph.
 ///
@@ -394,40 +490,36 @@ impl LedgerRef {
     /// position reads the same text as "not an address"
     /// ([`DatasetRef::parse`]).
     pub fn parse(input: &str) -> Result<Self, RefError> {
-        let body = input.strip_prefix(LEDGER_URN_PREFIX).unwrap_or(input);
-        let (before_graph, graph) = match body.split_once('#') {
-            Some((_, "")) => {
+        let text = AddressText::split(input);
+        let graph = match text.graph() {
+            Some("") => {
                 return Err(RefError::new(format!(
                     "Invalid ledger address '{input}': missing graph after '#'"
                 )))
             }
-            Some((left, fragment)) => {
-                let graph = GraphSel::parse(fragment)
-                    .map_err(|e| RefError::new(format!("Invalid ledger address '{input}': {e}")))?;
-                (left, graph)
-            }
-            None => (body, GraphSel::Default),
+            Some(fragment) => GraphSel::parse(fragment)
+                .map_err(|e| RefError::new(format!("Invalid ledger address '{input}': {e}")))?,
+            None => GraphSel::Default,
         };
-        let (base, at) = match before_graph.split_once('@') {
-            Some(("", _)) => {
+        let at = match text.pin() {
+            Some(_) if text.ledger().is_empty() => {
                 return Err(RefError::new(format!(
                     "Invalid ledger address '{input}': ledger id cannot be empty before '@'"
                 )))
             }
-            Some((_, "")) => {
+            Some("") => {
                 return Err(RefError::new(format!(
                     "Invalid ledger address '{input}': missing time spec after '@'"
                 )))
             }
-            Some((base, spec)) => {
-                let at = TimeSpec::parse_address_suffix(spec)
-                    .map_err(|e| RefError::new(format!("Invalid ledger address '{input}': {e}")))?;
-                (base, Some(at))
-            }
-            None => (before_graph, None),
+            Some(spec) => Some(
+                TimeSpec::parse_address_suffix(spec)
+                    .map_err(|e| RefError::new(format!("Invalid ledger address '{input}': {e}")))?,
+            ),
+            None => None,
         };
         Ok(Self {
-            id: LedgerId::parse(base)?,
+            id: LedgerId::parse(text.ledger())?,
             at,
             graph,
         })
@@ -539,18 +631,22 @@ impl DatasetRef {
     /// 6. Otherwise an absolute IRI is a `GraphIri`, and anything else is
     ///    refused (relative text the edge could not resolve).
     pub fn parse(s: &str) -> Result<Self, RefError> {
-        let pre_graph = s.split('#').next().unwrap_or(s);
-        if s.starts_with(LEDGER_URN_PREFIX) {
+        let text = AddressText::split(s);
+        // A pin with a known tag and a bad value is still a pin, and an
+        // address with nothing after its `#` (`mydb:main#`) is still an
+        // address, not an IRI with an empty fragment: either is reported.
+        let still_an_address = || {
+            text.pin().is_some_and(Self::is_known_pin)
+                || (text.graph() == Some("") && LedgerRef::parse(text.before_graph()).is_ok())
+        };
+        if text.is_urn() {
             return match LedgerRef::parse(s) {
                 Ok(address) if address.at.is_some() => Ok(Self::Address(address)),
                 Ok(address) => Ok(Self::Ambiguous {
                     address,
                     iri: GraphIri::parse(s)?,
                 }),
-                // A pin with a known tag and a bad value is still a pin, and an
-                // address with nothing after its `#` is still an address:
-                // report it.
-                Err(e) if Self::has_known_pin(pre_graph) || Self::lacks_its_graph(s) => Err(e),
+                Err(e) if still_an_address() => Err(e),
                 // Text that is no address, an unknown `@` tag included,
                 // is read as an IRI.
                 Err(_) => Ok(Self::GraphIri(GraphIri::parse(s)?)),
@@ -558,27 +654,24 @@ impl DatasetRef {
         }
         // The part an address's name and branch would occupy: before any
         // graph and any pin (a pin's tag has its own ':').
-        let base = pre_graph.split('@').next().unwrap_or(pre_graph);
+        let base = text.ledger();
         if base.contains("://") || base.matches(':').count() >= 2 {
             return Self::graph_iri(s);
         }
         match LedgerRef::parse(s) {
             Ok(address) if address.at.is_some() => Ok(Self::Address(address)),
-            Ok(address) if pre_graph.contains(':') => Ok(match GraphIri::parse(s) {
+            Ok(address) if base.contains(':') => Ok(match GraphIri::parse(s) {
                 Ok(iri) => Self::Ambiguous { address, iri },
                 Err(_) => Self::Address(address),
             }),
             Ok(address) => Ok(Self::Address(address)),
-            // A pin with a known tag and a bad value is still a pin, and an
-            // address with nothing after its `#` (`mydb:main#`) is still an
-            // address, not an IRI with an empty fragment: report it.
-            Err(e) if Self::has_known_pin(pre_graph) || Self::lacks_its_graph(s) => Err(e),
+            Err(e) if still_an_address() => Err(e),
             // Text that is no address, an unknown `@` tag included, is
             // read as an IRI.
             Err(not_an_address) => Self::graph_iri(s).map_err(|neither| {
                 // Text that is no IRI either but has an `@` (`mydb@foo`) is
                 // most likely a mistyped pin: say that.
-                if base.len() < pre_graph.len() {
+                if text.pin().is_some() {
                     not_an_address
                 } else {
                     neither
@@ -596,15 +689,9 @@ impl DatasetRef {
         })
     }
 
-    fn has_known_pin(pre_graph: &str) -> bool {
-        pre_graph
-            .split_once('@')
-            .is_some_and(|(_, spec)| TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag)))
-    }
-
-    /// An address followed by a `#` with nothing after it.
-    fn lacks_its_graph(s: &str) -> bool {
-        matches!(s.split_once('#'), Some((address, "")) if LedgerRef::parse(address).is_ok())
+    /// Whether a pin as written after its `@` starts with a known tag.
+    fn is_known_pin(spec: &str) -> bool {
+        TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag))
     }
 
     /// The address reading, when there is one.
@@ -739,19 +826,56 @@ impl fmt::Display for TargetError {
 
 impl std::error::Error for TargetError {}
 
+/// The graph names of the ledger a [`TargetLedger`] reads: the graph each
+/// registered IRI names, and the IRI each reserved graph is registered under.
+///
+/// A [`GraphRegistry`] is one, and so is any `Fn(&str) -> Option<GraphId>`,
+/// which knows no reserved IRI of its own. A reader that also holds the
+/// ledger's binary index store uses the one table over both,
+/// `fluree_db_binary_index::HeadGraphNames`.
+pub trait GraphNameTable {
+    /// The graph registered under exactly `iri`.
+    fn graph_id(&self, iri: &str) -> Option<GraphId>;
+
+    /// The IRI the reserved graph `g_id` (`txn-meta`, `config`) is registered
+    /// under: the ledger's own `urn:fluree:<id>#…`, or, on a branch made from
+    /// an indexed ledger, its source's, which the branch inherits. `None` when
+    /// the table cannot say, and the ledger's own IRI is assumed.
+    fn reserved_iri(&self, g_id: GraphId) -> Option<&str> {
+        let _ = g_id;
+        None
+    }
+}
+
+impl<F: Fn(&str) -> Option<GraphId>> GraphNameTable for F {
+    fn graph_id(&self, iri: &str) -> Option<GraphId> {
+        self(iri)
+    }
+}
+
+impl GraphNameTable for GraphRegistry {
+    fn graph_id(&self, iri: &str) -> Option<GraphId> {
+        self.graph_id_for_iri(iri)
+    }
+
+    fn reserved_iri(&self, g_id: GraphId) -> Option<&str> {
+        self.iri_for_graph_id(g_id)
+    }
+}
+
 /// The ledger a ledger-scoped surface reads, as the one context a dataset
 /// reference is resolved in: the HTTP ledger routes, the view API, the CLI's
 /// local target, and an update's WHERE.
 ///
-/// `lookup` is the ledger's graph registry: exact IRI to graph id.
+/// `names` is the ledger's graph registry ([`GraphNameTable`]).
 pub struct TargetLedger<'a> {
     id: &'a LedgerId,
-    lookup: &'a dyn Fn(&str) -> Option<GraphId>,
+    names: &'a dyn GraphNameTable,
 }
 
 impl<'a> TargetLedger<'a> {
-    pub fn new(id: &'a LedgerId, lookup: &'a dyn Fn(&str) -> Option<GraphId>) -> Self {
-        Self { id, lookup }
+    pub fn new(id: &'a LedgerId, names: &'a dyn GraphNameTable) -> Self {
+        Self { id, names }
     }
 
     pub fn id(&self) -> &LedgerId {
@@ -769,20 +893,28 @@ impl<'a> TargetLedger<'a> {
     ///    graph (`L#config`, `L#txn-meta`): that graph. The address keeps this
     ///    reading even if a registered graph shares its text (a graph position
     ///    reaches such a graph as `L#<text>`, see [`Self::graph_position`]).
-    /// 1. The written text as an exact registry IRI, reserved slots included:
+    /// 1. A keyword (`default` or `urn:default`, `txn-meta`, `config`): that
+    ///    graph, whatever the registry holds under the text, as in a graph
+    ///    position. A graph an earlier version registered literally as
+    ///    `urn:default` does not shadow the default graph.
+    /// 2. The written text as an exact registry IRI, reserved slots included:
     ///    a branch inherits its source's `urn:fluree:<source>#config`
     ///    registration, and a user graph may itself be named `urn:fluree:…`.
-    /// 2. Otherwise by what the text parsed as: a keyword is that graph; an
-    ///    address of this ledger selects its graph; an address of another
-    ///    ledger is [`TargetError::CrossLedger`]; a graph IRI the registry does
-    ///    not hold is [`TargetError::GraphNotFound`].
+    /// 3. Otherwise by what the text parsed as: an address of this ledger
+    ///    selects its graph; an address of another ledger is
+    ///    [`TargetError::CrossLedger`]; a graph IRI the registry does not hold
+    ///    is [`TargetError::GraphNotFound`].
     pub fn resolve(
         &self,
         written: &str,
         member: &MemberRef,
         pinned: bool,
     ) -> Result<TargetGraph, TargetError> {
-        if let Some(address) = member.address() {
+        let reference = match member {
+            MemberRef::Keyword(sel) => return self.graph(sel),
+            MemberRef::Dataset(reference) => reference,
+        };
+        if let Some(address) = reference.address() {
             if !pinned && address.at().is_none() && address.id() == self.id {
                 match address.graph() {
                     GraphSel::Named(_) => {}
@@ -791,24 +923,17 @@ impl<'a> TargetLedger<'a> {
             }
         }
         if let Some(found) = self.registered(written, || {
-            let held = match member {
-                MemberRef::Dataset(reference) => reference.graph_iri_reading(),
-                MemberRef::Keyword(_) => None,
-            };
-            held.filter(|iri| iri.as_str() == written)
+            reference
+                .graph_iri_reading()
+                .filter(|iri| iri.as_str() == written)
                 .cloned()
                 .unwrap_or_else(|| GraphIri(written.into()))
         }) {
             return Ok(found);
         }
-        match member {
-            MemberRef::Keyword(sel) => self.graph(sel),
-            MemberRef::Dataset(DatasetRef::GraphIri(iri)) => {
-                Err(TargetError::GraphNotFound(iri.to_string()))
-            }
-            MemberRef::Dataset(
-                reference @ (DatasetRef::Address(address) | DatasetRef::Ambiguous { address, .. }),
-            ) => {
+        match reference {
+            DatasetRef::GraphIri(iri) => Err(TargetError::GraphNotFound(iri.to_string())),
+            DatasetRef::Address(address) | DatasetRef::Ambiguous { address, .. } => {
                 if address.id() == self.id {
                     self.graph(address.graph())
                 } else {
@@ -855,7 +980,7 @@ impl<'a> TargetLedger<'a> {
     ///   refuses the name as a graph before it asks this table: the default
     ///   graph is written without naming a graph;
     /// - its address with a reserved keyword (`L#config`, `L#txn-meta`): that
-    ///   reserved graph, as its `urn:fluree:` form names it
+    ///   reserved graph, by its slot, under the IRI the registry holds there
     ///   ([`Self::reserved_graph_iri`]);
     /// - its address with an IRI graph (`L#<g>`): the graph `<g>`, which a
     ///   write creates when the ledger does not have it;
@@ -892,10 +1017,7 @@ impl<'a> TargetLedger<'a> {
                         found => found,
                     }
                 }
-                reserved => self.registered_under(Cow::Owned(
-                    self.reserved_urn(reserved)
-                        .expect("a keyword other than default names a reserved graph"),
-                )),
+                reserved => self.reserved_position(reserved),
             };
         }
         self.registered_under(Cow::Borrowed(iri))
@@ -903,16 +1025,18 @@ impl<'a> TargetLedger<'a> {
 
     /// The IRI of the reserved graph `iri` names when it is this ledger's own
     /// address, with no time, and a reserved keyword (`L#config`,
-    /// `L#txn-meta`, in any spelling of the address): the graph's
-    /// `urn:fluree:<ledger>#…` form. Every position, reads and writes alike,
-    /// reads such an address as that reserved graph, exactly as it reads the
-    /// `urn:fluree:` form. `None` for anything else.
+    /// `L#txn-meta`, in any spelling of the address): the IRI the registry
+    /// holds at that graph's slot ([`GraphNameTable::reserved_iri`]), which is
+    /// the graph's `urn:fluree:<ledger>#…` form except on a branch made from
+    /// an indexed ledger, where it is the source's. Every position, reads and
+    /// writes alike, reads such an address as that reserved graph. `None` for
+    /// anything else.
     pub fn reserved_graph_iri(&self, iri: &str) -> Option<String> {
         let address = self.own_address_reading(iri)?;
         if address.at().is_some() {
             return None;
         }
-        self.reserved_urn(address.graph())
+        self.reserved_iri(address.graph())
     }
 
     /// The registry IRI a graph-management verb (CLEAR, DROP, ADD, COPY,
@@ -931,12 +1055,49 @@ impl<'a> TargetLedger<'a> {
         match address.graph() {
             GraphSel::Named(graph) => Some(graph.as_str().to_string()),
             GraphSel::Default => None,
-            reserved => self.reserved_urn(reserved),
+            reserved => self.reserved_iri(reserved),
         }
     }
 
-    /// This ledger's `urn:fluree:` IRI for a reserved graph keyword.
-    fn reserved_urn(&self, graph: &GraphSel) -> Option<String> {
+    /// What a graph position reads for a reserved graph keyword: the graph at
+    /// its slot, under the IRI the registry holds there. A branch made from an
+    /// indexed ledger holds its source's `urn:fluree:` IRI at the slot, so
+    /// `L:feature#config` reads and writes the graph `FROM <L:feature#config>`
+    /// reads; looking up the branch's own IRI would miss it, and a write would
+    /// register a new graph. A table that names no reserved IRI is asked for
+    /// this ledger's own.
+    fn reserved_position(&self, graph: &GraphSel) -> GraphPosition<'static> {
+        let g_id = graph
+            .reserved_g_id()
+            .filter(|g_id| *g_id != DEFAULT_GRAPH_ID)
+            .expect("a keyword other than default names a reserved graph");
+        match self.names.reserved_iri(g_id) {
+            Some(iri) => GraphPosition::Registered {
+                g_id,
+                iri: Cow::Owned(iri.to_owned()),
+            },
+            None => self.registered_under(Cow::Owned(
+                self.own_reserved_urn(graph)
+                    .expect("a keyword other than default names a reserved graph"),
+            )),
+        }
+    }
+
+    /// The IRI this ledger's reserved graph `graph` is registered under: the
+    /// one at its slot ([`GraphNameTable::reserved_iri`]), else this ledger's
+    /// own `urn:fluree:` IRI. `None` for a graph that is not reserved.
+    fn reserved_iri(&self, graph: &GraphSel) -> Option<String> {
+        let g_id = graph
+            .reserved_g_id()
+            .filter(|g_id| *g_id != DEFAULT_GRAPH_ID)?;
+        self.names
+            .reserved_iri(g_id)
+            .map(ToOwned::to_owned)
+            .or_else(|| self.own_reserved_urn(graph))
+    }
+
+    /// This ledger's own `urn:fluree:` IRI for a reserved graph keyword.
+    fn own_reserved_urn(&self, graph: &GraphSel) -> Option<String> {
         match graph {
             GraphSel::Config => Some(crate::graph_registry::config_graph_iri(self.id)),
             GraphSel::TxnMeta => Some(crate::graph_registry::txn_meta_graph_iri(self.id)),
@@ -948,7 +1109,7 @@ impl<'a> TargetLedger<'a> {
     /// registry lookup, and `iri` moves into the position as it came (a
     /// borrow stays a borrow).
     fn registered_under<'i>(&self, iri: Cow<'i, str>) -> GraphPosition<'i> {
-        match (self.lookup)(&iri) {
+        match self.names.graph_id(&iri) {
             Some(g_id) => GraphPosition::Registered { g_id, iri },
             None => GraphPosition::New(iri),
         }
@@ -1002,7 +1163,7 @@ impl<'a> TargetLedger<'a> {
     /// caller's own [`GraphIri`] for `iri` when it holds one, so a hit copies
     /// nothing.
     fn registered(&self, iri: &str, named: impl FnOnce() -> GraphIri) -> Option<TargetGraph> {
-        let g_id = (self.lookup)(iri)?;
+        let g_id = self.names.graph_id(iri)?;
         Some(match g_id {
             DEFAULT_GRAPH_ID => self.reserved(GraphSel::Default),
             TXN_META_GRAPH_ID => self.reserved(GraphSel::TxnMeta),
@@ -1623,6 +1784,132 @@ mod tests {
             (resolved.g_id, resolved.graph),
             (DEFAULT_GRAPH_ID, GraphSel::Default)
         );
+    }
+
+    /// A graph an earlier version registered literally as `urn:default` does
+    /// not shadow the default graph in a dataset position (`FROM`, `USING`,
+    /// `WITH`), which reads the keyword first, as a graph position does: the
+    /// two cannot read different graphs for one name.
+    #[test]
+    fn a_legacy_urn_default_graph_does_not_shadow_the_default_graph() {
+        let registry = |iri: &str| (iri == DEFAULT_GRAPH_IRI).then_some(7);
+        let id = LedgerId::parse("L:main").unwrap();
+        let target = TargetLedger::new(&id, &registry);
+        for written in ["urn:default", "default"] {
+            let member = MemberRef::parse(written).unwrap();
+            assert_eq!(
+                target
+                    .resolve(written, &member, false)
+                    .map(|graph| graph.g_id),
+                Ok(DEFAULT_GRAPH_ID),
+                "{written}"
+            );
+        }
+        assert_eq!(target.graph_position("urn:default"), GraphPosition::Default);
+    }
+
+    /// A branch made from an indexed ledger holds its source's reserved IRIs
+    /// at the reserved slots. The branch's own address with a reserved
+    /// keyword names the graph at the slot, in a graph position as in a
+    /// dataset position, under the IRI the slot is registered with, so a
+    /// write lands in the graph `FROM <L:feature#config>` reads instead of
+    /// registering a new one under the branch's own `urn:fluree:` IRI.
+    #[test]
+    fn a_branch_reads_and_writes_a_reserved_keyword_by_its_slot() {
+        let registry = GraphRegistry::seed_from_entries(&[
+            (TXN_META_GRAPH_ID, "urn:fluree:L:main#txn-meta"),
+            (CONFIG_GRAPH_ID, "urn:fluree:L:main#config"),
+            (3, "http://ex.org/g"),
+        ])
+        .unwrap();
+        let id = LedgerId::parse("L:feature").unwrap();
+        let target = TargetLedger::new(&id, &registry);
+        for (written, g_id, iri) in [
+            (
+                "L:feature#config",
+                CONFIG_GRAPH_ID,
+                "urn:fluree:L:main#config",
+            ),
+            (
+                "urn:fluree:L:feature#config",
+                CONFIG_GRAPH_ID,
+                "urn:fluree:L:main#config",
+            ),
+            (
+                "L:feature#txn-meta",
+                TXN_META_GRAPH_ID,
+                "urn:fluree:L:main#txn-meta",
+            ),
+        ] {
+            assert_eq!(
+                target.graph_position(written),
+                GraphPosition::Registered {
+                    g_id,
+                    iri: iri.into()
+                },
+                "{written}"
+            );
+            assert_eq!(
+                target.reserved_graph_iri(written).as_deref(),
+                Some(iri),
+                "{written}"
+            );
+            assert_eq!(
+                target.graph_management_iri(written).as_deref(),
+                Some(iri),
+                "{written}"
+            );
+            let member = MemberRef::parse(written).unwrap();
+            assert_eq!(
+                target
+                    .resolve(written, &member, false)
+                    .map(|graph| graph.g_id),
+                Ok(g_id),
+                "{written}"
+            );
+        }
+        // A table that names no reserved IRI is asked for the ledger's own.
+        let by_iri = |iri: &str| registry.graph_id_for_iri(iri);
+        assert_eq!(
+            TargetLedger::new(&id, &by_iri).graph_position("L:feature#config"),
+            GraphPosition::New("urn:fluree:L:feature#config".into())
+        );
+    }
+
+    /// The text's spans are where the parser splits it, and the spellings
+    /// built from them keep the text as written: a bare name stays bare, a
+    /// URN keeps its wrapper where asked to, and only the pin is cut out.
+    #[test]
+    fn address_text_splits_where_the_parser_does() {
+        let text = AddressText::split("urn:fluree:mydb@t:2#http://ex.org/g");
+        assert!(text.is_urn());
+        assert_eq!(text.ledger(), "mydb");
+        assert_eq!(text.pin(), Some("t:2"));
+        assert_eq!(text.graph(), Some("http://ex.org/g"));
+        assert_eq!(text.before_graph(), "urn:fluree:mydb@t:2");
+        for (written, unpinned, bare) in [
+            ("mydb", "mydb", "mydb"),
+            ("mydb:main@t:2", "mydb:main", "mydb:main"),
+            ("mydb@t:2#config", "mydb#config", "mydb#config"),
+            (
+                "urn:fluree:mydb@t:2#http://ex.org/g",
+                "urn:fluree:mydb#http://ex.org/g",
+                "mydb#http://ex.org/g",
+            ),
+            ("urn:fluree:mydb:dev", "urn:fluree:mydb:dev", "mydb:dev"),
+        ] {
+            let text = AddressText::split(written);
+            assert_eq!(text.unpinned(), unpinned, "{written}");
+            assert_eq!(text.without_wrapper_or_pin(), bare, "{written}");
+            let address = LedgerRef::parse(written).unwrap();
+            assert_eq!(address.id(), &LedgerId::parse(text.ledger()).unwrap());
+            assert_eq!(address.at().is_some(), text.pin().is_some(), "{written}");
+        }
+        // Text with no pin is borrowed as it stands.
+        assert!(matches!(
+            AddressText::split("mydb#config").unpinned(),
+            Cow::Borrowed("mydb#config")
+        ));
     }
 
     #[test]

@@ -1405,14 +1405,11 @@ impl Fluree {
             )));
         }
         let target = db.snapshot.ledger_id.clone();
-        let registry = &db.snapshot.graph_registry;
-        let store = db.binary_store.as_ref();
-        let lookup = |iri: &str| {
-            registry
-                .graph_id_for_iri(iri)
-                .or_else(|| store.and_then(|s| s.graph_id_for_iri(iri)))
-        };
-        let graph = TargetLedger::new(&target, &lookup)
+        let names = fluree_db_binary_index::HeadGraphNames::new(
+            &db.snapshot.graph_registry,
+            db.binary_store.as_deref(),
+        );
+        let graph = TargetLedger::new(&target, &names)
             .resolve(written, &member, false)
             .map_err(|e| match e {
                 TargetError::CrossLedger {
