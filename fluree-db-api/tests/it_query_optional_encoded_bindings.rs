@@ -1977,6 +1977,92 @@ async fn cyclic_union_lane_stands_down_under_the_kill_switch() {
     failures.assert_none();
 }
 
+/// Over several graphs the cyclic join's union variant declines an
+/// arena-backed object (a big integer here): its key is a handle into a
+/// per-graph arena, so two graphs' equal keys need not be one value. The
+/// variant stamps `fallback:arena_type` and the general plan answers, by
+/// value. One graph keeps the lane. The square's `?v` is an object-only
+/// variable, so the join runs in its encoded-object mode.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_declines_arena_objects() {
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g1> {
+          ex:a1 ex:tag "t1" ; ex:big 123456789012345678901234567890 .
+          ex:b1 ex:tag "t1" ; ex:big 123456789012345678901234567890 .
+        }
+        GRAPH <urn:g2> {
+          ex:a1 ex:tag "t1" ; ex:big 999999999999999999999999999999 .
+          ex:b2 ex:tag "t1" ; ex:big 123456789012345678901234567890 .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-arena:main", trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let square = |ds: &str| {
+        format!(
+            "{PREFIXES}SELECT ?a ?b ?t ?v {ds} \
+             WHERE {{ ?a ex:tag ?t . ?b ex:tag ?t . ?a ex:big ?v . ?b ex:big ?v }}"
+        )
+    };
+    let big = "123456789012345678901234567890";
+    let one_graph = rows(&[
+        &["a1", "a1", "t1", big],
+        &["a1", "b1", "t1", big],
+        &["b1", "a1", "t1", big],
+        &["b1", "b1", "t1", big],
+    ]);
+    let mut union = one_graph.clone();
+    for row in [
+        ["a1", "a1", "t1", "999999999999999999999999999999"],
+        ["a1", "b2", "t1", big],
+        ["b1", "b2", "t1", big],
+        ["b2", "a1", "t1", big],
+        ["b2", "b1", "t1", big],
+        ["b2", "b2", "t1", big],
+    ] {
+        union.push(row.iter().map(|s| s.to_string()).collect());
+    }
+    union.sort();
+    // (label, query, the answer, the site and the outcome it must stamp)
+    let cases = [
+        (
+            "FROM g1 FROM g2",
+            square("FROM <urn:g1> FROM <urn:g2>"),
+            union,
+            "cyclic_bgp_union",
+            "fallback:arena_type",
+        ),
+        (
+            "FROM g1",
+            square("FROM <urn:g1>"),
+            one_graph,
+            "cyclic_bgp",
+            "proceed",
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, query, want, site, outcome) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["a", "b", "t", "v"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, site),
+            vec![outcome.to_string()],
+            &format!("{label}: `{site}` stamps"),
+        );
+    }
+    failures.assert_none();
+}
+
 /// EXISTS inside an expression (the semijoin cache, admitted by
 /// `fast_path_store`, built from `binary_g_id`'s graph). Labels: x1 in the
 /// default graph, y1 in g2.
