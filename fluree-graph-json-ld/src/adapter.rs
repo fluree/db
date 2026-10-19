@@ -13,14 +13,18 @@
 //!
 //! # Limitations
 //!
-//! - **`@graph`**: dropped, not flattened. Every `@`-prefixed key except
-//!   `@type` is skipped, so the contents of a `@graph` entry never reach the
-//!   sink at all. Emitting them correctly needs the quad protocol
+//! - **`@graph`** on a node (a graph selector, or a JSON-LD named graph's
+//!   content) is refused with [`AdapterError::Unsupported`]. Emitting it
+//!   correctly needs the quad protocol
 //!   ([`fluree_graph_ir::GraphSink::supports_quads`] /
 //!   [`fluree_graph_ir::GraphSink::emit_quad`]); until this adapter uses it,
-//!   the behavior stays as-is rather than being silently folded into the
-//!   default graph.
-//! - **`@reverse`**: Reverse properties are not yet supported
+//!   graph-scoped statements are refused rather than folded into the
+//!   default graph. (A top-level envelope is unwrapped by expansion and never
+//!   reaches the adapter.)
+//! - **`@reverse`** and **`@included`** are read as the transaction parser
+//!   reads them: a reverse property's values are the subjects of statements
+//!   pointing at the node, and included nodes are described alongside it with
+//!   no linking statement.
 //!
 //! # Example
 //!
@@ -66,6 +70,10 @@ pub enum AdapterError {
     /// Conversion stops at the first such error.
     #[error("Sink error: {0}")]
     Sink(#[from] fluree_graph_ir::SinkError),
+
+    /// Well-formed JSON-LD this adapter cannot represent faithfully.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Result type for adapter operations
@@ -164,9 +172,44 @@ fn process_node<S: GraphSink>(
 
     // Process each predicate-object pair
     for (key, value) in obj {
-        // Skip JSON-LD keywords except @type
-        if key.starts_with('@') && key != "@type" {
-            continue;
+        match key.as_str() {
+            // Nodes described alongside this one, with no linking statement.
+            "@included" => {
+                for node in node_items(value, "@included")? {
+                    process_node(node, sink, None)?;
+                }
+                continue;
+            }
+            // Statements whose object is this node.
+            "@reverse" => {
+                let Value::Object(properties) = value else {
+                    return Err(AdapterError::InvalidStructure(
+                        "@reverse must be a map of properties".to_string(),
+                    ));
+                };
+                for (property, values) in properties {
+                    let predicate_id = sink.term_iri(property);
+                    for node in node_items(values, "a reverse property's value")? {
+                        if let ProcessedValue::Single(node_id) = process_value(node, sink)? {
+                            sink.emit_triple(node_id, predicate_id, subject_id)?;
+                        }
+                    }
+                }
+                continue;
+            }
+            // Graph scoping (a node's graph selector, or a named graph's
+            // content) needs quads, which this adapter does not emit yet.
+            // Folding the statements into the default graph would lose data.
+            "@graph" => {
+                return Err(AdapterError::Unsupported(
+                    "JSON-LD `@graph` graph scoping is not supported by bulk import; \
+                     use `fluree insert`, or import the data as TriG or N-Quads"
+                        .to_string(),
+                ));
+            }
+            // Skip other JSON-LD keywords except @type
+            k if k.starts_with('@') && k != "@type" => continue,
+            _ => {}
         }
 
         // Handle @type specially (maps to rdf:type)
@@ -212,6 +255,24 @@ fn process_node<S: GraphSink>(
     }
 
     Ok(subject_id)
+}
+
+/// The node objects of a keyword value (one node or an array of them).
+fn node_items<'v>(value: &'v Value, what: &str) -> Result<Vec<&'v Value>> {
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    if items.iter().any(|item| {
+        !item
+            .as_object()
+            .is_some_and(|m| !m.contains_key("@value") && !m.contains_key("@list"))
+    }) {
+        return Err(AdapterError::InvalidStructure(format!(
+            "{what} must hold node objects"
+        )));
+    }
+    Ok(items)
 }
 
 /// Process a value and return the processed result
@@ -1185,5 +1246,65 @@ mod tests {
         }]);
         to_graph_events(&expanded, &mut sink).unwrap();
         assert_eq!(sink.graph().len(), 1);
+    }
+
+    /// Graph scoping is refused, not folded into the default graph: a node's
+    /// graph selector used to be dropped (its statements landed in the
+    /// default graph) and a named graph's content was dropped entirely.
+    #[test]
+    fn graph_scoping_is_refused_not_folded() {
+        for doc in [
+            json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:a", "@graph": "ex:g", "ex:p": 1}
+            ]}),
+            json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:g", "@graph": [
+                {"@id": "ex:a", "ex:p": 1}
+            ]}),
+        ] {
+            let expanded = crate::expand(&doc).unwrap();
+            let mut sink = GraphCollectorSink::new();
+            let err = to_graph_events(&expanded, &mut sink).unwrap_err();
+            assert!(matches!(err, AdapterError::Unsupported(_)), "{doc}: {err}");
+        }
+        // An envelope is unwrapped by expansion and imports as before.
+        let envelope = json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+            {"@id": "ex:a", "ex:p": 1}, {"@id": "ex:b", "ex:p": 2}
+        ]});
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&crate::expand(&envelope).unwrap(), &mut sink).unwrap();
+        assert_eq!(sink.graph().len(), 2);
+    }
+
+    /// Bulk import reads `@reverse` and `@included` as the transaction
+    /// parser does; they used to be dropped.
+    #[test]
+    fn reverse_and_included_are_read_like_the_transaction_parser() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child", "@type": "@id"}
+            },
+            "@id": "ex:kid",
+            "parent": "ex:mom",
+            "@included": [{"@id": "ex:other", "ex:p": 1}]
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let graph = sink.graph();
+        assert_eq!(graph.len(), 2, "{graph:?}");
+        let iri = |t: &Term| match t {
+            Term::Iri(iri) => iri.to_string(),
+            other => format!("{other:?}"),
+        };
+        let child = graph
+            .iter()
+            .find(|t| iri(&t.p) == "http://example.org/child")
+            .expect("the reverse statement");
+        assert_eq!(iri(&child.s), "http://example.org/mom");
+        assert_eq!(iri(&child.o), "http://example.org/kid");
+        assert!(graph
+            .iter()
+            .any(|t| iri(&t.s) == "http://example.org/other"));
     }
 }

@@ -109,8 +109,9 @@ whatever its tag, which is also what omitting the argument does.
 
 See [`fluree graphql`](../cli/graphql.md#shapes-sharpen-the-schema) for the full
 SHACL → GraphQL table. In brief: `sh:maxCount 1` gives a single value,
-`sh:minCount ≥ 1` gives `!`, `sh:in` gives an `enum`, `sh:inversePath` gives a
-reverse field, and `sh:closed true` drops observed-but-undeclared properties.
+`sh:minCount ≥ 1` gives `!` where the ledger config enables SHACL, `sh:in`
+gives an `enum`, `sh:inversePath` gives a reverse field, and `sh:closed true`
+drops observed-but-undeclared properties.
 
 `fluree graphql --bootstrap <ledger>` emits the shapes your current schema
 implies, as a starting point to edit.
@@ -122,9 +123,9 @@ shapes it lists are published, so it does not grow a type the moment someone
 writes an instance. It is also the only place mutations can be turned on — see
 [`fluree graphql`](../cli/graphql.md#publishing-a-curated-schema).
 
-Every mutation is an ordinary Fluree transaction, so SHACL validation and policy
-apply unchanged and a rejected write comes back as a GraphQL error having
-written nothing.
+Every mutation is an ordinary Fluree transaction, so policy applies, and SHACL
+validation applies where the ledger config enables SHACL; a rejected write
+comes back as a GraphQL error having written nothing.
 
 On a server running Raft consensus, GraphQL mutations return HTTP 501 before
 execution. Use the [transaction endpoints](../api/endpoints.md#transaction-endpoints) for writes in

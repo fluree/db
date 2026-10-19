@@ -108,6 +108,7 @@ without having to specify it each time:
 ```json
 {
   "@context": {"f": "https://ns.flur.ee/db#"},
+  "graph": "config",
   "insert": {
     "@id": "urn:fluree:mydb:main:config:ledger",
     "@type": "f:LedgerConfig",
@@ -118,6 +119,10 @@ without having to specify it each time:
   }
 }
 ```
+
+The `"graph": "config"` key writes the config into the ledger's config graph
+(`urn:fluree:mydb:main#config`), the only place it is read from; without it the
+insert would land in the default graph, and a config there is refused.
 
 See [Setting groups — reasoningDefaults](../ledger-config/setting-groups.md)
 for full configuration options.

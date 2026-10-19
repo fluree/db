@@ -12,6 +12,10 @@
         "tiny": 10.0,
         "small": 5.0
       },
+      "jsonld_parse": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
       "vector_query": {
         "small": 5.0
       },
@@ -99,6 +103,11 @@
         "medium": 3.0
       },
       "query_hot_limit_startup": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "datalog_fixpoint": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
