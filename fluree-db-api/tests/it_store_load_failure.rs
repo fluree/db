@@ -156,6 +156,43 @@ async fn a_lasting_store_load_failure_is_loaded_once_per_window() {
     assert!(handle.snapshot().await.binary_store.is_some());
 }
 
+/// A reload that cannot load the store keeps the state and store the ledger
+/// has, rather than swapping in a state without a store.
+#[tokio::test]
+async fn a_reload_that_cannot_load_the_store_keeps_the_ledger_it_has() {
+    let db = tempfile::tempdir().unwrap();
+    let id = "store-load/reload:main";
+    seed(db.path(), id).await;
+    let scratch = tempfile::tempdir().unwrap();
+    let cache = scratch.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let fluree = build(db.path(), &cache, Duration::ZERO);
+    let handle = fluree.ledger_cached(id).await.unwrap();
+    assert!(handle.snapshot().await.binary_store.is_some());
+
+    std::fs::remove_dir_all(&cache).unwrap();
+    std::fs::write(&cache, b"not a directory").unwrap();
+    let manager = fluree.ledger_manager().expect("caching enabled");
+    load_failure(
+        manager
+            .reload(&fluree_db_api::LedgerId::parse(id).unwrap())
+            .await,
+        "reload",
+    );
+    let handle = fluree.ledger_cached(id).await.expect("the ledger it had");
+    assert!(handle.snapshot().await.binary_store.is_some());
+
+    repair_cache(&cache);
+    assert_eq!(count(&fluree, id).await, 101);
+    fluree
+        .graph(id)
+        .transact()
+        .insert(&json!({"@context": {"ex": EX}, "@id": "ex:x", "ex:name": "x"}))
+        .commit()
+        .await
+        .expect("an insert on the ledger the reload kept");
+}
+
 /// Reads that a ledger cached without its store answered (each query loaded
 /// the store on its own) now get the load's error, as writes do; a ledger
 /// that exists still says so.
