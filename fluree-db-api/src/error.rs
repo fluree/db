@@ -742,6 +742,9 @@ impl ApiError {
                 ..
             }) if delta_bytes >= max_bytes => 413,
             ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
+            // This process has not loaded the ledger's index: its state, not
+            // the request's, and it clears when the index loads.
+            ApiError::Transact(TE::IndexNotLoaded(_)) => 503,
             // Well-formed, but a value breaks a constraint the ledger holds:
             // no room for its new datatypes (datatype IDs are never
             // released), or a vector the index cannot store beside the
@@ -903,6 +906,7 @@ impl ApiError {
                 errors::NOVELTY_AT_MAX
             }
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ApiError::Transact(TE::IndexNotLoaded(_)) => errors::INDEX_NOT_LOADED,
             // The generic code, the one its flattened 422 carries.
             ApiError::Transact(TE::InvalidVector(_)) => errors::INVALID_TRANSACTION,
             ApiError::Transact(_) => errors::INVALID_TRANSACTION,
@@ -1355,6 +1359,11 @@ mod tests {
                 ApiError::commit_contention(16, conflict()),
                 503,
                 COMMIT_CONTENTION,
+            ),
+            (
+                ApiError::Transact(TE::IndexNotLoaded("x".into())),
+                503,
+                INDEX_NOT_LOADED,
             ),
             (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
             (

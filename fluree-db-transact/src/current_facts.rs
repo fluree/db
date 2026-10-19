@@ -399,6 +399,10 @@ pub struct Slot {
 }
 
 /// Reads a ledger's current facts as of its current `t`.
+///
+/// Each read refuses with [`crate::TransactError::IndexNotLoaded`] when this
+/// process has not loaded the ledger's index ([`crate::check_index_loaded`]):
+/// merge and rebase read here before they commit.
 pub struct CurrentFacts<'l> {
     ledger: &'l LedgerState,
     to_t: i64,
@@ -420,6 +424,7 @@ impl<'l> CurrentFacts<'l> {
     /// one graph share one decision between per-slot novelty seeks and a
     /// single filtered novelty walk.
     pub async fn of_slots(&self, slots: &[Slot]) -> Result<Vec<Vec<StoredFact>>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         let novelty = NoveltyPlan::for_slots(self.ledger, slots, self.to_t);
         let mut out = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -438,6 +443,7 @@ impl<'l> CurrentFacts<'l> {
         g_sid: Option<&Sid>,
         s: &Sid,
     ) -> Result<Vec<StoredFact>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         let mut flakes = self
             .base(g_id, RangeMatch::new().with_subject(s.clone()))
             .await?;
@@ -468,6 +474,7 @@ impl<'l> CurrentFacts<'l> {
         limit: Option<usize>,
         tracker: Option<&Tracker>,
     ) -> Result<Vec<StoredFact>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         let db_ref = match tracker {
             Some(t) => self.ledger.as_graph_db_ref(g_id).with_tracker(t),
             None => self.ledger.as_graph_db_ref(g_id),
@@ -825,6 +832,30 @@ mod tests {
                 .expect("apply commit");
         }
         LedgerState::new(LedgerSnapshot::genesis("test:main"), novelty)
+    }
+
+    /// A ledger with an index this process has not loaded refuses every
+    /// read here with `IndexNotLoaded`; merge and rebase read here first.
+    #[tokio::test]
+    async fn an_index_that_is_not_loaded_refuses_every_read() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        let ledger = LedgerState::new(snapshot, Novelty::new(1));
+        let facts = CurrentFacts::new(&ledger);
+        let refused = |r: Result<Vec<StoredFact>>| {
+            assert!(
+                matches!(r, Err(crate::TransactError::IndexNotLoaded(_))),
+                "{r:?}"
+            );
+        };
+        refused(
+            facts
+                .of_slots(&[slot(0, None, "a", "b")])
+                .await
+                .map(|mut v| v.pop().unwrap_or_default()),
+        );
+        refused(facts.of_subject(0, None, &sid("a")).await);
+        refused(facts.whole_graph(0, None, None, None).await);
     }
 
     fn slot(g_id: GraphId, g_sid: Option<&Sid>, s: &str, p: &str) -> Slot {

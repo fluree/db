@@ -105,28 +105,22 @@ fn stored_length(
 
 /// The index store to read lengths from, if the ledger has an index.
 ///
-/// Refuses when the ledger has an index this check cannot read: none is
-/// attached, or the one attached is older than the index the ledger's
-/// novelty starts from, so a length indexed in between is in neither. Such
-/// an index could hold the length, so the write is refused rather than
-/// certified. This is the process's state, not the request's, so it is not
-/// an `InvalidVector`.
+/// Refuses, with [`TransactError::IndexNotLoaded`], when the ledger has an
+/// index this check cannot read lengths from ([`crate::check_index_loaded`]),
+/// or one read through no binary store. Such an index could hold the length,
+/// so the write is refused rather than certified.
 fn readable_index<'s>(
     base: &LedgerState,
     store: Option<&'s BinaryIndexStore>,
 ) -> Result<Option<&'s BinaryIndexStore>> {
-    let refuse = |why: &str| {
-        Err(TransactError::Core(fluree_db_core::Error::other(format!(
-            "cannot check a vector's length: {why}"
-        ))))
-    };
+    crate::check_index_loaded(&base.snapshot)?;
     match store {
-        Some(store) if store.max_t() < base.index_t() => {
-            refuse("the loaded index is older than the ledger's")
-        }
-        Some(store) => Ok(Some(store)),
-        None if base.index_t() > 0 => refuse("the ledger's index is not loaded"),
-        None => Ok(None),
+        Some(store) if store.max_t() >= base.index_t() => Ok(Some(store)),
+        None if base.index_t() == 0 => Ok(None),
+        _ => Err(TransactError::IndexNotLoaded(format!(
+            "no binary index at t={} to read vector lengths from",
+            base.index_t()
+        ))),
     }
 }
 
@@ -210,8 +204,8 @@ mod tests {
         };
         check(0).expect("no index: the first vector sets the length");
         match check(1) {
-            Err(TransactError::Core(e)) => {
-                assert!(e.to_string().contains("index is not loaded"), "{e}");
+            Err(TransactError::IndexNotLoaded(msg)) => {
+                assert!(msg.contains("index (t=1) is not loaded"), "{msg}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }

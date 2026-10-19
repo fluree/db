@@ -560,6 +560,37 @@ pub(crate) fn binary_store(state: &LedgerState) -> Option<Arc<BinaryIndexStore>>
         })
 }
 
+/// Refuse a write on `snapshot` when this process has not loaded the
+/// ledger's index: the ledger has one, but no range provider is attached
+/// (a store that failed to load), or the binary store attached is older than
+/// it. Every read of such a snapshot fails, or misses what was indexed in
+/// between, so a write lane calls this before its first read and refuses
+/// with [`TransactError::IndexNotLoaded`] rather than failing inside one.
+///
+/// The process's state, not the request's: the same write can succeed once
+/// the index loads.
+pub fn check_index_loaded(snapshot: &LedgerSnapshot) -> Result<()> {
+    if snapshot.t == 0 {
+        return Ok(());
+    }
+    match snapshot.range_provider.as_ref() {
+        None => Err(TransactError::IndexNotLoaded(format!(
+            "the ledger's index (t={}) is not loaded",
+            snapshot.t
+        ))),
+        Some(provider) => match provider.as_any().downcast_ref::<BinaryRangeProvider>() {
+            Some(brp) if brp.store().max_t() < snapshot.t => {
+                Err(TransactError::IndexNotLoaded(format!(
+                    "the loaded index (t={}) is older than the ledger's (t={})",
+                    brp.store().max_t(),
+                    snapshot.t
+                )))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
 /// The id of each graph `snapshot` holds, by its IRI's Sid, the txn-meta
 /// graph included: how a commit's flakes are routed into novelty.
 pub(crate) fn graph_ids(snapshot: &LedgerSnapshot) -> Result<HashMap<Sid, GraphId>> {
@@ -604,6 +635,10 @@ pub async fn build_commit(
 ) -> Result<StagedCommit> {
     // 1. Extract flakes from view
     let (mut base, flakes) = view.into_parts();
+    // The checks below read the base's index; refuse before they fail on one
+    // this process has not loaded. Merge, rebase and revert reach here
+    // without staging.
+    check_index_loaded(&base.snapshot)?;
 
     // Move commit options into locals so we can pass ownership where useful
     // (e.g., txn_meta) without forcing clones, while still using other fields later.

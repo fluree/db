@@ -1612,7 +1612,8 @@ fn stage_failure(message: &str) -> WorkerError {
 /// instead of spending the retry budget. A lagging view can only miss such a
 /// constraint, never invent one, so a refusal stands after a refresh.
 /// Anything else can be rooted in this node's view (a commit or namespace
-/// conflict, policy or SHACL over lagging state) and stays transient.
+/// conflict, policy or SHACL over lagging state, an index this node has not
+/// loaded: 503) and stays transient.
 fn build_commit_failure(err: ApiError) -> WorkerError {
     if matches!(
         &err,
@@ -1802,6 +1803,15 @@ mod tests {
                 "{status}"
             );
         }
+        // This node's state, not the request's: retried after a refresh.
+        assert!(matches!(
+            build_commit_failure(ApiError::Transact(
+                fluree_db_api::TransactError::IndexNotLoaded(
+                    "the ledger's index (t=1) is not loaded".into()
+                )
+            )),
+            WorkerError::Transient(_)
+        ));
     }
 
     #[test]

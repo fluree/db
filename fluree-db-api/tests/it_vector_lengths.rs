@@ -442,11 +442,84 @@ async fn retracting_the_vectors_keeps_the_length() {
     build_incremental(&fluree, id).await;
 }
 
-/// A ledger whose attached index is older than the index its novelty starts
-/// from cannot have a property's length read (it may have been indexed in
-/// between), so a vector write to it is refused rather than certified.
+/// The refusal of a write to a ledger whose index this process has not
+/// loaded: the process's state, not the request's, so 503 and retryable.
+fn not_loaded<T>(result: fluree_db_api::Result<T>, what: &str) -> String {
+    match result {
+        Err(e) => {
+            let status = e.status_code();
+            match e {
+                ApiError::Transact(TransactError::IndexNotLoaded(msg)) => {
+                    assert_eq!(status, 503, "{what}: {msg}");
+                    msg
+                }
+                e => panic!("{what}: expected an index-not-loaded refusal, got: {e}"),
+            }
+        }
+        Ok(_) => panic!("{what}: the write was accepted"),
+    }
+}
+
+/// A ledger whose index this process has not loaded (the state a store that
+/// failed to load leaves: the ledger's index `t`, no store, no range
+/// provider) refuses every write before its first read, rather than failing
+/// inside one with an error that reads as the request's fault.
 #[tokio::test]
-async fn an_attached_index_older_than_the_ledgers_refuses_a_vector() {
+async fn a_ledger_whose_index_is_not_loaded_refuses_writes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "vector-lengths/not-loaded:main";
+    create(&fluree, id).await;
+    insert(&fluree, id, vec![node("a", "embedding", 3)])
+        .await
+        .unwrap();
+    let indexed = rebuild(&fluree, id).await;
+    let unloaded = || {
+        let mut ledger = indexed.clone();
+        ledger.binary_store = None;
+        std::sync::Arc::make_mut(&mut ledger.snapshot).range_provider = None;
+        ledger
+    };
+    let plain = json!({"@context": ctx(), "@graph": [{"@id": "ex:p", "ex:name": "x"}]});
+    let update = json!({
+        "@context": ctx(),
+        "where": {"@id": "?s", "ex:embedding": "?v"},
+        "insert": {"@id": "?s", "ex:name": "y"}
+    });
+    let results = [
+        ("insert", fluree.insert(unloaded(), &plain).await.map(drop)),
+        ("upsert", fluree.upsert(unloaded(), &plain).await.map(drop)),
+        ("update", fluree.update(unloaded(), &update).await.map(drop)),
+        (
+            "vector insert",
+            insert_state(&fluree, unloaded(), vec![node("c", "embedding", 3)]).await,
+        ),
+    ];
+    for (what, result) in results {
+        let msg = not_loaded(result, what);
+        assert!(msg.contains("is not loaded"), "{what}: {msg}");
+    }
+    // The committers' first read: the write's policy context.
+    let ledger = unloaded();
+    not_loaded(
+        fluree_db_api::build_transact_policy_context(
+            &fluree,
+            &ledger.snapshot,
+            ledger.novelty.as_ref(),
+            Some(ledger.novelty.as_ref()),
+            ledger.t(),
+            &GovernanceOptions::default(),
+        )
+        .await,
+        "policy context",
+    );
+    assert_eq!(t(&fluree, id).await, indexed.t(), "nothing committed");
+}
+
+/// A ledger whose attached index is older than the index its novelty starts
+/// from reads nothing indexed in between (a property's vector length, for
+/// one), so a write to it is refused rather than certified.
+#[tokio::test]
+async fn an_attached_index_older_than_the_ledgers_refuses_writes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = "vector-lengths/old-store:main";
     create(&fluree, id).await;
@@ -471,16 +544,22 @@ async fn an_attached_index_older_than_the_ledgers_refuses_a_vector() {
 
     // The newer index installed, but the older store and its range provider
     // left attached. Both stay consistent with each other, so reads through
-    // the provider (SHACL staging, for one) still work, and only the vector
-    // check can tell the store is older than the ledger's index.
+    // the provider still work; they miss what was indexed in between.
     ledger.binary_store = older_store;
     std::sync::Arc::make_mut(&mut ledger.snapshot).range_provider = older_provider;
-    match insert_state(&fluree, ledger, vec![node("c", "other", 5)]).await {
-        Err(ApiError::Transact(TransactError::Core(e))) => {
-            assert!(e.to_string().contains("older than the ledger's"), "{e}");
-        }
-        Err(e) => panic!("expected the write to be refused, got: {e}"),
-        Ok(()) => panic!("a length this check cannot read was certified"),
+    let plain = json!({"@context": ctx(), "@graph": [{"@id": "ex:p", "ex:name": "x"}]});
+    for (what, result) in [
+        (
+            "a vector",
+            insert_state(&fluree, ledger.clone(), vec![node("c", "other", 5)]).await,
+        ),
+        (
+            "no vector",
+            fluree.insert(ledger.clone(), &plain).await.map(drop),
+        ),
+    ] {
+        let msg = not_loaded(result, what);
+        assert!(msg.contains("older than the ledger's"), "{what}: {msg}");
     }
 }
 
