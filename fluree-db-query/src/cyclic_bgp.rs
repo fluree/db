@@ -612,11 +612,17 @@ impl<O: Copy + Eq + std::hash::Hash + Ord> RelationIdx<O> {
             return 0;
         };
         let range = &self.obj_order[lo as usize..hi as usize];
-        let first = range.partition_point(|&i| self.rows[i as usize].0 < s);
-        range[first..]
-            .iter()
-            .take_while(|&&i| self.rows[i as usize].0 == s)
-            .count()
+        let subject = |pos: usize| self.rows[range[pos] as usize].0;
+        // A miss costs the one search a membership test costs; a hit then
+        // steps outward over the (rare) repeats.
+        let Ok(hit) = range.binary_search_by_key(&s, |&i| self.rows[i as usize].0) else {
+            return 0;
+        };
+        let before = (0..hit).rev().take_while(|&pos| subject(pos) == s).count();
+        let after = (hit + 1..range.len())
+            .take_while(|&pos| subject(pos) == s)
+            .count();
+        1 + before + after
     }
 
     fn distinct_subjects(&self) -> usize {
@@ -2361,6 +2367,7 @@ impl CyclicBgpOperator {
         let s_pos = self.var_pos(rel.edge.subject);
         let o_pos = self.var_pos(rel.edge.object);
         match (assigned[s_pos], assigned[o_pos]) {
+            // The callers take a bound pair without candidates; kept total.
             (Some(s), Some(o)) => vec![(s, o); rel.pair_count(s, &o)],
             (Some(s), None) => rel.subject_rows(s).to_vec(),
             (None, Some(o)) => rel.object_subjects(&o).map(|s| (s, o)).collect(),
@@ -2428,8 +2435,17 @@ impl CyclicBgpOperator {
         let rel = &self.ref_relations[rel_idx];
         let s_pos = self.var_pos(rel.edge.subject);
         let o_pos = self.var_pos(rel.edge.object);
-        let candidates = self.ref_relation_candidates(rel, assigned);
         used[rel_idx] = true;
+        if let (Some(s), Some(o)) = (assigned[s_pos], assigned[o_pos]) {
+            // Both ends bound: the edge only multiplies the assignment by the
+            // rows it holds for the pair.
+            for _ in 0..rel.pair_count(s, &o) {
+                self.extend_ref_assignments(assigned, used, out);
+            }
+            used[rel_idx] = false;
+            return;
+        }
+        let candidates = self.ref_relation_candidates(rel, assigned);
         for (subject, object) in candidates {
             let old_s = assigned[s_pos];
             let old_o = assigned[o_pos];
@@ -2453,6 +2469,7 @@ impl CyclicBgpOperator {
         let s_pos = self.var_pos(rel.edge.subject);
         let o_pos = self.var_pos(rel.edge.object);
         match (assigned[s_pos], assigned[o_pos]) {
+            // The callers take a bound pair without candidates; kept total.
             (Some(s), Some(o)) => s
                 .ref_s_id()
                 .map_or_else(Vec::new, |s_id| vec![(s_id, o); rel.pair_count(s_id, &o)]),
@@ -2483,8 +2500,18 @@ impl CyclicBgpOperator {
         let rel = &self.relations[rel_idx];
         let s_pos = self.var_pos(rel.edge.subject);
         let o_pos = self.var_pos(rel.edge.object);
-        let candidates = self.relation_candidates(rel, assigned);
         used[rel_idx] = true;
+        if let (Some(s), Some(o)) = (assigned[s_pos], assigned[o_pos]) {
+            // Both ends bound: the edge only multiplies the assignment by the
+            // rows it holds for the pair (none when the subject isn't a ref).
+            let rows = s.ref_s_id().map_or(0, |s_id| rel.pair_count(s_id, &o));
+            for _ in 0..rows {
+                self.extend_assignments(assigned, used, out);
+            }
+            used[rel_idx] = false;
+            return;
+        }
+        let candidates = self.relation_candidates(rel, assigned);
         for (subject_id, object) in candidates {
             let subject = EncObj::from_ref(subject_id);
             let old_s = assigned[s_pos];
