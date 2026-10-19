@@ -751,7 +751,7 @@ pub async fn stage_with_graph_delta(
                 ledger.snapshot.ledger_id
             )));
         }
-        resolve_write_graphs(&mut txn, &write_table)?;
+        resolve_write_graphs(&mut txn, &write_table, &mut ns_registry)?;
 
         // B2 (data writes): `#txn-meta` is never a write target (see
         // `refuse_txn_meta_write`). `txn.write_graphs` holds the fixed write
@@ -1271,9 +1271,18 @@ fn write_graph(target: &TargetLedger<'_>, iri: &str) -> Result<WriteGraph> {
 /// among them) and a sync target. `GRAPH ?g` templates resolve each binding
 /// through the same table as the WHERE streams (see
 /// [`FlakeGenerator::set_graph_table`]).
+///
+/// An annotated edge's reifier anchor, `(reifier, f:reifiesGraph, <iri>)`,
+/// names its scope's graph as written ([`GraphScope::emit`]). It follows the
+/// edge to the graph the table reads the scope as: dropped when that is the
+/// default graph (a default-graph bundle has no anchor), and naming `<g>`
+/// when the scope was written `L#<g>`.
+///
+/// [`GraphScope::emit`]: crate::ir::GraphScope::emit
 fn resolve_write_graphs(
     txn: &mut Txn,
     table: &(dyn Fn(&str) -> Result<WriteGraph> + Sync),
+    ns: &mut NamespaceRegistry,
 ) -> Result<()> {
     let mut resolved: HashMap<Arc<str>, WriteGraph> = HashMap::new();
     let mut resolve = |iri: &str| -> Result<WriteGraph> {
@@ -1284,18 +1293,31 @@ fn resolve_write_graphs(
         resolved.insert(iri.into(), graph.clone());
         Ok(graph)
     };
-    for template in txn
-        .insert_templates
-        .iter_mut()
-        .chain(txn.delete_templates.iter_mut())
-    {
-        if let TemplateGraph::Iri(iri) = &template.graph {
-            let graph = resolve(iri)?;
-            template.graph = match graph {
-                WriteGraph::Default => TemplateGraph::Default,
-                WriteGraph::Named(iri) => TemplateGraph::Iri(iri),
-            };
+    for templates in [&mut txn.insert_templates, &mut txn.delete_templates] {
+        let mut kept = Vec::with_capacity(templates.len());
+        for mut template in templates.drain(..) {
+            if let TemplateGraph::Iri(written) = &template.graph {
+                let written = Arc::clone(written);
+                let anchor = matches!(&template.predicate, TemplateTerm::Sid(p) if fluree_db_core::is_reifies_graph(p))
+                    && matches!(&template.object, TemplateTerm::Sid(o) if ns.lookup_sid_for_iri(&written).as_ref() == Some(o));
+                match resolve(&written)? {
+                    WriteGraph::Default => {
+                        if anchor {
+                            continue;
+                        }
+                        template.graph = TemplateGraph::Default;
+                    }
+                    WriteGraph::Named(graph) => {
+                        if anchor && *graph != *written {
+                            template.object = TemplateTerm::Sid(ns.sid_for_iri(&graph));
+                        }
+                        template.graph = TemplateGraph::Iri(graph);
+                    }
+                }
+            }
+            kept.push(template);
         }
+        *templates = kept;
     }
     for iri in std::mem::take(&mut txn.write_graphs) {
         if let WriteGraph::Named(graph) = resolve(&iri)? {
@@ -2810,9 +2832,29 @@ async fn stream_where_into_accumulator(
         lower_where_patterns(&txn.where_patterns, &ledger.snapshot, &mut txn.vars)?
     };
 
-    // If VALUES clause present, prepend it as first pattern (seeds the join)
+    // If VALUES clause present, prepend it as first pattern (seeds the join).
+    //
+    // The where reads every IRI in the ledger's encoding, the one a where
+    // VALUES lowers to. The update encoded its top-level `values` as it
+    // encodes its templates, with the transaction's registry, which gives a
+    // namespace the ledger has not registered a new code the where cannot
+    // decode; such an IRI enters the where in the ledger encoder's fallback
+    // form, `Sid(EMPTY, iri)`, and a write stores it under its canonical
+    // code (`FlakeGenerator`).
     if let Some(inline_values) = &txn.values {
-        let values_pattern = inline_values_to_pattern(inline_values, ledger, generator)?;
+        let in_ledger_encoding = |sid: &Sid| -> Sid {
+            let code = sid.namespace_code;
+            if fluree_vocab::namespaces::is_full_iri(code)
+                || ledger.snapshot.namespaces().contains_key(&code)
+            {
+                return sid.clone();
+            }
+            match generator.decode_sid(sid) {
+                Some(iri) => Sid::new(fluree_vocab::namespaces::EMPTY, iri),
+                None => sid.clone(),
+            }
+        };
+        let values_pattern = inline_values_to_pattern(inline_values, in_ledger_encoding)?;
         query_patterns.insert(0, values_pattern);
     }
 
@@ -3034,6 +3076,17 @@ async fn stream_where_into_accumulator(
             if let Some(alias) = alias {
                 named.push((alias.into(), g_id, false, iri));
             }
+        }
+        // A where node's `"@graph": "default"` reads the default graph as
+        // `GRAPH <urn:default>`, which a restricting `fromNamed` does not
+        // take away.
+        if txn.update_where_names_ledger_default
+            && !named
+                .iter()
+                .any(|(name, ..)| name.as_ref() == fluree_db_core::DEFAULT_GRAPH_IRI)
+        {
+            let name: Arc<str> = fluree_db_core::DEFAULT_GRAPH_IRI.into();
+            named.push((name.clone(), 0, false, name));
         }
     } else {
         // The ambient graph store: every graph of the ledger, each listed by
@@ -3492,43 +3545,25 @@ fn template_term_to_binding(term: &TemplateTerm) -> Result<Binding> {
     }
 }
 
-/// An update's top-level `values` as the VALUES pattern that seeds its WHERE.
-///
-/// The cells were encoded with the transaction's namespace table, which can
-/// hold codes the ledger's snapshot, the table the WHERE decodes with, does
-/// not have yet. Such a cell carries its IRI too (`IriMatch`), so the WHERE
-/// reads the IRI (a `GRAPH ?g` names its graph by it) while a template still
-/// writes the transaction's own encoding.
+/// Convert InlineValues to Pattern::Values
 fn inline_values_to_pattern(
     values: &InlineValues,
-    ledger: &LedgerState,
-    generator: &FlakeGenerator<'_>,
+    in_ledger_encoding: impl Fn(&Sid) -> Sid,
 ) -> Result<Pattern> {
-    let cell = |term: &TemplateTerm| match term {
-        TemplateTerm::Sid(sid) if ledger.snapshot.decode_sid(sid).is_none() => {
-            let iri = generator.iri_of(sid).ok_or_else(|| {
-                TransactError::InvalidTerm(format!(
-                    "VALUES IRI with unknown namespace code {}",
-                    sid.namespace_code
-                ))
-            })?;
-            Ok(Binding::IriMatch {
-                iri: iri.into(),
-                primary_sid: sid.clone(),
-                ledger_alias: ledger.snapshot.ledger_id.as_str().into(),
-            })
-        }
-        other => template_term_to_binding(other),
-    };
+    let vars = values.vars.clone();
     let rows: Result<Vec<Vec<Binding>>> = values
         .rows
         .iter()
-        .map(|row| row.iter().map(cell).collect())
+        .map(|row| {
+            row.iter()
+                .map(|term| match term {
+                    TemplateTerm::Sid(sid) => Ok(Binding::sid(in_ledger_encoding(sid))),
+                    other => template_term_to_binding(other),
+                })
+                .collect()
+        })
         .collect();
-    Ok(Pattern::Values {
-        vars: values.vars.clone(),
-        rows: rows?,
-    })
+    Ok(Pattern::Values { vars, rows: rows? })
 }
 
 /// The slots an upsert replaces, grouped by `(subject, graph IRI)`.
@@ -3821,12 +3856,9 @@ impl ShaclValidationOutcome {
 /// Validate a staged [`StagedLedger`] against SHACL shapes, each focus node
 /// in the graph staging routed its flakes to.
 ///
-/// `per_graph_policy`:
-/// - `None` = treat every graph containing staged flakes as `Reject` mode
-///   (legacy / unconditional reject — matches commit-transfer's previous
-///   behavior and shapes-exist heuristic).
-/// - `Some(map)` = only graphs in the map are validated; their mode comes
-///   from the map. Graphs absent from the map are skipped (disabled).
+/// `per_graph_policy` names the graphs that participate: only graphs in the
+/// map are validated, each in the mode the map gives it. Graphs absent from
+/// the map are skipped, so an empty map validates nothing.
 ///
 /// Returns a [`ShaclValidationOutcome`] split into reject / warn buckets.
 /// The caller decides whether to propagate an error, log warnings, or both.
@@ -3837,13 +3869,13 @@ pub async fn validate_view_with_shacl(
     shacl_cache: std::sync::Arc<ShaclCache>,
     hierarchy: Option<fluree_db_core::SchemaHierarchy>,
     tracker: Option<&fluree_db_core::Tracker>,
-    per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
+    per_graph_policy: &HashMap<GraphId, ShaclGraphPolicy>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
     sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ShaclValidationOutcome> {
-    // Fast path: if there are no SHACL shapes, elide validation entirely.
-    if shacl_cache.is_empty() {
+    // Fast path: no shapes or no participating graph, nothing to validate.
+    if shacl_cache.is_empty() || per_graph_policy.is_empty() {
         return Ok(ShaclValidationOutcome::default());
     }
 
@@ -3861,26 +3893,24 @@ pub async fn validate_view_with_shacl(
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
         .with_membership_graphs(membership_g_ids.to_vec())
         .with_constraint_failures(std::sync::Arc::clone(&constraint_failures));
-    let enabled_graphs: Option<HashSet<GraphId>> =
-        per_graph_policy.map(|m| m.keys().copied().collect());
+    let enabled_graphs: HashSet<GraphId> = per_graph_policy.keys().copied().collect();
     let report = validate_staged_nodes(
         view,
         &engine,
         tracker,
-        enabled_graphs.as_ref(),
+        &enabled_graphs,
         cross_ledger,
         sparql_iri_encoder,
     )
     .await?;
 
-    // A graph's validation mode. When per_graph_policy is None, every graph
-    // is in Reject mode.
-    let mode_of = |g_id: Option<GraphId>| match (per_graph_policy, g_id) {
-        (Some(m), Some(g_id)) => m
-            .get(&g_id)
-            .map(|p| p.mode)
-            .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
-        _ => fluree_db_core::ledger_config::ValidationMode::Reject,
+    // A graph's validation mode: the participating graph's, and Reject for a
+    // result tagged with no graph.
+    let mode_of = |g_id: Option<GraphId>| {
+        g_id.and_then(|g_id| per_graph_policy.get(&g_id))
+            .map_or(fluree_db_core::ledger_config::ValidationMode::Reject, |p| {
+                p.mode
+            })
     };
 
     // A constraint that cannot run, on a Violation shape in a Reject-mode
@@ -3941,7 +3971,7 @@ async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
     tracker: Option<&fluree_db_core::Tracker>,
-    enabled_graphs: Option<&HashSet<GraphId>>,
+    enabled_graphs: &HashSet<GraphId>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
     sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ValidationReport> {
@@ -4001,15 +4031,13 @@ async fn validate_staged_nodes(
     let mut all_results = Vec::new();
 
     for (g_id, subjects) in &subjects_by_graph {
-        // Per-graph enable/disable: when the caller supplies an explicit
-        // enabled set, graphs not in the set are skipped. Subjects staged in
-        // a disabled graph therefore receive no shape validation from this
-        // transaction, which matches the documented `shacl.enabled: false`
-        // semantics for that graph (`override-control.md`).
-        if let Some(enabled) = enabled_graphs {
-            if !enabled.contains(g_id) {
-                continue;
-            }
+        // Per-graph enable/disable: graphs not in the enabled set are
+        // skipped. Subjects staged in a disabled graph therefore receive no
+        // shape validation from this transaction, which matches the
+        // documented `shacl.enabled: false` semantics for that graph
+        // (`override-control.md`).
+        if !enabled_graphs.contains(g_id) {
+            continue;
         }
 
         // Build GraphDbRef for this graph.

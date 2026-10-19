@@ -141,8 +141,21 @@ impl GraphSel {
     /// ([`DEFAULT_GRAPH_IRI`], the name `/info` lists the default graph under)
     /// is a second spelling of `default`.
     pub fn keyword(s: &str) -> Option<Self> {
+        if s == DEFAULT_GRAPH_IRI {
+            return Some(Self::Default);
+        }
+        Self::bare_keyword(s)
+    }
+
+    /// The keyword `s` spells as a bare word (`default`, `txn-meta`,
+    /// `config`), the form a JSON-LD graph name is written in. `urn:default`
+    /// is not one here: written as a graph name it is an IRI, which a graph
+    /// position reads as the default graph
+    /// ([`TargetLedger::graph_position`]) and a write refuses as a graph's
+    /// name, where the bare `default` writes the default graph.
+    pub fn bare_keyword(s: &str) -> Option<Self> {
         match s {
-            "default" | DEFAULT_GRAPH_IRI => Some(Self::Default),
+            "default" => Some(Self::Default),
             "txn-meta" => Some(Self::TxnMeta),
             "config" => Some(Self::Config),
             _ => None,
@@ -1227,6 +1240,40 @@ mod tests {
     }
 
     // --- GraphSel ---
+
+    #[test]
+    fn keywords_and_absolute_iris_parse() {
+        assert_eq!(GraphSel::parse("default"), Ok(GraphSel::Default));
+        assert_eq!(GraphSel::parse("txn-meta"), Ok(GraphSel::TxnMeta));
+        assert_eq!(GraphSel::parse("config"), Ok(GraphSel::Config));
+        assert_eq!(
+            GraphSel::parse("http://example.org/g"),
+            Ok(GraphSel::Named(GraphIri("http://example.org/g".into())))
+        );
+        assert_eq!(
+            GraphSel::parse("urn:fluree:mydb:main#config"),
+            Ok(GraphSel::Named(GraphIri(
+                "urn:fluree:mydb:main#config".into()
+            )))
+        );
+        // `urn:default` spells `default`, but not as a bare word.
+        assert_eq!(GraphSel::keyword("urn:default"), Some(GraphSel::Default));
+        assert_eq!(GraphSel::bare_keyword("urn:default"), None);
+        for word in GraphSel::KEYWORDS {
+            assert_eq!(
+                GraphSel::bare_keyword(word),
+                GraphSel::keyword(word),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_and_empty_names_are_refused() {
+        for bad in ["", "g1", "graphs/g1", "#frag", "1http://x"] {
+            assert!(GraphSel::parse(bad).is_err(), "{bad:?} must not parse");
+        }
+    }
 
     #[test]
     fn graph_sel_keywords_and_iris() {
