@@ -594,6 +594,11 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
         Absent,
         Novelty,
         Indexed,
+        /// Never indexed; novelty holds the value under two spellings,
+        /// asserted by two requests (#2090).
+        TwoTermsInNovelty,
+        /// The index holds the value; novelty a later spelling of it.
+        IndexedThenNovelty,
     }
     let count = |fluree: fluree_db_api::Fluree, ledger_id: String| async move {
         let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
@@ -611,7 +616,13 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
     let mut failures = Vec::new();
     let mut case = 0;
     for spellings in &values {
-        for base in [Base::Absent, Base::Novelty, Base::Indexed] {
+        for base in [
+            Base::Absent,
+            Base::Novelty,
+            Base::Indexed,
+            Base::TwoTermsInNovelty,
+            Base::IndexedThenNovelty,
+        ] {
             for (ops, split) in sequences
                 .iter()
                 .flat_map(|ops| [(ops, false), (ops, true)])
@@ -640,7 +651,7 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                     .commit()
                     .await
                     .expect("seed");
-                let fluree = if let Base::Indexed = base {
+                let fluree = if let Base::Indexed | Base::IndexedThenNovelty = base {
                     crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
                     FlureeBuilder::file(path.clone())
                         .without_indexing()
@@ -649,6 +660,18 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                 } else {
                     fluree
                 };
+                if let Base::TwoTermsInNovelty | Base::IndexedThenNovelty = base {
+                    fluree
+                        .graph(ledger_id)
+                        .transact()
+                        .sparql_update(&format!(
+                            "{PFX}INSERT DATA {{ ex:s ex:p {} }}",
+                            spellings[1]
+                        ))
+                        .commit()
+                        .await
+                        .expect("second spelling");
+                }
                 let op_texts: Vec<String> = ops
                     .iter()
                     .map(|(insert, n)| {
@@ -711,9 +734,11 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                     .map(|(_, n)| *n)
                     .collect();
                 let two_terms_in_novelty = want == "1"
-                    && (matches!(base, Base::Novelty)
-                        || (split && !matches!(base, Base::Indexed) && asserted.len() > 1));
-                let unbuilt_ok = |n: &String| n == want || (two_terms_in_novelty && n == "2");
+                    && (matches!(base, Base::Novelty | Base::TwoTermsInNovelty)
+                        || (split && matches!(base, Base::Absent) && asserted.len() > 1));
+                let unbuilt_ok = |n: &String| {
+                    n == want || (two_terms_in_novelty && n.parse::<u32>().is_ok_and(|n| n > 1))
+                };
                 let got = [in_process, reloaded, incremental, rebuilt];
                 if !got[..2].iter().all(unbuilt_ok) || got[2..].iter().any(|n| n != want) {
                     failures.push(format!(
@@ -722,7 +747,7 @@ async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
                         update.replace('\n', " "),
                         if split { " (one request per op)" } else { "" },
                         if two_terms_in_novelty {
-                            " (2 before a build)"
+                            " (more than one before a build)"
                         } else {
                             ""
                         }

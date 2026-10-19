@@ -668,12 +668,28 @@ impl<'l> CurrentFacts<'l> {
     }
 
     /// The current fact each `(slot, flake)` names, in order: the fact of
-    /// `slot` with `flake`'s identity ([`FactIdentity`]). So a retraction
-    /// written elsewhere, which may carry a term as written where the index
-    /// keeps less of it, names the fact as stored. Each distinct slot is read
-    /// once, and each item is matched by hash, so naming k facts of an
-    /// n-fact slot costs one read of the slot and O(k + n) matching.
+    /// `slot` with `flake`'s identity ([`FactIdentity`]), its own term first.
+    /// So a retraction written elsewhere, which may carry a term as written
+    /// where the index keeps less of it, names the fact as stored. See
+    /// [`Self::all_named_by`] for every term of it.
     pub async fn named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Option<StoredFact>>> {
+        Ok(self
+            .all_named_by(items)
+            .await?
+            .into_iter()
+            .map(|named| named.into_iter().next())
+            .collect())
+    }
+
+    /// Every current fact of each `(slot, flake)`'s identity
+    /// ([`FactIdentity`]), in order: `flake`'s own term first, then the
+    /// slot's other terms of that fact. Novelty holds the subtypes of one big
+    /// integer apart until the next index build, so one fact can be current
+    /// under several terms; a retraction of the fact retracts each. Each
+    /// distinct slot is read once, and each item is matched by hash, so
+    /// naming k facts of an n-fact slot costs one read of the slot and
+    /// O(k + n) matching.
+    pub async fn all_named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Vec<StoredFact>>> {
         let mut slot_index: HashMap<(GraphId, &Sid, &Sid), usize> = HashMap::new();
         let mut slots: Vec<Slot> = Vec::new();
         let item_slots: Vec<usize> = items
@@ -690,17 +706,17 @@ impl<'l> CurrentFacts<'l> {
         let facts = self.of_slots(&slots).await?;
         let ids = FactIdentity::new(self.ledger);
         let mut by_term: Vec<HashMap<&Flake, usize>> = Vec::with_capacity(slots.len());
-        let mut by_key: Vec<HashMap<MergeKey, usize>> = Vec::with_capacity(slots.len());
+        let mut by_key: Vec<HashMap<MergeKey, Vec<usize>>> = Vec::with_capacity(slots.len());
         for (slot, slot_facts) in slots.iter().zip(&facts) {
             let mut slot_p_id = None;
             let mut terms = HashMap::with_capacity(slot_facts.len());
-            let mut keys = HashMap::new();
+            let mut keys: HashMap<MergeKey, Vec<usize>> = HashMap::new();
             for (n, fact) in slot_facts.iter().enumerate() {
                 terms.insert(&fact.flake, n);
                 if fact.flake.o.index_key_may_merge_terms() {
                     let p_id = || *slot_p_id.get_or_insert_with(|| self.keys.p_id(&slot.p));
                     if let Some(key) = ids.key_under(|| Some(slot.g_id), p_id, &fact.flake) {
-                        keys.insert(key, n);
+                        keys.entry(key).or_default().push(n);
                     }
                 }
             }
@@ -709,16 +725,25 @@ impl<'l> CurrentFacts<'l> {
         }
         // By term first: two terms of one key can both be current while
         // novelty holds them, and an item naming one of them exactly names
-        // that one.
+        // that one first.
         Ok(items
             .iter()
             .zip(item_slots)
             .map(|((slot, flake), i)| {
-                let n = by_term[i].get(flake).or_else(|| {
-                    let key = ids.key(Some(slot.g_id), flake)?;
-                    by_key[i].get(&key)
-                });
-                n.map(|&n| facts[i][n].clone())
+                let term = by_term[i].get(flake).copied();
+                let same_key = ids
+                    .key(Some(slot.g_id), flake)
+                    .and_then(|key| by_key[i].get(&key));
+                term.into_iter()
+                    .chain(
+                        same_key
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|&n| Some(n) != term),
+                    )
+                    .map(|n| facts[i][n].clone())
+                    .collect()
             })
             .collect())
     }
