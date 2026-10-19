@@ -168,6 +168,100 @@ async fn graph_patterns_address_graphs_as_before() {
     assert_eq!(sparql(&fluree, &ledger, &in_g2).await, strs(&["Carol"]));
 }
 
+/// In a JSON-LD query's `where`, a node's `"@graph": "default"` reads the
+/// query's default graph, which the union widens, and `"urn:default"` reads
+/// the default graph alone, as `GRAPH <urn:default>` does. An update's `where`
+/// reads the default graph alone either way.
+#[tokio::test]
+async fn jsonld_where_default_reads_the_union_and_urn_default_the_default_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "union/where-default:main").await;
+    let ledger = set_union(&fluree, ledger, true).await;
+    for (graph, expected) in [
+        ("default", strs(&["Alice", "Bob", "Carol"])),
+        ("urn:default", strs(&["Alice"])),
+    ] {
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?name",
+            "where": {"@id": "?s", "@graph": graph, "ex:name": "?name"}
+        });
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{graph}: {e}"));
+        assert_eq!(
+            column(&result.to_jsonld(&ledger.snapshot).expect("jsonld")),
+            expected,
+            "a query's where, \"@graph\": \"{graph}\""
+        );
+    }
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": {"@id": "?s", "@graph": "default", "ex:name": "?name"},
+                "insert": {"@id": "ex:seen", "ex:saw": "?name"}
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    assert_eq!(
+        sparql(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ex:seen ex:saw ?name }"
+        )
+        .await,
+        strs(&["Alice"]),
+        "an update's where read the default graph alone"
+    );
+}
+
+/// The request's union switch is a query option: an update refuses it, the
+/// JSON-LD `opts.unionDefaultGraph` as the SPARQL pragma, with the same
+/// error, rather than ignoring it.
+#[tokio::test]
+async fn updates_refuse_the_union_switch() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("union/update-switch:main")
+        .await
+        .expect("create ledger");
+    let graph = fluree.graph("union/update-switch:main");
+    let update = json!({
+        "@context": {"ex": "http://example.org/"},
+        "opts": {"unionDefaultGraph": true},
+        "where": {"@id": "?s", "ex:name": "?name"},
+        "insert": {"@id": "ex:seen", "ex:saw": "?name"}
+    });
+    let jsonld = graph
+        .transact()
+        .update(&update)
+        .commit()
+        .await
+        .expect_err("opts.unionDefaultGraph on an update");
+    let sparql = graph
+        .transact()
+        .sparql_update(
+            "# PRAGMA union-default-graph: true\n\
+             PREFIX ex: <http://example.org/>\n\
+             INSERT { ex:seen ex:saw ?name } WHERE { ?s ex:name ?name }",
+        )
+        .commit()
+        .await
+        .expect_err("the union pragma on an update");
+    for (surface, err) in [("JSON-LD", jsonld), ("SPARQL", sparql)] {
+        let err = err.to_string();
+        assert!(
+            err.contains("applies to queries, not updates"),
+            "{surface}: {err}"
+        );
+    }
+}
+
 /// The request's own switch wins over the ledger's, both ways, in SPARQL and
 /// in JSON-LD.
 #[tokio::test]

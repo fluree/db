@@ -33,10 +33,25 @@ async fn run(fluree: &MemoryFluree, db: &GraphDb, query: &str) -> JsonValue {
     response["data"].clone()
 }
 
-/// Two people and a company, plus shapes over both classes.
+/// Two people and a company, plus shapes over both classes, on a ledger whose
+/// config enables SHACL.
 async fn seeded(ledger_id: &str, shapes: JsonValue) -> (MemoryFluree, LedgerState) {
+    seeded_with(ledger_id, shapes, true).await
+}
+
+/// [`seeded`], with SHACL enabled in the config or not.
+async fn seeded_with(
+    ledger_id: &str,
+    shapes: JsonValue,
+    shacl_enabled: bool,
+) -> (MemoryFluree, LedgerState) {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = if shacl_enabled {
+        crate::support::enable_shacl(&fluree, ledger).await
+    } else {
+        ledger
+    };
     let ledger = fluree
         .insert(
             ledger,
@@ -111,6 +126,71 @@ async fn a_shape_supplies_cardinality_and_documentation() {
     assert!(sdl.contains("internalNote: [String!]"), "{sdl}");
     // And the unshaped class keeps its inferred type.
     assert!(sdl.contains("type Company {"), "{sdl}");
+}
+
+/// `sh:minCount 1` makes a field non-null only where the ledger config
+/// enforces SHACL: elsewhere nothing keeps a record from lacking the value,
+/// so a non-null field would turn that record into an error on read.
+#[tokio::test]
+async fn min_count_makes_a_field_non_null_only_where_shacl_is_enforced() {
+    let (_fluree, ledger) =
+        seeded_with("gql-shape-card-unenforced", person_shape(vec![]), false).await;
+    let sdl = schema_sdl(&view(&ledger)).await.expect("sdl");
+    assert!(sdl.contains("name: String\n"), "{sdl}");
+    assert!(!sdl.contains("name: String!"), "{sdl}");
+
+    let (_fluree, ledger) = seeded("gql-shape-card-enforced", person_shape(vec![])).await;
+    let sdl = schema_sdl(&view(&ledger)).await.expect("sdl");
+    assert!(sdl.contains("name: String!"), "{sdl}");
+}
+
+/// A view of one graph follows that graph's SHACL setting, also when a view
+/// of another graph at the same `t` was derived first.
+#[tokio::test]
+async fn min_count_follows_the_views_graph() {
+    let (fluree, ledger) =
+        seeded_with("gql-shape-card-per-graph", person_shape(vec![]), false).await;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "ex": EX, "f": "https://ns.flur.ee/db#" },
+                "@graph": [
+                    {
+                        "@id": "ex:carol",
+                        "@graph": "ex:g",
+                        "@type": "ex:Person",
+                        "ex:name": "Carol"
+                    },
+                    {
+                        "@id": "urn:it:cfg:ledger",
+                        "@type": "f:LedgerConfig",
+                        "@graph": "config",
+                        "f:graphOverrides": {
+                            "@id": "urn:it:cfg:g",
+                            "@type": "f:GraphConfig",
+                            "f:targetGraph": { "@id": "http://example.org/g" },
+                            "f:shaclDefaults": { "f:shaclEnabled": true }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("enable SHACL for ex:g")
+        .ledger;
+    let g = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri("http://example.org/g")
+        .expect("ex:g is registered");
+
+    let sdl = schema_sdl(&view(&ledger)).await.expect("sdl");
+    assert!(!sdl.contains("name: String!"), "{sdl}");
+    let sdl = schema_sdl(&view(&ledger).with_graph_id(g))
+        .await
+        .expect("sdl");
+    assert!(sdl.contains("name: String!"), "{sdl}");
 }
 
 #[tokio::test]
