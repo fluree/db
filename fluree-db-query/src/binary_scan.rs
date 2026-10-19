@@ -2502,7 +2502,7 @@ impl Operator for BinaryScanOperator {
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
-        let mut string_bound_slices = false;
+        let mut bound_slices = false;
         if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
             if let Some(bounds) = self.object_bounds.as_ref() {
                 let supports_range = |ot: OType| -> bool {
@@ -2549,6 +2549,16 @@ impl Operator for BinaryScanOperator {
                     range_o_type = Some(o_type);
                     // Also set the filter o_type so directory-level pre-skip can eliminate non-matching leaflets.
                     filter.o_type = Some(o_type);
+                    // `<`, `<=`, `>` and `>=` also order an `xsd:string` row
+                    // against a temporal bound, reading it as a value of that
+                    // type, so seek that slice too, unranged (string ids are
+                    // not in date order). `=` never equates the two, so its
+                    // seek stays on the temporal slice.
+                    if bounds.temporal_string_ordering {
+                        object_slices =
+                            vec![(OType::from_u16(o_type), None), (OType::XSD_STRING, None)];
+                        bound_slices = true;
+                    }
                 }
 
                 // Integer EQUALITY bounds (`FILTER(?v = 4112)`, the id-lookup
@@ -2623,7 +2633,7 @@ impl Operator for BinaryScanOperator {
                             [ot] => filter.o_type = Some(ot.as_u16()),
                             _ => {
                                 object_slices = otypes.into_iter().map(|ot| (ot, None)).collect();
-                                string_bound_slices = true;
+                                bound_slices = true;
                             }
                         },
                     }
@@ -2646,7 +2656,7 @@ impl Operator for BinaryScanOperator {
         // A bare number spanning several numeric datatypes seeks each slice
         // with its own cursor, drained in turn.
         let slice_filters = object_slice_filters(order, filter, &object_slices);
-        if !object_slices.is_empty() && !string_bound_slices {
+        if !object_slices.is_empty() && !bound_slices {
             stamp_bare_number_seek(slice_filters.len() > 1);
         }
         let open_cursor = |filter: BinaryFilter| {
@@ -2661,6 +2671,14 @@ impl Operator for BinaryScanOperator {
                 .with_tracker(ctx.tracker.clone());
                 return (cursor, None);
             }
+            // The temporal key range bounds the temporal slice only, not an
+            // `xsd:string` slice sought beside it.
+            let in_range = filter.o_type.is_none() || filter.o_type == range_o_type;
+            let (range_min_okey, range_max_okey) = if in_range {
+                (range_min_okey, range_max_okey)
+            } else {
+                (None, None)
+            };
             let min_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(0)),
                 o_key: filter.o_key.or(range_min_okey).unwrap_or(0),
