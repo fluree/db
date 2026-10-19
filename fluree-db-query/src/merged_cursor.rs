@@ -32,9 +32,9 @@
 //! **Cost.** The merge works on integer keys only, with no dictionary access.
 //! The input that holds the smallest row emits a run up to the smallest row of
 //! the other inputs, found by galloping, so disjoint stretches cost a few
-//! comparisons per run and interleaved rows one comparison each against the
-//! runner-up, plus the choice of the next input (a scan of the heads for up to
-//! four inputs, a heap above). A row is compared with the previous fact only
+//! comparisons per run, and interleaved or repeated rows one key read and one
+//! comparison each against the runner-up, plus the choice of the next input
+//! (a scan of the heads for up to four inputs, a heap above). A row is compared with the previous fact only
 //! at the start of a run, or on every row of a batch that holds list rows.
 //! The output is gathered column by column from the runs: a run that is a
 //! whole input batch is shared, not copied.
@@ -303,100 +303,39 @@ impl MergedRangeCursor {
     /// Merge the inputs' current batches until one of them is used up,
     /// recording the rows to emit in `self.runs`.
     fn merge_round<O: MergeOrder>(&mut self) {
-        let live: SmallVec<[usize; 8]> = (0..self.inputs.len())
-            .filter(|&i| self.inputs[i].pos < self.inputs[i].end)
-            .collect();
-        match live.len() {
-            0 => {}
-            1 => {
-                let i = live[0];
-                let (pos, end) = (self.inputs[i].pos, self.inputs[i].end);
-                self.emit(i, pos, end);
-                self.inputs[i].pos = end;
-            }
-            n if n <= LINEAR_MERGE_MAX_INPUTS => self.merge_linear::<O>(&live),
-            _ => self.merge_heap::<O>(&live),
-        }
-    }
-
-    /// The merge for a few inputs: the next input is found by scanning the
-    /// heads.
-    fn merge_linear<O: MergeOrder>(&mut self, live: &[usize]) {
-        let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
-            live.iter().map(|&i| self.inputs[i].head()).collect();
-        loop {
-            // The smallest head (the earlier input on a tie) and the
-            // smallest of the others.
-            let mut min_at = 0;
-            let mut runner_up: Option<Key> = None;
-            for at in 1..heads.len() {
-                if O::cmp(&heads[at], &heads[min_at]) == Ordering::Less {
-                    runner_up = Some(heads[min_at]);
-                    min_at = at;
-                } else if runner_up.is_none_or(|r| O::cmp(&heads[at], &r) == Ordering::Less) {
-                    runner_up = Some(heads[at]);
-                }
-            }
-            let i = live[min_at];
-            let bound = runner_up.expect("two or more inputs");
-            let (pos, end) = (self.inputs[i].pos, self.inputs[i].end);
-            let run_end = gallop::<O>(self.inputs[i].batch(), pos, end, &bound);
-            self.emit(i, pos, run_end);
-            self.inputs[i].pos = run_end;
-            if run_end == end {
-                return;
-            }
-            heads[min_at] = self.inputs[i].head();
-        }
-    }
-
-    /// The merge for many inputs: the next input comes off a heap of heads.
-    fn merge_heap<O: MergeOrder>(&mut self, live: &[usize]) {
-        let mut heap: BinaryHeap<HeapHead<O>> = live
+        let Self {
+            inputs, runs, last, ..
+        } = self;
+        // Each live input's batch, borrowed for the round; positions are
+        // written back at its end.
+        let mut lanes: SmallVec<[Lane<'_>; 4]> = inputs
             .iter()
-            .map(|&i| HeapHead::new(self.inputs[i].head(), i))
+            .enumerate()
+            .filter(|(_, input)| input.pos < input.end)
+            .map(|(i, input)| Lane {
+                input: i,
+                batch: input.batch(),
+                pos: input.pos,
+                end: input.end,
+                list_rows: input.list_rows,
+            })
             .collect();
-        while let Some(top) = heap.pop() {
-            let i = top.input;
-            let (pos, end) = (self.inputs[i].pos, self.inputs[i].end);
-            let run_end = match heap.peek() {
-                Some(next) => gallop::<O>(self.inputs[i].batch(), pos, end, &next.key),
-                None => end,
-            };
-            self.emit(i, pos, run_end);
-            self.inputs[i].pos = run_end;
-            if run_end == end {
-                return;
+        let mut out = Emitted { runs, last };
+        match lanes.as_mut_slice() {
+            [] => {}
+            [only] => {
+                let head = only.head();
+                advance::<O>(only, head, None, &mut out);
             }
-            heap.push(HeapHead::new(self.inputs[i].head(), i));
+            [a, b] => merge_two::<O>(a, b, &mut out),
+            lanes if lanes.len() <= LINEAR_MERGE_MAX_INPUTS => merge_linear::<O>(lanes, &mut out),
+            lanes => merge_heap::<O>(lanes, &mut out),
         }
-    }
-
-    /// Emit input `i`'s rows `[from, to)`, dropping each row whose fact is the
-    /// previous row's.
-    fn emit(&mut self, i: usize, mut from: usize, to: usize) {
-        let input = &self.inputs[i];
-        let batch = input.batch();
-        if input.list_rows {
-            // List items of one fact sit next to each other here: compare
-            // every row with the one before.
-            for row in from..to {
-                let fact = Key::at(batch, row).fact();
-                if self.last != Some(fact) {
-                    push_run(&mut self.runs, i, row, row + 1);
-                    self.last = Some(fact);
-                }
-            }
-            return;
-        }
-        // Without list rows, one input's rows are distinct facts, so only the
-        // first can repeat the previous row's.
-        if from < to && self.last == Some(Key::at(batch, from).fact()) {
-            from += 1;
-        }
-        if from < to {
-            push_run(&mut self.runs, i, from, to);
-            self.last = Some(Key::at(batch, to - 1).fact());
+        let positions: SmallVec<[(usize, usize); 4]> =
+            lanes.iter().map(|lane| (lane.input, lane.pos)).collect();
+        drop(lanes);
+        for (i, pos) in positions {
+            inputs[i].pos = pos;
         }
     }
 
@@ -444,6 +383,161 @@ fn input_projection(projection: ColumnProjection) -> ColumnProjection {
     }
 }
 
+/// One input's batch during a merge round, borrowed out of its
+/// [`MemberInput`] so the merge loop works on locals.
+struct Lane<'b> {
+    input: usize,
+    batch: &'b ColumnBatch,
+    /// The head; rows `[pos, end)` remain.
+    pos: usize,
+    end: usize,
+    list_rows: bool,
+}
+
+impl Lane<'_> {
+    #[inline(always)]
+    fn head(&self) -> Key {
+        Key::at(self.batch, self.pos)
+    }
+}
+
+/// Where a round's rows go: the runs to gather, and the fact of the last row
+/// emitted.
+struct Emitted<'a> {
+    runs: &'a mut Vec<Run>,
+    last: &'a mut Option<FactKey>,
+}
+
+impl Emitted<'_> {
+    /// Emit `lane`'s row `row` alone, whose key is `key`, unless its fact is
+    /// the previous row's.
+    #[inline(always)]
+    fn one(&mut self, lane: &Lane<'_>, row: usize, key: Key) {
+        let fact = key.fact();
+        if *self.last != Some(fact) {
+            push_run(self.runs, lane.input, row, row + 1);
+            *self.last = Some(fact);
+        }
+    }
+
+    /// Emit `lane`'s rows `[from, to)`, the first of which has key `first`,
+    /// dropping each row whose fact is the previous row's.
+    #[inline]
+    fn run(&mut self, lane: &Lane<'_>, mut from: usize, to: usize, first: Key) {
+        if lane.list_rows {
+            // List items of one fact sit next to each other here: compare
+            // every row with the one before.
+            for row in from..to {
+                self.one(lane, row, Key::at(lane.batch, row));
+            }
+            return;
+        }
+        // Without list rows, one input's rows are distinct facts, so only the
+        // first can repeat the previous row's.
+        if from < to && *self.last == Some(first.fact()) {
+            from += 1;
+        }
+        if from < to {
+            push_run(self.runs, lane.input, from, to);
+            *self.last = Some(Key::at(lane.batch, to - 1).fact());
+        }
+    }
+}
+
+/// Emit `lane`'s run: from its head, whose key is `head`, through its last
+/// row that sorts before `bound` (the smallest of the other heads; `None`,
+/// the whole batch). The head itself is always emitted: it is the smallest,
+/// the earlier input winning a tie. A row equal to `bound` ends the run, so
+/// the input holding the other copy emits next and drops it as a repeat, a
+/// run of one each. Returns the new head's key, or `None` when the run used
+/// up the batch.
+#[inline(always)]
+fn advance<O: MergeOrder>(
+    lane: &mut Lane<'_>,
+    head: Key,
+    bound: Option<&Key>,
+    out: &mut Emitted<'_>,
+) -> Option<Key> {
+    let next = lane.pos + 1;
+    let run_end = match bound {
+        Some(bound) if next < lane.end => {
+            let probe = Key::at(lane.batch, next);
+            if O::cmp(&probe, bound) != Ordering::Less {
+                // A run of one, the commonest where members interleave or
+                // repeat each other: the probed row is the new head.
+                out.one(lane, lane.pos, head);
+                lane.pos = next;
+                return Some(probe);
+            }
+            gallop::<O>(lane.batch, next, lane.end, bound)
+        }
+        _ => lane.end,
+    };
+    out.run(lane, lane.pos, run_end, head);
+    lane.pos = run_end;
+    (run_end < lane.end).then(|| lane.head())
+}
+
+/// The merge of two inputs, its heads in locals.
+fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitted<'_>) {
+    let (mut head_a, mut head_b) = (a.head(), b.head());
+    loop {
+        // The smaller head emits; `a` on a tie.
+        if O::cmp(&head_b, &head_a) == Ordering::Less {
+            match advance::<O>(b, head_b, Some(&head_a), out) {
+                Some(next) => head_b = next,
+                None => return,
+            }
+        } else {
+            match advance::<O>(a, head_a, Some(&head_b), out) {
+                Some(next) => head_a = next,
+                None => return,
+            }
+        }
+    }
+}
+
+/// The merge for a few inputs: the next input is found by scanning the
+/// heads.
+fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
+    let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
+        lanes.iter().map(Lane::head).collect();
+    loop {
+        // The smallest head (the earlier input on a tie) and the smallest of
+        // the others.
+        let mut min_at = 0;
+        let mut runner_up: Option<Key> = None;
+        for at in 1..heads.len() {
+            if O::cmp(&heads[at], &heads[min_at]) == Ordering::Less {
+                runner_up = Some(heads[min_at]);
+                min_at = at;
+            } else if runner_up.is_none_or(|r| O::cmp(&heads[at], &r) == Ordering::Less) {
+                runner_up = Some(heads[at]);
+            }
+        }
+        match advance::<O>(&mut lanes[min_at], heads[min_at], runner_up.as_ref(), out) {
+            Some(next) => heads[min_at] = next,
+            None => return,
+        }
+    }
+}
+
+/// The merge for many inputs: the next input comes off a heap of heads.
+fn merge_heap<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
+    let mut heap: BinaryHeap<HeapHead<O>> = lanes
+        .iter()
+        .enumerate()
+        .map(|(at, lane)| HeapHead::new(lane.head(), at))
+        .collect();
+    while let Some(top) = heap.pop() {
+        let bound = heap.peek().map(|next| next.key);
+        match advance::<O>(&mut lanes[top.input], top.key, bound.as_ref(), out) {
+            Some(next) => heap.push(HeapHead::new(next, top.input)),
+            None => return,
+        }
+    }
+}
+
 /// One member's stream: its cursor and the part of its current batch not yet
 /// merged.
 struct MemberInput {
@@ -484,11 +578,6 @@ impl MemberInput {
     #[inline]
     fn batch(&self) -> &ColumnBatch {
         self.batch.as_ref().expect("a live input holds a batch")
-    }
-
-    #[inline]
-    fn head(&self) -> Key {
-        Key::at(self.batch(), self.pos)
     }
 }
 
@@ -566,6 +655,8 @@ fn gather_column<T: Copy + PartialEq>(
     let mut values = Vec::with_capacity(row_count);
     for run in runs {
         match column(inputs[run.input].batch()) {
+            // A run of one row, the commonest where members interleave.
+            ColumnData::Block(block) if run.to - run.from == 1 => values.push(block[run.from]),
             ColumnData::Block(block) => values.extend_from_slice(&block[run.from..run.to]),
             ColumnData::Const(v) => values.resize(values.len() + (run.to - run.from), *v),
             ColumnData::AbsentDefault => {
@@ -623,11 +714,11 @@ fn trim<O: MergeOrder>(batch: &ColumnBatch, min: &Key, max: &Key) -> (usize, usi
     (start, end, past_max)
 }
 
-/// The first row in `(pos, end]` whose key sorts after `bound`, given that
-/// row `pos`'s does not: an exponential probe, then a binary search.
+/// The first row in `(pos, end]` whose key does not sort before `bound`,
+/// given that row `pos`'s does: an exponential probe, then a binary search.
 #[inline]
 fn gallop<O: MergeOrder>(batch: &ColumnBatch, pos: usize, end: usize, bound: &Key) -> usize {
-    let after = |row: usize| O::cmp(&Key::at(batch, row), bound) == Ordering::Greater;
+    let after = |row: usize| O::cmp(&Key::at(batch, row), bound) != Ordering::Less;
     let mut lo = pos + 1;
     let mut step = 1;
     let hi = loop {
@@ -681,8 +772,10 @@ impl Key {
     }
 
     /// Row `row` of `batch`, read with the defaults the cursor reads absent
-    /// columns with.
-    #[inline]
+    /// columns with. Forced inline: the merge reads a key or two per row, and
+    /// an out-of-line call returning the key through memory was over a third
+    /// of the merge's time.
+    #[inline(always)]
     fn at(batch: &ColumnBatch, row: usize) -> Self {
         Self {
             s_id: batch.s_id.get(row),
@@ -693,7 +786,7 @@ impl Key {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn fact(&self) -> FactKey {
         FactKey {
             s_id: self.s_id,
@@ -752,8 +845,8 @@ impl MergeOrder for Opst {
     }
 }
 
-/// An input's head on the heap: a min-heap on the key, the earlier input
-/// first on a tie.
+/// A lane's head on the heap: a min-heap on the key, the earlier lane first
+/// on a tie.
 struct HeapHead<O> {
     key: Key,
     input: usize,
@@ -1402,13 +1495,20 @@ mod tests {
     /// `cargo test --release -p fluree-db-query --lib merged_cursor::tests::merge_cost -- --ignored --nocapture`.
     /// `MERGE_COST=<scenario>` runs one scenario; `<scenario>:setup` runs its
     /// setup alone, so the difference of two runs' instructions retired
-    /// (`/usr/bin/time -l`) is the merge's.
+    /// (`/usr/bin/time -l`) is the merge's. `MERGE_COST_REPS` sets the
+    /// repetitions (10); `MERGE_COST_COUNT_ONLY=1` projects no column (the
+    /// default projects `s_id`).
     #[test]
     #[ignore]
     fn merge_cost_per_row() {
         const ROWS: u64 = 1 << 20;
         const LEAFLET: usize = 4096;
-        const REPS: usize = 10;
+        let reps: usize = std::env::var("MERGE_COST_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        // `MERGE_COST_COUNT_ONLY=1`: no output column, as a counting lane reads.
+        let count_only = std::env::var("MERGE_COST_COUNT_ONLY").is_ok();
         // Each scenario: members' rows, in PSOT over one predicate.
         let scenarios: Vec<(&str, Vec<Vec<Row>>)> = {
             let r = |s: u64| -> Row { (s, 5, STR, s % 97, NO_LIST) };
@@ -1458,7 +1558,7 @@ mod tests {
             let input_rows: usize = members.iter().map(Vec::len).sum();
             let mut best = std::time::Duration::MAX;
             let mut emitted = 0;
-            for _ in 0..REPS {
+            for _ in 0..reps {
                 let batches = leaflets
                     .iter()
                     .map(|m| m.iter().cloned().map(Ok).collect())
@@ -1470,7 +1570,11 @@ mod tests {
                     &min,
                     &max,
                     ColumnProjection {
-                        output: ColumnSet::single(ColumnId::SId),
+                        output: if count_only {
+                            ColumnSet::EMPTY
+                        } else {
+                            ColumnSet::single(ColumnId::SId)
+                        },
                         internal: ColumnSet::EMPTY,
                     },
                 );
@@ -1488,7 +1592,7 @@ mod tests {
             }
             if !setup_only {
                 println!(
-                    "{name:>20}: {input_rows} input rows, {emitted} emitted, {:.2} ns/input row (best of {REPS})",
+                    "{name:>20}: {input_rows} input rows, {emitted} emitted, {:.2} ns/input row (best of {reps})",
                     best.as_nanos() as f64 / input_rows as f64
                 );
             }
