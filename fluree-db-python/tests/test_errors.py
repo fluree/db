@@ -138,3 +138,24 @@ def test_a_commit_conflict_says_where_the_ledger_moved(conn):
         txn.commit()
     assert (err.value.expected_t, err.value.head_t) == (1, 2)
     assert ConflictError("other").expected_t is None
+
+
+def test_a_bulk_import_is_refused_as_a_write_of_it_would_be(tmp_path):
+    """A vector the ledger cannot store stops an import with the refusal a
+    transaction of it gets: an `InvalidRequestError`, status 422, naming the
+    property."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.ttl").write_text(
+        f"@prefix ex: <{EX}> .\n@prefix f: <{F}> .\n"
+        'ex:a ex:embedding "[1.0, 2.0, 3.0]"^^f:embeddingVector .\n'
+        'ex:b ex:embedding "[1.0, 2.0]"^^f:embeddingVector .\n'
+    )
+    with fluree.connect(tmp_path / "db") as conn:
+        with pytest.raises(InvalidRequestError) as refused:
+            conn.create("vectors", source=source)
+    assert refused.value.status == 422
+    assert (
+        "Invalid vector: <http://example.org/embedding>: vector dims mismatch: expected 3, got 2"
+        in str(refused.value)
+    )
