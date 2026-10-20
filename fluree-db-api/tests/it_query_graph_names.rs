@@ -164,3 +164,30 @@ async fn an_update_where_clause_names_its_graph_compactly() {
     });
     assert_eq!(names(&fluree, &ledger, &copied).await, vec![json!("Bob")]);
 }
+
+/// An update's `fromNamed` alias may look like a compact IRI too, and its
+/// `where` clause naming it means the alias.
+#[tokio::test]
+async fn an_update_alias_spelled_like_a_compact_iri_is_the_alias() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger(&fluree, "graph-names/update-alias:main").await;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "fromNamed": [{"graph": "urn:g2", "alias": "ex:people"}],
+                "where": [["graph", "ex:people", {"@id": "ex:carol", "schema:name": "?n"}]],
+                "insert": {"@id": "ex:carol", "ex:copied": "?n"}
+            }),
+        )
+        .await
+        .expect("update")
+        .ledger;
+    let copied = json!({
+        "@context": ctx(),
+        "select": "?n",
+        "where": {"@id": "ex:carol", "ex:copied": "?n"}
+    });
+    assert_eq!(names(&fluree, &ledger, &copied).await, vec![json!("Carol")]);
+}

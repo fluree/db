@@ -889,8 +889,9 @@ fn parse_update_where_named_graphs(
                         )
                     })?;
                     // If no alias provided, use the raw graph selector string as an implicit alias.
-                    // This makes `fromNamed: ["ex:g2"]` usable as `["graph", "ex:g2", ...]`
-                    // in WHERE patterns even though GRAPH names are not expanded via @context.
+                    // A WHERE `["graph", …]` name the update's `fromNamed` spells is kept as
+                    // written, so `fromNamed: ["ex:g2"]` makes `["graph", "ex:g2", ...]` mean
+                    // this entry rather than the IRI its spelling expands to.
                     let implicit_alias = graph_val.as_str().map(std::string::ToString::to_string);
                     let iri = expand_update_graph_iri(graph_val, context, strict)?;
                     out.push(crate::ir::UpdateNamedGraph {
