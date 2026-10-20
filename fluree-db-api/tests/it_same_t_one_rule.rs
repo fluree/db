@@ -350,11 +350,6 @@ async fn run_case(kind: Kind, path: Path, graph: Option<&str>) -> Vec<String> {
     let want = vec![kind.lexical().to_string()];
     observed
         .into_iter()
-        // The fresh-graph branch an incremental build writes keeps no
-        // history: it writes the window's winners as rows. That is fixed with
-        // the lifecycle walk in `fix/delete-survives-index-build` (#2118),
-        // and holds with it; nothing here depends on the same-`t` rule.
-        .filter(|(label, _)| !(path == Path::FreshGraph && label == "incremental: at t-1"))
         .filter(|(label, v)| {
             if label.ends_with("stats count") {
                 v != &vec!["1".to_string()]
