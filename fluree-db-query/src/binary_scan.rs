@@ -942,11 +942,7 @@ impl BinaryScanOperator {
                 col.push(binding);
             }
             if record_facts {
-                let object = record_object.then(|| flake_object_binding(&flake));
-                let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
-                if let Some(facts) = self.row_facts.as_mut() {
-                    facts.push(RowFact { object, list_index });
-                }
+                self.record_flake_fact(record_object, &flake);
             }
             produced += 1;
         }
@@ -1526,17 +1522,6 @@ impl BinaryScanOperator {
                 }
             }
 
-            // The matched object a recorded fact names: a constant literal
-            // can match terms of several datatypes.
-            let fact_object = if record_object {
-                Some(match &decoded_o {
-                    Some(val) => val.clone(),
-                    None => decode_value(o_type, o_key, p_id)?,
-                })
-            } else {
-                None
-            };
-
             bindings.clear();
             bindings.resize(base_len, Binding::Unbound);
 
@@ -1619,18 +1604,60 @@ impl BinaryScanOperator {
                 columns[i].push(binding);
             }
             if record_facts {
-                let object = fact_object.map(|val| {
-                    materialized_object_binding(self.store(), o_type, p_id, val, None, None)
-                });
-                let list_index = (o_i != u32::MAX).then_some(o_i);
-                if let Some(facts) = self.row_facts.as_mut() {
-                    facts.push(RowFact { object, list_index });
-                }
+                self.record_index_row_fact(&view, record_object, o_type, o_key, p_id, o_i)?;
             }
             produced += 1;
         }
 
         Ok(produced)
+    }
+}
+
+impl BinaryScanOperator {
+    /// Record the fact an index row matched: its list position, and the term
+    /// it matched when the pattern's object is a constant literal (a constant
+    /// can match terms of several datatypes). Out of line, so a scan that
+    /// records nothing carries none of it in its row loop.
+    #[inline(never)]
+    fn record_index_row_fact(
+        &mut self,
+        view: &BinaryGraphView,
+        record_object: bool,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        o_i: u32,
+    ) -> Result<()> {
+        let object = if record_object {
+            let val = view
+                .decode_value(o_type, o_key, p_id)
+                .map_err(|e| QueryError::from_io("decode_value", e))?;
+            Some(materialized_object_binding(
+                self.store(),
+                o_type,
+                p_id,
+                val,
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        let list_index = (o_i != u32::MAX).then_some(o_i);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
+        Ok(())
+    }
+
+    /// [`Self::record_index_row_fact`] for a decoded flake.
+    #[inline(never)]
+    fn record_flake_fact(&mut self, record_object: bool, flake: &Flake) {
+        let object = record_object.then(|| flake_object_binding(flake));
+        let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
     }
 }
 
