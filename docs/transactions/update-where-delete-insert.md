@@ -186,7 +186,7 @@ Example: read from one graph, write to two graphs
 Use `fromNamed` to allow (and optionally alias) named graphs for `where` `["graph", ...]` patterns:
 
 Notes:
-- In `where` `["graph", …]` patterns, you can reference the graph by **alias** (e.g. `"g2"`) or by the **graph IRI** (e.g. `"http://example.org/g2"`); the name is taken as written. Aliases are just convenience names for matching. A node-level `@graph` in `where` also takes compact IRIs and the keywords, as templates do (see the notes above).
+- In `where` `["graph", …]` patterns, you can reference the graph by **alias** (e.g. `"g2"`), by the **graph IRI** (e.g. `"http://example.org/g2"`), or by a compact IRI your `@context` expands. A name a `fromNamed` entry spells (its alias, or its graph as listed) is taken as written, even when it reads as a compact IRI. Aliases are just convenience names for matching. A node-level `@graph` in `where` also takes compact IRIs and the keywords, as templates do (see the notes above).
 - In `insert` / `delete` templates, graph selection is a **write target**. You can use:
   - the full graph IRI (`"http://example.org/g2"`)
   - a compact IRI/term that expands via `@context` (e.g. `"ex:g2"`)

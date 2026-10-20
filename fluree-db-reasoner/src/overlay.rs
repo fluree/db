@@ -5,18 +5,23 @@
 //!
 //! # Design
 //!
-//! - Flakes are stored once, sorted in SPOT order; the other three index
-//!   orders are permutations of that array (`u32` positions), so a derived
-//!   fact costs one `Flake` plus twelve bytes rather than four `Flake`s.
-//!   Range lookups binary-search the permutation with the index comparator.
+//! - Flakes are partitioned by graph. Within a graph they are stored once,
+//!   sorted in SPOT order; the other three index orders are permutations of
+//!   that array (`u32` positions), so a derived fact costs one `Flake` plus
+//!   twelve bytes rather than four `Flake`s. Range lookups binary-search the
+//!   permutation with the index comparator.
+//! - OWL 2 RL facts all belong to the default graph; a datalog rule can
+//!   derive into a named graph.
 //! - The overlay includes `FrozenSameAs` for owl:sameAs equivalence handling
 //! - Derived facts are canonicalized (use canonical representatives for S/O positions)
 //! - Query-time lookups canonicalize the query key first, only expand when necessary
 
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
+use fluree_db_core::graph_registry::DEFAULT_GRAPH_ID;
 use fluree_db_core::overlay::OverlayProvider;
 use fluree_db_core::{GraphId, Sid};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::same_as::FrozenSameAs;
@@ -26,14 +31,8 @@ use crate::same_as::FrozenSameAs;
 /// Implements `OverlayProvider` to be composable with base overlays (e.g., novelty).
 #[derive(Debug, Clone)]
 pub struct DerivedFactsOverlay {
-    /// Flakes sorted by SPOT index order — the only materialized copy.
-    spot: Arc<[Flake]>,
-    /// Positions into `spot`, ordered by the PSOT comparator.
-    psot: Arc<[u32]>,
-    /// Positions into `spot`, ordered by the POST comparator.
-    post: Arc<[u32]>,
-    /// Positions into `spot`, ordered by the OPST comparator.
-    opst: Arc<[u32]>,
+    /// One partition per graph holding derived facts, in graph id order.
+    graphs: Arc<[GraphFacts]>,
     /// owl:sameAs equivalence classes
     same_as: FrozenSameAs,
     /// Epoch for cache key differentiation
@@ -48,48 +47,29 @@ pub struct DerivedFactsOverlay {
     instance_id: u64,
 }
 
-impl DerivedFactsOverlay {
-    /// Create an empty overlay (no derived facts) with default epoch and empty sameAs
-    ///
-    /// Use `empty_with_metadata()` when you need to preserve specific epoch/sameAs values.
-    pub fn empty() -> Self {
-        Self::empty_with_metadata(FrozenSameAs::empty(), 0)
-    }
+/// The derived facts of one graph.
+#[derive(Debug)]
+struct GraphFacts {
+    g_id: GraphId,
+    /// Flakes sorted by SPOT index order — the only materialized copy.
+    spot: Box<[Flake]>,
+    /// Positions into `spot`, ordered by the PSOT comparator.
+    psot: Box<[u32]>,
+    /// Positions into `spot`, ordered by the POST comparator.
+    post: Box<[u32]>,
+    /// Positions into `spot`, ordered by the OPST comparator.
+    opst: Box<[u32]>,
+}
 
-    /// Create an empty overlay preserving sameAs state and epoch
-    ///
-    /// Use this when reasoning produces no derived facts but you still need to
-    /// preserve the epoch and sameAs state for cache correctness.
-    pub fn empty_with_metadata(same_as: FrozenSameAs, epoch: u64) -> Self {
-        Self {
-            spot: Arc::from([]),
-            psot: Arc::from([]),
-            post: Arc::from([]),
-            opst: Arc::from([]),
-            same_as,
-            epoch,
-            instance_id: fluree_db_core::overlay::next_overlay_content_version(),
-        }
-    }
-
-    /// Create an overlay from flakes in any order.
-    ///
-    /// The flakes are sorted into SPOT order once; the PSOT / POST / OPST
-    /// orders are derived as position permutations over that array.
-    ///
-    /// # Arguments
-    ///
-    /// * `flakes` - Derived flakes (deduplicated by the caller)
-    /// * `same_as` - Frozen sameAs equivalence classes
-    /// * `epoch` - Epoch for cache differentiation
-    pub fn new(mut flakes: Vec<Flake>, same_as: FrozenSameAs, epoch: u64) -> Self {
+impl GraphFacts {
+    fn new(g_id: GraphId, mut flakes: Vec<Flake>) -> Self {
         assert!(
             flakes.len() <= u32::MAX as usize,
             "derived-facts overlay exceeds u32 positions"
         );
         flakes.sort_by(|a, b| IndexType::Spot.comparator()(a, b));
-        let spot: Arc<[Flake]> = flakes.into();
-        let permutation = |index: IndexType| -> Arc<[u32]> {
+        let spot: Box<[Flake]> = flakes.into();
+        let permutation = |index: IndexType| -> Box<[u32]> {
             let cmp = index.comparator();
             let mut order: Vec<u32> = (0..spot.len() as u32).collect();
             order.sort_by(|a, b| cmp(&spot[*a as usize], &spot[*b as usize]));
@@ -99,55 +79,12 @@ impl DerivedFactsOverlay {
         let post = permutation(IndexType::Post);
         let opst = permutation(IndexType::Opst);
         Self {
+            g_id,
             spot,
             psot,
             post,
             opst,
-            same_as,
-            epoch,
-            instance_id: fluree_db_core::overlay::next_overlay_content_version(),
         }
-    }
-
-    /// Process-unique identity of this materialization (stable across clones).
-    pub fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-
-    /// Get the sameAs equivalence structure
-    pub fn same_as(&self) -> &FrozenSameAs {
-        &self.same_as
-    }
-
-    /// Get the canonical representative for a Sid
-    pub fn canonical(&self, sid: Sid) -> Sid {
-        self.same_as.canonical(sid)
-    }
-
-    /// Expand a Sid to all equivalents
-    pub fn expand_equivalents(&self, sid: Sid) -> &[Sid] {
-        self.same_as.expand(sid)
-    }
-
-    /// Get number of derived facts
-    pub fn len(&self) -> usize {
-        self.spot.len()
-    }
-
-    /// Check if empty (no derived facts)
-    pub fn is_empty(&self) -> bool {
-        self.spot.is_empty()
-    }
-
-    /// The derived flakes in SPOT order.
-    pub fn flakes_spot(&self) -> &[Flake] {
-        &self.spot
-    }
-
-    /// Iterate the derived flakes in the given index order.
-    pub fn iter(&self, index: IndexType) -> impl Iterator<Item = &Flake> + '_ {
-        let view = self.view(index);
-        (0..view.len()).map(move |i| view.get(i))
     }
 
     /// Positional view of the flakes in one index order.
@@ -180,6 +117,116 @@ impl DerivedFactsOverlay {
             }
         }
         lo
+    }
+}
+
+impl DerivedFactsOverlay {
+    /// Create an empty overlay (no derived facts) with default epoch and empty sameAs
+    ///
+    /// Use `empty_with_metadata()` when you need to preserve specific epoch/sameAs values.
+    pub fn empty() -> Self {
+        Self::empty_with_metadata(FrozenSameAs::empty(), 0)
+    }
+
+    /// Create an empty overlay preserving sameAs state and epoch
+    ///
+    /// Use this when reasoning produces no derived facts but you still need to
+    /// preserve the epoch and sameAs state for cache correctness.
+    pub fn empty_with_metadata(same_as: FrozenSameAs, epoch: u64) -> Self {
+        Self {
+            graphs: Arc::from([]),
+            same_as,
+            epoch,
+            instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+        }
+    }
+
+    /// Create an overlay of default-graph facts from flakes in any order.
+    ///
+    /// The flakes are sorted into SPOT order once; the PSOT / POST / OPST
+    /// orders are derived as position permutations over that array.
+    ///
+    /// # Arguments
+    ///
+    /// * `flakes` - Derived flakes (deduplicated by the caller)
+    /// * `same_as` - Frozen sameAs equivalence classes
+    /// * `epoch` - Epoch for cache differentiation
+    pub fn new(flakes: Vec<Flake>, same_as: FrozenSameAs, epoch: u64) -> Self {
+        Self::new_routed(flakes, same_as, epoch, |_| DEFAULT_GRAPH_ID)
+    }
+
+    /// Create an overlay whose flakes each belong to the graph `route`
+    /// assigns them.
+    pub fn new_routed(
+        flakes: Vec<Flake>,
+        same_as: FrozenSameAs,
+        epoch: u64,
+        route: impl Fn(&Flake) -> GraphId,
+    ) -> Self {
+        let mut by_graph: BTreeMap<GraphId, Vec<Flake>> = BTreeMap::new();
+        for flake in flakes {
+            by_graph.entry(route(&flake)).or_default().push(flake);
+        }
+        Self {
+            graphs: by_graph
+                .into_iter()
+                .map(|(g_id, flakes)| GraphFacts::new(g_id, flakes))
+                .collect(),
+            same_as,
+            epoch,
+            instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+        }
+    }
+
+    /// Process-unique identity of this materialization (stable across clones).
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Get the sameAs equivalence structure
+    pub fn same_as(&self) -> &FrozenSameAs {
+        &self.same_as
+    }
+
+    /// Get the canonical representative for a Sid
+    pub fn canonical(&self, sid: Sid) -> Sid {
+        self.same_as.canonical(sid)
+    }
+
+    /// Expand a Sid to all equivalents
+    pub fn expand_equivalents(&self, sid: Sid) -> &[Sid] {
+        self.same_as.expand(sid)
+    }
+
+    /// Get number of derived facts, across graphs
+    pub fn len(&self) -> usize {
+        self.graphs.iter().map(|g| g.spot.len()).sum()
+    }
+
+    /// Check if empty (no derived facts)
+    pub fn is_empty(&self) -> bool {
+        self.graphs.iter().all(|g| g.spot.is_empty())
+    }
+
+    /// The graphs holding derived facts.
+    pub fn graph_ids(&self) -> impl Iterator<Item = GraphId> + '_ {
+        self.graphs.iter().map(|g| g.g_id)
+    }
+
+    fn graph(&self, g_id: GraphId) -> Option<&GraphFacts> {
+        self.graphs.iter().find(|g| g.g_id == g_id)
+    }
+
+    /// The default graph's derived flakes in SPOT order.
+    pub fn flakes_spot(&self) -> &[Flake] {
+        self.graph(DEFAULT_GRAPH_ID).map_or(&[], |g| &g.spot)
+    }
+
+    /// Iterate the default graph's derived flakes in the given index order.
+    pub fn iter(&self, index: IndexType) -> impl Iterator<Item = &Flake> + '_ {
+        let view = self.graph(DEFAULT_GRAPH_ID).map(|g| g.view(index));
+        let len = view.map_or(0, |v| v.len());
+        (0..len).map(move |i| view.expect("non-empty view").get(i))
     }
 }
 
@@ -227,12 +274,10 @@ impl OverlayProvider for DerivedFactsOverlay {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     ) {
-        // Derived facts from reasoning are default-graph only
-        if g_id != 0 {
+        let Some(graph) = self.graph(g_id) else {
             return;
-        }
-
-        let view = self.view(index);
+        };
+        let view = graph.view(index);
         if view.len() == 0 {
             return;
         }
@@ -242,7 +287,7 @@ impl OverlayProvider for DerivedFactsOverlay {
             0
         } else if let Some(first) = first {
             // Exclusive left boundary: start after first
-            self.upper_bound(index, first)
+            graph.upper_bound(index, first)
         } else {
             0
         };
@@ -250,7 +295,7 @@ impl OverlayProvider for DerivedFactsOverlay {
         // Determine end position
         let end = if let Some(rhs) = rhs {
             // Inclusive right boundary: include rhs
-            self.upper_bound(index, rhs)
+            graph.upper_bound(index, rhs)
         } else {
             view.len()
         };
@@ -315,6 +360,16 @@ impl DerivedFactsBuilder {
         // Preserves same_as and epoch even with zero derived flakes.
         DerivedFactsOverlay::new(self.flakes, same_as, epoch)
     }
+
+    /// Build the final overlay, each flake in the graph `route` assigns it.
+    pub fn build_routed(
+        self,
+        same_as: FrozenSameAs,
+        epoch: u64,
+        route: impl Fn(&Flake) -> GraphId,
+    ) -> DerivedFactsOverlay {
+        DerivedFactsOverlay::new_routed(self.flakes, same_as, epoch, route)
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +408,38 @@ mod tests {
         let overlay = builder.build(FrozenSameAs::empty(), 42);
         assert_eq!(overlay.len(), 2);
         assert_eq!(overlay.epoch(), 42);
+    }
+
+    #[test]
+    fn routed_flakes_are_visible_only_in_their_graph() {
+        let mut builder = DerivedFactsBuilder::new();
+        builder.push(make_flake(1, 1, 100, 1));
+        builder.push(make_flake(2, 1, 200, 1));
+        builder.push(make_flake(3, 1, 300, 1));
+        let overlay =
+            builder.build_routed(
+                FrozenSameAs::empty(),
+                1,
+                |f| {
+                    if f.s == sid(2) {
+                        5
+                    } else {
+                        0
+                    }
+                },
+            );
+        assert_eq!(overlay.len(), 3);
+        assert_eq!(overlay.graph_ids().collect::<Vec<_>>(), vec![0, 5]);
+        let subjects = |g_id| {
+            let mut out = Vec::new();
+            overlay.for_each_overlay_flake(g_id, IndexType::Spot, None, None, true, 1, &mut |f| {
+                out.push(f.s.clone());
+            });
+            out
+        };
+        assert_eq!(subjects(0), vec![sid(1), sid(3)]);
+        assert_eq!(subjects(5), vec![sid(2)]);
+        assert!(subjects(7).is_empty());
     }
 
     #[test]

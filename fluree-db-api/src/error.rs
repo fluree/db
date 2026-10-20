@@ -474,6 +474,12 @@ pub enum ApiError {
     #[error("Indexing is disabled - no background indexer configured")]
     IndexingDisabled,
 
+    /// Another open instance holds the file storage root: one in another
+    /// process, or a second one built in this process. `holder` is its
+    /// process id when known.
+    #[error("{}", storage_in_use_message(root, *holder))]
+    StorageInUse { root: String, holder: Option<u32> },
+
     /// Refresh did not reach the requested minimum `t` value.
     ///
     /// The nameservice was polled and any available commits were applied,
@@ -702,6 +708,8 @@ impl ApiError {
             | ApiError::ReindexConflict { .. }
             | ApiError::GraphSourceRetracted(_) => 409,
 
+            ApiError::StorageInUse { .. } => 423,
+
             // Read-after-write: the ledger has not caught up to the `t` the
             // caller asked for.
             ApiError::AwaitTNotReached { .. } => 408,
@@ -823,6 +831,7 @@ impl ApiError {
                 // distinct codes.
                 413 => errors::PAYLOAD_TOO_LARGE,
                 422 => errors::INVALID_TRANSACTION,
+                423 => errors::STORAGE_IN_USE,
                 _ => errors::INTERNAL,
             },
 
@@ -854,6 +863,7 @@ impl ApiError {
 
             ApiError::IndexTimeout(_) => errors::INDEX_TIMEOUT,
             ApiError::IndexingDisabled => errors::INDEXING_DISABLED,
+            ApiError::StorageInUse { .. } => errors::STORAGE_IN_USE,
             ApiError::ReindexConflict { .. } => errors::REINDEX_CONFLICT,
             ApiError::Indexer(e) => {
                 use crate::wasm_compat::IndexerError;
@@ -967,6 +977,23 @@ impl ApiError {
     }
 }
 
+fn storage_in_use_message(root: &str, holder: Option<u32>) -> String {
+    if holder == Some(std::process::id()) {
+        return format!(
+            "storage '{root}' is already open in this process; \
+             use that instance instead of opening the storage again"
+        );
+    }
+    let by = holder
+        .map(|pid| format!(" (pid {pid})"))
+        .unwrap_or_default();
+    format!(
+        "storage '{root}' is in use by another Fluree process{by}. Only one process \
+         can open a storage directory; to share it, run `fluree server` on it and \
+         send requests to the server"
+    )
+}
+
 /// The HTTP status for a query engine error, wherever it surfaces: wrapped in
 /// [`ApiError::Query`], or reported directly by a tracked query.
 ///
@@ -1044,7 +1071,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 48
+    const VARIANTS: usize = 49
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + cfg!(feature = "iceberg") as usize;
@@ -1255,6 +1282,14 @@ mod tests {
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
             (
+                ApiError::StorageInUse {
+                    root: "x".into(),
+                    holder: None,
+                },
+                423,
+                STORAGE_IN_USE,
+            ),
+            (
                 ApiError::ReindexConflict {
                     expected: 1,
                     found: 2,
@@ -1430,6 +1465,7 @@ mod tests {
                 | ApiError::Http { .. }
                 | ApiError::IndexTimeout(_)
                 | ApiError::IndexingDisabled
+                | ApiError::StorageInUse { .. }
                 | ApiError::AwaitTNotReached { .. }
                 | ApiError::CommitContention { .. }
                 | ApiError::ReindexConflict { .. }

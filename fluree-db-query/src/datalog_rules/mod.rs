@@ -7,9 +7,11 @@
 //! executor supports is available to a rule: edge annotations (`@annotation`,
 //! `{| |}`, `~ ?r`), claim-first patterns (`@reifies`, `rdf:reifies`), full
 //! FILTER expressions, BIND, VALUES, UNION, property paths and subqueries.
-//! The only constructs a rule body may not use are the non-monotonic ones
-//! (OPTIONAL, MINUS, NOT EXISTS, aggregates, SERVICE), which a fixpoint cannot
-//! evaluate soundly; those are rejected with an error naming the construct.
+//! `NOT EXISTS` and grouped aggregate subqueries are supported when the
+//! program is stratified: no rule may negate or aggregate facts that depend
+//! on its own conclusions. The constructs a rule body may not use (OPTIONAL,
+//! MINUS, top-level aggregates, SERVICE) are rejected with an error naming
+//! the construct.
 //!
 //! Rules are stored as `f:rule` values (JSON with `where`/`insert`, or an
 //! `f:sparql`-typed `CONSTRUCT … WHERE …` string) or supplied per query in the
@@ -21,6 +23,7 @@ mod closure;
 mod delta;
 mod dependency;
 mod execute;
+mod explain;
 mod parse;
 mod validate;
 
@@ -28,8 +31,12 @@ pub use dependency::{
     Access, GraphScope, PredicateFootprint, RuleComponent, RuleDependencies, RuleFootprint,
 };
 pub use execute::{
-    execute_datalog_rules, execute_datalog_rules_with_query_rules, load_rule_set, run_fixpoint,
-    run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule,
+    derived_fact_graph, execute_datalog_rules, execute_datalog_rules_with_query_rules,
+    load_rule_set, run_fixpoint, run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule,
+};
+pub(crate) use explain::{explain_facts, materialized_facts};
+pub use explain::{
+    Absence, Derivation, ExplainTarget, ExplainedFact, Explanation, GroupInputs, Premise,
 };
 pub use parse::parse_query_time_rule;
 
@@ -70,6 +77,9 @@ pub struct RuleHead {
     pub subject: HeadTerm,
     pub predicate: HeadTerm,
     pub object: HeadTerm,
+    /// The named graph the triple is derived into, as an expanded IRI.
+    /// `None`: the graph the rules run against.
+    pub graph: Option<Arc<str>>,
 }
 
 /// The rule body: a lowered query whose `output` projects every variable the
@@ -148,6 +158,25 @@ impl DatalogRuleSet {
 
     pub fn len(&self) -> usize {
         self.rules.len()
+    }
+
+    /// The rules that negate or aggregate facts, each with what makes it so
+    /// (see [`RuleFootprint::non_monotone_construct`]).
+    pub fn non_monotone_rules(&self) -> Vec<(&str, &'static str)> {
+        self.rules
+            .iter()
+            .filter_map(|r| {
+                r.footprint
+                    .non_monotone_construct()
+                    .map(|construct| (r.name.as_str(), construct))
+            })
+            .collect()
+    }
+
+    /// Whether some rule calls `NOW()` or `TODAY()`, so the run needs an
+    /// evaluation time.
+    pub fn reads_clock(&self) -> bool {
+        self.rules.iter().any(|r| r.footprint.reads_clock)
     }
 
     /// Read/write footprints and recursive groups, indexed by execution order.
