@@ -43,7 +43,8 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet,
+    BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnData, ColumnProjection,
+    ColumnSet,
 };
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{DecodeKind, OType, Tracker};
@@ -64,7 +65,8 @@ pub enum MergeDecline {
     /// big numbers, vectors and spatial values. Its encoded key does not name
     /// one value across members.
     ArenaType { o_type: u16 },
-    /// A member has no index branch for the order.
+    /// A member has index branches, but none for the order. (A member the
+    /// index holds nothing for is left out: being current, it holds nothing.)
     NoBranch,
     /// A member's index does not answer for it alone: it has novelty, or it
     /// is read below the index's `t`.
@@ -89,6 +91,14 @@ impl MergeDecline {
             MergeDecline::Novelty => FastPathFallback::Novelty,
         }
     }
+}
+
+/// Whether the index holds nothing for graph `g_id`: no branch for any order.
+/// A member with no novelty is then empty.
+pub(crate) fn indexes_nothing(store: &BinaryIndexStore, g_id: GraphId) -> bool {
+    RunSortOrder::all_build_orders()
+        .iter()
+        .all(|&order| store.branch_for_order(g_id, order).is_none())
 }
 
 /// Whether `o_type`'s `o_key` is a handle into an arena per
@@ -145,9 +155,15 @@ impl MergedRangeCursor {
         let mut inputs = SmallVec::new();
         for member in set.members() {
             let store = member.store();
-            let branch = store
-                .branch_for_order(member.g_id(), order)
-                .ok_or(MergeDecline::NoBranch)?;
+            let Some(branch) = store.branch_for_order(member.g_id(), order) else {
+                // A current member the index holds nothing for holds nothing:
+                // a default graph with every fact in named graphs. One with
+                // other orders' branches but not this one cannot be read.
+                if indexes_nothing(store, member.g_id()) {
+                    continue;
+                }
+                return Err(MergeDecline::NoBranch);
+            };
             if branch.find_leaves_in_range(min, max, cmp).is_empty() {
                 continue;
             }
@@ -1594,9 +1610,11 @@ mod tests {
     }
 
     /// Construction over a real (empty) store: a set that is not current
-    /// declines `Novelty`; a current one with no branch declines `NoBranch`.
+    /// declines `Novelty`; a current one whose members the index holds
+    /// nothing for (a default graph with every fact in named graphs) merges
+    /// to no rows.
     #[test]
-    fn construction_declines_novelty_and_a_missing_branch() {
+    fn construction_declines_novelty_and_skips_a_member_with_no_branch() {
         use crate::index_scope::{IndexMember, MemberSet};
         let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
         let (min, max) = full_range();
@@ -1622,7 +1640,19 @@ mod tests {
             .expect("two members")
         };
         assert_eq!(new(&at(store.max_t() + 1)), Err(MergeDecline::Novelty));
-        assert_eq!(new(&at(store.max_t())), Err(MergeDecline::NoBranch));
+        let current = at(store.max_t());
+        assert!(indexes_nothing(&store, 3) && indexes_nothing(&store, 4));
+        let mut cursor = MergedRangeCursor::new(
+            &current,
+            RunSortOrder::Psot,
+            &min,
+            &max,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        )
+        .expect("members the index holds nothing for are left out");
+        assert!(cursor.members_in_range().is_empty());
+        assert!(cursor.next_batch().unwrap().unwrap().is_none());
     }
 
     /// The merge's cost per input row, in isolation. Ignored: run it on the
