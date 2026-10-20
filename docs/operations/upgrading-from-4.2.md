@@ -74,10 +74,20 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
   the server does; without it the node locks the shared store and a second node
   on it is refused. See
   [One process per directory](storage.md#one-process-per-directory).
+- **A directory on a filesystem that cannot lock no longer opens.** Some network
+  and FUSE mounts cannot lock a file. 4.2 opened a directory there like any
+  other; now every open of it fails, from the server, the CLI, Python or Rust,
+  until `FLUREE_STORAGE_ALLOW_UNLOCKED=true` opens it without that protection.
+- **`fluree create --from` goes through a running local server.** The file is
+  uploaded for the server to import, and a directory is refused; 4.2 imported
+  both locally. To import a directory, stop the server first.
 - **`fluree memory` no longer opens the project's storage.** In a project, its
   ledger is a cache in memory, rebuilt from `.fluree-memory/*.ttl` on each run.
   The `__memory` ledger earlier releases kept in `.fluree/storage` is no longer
-  read.
+  read. A 4.2 `fluree memory import` wrote only to that ledger, so if you imported
+  memories on 4.2, run `fluree memory export > memories.json` before upgrading
+  and `fluree memory import memories.json` after; import now writes the `.ttl`
+  files.
 
 ### For API clients
 
