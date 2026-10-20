@@ -3,7 +3,7 @@
 //!
 //! A default graph of two or more members is the set union of their facts
 //! (SPARQL §13.2). A fact is storage's own identity: one fact per value and
-//! list position (AJ-66), so a fact present in two members is one row, while
+//! list position, so a fact present in two members is one row, while
 //! two items of one `@list` that repeat a value stay two facts. This cursor
 //! drops a row when its fact ([`Key::identity`], the one definition) equals
 //! the row emitted before it.
@@ -903,7 +903,7 @@ impl Key {
     }
 
     /// The fact this row stores: the one definition of what the merge
-    /// deduplicates on. Storage's fact identity (AJ-66) is one fact per value
+    /// deduplicates on. Storage's fact identity is one fact per value
     /// and list position, and for a non-arena `o_type` the index key is the
     /// value, so the identity is the whole key.
     #[inline(always)]
@@ -1146,7 +1146,7 @@ mod tests {
         }
     }
 
-    /// A row's fact: every column, the list index included (AJ-66).
+    /// A row's fact: every column, the list index included.
     fn fact(row: &Row) -> Row {
         *row
     }
