@@ -394,8 +394,6 @@ fn allowance(fluree: &fluree_db_api::Fluree) -> Value {
         "assembly_decrypted": s.assembly_decrypted, "assembly_reused": s.assembly_reused,
         "rent_covered_bytes": s.rent_covered_bytes,
         "crossing_coverage": s.crossing_coverage, "promotion_coverage": s.promotion_coverage,
-        "evicted_served_lookups": s.evicted_served_lookups,
-        "evicted_served_bytes": s.evicted_served_bytes, "evicted_served": s.evicted_served,
         "evicted": s.evicted, "evicted_bytes": s.evicted_bytes,
         "busy": s.busy, "no_room": s.no_room,
         "too_large": s.too_large, "rent_epoch": s.rent_epoch,

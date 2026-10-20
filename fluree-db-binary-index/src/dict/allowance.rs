@@ -3,16 +3,19 @@
 //!
 //! A pack is read by range until its recent ranged misses have decrypted its
 //! size and covered enough of it; then it is promoted into the allowance,
-//! which evicts packs in clock order to admit it. Readers hold a promoted
-//! pack only for a lookup. A pack's bytes stay charged until the last
-//! reference drops, and readers of the same object — snapshots, reloads,
-//! ledgers on the same storage — share one copy, charged once.
+//! which evicts packs in clock order to admit it. Readers find a promoted
+//! pack through its [`PackSlot`] and hold it only for a lookup. A pack's
+//! bytes stay charged until the last reference drops, and readers of the
+//! same object — snapshots, reloads, ledgers on the same storage — share one
+//! copy, charged once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+use arc_swap::ArcSwapOption;
 
 use crate::read::cached_units::{Epochs, MissMeter};
 
@@ -73,13 +76,6 @@ fn decile(covered: u64, len: u64) -> usize {
     ((covered.saturating_mul(10)) / len.max(1)).min(9) as usize
 }
 
-/// Buckets of a count by powers of two: 0, 1, 2-3, 4-7, …
-const SERVED_BUCKETS: usize = 24;
-
-fn log2_bucket(n: u64) -> usize {
-    ((u64::BITS - n.leading_zeros()) as usize).min(SERVED_BUCKETS - 1)
-}
-
 fn histogram<const N: usize>() -> [AtomicU64; N] {
     std::array::from_fn(|_| AtomicU64::new(0))
 }
@@ -98,9 +94,6 @@ pub struct DictionaryAllowance {
     /// Whether the rent clock's period follows the capacity.
     rent_follows_capacity: bool,
     state: Mutex<State>,
-    /// Bumped whenever the pool admits or evicts a pack, so a reader that
-    /// found its pack absent knows when to look again.
-    generation: AtomicU64,
     released: AtomicU64,
     promoted: AtomicU64,
     promoted_bytes: AtomicU64,
@@ -111,11 +104,6 @@ pub struct DictionaryAllowance {
     /// size, and when it was promoted.
     crossing_coverage: [AtomicU64; 10],
     promotion_coverage: [AtomicU64; 10],
-    /// Over evicted packs: lookups and value bytes served whole between
-    /// promotion and eviction, and the lookups' distribution.
-    evicted_served_lookups: AtomicU64,
-    evicted_served_bytes: AtomicU64,
-    evicted_served: [AtomicU64; SERVED_BUCKETS],
     evicted: AtomicU64,
     evicted_bytes: AtomicU64,
     busy: AtomicU64,
@@ -135,18 +123,26 @@ struct State {
     resident: HashMap<u128, Arc<HeldPack>>,
     clock: VecDeque<u128>,
     in_flight: HashSet<u128>,
-    /// Rent meters by pack, shared by every reader of it; an entry lives as
-    /// long as some reader holds its meter, and dead ones are pruned
+    /// Rent meters and slots by pack, shared by every reader of it; an entry
+    /// lives as long as some reader holds either, and dead ones are pruned
     /// whenever the table doubles.
     meters: HashMap<u128, MeterEntry>,
     meters_pruned_at: usize,
 }
 
-/// A pack's rent meter, held weakly, with what a report names it by.
+/// A pack's rent meter and slot, held weakly, with what a report names it
+/// by.
 struct MeterEntry {
     meter: Weak<MissMeter>,
+    slot: Weak<PackSlot>,
     len: u64,
     kind: u8,
+}
+
+impl MeterEntry {
+    fn is_live(&self) -> bool {
+        self.meter.strong_count() > 0 || self.slot.strong_count() > 0
+    }
 }
 
 /// One live pack's rental, for diagnostics.
@@ -192,9 +188,6 @@ pub struct AllowanceStats {
     pub rent_covered_bytes: u64,
     pub crossing_coverage: [u64; 10],
     pub promotion_coverage: [u64; 10],
-    pub evicted_served_lookups: u64,
-    pub evicted_served_bytes: u64,
-    pub evicted_served: [u64; SERVED_BUCKETS],
     pub evicted: u64,
     pub evicted_bytes: u64,
     /// Promotions turned away: another in flight, no room yet, larger than
@@ -219,11 +212,6 @@ pub struct HeldPack {
     allowance: Weak<DictionaryAllowance>,
     /// Clock reference bit: set on use, cleared as the hand passes.
     referenced: AtomicBool,
-    /// Set when the pool lets the pack go, so a reader drops it after its
-    /// lookup instead of keeping it alive.
-    evicted: AtomicBool,
-    served_lookups: AtomicU64,
-    served_bytes: AtomicU64,
 }
 
 impl HeldPack {
@@ -235,29 +223,23 @@ impl HeldPack {
         false
     }
 
-    /// Lookups served whole so far, and their value bytes.
-    #[cfg(test)]
-    pub(crate) fn served(&self) -> (u64, u64) {
-        (
-            self.served_lookups.load(Ordering::Relaxed),
-            self.served_bytes.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Count a lookup served from the whole pack, of `bytes` value bytes.
-    pub(crate) fn note_served(&self, bytes: usize) {
-        self.served_lookups.fetch_add(1, Ordering::Relaxed);
-        self.served_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-
     pub(crate) fn mark_used(&self) {
         if !self.referenced.load(Ordering::Relaxed) {
             self.referenced.store(true, Ordering::Relaxed);
         }
     }
+}
 
-    pub(crate) fn is_evicted(&self) -> bool {
-        self.evicted.load(Ordering::Acquire)
+/// Where the readers of one pack find the pool's copy: filled when the pool
+/// admits the pack and emptied when it evicts it, both under the pool's
+/// lock. A lookup loads it without a lock or a count on the pack, so lookups
+/// on many threads in one pack held whole write nothing they share.
+pub struct PackSlot(ArcSwapOption<HeldPack>);
+
+impl PackSlot {
+    /// The pool's copy, if it holds one, for the length of a lookup.
+    pub fn load(&self) -> arc_swap::Guard<Option<Arc<HeldPack>>> {
+        self.0.load()
     }
 }
 
@@ -323,7 +305,6 @@ impl DictionaryAllowance {
             rent_clock: Arc::new(Epochs::new(period)),
             rent_follows_capacity: follows,
             state: Mutex::default(),
-            generation: AtomicU64::new(0),
             released: AtomicU64::new(0),
             promoted: AtomicU64::new(0),
             promoted_bytes: AtomicU64::new(0),
@@ -332,9 +313,6 @@ impl DictionaryAllowance {
             rent_covered_bytes: AtomicU64::new(0),
             crossing_coverage: histogram(),
             promotion_coverage: histogram(),
-            evicted_served_lookups: AtomicU64::new(0),
-            evicted_served_bytes: AtomicU64::new(0),
-            evicted_served: histogram(),
             evicted: AtomicU64::new(0),
             evicted_bytes: AtomicU64::new(0),
             busy: AtomicU64::new(0),
@@ -363,31 +341,46 @@ impl DictionaryAllowance {
         capacity
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    /// The rent meter of the pack `identity` — `len` bytes in `units`
-    /// units, of dictionary `kind` — shared by all its readers.
-    pub fn meter(&self, identity: u128, units: u64, len: u64, kind: u8) -> Arc<MissMeter> {
-        let mut state = self.lock();
-        if let Some(meter) = state.meters.get(&identity).and_then(|e| e.meter.upgrade()) {
-            return meter;
-        }
+    /// What every reader of the pack `identity` — `len` bytes in `units`
+    /// units, of dictionary `kind` — shares: its rent meter, and the slot
+    /// that holds the pool's copy while there is one.
+    pub fn tenancy(
+        &self,
+        identity: u128,
+        units: u64,
+        len: u64,
+        kind: u8,
+    ) -> (Arc<MissMeter>, Arc<PackSlot>) {
+        let mut guard = self.lock();
+        let state = &mut *guard;
         if state.meters.len() >= 2 * state.meters_pruned_at.max(32) {
-            state.meters.retain(|_, e| e.meter.strong_count() > 0);
+            state.meters.retain(|_, e| e.is_live());
             state.meters_pruned_at = state.meters.len();
         }
-        let meter = Arc::new(MissMeter::new(units).with_rent_clock(Arc::clone(&self.rent_clock)));
-        state.meters.insert(
-            identity,
-            MeterEntry {
-                meter: Arc::downgrade(&meter),
-                len,
-                kind,
-            },
-        );
-        meter
+        let entry = state.meters.entry(identity).or_insert_with(|| MeterEntry {
+            meter: Weak::new(),
+            slot: Weak::new(),
+            len,
+            kind,
+        });
+        let meter = entry.meter.upgrade().unwrap_or_else(|| {
+            let meter =
+                Arc::new(MissMeter::new(units).with_rent_clock(Arc::clone(&self.rent_clock)));
+            entry.meter = Arc::downgrade(&meter);
+            meter
+        });
+        let slot = entry.slot.upgrade().unwrap_or_else(|| {
+            let held = state.resident.get(&identity).cloned();
+            let slot = Arc::new(PackSlot(ArcSwapOption::new(held)));
+            entry.slot = Arc::downgrade(&slot);
+            slot
+        });
+        (meter, slot)
+    }
+
+    /// The slot of `identity`, if a reader holds one.
+    fn slot(state: &State, identity: u128) -> Option<Arc<PackSlot>> {
+        state.meters.get(&identity).and_then(|e| e.slot.upgrade())
     }
 
     /// Every live pack's rental and whether the pool holds it.
@@ -510,13 +503,13 @@ impl DictionaryAllowance {
             bytes,
             allowance: Arc::downgrade(self),
             referenced: AtomicBool::new(false),
-            evicted: AtomicBool::new(false),
-            served_lookups: AtomicU64::new(0),
-            served_bytes: AtomicU64::new(0),
         });
         state.resident.insert(identity, Arc::clone(&pack));
         state.clock.push_back(identity);
+        let displaced =
+            Self::slot(&state, identity).and_then(|slot| slot.0.swap(Some(Arc::clone(&pack))));
         drop(state);
+        drop(displaced);
         self.promoted.fetch_add(1, Ordering::Relaxed);
         self.promoted_bytes.fetch_add(len, Ordering::Relaxed);
         self.assembly_decrypted
@@ -526,7 +519,6 @@ impl DictionaryAllowance {
         self.rent_covered_bytes
             .fetch_add(covered, Ordering::Relaxed);
         self.promotion_coverage[decile(covered, len)].fetch_add(1, Ordering::Relaxed);
-        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(Promotion::Promoted(pack))
     }
 
@@ -557,29 +549,24 @@ impl DictionaryAllowance {
     /// Evict `chosen`; the caller drops the returned packs once the lock is
     /// released.
     fn evict_all(&self, state: &mut State, chosen: Vec<u128>) -> Vec<Arc<HeldPack>> {
-        let victims: Vec<_> = chosen.into_iter().map(|id| self.evict(state, id)).collect();
-        if !victims.is_empty() {
-            self.generation.fetch_add(1, Ordering::AcqRel);
+        let mut taken = Vec::with_capacity(2 * chosen.len());
+        for identity in chosen {
+            self.evict(state, identity, &mut taken);
         }
-        victims
+        taken
     }
 
-    /// Take resident `identity` out of the pool, marked evicted so readers
-    /// drop it; the caller drops it once the lock is released.
-    fn evict(&self, state: &mut State, identity: u128) -> Arc<HeldPack> {
+    /// Take resident `identity` out of the pool and out of its slot, so no
+    /// lookup finds it again, into `taken`, which the caller drops once the
+    /// lock is released.
+    fn evict(&self, state: &mut State, identity: u128, taken: &mut Vec<Arc<HeldPack>>) {
         let pack = state.resident.remove(&identity).expect("resident");
         state.clock.retain(|id| *id != identity);
-        pack.evicted.store(true, Ordering::Release);
-        let served = pack.served_lookups.load(Ordering::Relaxed);
-        self.evicted_served_lookups
-            .fetch_add(served, Ordering::Relaxed);
-        self.evicted_served_bytes
-            .fetch_add(pack.served_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.evicted_served[log2_bucket(served)].fetch_add(1, Ordering::Relaxed);
+        taken.extend(Self::slot(state, identity).and_then(|slot| slot.0.swap(None)));
         self.evicted.fetch_add(1, Ordering::Relaxed);
         self.evicted_bytes
             .fetch_add(pack.len() as u64, Ordering::Relaxed);
-        pack
+        taken.push(pack);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -605,9 +592,6 @@ impl DictionaryAllowance {
             rent_covered_bytes: load(&self.rent_covered_bytes),
             crossing_coverage: snapshot(&self.crossing_coverage),
             promotion_coverage: snapshot(&self.promotion_coverage),
-            evicted_served_lookups: load(&self.evicted_served_lookups),
-            evicted_served_bytes: load(&self.evicted_served_bytes),
-            evicted_served: snapshot(&self.evicted_served),
             evicted: load(&self.evicted),
             evicted_bytes: load(&self.evicted_bytes),
             busy: load(&self.busy),
@@ -673,20 +657,29 @@ mod tests {
         assert_eq!(stats.promotion_coverage[7], 4, "30 of 40 bytes covered");
     }
 
-    /// An evicted pack a reader still holds stays charged: a promotion that
-    /// needs its bytes waits until the reader drops it.
+    /// A pack evicted while a lookup holds it from its slot stays readable
+    /// and charged: a promotion that needs its bytes waits until the lookup
+    /// lets go. Its slot empties at eviction, so no later lookup finds it.
     #[test]
-    fn an_evicted_pack_stays_charged_while_a_reader_holds_it() {
+    fn an_evicted_pack_stays_charged_while_a_lookup_holds_it() {
         let allowance = DictionaryAllowance::new(100);
+        let (_meter, slot) = allowance.tenancy(1, 4, 60, 0);
         drop(promoted(allowance.promote(1, 60, 45, fill).unwrap()));
-        let reader = allowance.resident(1).unwrap();
+        let reader = slot.load();
+        assert!(reader.is_some(), "the slot fills on promotion");
         assert!(matches!(
             allowance
                 .promote(2, 60, 0, |_| panic!("no room to assemble"))
                 .unwrap(),
             Promotion::NoRoom
         ));
-        assert!(reader.is_evicted() && allowance.resident(1).is_none());
+        assert!(slot.load().is_none() && allowance.resident(1).is_none());
+        assert!(
+            reader
+                .as_deref()
+                .is_some_and(|pack| pack.iter().all(|&b| b == 9)),
+            "still readable"
+        );
         let stats = allowance.stats();
         assert_eq!((stats.used, stats.outstanding), (60, 60), "still charged");
         drop(reader);
@@ -696,22 +689,30 @@ mod tests {
         assert_eq!(allowance.stats().peak, 60);
     }
 
-    /// Readers of one pack share a meter; the table forgets packs no reader
-    /// holds a meter for, so it does not grow with retired packs.
+    /// Readers of one pack share a meter and a slot, and one that arrives
+    /// while the pool holds the pack finds it in the slot; the table forgets
+    /// packs no reader holds either for, so it does not grow with retired
+    /// packs.
     #[test]
-    fn meters_are_shared_per_pack_and_pruned() {
+    fn tenancies_are_shared_per_pack_and_pruned() {
         let allowance = DictionaryAllowance::new(100);
-        let a = allowance.meter(1, 4, 0, 0);
-        assert!(Arc::ptr_eq(&a, &allowance.meter(1, 4, 0, 0)));
+        let (meter, slot) = allowance.tenancy(1, 4, 0, 0);
+        let (again, same) = allowance.tenancy(1, 4, 0, 0);
+        assert!(Arc::ptr_eq(&meter, &again) && Arc::ptr_eq(&slot, &same));
+        drop((again, same));
         for identity in 2..1_000u128 {
-            drop(allowance.meter(identity, 4, 0, 0));
+            drop(allowance.tenancy(identity, 4, 0, 0));
         }
         let live = allowance.lock().meters.len();
         assert!(live <= 64, "{live} entries");
+        let (again, same) = allowance.tenancy(1, 4, 0, 0);
         assert!(
-            Arc::ptr_eq(&a, &allowance.meter(1, 4, 0, 0)),
-            "a held meter survives"
+            Arc::ptr_eq(&meter, &again) && Arc::ptr_eq(&slot, &same),
+            "a held tenancy survives"
         );
+        drop(promoted(allowance.promote(7, 40, 30, fill).unwrap()));
+        let (_, late) = allowance.tenancy(7, 4, 40, 0);
+        assert!(late.load().is_some(), "a resident pack fills a new slot");
     }
 
     /// A promotion already in flight turns another away; one already done

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-use super::allowance::{reject, DictionaryAllowance, HeldPack, Promotion};
+use super::allowance::{reject, DictionaryAllowance, PackSlot, Promotion};
 use super::forward_pack::{
     find_page_in_dir, lookup_in_pack, page_dir_range, parse_pack_meta, parse_pack_meta_parts,
     PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
@@ -79,11 +79,8 @@ struct AdaptivePack {
     checked: Box<[AtomicBool]>,
     allowance: Arc<DictionaryAllowance>,
     meter: Arc<MissMeter>,
-    /// The allowance's copy as last seen, used while it lives and is not
-    /// evicted. Readers hold it only for a lookup.
-    seen: parking_lot::RwLock<std::sync::Weak<HeldPack>>,
-    /// The allowance generation at which this pack was last found absent.
-    absent_at: std::sync::atomic::AtomicU64,
+    /// Where the allowance's copy is, while it holds one.
+    slot: Arc<PackSlot>,
     /// Bytes of distinct units a rental must cover before promotion.
     min_covered: u64,
 }
@@ -96,25 +93,23 @@ impl AdaptivePack {
         coverage: f64,
         kind: u8,
     ) -> Self {
-        let meter = allowance.meter(units.identity(), units.unit_count(), units.len(), kind);
+        let (meter, slot) =
+            allowance.tenancy(units.identity(), units.unit_count(), units.len(), kind);
         let min_covered = (units.len() as f64 * coverage.clamp(0.0, 1.0)).ceil() as u64;
         Self {
             units: units.with_meter(Arc::clone(&meter)),
             checked,
             allowance,
             meter,
-            seen: parking_lot::RwLock::new(std::sync::Weak::new()),
-            absent_at: std::sync::atomic::AtomicU64::new(u64::MAX),
+            slot,
             min_covered,
         }
     }
 
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
-        if let Some(whole) = self.whole() {
-            let mark = out.len();
-            let found = lookup_whole(&whole, meta, id, out);
-            whole.note_served(out.len() - mark);
-            return Ok(found);
+        if let Some(whole) = &*self.slot.load() {
+            whole.mark_used();
+            return Ok(lookup_whole(whole, meta, id, out));
         }
         if id < meta.first_id || id > meta.last_id {
             return Ok(false);
@@ -160,30 +155,7 @@ impl AdaptivePack {
         Ok(())
     }
 
-    /// The allowance's copy, if it holds one.
-    fn whole(&self) -> Option<Arc<HeldPack>> {
-        if let Some(pack) = self.seen.read().upgrade() {
-            if !pack.is_evicted() {
-                pack.mark_used();
-                return Some(pack);
-            }
-        }
-        let generation = self.allowance.generation();
-        if self.absent_at.swap(generation, Ordering::Relaxed) == generation {
-            return None;
-        }
-        let pack = self.allowance.resident(self.units.identity())?;
-        self.adopt(&pack);
-        pack.mark_used();
-        Some(pack)
-    }
-
-    /// Use `pack` from now on; rent starts again from nothing.
-    fn adopt(&self, pack: &Arc<HeldPack>) {
-        *self.seen.write() = Arc::downgrade(pack);
-        self.meter.reset();
-    }
-
+    /// Once the pack is held whole, its rent starts again from nothing.
     fn settle(&self, promotion: Promotion) {
         self.meter.set_reason(promotion.reason());
         match promotion {
@@ -191,11 +163,11 @@ impl AdaptivePack {
                 if self.meter.note_promotion() > 0 {
                     self.allowance.note_repromotion(pack.len() as u64);
                 }
-                self.adopt(&pack);
+                self.meter.reset();
                 self.units.forget_cached();
                 fluree_db_core::io_stats::record_work("pack promoted whole", pack.len());
             }
-            Promotion::Resident(pack) => self.adopt(&pack),
+            Promotion::Resident(_) => self.meter.reset(),
             Promotion::Busy | Promotion::NoRoom | Promotion::TooLarge => {}
         }
     }
@@ -2172,33 +2144,6 @@ mod tests {
             );
         }
 
-        /// Lookups a whole pack serves are counted, and recorded with their
-        /// value bytes when it is evicted.
-        #[test]
-        fn lookups_served_whole_are_recorded_at_eviction() {
-            let len = pack_from(FIRST).len() as u64;
-            let other = FIRST + 10 * COUNT as u64;
-            let cs = SegmentedContentStore::new(true);
-            let cache = unaging_cache(len + len / 2);
-            let a = adaptive(&cs, FIRST, &cache);
-            read_all(&a, FIRST);
-            let (before, before_bytes) = cache
-                .dictionary_allowance()
-                .resident(identity(&cs, FIRST))
-                .expect("promoted")
-                .served();
-            read_ids(&a, FIRST, 0..100);
-            let served: u64 = (0..100).map(|i| value(FIRST + i).len() as u64).sum();
-            read_all(&adaptive(&cs, other, &cache), other);
-            let stats = cache.dictionary_allowance().stats();
-            assert_eq!(stats.evicted, 1);
-            assert_eq!(
-                (stats.evicted_served_lookups, stats.evicted_served_bytes),
-                (before + 100, before_bytes + served)
-            );
-            assert_eq!(stats.evicted_served.iter().sum::<u64>(), 1);
-        }
-
         /// Promoted packs live in anonymous mappings of their own.
         #[cfg(not(target_arch = "wasm32"))]
         #[test]
@@ -2402,6 +2347,71 @@ mod tests {
             let err = reader.forward_lookup_str(FIRST).unwrap_err();
             assert!(err.to_string().contains("pack kind"), "{err}");
             assert_eq!(cache.dictionary_allowance().stats().used, 0);
+        }
+
+        /// Time per lookup on the slowest of `threads` threads each looking
+        /// up `n` ids in `reader`, started together once all have warmed up;
+        /// the fastest of three runs.
+        fn lookup_ns(reader: &ForwardPackReader, threads: usize, n: u64) -> f64 {
+            let run = || {
+                let start = std::sync::Barrier::new(threads);
+                let slowest = std::thread::scope(|scope| {
+                    let workers: Vec<_> = (0..threads as u64)
+                        .map(|t| {
+                            let start = &start;
+                            scope.spawn(move || {
+                                // Large enough to share no cache line with the pack.
+                                let mut out = Vec::with_capacity(16 * 1024);
+                                let mut look = |i: u64| {
+                                    out.clear();
+                                    let id = FIRST + (i * 7 + t * 13) % COUNT as u64;
+                                    assert!(reader.forward_lookup_into(id, &mut out).unwrap());
+                                };
+                                (0..COUNT as u64).for_each(&mut look);
+                                start.wait();
+                                let began = std::time::Instant::now();
+                                (0..n).for_each(&mut look);
+                                began.elapsed()
+                            })
+                        })
+                        .collect();
+                    workers.into_iter().map(|w| w.join().unwrap()).max()
+                });
+                slowest.expect("a worker").as_nanos() as f64 / n as f64
+            };
+            (0..3).map(|_| run()).fold(f64::INFINITY, f64::min)
+        }
+
+        /// Lookups in a promoted pack on several threads at once each run
+        /// about as fast as on one: they find the pack without a lock or a
+        /// count on it, so, like lookups in a pack held whole from the start,
+        /// they write nothing they share.
+        #[test]
+        fn lookups_in_a_promoted_pack_scale_across_threads() {
+            // Eight threads catch a regression in a debug build, where a
+            // lookup's own work hides most of what sharing costs: CI's eight
+            // cores are the gate, and fewer only check that lookups keep
+            // pace. Run alone (`.config/nextest.toml`).
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+            if threads < 2 {
+                eprintln!("SKIPPED: needs two cores, found {threads}");
+                return;
+            }
+            let len = pack_from(FIRST).len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let cache = unaging_cache(len);
+            let reader = adaptive(&cs, FIRST, &cache);
+            read_all(&reader, FIRST);
+            assert_eq!(cache.dictionary_allowance().stats().promoted, 1);
+            let reads = cs.reads().len();
+            let n = 500_000;
+            let one = lookup_ns(&reader, 1, n);
+            let many = lookup_ns(&reader, threads, n);
+            assert_eq!(cs.reads().len(), reads, "served whole");
+            assert!(
+                many < 3.0 * one,
+                "{threads} threads: {many:.0} ns a lookup against {one:.0} on one"
+            );
         }
     }
 }
