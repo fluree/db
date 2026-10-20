@@ -34,6 +34,8 @@ pub fn format(
     compactor: &IriCompactor,
     _config: &FormatterConfig,
 ) -> Result<String> {
+    // Rows reach the dictionaries in order; reuse the units they land in.
+    let _units = fluree_db_binary_index::UnitMemoScope::enter();
     // CONSTRUCT/DESCRIBE produce graphs (handled by JSON-LD/Turtle etc.), not result sets.
     if result.output.construct_template().is_some() {
         return Err(FormatError::InvalidBinding(

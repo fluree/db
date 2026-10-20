@@ -217,7 +217,9 @@ async fn remote_storage_builds_seed_the_disk_cache() {
 
 /// Encrypted remote storage reads back plaintext, so nothing of it may land in
 /// the cache — not what the indexer wrote, nor what readers fetched. The
-/// remote test above is the same flow without the key.
+/// remote test above is the same flow without the key. Remote objects are
+/// decrypted whole, so none of the in-memory cache's budget is reserved for
+/// reading them by range either.
 #[tokio::test(flavor = "multi_thread")]
 async fn encrypted_remote_storage_writes_nothing_to_the_disk_cache() {
     let storage = EncryptedStorage::new(
@@ -230,6 +232,9 @@ async fn encrypted_remote_storage_writes_nothing_to_the_disk_cache() {
         cached.is_empty(),
         "encrypted storage spilled plaintext to the disk cache: {cached:?}"
     );
+    let cache = built.fluree.leaflet_cache();
+    assert_eq!(cache.reserved_bytes(), 0);
+    assert_eq!(cache.dictionary_allowance().capacity(), 0);
 }
 
 /// Once armed, counts reads and holds each one until released.

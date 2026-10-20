@@ -400,12 +400,39 @@ different key id than the record's replaces the record.
 
 - **Cipher**: AES-256-GCM (Galois/Counter Mode)
 - **Key Size**: 256 bits (32 bytes)
-- **Nonce Size**: 96 bits (12 bytes), randomly generated per write
-- **Tag Size**: 128 bits (16 bytes)
+- **Per-object key**: HKDF-SHA256 of the configured key, with a random 32-byte
+  salt per write and the envelope header as context
+- **Segments**: 64 KiB of plaintext each, each with its own 96-bit nonce and
+  128-bit tag
 
 ### Ciphertext Envelope Format
 
-All encrypted data uses a portable envelope format:
+New writes use a segmented envelope (version 2), so a reader can decrypt the
+part of an object it needs:
+
+```
+offset  len  field
+     0    4  magic "FLU\0"
+     4    1  version = 0x02
+     5    1  algorithm = 0x02 (AES-256-GCM, HKDF-SHA256 object key)
+     6    4  key id, u32 LE
+    10    1  log2 of the segment size (16 = 64 KiB)
+    11    1  reserved, 0
+    12    8  plaintext length, u64 LE
+    20   32  salt, random per write
+    52    7  nonce prefix, random per write
+    59    5  reserved, 0
+    64       segment 0 ‖ segment 1 ‖ … (ciphertext + 16-byte tag each)
+```
+
+Segment `i`'s nonce is the nonce prefix, `i` as a big-endian u32, and a byte
+marking the last segment. Changing any header byte changes the object key and
+fails every segment; the nonce binds each segment to its position and to
+whether it ends the object, so segments cannot be reordered, truncated or
+spliced between objects.
+
+Releases before segmented envelopes wrote version 1, one AES-GCM message per
+object. This release still reads it:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -422,7 +449,7 @@ All encrypted data uses a portable envelope format:
 ```
 
 - **Magic bytes**: `FLU\0` (0x46 0x4C 0x55 0x00) for format detection
-- **Version**: Format version (currently 0x01)
+- **Version**: 0x01
 - **Algorithm**: 0x01 = AES-256-GCM
 - **Key ID**: Identifier for key rotation support, little-endian
 - **Nonce**: Randomly generated per encryption operation
@@ -431,9 +458,12 @@ All encrypted data uses a portable envelope format:
 ### Security Properties
 
 1. **Confidentiality**: AES-256 encryption protects data content
-2. **Integrity**: GCM authentication tag detects tampering
-3. **Authenticity**: Header is included in AAD (Additional Authenticated Data)
-4. **Non-deterministic**: Random nonces mean same plaintext → different ciphertext
+2. **Integrity**: GCM authentication tags detect tampering. A full read verifies
+   every segment and the exact length; a partial read verifies the segments it
+   returns bytes from
+3. **Authenticity**: The header is bound through the object key (version 2) or
+   as associated data (version 1)
+4. **Non-deterministic**: Random salts and nonces mean same plaintext → different ciphertext
 
 Integrity is per blob. The tag detects a modified blob, but the envelope is not
 bound to its address, so it does not detect one valid blob substituted for
@@ -529,18 +559,54 @@ its session directory behind
 
 ## Performance Considerations
 
-- **CPU overhead**: ~5-15% for encryption/decryption (depends on hardware AES support)
-- **Storage overhead**: 22 bytes header + 16 bytes tag per object
+- **CPU overhead**: AES-GCM with hardware AES support decrypts on the order of
+  1 GB/s per core
+- **Storage overhead**: 64 bytes of header per object plus 16 bytes per 64 KiB
+  segment (about 0.025%)
 - **Memory**: Keys are kept in memory while the connection is open
+- **Partial reads on file storage**: index leaves and dictionaries are read by
+  range. Only the 64 KiB segments a query touches are decrypted, and they are
+  kept in the in-memory leaflet cache, so a leaf or dictionary is not decrypted
+  whole to answer a lookup.
+- **Cache budget on encrypted storage**: by default 60% of `cacheMaxMb` is a
+  *dictionary allowance*: forward dictionary packs (up to 16 MiB each) that
+  queries keep missing are promoted into it and held decrypted whole, and
+  evicted in least-recently-used order when others need the room. A
+  thirty-second of the rest holds the indexes that let reverse-dictionary
+  lookups scan 4 KiB instead of a whole leaf. Data that cannot use them —
+  version 1 envelopes and remote reads, which are decrypted whole — gives
+  them back to the leaflet cache when it is first read: the allowance keeps
+  only enough for what it already holds and the packs read by range before.
+  What is given back stays with the leaflet cache for the life of the
+  connection, so after reindexing such data, restart to have the allowance
+  again. Set the allowance with `cacheDictionaryMaxMb` (or
+  `FlureeBuilder::cache_dictionary_max_mb`); one smaller than a pack or two
+  holds none, and one above 90% of `cacheMaxMb` is capped at 90%, with a
+  warning, so the leaflet cache keeps the rest. Unencrypted storage gives all
+  of `cacheMaxMb` to the leaflet cache.
+- **Warm-up**: a dictionary pack starts out read by range and is promoted only
+  after its misses have decrypted about its own size, so the first passes over
+  a working set are slower than later ones. After a workload moves away and
+  comes back, its packs earn their place again over a pass or two.
 - **No disk cache**: because the read-through disk cache is bypassed (see above),
-  a remote backend such as S3 fetches each index leaf whole on its first open —
-  AES-GCM cannot decrypt part of an object, so range reads would each fetch it
-  whole anyway — and keeps the decrypted leaf in the in-memory leaflet cache
-  until it falls out. Concurrent readers of the same artifact still share one
-  fetch. Size that cache (`cacheMaxMb`) for the working set: decrypted leaves
-  count against it in full. File storage has no network round trip, but a leaf
-  that falls out of the cache is re-read and decrypted whole rather than
-  mapped.
+  a remote backend such as S3 fetches each index leaf whole on its first open
+  and keeps the decrypted leaf in the in-memory leaflet cache until it falls
+  out. Concurrent readers of the same artifact still share one fetch. Size that
+  cache (`cacheMaxMb`) for the working set: decrypted leaves count against it
+  in full.
+- **Data written by earlier releases**: version 1 envelopes are read whole, as
+  those releases read them. A reindex writes a new index, its leaves and
+  dictionaries, as version 2; commits and other objects it does not rewrite
+  stay version 1. A key rotation rewrites each blob on the retiring key as
+  version 2. Releases before this one cannot read version 2, so:
+  - After a key rotation, an earlier release cannot read the ledger's history
+    either, commits from before the upgrade included: a rollback that
+    reindexes from those commits ([Rolling
+    back](../operations/upgrading-from-4.2.md#rolling-back)) no longer works.
+  - On a store several processes share (Raft nodes, which write commits from
+    whichever node owns the branch, and query peers), every process reading
+    it must run this release before any process writes to it with this
+    release.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 

@@ -104,6 +104,10 @@ pub const FIELD_PARALLELISM: &str = "https://ns.flur.ee/system#parallelism";
 /// Maximum cache size in megabytes
 pub const FIELD_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#cacheMaxMb";
 
+/// On encrypted storage, the megabytes of the cache that dictionary packs may
+/// hold decrypted whole
+pub const FIELD_CACHE_DICTIONARY_MAX_MB: &str = "https://ns.flur.ee/system#cacheDictionaryMaxMb";
+
 /// Index storage reference
 pub const FIELD_INDEX_STORAGE: &str = "https://ns.flur.ee/system#indexStorage";
 

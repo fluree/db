@@ -72,7 +72,8 @@ impl TermDictReader {
                 pack_ns_code(*p_id),
                 prev.and_then(|p| p.forward.get(p_id)),
             )
-            .await?;
+            .await?
+            .with_page_cache(leaflet_cache.cloned());
             forward.insert(*p_id, reader);
         }
         let reverse = Some(
