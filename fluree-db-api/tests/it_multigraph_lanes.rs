@@ -16,7 +16,7 @@ mod span_capture;
 mod multigraph;
 
 use multigraph::{
-    assert_routing, check, Fixture, Graphs, Scope, Shape, State, Surface, SCOPES, SHAPES,
+    assert_routing, check, Fixture, Graphs, Kind, Scope, Shape, State, Surface, SCOPES, SHAPES,
 };
 
 /// Every shape, scope and surface over fixture A in `state`.
@@ -76,10 +76,11 @@ const E_ONE_PLANNED: &str = "stats_count_by_predicate";
 
 /// Lane E's shape in every scope of fixture A in `state`: the answer by hand
 /// with fast paths on and off, and the routing. The union lane answers a
-/// current scope of several graphs and the empty one; a scope with novelty
-/// or read below the index declines it with `Novelty`; the one-graph lane
-/// answers one current graph; nothing answers a GRAPH scope (not the shape)
-/// or two ledgers.
+/// current scope of several graphs, also one with a default graph the index
+/// holds no leaf for, and the empty one; a scope with novelty or read below
+/// the index declines it with `Novelty`; the one-graph lane answers one
+/// current graph; nothing answers a GRAPH scope (not the shape) or two
+/// ledgers.
 async fn lane_e(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -95,12 +96,14 @@ async fn lane_e(state: State) {
             }
             let run = check(&fx, scope, Shape::PerPredicateCount, surface, &mut failures).await;
             runs += 1;
+            // Novelty belongs to the ledger, so a write to g2 leaves no
+            // member of any scope current.
             let current = state != State::Novelty && scope != Scope::TimeTravel;
-            match scope.graphs() {
-                Graphs::G1G2 | Graphs::G0G1G2 if current => {
+            match scope.kind() {
+                Kind::Union if current => {
                     assert_routing(&run, &[E_UNION], &[E_ONE, E_ONE_PLANNED], &mut failures);
                 }
-                Graphs::G1G2 | Graphs::G0G1G2 => {
+                Kind::Union => {
                     assert_routing(&run, &[], &all, &mut failures);
                     let novelty = (E_UNION.to_string(), "fallback:novelty".to_string());
                     if !run.fell_back.contains(&novelty) {
@@ -110,13 +113,16 @@ async fn lane_e(state: State) {
                         ));
                     }
                 }
-                Graphs::Empty => {
+                Kind::Empty => {
                     assert_routing(&run, &[E_UNION], &[E_ONE, E_ONE_PLANNED], &mut failures);
                 }
-                Graphs::G0 | Graphs::G1 if state != State::Novelty => {
+                // In a GRAPH scope the pattern is not the lane's shape.
+                Kind::One if current && matches!(scope.graphs(), Graphs::G0 | Graphs::G1) => {
                     assert_routing(&run, &[E_ONE], &[E_UNION], &mut failures);
                 }
-                _ => assert_routing(&run, &[], &[E_UNION, E_ONE], &mut failures),
+                Kind::One | Kind::None => {
+                    assert_routing(&run, &[], &[E_UNION, E_ONE], &mut failures);
+                }
             }
         }
     }
