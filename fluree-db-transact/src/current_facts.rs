@@ -805,11 +805,20 @@ impl<'l> CurrentFacts<'l> {
     /// where the index keeps less of it, names the fact as stored. See
     /// [`Self::all_named_by`] for every term of it.
     pub async fn named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Option<StoredFact>>> {
-        Ok(self
-            .all_named_by(items)
-            .await?
-            .into_iter()
-            .map(|named| named.into_iter().next())
+        let (slots, item_slots) = distinct_slots(items);
+        let facts = self.of_slots(&slots).await?;
+        let ids = FactIdentity::new(self.ledger);
+        let index = self.index_slots(&slots, &facts, &ids);
+        Ok(items
+            .iter()
+            .zip(item_slots)
+            .map(|((slot, flake), i)| {
+                let named = index[i].term(flake).or_else(|| {
+                    let key = ids.key(Some(slot.g_id), flake)?;
+                    index[i].first.get(&key).copied()
+                });
+                named.map(|n| facts[i][n].clone())
+            })
             .collect())
     }
 
@@ -817,67 +826,78 @@ impl<'l> CurrentFacts<'l> {
     /// ([`FactIdentity`]), in order: `flake`'s own term first, then the
     /// slot's other terms of that fact. Novelty holds the subtypes of one big
     /// integer apart until the next index build, so one fact can be current
-    /// under several terms; a retraction of the fact retracts each. Each
-    /// distinct slot is read once, and each item is matched by hash, so
-    /// naming k facts of an n-fact slot costs one read of the slot and
-    /// O(k + n) matching.
+    /// under several terms; a retraction of the fact retracts each.
     pub async fn all_named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Vec<StoredFact>>> {
-        let mut slot_index: HashMap<(GraphId, &Sid, &Sid), usize> = HashMap::new();
-        let mut slots: Vec<Slot> = Vec::new();
-        let item_slots: Vec<usize> = items
-            .iter()
-            .map(|(slot, _)| {
-                *slot_index
-                    .entry((slot.g_id, &slot.s, &slot.p))
-                    .or_insert_with(|| {
-                        slots.push(slot.clone());
-                        slots.len() - 1
-                    })
-            })
-            .collect();
+        let (slots, item_slots) = distinct_slots(items);
         let facts = self.of_slots(&slots).await?;
         let ids = FactIdentity::new(self.ledger);
-        let mut by_term: Vec<HashMap<&Flake, usize>> = Vec::with_capacity(slots.len());
-        let mut by_key: Vec<HashMap<MergeKey, Vec<usize>>> = Vec::with_capacity(slots.len());
-        for (slot, slot_facts) in slots.iter().zip(&facts) {
-            let mut slot_p_id = None;
-            let mut terms = HashMap::with_capacity(slot_facts.len());
-            let mut keys: HashMap<MergeKey, Vec<usize>> = HashMap::new();
-            for (n, fact) in slot_facts.iter().enumerate() {
-                terms.insert(&fact.flake, n);
-                if fact.flake.o.index_key_may_merge_terms() {
-                    let p_id = || *slot_p_id.get_or_insert_with(|| self.keys.p_id(&slot.p));
-                    if let Some(key) = ids.key_under(|| Some(slot.g_id), p_id, &fact.flake) {
-                        keys.entry(key).or_default().push(n);
-                    }
-                }
-            }
-            by_term.push(terms);
-            by_key.push(keys);
-        }
-        // By term first: two terms of one key can both be current while
-        // novelty holds them, and an item naming one of them exactly names
-        // that one first.
+        let index = self.index_slots(&slots, &facts, &ids);
         Ok(items
             .iter()
             .zip(item_slots)
             .map(|((slot, flake), i)| {
-                let term = by_term[i].get(flake).copied();
-                let same_key = ids
-                    .key(Some(slot.g_id), flake)
-                    .and_then(|key| by_key[i].get(&key));
+                let term = index[i].term(flake);
+                let key = ids.key(Some(slot.g_id), flake);
+                let same_key = key.iter().flat_map(|key| index[i].same_key(key));
                 term.into_iter()
-                    .chain(
-                        same_key
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                            .filter(|&n| Some(n) != term),
-                    )
+                    .chain(same_key.filter(|&n| Some(n) != term))
                     .map(|n| facts[i][n].clone())
                     .collect()
             })
             .collect())
+    }
+
+    /// Each slot's facts indexed by term and by identity key ([`SlotIndex`]).
+    /// Each distinct slot is read once and each item matched by hash, so
+    /// naming k facts of an n-fact slot costs one read of the slot and
+    /// O(k + n) matching.
+    fn index_slots<'f>(
+        &self,
+        slots: &[Slot],
+        facts: &'f [Vec<StoredFact>],
+        ids: &FactIdentity<'_>,
+    ) -> Vec<SlotIndex<'f>> {
+        slots
+            .iter()
+            .zip(facts)
+            .map(|(slot, slot_facts)| {
+                let mut slot_p_id = None;
+                let mut index = SlotIndex {
+                    terms: HashMap::with_capacity(slot_facts.len()),
+                    first: HashMap::new(),
+                    next: None,
+                };
+                for (n, fact) in slot_facts.iter().enumerate() {
+                    index.terms.insert(&fact.flake, n);
+                    if !fact.flake.o.index_key_may_merge_terms() {
+                        continue;
+                    }
+                    let p_id = || *slot_p_id.get_or_insert_with(|| self.keys.p_id(&slot.p));
+                    let Some(key) = ids.key_under(|| Some(slot.g_id), p_id, &fact.flake) else {
+                        continue;
+                    };
+                    match index.first.entry(key) {
+                        Entry::Vacant(e) => {
+                            e.insert(n);
+                        }
+                        // Two terms of one fact: chain them. Only novelty
+                        // holding one big integer under several subtypes
+                        // gets here, so the chain is rarely allocated.
+                        Entry::Occupied(e) => {
+                            let next = index
+                                .next
+                                .get_or_insert_with(|| vec![usize::MAX; slot_facts.len()]);
+                            let mut at = *e.get();
+                            while next[at] != usize::MAX {
+                                at = next[at];
+                            }
+                            next[at] = n;
+                        }
+                    }
+                }
+                index
+            })
+            .collect()
     }
 
     /// [`Self::of_slots`], except that a slot given `Some(values)` is read
@@ -1039,6 +1059,51 @@ impl<'l> CurrentFacts<'l> {
             .into_iter()
             .map(|flake| stored(flake, g_sid, index_t))
             .collect()
+    }
+}
+
+/// The distinct slots of `items`, in first-seen order, and each item's
+/// place among them.
+fn distinct_slots(items: &[(Slot, &Flake)]) -> (Vec<Slot>, Vec<usize>) {
+    let mut slot_index: HashMap<(GraphId, &Sid, &Sid), usize> = HashMap::new();
+    let mut slots: Vec<Slot> = Vec::new();
+    let item_slots = items
+        .iter()
+        .map(|(slot, _)| {
+            *slot_index
+                .entry((slot.g_id, &slot.s, &slot.p))
+                .or_insert_with(|| {
+                    slots.push(slot.clone());
+                    slots.len() - 1
+                })
+        })
+        .collect();
+    (slots, item_slots)
+}
+
+/// One slot's current facts indexed for naming: by term, and by identity
+/// key ([`MergeKey`]) through the first fact holding each key and, when
+/// several terms of one fact are current, a chain to the next.
+struct SlotIndex<'f> {
+    terms: HashMap<&'f Flake, usize>,
+    first: HashMap<MergeKey, usize>,
+    next: Option<Vec<usize>>,
+}
+
+impl SlotIndex<'_> {
+    /// The fact holding `flake`'s term exactly.
+    fn term(&self, flake: &Flake) -> Option<usize> {
+        self.terms.get(flake).copied()
+    }
+
+    /// Every fact with identity key `key`, in slot order.
+    fn same_key<'a>(&'a self, key: &MergeKey) -> impl Iterator<Item = usize> + 'a {
+        std::iter::successors(self.first.get(key).copied(), move |&n| {
+            self.next
+                .as_ref()
+                .map(|next| next[n])
+                .filter(|&m| m != usize::MAX)
+        })
     }
 }
 
@@ -1435,8 +1500,9 @@ struct SlotFacts {
     /// A wide slot's facts by index key, grouped with `keys`.
     by_key: Option<Groups<IndexKey>>,
     /// A wide slot's big integers by value ([`value_hash`]), built when an
-    /// intent first needs them.
-    by_value: Option<Groups<u64>>,
+    /// intent first needs them. Boxed: most slots never build it, and every
+    /// slot a batch reads carries the field.
+    by_value: Option<Box<Groups<u64>>>,
 }
 
 impl SlotFacts {
@@ -1516,11 +1582,11 @@ impl SlotFacts {
     /// Group a wide slot's big integers by value, once.
     fn ensure_by_value(&mut self) {
         if self.is_wide() && self.by_value.is_none() {
-            self.by_value = Some(Groups::build(
+            self.by_value = Some(Box::new(Groups::build(
                 &self.facts,
                 |_, f| value_hash(&f.flake),
                 same_value,
-            ));
+            )));
         }
     }
 
