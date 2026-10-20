@@ -386,11 +386,12 @@ impl Fluree {
         let params = options.sparql_params(&input)?;
 
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
+            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )?,
             QueryInput::Sparql(sparql) => crate::query::helpers::parse_sparql_to_ir(
                 sparql,

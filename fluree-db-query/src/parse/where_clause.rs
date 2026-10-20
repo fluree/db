@@ -583,6 +583,7 @@ pub fn parse_where_array_element(
                 nested_counter,
                 None,
                 Some(ctx),
+                &std::collections::HashSet::new(),
             )?;
             query
                 .patterns

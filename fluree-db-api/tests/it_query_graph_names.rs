@@ -96,6 +96,29 @@ async fn a_dataset_alias_spelled_like_a_compact_iri_is_the_alias() {
     assert_eq!(normalize_rows(&rows), vec![json!("Carol")]);
 }
 
+/// A dataset built outside the query body protects its aliases too: the
+/// query names `ex:people` without a `fromNamed` of its own, and still means
+/// the alias the dataset registered.
+#[tokio::test]
+async fn an_alias_from_a_dataset_built_outside_the_query_is_the_alias() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = ledger(&fluree, "graph-names/outside-alias:main").await;
+    let spec = DatasetSpec::from_json(&json!({
+        "from": "graph-names/outside-alias:main",
+        "fromNamed": {"ex:people": {"@id": "graph-names/outside-alias:main", "@graph": "urn:g2"}}
+    }))
+    .expect("dataset spec");
+    let dataset = fluree.build_dataset_view(&spec).await.expect("dataset");
+    let result = fluree
+        .query_dataset(&dataset, &names_in("ex:people"))
+        .await
+        .expect("query");
+    let rows = result
+        .to_jsonld(dataset.primary().unwrap().snapshot.as_ref())
+        .expect("format");
+    assert_eq!(normalize_rows(&rows), vec![json!("Carol")]);
+}
+
 /// A rule body reads a named graph by its compact name, too.
 #[tokio::test]
 async fn a_rule_body_names_its_graph_compactly() {

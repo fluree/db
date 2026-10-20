@@ -54,7 +54,7 @@ use crate::var_registry::VarRegistry;
 use ast::{UnresolvedColumn, UnresolvedPathExpr, UnresolvedProjection};
 use fluree_graph_json_ld::{parse_context, ParsedContext};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Map from context term name to its parsed `@path` expression.
@@ -65,6 +65,15 @@ pub type PathAliasMap = HashMap<String, UnresolvedPathExpr>;
 
 // Re-export is_variable from node_map for use within this module
 use node_map::is_variable;
+
+/// [`parse_query_ast_in_dataset`] with no dataset names beyond the body's.
+#[cfg(test)]
+pub(crate) fn parse_query_ast(
+    json: &JsonValue,
+    strict_override: Option<bool>,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    parse_query_ast_in_dataset(json, strict_override, &HashSet::new())
+}
 
 /// Parse a JSON-LD query into an unresolved AST and determine the select mode.
 ///
@@ -79,9 +88,13 @@ use node_map::is_variable;
 ///
 /// A tuple of `(UnresolvedQuery, SelectMode)` where the mode is derived from
 /// the query's select/selectOne/construct/ask key.
-pub(crate) fn parse_query_ast(
+///
+/// A `["graph", …]` name in `dataset_names` (a dataset built outside the
+/// body) is kept as written, as one the body's own `fromNamed` spells is.
+pub(crate) fn parse_query_ast_in_dataset(
     json: &JsonValue,
     strict_override: Option<bool>,
+    dataset_names: &HashSet<String>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
     // M1b: read-side firewall on user-authored `f:reifies*` IRIs.
     // The IR-level expansion in `where_plan.rs::expand_edge_annotation_patterns`
@@ -102,6 +115,7 @@ pub(crate) fn parse_query_ast(
         &mut nested_counter,
         strict_override,
         None,
+        dataset_names,
     )
 }
 
@@ -205,6 +219,7 @@ pub(crate) fn parse_query_ast_internal(
     nested_counter: &mut u32,
     strict_override: Option<bool>,
     parent: Option<&JsonLdParseCtx>,
+    dataset_names: &HashSet<String>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
     let obj = json
         .as_object()
@@ -229,8 +244,11 @@ pub(crate) fn parse_query_ast_internal(
         aliases: query_from_named_aliases(obj),
         default_by_name: false,
     };
-    // A `["graph", …]` name the dataset spells is kept as written.
-    let mut names = dataset_names(obj);
+    // A `["graph", …]` name the dataset spells is kept as written: the
+    // body's own `fromNamed`, the dataset the query runs against, and an
+    // enclosing query's names.
+    let mut names = body_dataset_names(obj);
+    names.extend(dataset_names.iter().cloned());
     if let Some(parent) = parent {
         let own = std::mem::replace(&mut graph_names, parent.graph_names.clone()).aliases;
         for (alias, iri) in own {
@@ -709,7 +727,7 @@ fn parse_top_level_values(
 /// top level or under `opts`: aliases, ledger and graph source names, and
 /// graph selectors. A `graph` clause naming one of them as written means
 /// it, even where it reads as a compact IRI.
-fn dataset_names(obj: &serde_json::Map<String, JsonValue>) -> std::collections::HashSet<String> {
+fn body_dataset_names(obj: &serde_json::Map<String, JsonValue>) -> HashSet<String> {
     fn collect(value: &JsonValue, names: &mut std::collections::HashSet<String>) {
         match value {
             JsonValue::String(s) => {
@@ -1635,7 +1653,21 @@ pub fn parse_query<E: IriEncoder>(
     vars: &mut VarRegistry,
     strict_override: Option<bool>,
 ) -> Result<Query> {
-    let (ast, select_mode) = parse_query_ast(json, strict_override)?;
+    parse_query_in_dataset(json, encoder, vars, strict_override, &HashSet::new())
+}
+
+/// [`parse_query`] for a query run against a dataset built outside its body
+/// (a Rust `DataSetDb`, or a graph source a `from` registers): a
+/// `["graph", …]` name in `dataset_names` is kept as written rather than
+/// expanded as a compact IRI.
+pub fn parse_query_in_dataset<E: IriEncoder>(
+    json: &JsonValue,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    strict_override: Option<bool>,
+    dataset_names: &HashSet<String>,
+) -> Result<Query> {
+    let (ast, select_mode) = parse_query_ast_in_dataset(json, strict_override, dataset_names)?;
     let mut query = lower_query(ast, encoder, vars, select_mode)?;
     // The JSON-LD query surface projects a variable its grouping does not
     // produce as a per-group list (documented in `docs/query/jsonld-query.md`).

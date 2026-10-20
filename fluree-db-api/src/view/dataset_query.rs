@@ -4,8 +4,8 @@
 
 use crate::query::helpers::{
     build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
-    parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset,
-    tracked_query_tracker, tracker_for_input_limits,
+    parse_jsonld_query_for_dataset, parse_sparql_to_ir, prepare_for_execution,
+    sparql_ast_has_dataset, tracked_query_tracker, tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
@@ -140,11 +140,12 @@ impl Fluree {
 
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )?,
             QueryInput::Sparql(sparql) => {
                 // For dataset view, SPARQL FROM/FROM NAMED are allowed
@@ -261,11 +262,12 @@ impl Fluree {
 
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )?,
             QueryInput::Sparql(sparql) => parse_sparql_to_ir(
                 sparql,
@@ -378,11 +380,12 @@ impl Fluree {
 
         // Parse (SPARQL reuses the entry method's AST when threaded — #1473)
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
             QueryInput::Sparql(sparql) => {
@@ -496,11 +499,12 @@ impl Fluree {
         })?;
 
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => parse_jsonld_query(
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
             QueryInput::Sparql(sparql) => parse_sparql_to_ir(
