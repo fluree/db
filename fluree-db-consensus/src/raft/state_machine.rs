@@ -85,6 +85,12 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             derived_facts: r.derived_facts,
             iterations: r.iterations,
             duration_ms: r.duration_ms,
+            // Not carried: adding them would change the positional wire form
+            // of records already in the log. A retried submission reports the
+            // cap without naming its rules.
+            capped_rules: Vec::new(),
+            pending_rules: Vec::new(),
+            evaluation_time: None,
         }
     }
 }

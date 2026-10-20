@@ -545,6 +545,17 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             "reasoning-max-memory-mb",
             self.ast.pragmas.reasoning_max_memory_mb.as_deref(),
         )?;
+        if let Some(raw) = self.ast.pragmas.reasoning_time.as_deref() {
+            modes.evaluation_time = Some(
+                fluree_db_core::temporal::DateTime::parse(raw.trim()).map_err(|e| {
+                    LowerError::invalid_pragma(
+                        "reasoning-time",
+                        format!("expected an ISO 8601 datetime: {e}"),
+                        self.ast.span,
+                    )
+                })?,
+            );
+        }
 
         if modes == ReasoningModes::default() {
             return Ok(ReasoningConfig::default());

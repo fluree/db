@@ -298,6 +298,10 @@ pub struct ExecutionContext<'a> {
     /// evaluation to compact IRIs the way `db.labels()` does: strip the
     /// vocab prefix, otherwise return the full IRI.
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return. `None` reads the wall clock on
+    /// every call. Rule bodies set it to the materialization's evaluation
+    /// time, so every rule in one run sees one clock.
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
     /// IRI template over the FK join columns is rendered directly from the child
     /// row's FK columns, skipping the parent-table scan and its referential
@@ -522,6 +526,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -584,6 +589,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store,
@@ -650,6 +656,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store,
@@ -705,6 +712,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -759,6 +767,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -815,6 +824,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
             path_pair_limit: None,
             binary_store: None,
@@ -1552,6 +1562,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
@@ -1617,6 +1628,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
@@ -1678,6 +1690,7 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
             path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
