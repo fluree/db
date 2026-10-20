@@ -13,7 +13,7 @@ Geospatial support is implemented with:
 - **Index-accelerated proximity queries**: POST latitude-band scans with haversine post-filtering
 - **Time travel support**: Point-in-time geo queries via `from: "<ledger>@t:<t>"` (see examples below)
 
-Non-POINT geometries (polygons, linestrings, multipolygons, etc.) are indexed using a separate S2 cell-based spatial index that enables efficient containment and intersection queries.
+Non-POINT geometries (polygons, linestrings, multipolygons, etc.) are stored as `geo:wktLiteral` values and read back like any other value. Incremental index builds also write a separate S2 cell-based spatial index for them, but no query surface reads that index yet: containment and intersection queries over complex geometries are not available. See [S2 Spatial Index](#s2-spatial-index-complex-geometries).
 
 ## Storing Geographic Data
 
@@ -356,9 +356,17 @@ This returns only cities from the France graph within 50km of Paris, not cities 
 
 ## S2 Spatial Index (Complex Geometries)
 
-Fluree provides an S2 cell-based spatial index for complex geometries (polygons, linestrings, multipolygons). This index enables efficient spatial predicate queries like "find all places within this region" or "find all regions that contain this point."
+> **Not yet available.** The `idx:spatial` query syntax in this section isn't supported by any query surface yet. JSON-LD, SPARQL and Cypher don't recognize it, so a query written this way is read as ordinary triple patterns and returns no results. What exists today is the index side:
+>
+> - Incremental index builds write an S2 cell index for non-POINT `geo:wktLiteral` values, per graph and predicate.
+> - A full reindex doesn't rebuild it yet.
+> - Values written since the last index build aren't in it.
+>
+> The rest of this section describes the planned query interface, whose final syntax may differ. For point proximity, use [`geof:distance`](#distance-queries), which is supported.
 
-### Supported Operations
+The S2 cell-based spatial index for complex geometries (polygons, linestrings, multipolygons) is designed to answer spatial predicate queries like "find all places within this region" or "find all regions that contain this point."
+
+### Planned Operations
 
 | Operation | Description | Use Case |
 |-----------|-------------|----------|
@@ -367,7 +375,9 @@ Fluree provides an S2 cell-based spatial index for complex geometries (polygons,
 | `intersects` | Find geometries that overlap with a query geometry | "Find all parcels that touch this proposed road" |
 | `nearby` | Find geometries within a radius (with distances) | "Find polygons within 10km of this point" |
 
-### Query Syntax
+### Planned Query Syntax
+
+Not yet accepted by the query parser (see the note above).
 
 **JSON-LD Query (find places within a polygon):**
 ```json
@@ -449,9 +459,9 @@ Fluree provides an S2 cell-based spatial index for complex geometries (polygons,
 
 The S2 spatial index uses Google's S2 geometry library to map geometries to hierarchical cells on a sphere:
 
-1. **Ingestion**: When a `geo:wktLiteral` polygon/linestring is committed, the indexer generates an S2 cell covering and stores cell entries in the spatial index.
+1. **Ingestion**: During an incremental index build, the indexer generates an S2 cell covering for each `geo:wktLiteral` polygon/linestring the build covers and stores cell entries in the spatial index. (A full reindex doesn't rebuild the spatial index yet.)
 
-2. **Query**: When you query with a spatial predicate, the system:
+2. **Query** (planned): When you query with a spatial predicate, the system:
    - Generates an S2 covering for your query geometry
    - Scans the index for matching cell ranges
    - Applies bounding-box prefiltering
@@ -461,7 +471,7 @@ The S2 spatial index uses Google's S2 geometry library to map geometries to hier
 
 ### Index Configuration
 
-The S2 index is automatically created for predicates with `geo:wktLiteral` values. Configuration options:
+Incremental index builds create the S2 index for predicates with `geo:wktLiteral` values. Configuration options:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -581,12 +591,12 @@ Fluree provides two spatial query paths. Use this guide to pick the right one:
 |----------|----------|--------|
 | "Find restaurants near me" | `geof:distance` bind+filter | POINT proximity with distance ranking |
 | "Find cities within 100km" | `geof:distance` bind+filter | POINT data with radius filter |
-| "Find buildings in this district" | `idx:spatial` (within) | POLYGONs inside a boundary |
-| "Which zone contains this address?" | `idx:spatial` (contains) | POLYGON containment test |
-| "Find parcels crossing this road" | `idx:spatial` (intersects) | LINESTRING intersection |
-| "Find regions near this location" | `idx:spatial` (nearby) | POLYGONs with distance from point |
+| "Find buildings in this district" | `idx:spatial` (within), not yet available | POLYGONs inside a boundary |
+| "Which zone contains this address?" | `idx:spatial` (contains), not yet available | POLYGON containment test |
+| "Find parcels crossing this road" | `idx:spatial` (intersects), not yet available | LINESTRING intersection |
+| "Find regions near this location" | `idx:spatial` (nearby), not yet available | POLYGONs with distance from point |
 
-**Quick rule**: Use `geof:distance` bind+filter for POINT locations with radius queries. Use `idx:spatial` for polygon/linestring containment, intersection, or region-based queries.
+**Quick rule**: Use `geof:distance` bind+filter for POINT locations with radius queries. Polygon/linestring containment, intersection and region queries (`idx:spatial`) aren't available yet; see the note under [S2 Spatial Index](#s2-spatial-index-complex-geometries).
 
 ### End-to-End Example: Points and Polygons
 
@@ -650,7 +660,7 @@ This example shows storing both POINT locations and POLYGON boundaries, then que
 }
 ```
 
-**3. Find which district contains the Louvre (POLYGON containment):**
+**3. Find which district contains the Louvre (POLYGON containment; planned, not yet available):**
 ```json
 {
   "@context": {
@@ -691,7 +701,7 @@ Store regions with multiple disjoint areas (e.g., archipelagos, non-contiguous t
 }
 ```
 
-Query: "Find states that contain this coordinate"
+Query: "Find states that contain this coordinate" (planned `idx:spatial` syntax, not yet available)
 ```json
 {
   "where": [
@@ -726,7 +736,7 @@ Store routes, roads, or boundaries:
 }
 ```
 
-Query: "Find highways that cross this region"
+Query: "Find highways that cross this region" (planned `idx:spatial` syntax, not yet available)
 ```json
 {
   "where": [
@@ -829,23 +839,23 @@ The `ex:entrance` POINT is stored as a native GeoPoint, while the `ex:boundary` 
 
 ## GeoSPARQL-related support (v1)
 
-Fluree supports the GeoSPARQL `geo:wktLiteral` datatype and `geof:distance` function. Point proximity queries use a unified `geof:distance` bind+filter pattern in both JSON-LD and SPARQL. For complex geometry queries (`within`/`contains`/`intersects`/`nearby`), use the JSON-LD `idx:spatial` pattern described above.
+Fluree supports the GeoSPARQL `geo:wktLiteral` datatype and `geof:distance` function. Point proximity queries use a unified `geof:distance` bind+filter pattern in both JSON-LD and SPARQL. Complex geometry queries (`within`/`contains`/`intersects`/`nearby`) aren't available yet: the `idx:spatial` pattern described above isn't supported by any query surface.
 
 | Feature | Status |
 |---------|--------|
 | `geo:wktLiteral` datatype | ✅ Supported |
 | POINT geometry | ✅ Native encoding (60-bit packed) |
-| LINESTRING geometry | ✅ S2 spatial index |
-| POLYGON geometry | ✅ S2 spatial index |
-| MULTIPOLYGON geometry | ✅ S2 spatial index |
+| LINESTRING geometry | ✅ Stored and read back; S2 index written by incremental builds, not yet queryable |
+| POLYGON geometry | ✅ Stored and read back; S2 index written by incremental builds, not yet queryable |
+| MULTIPOLYGON geometry | ✅ Stored and read back; S2 index written by incremental builds, not yet queryable |
 | `geo:asWKT` property | ✅ Use any property with wktLiteral type |
 | `geof:distance` function | ✅ Supported (haversine, ~0.3% accuracy) |
 | Proximity queries (radius) | ✅ Index-accelerated via geof:distance bind+filter |
 | Time travel | ✅ Support via `from: "<ledger>@t:<t>"` |
 | k-NN queries (nearest K) | ✅ Via ORDER BY distance + LIMIT |
-| `within` spatial predicate | ✅ Via JSON-LD `idx:spatial` |
-| `contains` spatial predicate | ✅ Via JSON-LD `idx:spatial` |
-| `intersects` spatial predicate | ✅ Via JSON-LD `idx:spatial` |
+| `within` spatial predicate | 🔜 Planned (`idx:spatial` not yet supported) |
+| `contains` spatial predicate | 🔜 Planned (`idx:spatial` not yet supported) |
+| `intersects` spatial predicate | 🔜 Planned (`idx:spatial` not yet supported) |
 | Spatial join (two variables) | 🔜 Planned (R-tree) |
 
 ## Best Practices
@@ -913,27 +923,19 @@ Invalid coordinates are stored as strings and won't benefit from native GeoPoint
 { "@id": "?place", "ex:geo": "?loc" }         // Wrong - different predicate
 ```
 
-For S2 spatial queries, `idx:property` must also match:
-```json
-"idx:property": "ex:boundary"    // Correct
-"idx:property": "ex:geo"         // Wrong - different predicate
-```
+### An `idx:spatial` query returns no results
 
-### "No spatial index available" error
+The `idx:spatial` pattern isn't supported yet (see [S2 Spatial Index](#s2-spatial-index-complex-geometries)): it's read as ordinary triple patterns, which match nothing.
 
-The spatial index is built asynchronously after commits. If querying immediately after insert:
-- Wait for background indexing to complete, or
-- Use `from: "<ledger>@t:<t>"` to query up to the indexed `t`
+### Large polygons produce large coverings
 
-### Large polygons cause slow queries
-
-Polygons crossing the antimeridian (±180° longitude) generate many S2 cells. Consider:
+Polygons crossing the antimeridian (±180° longitude) generate many S2 cells when indexed. Consider:
 - Splitting the polygon at the antimeridian
-- Using a simpler bounding region for initial filtering
+- Using a simpler bounding region
 
-### SPARQL spatial predicates not accelerated
+### SPARQL spatial predicates
 
-In v1, SPARQL `geof:*` spatial predicates (like `geof:sfWithin`) evaluate as filters, not index operators. For accelerated spatial queries on complex geometries, use the JSON-LD `idx:spatial` pattern instead. Note: `geof:distance` bind+filter patterns **are** automatically accelerated in both SPARQL and JSON-LD.
+SPARQL implements `geof:distance` only. Other GeoSPARQL functions, such as `geof:sfWithin`, aren't implemented, and a query that calls one reports an unknown function. `geof:distance` bind+filter patterns **are** automatically accelerated in both SPARQL and JSON-LD.
 
 ## Related Documentation
 
