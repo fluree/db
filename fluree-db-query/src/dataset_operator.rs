@@ -35,7 +35,7 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::ir::triple::TriplePattern;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
+use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm, TermDicts};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState, RowFact};
 use crate::sort::SortSpec;
@@ -234,15 +234,45 @@ pub(crate) fn union_dedups_on_fact_identity(members: usize, mode: TemporalMode) 
 /// it forgoes the per-member count-only shortcut (surfaced to EXPLAIN via
 /// `plan_details.default_union_set_merge`).
 struct BatchDeduper {
-    seen: HashMap<FactRow, (), FxBuildHasher>,
+    seen: HashMap<UnionFact, (), FxBuildHasher>,
     norm: Option<EqualityNorm>,
 }
 
-/// A union row's dedup key: its normalized bindings and the fact it matched.
+/// One fact of a default graph of several graphs: storage's identity, one
+/// fact per value and list position. It is a row's bindings, normalized so a
+/// late-materialized term and its decoded twin are one, plus the fact the
+/// row's scan says it matched ([`RowFact`]: a constant object's matched term,
+/// and the list position).
+///
+/// Every reader that collapses a union's rows keys on this, so they cannot
+/// disagree about what one fact is: [`BatchDeduper`] for the general plan,
+/// and the nested-loop join's union probes.
 #[derive(PartialEq, Eq, Hash)]
-struct FactRow {
+pub(crate) struct UnionFact {
     bindings: Vec<Binding>,
     fact: Option<RowFact>,
+}
+
+impl UnionFact {
+    /// The fact a row with `bindings` matched, `fact` being what its scan
+    /// recorded, normalized through `dicts` and `gv` ([`EqualityNorm::parts`]).
+    pub(crate) fn of<'b>(
+        bindings: impl IntoIterator<Item = &'b Binding>,
+        fact: Option<&RowFact>,
+        dicts: Option<TermDicts<'_>>,
+        gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Self {
+        Self {
+            bindings: bindings
+                .into_iter()
+                .map(|b| normalize_for_key(b, dicts, gv))
+                .collect(),
+            fact: fact.map(|f| RowFact {
+                object: f.object.as_ref().map(|o| normalize_for_key(o, dicts, gv)),
+                list_index: f.list_index,
+            }),
+        }
+    }
 }
 
 impl BatchDeduper {
@@ -263,24 +293,12 @@ impl BatchDeduper {
             ));
         }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
-        let normalized_fact = |row: usize| -> Option<RowFact> {
-            facts.map(|f| RowFact {
-                object: f[row]
-                    .object
-                    .as_ref()
-                    .map(|o| normalize_for_key(o, dicts, gv)),
-                list_index: f[row].list_index,
-            })
-        };
         // A ground (all-constant) pattern emits the empty solution mapping
         // with no columns: one solution per fact it matched.
         if batch.schema().is_empty() {
             let mut kept = 0;
             for row in 0..batch.len() {
-                let key = FactRow {
-                    bindings: Vec::new(),
-                    fact: normalized_fact(row),
-                };
+                let key = UnionFact::of([], facts.map(|f| &f[row]), dicts, gv);
                 if self.seen.insert(key, ()).is_none() {
                     kept += 1;
                 }
@@ -290,12 +308,12 @@ impl BatchDeduper {
         let num_cols = batch.schema().len();
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
         for row_idx in 0..batch.len() {
-            let key = FactRow {
-                bindings: (0..num_cols)
-                    .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), dicts, gv))
-                    .collect(),
-                fact: normalized_fact(row_idx),
-            };
+            let key = UnionFact::of(
+                (0..num_cols).map(|col| batch.get_by_col(row_idx, col)),
+                facts.map(|f| &f[row_idx]),
+                dicts,
+                gv,
+            );
             let mut h = FxHasher::default();
             key.hash(&mut h);
             let hash = h.finish();
