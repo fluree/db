@@ -360,7 +360,12 @@ async fn scope_of(fluree: &Fluree, spec: &DatasetSpec) -> Vec<String> {
 async fn from_several_graphs_shares_one_load_of_the_ledger() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().to_string();
-    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+    // No background indexing: it would index the write below before the
+    // query reads it, and the "novelty in g2" row would see none.
+    let fluree = FlureeBuilder::file(path.clone())
+        .without_indexing()
+        .build()
+        .expect("build");
     let handle = indexed(&fluree, LEDGER, TRIG).await;
     let mut failures: Vec<String> = Vec::new();
     let mut expect = |label: &str, got: Vec<String>, want: &str| {
@@ -395,6 +400,7 @@ async fn from_several_graphs_shares_one_load_of_the_ledger() {
 
     let uncached = FlureeBuilder::file(path)
         .without_ledger_caching()
+        .without_indexing()
         .build()
         .expect("build uncached");
     expect(
