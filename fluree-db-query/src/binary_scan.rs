@@ -36,7 +36,7 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
-use crate::operator::{Operator, OperatorState};
+use crate::operator::{Operator, OperatorState, RowFact};
 use crate::policy::QueryPolicyEnforcer;
 use crate::sid_iri;
 use crate::stats_cache::cached_stats_view_for_db;
@@ -242,6 +242,10 @@ pub struct BinaryScanOperator {
     /// `mode == Current`, it is constructed by `ScanDatasetBuilder` directly
     /// and emits current-state bindings without the `op` channel.
     mode: crate::temporal_mode::TemporalMode,
+    /// The fact each row of the batch being built matched, when a union of
+    /// graphs that deduplicates on fact identity armed recording
+    /// ([`Operator::record_row_facts`]).
+    row_facts: Option<Vec<RowFact>>,
 }
 
 /// A filter that can be evaluated on encoded index columns (no term decoding).
@@ -757,7 +761,14 @@ impl BinaryScanOperator {
             range_dt: None,
             unresolved_bound_subject_iri: None,
             mode,
+            row_facts: None,
         }
+    }
+
+    /// Whether the pattern's object is a constant literal, the one position
+    /// a constant can match several terms at.
+    fn object_is_constant_literal(&self) -> bool {
+        matches!(&self.pattern.o, Term::Value(v) if !matches!(v, FlakeValue::Ref(_)))
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -926,6 +937,15 @@ impl BinaryScanOperator {
 
             for (col, binding) in columns.iter_mut().zip(bindings) {
                 col.push(binding);
+            }
+            if self.row_facts.is_some() {
+                let object = self
+                    .object_is_constant_literal()
+                    .then(|| flake_object_binding(&flake));
+                let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
+                if let Some(facts) = self.row_facts.as_mut() {
+                    facts.push(RowFact { object, list_index });
+                }
             }
             produced += 1;
         }
@@ -1501,6 +1521,17 @@ impl BinaryScanOperator {
                 }
             }
 
+            // The matched object a recorded fact names: a constant literal
+            // can match terms of several datatypes.
+            let fact_object = if self.row_facts.is_some() && self.object_is_constant_literal() {
+                Some(match &decoded_o {
+                    Some(val) => val.clone(),
+                    None => decode_value(o_type, o_key, p_id)?,
+                })
+            } else {
+                None
+            };
+
             bindings.clear();
             bindings.resize(base_len, Binding::Unbound);
 
@@ -1582,10 +1613,40 @@ impl BinaryScanOperator {
             for (i, binding) in bindings.drain(..).enumerate() {
                 columns[i].push(binding);
             }
+            if self.row_facts.is_some() {
+                let object = fact_object.map(|val| {
+                    materialized_object_binding(self.store(), o_type, p_id, val, None, None)
+                });
+                let list_index = (o_i != u32::MAX).then_some(o_i);
+                if let Some(facts) = self.row_facts.as_mut() {
+                    facts.push(RowFact { object, list_index });
+                }
+            }
             produced += 1;
         }
 
         Ok(produced)
+    }
+}
+
+/// A decoded flake's object as the scan binds it, without its `t`: the
+/// matched object of a recorded fact ([`RowFact`]).
+fn flake_object_binding(flake: &Flake) -> Binding {
+    match &flake.o {
+        FlakeValue::Ref(r) => Binding::sid(r.clone()),
+        v => {
+            let dtc = match flake.m.as_ref().and_then(|m| m.lang.as_ref()) {
+                Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang.as_str())),
+                None => DatatypeConstraint::Explicit(flake.dt.clone()),
+            };
+            Binding::Lit {
+                val: v.clone(),
+                dtc,
+                t: None,
+                op: None,
+                p_id: None,
+            }
+        }
     }
 }
 
@@ -2066,6 +2127,15 @@ fn repeated_var_flags(pattern: &TriplePattern) -> (bool, bool, bool) {
 impl Operator for BinaryScanOperator {
     fn schema(&self) -> &[VarId] {
         &self.schema
+    }
+
+    fn record_row_facts(&mut self) -> bool {
+        self.row_facts = Some(Vec::new());
+        true
+    }
+
+    fn take_row_facts(&mut self) -> Option<Vec<RowFact>> {
+        self.row_facts.as_mut().map(std::mem::take)
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
@@ -2999,6 +3069,9 @@ impl Operator for BinaryScanOperator {
         let mut columns: Vec<Vec<Binding>> = (0..num_vars)
             .map(|_| Vec::with_capacity(batch_size))
             .collect();
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.clear();
+        }
 
         // Residency mode: handle a store's ContentStore + retry budget for
         // the drain/fetch/retry arm in the cursor loop below.
