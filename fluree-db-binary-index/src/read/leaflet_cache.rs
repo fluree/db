@@ -1854,6 +1854,15 @@ mod tests {
         );
         cache.pool().invalidate(&CacheKey::DictLeaf(5));
         cache.pool().run_pending_tasks();
+        // moka's map frees what it removes once every thread in the process
+        // has left the epoch it was removed in, which other tests can delay.
+        for _ in 0..10_000 {
+            if Arc::strong_count(&bytes) == 1 {
+                break;
+            }
+            crossbeam_epoch::pin().flush();
+            std::thread::yield_now();
+        }
         assert_eq!(Arc::strong_count(&bytes), 1, "nothing else holds it");
     }
 

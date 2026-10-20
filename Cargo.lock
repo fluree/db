@@ -3122,6 +3122,7 @@ dependencies = [
  "bigdecimal 0.4.10",
  "chrono",
  "ciborium",
+ "crossbeam-epoch",
  "fluree-db-core",
  "fluree-db-spatial",
  "fluree-vocab",

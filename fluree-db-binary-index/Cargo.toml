@@ -58,6 +58,7 @@ rust-stemmers = "1.2"
 
 [dev-dependencies]
 async-trait.workspace = true
+crossbeam-epoch = "0.9"
 tracing-subscriber.workspace = true
 
 [lints]
