@@ -630,6 +630,9 @@ mod inner {
         named_graphs: Vec<(Sid, NamedGraphUse)>,
         /// Graph SID -> index into `named_graphs`.
         named_graph_slots: HashMap<Sid, usize>,
+        /// The graph term the last quad named, and its slot: a producer names
+        /// one graph for a run of statements.
+        last_graph: Option<(TermId, usize)>,
     }
 
     /// A named graph an [`ImportSink`] wrote statements to (JSON-LD `@graph`
@@ -686,6 +689,7 @@ mod inner {
                 spool_ctx: None,
                 named_graphs: Vec::new(),
                 named_graph_slots: HashMap::new(),
+                last_graph: None,
             })
         }
 
@@ -711,6 +715,7 @@ mod inner {
                 spool_ctx: None,
                 named_graphs: Vec::new(),
                 named_graph_slots: HashMap::new(),
+                last_graph: None,
             })
         }
 
@@ -813,10 +818,16 @@ mod inner {
         /// The `named_graphs` slot of the graph `graph` names, registered on
         /// first use.
         fn named_graph_slot(&mut self, graph: TermId) -> Result<usize, SinkError> {
+            if let Some((last, slot)) = self.last_graph {
+                if last == graph {
+                    return Ok(slot);
+                }
+            }
             let Some(sid) = self.resolve_sid(graph) else {
                 return Err(SinkError::rejected("a graph name must be an IRI"));
             };
             if let Some(&slot) = self.named_graph_slots.get(&sid) {
+                self.last_graph = Some((graph, slot));
                 return Ok(slot);
             }
             let iri = self.ns.iri_for_sid(&sid).ok_or_else(|| {
@@ -828,6 +839,7 @@ mod inner {
             self.named_graphs
                 .push((sid.clone(), NamedGraphUse { iri, g_id: None }));
             self.named_graph_slots.insert(sid, slot);
+            self.last_graph = Some((graph, slot));
             Ok(slot)
         }
 

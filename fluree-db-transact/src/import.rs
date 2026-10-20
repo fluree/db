@@ -1339,22 +1339,12 @@ mod inner {
             .map_err(|e| TransactError::Parse(format!("JSON-LD expand error: {e}")))?;
 
         // Graph names resolve against the top-level `@context`, parsed only
-        // for a document that names a graph, and each name once. A refusal
-        // keeps its own error.
-        use fluree_graph_json_ld::adapter::GraphNameRef;
+        // for a document that names a graph (the adapter asks once per
+        // name). A refusal keeps its own error.
         let mut graph_context: Option<fluree_graph_json_ld::ParsedContext> = None;
-        let mut resolved_selectors: HashMap<String, Option<String>> = HashMap::new();
-        let mut resolved_named_graphs: HashMap<String, Option<String>> = HashMap::new();
         let mut refusal: Option<TransactError> = None;
         let converted =
             fluree_graph_json_ld::adapter::to_graph_events_scoped(&expanded, &mut sink, |name| {
-                let (resolved_names, raw) = match name {
-                    GraphNameRef::Selector(raw) => (&mut resolved_selectors, raw),
-                    GraphNameRef::NamedGraph(raw) => (&mut resolved_named_graphs, raw),
-                };
-                if let Some(graph) = resolved_names.get(raw) {
-                    return Ok(graph.clone());
-                }
                 let resolved = match graph_context.take() {
                     Some(context) => Ok(context),
                     None => crate::parse::edge_annotations::top_level_context(&doc),
@@ -1363,9 +1353,6 @@ mod inner {
                     let graph = import_graph_name(name, &context, ledger_id);
                     graph_context = Some(context);
                     graph
-                })
-                .inspect(|graph| {
-                    resolved_names.insert(raw.to_string(), graph.clone());
                 });
                 resolved.map_err(|e| {
                     let message = e.to_string();

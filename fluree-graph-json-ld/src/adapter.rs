@@ -61,6 +61,7 @@ use crate::is_keyword_form;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
 use fluree_vocab::{rdf, reifies_iris};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Strip `_:` prefix from blank node label if present
@@ -170,7 +171,12 @@ where
     S: GraphSink,
     F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
 {
-    let mut walk = Walk { sink, resolve };
+    let mut walk = Walk {
+        sink,
+        resolve,
+        selectors: HashMap::new(),
+        named_graphs: HashMap::new(),
+    };
     match expanded {
         Value::Array(arr) => {
             for item in arr {
@@ -194,6 +200,12 @@ where
 struct Walk<'s, S, F> {
     sink: &'s mut S,
     resolve: F,
+    /// The scope each graph name opened, by name as written: a document
+    /// names few graphs, often on every node. A term stays valid for the
+    /// whole walk (producers may keep IRI terms across statements, and the
+    /// walk ends none).
+    selectors: HashMap<String, Scope>,
+    named_graphs: HashMap<String, Scope>,
 }
 
 impl<S, F> Walk<'_, S, F>
@@ -203,15 +215,29 @@ where
 {
     /// The scope a graph name opens.
     fn open(&mut self, name: GraphNameRef<'_>) -> Result<Scope> {
-        let Some(iri) = (self.resolve)(name)? else {
-            return Ok(Scope::Default);
+        let (opened, raw) = match name {
+            GraphNameRef::Selector(raw) => (&self.selectors, raw),
+            GraphNameRef::NamedGraph(raw) => (&self.named_graphs, raw),
         };
-        if !self.sink.supports_quads() {
-            return Err(AdapterError::Unsupported(format!(
-                "graph <{iri}>: this sink cannot write named graphs"
-            )));
+        if let Some(&scope) = opened.get(raw) {
+            return Ok(scope);
         }
-        Ok(Scope::Named(self.sink.term_iri(&iri)))
+        let scope = match (self.resolve)(name)? {
+            None => Scope::Default,
+            Some(iri) => {
+                if !self.sink.supports_quads() {
+                    return Err(AdapterError::Unsupported(format!(
+                        "graph <{iri}>: this sink cannot write named graphs"
+                    )));
+                }
+                Scope::Named(self.sink.term_iri(&iri))
+            }
+        };
+        match name {
+            GraphNameRef::Selector(_) => self.selectors.insert(raw.to_string(), scope),
+            GraphNameRef::NamedGraph(_) => self.named_graphs.insert(raw.to_string(), scope),
+        };
+        Ok(scope)
     }
 
     /// Emit one statement in `scope`.
