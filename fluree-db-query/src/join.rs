@@ -110,21 +110,19 @@ impl GroupedCountDrain {
 }
 
 /// Prepared per-leaf inputs shared by the batched probe paths and the range
-/// semijoin walk. Owns the leaf blob, decoded header/dir, the leaf-id hash,
-/// and the optional sidecar bytes; [`LeafScan::load_leaflet`] reads one
-/// leaflet from them.
+/// semijoin walk: the opened leaf and its leaf-id hash.
+/// [`LeafScan::load_leaflet`] reads one leaflet through it, so a leaflet the
+/// cache holds decoded is served without reading the leaf at all.
 pub(crate) struct LeafScan {
-    pub(crate) leaf_bytes: fluree_db_core::ContentBytes,
-    pub(crate) header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
-    pub(crate) dir: Arc<fluree_db_binary_index::format::leaf::DecodedLeafDirV3>,
-    pub(crate) leaf_id: u128,
-    /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
-    /// leaflet alone is authoritative); always fetched when `need_replay`
-    /// is true so `replay_leaflet_at_t` can reconstruct historical state.
-    pub(crate) sidecar_bytes: Option<fluree_db_core::ContentBytes>,
+    handle: Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>,
+    leaf_id: u128,
 }
 
 impl LeafScan {
+    pub(crate) fn dir(&self) -> &fluree_db_binary_index::format::leaf::DecodedLeafDirV3 {
+        self.handle.dir()
+    }
+
     /// Load one leaflet's `proj` columns, through the store's leaflet cache
     /// when it has one, and replay it to `replay_to` on a historical read. An
     /// empty-after-retract leaflet starts empty so the replay can rebuild it.
@@ -136,10 +134,11 @@ impl LeafScan {
         replay_to: Option<i64>,
     ) -> Result<fluree_db_binary_index::ColumnBatch> {
         use fluree_db_binary_index::read::column_loader::{
-            load_leaflet_columns, load_leaflet_columns_cached, LeafletDecodeSpec,
+            load_columns_cached_via_handle, LeafletDecodeSpec,
         };
 
-        let entry = &self.dir.entries[leaflet_idx];
+        let dir = self.handle.dir();
+        let entry = &dir.entries[leaflet_idx];
         let batch = if entry.row_count == 0 {
             fluree_db_binary_index::ColumnBatch::empty()
         } else {
@@ -150,36 +149,24 @@ impl LeafScan {
                         leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
                             QueryError::Internal("leaflet idx exceeds u32".to_string())
                         })?,
-                        order: self.header.order,
+                        order: dir.order,
                         decode_set: proj.effective(),
                     };
-                    load_leaflet_columns_cached(
-                        &self.leaf_bytes,
-                        entry,
-                        self.dir.payload_base,
-                        cache,
-                        spec,
-                    )
+                    load_columns_cached_via_handle(self.handle.as_ref(), cache, spec)
                 }
-                None => load_leaflet_columns(
-                    &self.leaf_bytes,
-                    entry,
-                    self.dir.payload_base,
-                    proj,
-                    self.header.order,
-                ),
+                None => self.handle.load_columns(leaflet_idx, proj, dir.order),
             }
             .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
         };
         let Some(to_t) = replay_to else {
             return Ok(batch);
         };
-        let replayed = fluree_db_binary_index::replay_leaflet_at_t(
+        let replayed = fluree_db_binary_index::replay_leaflet_at_t_with(
             &batch,
             entry,
-            self.sidecar_bytes.as_deref(),
             to_t,
-            self.header.order,
+            dir.order,
+            || self.handle.load_sidecar_segment(leaflet_idx),
         )
         .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?;
         Ok(replayed.unwrap_or(batch))
@@ -260,39 +247,15 @@ pub(crate) fn prepare_leaf_for_scan(
     leaf_entry: &fluree_db_binary_index::format::branch::LeafEntry,
     need_replay: bool,
 ) -> Result<LeafScan> {
-    use fluree_db_binary_index::format::leaf::{
-        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
-    };
-
-    let leaf_bytes = store
-        .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
-        .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
-    let sidecar_bytes = if need_replay {
-        store
-            .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
-            .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
-    } else {
-        None
-    };
-    let header = decode_leaf_header_v3(&leaf_bytes)
-        .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
+    let handle = store
+        .open_leaf_handle(
+            &leaf_entry.leaf_cid,
+            leaf_entry.sidecar_cid.as_ref(),
+            need_replay,
+        )
+        .map_err(|e| QueryError::Internal(format!("open leaf: {e}")))?;
     let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
-    // Shared with every other reader of this leaf; a directory decode is
-    // O(leaflets) and this runs once per leaf per probe.
-    let decode = || decode_leaf_dir_v3_with_base(&leaf_bytes, &header).map(Arc::new);
-    let dir = match store.leaflet_cache() {
-        Some(cache) => cache.try_get_or_load_leaf_dir(leaf_id, decode),
-        None => decode(),
-    }
-    .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
-
-    Ok(LeafScan {
-        leaf_bytes,
-        header,
-        dir,
-        leaf_id,
-        sidecar_bytes,
-    })
+    Ok(LeafScan { handle, leaf_id })
 }
 
 /// The row range of `p_id` in a PSOT leaflet; the whole leaflet when it holds
@@ -2327,7 +2290,7 @@ impl NestedLoopJoinOperator {
         for leaf_idx in leaf_range {
             ctx.check_cancelled()?;
             let leaf = prepare_leaf_for_scan(store, &branch.leaves[leaf_idx], false)?;
-            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+            for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
                 if entry.row_count == 0 {
                     continue;
                 }
@@ -2435,7 +2398,7 @@ impl NestedLoopJoinOperator {
             let leaf_entry = &branch.leaves[leaf_idx];
             let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+            for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
                 ctx.check_cancelled()?;
                 leaflets_scanned += 1;
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
@@ -3441,7 +3404,7 @@ pub(crate) fn for_each_object_probe_match(
         let leaf_entry = &branch.leaves[leaf_idx];
         let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+        for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
             ctx.check_cancelled()?;
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
@@ -3707,7 +3670,7 @@ fn pooled_subject_probe(
     for leaf_idx in leaf_range {
         ctx.check_cancelled()?;
         let leaf = prepare_leaf_for_scan(store, &branch.leaves[leaf_idx], false)?;
-        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+        for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
             if entry.row_count == 0 {
                 continue;
             }
@@ -3884,7 +3847,7 @@ fn batched_subject_probe_binary_uncharged(
         let leaf_entry = &branch.leaves[leaf_idx];
         let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+        for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
             ctx.check_cancelled()?;
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
@@ -4107,7 +4070,7 @@ fn batched_subject_star_spot_uncharged(
         let leaf_entry = &branch.leaves[leaf_idx];
         let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
-        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+        for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {

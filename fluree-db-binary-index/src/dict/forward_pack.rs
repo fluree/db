@@ -78,7 +78,7 @@ pub struct PackHeader {
 }
 
 impl PackHeader {
-    fn decode(data: &[u8]) -> io::Result<Self> {
+    pub(crate) fn decode(data: &[u8]) -> io::Result<Self> {
         if data.len() < PACK_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -140,7 +140,7 @@ pub struct PageDirEntry {
 }
 
 impl PageDirEntry {
-    fn decode(data: &[u8]) -> Self {
+    pub(crate) fn decode(data: &[u8]) -> Self {
         Self {
             page_first_id: u64::from_le_bytes(data[0..8].try_into().unwrap()),
             entry_count: u32::from_le_bytes(data[8..12].try_into().unwrap()),
@@ -325,29 +325,54 @@ pub(crate) struct ParsedPackMeta {
 /// - Non-ascending / overlapping page ID ranges
 pub(crate) fn parse_pack_meta(data: &[u8]) -> io::Result<ParsedPackMeta> {
     let header = PackHeader::decode(data)?;
+    let dir = page_dir_range(&header, data.len() as u64)?;
+    parse_pack_meta_parts(
+        &header,
+        &data[dir.start as usize..dir.end as usize],
+        data.len() as u64,
+    )
+}
 
-    let dir_offset = header.page_dir_offset as usize;
-    let dir_size = header.page_count as usize * PAGE_DIR_ENTRY_SIZE;
+/// Where a pack's page directory lies, checked against the pack's length.
+pub(crate) fn page_dir_range(
+    header: &PackHeader,
+    pack_len: u64,
+) -> io::Result<std::ops::Range<u64>> {
+    let dir_offset = header.page_dir_offset;
+    let dir_size = u64::from(header.page_count) * PAGE_DIR_ENTRY_SIZE as u64;
     let dir_end = dir_offset
         .checked_add(dir_size)
         .ok_or_else(|| io::Error::other("pack: directory offset overflow"))?;
 
-    if dir_end > data.len() {
+    if dir_end > pack_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "pack: page directory at offset {} (size {}) exceeds pack length {}",
-                dir_offset,
-                dir_size,
-                data.len()
+                "pack: page directory at offset {dir_offset} (size {dir_size}) exceeds pack length {pack_len}",
             ),
         ));
     }
+    Ok(dir_offset..dir_end)
+}
 
+/// [`parse_pack_meta`] from the header, the directory's bytes (see
+/// [`page_dir_range`]) and the pack's length, for a pack read by range.
+pub(crate) fn parse_pack_meta_parts(
+    header: &PackHeader,
+    dir_bytes: &[u8],
+    pack_len: u64,
+) -> io::Result<ParsedPackMeta> {
+    if dir_bytes.len() != header.page_count as usize * PAGE_DIR_ENTRY_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pack: page directory length does not match its page count",
+        ));
+    }
     let mut directory = Vec::with_capacity(header.page_count as usize);
     for i in 0..header.page_count as usize {
-        let entry_offset = dir_offset + i * PAGE_DIR_ENTRY_SIZE;
-        let entry = PageDirEntry::decode(&data[entry_offset..entry_offset + PAGE_DIR_ENTRY_SIZE]);
+        let entry_offset = i * PAGE_DIR_ENTRY_SIZE;
+        let entry =
+            PageDirEntry::decode(&dir_bytes[entry_offset..entry_offset + PAGE_DIR_ENTRY_SIZE]);
 
         // Reject empty pages — entry_count==0 causes underflow in ID range math.
         if entry.entry_count == 0 {
@@ -370,16 +395,13 @@ pub(crate) fn parse_pack_meta(data: &[u8]) -> io::Result<ParsedPackMeta> {
         }
 
         // Validate page bounds.
-        let page_end = entry.page_offset as usize + entry.page_len as usize;
-        if page_end > data.len() {
+        let page_end = u64::from(entry.page_offset) + u64::from(entry.page_len);
+        if page_end > pack_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "pack: page {} at offset {} (len {}) exceeds pack length {}",
-                    i,
-                    entry.page_offset,
-                    entry.page_len,
-                    data.len()
+                    i, entry.page_offset, entry.page_len, pack_len
                 ),
             ));
         }
@@ -436,7 +458,7 @@ pub(crate) fn lookup_in_pack<'a>(
 }
 
 /// Binary search a page directory for the page containing `id`.
-fn find_page_in_dir(directory: &[PageDirEntry], id: u64) -> Option<usize> {
+pub(crate) fn find_page_in_dir(directory: &[PageDirEntry], id: u64) -> Option<usize> {
     let idx = directory.partition_point(|d| d.page_first_id <= id);
     if idx == 0 {
         return None;
@@ -531,7 +553,7 @@ impl<'a> ForwardPack<'a> {
 impl<'a> ForwardPage<'a> {
     /// Lightweight parse that skips validation (used internally by `ForwardPack`
     /// and `lookup_in_pack` which already validated directory bounds).
-    fn from_bytes_unchecked(data: &'a [u8], first_id: u64) -> Self {
+    pub(crate) fn from_bytes_unchecked(data: &'a [u8], first_id: u64) -> Self {
         let entry_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let offsets_start = 4;
         let data_start = offsets_start + (entry_count as usize + 1) * 4;

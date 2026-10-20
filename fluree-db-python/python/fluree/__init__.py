@@ -56,6 +56,7 @@ from fluree._rdf import RdfFormat, parse, serialize
 from fluree._terms import IRI, BlankNode, LangString, Literal, Quad, Triple, Vector
 from fluree.errors import (
     ConflictError,
+    DatabaseInUseError,
     FlureeError,
     InvalidRequestError,
     NotFoundError,
@@ -79,6 +80,7 @@ __all__ = [
     "Conflict",
     "ConflictError",
     "Connection",
+    "DatabaseInUseError",
     "EnvVar",
     "FlureeError",
     "FullText",

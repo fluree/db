@@ -11,6 +11,7 @@ use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_query::{Batch, Binding, VarId};
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use once_cell::sync::Lazy;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -80,6 +81,11 @@ pub struct FlakeGenerator<'a> {
     /// Graph-variable resolutions keyed by the bound Sid, so a Sid-bound `?g`
     /// rebuilds and validates its IRI once per graph, not once per row.
     sid_graphs: HashMap<Sid, Sid>,
+
+    /// Canonical Sids of the fallback-encoded IRIs written so far, keyed by
+    /// the IRI (the fallback Sid's name), so each is re-encoded once per
+    /// transaction, not once per flake.
+    canonical_sids: FxHashMap<Arc<str>, Sid>,
 }
 
 impl<'a> FlakeGenerator<'a> {
@@ -98,7 +104,15 @@ impl<'a> FlakeGenerator<'a> {
             written_graphs: HashMap::new(),
             graph_aliases: HashMap::new(),
             sid_graphs: HashMap::new(),
+            canonical_sids: FxHashMap::default(),
         }
+    }
+
+    /// `sid`'s IRI, decoded with the transaction's namespace codes: the
+    /// ledger's and the ones the transaction has allocated.
+    pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
+        let prefix = self.ns_registry.get_prefix(sid.namespace_code)?;
+        Some(format!("{prefix}{}", sid.name))
     }
 
     /// Set the WHERE dataset's alias names and the canonical IRI each resolves
@@ -119,6 +133,32 @@ impl<'a> FlakeGenerator<'a> {
         let sid = self.ns_registry.sid_for_iri(iri);
         self.written_graphs.insert(iri.to_string(), sid.clone());
         sid
+    }
+
+    /// Put `sid` under its canonical namespace code. A WHERE constant whose
+    /// namespace the ledger has not registered lowers to the encoder's
+    /// fallback, `Sid(EMPTY, iri)`; it is re-encoded through the
+    /// transaction's registry, which gives the namespace its code, as a
+    /// template naming the IRI would. Every other Sid is already canonical.
+    #[inline]
+    fn canonicalize(&mut self, sid: &mut Sid) {
+        if sid.namespace_code == fluree_vocab::namespaces::EMPTY {
+            *sid = self.canonical_sid(sid);
+        }
+    }
+
+    /// The canonical Sid for the fallback-encoded `sid`, re-encoded on its
+    /// IRI's first write in the transaction and cached: a hit clones the
+    /// cached Sid, a refcount bump.
+    #[cold]
+    fn canonical_sid(&mut self, sid: &Sid) -> Sid {
+        if let Some(canonical) = self.canonical_sids.get(&*sid.name) {
+            return canonical.clone();
+        }
+        let canonical = self.ns_registry.sid_for_iri(&sid.name);
+        self.canonical_sids
+            .insert(Arc::clone(&sid.name), canonical.clone());
+        canonical
     }
 
     /// Set the global solution index of the next batch's first row, so blank
@@ -244,10 +284,23 @@ impl<'a> FlakeGenerator<'a> {
         };
 
         // If any component is None (unbound variable), skip this flake
-        let (s, p, o, dt) = match (s, p, o, dt) {
+        let (mut s, mut p, mut o, mut dt) = match (s, p, o, dt) {
             (Some(s), Some(p), Some(o), Some(dt)) => (s, p, o, dt),
             _ => return Ok(None),
         };
+
+        // An assertion stores every IRI under its canonical namespace code,
+        // whichever path bound it, so one IRI is never stored under two Sids.
+        // A retraction keeps the Sid it was bound to: it must match the flake
+        // as stored.
+        if op {
+            self.canonicalize(&mut s);
+            self.canonicalize(&mut p);
+            if let FlakeValue::Ref(sid) = &mut o {
+                self.canonicalize(sid);
+            }
+            self.canonicalize(&mut dt);
+        }
 
         // Late hard guard for storage invariants: catches (FlakeValue, dt)
         // mis-pairings (e.g. scalar object key with VECTOR_ID datatype) before

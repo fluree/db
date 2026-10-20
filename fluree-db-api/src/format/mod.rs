@@ -376,6 +376,7 @@ pub fn format_results(
     }
 
     // SELECT query dispatch
+    let _units = fluree_db_binary_index::UnitMemoScope::enter();
     match config.format {
         OutputFormat::JsonLd => jsonld::format(result, &compactor, config),
         OutputFormat::SparqlJson => sparql::format(result, &compactor, config),
@@ -435,6 +436,7 @@ fn stream_json(
     compactor: &IriCompactor,
     config: &FormatterConfig,
 ) -> Result<String> {
+    let _units = fluree_db_binary_index::UnitMemoScope::enter();
     match config.format {
         OutputFormat::JsonLd => jsonld::format_string(result, compactor, config),
         OutputFormat::SparqlJson => sparql::format_string(result, compactor, config),
@@ -611,6 +613,7 @@ pub async fn format_results_async(
     }
 
     // SELECT query dispatch (sync formatters)
+    let _units = fluree_db_binary_index::UnitMemoScope::enter();
     match config.format {
         OutputFormat::JsonLd => jsonld::format(result, &compactor, config),
         OutputFormat::SparqlJson => sparql::format(result, &compactor, config),

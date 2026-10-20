@@ -168,6 +168,8 @@ pub fn format_string_for(
     snapshot: &LedgerSnapshot,
     config: &FormatterConfig,
 ) -> Result<String> {
+    // Rows reach the dictionaries in order; reuse the units they land in.
+    let _units = fluree_db_binary_index::UnitMemoScope::enter();
     let delimiter = Delimiter::from_format(config.format).ok_or_else(|| {
         FormatError::InvalidBinding(format!("{:?} is not a delimited format", config.format))
     })?;

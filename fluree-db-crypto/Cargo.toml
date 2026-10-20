@@ -23,6 +23,8 @@ hex = { workspace = true }
 # - aes-gcm 0.10.3: AES-256-GCM authenticated encryption
 # - rand_core 0.6.4: Crypto-grade RNG (OsRng via getrandom)
 aes-gcm = "0.10"
+# Per-object keys for segmented envelopes
+hkdf = "0.12"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Secret handling with automatic zeroization

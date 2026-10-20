@@ -588,7 +588,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                transaction_receipt_from(idempotency_key, receipt)
+                transaction_receipt_from(idempotency_key, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -638,7 +638,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                revert_receipt_from(idempotency_key, branch, strategy, receipt)
+                revert_receipt_from(idempotency_key, branch, strategy, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -711,7 +711,7 @@ impl Committer for QueuedTransactor {
                 source_branch,
                 target_for_queue,
                 strategy,
-                receipt,
+                *receipt,
             ),
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -752,7 +752,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                rebase_receipt_from(idempotency_key, branch, strategy, receipt)
+                rebase_receipt_from(idempotency_key, branch, strategy, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -843,7 +843,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                push_receipt_from(idempotency_key, ledger_id, receipt)
+                push_receipt_from(idempotency_key, ledger_id, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))

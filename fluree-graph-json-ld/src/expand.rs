@@ -2,6 +2,7 @@ use crate::context::{Container, ContextEntry, ParsedContext, TypeValue};
 use crate::error::{JsonLdError, Result};
 use crate::iri::{self, UnresolvedIriDisposition};
 use serde_json::{json, Map, Value as JsonValue};
+use std::borrow::Cow;
 
 /// Check if a value is a variable (starts with ?)
 fn is_variable(s: &str) -> bool {
@@ -199,10 +200,10 @@ fn parse_node_value(
     value: &JsonValue,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
-    guard_depth(idx)?;
+    guard_depth(path)?;
     let type_val = entry.and_then(|e| e.type_.as_ref());
     let id_val = entry.and_then(|e| e.id.as_deref());
 
@@ -283,24 +284,23 @@ fn parse_node_value(
 
             let mut results = Vec::new();
             for (i, item) in arr.iter().enumerate() {
-                let mut new_idx = idx.to_vec();
-                new_idx.push(json!(i));
+                let item_path = path.index(i);
 
                 if let JsonValue::Array(_) = item {
                     return Err(JsonLdError::NestedSequence {
-                        idx: new_idx.clone(),
+                        idx: item_path.to_vec(),
                     });
                 }
 
                 let expanded = if item.is_object() {
                     let map = item.as_object().unwrap();
                     if map.contains_key("@value") || map.contains_key("value") {
-                        parse_node_value(item, entry, context, &new_idx, strict)?
+                        parse_node_value(item, entry, context, &item_path, strict)?
                     } else {
-                        vec![expand_node_internal(item, context, &new_idx, strict)?]
+                        vec![expand_node_internal(item, context, &item_path, strict)?]
                     }
                 } else {
-                    parse_node_value(item, entry, context, &new_idx, strict)?
+                    parse_node_value(item, entry, context, &item_path, strict)?
                 };
                 results.extend(expanded);
             }
@@ -331,9 +331,8 @@ fn parse_node_value(
             // Check for @list
             if is_list_item(map) {
                 let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
-                let mut new_idx = idx.to_vec();
-                new_idx.push(json!("@list"));
-                let expanded = parse_node_value(list_val, entry, context, &new_idx, strict)?;
+                let list_path = path.key("@list");
+                let expanded = parse_node_value(list_val, entry, context, &list_path, strict)?;
                 let mut obj = Map::new();
                 obj.insert("@list".to_string(), JsonValue::Array(expanded));
                 return Ok(vec![JsonValue::Object(obj)]);
@@ -342,14 +341,12 @@ fn parse_node_value(
             // Check for @set (flatten it)
             if is_set_item(map) {
                 let set_val = map.get("@set").or_else(|| map.get("set")).unwrap();
-                let mut new_idx = idx.to_vec();
-                new_idx.push(json!("@set"));
-                return parse_node_value(set_val, entry, context, &new_idx, strict);
+                return parse_node_value(set_val, entry, context, &path.key("@set"), strict);
             }
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, idx, strict);
+                return parse_value_object(map, entry, context, path, strict);
             }
 
             // Check for @container: @language
@@ -389,19 +386,16 @@ fn parse_node_value(
             let ctx = if let Some(e) = entry {
                 if let Some(ref nested) = e.context {
                     let mut merged = context.clone();
-                    merged.terms.extend(nested.terms.clone());
-                    if nested.vocab.is_some() {
-                        merged.vocab = nested.vocab.clone();
-                    }
-                    merged
+                    apply_scoped_context(&mut merged, nested);
+                    Cow::Owned(merged)
                 } else {
-                    context.clone()
+                    Cow::Borrowed(context)
                 }
             } else {
-                context.clone()
+                Cow::Borrowed(context)
             };
 
-            Ok(vec![expand_node_internal(value, &ctx, idx, strict)?])
+            Ok(vec![expand_node_internal(value, &ctx, path, strict)?])
         }
     }
 }
@@ -411,7 +405,7 @@ fn parse_value_object(
     map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
     let val = map.get("@value").or_else(|| map.get("value")).unwrap();
@@ -468,12 +462,11 @@ fn parse_value_object(
     // `{"@value": …, "@annotation": {…}}`: the annotation describes a
     // reifier of the triple this value completes, and expands as a node does.
     if let Some(annotation) = map.get("@annotation") {
-        let mut key_idx = idx.to_vec();
-        key_idx.push(json!("@annotation"));
-        let expanded = match expand_node_internal(annotation, context, &key_idx, strict)? {
-            JsonValue::Array(nodes) => nodes,
-            node => vec![node],
-        };
+        let expanded =
+            match expand_node_internal(annotation, context, &path.key("@annotation"), strict)? {
+                JsonValue::Array(nodes) => nodes,
+                node => vec![node],
+            };
         obj.insert("@annotation".to_string(), JsonValue::Array(expanded));
     }
 
@@ -481,11 +474,11 @@ fn parse_value_object(
 }
 
 /// Parse @type values and return expanded types with potentially updated context
-fn parse_type(
+fn parse_type<'c>(
     node_map: &Map<String, JsonValue>,
-    context: &ParsedContext,
+    context: &'c ParsedContext,
     strict: bool,
-) -> Result<(Vec<String>, ParsedContext)> {
+) -> Result<(Vec<String>, Cow<'c, ParsedContext>)> {
     let type_key = &context.type_key;
     let type_id = context.get(type_key).and_then(|e| e.id.clone());
 
@@ -509,7 +502,7 @@ fn parse_type(
         };
 
         // Check for type-dependent sub-contexts
-        let mut updated_context = context.clone();
+        let mut updated_context = Cow::Borrowed(context);
         // Check original (unexpanded) types for sub-context
         let original_types: Vec<&str> = match type_val {
             JsonValue::String(s) => vec![s.as_str()],
@@ -520,17 +513,52 @@ fn parse_type(
         for orig_t in original_types {
             if let Some(entry) = context.get(orig_t) {
                 if let Some(ref sub_ctx) = entry.context {
-                    updated_context.terms.extend(sub_ctx.terms.clone());
-                    if sub_ctx.vocab.is_some() {
-                        updated_context.vocab = sub_ctx.vocab.clone();
-                    }
+                    apply_scoped_context(updated_context.to_mut(), sub_ctx);
                 }
             }
         }
 
         Ok((types, updated_context))
     } else {
-        Ok((vec![], context.clone()))
+        Ok((vec![], Cow::Borrowed(context)))
+    }
+}
+
+/// Apply a scoped (property- or type-scoped) context's terms to the active
+/// context. A scoped context is parsed on its own, when its term is defined,
+/// so a term IRI it writes as a compact IRI over a prefix it does not define
+/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there. It
+/// is expanded here, against the active context the scoped context applies
+/// to, before the scoped terms take effect; left compact, it would expand a
+/// key to the compact string and store that as an IRI.
+fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
+    let resolve = |iri: &str| -> Option<String> {
+        let (prefix, suffix) = iri::parse_prefix(iri)?;
+        let prefix_iri = active.get(&prefix)?.id.as_deref()?;
+        (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+    };
+    let resolved: Vec<(String, ContextEntry)> = scoped
+        .terms
+        .iter()
+        .map(|(term, entry)| {
+            let mut entry = entry.clone();
+            if let Some(iri) = entry.id.as_deref().and_then(resolve) {
+                entry.id = Some(iri);
+            }
+            if let Some(iri) = entry.reverse.as_deref().and_then(resolve) {
+                entry.reverse = Some(iri);
+            }
+            if let Some(TypeValue::Iri(datatype)) = &entry.type_ {
+                if let Some(iri) = resolve(datatype) {
+                    entry.type_ = Some(TypeValue::Iri(iri));
+                }
+            }
+            (term.clone(), entry)
+        })
+        .collect();
+    active.terms.extend(resolved);
+    if scoped.vocab.is_some() {
+        active.vocab = scoped.vocab.clone();
     }
 }
 
@@ -552,44 +580,93 @@ fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
 /// ~64 levels rather than 128. See [`guard_depth`].
 pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
 
-/// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The `idx` path vector gains at
-/// least one element on each recursion edge (an array index or property key,
-/// directly or in the immediate caller), so its length bounds the depth. Both
+/// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The [`Path`] gains at least
+/// one step on each recursion edge (an array index or property key, directly
+/// or in the immediate caller), so its depth bounds the recursion. Both
 /// recursion entry points ([`expand_node_internal`] and [`parse_node_value`])
 /// call this, so the `@list`/`@set` self-recursion in `parse_node_value` —
 /// which never re-enters `expand_node_internal` — is bounded too.
 ///
-/// The bound is on `idx` entries (recursion frames), not user-visible nesting
-/// levels, and the two are not the same: a plain node chain adds one entry per
+/// The bound is on path steps (recursion frames), not user-visible nesting
+/// levels, and the two are not the same: a plain node chain adds one step per
 /// level, so it reaches `MAX_EXPAND_DEPTH` levels, but each `@list`/`@set`
 /// container level adds two (the property key, then the container marker), so
 /// container chains are refused at roughly half that — ~64 user-visible levels.
 /// A container-chain rejection near 64 is expected, not a bug.
-fn guard_depth(idx: &[JsonValue]) -> Result<()> {
-    if idx.len() > MAX_EXPAND_DEPTH {
+fn guard_depth(path: &Path<'_>) -> Result<()> {
+    if path.depth > MAX_EXPAND_DEPTH {
         return Err(JsonLdError::NestingTooDeep);
     }
     Ok(())
+}
+
+/// Where expansion is in the document: the array indexes and property keys
+/// from the root. Each step borrows its parent, so descending costs no
+/// allocation; the steps are collected only to report a
+/// [`JsonLdError::NestedSequence`].
+struct Path<'a> {
+    depth: usize,
+    last: Option<(&'a Path<'a>, Step<'a>)>,
+}
+
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Index(usize),
+    Key(&'a str),
+}
+
+impl<'a> Path<'a> {
+    const ROOT: Path<'static> = Path {
+        depth: 0,
+        last: None,
+    };
+
+    fn index(&'a self, i: usize) -> Path<'a> {
+        self.then(Step::Index(i))
+    }
+
+    fn key(&'a self, key: &'a str) -> Path<'a> {
+        self.then(Step::Key(key))
+    }
+
+    fn then(&'a self, step: Step<'a>) -> Path<'a> {
+        Path {
+            depth: self.depth + 1,
+            last: Some((self, step)),
+        }
+    }
+
+    /// The steps from the root, as JSON values (an index is a number, a key a
+    /// string).
+    fn to_vec(&self) -> Vec<JsonValue> {
+        let mut steps = Vec::with_capacity(self.depth);
+        let mut at = self;
+        while let Some((parent, step)) = at.last {
+            steps.push(match step {
+                Step::Index(i) => json!(i),
+                Step::Key(k) => json!(k),
+            });
+            at = parent;
+        }
+        steps.reverse();
+        steps
+    }
 }
 
 /// Internal node expansion
 fn expand_node_internal(
     node_map: &JsonValue,
     context: &ParsedContext,
-    idx: &[JsonValue],
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<JsonValue> {
-    guard_depth(idx)?;
+    guard_depth(path)?;
     match node_map {
         JsonValue::Array(arr) => {
             let expanded: Result<Vec<JsonValue>> = arr
                 .iter()
                 .enumerate()
-                .map(|(i, item)| {
-                    let mut new_idx = idx.to_vec();
-                    new_idx.push(json!(i));
-                    expand_node_internal(item, context, &new_idx, strict)
-                })
+                .map(|(i, item)| expand_node_internal(item, context, &path.index(i), strict))
                 .collect();
             Ok(JsonValue::Array(expanded?))
         }
@@ -598,9 +675,9 @@ fn expand_node_internal(
             // Parse local context if present
             let local_context = get_context(map);
             let merged_context = if let Some(lc) = local_context {
-                ParsedContext::parse(Some(context), lc)?
+                Cow::Owned(ParsedContext::parse(Some(context), lc)?)
             } else {
-                context.clone()
+                Cow::Borrowed(context)
             };
 
             // Parse @type and get updated context
@@ -615,89 +692,223 @@ fn expand_node_internal(
             }
 
             // Process other keys
-            let type_key = &merged_context.type_key;
-            let type_id = merged_context.get(type_key).and_then(|e| e.id.clone());
-
-            for (k, v) in map {
-                // Skip context and type keys
-                if k == "@context" || k == "context" {
-                    continue;
-                }
-                if k == type_key || Some(k.clone()) == type_id {
-                    continue;
-                }
-
-                let mut key_idx = idx.to_vec();
-                key_idx.push(json!(k));
-
-                let (expanded_key, entry) = details_dispatch(k, &context_with_types, true, strict)?;
-
-                // Handle @graph
-                if expanded_key == "@graph" || k == "@graph" || k == "graph" {
-                    let graph_expanded =
-                        expand_node_internal(v, &context_with_types, &key_idx, strict)?;
-                    result.insert("@graph".to_string(), graph_expanded);
-                    continue;
-                }
-
-                // Handle @id
-                if expanded_key == "@id" || k == "@id" {
-                    match v {
-                        JsonValue::String(s) => {
-                            result.insert(
-                                "@id".to_string(),
-                                json!(iri_dispatch(s, &context_with_types, false, strict)?),
-                            );
-                        }
-                        // A triple term, `{"@id": {"@id": s, p: o}}`: the
-                        // embedded node naming its triple.
-                        JsonValue::Object(_) => {
-                            result.insert(
-                                "@id".to_string(),
-                                expand_node_internal(v, &context_with_types, &key_idx, strict)?,
-                            );
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // Expand value
-                let expanded_values =
-                    parse_node_value(v, entry.as_ref(), &context_with_types, &key_idx, strict)?;
-
-                // A key whose values expand to nothing is dropped — EXCEPT
-                // `@list`: `{"@list": []}` is a value, the empty list, which
-                // denotes the IRI rdf:nil. Dropping the key here turned
-                // `[{"@list": []}]` into `[{}]` — a spurious blank node
-                // downstream instead of the rdf:nil triple (issue #1694
-                // twin). This branch is how an array-position `{"@list": …}`
-                // item expands (it routes through `expand_node_internal`
-                // rather than `parse_node_value`'s `@list` arm).
-                if !expanded_values.is_empty() || expanded_key == "@list" {
-                    // Check for @reverse
-                    if let Some(ref e) = entry {
-                        if e.reverse.is_some() {
-                            result.insert(expanded_key, JsonValue::Array(expanded_values));
-                            continue;
-                        }
-                    }
-
-                    // Append to existing or create new
-                    if let Some(existing) = result.get_mut(&expanded_key) {
-                        if let JsonValue::Array(arr) = existing {
-                            arr.extend(expanded_values);
-                        }
-                    } else {
-                        result.insert(expanded_key, JsonValue::Array(expanded_values));
-                    }
-                }
-            }
+            let type_key = merged_context.type_key.clone();
+            let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
+            let keys = NodeKeys {
+                context: &context_with_types,
+                type_key: &type_key,
+                type_id: type_id.as_deref(),
+                strict,
+            };
+            expand_node_entries(map, &keys, path, false, &mut result)?;
 
             Ok(JsonValue::Object(result))
         }
 
         _ => Ok(node_map.clone()),
+    }
+}
+
+/// What a node object's entries expand against.
+struct NodeKeys<'a> {
+    context: &'a ParsedContext,
+    /// The `@type` key and its alias, handled by [`parse_type`].
+    type_key: &'a str,
+    type_id: Option<&'a str>,
+    strict: bool,
+}
+
+/// Expand a node object's entries (every entry but `@context` and the type
+/// key) into `result`. `nested` is true for the entries of a `@nest` value,
+/// which belong to the enclosing node and so may not name another node or
+/// graph.
+fn expand_node_entries(
+    map: &Map<String, JsonValue>,
+    keys: &NodeKeys<'_>,
+    path: &Path<'_>,
+    nested: bool,
+    result: &mut Map<String, JsonValue>,
+) -> Result<()> {
+    let context = keys.context;
+    let strict = keys.strict;
+    for (k, v) in map {
+        // Skip context and type keys
+        if k == "@context" || k == "context" {
+            continue;
+        }
+        if k == keys.type_key || Some(k.as_str()) == keys.type_id {
+            continue;
+        }
+
+        let key_path = path.key(k);
+
+        let (expanded_key, entry) = details_dispatch(k, context, true, strict)?;
+
+        // Handle @graph: the keyword, an alias of it, or the legacy bare
+        // `graph` key when the context does not define `graph` as a property
+        // (a defined term is ordinary data).
+        if expanded_key == "@graph" || crate::graph_shape::is_graph_key(k, context) {
+            if nested {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@nest",
+                    reason: "a nested value cannot carry `@graph`",
+                });
+            }
+            let graph_expanded = expand_node_internal(v, context, &key_path, strict)?;
+            result.insert("@graph".to_string(), graph_expanded);
+            continue;
+        }
+
+        // Handle @id
+        if expanded_key == "@id" || k == "@id" {
+            if nested {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@nest",
+                    reason: "a nested value belongs to the enclosing node and cannot carry `@id`",
+                });
+            }
+            match v {
+                JsonValue::String(s) => {
+                    result.insert(
+                        "@id".to_string(),
+                        json!(iri_dispatch(s, context, false, strict)?),
+                    );
+                }
+                // A triple term, `{"@id": {"@id": s, p: o}}`: the embedded
+                // node naming its triple.
+                JsonValue::Object(_) => {
+                    result.insert(
+                        "@id".to_string(),
+                        expand_node_internal(v, context, &key_path, strict)?,
+                    );
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // `@nest` (JSON-LD 1.1): the value's entries are this node's own
+        // entries, recursively.
+        if expanded_key == "@nest" {
+            expand_nest_value(v, keys, &key_path, result)?;
+            continue;
+        }
+
+        // `@reverse` (keyword): a map of properties whose values are the
+        // subjects of statements that point at this node.
+        if expanded_key == "@reverse" {
+            if !v.is_object() {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@reverse",
+                    reason: "the value must be a map of reverse properties",
+                });
+            }
+            if let JsonValue::Object(props) = expand_node_internal(v, context, &key_path, strict)? {
+                for (property, values) in props {
+                    if property.starts_with('@') {
+                        return Err(JsonLdError::InvalidKeywordValue {
+                            keyword: "@reverse",
+                            reason: "the value may hold only properties",
+                        });
+                    }
+                    let values = match values {
+                        JsonValue::Array(values) => values,
+                        other => vec![other],
+                    };
+                    push_reverse(result, property, values);
+                }
+            }
+            continue;
+        }
+
+        // Expand value
+        let expanded_values = parse_node_value(v, entry.as_ref(), context, &key_path, strict)?;
+
+        // A key whose values expand to nothing is dropped — EXCEPT
+        // `@list`: `{"@list": []}` is a value, the empty list, which
+        // denotes the IRI rdf:nil. Dropping the key here turned
+        // `[{"@list": []}]` into `[{}]` — a spurious blank node
+        // downstream instead of the rdf:nil triple (issue #1694
+        // twin). This branch is how an array-position `{"@list": …}`
+        // item expands (it routes through `expand_node_internal`
+        // rather than `parse_node_value`'s `@list` arm).
+        if !expanded_values.is_empty() || expanded_key == "@list" {
+            // A term defined with `@reverse` is a reverse property: its values
+            // are the subjects, as with the `@reverse` keyword. (It used to be
+            // written forward, inverting the statement.)
+            if entry.as_ref().is_some_and(|e| e.reverse.is_some()) {
+                push_reverse(result, expanded_key, expanded_values);
+                continue;
+            }
+
+            // Append to existing or create new
+            if let Some(existing) = result.get_mut(&expanded_key) {
+                if let JsonValue::Array(arr) = existing {
+                    arr.extend(expanded_values);
+                }
+            } else {
+                result.insert(expanded_key, JsonValue::Array(expanded_values));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge a `@nest` value (a map, or an array of maps) into the enclosing
+/// node: its properties and types are the node's own.
+fn expand_nest_value(
+    value: &JsonValue,
+    keys: &NodeKeys<'_>,
+    path: &Path<'_>,
+    result: &mut Map<String, JsonValue>,
+) -> Result<()> {
+    guard_depth(path)?;
+    let items: Vec<&JsonValue> = match value {
+        JsonValue::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    for item in items {
+        let nested = match item {
+            JsonValue::Object(nested)
+                if !["@value", "@list", "@set"]
+                    .iter()
+                    .any(|k| nested.contains_key(*k)) =>
+            {
+                nested
+            }
+            _ => {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@nest",
+                    reason: "the value must be a map (or maps) of properties",
+                })
+            }
+        };
+        let (types, _) = parse_type(nested, keys.context, keys.strict)?;
+        if !types.is_empty() {
+            let slot = result
+                .entry("@type".to_string())
+                .or_insert_with(|| JsonValue::Array(Vec::new()));
+            if let JsonValue::Array(existing) = slot {
+                existing.extend(types.into_iter().map(JsonValue::String));
+            }
+        }
+        expand_node_entries(nested, keys, path, true, result)?;
+    }
+    Ok(())
+}
+
+/// Add `values` under `property` in the node's `@reverse` map.
+fn push_reverse(result: &mut Map<String, JsonValue>, property: String, values: Vec<JsonValue>) {
+    let reverse = result
+        .entry("@reverse".to_string())
+        .or_insert_with(|| JsonValue::Object(Map::new()));
+    if let JsonValue::Object(reverse) = reverse {
+        match reverse.get_mut(&property) {
+            Some(JsonValue::Array(existing)) => existing.extend(values),
+            _ => {
+                reverse.insert(property, JsonValue::Array(values));
+            }
+        }
     }
 }
 
@@ -707,63 +918,62 @@ pub(crate) fn node_impl(
     context: &ParsedContext,
     strict: bool,
 ) -> Result<JsonValue> {
-    let idx = vec![];
-
     match node_map {
         JsonValue::Array(arr) => {
             let expanded: Result<Vec<JsonValue>> = arr
                 .iter()
                 .enumerate()
-                .map(|(i, item)| {
-                    let new_idx = vec![json!(i)];
-                    expand_node_internal(item, context, &new_idx, strict)
-                })
+                .map(|(i, item)| expand_node_internal(item, context, &Path::ROOT.index(i), strict))
                 .collect();
             Ok(JsonValue::Array(expanded?))
         }
 
         JsonValue::Object(map) => {
-            // Check for @graph at top level
-            let graph_key = if map.contains_key("@graph") {
-                Some("@graph")
-            } else if map.contains_key("graph") {
-                Some("graph")
-            } else {
-                None
-            };
-
-            // Handle envelope form: when @graph is present at top level WITHOUT
-            // an @id, this is an envelope/default-graph wrapper. Expand only the
-            // @graph contents. Extra top-level keys (txn-meta properties) are
-            // handled separately by the transact parser's extract_txn_meta(),
-            // so we must not feed the whole envelope into expand_node_internal —
-            // that would treat the envelope as a single node and silently drop @graph.
+            // Envelope form: a top-level `@graph` holding node objects, with no
+            // `@id`, is a default-graph wrapper. Expand only the `@graph`
+            // contents. Extra top-level keys (txn-meta properties) are handled
+            // separately by the transact parser's extract_txn_meta(), so we
+            // must not feed the whole envelope into expand_node_internal — that
+            // would treat the envelope as a single node and silently drop
+            // @graph.
             //
-            // When @id IS present alongside @graph, this is a JSON-LD named graph
-            // (the @id names the graph) — fall through to normal expansion which
-            // preserves the @id, properties, and nested @graph.
-            if let Some(gk) = graph_key {
-                let has_id = map.contains_key("@id") || map.contains_key("id");
-                if !has_id {
-                    let local_context = get_context(map);
-                    let merged_context = if let Some(lc) = local_context {
-                        ParsedContext::parse(Some(context), lc)?
-                    } else {
-                        context.clone()
-                    };
-
-                    if let Some(graph) = map.get(gk) {
-                        let new_idx = vec![json!(gk)];
-                        return expand_node_internal(graph, &merged_context, &new_idx, strict);
-                    }
+            // The value decides (`graph_shape::is_envelope_graph`, shared with
+            // every other reader of `@graph`): with an `@id` the content is a
+            // JSON-LD named graph, and a graph *selector* marks a node, not a
+            // wrapper. Both expand as a node, which keeps the `@id`, the
+            // properties and the `@graph` entry.
+            let has_id = map.contains_key("@id") || map.contains_key("id");
+            if let Some(graph) = map.get("@graph") {
+                if crate::graph_shape::is_envelope_graph(graph, has_id)? {
+                    return expand_envelope(map, "@graph", graph, context, strict);
                 }
+            } else if let Some(graph) = map.get("graph").filter(|_| !has_id) {
+                // Legacy bare `graph` envelope key. The transaction paths strip
+                // it before expansion (it is a reserved routing key there).
+                return expand_envelope(map, "graph", graph, context, strict);
             }
 
-            expand_node_internal(node_map, context, &idx, strict)
+            expand_node_internal(node_map, context, &Path::ROOT, strict)
         }
 
         _ => Ok(node_map.clone()),
     }
+}
+
+/// Expand the contents of an envelope's `@graph` under the envelope's own
+/// `@context`.
+fn expand_envelope(
+    map: &Map<String, JsonValue>,
+    graph_key: &str,
+    graph: &JsonValue,
+    context: &ParsedContext,
+    strict: bool,
+) -> Result<JsonValue> {
+    let merged_context = match get_context(map) {
+        Some(lc) => ParsedContext::parse(Some(context), lc)?,
+        None => context.clone(),
+    };
+    expand_node_internal(graph, &merged_context, &Path::ROOT.key(graph_key), strict)
 }
 
 /// Expand a JSON-LD node (document).
@@ -1133,6 +1343,88 @@ mod tests {
         crate::expand(&nested_nodes(100)).expect("below-ceiling nesting must expand");
     }
 
+    /// A node chain expands up to the ceiling and is refused one level past
+    /// it: the bound is exact.
+    #[test]
+    fn nesting_ceiling_is_exact() {
+        crate::expand(&nested_nodes(MAX_EXPAND_DEPTH)).expect("nesting at the ceiling expands");
+        let err = crate::expand(&nested_nodes(MAX_EXPAND_DEPTH + 1)).expect_err("past it");
+        assert!(
+            matches!(err, JsonLdError::NestingTooDeep),
+            "expected NestingTooDeep, got: {err}"
+        );
+    }
+
+    /// A scoped context's term IRIs written as compact IRIs over a prefix the
+    /// outer context defines expand against that context, at every level of
+    /// a chain of scoped contexts, in both expansion modes; they used to stay
+    /// compact (`"ex:b"` as a key).
+    #[test]
+    fn scoped_context_terms_expand_against_the_active_context() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "a": {"@id": "ex:a", "@context": {
+                    "b": {"@id": "ex:b", "@context": {
+                        "c": {"@id": "ex:c", "@context": {"@vocab": "http://deep/"}}
+                    }}
+                }}
+            },
+            "@id": "ex:root",
+            "a": {"b": {"c": {"z": 1, "@type": "T"}}}
+        });
+        let expected = json!({
+            "@id": "http://example.org/root",
+            "http://example.org/a": [{
+                "http://example.org/b": [{
+                    "http://example.org/c": [{"@type": ["http://deep/T"], "http://deep/z": [{"@value": 1}]}]
+                }]
+            }]
+        });
+        for (mode, expanded) in [
+            ("permissive", crate::expand(&doc)),
+            ("strict", crate::expand_checked(&doc)),
+        ] {
+            let expanded = expanded.unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert_eq!(expanded, expected, "{mode}");
+        }
+
+        // A scoped datatype over the outer prefix expands too.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "a": {"@id": "ex:a", "@context": {"n": {"@id": "ex:n", "@type": "ex:Num"}}}
+            },
+            "@id": "ex:root",
+            "a": {"n": "5"}
+        });
+        let expanded = crate::expand_checked(&doc).unwrap();
+        assert_eq!(
+            expanded["http://example.org/a"][0]["http://example.org/n"][0]["@type"],
+            json!("http://example.org/Num"),
+            "{expanded}"
+        );
+    }
+
+    /// An array inside an array is refused with the path to it from the
+    /// document root: array indexes and the keys as written.
+    #[test]
+    fn nested_sequence_reports_its_path() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:a"}, {"@id": "ex:b", "ex:p": ["x", ["y"]]}]
+        });
+        match crate::expand(&doc).expect_err("a nested array is refused") {
+            JsonLdError::NestedSequence { idx } => {
+                assert_eq!(
+                    idx,
+                    vec![json!("@graph"), json!(1), json!("ex:p"), json!(1)]
+                );
+            }
+            other => panic!("expected NestedSequence, got: {other}"),
+        }
+    }
+
     /// A programmatically built value bypasses serde_json's deserialization
     /// recursion limit, so expansion itself must refuse deep nesting with a
     /// clean error instead of overflowing the stack. (Depth is kept moderate
@@ -1191,6 +1483,145 @@ mod tests {
         assert!(
             err.to_string().contains("recursion limit"),
             "expected serde_json recursion-limit error, got: {err}"
+        );
+    }
+
+    /// A context that defines `graph` as a property gets a property: the
+    /// legacy bare `graph` spelling of `@graph` applies only when the context
+    /// leaves the word undefined. It used to hijack the key at every level,
+    /// dropping the triple and routing the node into a graph named by the
+    /// value.
+    #[test]
+    fn graph_term_in_context_is_a_property_not_a_graph_key() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "graph": "ex:graphProp"},
+            "@id": "ex:s",
+            "ex:child": {"@id": "ex:c", "graph": "blue"}
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        let child = &expanded["http://example.org/child"][0];
+        assert!(child.get("@graph").is_none(), "{expanded}");
+        assert_eq!(child["http://example.org/graphProp"][0]["@value"], "blue");
+
+        // Undefined, the bare word still means `@graph`.
+        let legacy = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:child": {"@id": "ex:c", "graph": "ex:g", "ex:p": 1}
+        });
+        let expanded = crate::expand(&legacy).unwrap();
+        assert_eq!(expanded["http://example.org/child"][0]["@graph"], "ex:g");
+    }
+
+    /// `@nest` (JSON-LD 1.1): the nested value's properties and types are
+    /// the enclosing node's own, recursively.
+    #[test]
+    fn nest_merges_into_the_enclosing_node() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "labels": "@nest"},
+            "@id": "ex:s",
+            "ex:a": 1,
+            "@nest": {
+                "@type": "ex:T",
+                "ex:a": 2,
+                "ex:b": 3,
+                "@nest": {"ex:c": 4}
+            },
+            "labels": [{"ex:d": 5}]
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(expanded["@id"], "http://example.org/s");
+        assert_eq!(expanded["@type"], json!(["http://example.org/T"]));
+        let values = |p: &str| -> Vec<JsonValue> {
+            expanded[format!("http://example.org/{p}")]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["@value"].clone())
+                .collect()
+        };
+        assert_eq!(values("a"), [json!(1), json!(2)]);
+        assert_eq!(values("b"), [json!(3)]);
+        assert_eq!(values("c"), [json!(4)]);
+        assert_eq!(values("d"), [json!(5)]);
+        assert!(expanded.get("@nest").is_none(), "{expanded}");
+
+        for bad in [
+            json!({"@id": "ex:s", "@nest": {"@id": "ex:other", "ex:a": 1}}),
+            json!({"@id": "ex:s", "@nest": "text"}),
+            json!({"@id": "ex:s", "@nest": {"@value": 1}}),
+        ] {
+            let err = crate::expand(&bad).unwrap_err();
+            assert!(
+                matches!(err, JsonLdError::InvalidKeywordValue { .. }),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// A reverse property, spelled with the `@reverse` keyword or through a
+    /// context term defined with `@reverse`, expands into the node's
+    /// `@reverse` map. The term form used to expand as a forward property,
+    /// inverting the statement.
+    #[test]
+    fn reverse_properties_expand_into_the_reverse_map() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child", "@type": "@id"}
+            },
+            "@id": "ex:kid",
+            "parent": "ex:mom",
+            "@reverse": {"ex:child": {"@id": "ex:dad"}}
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert!(
+            expanded.get("http://example.org/child").is_none(),
+            "{expanded}"
+        );
+        let mut subjects: Vec<&str> = expanded["@reverse"]["http://example.org/child"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["@id"].as_str().unwrap())
+            .collect();
+        subjects.sort_unstable();
+        assert_eq!(
+            subjects,
+            ["http://example.org/dad", "http://example.org/mom"]
+        );
+
+        let err = crate::expand(&json!({"@id": "ex:s", "@reverse": "x"})).unwrap_err();
+        assert!(
+            matches!(err, JsonLdError::InvalidKeywordValue { .. }),
+            "{err}"
+        );
+    }
+
+    /// A top-level `@graph` is an envelope only when it holds node objects
+    /// and the object has no `@id`. A graph selector marks a node.
+    #[test]
+    fn top_level_graph_selector_is_a_node_not_an_envelope() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": "ex:g",
+            "ex:p": 1
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(expanded["@graph"], "ex:g", "{expanded}");
+        assert_eq!(expanded["http://example.org/p"][0]["@value"], 1);
+
+        let envelope = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:a", "ex:p": 1}, {"@id": "ex:b", "ex:p": 2}]
+        });
+        let expanded = crate::expand(&envelope).unwrap();
+        assert_eq!(expanded.as_array().map(Vec::len), Some(2), "{expanded}");
+
+        let err = crate::expand(&json!({"@graph": 3})).unwrap_err();
+        assert!(
+            matches!(err, JsonLdError::InvalidGraphValue { .. }),
+            "{err}"
         );
     }
 }

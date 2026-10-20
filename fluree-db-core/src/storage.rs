@@ -121,7 +121,10 @@ mod content_bytes;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
+mod range_source;
 pub mod residency;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+mod root_lock;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod wal;
 
@@ -131,6 +134,9 @@ pub use content_bytes::DEFAULT_MMAP_MIN_BYTES;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
+pub use range_source::RangeSource;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub use root_lock::{RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE};
 
 use crate::address_path::StorageNamespace;
 use crate::error::Result;
@@ -237,6 +243,20 @@ pub trait StorageRead: Debug + Send + Sync {
     ///
     /// The default answers `Ok(None)`.
     fn get_local(&self, address: &str) -> Result<Option<ContentBytes>> {
+        let _ = address;
+        Ok(None)
+    }
+
+    /// The object at `address` as a [`RangeSource`], when it is on this
+    /// machine and this storage reads ranges of it for less than
+    /// [`Self::get_local`] costs: a storage that decrypts on read, for an
+    /// object encrypted in independently readable segments.
+    ///
+    /// `Ok(None)` when there is no such source: the object is not here, or
+    /// this storage reads it whole. The caller then uses `get_local`. Errors
+    /// as for `get_local`. Synchronous, never leaves the machine, and the
+    /// default answers `Ok(None)`.
+    fn get_local_ranged(&self, address: &str) -> Result<Option<Arc<dyn RangeSource>>> {
         let _ = address;
         Ok(None)
     }
@@ -563,6 +583,10 @@ impl StorageRead for Arc<dyn Storage> {
         self.as_ref().get_local(address)
     }
 
+    fn get_local_ranged(&self, address: &str) -> Result<Option<Arc<dyn RangeSource>>> {
+        self.as_ref().get_local_ranged(address)
+    }
+
     fn permits_plaintext_cache(&self) -> bool {
         self.as_ref().permits_plaintext_cache()
     }
@@ -671,6 +695,16 @@ pub trait ContentStore: Debug + Send + Sync {
     /// lookup, and must not perform I/O or block. The default answers
     /// `Ok(None)`.
     fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// The object as a [`RangeSource`] when it is on this machine and the
+    /// store reads ranges of it for less than [`Self::get_local`] costs; see
+    /// [`StorageRead::get_local_ranged`]. Readers ask only a store with
+    /// [`Self::costly_local_reads`], and fall back to `get_local` on
+    /// `Ok(None)`. The default answers `Ok(None)`.
+    fn get_local_ranged(&self, id: &ContentId) -> Result<Option<Arc<dyn RangeSource>>> {
         let _ = id;
         Ok(None)
     }
@@ -815,6 +849,10 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().get_local(id)
     }
 
+    fn get_local_ranged(&self, id: &ContentId) -> Result<Option<Arc<dyn RangeSource>>> {
+        self.as_ref().get_local_ranged(id)
+    }
+
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.as_ref().miss_register()
     }
@@ -886,6 +924,49 @@ pub(crate) fn record_read(id: &ContentId, source: &'static str, bytes: &[u8]) {
         (None, _) => "unknown".to_string(),
     };
     crate::io_stats::record(|| label, source, bytes.len());
+}
+
+/// `source`, counting each range it serves under `local-range` when read
+/// accounting is on.
+fn counted_source(id: &ContentId, source: Arc<dyn RangeSource>) -> Arc<dyn RangeSource> {
+    if !crate::io_stats::enabled() {
+        return source;
+    }
+    let label = id.content_kind().map_or_else(
+        || "unknown".to_string(),
+        |k| format!("{k:?}").to_lowercase(),
+    );
+    Arc::new(CountedSource { label, source })
+}
+
+#[derive(Debug)]
+struct CountedSource {
+    label: String,
+    source: Arc<dyn RangeSource>,
+}
+
+impl RangeSource for CountedSource {
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    fn read_range(&self, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
+        let bytes = self.source.read_range(range)?;
+        crate::io_stats::record(|| self.label.clone(), "local-range", bytes.len());
+        Ok(bytes)
+    }
+
+    fn read_unit(&self) -> u64 {
+        self.source.read_unit()
+    }
+
+    fn cache_weight(&self) -> usize {
+        self.source.cache_weight()
+    }
+
+    fn cache_identity(&self) -> u128 {
+        self.source.cache_identity()
+    }
 }
 
 /// Bridge adapter that wraps an existing `S: Storage` to provide `ContentStore`.
@@ -1168,6 +1249,28 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
             record_read(id, "local", bytes);
         }
         Ok(bytes)
+    }
+
+    fn get_local_ranged(&self, id: &ContentId) -> Result<Option<Arc<dyn RangeSource>>> {
+        if force_remote_reads() {
+            return Ok(None);
+        }
+        let Ok(address) = self.cid_to_address(id) else {
+            return Ok(None);
+        };
+        let mut source = self.storage.get_local_ranged(&address)?;
+        // The same legacy fallbacks as `get_local`.
+        if source.is_none() {
+            if let Some(legacy) = self.legacy_dict_address(id) {
+                source = self.storage.get_local_ranged(&legacy)?;
+            }
+        }
+        if source.is_none() {
+            if let Some(legacy) = self.legacy_index_root_address(id) {
+                source = self.storage.get_local_ranged(&legacy)?;
+            }
+        }
+        Ok(source.map(|source| counted_source(id, source)))
     }
 
     fn supports_ranged_reads(&self) -> bool {
@@ -1644,6 +1747,18 @@ impl ContentStore for BranchedContentStore {
         for parent in &self.parents {
             if let Some(bytes) = parent.get_local(id)? {
                 return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_local_ranged(&self, id: &ContentId) -> Result<Option<Arc<dyn RangeSource>>> {
+        if let Some(source) = self.branch_store.get_local_ranged(id)? {
+            return Ok(Some(source));
+        }
+        for parent in &self.parents {
+            if let Some(source) = parent.get_local_ranged(id)? {
+                return Ok(Some(source));
             }
         }
         Ok(None)

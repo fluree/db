@@ -246,8 +246,6 @@ pub struct BinaryScanOperator {
     /// Empty for a bound predicate, under `include_system_facts`, and on
     /// ledgers without legacy annotation bundles.
     hidden_p_ids: Vec<u32>,
-    /// Cached s_id → Sid for amortized IRI resolution.
-    sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
     p_is_var: bool,
     /// Snapshot of `ExecutionContext::include_system_facts` taken at
@@ -860,7 +858,6 @@ impl BinaryScanOperator {
             p_sids: Vec::new().into(),
             p_sids_ephemeral: HashMap::new(),
             hidden_p_ids: Vec::new(),
-            sid_cache: HashMap::new(),
             p_is_var,
             include_system_facts: false,
             inline_ops,
@@ -1292,24 +1289,6 @@ impl BinaryScanOperator {
             .find_subject(sid.namespace_code, sid.name.as_ref())
     }
 
-    /// Resolve s_id → Sid with caching.
-    fn resolve_s_id(&mut self, s_id: u64) -> Result<Sid> {
-        if let Some(sid) = self.sid_cache.get(&s_id) {
-            return Ok(sid.clone());
-        }
-        let iri = self
-            .store()
-            .resolve_subject_iri(s_id)
-            .map_err(|e| QueryError::Internal(format!("resolve s_id={s_id}: {e}")))?;
-        let sid = self
-            .store()
-            .find_subject_sid(&iri)
-            .map_err(|e| QueryError::Internal(format!("find_subject_sid: {e}")))?
-            .unwrap_or_else(|| self.store().encode_iri(&iri));
-        self.sid_cache.insert(s_id, sid.clone());
-        Ok(sid)
-    }
-
     /// Resolve p_id → Sid (pre-computed, O(1)).
     #[inline]
     fn resolve_p_id(&self, p_id: u32) -> Sid {
@@ -1346,7 +1325,8 @@ impl BinaryScanOperator {
     /// e.g. `?x <p> ?x` or `?x ?x ?o`. These are equality constraints that must be applied
     /// even when emission pruning omits one of the positions.
     fn within_row_var_equality_ok(
-        &mut self,
+        &self,
+        view: &BinaryGraphView,
         s_id: u64,
         p_id: u32,
         o_type: u16,
@@ -1370,7 +1350,9 @@ impl BinaryScanOperator {
 
         // Comparisons involving predicate IDs require Sid materialization (different ID domains).
         if self.check_s_eq_p {
-            let s = self.resolve_s_id(s_id)?;
+            let s = view
+                .resolve_subject_sid(s_id)
+                .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;
             let p = self.resolve_p_id(p_id);
             if s != p {
                 return Ok(false);
@@ -1381,7 +1363,9 @@ impl BinaryScanOperator {
             if !(ot.is_iri_ref() || ot.is_blank_node()) {
                 return Ok(false);
             }
-            let o_sid = self.resolve_s_id(o_key)?;
+            let o_sid = view
+                .resolve_subject_sid(o_key)
+                .map_err(|e| QueryError::from_io("resolve_subject_sid", e))?;
             let p_sid = self.resolve_p_id(p_id);
             if o_sid != p_sid {
                 return Ok(false);
@@ -1568,7 +1552,7 @@ impl BinaryScanOperator {
                 continue;
             }
 
-            if !self.within_row_var_equality_ok(s_id, p_id, o_type, o_key)? {
+            if !self.within_row_var_equality_ok(view, s_id, p_id, o_type, o_key)? {
                 continue;
             }
 
@@ -3496,7 +3480,6 @@ impl Operator for BinaryScanOperator {
         self.pending_cursors.clear();
         self.range_iter = None;
         self.store = None;
-        self.sid_cache.clear();
         self.p_sids = Vec::new().into();
         self.p_sids_ephemeral.clear();
         self.hidden_p_ids.clear();

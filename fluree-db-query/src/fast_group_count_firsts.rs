@@ -11,15 +11,12 @@ use crate::operator::{Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
-use fluree_db_binary_index::format::leaf::{
-    decode_leaf_dir_v3_with_base, decode_leaf_header_v3, LeafletDirEntryV3,
-};
+use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
-use fluree_db_binary_index::read::column_loader::{
-    load_leaflet_columns, load_leaflet_columns_cached,
-};
+use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
+use fluree_db_binary_index::read::leaf_access::LeafHandle;
 use fluree_db_binary_index::{
     BinaryCursor, BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
     RunSortOrder,
@@ -560,14 +557,13 @@ fn pid_prefix_v6_from_entry(entry: &LeafletDirEntryV3) -> (u32, u16, u64) {
 
 /// Load a V3 leaflet's columns, using the `LeafletCache` when available.
 fn load_v6_batch(
-    leaf_bytes: &[u8],
+    handle: &dyn LeafHandle,
     entry: &LeafletDirEntryV3,
-    payload_base: usize,
-    order: RunSortOrder,
     cache: &Option<&Arc<fluree_db_binary_index::LeafletCache>>,
     leaf_id: u128,
     leaflet_idx: u32,
 ) -> Result<fluree_db_binary_index::ColumnBatch> {
+    let order = handle.dir().order;
     let mut needed = ColumnSet::EMPTY;
     needed.insert(ColumnId::OKey);
     if entry.o_type_const.is_none() {
@@ -579,10 +575,8 @@ fn load_v6_batch(
         needed.insert(ColumnId::PId);
     }
     let batch = match cache {
-        Some(c) => load_leaflet_columns_cached(
-            leaf_bytes,
-            entry,
-            payload_base,
+        Some(c) => load_columns_cached_via_handle(
+            handle,
             c,
             fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
                 leaf_id,
@@ -596,7 +590,7 @@ fn load_v6_batch(
                 output: ColumnSet::EMPTY,
                 internal: needed,
             };
-            load_leaflet_columns(leaf_bytes, entry, payload_base, &projection, order)
+            handle.load_columns(leaflet_idx as usize, &projection, order)
         }
     };
     batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
@@ -706,13 +700,10 @@ fn count_object_key_v6(
     for leaf_idx in leaf_range.clone() {
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
-        let bytes = store
-            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
-            .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
-        let header =
-            decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
-        let dir = decode_leaf_dir_v3_with_base(&bytes, &header)
-            .map_err(|e| QueryError::Internal(e.to_string()))?;
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, None, false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        let dir = handle.dir();
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (i, entry) in dir.entries.iter().enumerate() {
@@ -793,10 +784,8 @@ fn count_object_key_v6(
             }
 
             let batch = load_v6_batch(
-                &bytes,
+                handle.as_ref(),
                 entry,
-                dir.payload_base,
-                header.order,
                 &cache,
                 leaf_id,
                 u32::try_from(i)
@@ -924,13 +913,10 @@ pub(crate) fn group_count_v6(
     for leaf_idx in leaf_range.clone() {
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
-        let bytes = store
-            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
-            .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
-        let header =
-            decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
-        let dir = decode_leaf_dir_v3_with_base(&bytes, &header)
-            .map_err(|e| QueryError::Internal(e.to_string()))?;
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, None, false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        let dir = handle.dir();
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (i, entry) in dir.entries.iter().enumerate() {
@@ -994,10 +980,8 @@ pub(crate) fn group_count_v6(
 
             // Decode columns (cached when available).
             let batch = load_v6_batch(
-                &bytes,
+                handle.as_ref(),
                 entry,
-                dir.payload_base,
-                header.order,
                 &cache,
                 leaf_id,
                 u32::try_from(i)

@@ -116,12 +116,20 @@ async fn test_encryption_envelope_format() {
 
     encrypted.write_bytes("test/data", b"hello").await.unwrap();
 
-    // Check envelope format: magic bytes "FLU\0"
+    // Check envelope format: magic bytes "FLU\0", then a segmented envelope:
+    // a 64-byte header and one segment of 5 bytes plus its tag.
     let raw_bytes = storage.read_bytes("test/data").await.unwrap();
-    assert!(raw_bytes.len() >= 22 + 16, "Should have header + tag");
+    assert_eq!(
+        raw_bytes.len(),
+        64 + 5 + 16,
+        "Should have header + segment + tag"
+    );
     assert_eq!(&raw_bytes[0..4], b"FLU\x00", "Should have magic bytes");
-    assert_eq!(raw_bytes[4], 0x01, "Version should be 1");
-    assert_eq!(raw_bytes[5], 0x01, "Algorithm should be AES-256-GCM (1)");
+    assert_eq!(raw_bytes[4], 0x02, "Version should be 2 (segmented)");
+    assert_eq!(
+        raw_bytes[5], 0x02,
+        "Algorithm should be AES-256-GCM with an HKDF object key (2)"
+    );
 }
 
 /// Test that different keys produce different ciphertext
@@ -355,6 +363,82 @@ async fn build_client_file_honours_key_and_spills_no_plaintext() {
         regular_files_under(cache.path()).is_empty(),
         "disk cache holds artifacts: {:?}",
         regular_files_under(cache.path())
+    );
+}
+
+/// Over encrypted file storage, indexed reads decrypt what they use: leaves
+/// and dictionary packs are read by range, and what they decrypt is kept as
+/// segments in the leaflet cache — never a leaf decrypted whole, never a
+/// dictionary page assembled. Results match plain storage.
+#[tokio::test]
+async fn encrypted_file_reads_leaves_and_packs_by_range() {
+    async fn names(encrypted: bool) -> (Vec<(String, String)>, Vec<(&'static str, u64, u64)>) {
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let cache = tempfile::TempDir::new().expect("tempdir");
+        let mut storage = json!({"@type": "Storage", "filePath": data.path().to_string_lossy()});
+        if encrypted {
+            storage["AES256Key"] = json!(KEY_B64);
+        }
+        let fluree = FlureeBuilder::from_json_ld(&jsonld_storage_config(storage))
+            .expect("config")
+            .with_ledger_cache_config(cache_config(cache.path()))
+            .build_client()
+            .await
+            .expect("build_client");
+        seed_index_and_query(&fluree, "enc-ranged", data.path()).await;
+        if encrypted {
+            let leaf = regular_files_under(data.path())
+                .into_iter()
+                .find(|p| p.extension().is_some_and(|e| e == "fli"))
+                .expect("a leaf at rest");
+            assert_eq!(std::fs::read(leaf).unwrap()[4], 2, "leaves are segmented");
+        }
+
+        let ledger = fluree.ledger("enc-ranged:main").await.expect("reload");
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?s", "?name"],
+            "where": {"@id": "?s", "ex:name": "?name"}
+        });
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("query");
+        let memo_hits = fluree_db_binary_index::unit_memo_hits();
+        let rows = result
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("to_jsonld");
+        if encrypted {
+            assert!(
+                fluree_db_binary_index::unit_memo_hits() > memo_hits,
+                "formatting rows in order reuses the dictionary units it reads"
+            );
+        }
+        let mut rows: Vec<(String, String)> = rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                (
+                    row[0].as_str().unwrap().to_string(),
+                    row[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        (rows, fluree.leaflet_cache().occupancy())
+    }
+
+    let (plain, _) = names(false).await;
+    let (encrypted, occupancy) = names(true).await;
+    assert_eq!(plain.len(), 120);
+    assert_eq!(encrypted, plain);
+    let held = |kind: &str| occupancy.iter().any(|(k, n, _)| *k == kind && *n > 0);
+    assert!(held("ranged-leaf"), "{occupancy:?}");
+    assert!(held("source-unit"), "{occupancy:?}");
+    assert!(
+        !held("leaf-bytes-heap"),
+        "a leaf decrypted whole: {occupancy:?}"
     );
 }
 

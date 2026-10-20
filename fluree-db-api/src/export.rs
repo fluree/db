@@ -315,7 +315,7 @@ impl<'a> ExportResolver<'a> {
     /// Mirrors `BinaryGraphView::resolve_subject_sid_uncached`: a novel id
     /// (above its namespace's watermark) resolves straight from `DictNovelty`
     /// to `Sid(ns_code, suffix)`, which is the exact value the transaction
-    /// wrote; anything persisted round-trips through the subject dictionary.
+    /// wrote; anything persisted resolves through the subject dictionary.
     /// Exactness matters because the resulting `EdgeKey` is a seek key into
     /// arena leaves sorted by the derived `Ord` — a Sid that differs in any
     /// position lands on the wrong span and reports "no annotations" rather
@@ -330,6 +330,9 @@ impl<'a> ExportResolver<'a> {
                     }
                 }
             }
+        }
+        if let Ok((ns_code, suffix)) = self.store.resolve_subject_parts(s_id) {
+            return self.store.subject_sid_of_parts(ns_code, suffix);
         }
         let iri = self.resolve_subject_iri(s_id)?;
         Ok(self

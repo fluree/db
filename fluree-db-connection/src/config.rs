@@ -222,20 +222,25 @@ impl Default for StorageConfig {
 pub struct CacheConfig {
     /// Maximum cache size in MB
     pub max_mb: usize,
+    /// On encrypted storage, the MB of `max_mb` that dictionary packs may
+    /// hold decrypted whole; by default a fixed share of it.
+    pub dictionary_max_mb: Option<usize>,
 }
 
 impl CacheConfig {
     /// Create a cache config with the given max MB.
     pub fn with_max_mb(max_mb: usize) -> Self {
-        CacheConfig { max_mb }
+        CacheConfig {
+            max_mb,
+            dictionary_max_mb: None,
+        }
     }
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         // Use memory-based default: tiered fraction of system RAM (see cache::default_cache_max_mb).
-        let max_mb = crate::cache::default_cache_max_mb();
-        CacheConfig { max_mb }
+        Self::with_max_mb(crate::cache::default_cache_max_mb())
     }
 }
 
@@ -408,6 +413,9 @@ impl ConnectionConfig {
         let cache_max_mb = resolve_u64(&graph, conn_node, vocab::FIELD_CACHE_MAX_MB)
             .map(|v| v as usize)
             .unwrap_or_else(crate::cache::default_cache_max_mb);
+        let cache_dictionary_max_mb =
+            resolve_u64(&graph, conn_node, vocab::FIELD_CACHE_DICTIONARY_MAX_MB)
+                .map(|v| v as usize);
 
         // 5. Resolve storage references using resolve_first (single-valued fields)
         let index_storage = conn_node
@@ -447,7 +455,10 @@ impl ConnectionConfig {
         Ok(ConnectionConfig {
             id: get_id(conn_node),
             parallelism,
-            cache: CacheConfig::with_max_mb(cache_max_mb),
+            cache: CacheConfig {
+                dictionary_max_mb: cache_dictionary_max_mb,
+                ..CacheConfig::with_max_mb(cache_max_mb)
+            },
             index_storage,
             commit_storage,
             primary_publisher,
@@ -880,6 +891,7 @@ impl CacheConfig {
             .ok_or_else(|| ConnectionError::invalid_config("Cache config must be an object"))?;
 
         let mut max_mb: Option<usize> = None;
+        let mut dictionary_max_mb: Option<usize> = None;
 
         for (key, value) in obj {
             match key.as_str() {
@@ -892,6 +904,9 @@ impl CacheConfig {
                 "maxMb" | "max_mb" | "cacheMaxMb" => {
                     max_mb = Some(resolve_config_value_usize(value)?);
                 }
+                "dictionaryMaxMb" | "dictionary_max_mb" | "cacheDictionaryMaxMb" => {
+                    dictionary_max_mb = Some(resolve_config_value_usize(value)?);
+                }
                 _ => {
                     return Err(ConnectionError::invalid_config(format!(
                         "Unknown cache configuration field: '{key}'"
@@ -900,9 +915,13 @@ impl CacheConfig {
             }
         }
 
-        Ok(match max_mb {
+        let base = match max_mb {
             Some(mb) => CacheConfig::with_max_mb(mb),
             None => CacheConfig::default(),
+        };
+        Ok(CacheConfig {
+            dictionary_max_mb,
+            ..base
         })
     }
 }

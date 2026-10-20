@@ -523,6 +523,9 @@ async fn build_direct_fluree(
         FlureeBuilder::file(&path_str)
     };
 
+    if config.storage_lock && config.owns_storage_root() && wal_owner.is_none() {
+        builder = builder.with_storage_lock();
+    }
     // Server-level overrides take precedence over connection config defaults.
     if let Some(owner) = wal_owner {
         // Voters share one payload root, so each node journals it under a
@@ -532,6 +535,9 @@ async fn build_direct_fluree(
     }
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);
+    }
+    if let Some(max_mb) = config.cache_dictionary_max_mb {
+        builder = builder.cache_dictionary_max_mb(max_mb);
     }
     if let Some(max_mb) = config.disk_cache_max_mb {
         builder = builder.disk_cache_max_mb(max_mb);

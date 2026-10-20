@@ -55,3 +55,7 @@ Define data quality constraints: required properties, datatype validation, value
 ### [Edge Annotations](cookbook-edge-annotations.md)
 
 Attach properties to a relationship: model property-graph edges, record statement-level provenance, represent parallel relationships, query inline or annotation-rooted, and understand what a retraction leaves — in JSON-LD and SPARQL 1.2.
+
+### [Custom Stages in Python](custom-stages-python.md)
+
+Run model calls and versioned decision procedures in Python against pinned ledger state, and publish each stage's result into a named graph it owns: a generation record, replay under a new version, failed and stale runs, and datalog rules that build on the result.

@@ -134,12 +134,7 @@ pub fn replay_leaflet_at_t(
     to_t: i64,
     order: RunSortOrder,
 ) -> io::Result<Option<ColumnBatch>> {
-    let to_t_u32 = u32::try_from(to_t).unwrap_or(u32::MAX);
-    let needs_replay = entry.history_max_t > to_t_u32 || batch_has_rows_above_t(batch, to_t_u32);
-    if !needs_replay {
-        return Ok(None);
-    }
-    if entry.history_len > 0 {
+    replay_leaflet_at_t_with(batch, entry, to_t, order, || {
         let sc_bytes = sidecar_bytes.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -152,7 +147,29 @@ pub fn replay_leaflet_at_t(
             min_t: entry.history_min_t,
             max_t: entry.history_max_t,
         };
-        let history = decode_history_segment(sc_bytes, &seg)?;
+        decode_history_segment(sc_bytes, &seg)
+    })
+}
+
+/// [`replay_leaflet_at_t`] with the leaflet's history segment from
+/// `load_history`, called only when the leaflet has history and needs
+/// replay: a leaf handle's
+/// [`load_sidecar_segment`](crate::read::leaf_access::LeafHandle::load_sidecar_segment),
+/// which reads just that segment.
+pub fn replay_leaflet_at_t_with(
+    batch: &ColumnBatch,
+    entry: &LeafletDirEntryV3,
+    to_t: i64,
+    order: RunSortOrder,
+    load_history: impl FnOnce() -> io::Result<Vec<HistEntryV2>>,
+) -> io::Result<Option<ColumnBatch>> {
+    let to_t_u32 = u32::try_from(to_t).unwrap_or(u32::MAX);
+    let needs_replay = entry.history_max_t > to_t_u32 || batch_has_rows_above_t(batch, to_t_u32);
+    if !needs_replay {
+        return Ok(None);
+    }
+    if entry.history_len > 0 {
+        let history = load_history()?;
         return Ok(replay_leaflet(batch, &history, to_t, order));
     }
     // No sidecar, but base rows have t > to_t — filter them out.

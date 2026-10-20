@@ -11,3 +11,9 @@
 # visibly, and letting the rest of the suite finish under `--no-fail-fast`.
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# Times lookups on up to eight threads against one; tests running beside it
+# would take the cores it measures.
+[[profile.default.overrides]]
+filter = 'test(lookups_in_a_promoted_pack_scale_across_threads)'
+threads-required = 'num-test-threads'

@@ -3,6 +3,7 @@
 pub mod batched_lookup;
 pub mod binary_cursor;
 pub mod binary_index_store;
+pub mod cached_units;
 pub mod column_loader;
 pub mod column_types;
 pub mod leaf_access;

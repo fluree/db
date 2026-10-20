@@ -91,6 +91,8 @@ mod encrypted;
 mod envelope;
 mod error;
 mod key;
+mod segmented;
+mod stats;
 
 // Re-export main types
 pub use encrypted::EncryptedStorage;

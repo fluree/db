@@ -460,6 +460,13 @@ path = "tests/it_cyclic_bgp_probe.rs"
 name = "it_cyclic_bgp_string_dict"
 path = "tests/it_cyclic_bgp_string_dict.rs"
 
+# Own binary: asserts on the load-time warning for shapes no config enforces.
+# Same convention and same two hazards as the capture tests above.
+[[test]]
+name = "it_unenforced_shapes_warning"
+path = "tests/it_unenforced_shapes_warning.rs"
+required-features = ["shacl"]
+
 # Own binary: asserts on a tracing event to pin that the BM25 incremental sync
 # really narrows its indexing query. Same convention and same two hazards as the
 # capture tests above — process-global callsite-interest cache, thread-local
@@ -573,6 +580,10 @@ name = "it_key_rotation"
 path = "tests/it_key_rotation.rs"
 
 [[test]]
+name = "it_encrypted_cache_reservation"
+path = "tests/it_encrypted_cache_reservation.rs"
+
+[[test]]
 name = "it_credential"
 path = "tests/it_credential.rs"
 required-features = ["credential"]
@@ -664,6 +675,10 @@ required-features = ["graphql"]
 
 [[bench]]
 name = "insert_formats"
+harness = false
+
+[[bench]]
+name = "jsonld_parse"
 harness = false
 
 [[bench]]

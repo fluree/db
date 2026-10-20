@@ -18,6 +18,8 @@ pub fn format(
     compactor: &IriCompactor,
     config: &FormatterConfig,
 ) -> Result<String> {
+    // Rows reach the dictionaries in order; reuse the units they land in.
+    let _units = fluree_db_binary_index::UnitMemoScope::enter();
     let name = match config.format {
         OutputFormat::RdfXml => "RDF/XML",
         OutputFormat::Turtle => "Turtle",

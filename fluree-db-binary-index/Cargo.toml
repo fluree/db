@@ -32,6 +32,7 @@ ciborium = "0.2"
 # moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 
 # Concurrency
+arc-swap = "1.9.2"
 once_cell.workspace = true
 parking_lot = "0.12"
 futures.workspace = true
@@ -57,6 +58,7 @@ rust-stemmers = "1.2"
 
 [dev-dependencies]
 async-trait.workspace = true
+crossbeam-epoch = "0.9"
 tracing-subscriber.workspace = true
 
 [lints]

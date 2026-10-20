@@ -693,6 +693,13 @@ impl FlureeServerBuilder {
         self
     }
 
+    /// On encrypted storage, set the MB of the cache budget that dictionary
+    /// packs may hold decrypted whole
+    pub fn cache_dictionary_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.cache_dictionary_max_mb = Some(max_mb);
+        self
+    }
+
     /// Set the global on-disk cache budget in MB (Fluree object storage + Iceberg)
     pub fn disk_cache_max_mb(mut self, max_mb: usize) -> Self {
         self.config.disk_cache_max_mb = Some(max_mb);

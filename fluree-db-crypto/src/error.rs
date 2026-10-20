@@ -49,6 +49,13 @@ pub enum EncryptionError {
         context: &'static str,
     },
 
+    /// An envelope ends before the bytes its header declares.
+    #[error("Encrypted object truncated: {context}")]
+    Truncated {
+        /// What was cut short.
+        context: &'static str,
+    },
+
     /// Decryption operation failed.
     ///
     /// This occurs when:
@@ -87,6 +94,11 @@ impl EncryptionError {
     /// Create an encryption failed error.
     pub fn encrypt_failed(context: &'static str) -> Self {
         Self::EncryptFailed { context }
+    }
+
+    /// Create a truncation error.
+    pub fn truncated(context: &'static str) -> Self {
+        Self::Truncated { context }
     }
 
     /// Create a decryption failed error.

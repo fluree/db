@@ -1340,6 +1340,16 @@ impl BinaryIndexStore {
 
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
 
+        if let Some(source) = self.local_leaf_source(cs, leaf_cid, leaf_id, true)? {
+            return self.leaf_handle_from_source(
+                cs,
+                leaf_cid,
+                leaf_id,
+                source,
+                sidecar_cid,
+                need_replay,
+            );
+        }
         if let Some(bytes) = self.local_leaf_bytes(cs, leaf_cid, leaf_id)? {
             return self.leaf_handle_from_bytes(bytes, leaf_id, sidecar_cid, need_replay);
         }
@@ -1419,6 +1429,89 @@ impl BinaryIndexStore {
         )))
     }
 
+    /// A leaf on this machine read by range, for a store whose whole-leaf
+    /// local read decrypts the leaf: only the segments a read touches are
+    /// decrypted, and the leaf is never held whole. `None` when the store
+    /// reads the leaf whole (an older envelope), or the leaf is not here.
+    ///
+    /// With `keep`, the source enters the cache, so a leaf is opened (mapped,
+    /// its key derived) once rather than per open; a directory walk that
+    /// touches many leaves it never scans passes `false`. A leaf the cache
+    /// already holds whole is read from that.
+    fn local_leaf_source(
+        &self,
+        cs: &Arc<dyn ContentStore>,
+        leaf_cid: &ContentId,
+        leaf_id: u128,
+        keep: bool,
+    ) -> io::Result<Option<Arc<dyn fluree_db_core::RangeSource>>> {
+        if !cs.costly_local_reads() {
+            return Ok(None);
+        }
+        if let Some(cache) = &self.leaflet_cache {
+            if let Some(source) = cache.get_ranged_leaf(leaf_id) {
+                return Ok(Some(source));
+            }
+            if cache.get_leaf_bytes(leaf_id).is_some() {
+                return Ok(None);
+            }
+        }
+        let Some(source) = cs.get_local_ranged(leaf_cid).map_err(storage_io_error)? else {
+            return Ok(None);
+        };
+        Ok(Some(match &self.leaflet_cache {
+            Some(cache) if keep => {
+                // Its decrypted units are kept too, so a reader that loads
+                // columns without the decoded cache does not decrypt again.
+                let source: Arc<dyn fluree_db_core::RangeSource> = Arc::new(
+                    super::cached_units::CachedUnits::new(source, Arc::clone(cache)),
+                );
+                cache.get_or_insert_ranged_leaf(leaf_id, source)
+            }
+            _ => source,
+        }))
+    }
+
+    /// The handle for a leaf read by range from a local source, its
+    /// directory shared through the cache like a whole leaf's.
+    fn leaf_handle_from_source(
+        &self,
+        cs: &Arc<dyn ContentStore>,
+        leaf_cid: &ContentId,
+        leaf_id: u128,
+        source: Arc<dyn fluree_db_core::RangeSource>,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        let read_unit = source.read_unit();
+        let fetcher: Arc<dyn super::leaf_access::RangeReadFetcher> = Arc::new(
+            LocalSourceFetcher::new(leaf_cid.clone(), source, Arc::clone(cs)),
+        );
+        let load_dir = || {
+            super::leaf_access::fetch_header_and_directory(fetcher.as_ref(), leaf_cid)
+                .map(|(dir, _, _)| Arc::new(dir))
+        };
+        let dir = match &self.leaflet_cache {
+            Some(cache) => cache.try_get_or_load_leaf_dir(leaf_id, load_dir)?,
+            None => load_dir()?,
+        };
+        let sidecar = if need_replay {
+            sidecar_cid.cloned()
+        } else {
+            None
+        };
+        Ok(Box::new(
+            super::leaf_access::RangeReadLeafHandle::over_local_source(
+                leaf_cid.clone(),
+                dir,
+                leaf_id,
+                fetcher,
+                sidecar,
+                read_unit,
+            ),
+        ))
+    }
+
     /// Build the handle for a leaf whose bytes are on this machine, sharing
     /// the decoded directory through the cache: content-addressed, so it is
     /// parsed once per leaf CID however many times the leaf is opened.
@@ -1482,6 +1575,11 @@ impl BinaryIndexStore {
             .cas
             .as_ref()
             .ok_or_else(|| io::Error::other("no content store"))?;
+        if let Some(source) = self.local_leaf_source(cs, leaf_cid, leaf_id, false)? {
+            let fetcher = LocalSourceFetcher::new(leaf_cid.clone(), source, Arc::clone(cs));
+            let (dir, _, _) = super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
+            return Ok(Arc::new(dir));
+        }
         let local = match self
             .leaflet_cache
             .as_ref()
@@ -2445,6 +2543,38 @@ impl BinaryIndexStore {
         Ok(self
             .find_full_iri_subject_fallback(iri)?
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
+    }
+
+    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`: what
+    /// [`Self::find_subject_sid`] gives for its IRI, else [`Self::encode_iri`].
+    ///
+    /// When the canonical split of the IRI is exactly the parts the subject is
+    /// stored under, they are the answer: the reverse dictionary holds that
+    /// key, so the lookup `find_subject_sid` would make returns them. A
+    /// full-IRI namespace, or a split the current rules do not produce, takes
+    /// the lookup.
+    pub fn subject_sid_of_parts(&self, ns_code: u16, suffix: String) -> io::Result<Sid> {
+        if namespaces::is_full_iri(ns_code) {
+            return Ok(self
+                .find_subject_sid(&suffix)?
+                .unwrap_or_else(|| self.encode_iri(&suffix)));
+        }
+        let prefix = self.dicts.namespace_codes.get(&ns_code).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no namespace prefix for code={ns_code}"),
+            )
+        })?;
+        let iri = format!("{prefix}{suffix}");
+        let (canonical_prefix, canonical_suffix) = canonical_split(&iri, self.ns_split_mode);
+        if canonical_suffix == suffix
+            && self.dicts.namespace_reverse.get(canonical_prefix) == Some(&ns_code)
+        {
+            return Ok(Sid::new(ns_code, suffix));
+        }
+        Ok(self
+            .find_subject_sid(&iri)?
+            .unwrap_or_else(|| self.encode_iri(&iri)))
     }
 
     /// Translate a `Sid` to `p_id` via the predicate reverse map.
@@ -3500,12 +3630,8 @@ impl BinaryGraphView {
         }
         // Persisted forward-pack lookup; charge before the I/O.
         self.charge_dict_touch()?;
-        let iri = self.store.resolve_subject_iri(s_id)?;
-        if let Some(sid) = self.store.find_subject_sid(&iri)? {
-            Ok(sid)
-        } else {
-            Ok(self.store.encode_iri(&iri))
-        }
+        let (ns_code, suffix) = self.store.resolve_subject_parts(s_id)?;
+        self.store.subject_sid_of_parts(ns_code, suffix)
     }
 
     pub fn store(&self) -> &BinaryIndexStore {
@@ -3660,7 +3786,8 @@ async fn build_dictionary_set(
             *ns_code,
             prev.and_then(|p| p.subject_forward_packs.get(ns_code)),
         )
-        .await?;
+        .await?
+        .with_page_cache(leaflet_cache.cloned());
         subject_forward_packs.insert(*ns_code, reader);
     }
     let subject_forward_us = phase.elapsed().as_micros() as u64;
@@ -3687,7 +3814,8 @@ async fn build_dictionary_set(
         0,
         prev.map(|p| &p.string_forward_packs),
     )
-    .await?;
+    .await?
+    .with_page_cache(leaflet_cache.cloned());
     let string_forward_us = phase.elapsed().as_micros() as u64;
 
     // String reverse tree.
@@ -4040,6 +4168,58 @@ impl ContentStoreRangeFetcher {
                     .map_err(|e| io::Error::other(format!("CAS range fetch failed: {e}")))
             }
         })
+    }
+}
+
+/// Range reads of a leaf from a local source: synchronous, so never over
+/// the sync→async bridge. The leaf's history sidecar is read from its own
+/// source, opened once per handle, or from what the store serves for it.
+struct LocalSourceFetcher {
+    leaf_cid: ContentId,
+    source: Arc<dyn fluree_db_core::RangeSource>,
+    cs: Arc<dyn ContentStore>,
+    #[allow(clippy::type_complexity)]
+    sidecar: std::sync::OnceLock<(ContentId, Option<Arc<dyn fluree_db_core::RangeSource>>)>,
+}
+
+impl LocalSourceFetcher {
+    fn new(
+        leaf_cid: ContentId,
+        source: Arc<dyn fluree_db_core::RangeSource>,
+        cs: Arc<dyn ContentStore>,
+    ) -> Self {
+        Self {
+            leaf_cid,
+            source,
+            cs,
+            sidecar: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl super::leaf_access::RangeReadFetcher for LocalSourceFetcher {
+    fn fetch_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> io::Result<Vec<u8>> {
+        if *id == self.leaf_cid {
+            return self.source.read_range(range).map_err(storage_io_error);
+        }
+        let sidecar = match self.sidecar.get() {
+            Some((sidecar_id, source)) if sidecar_id == id => source.clone(),
+            _ => {
+                let opened = self.cs.get_local_ranged(id).map_err(storage_io_error)?;
+                let _ = self.sidecar.set((id.clone(), opened.clone()));
+                opened
+            }
+        };
+        if let Some(source) = sidecar {
+            return source.read_range(range).map_err(storage_io_error);
+        }
+        if let Some(bytes) = self.cs.get_local(id).map_err(storage_io_error)? {
+            let len = bytes.len() as u64;
+            let start = range.start.min(len) as usize;
+            let end = range.end.min(len).max(range.start.min(len)) as usize;
+            return Ok(bytes[start..end].to_vec());
+        }
+        ContentStoreRangeFetcher::new(Arc::clone(&self.cs)).fetch_range(id, range)
     }
 }
 
@@ -5531,6 +5711,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// A subject stored under its IRI's canonical split resolves to its
+    /// stored parts without the reverse lookup; every other subject takes
+    /// it, and each resolves to what that lookup gives.
+    #[test]
+    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits() {
+        use crate::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
+
+        const EX: u16 = 100;
+        // Registered, but its subject's IRI splits under a prefix that is not.
+        const EX_A: u16 = 101;
+        // Same prefix as EX; the reverse map names EX for it.
+        const DUP: u16 = 102;
+        // Its IRI's canonical prefix maps back to it, with another suffix.
+        const EX_C: u16 = 103;
+        let subjects: [(u16, &str); 6] = [
+            (EX, "alice"),
+            (EX_A, "b/c"),
+            (DUP, "carol"),
+            (EX_C, "/d"),
+            (namespaces::EMPTY, "urn:isbn:123"),
+            (namespaces::OVERFLOW, "https://example.org/zed"),
+        ];
+
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()));
+        store.set_ns_split_mode(NsSplitMode::MostGranular);
+        // Full-IRI namespaces have no prefix, as in a real store.
+        store.dicts.namespace_codes = Arc::new(HashMap::from([
+            (EX, "https://example.org/".to_string()),
+            (EX_A, "https://example.org/a/".to_string()),
+            (DUP, "https://example.org/".to_string()),
+            (EX_C, "https://example.org/c".to_string()),
+        ]));
+        store.dicts.namespace_reverse = Arc::new(HashMap::from([
+            ("https://example.org/".to_string(), EX),
+            ("https://example.org/a/".to_string(), EX_A),
+            ("https://example.org/c/".to_string(), EX_C),
+        ]));
+        let mut reverse = Vec::new();
+        for (ns_code, suffix) in subjects {
+            store.dicts.subject_forward_packs.insert(
+                ns_code,
+                ForwardPackReader::from_memory(vec![Arc::from(
+                    make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
+                )])
+                .unwrap(),
+            );
+            reverse.push(ReverseEntry {
+                key: subject_reverse_key(ns_code, suffix.as_bytes()),
+                id: SubjectId::new(ns_code, 1).as_u64(),
+            });
+        }
+        reverse.sort_by(|a, b| a.key.cmp(&b.key));
+        let tree = Arc::new(build_reverse_reader(reverse));
+        store.dicts.subject_reverse_tree = Some(Arc::clone(&tree));
+        let store = Arc::new(store);
+        let view = BinaryGraphView::new(Arc::clone(&store), 0);
+
+        for (ns_code, suffix) in subjects {
+            let s_id = SubjectId::new(ns_code, 1).as_u64();
+            let iri = store.resolve_subject_iri(s_id).unwrap();
+            let expected = store
+                .find_subject_sid(&iri)
+                .unwrap()
+                .unwrap_or_else(|| store.encode_iri(&iri));
+            let lookups = tree.cache_hits();
+            assert_eq!(
+                view.resolve_subject_sid(s_id).unwrap(),
+                expected,
+                "{suffix}"
+            );
+            let lookups = tree.cache_hits() - lookups;
+            if ns_code == EX {
+                assert_eq!(expected, Sid::new(EX, "alice"));
+                assert_eq!(lookups, 0, "a canonical subject needs no reverse lookup");
+            } else {
+                assert!(lookups > 0, "{suffix} takes the reverse lookup");
+            }
+        }
+    }
+
     #[test]
     fn subject_decodes_are_memoized_per_view() {
         use fluree_db_core::tracking::{Tracker, TrackingOptions};
@@ -5884,6 +6144,427 @@ pub(crate) mod tests {
             Err(_) => {
                 panic!("run_sync_on_runtime wedged no-runtime fan-out on shared helper runtime")
             }
+        }
+    }
+
+    /// Leaves of a store whose whole local reads decrypt everything, read
+    /// through a range source instead.
+    pub(crate) mod ranged_local {
+        use super::*;
+        use crate::read::column_loader::{load_columns_cached_via_handle, LeafletDecodeSpec};
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+        use crate::read::leaf_access::{FullBlobLeafHandle, LeafHandle};
+        use fluree_db_core::RangeSource;
+        use std::ops::Range;
+        use std::sync::Mutex;
+
+        /// Plaintext served by range, recording each request, standing in
+        /// for a segmented envelope whose reads cost `unit`-byte segments.
+        #[derive(Debug)]
+        pub(crate) struct RecordingSource {
+            bytes: Vec<u8>,
+            unit: u64,
+            identity: u128,
+            reads: Mutex<Vec<Range<u64>>>,
+        }
+
+        impl RecordingSource {
+            pub(crate) fn reads(&self) -> Vec<Range<u64>> {
+                self.reads.lock().unwrap().clone()
+            }
+        }
+
+        impl RangeSource for RecordingSource {
+            fn len(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+
+            fn read_range(&self, range: Range<u64>) -> fluree_db_core::Result<Vec<u8>> {
+                self.reads.lock().unwrap().push(range.clone());
+                let len = self.bytes.len() as u64;
+                let start = range.start.min(len) as usize;
+                let end = range.end.min(len).max(range.start.min(len)) as usize;
+                Ok(self.bytes[start..end].to_vec())
+            }
+
+            fn read_unit(&self) -> u64 {
+                self.unit
+            }
+
+            fn cache_weight(&self) -> usize {
+                1024
+            }
+
+            fn cache_identity(&self) -> u128 {
+                self.identity
+            }
+        }
+
+        /// A store whose local reads decrypt: whole reads are counted, and
+        /// `ranged` stores open a [`RecordingSource`] per object.
+        #[derive(Debug, Clone)]
+        pub(crate) struct SegmentedContentStore {
+            inner: MemoryContentStore,
+            ranged: bool,
+            unit: u64,
+            pub(crate) whole_reads: Arc<AtomicUsize>,
+            pub(crate) opens: Arc<AtomicUsize>,
+            pub(crate) sources: Arc<Mutex<Vec<Arc<RecordingSource>>>>,
+        }
+
+        impl SegmentedContentStore {
+            pub(crate) fn new(ranged: bool) -> Self {
+                Self {
+                    inner: MemoryContentStore::new(),
+                    ranged,
+                    unit: 4096,
+                    whole_reads: Arc::new(AtomicUsize::new(0)),
+                    opens: Arc::new(AtomicUsize::new(0)),
+                    sources: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            pub(crate) fn put_sync(&self, kind: ContentKind, bytes: &[u8]) -> ContentId {
+                let inner = self.inner.clone();
+                let bytes = bytes.to_vec();
+                run_sync_on_runtime(async move {
+                    inner
+                        .put(kind, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                })
+                .expect("store bytes")
+            }
+
+            /// Every range read so far, across sources.
+            pub(crate) fn reads(&self) -> Vec<Range<u64>> {
+                self.sources
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| s.reads())
+                    .collect()
+            }
+        }
+
+        #[async_trait]
+        impl ContentStore for SegmentedContentStore {
+            async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+                self.inner.has(id).await
+            }
+
+            async fn get(
+                &self,
+                id: &ContentId,
+            ) -> fluree_db_core::Result<fluree_db_core::ContentBytes> {
+                self.inner.get(id).await
+            }
+
+            async fn put(
+                &self,
+                kind: ContentKind,
+                bytes: &[u8],
+            ) -> fluree_db_core::Result<ContentId> {
+                self.inner.put(kind, bytes).await
+            }
+
+            async fn put_with_id(
+                &self,
+                id: &ContentId,
+                bytes: &[u8],
+            ) -> fluree_db_core::Result<()> {
+                self.inner.put_with_id(id, bytes).await
+            }
+
+            async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+                self.inner.release(id).await
+            }
+
+            fn get_local(
+                &self,
+                id: &ContentId,
+            ) -> fluree_db_core::Result<Option<fluree_db_core::ContentBytes>> {
+                self.whole_reads.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(self.inner.get_local(id)?.map(|bytes| bytes.to_vec().into()))
+            }
+
+            fn get_local_ranged(
+                &self,
+                id: &ContentId,
+            ) -> fluree_db_core::Result<Option<Arc<dyn RangeSource>>> {
+                if !self.ranged {
+                    return Ok(None);
+                }
+                let Some(bytes) = self.inner.get_local(id)? else {
+                    return Ok(None);
+                };
+                self.opens.fetch_add(1, AtomicOrdering::SeqCst);
+                let source = Arc::new(RecordingSource {
+                    bytes: bytes.to_vec(),
+                    unit: self.unit,
+                    // One object of one store, as an envelope's identity is.
+                    identity: xxhash_rust::xxh3::xxh3_128(&id.to_bytes()),
+                    reads: Mutex::new(Vec::new()),
+                });
+                self.sources.lock().unwrap().push(Arc::clone(&source));
+                Ok(Some(source))
+            }
+
+            fn costly_local_reads(&self) -> bool {
+                true
+            }
+        }
+
+        fn setup(ranged: bool) -> (SegmentedContentStore, BinaryIndexStore, ContentId, Vec<u8>) {
+            let info = build_large_test_leaf_info();
+            let cs = SegmentedContentStore::new(ranged);
+            let leaf_cid = cs.put_sync(ContentKind::IndexLeaf, &info.leaf_bytes);
+            let mut store = empty_store(Arc::new(cs.clone()));
+            store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(64)));
+            (cs, store, leaf_cid, info.leaf_bytes)
+        }
+
+        fn spec(leaf_cid: &ContentId, leaflet_idx: u32, columns: ColumnSet) -> LeafletDecodeSpec {
+            LeafletDecodeSpec {
+                leaf_id: xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref()),
+                leaflet_idx,
+                order: RunSortOrder::Post,
+                decode_set: columns,
+            }
+        }
+
+        fn okey_and_sid() -> ColumnSet {
+            let mut columns = ColumnSet::EMPTY;
+            columns.insert(crate::format::column_block::ColumnId::OKey);
+            columns.insert(crate::format::column_block::ColumnId::SId);
+            columns
+        }
+
+        fn bytes_read(reads: &[Range<u64>], len: u64) -> u64 {
+            reads
+                .iter()
+                .map(|r| r.end.min(len) - r.start.min(len))
+                .sum()
+        }
+
+        /// One leaflet of a large leaf costs its directory and that
+        /// leaflet's column blocks; the whole leaf is never read, and the
+        /// columns match a whole-blob decode.
+        #[test]
+        fn a_leaflet_read_decrypts_only_what_it_needs() {
+            let (cs, store, leaf_cid, leaf_bytes) = setup(true);
+            let cache = store.leaflet_cache.clone().unwrap();
+            let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+            let leaflets = handle.dir().entries.len();
+            assert!(leaflets > 4, "the fixture spans several leaflets");
+
+            let batch = load_columns_cached_via_handle(
+                handle.as_ref(),
+                &cache,
+                spec(&leaf_cid, 3, okey_and_sid()),
+            )
+            .unwrap();
+            let whole = FullBlobLeafHandle::new(leaf_bytes.clone(), None, 0).unwrap();
+            let projection = ColumnProjection {
+                output: okey_and_sid(),
+                internal: ColumnSet::EMPTY,
+            };
+            let expected = whole
+                .load_columns(3, &projection, RunSortOrder::Post)
+                .unwrap();
+            assert_eq!(batch.row_count, expected.row_count);
+            for row in 0..batch.row_count {
+                assert_eq!(batch.o_key.get_or(row, 0), expected.o_key.get_or(row, 0));
+                assert_eq!(batch.s_id.get_or(row, 0), expected.s_id.get_or(row, 0));
+            }
+
+            assert_eq!(
+                cs.whole_reads.load(AtomicOrdering::SeqCst),
+                0,
+                "no whole read"
+            );
+            let len = leaf_bytes.len() as u64;
+            let read = bytes_read(&cs.reads(), len);
+            assert!(
+                read < len / 2,
+                "read {read} of a {len}-byte leaf for one leaflet of {leaflets}"
+            );
+        }
+
+        /// A leaflet the cache holds decoded is served without reading the
+        /// leaf, and the leaf's source is opened once across opens.
+        #[test]
+        fn decoded_leaflets_and_open_sources_are_reused() {
+            let (cs, store, leaf_cid, _) = setup(true);
+            let cache = store.leaflet_cache.clone().unwrap();
+            for _ in 0..3 {
+                let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+                load_columns_cached_via_handle(
+                    handle.as_ref(),
+                    &cache,
+                    spec(&leaf_cid, 2, okey_and_sid()),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                cs.opens.load(AtomicOrdering::SeqCst),
+                1,
+                "source opened once"
+            );
+            let reads = cs.reads();
+            let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+            load_columns_cached_via_handle(
+                handle.as_ref(),
+                &cache,
+                spec(&leaf_cid, 2, okey_and_sid()),
+            )
+            .unwrap();
+            assert_eq!(cs.reads(), reads, "a cached leaflet reads nothing");
+        }
+
+        /// A scan reads leaflet by leaflet: never the whole leaf at once,
+        /// and about the leaf's bytes in total.
+        #[test]
+        fn a_scan_never_holds_the_leaf_whole() {
+            let (cs, store, leaf_cid, leaf_bytes) = setup(true);
+            let cache = store.leaflet_cache.clone().unwrap();
+            let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+            for idx in 0..handle.dir().entries.len() {
+                load_columns_cached_via_handle(
+                    handle.as_ref(),
+                    &cache,
+                    spec(&leaf_cid, idx as u32, okey_and_sid()),
+                )
+                .unwrap();
+            }
+            let len = leaf_bytes.len() as u64;
+            let reads = cs.reads();
+            let largest = reads
+                .iter()
+                .map(|r| r.end.min(len) - r.start)
+                .max()
+                .unwrap();
+            assert!(largest < len / 4, "largest read {largest} of {len}");
+            assert!(bytes_read(&reads, len) <= len + 4096 * reads.len() as u64);
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        /// Readers that load columns without the decoded cache, as scan
+        /// fast paths do, read each of a leaf's units from the source once:
+        /// the decrypted units are kept in the leaflet cache.
+        #[test]
+        fn uncached_column_loads_read_each_unit_once() {
+            let (cs, store, leaf_cid, _) = setup(true);
+            let projection = ColumnProjection {
+                output: okey_and_sid(),
+                internal: ColumnSet::EMPTY,
+            };
+            let scan = || {
+                let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+                for idx in 0..handle.dir().entries.len() {
+                    handle
+                        .load_columns(idx, &projection, RunSortOrder::Post)
+                        .unwrap();
+                }
+            };
+            scan();
+            let reads = cs.reads();
+            assert!(
+                reads.iter().all(|r| r.start % 4096 == 0),
+                "whole units: {reads:?}"
+            );
+            scan();
+            assert_eq!(
+                cs.reads().len(),
+                reads.len(),
+                "a second scan decrypts nothing"
+            );
+            let cache = store.leaflet_cache.as_ref().unwrap();
+            assert!(cache
+                .occupancy()
+                .iter()
+                .any(|(kind, _, _)| *kind == "source-unit"));
+        }
+
+        /// A directory walk reads the leaf's prefix and keeps nothing but
+        /// the decoded directory.
+        #[test]
+        fn a_directory_walk_reads_the_prefix_and_keeps_no_source() {
+            let (cs, store, leaf_cid, _) = setup(true);
+            let dir = store.open_leaf_dir(&leaf_cid).unwrap();
+            assert!(!dir.entries.is_empty());
+            let reads = cs.reads();
+            assert!(
+                reads
+                    .iter()
+                    .all(|r| r.start < crate::read::leaf_access::SPECULATIVE_HEADER_DIR_BYTES),
+                "{reads:?}"
+            );
+            let cache = store.leaflet_cache.as_ref().unwrap();
+            assert!(
+                cache
+                    .occupancy()
+                    .iter()
+                    .all(|(kind, _, _)| *kind != "ranged-leaf"),
+                "a walk does not keep the source"
+            );
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        /// Column blocks within one read unit of each other are one read,
+        /// so a segment between them is not decrypted twice: POST stores
+        /// `o_key`, `s_id`, `t` in that order, and the `s_id` block skipped
+        /// here is wider than the default gap but narrower than the unit.
+        #[test]
+        fn blocks_within_a_read_unit_are_one_read() {
+            let info = build_large_test_leaf_info();
+            let cs = SegmentedContentStore {
+                unit: 64 * 1024,
+                ..SegmentedContentStore::new(true)
+            };
+            let leaf_cid = cs.put_sync(ContentKind::IndexLeaf, &info.leaf_bytes);
+            let store = empty_store(Arc::new(cs.clone()));
+            let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+            let entry = &handle.dir().entries[5];
+            let sid = entry
+                .column_refs
+                .iter()
+                .find(|r| r.col_id == crate::format::column_block::ColumnId::SId.to_u16())
+                .unwrap();
+            assert!(
+                sid.compressed_len > 4096,
+                "the skipped block outgrows the default gap"
+            );
+
+            let before = cs.reads().len();
+            let mut columns = ColumnSet::EMPTY;
+            columns.insert(crate::format::column_block::ColumnId::OKey);
+            columns.insert(crate::format::column_block::ColumnId::T);
+            let projection = ColumnProjection {
+                output: columns,
+                internal: ColumnSet::EMPTY,
+            };
+            handle
+                .load_columns(5, &projection, RunSortOrder::Post)
+                .unwrap();
+            assert_eq!(cs.reads().len() - before, 1);
+        }
+
+        /// A store that reads a leaf only whole (an older envelope) keeps
+        /// the whole-leaf lane.
+        #[test]
+        fn a_leaf_without_a_ranged_source_is_read_whole() {
+            let (cs, store, leaf_cid, _) = setup(false);
+            let cache = store.leaflet_cache.clone().unwrap();
+            let handle = store.open_leaf_handle(&leaf_cid, None, false).unwrap();
+            load_columns_cached_via_handle(
+                handle.as_ref(),
+                &cache,
+                spec(&leaf_cid, 1, okey_and_sid()),
+            )
+            .unwrap();
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 1);
+            assert!(cs.reads().is_empty());
         }
     }
 }

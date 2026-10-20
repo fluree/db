@@ -1010,6 +1010,8 @@ pub fn decode_leaf_dir_v3(
 /// leaflet column block payloads begin. Pass it to `load_leaflet_columns()`.
 #[derive(Debug, Clone)]
 pub struct DecodedLeafDirV3 {
+    /// The leaf's sort order, from its header.
+    pub order: RunSortOrder,
     pub entries: Vec<LeafletDirEntryV3>,
     /// Byte offset in the leaf blob where payload data starts
     /// (= header size + directory size). Authoritative — do not recompute.
@@ -1121,6 +1123,7 @@ pub fn decode_leaf_dir_v3_with_base(
     }
 
     Ok(DecodedLeafDirV3 {
+        order: header.order,
         entries,
         payload_base: pos,
     })

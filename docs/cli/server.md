@@ -81,6 +81,19 @@ fluree server start --listen-addr 0.0.0.0:8090 --log-level debug
 
 The `--dry-run` flag prints the fully resolved configuration (config file + env + flag overrides merged) without actually starting the server. Useful for debugging "why is it using port X?".
 
+### One server per storage directory
+
+A server on file storage locks its storage directory for as long as it runs. A second
+`server run` or `server start` on the same directory is refused with the pid of the process that
+holds it, and so is a Python process calling `fluree.connect(".fluree/storage")` meanwhile.
+`start` checks before it launches anything, so a refused start leaves the running server's PID
+file and `server.meta.json` alone. The lock belongs to the running process, so a crash or
+`kill -9` releases it; there is nothing to clean up. Shared-storage query peers and Raft nodes
+open a directory that other processes use on purpose, and take no lock.
+
+CLI commands route to the running server; with `--direct` they open the directory themselves,
+without the lock. See [One process per directory](../operations/storage.md#one-process-per-directory).
+
 ## stop
 
 Stop a backgrounded server by sending SIGTERM and waiting for graceful shutdown (up to 10 seconds).
@@ -212,6 +225,7 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 cors_enabled = true
 # cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_dictionary_max_mb = 2048  # encrypted storage: part of the cache budget for whole dictionary packs, given back if unusable; default: 60%
 
 [server.indexing]
 enabled = true

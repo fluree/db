@@ -268,6 +268,14 @@ struct TrackerInner {
 #[derive(Clone, Default)]
 pub struct Tracker(Option<Arc<TrackerInner>>);
 
+impl std::fmt::Debug for Tracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tracker")
+            .field("enabled", &self.is_enabled())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Tracker {
     /// Create a tracker from options. Returns a disabled tracker if no tracking is enabled.
     pub fn new(options: TrackingOptions) -> Self {
@@ -589,6 +597,16 @@ pub struct ReasoningTally {
     /// materialization this reports the original computation, not this
     /// request's (near-zero) cache hit.
     pub duration_ms: u64,
+    /// Datalog rules the cap cut short while they ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capped_rules: Vec<String>,
+    /// Datalog rules that never ran because the cap fired first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_rules: Vec<String>,
+    /// The time datalog rule bodies evaluated `NOW()` and `TODAY()` at, when
+    /// a rule called either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_time: Option<String>,
 }
 
 fn format_time_ms(duration: Duration) -> String {
