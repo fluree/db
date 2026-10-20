@@ -22,22 +22,22 @@ use crate::support::{
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug)]
-enum Surface {
+pub(crate) enum Surface {
     JsonLd,
     Sparql,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Storage {
+pub(crate) enum Storage {
     NoveltyOnly,
     Indexed,
 }
 
-const T0: &str = "2026-06-30T00:00:00Z";
+pub(crate) const T0: &str = "2026-06-30T00:00:00Z";
 /// Three days on: the window no longer reaches `ex:t2a`.
 const T1: &str = "2026-07-03T00:00:00Z";
 
-fn ctx() -> Value {
+pub(crate) fn ctx() -> Value {
     json!({
         "ex": "http://example.org/",
         "f": "https://ns.flur.ee/db#",
@@ -216,7 +216,11 @@ fn stored_rules(surface: Surface) -> Vec<Value> {
 /// A ledger holding the data and the stored program, loaded by a second
 /// instance from novelty only or from a published index. Later commits land
 /// in novelty, so an indexed ledger becomes a mixed one.
-async fn load(ledger_id: &str, surface: Surface, storage: Storage) -> (MemoryFluree, MemoryLedger) {
+pub(crate) async fn load(
+    ledger_id: &str,
+    surface: Surface,
+    storage: Storage,
+) -> (MemoryFluree, MemoryLedger) {
     let (writer, reader) = instances_sharing_storage();
     let ledger = genesis_ledger(&writer, ledger_id);
     let mut graph = data();
@@ -350,7 +354,11 @@ async fn assert_assessment(
     assert_eq!(concluded, expected, "{state}, {surface:?}");
 }
 
-async fn commit(fluree: &MemoryFluree, ledger: MemoryLedger, update: Value) -> MemoryLedger {
+pub(crate) async fn commit(
+    fluree: &MemoryFluree,
+    ledger: MemoryLedger,
+    update: Value,
+) -> MemoryLedger {
     let mut update = update;
     update["@context"] = ctx();
     fluree.update(ledger, &update).await.expect("commit").ledger

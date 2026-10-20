@@ -81,6 +81,8 @@ struct QueryCancellationInner {
     /// When set, the handle reports [`QueryCancellationReason::Timeout`] once
     /// this instant passes, without anyone having to signal it.
     deadline: Option<Instant>,
+    /// A handle whose cancellation this one also reports.
+    parent: Option<QueryCancellation>,
 }
 
 impl Default for QueryCancellationInner {
@@ -90,6 +92,7 @@ impl Default for QueryCancellationInner {
             allocated: AtomicUsize::new(0),
             memory_limit: AtomicUsize::new(NO_MEMORY_LIMIT),
             deadline: None,
+            parent: None,
         }
     }
 }
@@ -128,6 +131,24 @@ impl QueryCancellation {
         Self {
             inner: Some(Arc::new(QueryCancellationInner {
                 deadline: Some(deadline),
+                ..QueryCancellationInner::default()
+            })),
+        }
+    }
+
+    /// A handle for work done on this handle's behalf under a deadline of its
+    /// own: it reports this handle's cancellation, and times out by itself
+    /// once `deadline` passes without cancelling this one. Its memory is
+    /// accounted separately. Disabled when this handle is and there is no
+    /// deadline.
+    pub fn with_deadline_inside(&self, deadline: Option<Instant>) -> Self {
+        if !self.is_enabled() && deadline.is_none() {
+            return Self::disabled();
+        }
+        Self {
+            inner: Some(Arc::new(QueryCancellationInner {
+                deadline,
+                parent: self.is_enabled().then(|| self.clone()),
                 ..QueryCancellationInner::default()
             })),
         }
@@ -172,6 +193,9 @@ impl QueryCancellation {
             {
                 self.cancel_with(QueryCancellationReason::Timeout);
                 return self.reason();
+            }
+            if let Some(parent) = &inner.parent {
+                return parent.reason();
             }
         }
         None
@@ -250,6 +274,26 @@ mod tests {
     use super::{QueryCancellation, QueryCancellationReason};
     use crate::clock::Instant;
     use std::time::Duration;
+
+    #[test]
+    fn a_handle_inside_another_reports_both_but_cancels_only_itself() {
+        let query = QueryCancellation::new();
+        let expired = query.with_deadline_inside(Some(Instant::now()));
+        assert_eq!(expired.reason(), Some(QueryCancellationReason::Timeout));
+        assert_eq!(query.reason(), None);
+
+        let pending = query.with_deadline_inside(Some(Instant::now() + Duration::from_secs(3600)));
+        assert_eq!(pending.reason(), None);
+        query.cancel_with(QueryCancellationReason::ClientDisconnected);
+        assert_eq!(
+            pending.reason(),
+            Some(QueryCancellationReason::ClientDisconnected)
+        );
+
+        assert!(!QueryCancellation::disabled()
+            .with_deadline_inside(None)
+            .is_enabled());
+    }
 
     #[test]
     fn a_deadline_reports_timeout_once_it_passes() {

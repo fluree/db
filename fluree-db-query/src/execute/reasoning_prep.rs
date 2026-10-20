@@ -3,6 +3,7 @@
 //! Handles schema hierarchy computation, effective reasoning mode determination,
 //! and derived facts computation for OWL2-RL and datalog rules.
 
+use super::runner::QueryRequest;
 use crate::ir::ReasoningModes;
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
 use crate::Result;
@@ -291,13 +292,11 @@ fn refuse_non_monotone_rules_under_rewrites(
 /// incomplete rule set answers silently wrong, which is worse than a query
 /// that fails naming the rule.
 pub async fn compute_derived_facts(
-    snapshot: &LedgerSnapshot,
-    g_id: GraphId,
-    overlay: &dyn fluree_db_core::OverlayProvider,
-    to_t: i64,
+    base_db: GraphDbRef<'_>,
     reasoning: &ReasoningModes,
     rules_source_g_id: Option<GraphId>,
     binary_store: Option<&Arc<BinaryIndexStore>>,
+    request: QueryRequest<'_>,
 ) -> crate::error::Result<DerivedFactsOutcome> {
     use crate::datalog_rules::{load_rule_set, run_fixpoint, RuleExecutionEnv};
     use std::collections::hash_map::DefaultHasher;
@@ -307,7 +306,13 @@ pub async fn compute_derived_facts(
     // standing up a second cap.
     let budget = reasoning_budget(reasoning);
     let cache = global_reasoning_cache();
-    let base_db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
+    let GraphDbRef {
+        snapshot,
+        g_id,
+        overlay,
+        t: to_t,
+        ..
+    } = base_db;
 
     // Datalog: load the rule set first so its content can key the cache.
     let (rule_set, datalog_key) = if reasoning.datalog {
@@ -363,6 +368,8 @@ pub async fn compute_derived_facts(
         tracing::debug!("computing OWL2-RL derived facts");
         let reasoning_opts = ReasoningOptions {
             budget: budget.clone(),
+            cancellation: request.cancellation.cloned().unwrap_or_default(),
+            tracker: request.tracker.cloned().unwrap_or_default(),
             ..Default::default()
         };
         match reason_owl2rl(base_db, &reasoning_opts, cache).await {
@@ -445,6 +452,13 @@ pub async fn compute_derived_facts(
                 same_as = result.overlay.same_as().clone();
                 owl_overlay = Some(result.overlay.clone());
             }
+            // The request ended: it was cancelled or ran out of fuel.
+            Err(fluree_db_reasoner::ReasonerError::Cancelled(reason)) => {
+                return Err(crate::error::QueryError::Cancelled { reason });
+            }
+            Err(fluree_db_reasoner::ReasonerError::FuelExceeded(e)) => {
+                return Err(crate::error::QueryError::FuelLimitExceeded(e));
+            }
             Err(e) => {
                 // A positive program over a missing closure only derives
                 // less; one that negates or counts would read the missing
@@ -482,6 +496,7 @@ pub async fn compute_derived_facts(
         let env = RuleExecutionEnv {
             binary_store,
             evaluation_time: reasoning.evaluation_time.as_ref(),
+            request,
         };
 
         // If OWL2-RL produced derived facts, run the rules over base + OWL
@@ -578,5 +593,86 @@ pub async fn compute_derived_facts(
     Ok(DerivedFactsOutcome {
         overlay: (!derived_overlay.is_empty()).then(|| derived_overlay.clone()),
         diagnostics,
+    })
+}
+
+/// Explain the derived facts `target` names. Materializes as a query with
+/// these reasoning modes would (served from the reasoning cache when it can),
+/// then re-runs each rule that can derive the facts over the result and
+/// reports the rows that do.
+///
+/// The explanation exposes every premise, whatever a policy would hide, so
+/// callers must only offer it to unrestricted readers.
+pub async fn explain_derived_facts(
+    base_db: GraphDbRef<'_>,
+    reasoning: &ReasoningModes,
+    rules_source_g_id: Option<GraphId>,
+    binary_store: Option<&Arc<BinaryIndexStore>>,
+    request: QueryRequest<'_>,
+    target: &crate::datalog_rules::ExplainTarget,
+) -> crate::error::Result<crate::datalog_rules::Explanation> {
+    use crate::datalog_rules::{
+        explain_facts, load_rule_set, materialized_facts, Explanation, RuleExecutionEnv,
+    };
+
+    if !reasoning.datalog {
+        return Err(crate::error::QueryError::InvalidQuery(
+            "explaining derived facts needs datalog reasoning: set \"reasoning\" to \
+             include \"datalog\""
+                .to_string(),
+        ));
+    }
+    // The whole explanation runs under the reasoning budget's time limit:
+    // what materializing leaves of it bounds the replays.
+    let deadline =
+        fluree_db_core::clock::Instant::now().checked_add(reasoning_budget(reasoning).max_duration);
+    let outcome =
+        compute_derived_facts(base_db, reasoning, rules_source_g_id, binary_store, request).await?;
+    let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
+    let diagnostics = outcome.diagnostics.unwrap_or_default();
+    let evaluation_time = diagnostics
+        .evaluation_time
+        .as_deref()
+        .map(fluree_db_core::temporal::DateTime::parse)
+        .transpose()
+        .map_err(crate::error::QueryError::Internal)?;
+
+    let materialized = outcome.overlay.as_deref().map_or_else(Vec::new, |derived| {
+        materialized_facts(derived, base_db.snapshot, base_db.g_id, target)
+    });
+    let combined = outcome
+        .overlay
+        .map(|derived| ReasoningOverlay::new(base_db.overlay, derived));
+    let mut view = GraphDbRef::new(
+        base_db.snapshot,
+        base_db.g_id,
+        combined.as_ref().map_or(base_db.overlay, |o| {
+            o as &dyn fluree_db_core::OverlayProvider
+        }),
+        base_db.t,
+    );
+    view.eager = true;
+    let env = RuleExecutionEnv {
+        binary_store,
+        evaluation_time: evaluation_time.as_ref(),
+        request,
+    };
+    let (facts, not_replayed, replayed) = explain_facts(
+        view,
+        base_db,
+        &rule_set,
+        env,
+        target,
+        &materialized,
+        deadline,
+    )
+    .await?;
+    Ok(Explanation {
+        t: base_db.t,
+        rule_set: format!("{:016x}", rule_set.content_hash()),
+        evaluation_time: diagnostics.evaluation_time,
+        complete: !diagnostics.capped && replayed,
+        facts,
+        not_replayed,
     })
 }
