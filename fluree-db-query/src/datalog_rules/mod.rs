@@ -23,6 +23,7 @@ mod closure;
 mod delta;
 mod dependency;
 mod execute;
+mod explain;
 mod parse;
 mod validate;
 
@@ -32,6 +33,10 @@ pub use dependency::{
 pub use execute::{
     derived_fact_graph, execute_datalog_rules, execute_datalog_rules_with_query_rules,
     load_rule_set, run_fixpoint, run_fixpoint_with_schedule, RuleExecutionEnv, RuleSchedule,
+};
+pub(crate) use explain::{explain_facts, materialized_facts};
+pub use explain::{
+    Absence, Derivation, ExplainTarget, ExplainedFact, Explanation, GroupInputs, Premise,
 };
 pub use parse::parse_query_time_rule;
 

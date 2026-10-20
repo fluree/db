@@ -550,13 +550,16 @@ fn parse_update(
         };
         // Graph names in the WHERE resolve as in the templates: this ledger's
         // keywords, the same `fromNamed` aliases, and `default` for the
-        // ledger's default graph.
+        // ledger's default graph. A `["graph", …]` name the update's
+        // `fromNamed` spells is that alias, even where it reads as a compact
+        // IRI; any other compact IRI expands.
         let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
             .with_graph_names(fluree_db_query::parse::GraphNameEnv {
                 ledger_id: Some(ledger_id.to_string()),
                 aliases: from_named_aliases.clone(),
                 default_by_name,
-            });
+            })
+            .with_dataset_names(from_named_aliases.keys().cloned().collect());
         parse_where_with_counters(
             where_val,
             &ctx,
@@ -885,8 +888,9 @@ fn parse_update_where_named_graphs(
                         )
                     })?;
                     // If no alias provided, use the raw graph selector string as an implicit alias.
-                    // This makes `fromNamed: ["ex:g2"]` usable as `["graph", "ex:g2", ...]`
-                    // in WHERE patterns even though GRAPH names are not expanded via @context.
+                    // A WHERE `["graph", …]` name the update's `fromNamed` spells is kept as
+                    // written, so `fromNamed: ["ex:g2"]` makes `["graph", "ex:g2", ...]` mean
+                    // this entry rather than the IRI its spelling expands to.
                     let implicit_alias = graph_val.as_str().map(std::string::ToString::to_string);
                     let iri = expand_update_graph_iri(graph_val, context, strict)?;
                     out.push(crate::ir::UpdateNamedGraph {

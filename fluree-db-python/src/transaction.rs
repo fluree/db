@@ -156,10 +156,10 @@ impl Transaction {
                         last = if cypher_statement_is_write(&statement)? {
                             txn.stage_cypher(&statement, params.clone()).await?
                         } else {
-                            let view = self.view(fluree, txn).await?;
+                            let view = self.view(&fluree, txn).await?;
                             Some(
                                 cypher::read_table(
-                                    fluree,
+                                    &fluree,
                                     &view,
                                     &statement,
                                     params.as_ref(),
@@ -188,7 +188,7 @@ impl Transaction {
     fn snapshot(&self, py: Python<'_>) -> PyResult<Snapshot> {
         let fluree = self.fluree.get()?;
         let db =
-            self.with_txn(|txn| block_on(py, self.view(fluree, txn.get()?))?.map_err(api_error))?;
+            self.with_txn(|txn| block_on(py, self.view(&fluree, txn.get()?))?.map_err(api_error))?;
         Ok(Snapshot::new(&self.fluree, db))
     }
 

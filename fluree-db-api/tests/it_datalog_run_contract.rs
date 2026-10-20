@@ -10,10 +10,12 @@ use crate::it_datalog_rule_schedule::{chain_data, ledger_with, sparql_rules};
 use crate::support::{genesis_ledger, normalize_rows, query_jsonld, query_sparql, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::temporal::DateTime;
+use fluree_db_core::{QueryCancellation, QueryCancellationReason};
 use fluree_db_query::datalog_rules::{
     run_fixpoint_with_schedule, DatalogExecutionResult, DatalogRuleSet, RuleExecutionEnv,
     RuleSchedule,
 };
+use fluree_db_query::execute::QueryRequest;
 use fluree_db_query::reasoning::ReasoningBudget;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -31,8 +33,8 @@ async fn fixpoint(
         max_iterations,
         budget,
         RuleExecutionEnv {
-            binary_store: None,
             evaluation_time,
+            ..RuleExecutionEnv::default()
         },
         RuleSchedule::Dependencies,
     )
@@ -282,6 +284,62 @@ async fn the_deadline_interrupts_a_running_rule_body() {
         "a 20ms budget ran {elapsed:?}: the {}-pair body was not interrupted",
         NODES * NODES
     );
+}
+
+/// A request cancelled while a body runs ends the run with the cancellation,
+/// not a capped result: the deadline caps a run, the request's cancellation
+/// ends it.
+#[tokio::test]
+async fn a_cancelled_request_ends_the_run() {
+    const NODES: usize = 3_000;
+    let graph: Vec<Value> = (0..NODES)
+        .map(|i| json!({"@id": format!("ex:a{i}"), "ex:kind": {"@id": "ex:k"}}))
+        .collect();
+    let ledger = ledger_with(
+        "datalog/contract-cancelled:main",
+        json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}),
+    )
+    .await;
+    let rules = sparql_rules(
+        &ledger,
+        &[
+            "CONSTRUCT { ?x ex:sameKind ?y } WHERE { ?x ex:kind ?k . ?y ex:kind ?k \
+           FILTER(STRLEN(STR(?x)) + STRLEN(STR(?y)) < 0) }"
+                .to_string(),
+        ],
+    );
+    let handle = QueryCancellation::new();
+    let canceller = handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        canceller.cancel_with(QueryCancellationReason::ClientDisconnected);
+    });
+    let budget = ReasoningBudget::new(Duration::from_secs(20), usize::MAX, usize::MAX);
+
+    let result = run_fixpoint_with_schedule(
+        ledger.as_graph_db_ref(0),
+        &rules,
+        100,
+        &budget,
+        RuleExecutionEnv {
+            request: QueryRequest {
+                cancellation: Some(&handle),
+                tracker: None,
+            },
+            ..RuleExecutionEnv::default()
+        },
+        RuleSchedule::Dependencies,
+    )
+    .await;
+    match result {
+        Err(fluree_db_query::QueryError::Cancelled {
+            reason: QueryCancellationReason::ClientDisconnected,
+        }) => {}
+        other => panic!(
+            "expected the cancellation, got {:?}",
+            other.map(|r| r.diagnostics)
+        ),
+    }
 }
 
 /// The iteration cap fires inside the recursion. The recursive rule is named

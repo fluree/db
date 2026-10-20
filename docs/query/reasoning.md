@@ -378,6 +378,17 @@ The budget is configurable at three levels (highest precedence first):
    `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB`
    environment variables.
 
+**The query's own limits apply too.** Materialization runs on the query's
+behalf, so cancelling the query — a client disconnect, or a query timeout —
+stops OWL 2 RL and datalog rule bodies mid-run, and the query fails with the
+cancellation rather than answering over a partial closure. The work counts
+toward the query's fuel: OWL 2 RL charges 0.001 fuel for each fact a round
+processes, and rule bodies are charged like any query, including the
+property paths a transitive-closure rule runs as. Only the
+query that computes a materialization pays for it; queries answered from the
+cached result do not, and a run that was cancelled or ran out of fuel caches
+nothing.
+
 ## Performance considerations
 
 | Mode | Overhead | Caching |

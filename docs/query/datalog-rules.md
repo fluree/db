@@ -533,6 +533,62 @@ the default graph (`urn:default`; leave the graph out instead) or a system
 graph such as the transaction metadata graph. A rule naming any other graph
 fails the query with an error naming the graph.
 
+A graph a Python job publishes is input like any other: see
+[Custom stages in Python](../guides/custom-stages-python.md) for running
+model calls and versioned decisions outside the engine and publishing their
+results into a graph your rules read.
+
+## Explaining a derived fact
+
+The Rust API's `Fluree::explain_derived` reports why the rules concluded a
+fact. The request carries the query's `@context` and reasoning keys, which
+merge with the ledger's reasoning settings as a query's do, and an `explain`
+node map naming the facts by subject and one predicate, with an optional
+object (a variable or no object explains every value) and `@graph`:
+
+```rust
+let explanation = fluree
+    .explain_derived(&db, &json!({
+        "@context": {"ex": "http://example.org/"},
+        "reasoning": "datalog",
+        "explain": {"@id": "ex:acct2", "@type": "ex:Candidate"}
+    }))
+    .await?;
+```
+
+For each rule body row that derives the fact, the explanation gives the
+rule, the row's bindings, and:
+
+- **premises**: the body's triple patterns with the row substituted — the
+  facts it matched — each marked `derived` when reasoning produced it, so
+  explaining that premise in turn walks the derivation back to asserted
+  facts. A `UNION` contributes the branch the row matched. A property path
+  is listed with its ends substituted and `path` set, its `predicate` the
+  path in SPARQL syntax (`<http://example.org/partOf>+`); it is a
+  connection, not one stored fact;
+- **absences**: each negated pattern the row passed (inside a `UNION`, in
+  the branch it matched), with the row
+  substituted and its open variables left as variables, and the graph it
+  searched;
+- **groups**: for an aggregating subquery, the group's key, the graph it
+  read when the subquery sits in a `GRAPH` block, and the solutions it
+  counted.
+
+Only facts the run materialized are explained, so a capped run never
+explains a conclusion it did not reach. A rule whose body gives different
+rows each time it runs (it calls `RAND`, `UUID`, `STRUUID` or `BNODE`, or
+reads transaction metadata) cannot be replayed: the explanation names it in
+`not_replayed`, and a fact only it derived appears without derivations, as
+does a fact OWL 2 RL entailed. The explanation also records the snapshot
+`t`, a hash of the rule set, the evaluation time `NOW()` returned, and
+whether it is complete: a capped run's conclusions may be missing facts.
+Replays run under the same reasoning budget, measured from the start of the
+explanation, and one the time limit stops leaves the explanation incomplete.
+`explain_derived_with_options` takes a host's cancellation, which stops the
+explanation with an error, and a fuel tracker. Premises appear whatever a
+policy would hide, so a view under a non-root policy is refused, the ledger's
+configured default policy included. The shape of the result is experimental.
+
 ## Examples
 
 ### Sibling inference
@@ -842,5 +898,6 @@ When both OWL 2 RL and Datalog are enabled:
 | Enabling reasoning in queries | [Query-time reasoning](reasoning.md) |
 | Edge annotations (claims) in rule bodies | [Edge annotations](../concepts/edge-annotations.md) |
 | Engine design and the head-annotation decision | [Rules engine design](../design/rules-engine.md) |
+| Publishing results from Python into a graph rules read | [Custom stages in Python](../guides/custom-stages-python.md) |
 | OWL & RDFS constructs | [OWL & RDFS reference](../reference/owl-rdfs-support.md) |
 | Ledger-wide config | [Setting groups](../ledger-config/setting-groups.md) |

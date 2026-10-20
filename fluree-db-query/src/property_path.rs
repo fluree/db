@@ -423,6 +423,10 @@ impl PropertyPathOperator {
     /// edges are removed here so the path neither traverses them nor reaches the
     /// nodes behind them, matching the per-flake semantics of the scan path.
     /// No-op for root / no policy (the filter short-circuits).
+    ///
+    /// Every edge read is charged to the query's fuel, as a row a range read
+    /// returns: traversal reads each reached node's edges, so this prices
+    /// the walk itself.
     async fn read_graph_edges(
         ctx: &ExecutionContext<'_>,
         graph: &PathGraph<'_>,
@@ -439,6 +443,9 @@ impl PropertyPathOperator {
             RangeOptions::new().with_to_t(graph.to_t),
         )
         .await?;
+        ctx.tracker.consume_fuel(
+            flakes.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+        )?;
         BinaryScanOperator::filter_flakes_by_enforcer(
             ctx,
             graph.policy_enforcer.as_ref(),
@@ -1835,6 +1842,10 @@ impl Operator for PropertyPathOperator {
                 self.state = OperatorState::Exhausted;
                 return Ok(None);
             }
+            // Each emitted row is charged, as a scan charges its rows.
+            ctx.tracker.consume_fuel(
+                batch_results.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+            )?;
 
             // A both-constant path (e.g. `:a0 (:p)* :a1`, pp36) binds no
             // variables, so `in_schema` is empty and `Batch::new` would infer
@@ -1924,6 +1935,9 @@ impl Operator for PropertyPathOperator {
             }
 
             if !all_rows.is_empty() {
+                ctx.tracker.consume_fuel(
+                    all_rows.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+                )?;
                 // Same empty-schema guard as unseeded mode (pp36): a
                 // both-constant path over a variable-free child produces rows
                 // with no columns; preserve the row count instead of letting

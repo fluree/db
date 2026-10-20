@@ -93,6 +93,7 @@
   - [SHACL validation](guides/cookbook-shacl.md)
   - [Edge annotations](guides/cookbook-edge-annotations.md)
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
+  - [Custom stages in Python](guides/custom-stages-python.md)
 
 - [Design](design/README.md)
   - [Performance architecture](design/performance.md)
@@ -248,6 +249,7 @@
   - [CLI reference](unstructured/cli/README.md)
     - [ingest](unstructured/cli/ingest.md)
     - [search](unstructured/cli/search.md)
+    - [parse](unstructured/cli/parse.md)
   - [Reference](unstructured/reference/README.md)
     - [Configuration](unstructured/reference/configuration.md)
     - [Vocabulary](unstructured/reference/vocabulary.md)

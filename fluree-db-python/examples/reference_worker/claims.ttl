@@ -1,0 +1,40 @@
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Reference data.
+ex:policy ex:reviewThreshold 1000 .
+ex:acme a ex:ApprovedVendor ; ex:name "Acme" .
+ex:globex a ex:ApprovedVendor ; ex:name "Globex" .
+
+# Over the threshold on one document.
+ex:case1 a ex:Case ; ex:expectedDocuments 2 .
+ex:doc1a ex:case ex:case1 ; ex:receivedAt "2026-06-01T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Invoice from Acme for 1200.00" .
+ex:doc1b ex:case ex:case1 ; ex:receivedAt "2026-06-20T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Invoice from Acme for 300.00" .
+
+# Under the threshold on each document, over it in total.
+ex:case2 a ex:Case ; ex:expectedDocuments 2 .
+ex:doc2a ex:case ex:case2 ; ex:receivedAt "2026-06-02T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Invoice from Globex for 600.00" .
+ex:doc2b ex:case ex:case2 ; ex:receivedAt "2026-06-03T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Invoice from Acme for 700.00" .
+
+# A vendor that is not approved.
+ex:case3 a ex:Case ; ex:expectedDocuments 1 .
+ex:doc3a ex:case ex:case3 ; ex:receivedAt "2026-06-04T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Invoice from Initech for 50.00" .
+
+# One of the two expected documents.
+ex:case4 a ex:Case ; ex:expectedDocuments 2 .
+ex:doc4a ex:case ex:case4 ; ex:receivedAt "2026-06-05T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Invoice from Acme for 10.00" .
+
+# A document whose text never arrived.
+ex:case5 a ex:Case ; ex:expectedDocuments 1 .
+ex:doc5a ex:case ex:case5 ; ex:receivedAt "2026-06-06T10:00:00Z"^^xsd:dateTime .
+
+# A document with nothing to extract: the search completed and found nothing.
+ex:case6 a ex:Case ; ex:expectedDocuments 1 .
+ex:doc6a ex:case ex:case6 ; ex:receivedAt "2026-06-07T10:00:00Z"^^xsd:dateTime ;
+    ex:text "Thank you for your order." .
