@@ -33,6 +33,9 @@ struct ServerMeta {
     started_at: String,
     /// The raw args passed to the `_child` process (for `restart`).
     args: Vec<String>,
+    /// The storage root the server locks, if it locks one.
+    #[serde(default)]
+    locked_root: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +244,7 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: Vec::new(),
+        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
     }
 }
 
@@ -300,7 +304,7 @@ async fn run_start(
     // Check for existing server
     let data_dir = dirs.data_dir();
     let pid_file = pid_path(data_dir);
-    if let Some(running) = already_running(&server_config, read_pid(&pid_file)) {
+    if let Some(running) = already_running(&server_config, recorded_server(data_dir).as_ref()) {
         return Err(CliError::Server(running));
     }
     if pid_file.exists() {
@@ -374,6 +378,7 @@ async fn run_start(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args,
+        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| CliError::Server(format!("failed to serialize metadata: {e}")))?;
@@ -403,21 +408,43 @@ async fn run_start(
     Ok(())
 }
 
+/// The server `start` last recorded in this project.
+struct Recorded {
+    pid: u32,
+    /// The storage root it locks, from its metadata.
+    locked_root: Option<PathBuf>,
+}
+
+fn recorded_server(data_dir: &Path) -> Option<Recorded> {
+    let pid = read_pid(&pid_path(data_dir))?;
+    let locked_root = fs::read_to_string(meta_path(data_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str::<ServerMeta>(&s).ok())
+        .filter(|meta| meta.pid == pid)
+        .and_then(|meta| meta.locked_root);
+    Some(Recorded { pid, locked_root })
+}
+
 /// Why `start` must not launch a server, if it must not.
 ///
 /// A server that will lock its file storage is answered by that lock, which
 /// a crash cannot leave behind and which also catches a foreground server or
-/// another program using the storage; a recorded pid that is alive could be
-/// one the system reused. Any other server (a shared-storage peer, a Raft
-/// node, a connection config) is answered by the recorded pid.
-fn already_running(server_config: &ServerConfig, recorded: Option<u32>) -> Option<String> {
+/// another program using the storage. When the root is free, a recorded
+/// server that locked it is gone, and a live pid of its was reused. Any
+/// other recorded server (a shared-storage peer, a Raft node, a connection
+/// config) is answered by its pid.
+fn already_running(server_config: &ServerConfig, recorded: Option<&Recorded>) -> Option<String> {
     let running =
         |pid| format!("server already running (pid {pid}). Use 'fluree server stop' first.");
     let Some(root) = server_config.owned_storage_path() else {
-        return recorded.filter(|pid| is_process_alive(*pid)).map(running);
+        return recorded
+            .filter(|r| is_process_alive(r.pid))
+            .map(|r| running(r.pid));
     };
     match fluree_db_core::RootLock::acquire(root) {
-        Ok(_probe) => None,
+        Ok(_probe) => recorded
+            .filter(|r| r.locked_root.as_deref() != Some(root) && is_process_alive(r.pid))
+            .map(|r| running(r.pid)),
         Err(fluree_db_core::RootLockError::Unsupported(error)) => Some(format!(
             "storage {} is on a filesystem that cannot lock it ({error}); set {}=true to \
              start a server on it without protection from a second process",
@@ -428,7 +455,7 @@ fn already_running(server_config: &ServerConfig, recorded: Option<u32>) -> Optio
             Some(format!("storage {}: {error}", root.display()))
         }
         Err(fluree_db_core::RootLockError::Held { holder }) => match holder {
-            Some(pid) if Some(pid) == recorded => Some(running(pid)),
+            Some(pid) if Some(pid) == recorded.map(|r| r.pid) => Some(running(pid)),
             _ => Some(format!(
                 "storage {} is in use by another Fluree process{}; stop it before starting a server on it",
                 root.display(),
@@ -532,6 +559,8 @@ async fn run_start_with_child_args(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args.to_vec(),
+        // Replayed args are not resolved here, so a later `start` trusts the pid.
+        locked_root: None,
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| CliError::Server(format!("failed to serialize metadata: {e}")))?;
@@ -1658,11 +1687,18 @@ mod tests {
         }
     }
 
+    /// A live pid: this process's.
+    fn recorded(locked_root: Option<&Path>) -> Recorded {
+        Recorded {
+            pid: std::process::id(),
+            locked_root: locked_root.map(Path::to_path_buf),
+        }
+    }
+
     #[test]
     fn start_refuses_a_held_storage_root_and_names_its_server() {
         let dir = tempfile::tempdir().unwrap();
         let _held = fluree_db_core::RootLock::acquire(dir.path()).unwrap();
-        let ours = std::process::id();
 
         let elsewhere = already_running(&file_backed(dir.path()), None).unwrap();
         assert!(
@@ -1670,7 +1706,8 @@ mod tests {
             "{elsewhere}"
         );
 
-        let server = already_running(&file_backed(dir.path()), Some(ours)).unwrap();
+        let ours = recorded(Some(dir.path()));
+        let server = already_running(&file_backed(dir.path()), Some(&ours)).unwrap();
         assert!(server.contains("server already running"), "{server}");
     }
 
@@ -1687,13 +1724,52 @@ mod tests {
     }
 
     #[test]
-    fn start_ignores_a_live_recorded_pid_when_the_root_is_free() {
+    fn start_ignores_a_live_pid_recorded_for_the_free_root() {
         let dir = tempfile::tempdir().unwrap();
-        let reused = std::process::id();
+        let reused = recorded(Some(dir.path()));
 
         assert_eq!(
-            already_running(&file_backed(dir.path()), Some(reused)),
+            already_running(&file_backed(dir.path()), Some(&reused)),
             None
         );
+    }
+
+    /// A connection-config server, or one on other storage, leaves this
+    /// root free while it runs.
+    #[test]
+    fn start_refuses_while_a_recorded_server_that_does_not_lock_the_root_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+
+        for running in [recorded(None), recorded(Some(other.path()))] {
+            let refused = already_running(&file_backed(dir.path()), Some(&running)).unwrap();
+            assert!(refused.contains("server already running"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_recorded_root_comes_from_the_recorded_servers_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/srv/fluree");
+        let meta = |pid| ServerMeta {
+            pid,
+            listen_addr: String::new(),
+            storage_path: String::new(),
+            connection_config: None,
+            bolt_listen_addr: None,
+            config_path: None,
+            started_at: String::new(),
+            args: Vec::new(),
+            locked_root: Some(root.clone()),
+        };
+        fs::write(pid_path(data.path()), "41").unwrap();
+
+        write_meta(&meta_path(data.path()), &meta(41));
+        let same = recorded_server(data.path()).unwrap();
+        assert_eq!((same.pid, same.locked_root), (41, Some(root.clone())));
+
+        write_meta(&meta_path(data.path()), &meta(42));
+        let other = recorded_server(data.path()).unwrap();
+        assert_eq!((other.pid, other.locked_root), (41, None));
     }
 }
