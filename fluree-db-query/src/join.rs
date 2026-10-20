@@ -622,6 +622,26 @@ fn grouped_in_substitution() -> QueryError {
     )
 }
 
+/// Routing-stamp site of the nested-loop join's batched probe lanes over one
+/// graph (subject, object and existence probes).
+pub const NESTED_LOOP_BATCHED_SITE: &str = "nested-loop-batched";
+
+/// One row a batched subject probe matched ([`NestedLoopJoinOperator::scan_matches`]).
+struct SubjectMatch<'m> {
+    /// The probed subject.
+    // Kept for: the probes over a union of graphs, which key a fact on it.
+    #[allow(dead_code)]
+    s_id: u64,
+    /// The accumulated left rows that probed it.
+    accum: &'m [usize],
+    /// The object the row binds.
+    object: &'m Binding,
+    /// The fact's list position; `u32::MAX` when it is not a list item.
+    // Kept for: the probes over a union of graphs, which key a fact on it.
+    #[allow(dead_code)]
+    o_i: u32,
+}
+
 /// Identifies the source of a left row in `pending_output`.
 #[derive(Debug, Clone)]
 enum BatchRef {
@@ -1401,6 +1421,12 @@ impl Operator for NestedLoopJoinOperator {
                 active_graph_count,
                 "nested loop join runtime path"
             );
+            if use_batched {
+                crate::fast_path_outcome::stamp_fast_path(
+                    NESTED_LOOP_BATCHED_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
             self.logged_runtime_mode = true;
         }
 
@@ -2029,7 +2055,7 @@ impl NestedLoopJoinOperator {
     }
 
     /// Phase 4: Scan PSOT leaves, matching accumulated subjects and invoking
-    /// `on_match` per matched (left-row group, object) pair.
+    /// `on_match` per matched (left-row group, object) pair ([`SubjectMatch`]).
     ///
     /// Uses V3 column-based leaf loading via `get_leaf_bytes_sync` + `load_leaflet_columns_cached`,
     /// binary-searches for matching subjects within each leaflet's p_id segment, and builds the
@@ -2048,7 +2074,7 @@ impl NestedLoopJoinOperator {
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
         mut probe_ops: Option<&mut ProbeOps>,
-        on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
     ) -> Result<()> {
         use fluree_db_core::o_type::OType;
 
@@ -2135,8 +2161,8 @@ impl NestedLoopJoinOperator {
                             .o_type_const
                             .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
                             if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                                 == RowFate::Drop
                             {
@@ -2158,7 +2184,6 @@ impl NestedLoopJoinOperator {
                         {
                             Binding::encoded_sid(o_key_val)
                         } else {
-                            let o_i = batch.o_i.get_or(row, u32::MAX);
                             let t = batch.t.get_or(row, 0) as i64;
                             build_probe_object_binding(
                                 ctx,
@@ -2167,12 +2192,17 @@ impl NestedLoopJoinOperator {
                                 p_id,
                                 o_type_val,
                                 o_key_val,
-                                o_i,
+                                o_i_val,
                                 t,
                             )?
                         };
 
-                        on_match(accum_indices, &obj_binding)?;
+                        on_match(SubjectMatch {
+                            s_id,
+                            accum: accum_indices,
+                            object: &obj_binding,
+                            o_i: o_i_val,
+                        })?;
                     }
                 }
             }
@@ -2215,7 +2245,12 @@ impl NestedLoopJoinOperator {
                         )?
                     };
                     matched_rows += 1;
-                    on_match(accum_indices, &obj_binding)
+                    on_match(SubjectMatch {
+                        s_id,
+                        accum: accum_indices,
+                        object: &obj_binding,
+                        o_i: op.o_i,
+                    })
                 })?;
             }
         }
@@ -2486,7 +2521,8 @@ impl NestedLoopJoinOperator {
                 vec![Vec::new(); self.batched_accumulator.len()]
             };
             {
-                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                let mut on_match = |m: SubjectMatch<'_>| -> Result<()> {
+                    let (accum_indices, obj) = (m.accum, m.object);
                     // Right-side tail (object + any right-scan inline outputs) is
                     // independent of the left row, so build it once per match.
                     let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
@@ -2570,7 +2606,8 @@ impl NestedLoopJoinOperator {
             let mut scatter: Vec<Vec<Vec<Binding>>> =
                 vec![Vec::new(); self.batched_accumulator.len()];
             {
-                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                let mut on_match = |m: SubjectMatch<'_>| -> Result<()> {
+                    let (accum_indices, obj) = (m.accum, m.object);
                     for &accum_idx in accum_indices {
                         let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
                         let left_batch = &self.stored_left_batches[*batch_idx];
