@@ -69,7 +69,10 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
   `materialize`, `doc`, and `clone`/`pull`/`push`/`fetch`/`publish`) are
   refused until it stops. Shared-storage query peers and Raft nodes take no lock; a
   Rust program that reads a directory another process owns opts out with
-  `FlureeBuilder::without_storage_lock()`. See
+  `FlureeBuilder::without_storage_lock()`. A program that embeds a Raft node
+  builds its engine with `FlureeBuilder::with_storage_wal_owner(<node id>)`, as
+  the server does; without it the node locks the shared store and a second node
+  on it is refused. See
   [One process per directory](storage.md#one-process-per-directory).
 - **`fluree memory` no longer opens the project's storage.** In a project, its
   ledger is a cache in memory, rebuilt from `.fluree-memory/*.ttl` on each run.
