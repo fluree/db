@@ -4147,7 +4147,7 @@ pub struct DocParseArgs {
 
     /// `doco` prints the structure graph; `text` prints the plain-text
     /// projection its `nif:beginIndex`/`nif:endIndex` offsets index into
-    #[arg(short = 'f', long, value_enum, default_value_t = DocParseFormat::Doco)]
+    #[arg(long, value_enum, default_value_t = DocParseFormat::Doco)]
     pub format: DocParseFormat,
 
     /// Write to this file instead of stdout

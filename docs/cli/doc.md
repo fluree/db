@@ -163,7 +163,7 @@ The chunk IRI is a real node: follow `doc:sourceElement` to the paragraphs and c
 
 ## fluree doc parse
 
-Prints the structure graph `fluree doc ingest` would write for one file, as JSON-LD, or the plain-text projection its offsets index into. Nothing is written and no ledger is needed, so it runs outside a project too. Where there is a project (or a global config), its `[doc.vlm]` slot reads what the deterministic pass could not and its parse cache is used, exactly as for `ingest`.
+Prints the structure graph `fluree doc ingest` would write for one file, as JSON-LD, or the plain-text projection its offsets index into. No ledger is written or needed, so it runs outside a project too. Where there is a project (or a global config), its `[doc.vlm]` slot reads what the deterministic pass could not and the parse is cached there, exactly as for `ingest`. `FLUREE_DOC_VLM_*` / `FLUREE_DOC_LLM_*` configure a model anywhere; with none of these, or with `--no-escalate`, no model is called.
 
 ### Usage
 
@@ -175,7 +175,7 @@ fluree doc parse <FILE> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-f, --format <FORMAT>` | `doco` (default): the DoCO JSON-LD graph. `text`: the plain-text projection that `nif:beginIndex` / `nif:endIndex` index into. |
+| `--format <FORMAT>` | `doco` (default): the DoCO JSON-LD graph. `text`: the plain-text projection that `nif:beginIndex` / `nif:endIndex` index into. |
 | `-o, --output <FILE>` | Write to this file instead of stdout. |
 | `--base-iri <IRI>` | Prefix the file name is appended to, forming the document IRI (default `urn:fluree:doc:`), as `ingest` does for a file named on its command line. |
 | `--doc-iri <IRI>` | The document IRI in full, in place of `--base-iri` and the file name. Every node is minted under it and stamped with it. |

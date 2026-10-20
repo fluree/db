@@ -322,20 +322,16 @@ fn parse_pdf(
         emit_anchors: opts.vlm.is_some(),
         ..AnalyzeOptions::default()
     };
-    // Crops are chosen from the document as extracted: analysis changes the
-    // pages it reads, and the engine plans from what it was given.
-    let extracted = opts.vlm.is_some().then(|| doc.clone());
+    // Planned before the analysis below changes the pages: crops are chosen
+    // from the document as extracted.
+    let jobs = opts.vlm.is_some().then(|| {
+        fluree_doc_pdf::escalate::plan(&doc, &outline, &analyze_opts, &CropHints::default())
+    });
     let mut analysis = fluree_doc_pdf::document::analyze_with(&mut doc, &outline, &analyze_opts);
 
     let mut escalated_crops = 0;
     let mut escalation_skipped = None;
-    if let (Some(vlm), Some(extracted)) = (&opts.vlm, &extracted) {
-        let jobs = fluree_doc_pdf::escalate::plan(
-            extracted,
-            &outline,
-            &analyze_opts,
-            &CropHints::default(),
-        );
+    if let (Some(vlm), Some(jobs)) = (&opts.vlm, jobs) {
         // Over the cap, the deterministic tier stands: nothing has been
         // spent, the document still lands, and the caller is told so it
         // can raise `--max-crops` on purpose.

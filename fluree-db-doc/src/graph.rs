@@ -425,20 +425,16 @@ mod tests {
     /// The sweep list goes stale the moment an emitter writes a predicate
     /// outside it, and a stale list leaks silently — the retracted document
     /// keeps a triple forever and nothing says so. So: run the real
-    /// emitters over a document exercising every structural shape, and
-    /// assert the contract holds for every predicate they produced.
+    /// emitters over documents exercising every structural shape, one per
+    /// reader that writes terms of its own, and assert the contract holds
+    /// for every predicate they produced.
     #[test]
     fn every_emitted_predicate_is_owned() {
-        use crate::chunk::{chunk_doco, ChunkConfig};
-        use crate::extract::{
-            resolve, ChunkExtraction, ChunkInput, LlmEntity, LlmRelation, ResolvePolicy,
-        };
-        use crate::parse::{parse_bytes, ParseOptions, SourceKind};
+        use crate::parse::SourceKind;
 
-        let doc_iri = "urn:fluree:doc:guard.html";
         // HTML rather than Markdown: it also declares a title and an author,
         // which the engine writes on its root in Dublin Core.
-        let source = "\
+        let html = "\
 <html><head><title>Guard</title><meta name=\"author\" content=\"Jane Doe\"></head><body>
 <h1>Heading</h1>
 <p>Jane Doe joined Acme, with a <a href=\"https://example.org/x\">link</a>.</p>
@@ -448,20 +444,103 @@ mod tests {
 <p>Closing paragraph.</p>
 </body></html>
 ";
+        let eml = "From: Jane Doe <jane@example.org>\r\n\
+                   To: Bo <bo@example.org>\r\n\
+                   Cc: Ana <ana@example.org>\r\n\
+                   Subject: Q3\r\n\
+                   Date: Tue, 7 Oct 2026 10:00:00 +0000\r\n\
+                   Message-ID: <q3@example.org>\r\n\r\n\
+                   Jane Doe joined Acme.\r\n\r\n--\r\nJane\r\n";
+        let vtt = "WEBVTT\n\n\
+                   00:00:01.000 --> 00:00:04.000\n<v Jane Doe>Jane Doe joined Acme.\n\n\
+                   00:00:04.000 --> 00:00:06.000\n<v Bo>Welcome.\n";
+        // A PDF root also carries the creation and modification dates.
+        let pdf: &[u8] = include_bytes!("../testdata/probe-booktabs.pdf");
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (file_name, kind, source) in [
+            ("guard.html", SourceKind::Html, html.as_bytes()),
+            ("guard.eml", SourceKind::Eml, eml.as_bytes()),
+            ("guard.vtt", SourceKind::WebVtt, vtt.as_bytes()),
+            ("guard.pdf", SourceKind::Pdf, pdf),
+        ] {
+            seen.extend(swept_predicates(file_name, kind, source));
+        }
+
+        // Non-vacuity: a fixture that emitted almost nothing would pass the
+        // per-document assertions while proving nothing. Pin the shapes they
+        // must have reached, one per emitter.
+        for required in [
+            "@type",
+            "doc:text",          // chunk nodes
+            "doc:sourceElement", // chunk → structure graph
+            "doc:sha256",        // the document node
+            "doc:embeddingModel",
+            "doc:extractionFingerprint",
+            "doc:verdict",  // relation nodes
+            "rdf:subject",  // the reification triple
+            "nif:isString", // structure elements
+            "po:contains",  // the structure spine
+            "po:containsAsHeader",
+            "rdfs:label",
+            "doc:xhtmlTag",
+            "doc:cellValue", // table cells, reached through their table
+            "dcterms:title", // what the file declares, on the root
+            "dcterms:creator",
+            "dcterms:created",
+            "dcterms:modified",
+            "doc:sourceName",
+            "doc:from", // email: messages and mailboxes
+            "doc:to",
+            "doc:address",
+            "doc:sentAt",
+            "doc:speaker", // transcript turns
+            "doc:startMs",
+            "doc:pageIndex", // PDF geometry
+            "doc:bbox",
+        ] {
+            assert!(
+                seen.contains(required),
+                "the guard fixtures stopped emitting {required}; they no longer \
+                 prove the sweep covers that emitter. saw: {seen:?}"
+            );
+        }
+    }
+
+    /// Every predicate on a node re-ingest sweeps, for one document run
+    /// through the parser, chunker and extraction into its transaction —
+    /// after asserting the sweep reaches every structure node and owns every
+    /// predicate on them.
+    fn swept_predicates(
+        file_name: &str,
+        kind: crate::parse::SourceKind,
+        source: &[u8],
+    ) -> std::collections::BTreeSet<String> {
+        use crate::chunk::{chunk_doco, ChunkConfig};
+        use crate::extract::{
+            resolve, ChunkExtraction, ChunkInput, LlmEntity, LlmRelation, ResolvePolicy,
+        };
+        use crate::parse::{parse_bytes, ParseOptions};
+
+        let doc_iri = format!("urn:fluree:doc:{file_name}");
+        let doc_iri = doc_iri.as_str();
         let parsed = parse_bytes(
-            source.as_bytes().to_vec(),
-            SourceKind::Html,
+            source.to_vec(),
+            kind,
             "guard",
             &ParseOptions {
                 base_iri: doc_iri.into(),
                 doc_iri: doc_iri.into(),
-                source_name: Some("guard.html".into()),
+                source_name: Some(file_name.into()),
                 vlm: None,
             },
         )
-        .expect("html parses");
+        .unwrap_or_else(|e| panic!("{file_name}: {e}"));
         let chunks = chunk_doco(&parsed.doco, &ChunkConfig::default()).expect("chunks");
-        assert!(!chunks.is_empty(), "the fixture must produce a chunk");
+        assert!(
+            !chunks.is_empty(),
+            "{file_name}: the fixture must produce a chunk"
+        );
 
         let extraction = ChunkExtraction {
             entities: vec![LlmEntity {
@@ -504,10 +583,10 @@ mod tests {
 
         let meta = DocumentMeta {
             doc_iri: doc_iri.into(),
-            file_name: "guard.html".into(),
-            relative_path: "guard.html".into(),
+            file_name: file_name.into(),
+            relative_path: file_name.into(),
             sha256: "0".repeat(64),
-            media_type: "text/html".into(),
+            media_type: kind.media_type().into(),
             byte_size: source.len() as u64,
             pages: 1,
             escalated_crops: 0,
@@ -560,7 +639,6 @@ mod tests {
             })
             .map(str::to_string)
             .collect();
-        assert!(!cells.is_empty(), "the guard fixture must emit table cells");
 
         // Every node of the structure graph is one of those: a node the
         // sweep cannot reach outlives every re-ingest of its document.
@@ -574,8 +652,8 @@ mod tests {
             .collect();
         assert!(
             unreached.is_empty(),
-            "re-ingest would leave these structure nodes behind — stamp them \
-             or reach them in retract_update: {unreached:?}"
+            "{file_name}: re-ingest would leave these structure nodes behind — \
+             stamp them or reach them in retract_update: {unreached:?}"
         );
 
         let mut seen: std::collections::BTreeSet<String> = Default::default();
@@ -598,37 +676,10 @@ mod tests {
         }
         assert!(
             leaked.is_empty(),
-            "re-ingest would leave these behind forever — add the namespace \
-             or the term to the sweep in graph.rs: {leaked:?}"
+            "{file_name}: re-ingest would leave these behind forever — add the \
+             namespace or the term to the sweep in graph.rs: {leaked:?}"
         );
-        // Non-vacuity: a fixture that emitted almost nothing would pass the
-        // assertion above while proving nothing. Pin the shapes it must
-        // have reached, one per emitter.
-        for required in [
-            "@type",
-            "doc:text",          // chunk nodes
-            "doc:sourceElement", // chunk → structure graph
-            "doc:sha256",        // the document node
-            "doc:embeddingModel",
-            "doc:extractionFingerprint",
-            "doc:verdict",  // relation nodes
-            "rdf:subject",  // the reification triple
-            "nif:isString", // structure elements
-            "po:contains",  // the structure spine
-            "po:containsAsHeader",
-            "rdfs:label",
-            "doc:xhtmlTag",
-            "doc:cellValue", // table cells, reached through their table
-            "dcterms:title", // what the file declares, on the root
-            "dcterms:creator",
-            "doc:sourceName",
-        ] {
-            assert!(
-                seen.contains(required),
-                "the guard fixture stopped emitting {required}; it no longer \
-                 proves the sweep covers that emitter. saw: {seen:?}"
-            );
-        }
+        seen
     }
 
     #[test]

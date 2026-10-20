@@ -6,7 +6,7 @@ Parse one document and print its DoCO structure graph: what [`ingest`](ingest.md
 fluree doc parse <FILE> [OPTIONS]
 ```
 
-Nothing is written, and no project is needed: it runs in any directory. Where there is a project, or a global Fluree config, its `vlm` slot reads the pages and regions the deterministic pass could not, and its parse cache is used, as for `ingest`. With neither, the parse is deterministic and makes no network connection.
+No ledger is written, and no project is needed: it runs in any directory. Where there is a project, or a global Fluree config, its `[doc.vlm]` slot (`[doc.llm]` failing that) reads the pages and regions the deterministic pass could not, and the parse is cached there, as for `ingest`. `FLUREE_DOC_VLM_*` and `FLUREE_DOC_LLM_*` configure a model anywhere, with or without either. With none of these, the parse is deterministic and makes no network connection; `--no-escalate` rules out a model call whatever is configured.
 
 ## Arguments
 
@@ -18,7 +18,7 @@ Nothing is written, and no project is needed: it runs in any directory. Where th
 
 | Option | Description |
 |---|---|
-| `-f, --format <FORMAT>` | `doco` (default): the structure graph as JSON-LD. `text`: the plain-text projection that `nif:beginIndex` / `nif:endIndex` index into. |
+| `--format <FORMAT>` | `doco` (default): the structure graph as JSON-LD. `text`: the plain-text projection that `nif:beginIndex` / `nif:endIndex` index into. |
 | `-o, --output <FILE>` | Write to this file instead of stdout. |
 | `--base-iri <IRI>` | Prefix the file name is appended to, forming the document IRI (default `urn:fluree:doc:`), as `ingest` does for a file named on its command line. |
 | `--doc-iri <IRI>` | The document IRI in full, in place of `--base-iri` and the file name. Every node is minted under it and stamped with it. |
