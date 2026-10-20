@@ -73,7 +73,7 @@ pub(crate) fn parse_jsonld_query_for_dataset(
     };
 
     let mut vars = VarRegistry::new();
-    let dataset_names = dataset.named.keys().map(|name| name.to_string()).collect();
+    let dataset_names = dataset.named.keys().map(ToString::to_string).collect();
     let parsed = parse_query_in_dataset(
         query_ref,
         snapshot,
