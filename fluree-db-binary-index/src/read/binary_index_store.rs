@@ -2357,6 +2357,38 @@ impl BinaryIndexStore {
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
     }
 
+    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`: what
+    /// [`Self::find_subject_sid`] gives for its IRI, else [`Self::encode_iri`].
+    ///
+    /// When the canonical split of the IRI is exactly the parts the subject is
+    /// stored under, they are the answer: the reverse dictionary holds that
+    /// key, so the lookup `find_subject_sid` would make returns them. A
+    /// full-IRI namespace, or a split the current rules do not produce, takes
+    /// the lookup.
+    pub fn subject_sid_of_parts(&self, ns_code: u16, suffix: String) -> io::Result<Sid> {
+        if namespaces::is_full_iri(ns_code) {
+            return Ok(self
+                .find_subject_sid(&suffix)?
+                .unwrap_or_else(|| self.encode_iri(&suffix)));
+        }
+        let prefix = self.dicts.namespace_codes.get(&ns_code).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no namespace prefix for code={ns_code}"),
+            )
+        })?;
+        let iri = format!("{prefix}{suffix}");
+        let (canonical_prefix, canonical_suffix) = canonical_split(&iri, self.ns_split_mode);
+        if canonical_suffix == suffix
+            && self.dicts.namespace_reverse.get(canonical_prefix) == Some(&ns_code)
+        {
+            return Ok(Sid::new(ns_code, suffix));
+        }
+        Ok(self
+            .find_subject_sid(&iri)?
+            .unwrap_or_else(|| self.encode_iri(&iri)))
+    }
+
     /// Translate a `Sid` to `p_id` via the predicate reverse map.
     ///
     /// Returns `None` if the namespace code is unknown or the predicate
@@ -3247,12 +3279,8 @@ impl BinaryGraphView {
         }
         // Persisted forward-pack lookup; charge before the I/O.
         self.charge_dict_touch()?;
-        let iri = self.store.resolve_subject_iri(s_id)?;
-        if let Some(sid) = self.store.find_subject_sid(&iri)? {
-            Ok(sid)
-        } else {
-            Ok(self.store.encode_iri(&iri))
-        }
+        let (ns_code, suffix) = self.store.resolve_subject_parts(s_id)?;
+        self.store.subject_sid_of_parts(ns_code, suffix)
     }
 
     pub fn store(&self) -> &BinaryIndexStore {
@@ -5296,6 +5324,88 @@ pub(crate) mod tests {
                 let _ = std::fs::remove_dir_all(cache_dir);
             }
         }
+    }
+
+    /// A subject stored under its IRI's canonical split resolves to its
+    /// stored parts without the reverse lookup; every other subject takes
+    /// it, and each resolves to what that lookup gives.
+    #[test]
+    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits() {
+        use crate::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
+
+        const EX: u16 = 100;
+        // Registered, but its subject's IRI splits under a prefix that is not.
+        const EX_A: u16 = 101;
+        // Same prefix as EX; the reverse map names EX for it.
+        const DUP: u16 = 102;
+        // Its IRI's canonical prefix maps back to it, with another suffix.
+        const EX_C: u16 = 103;
+        let subjects: [(u16, &str); 6] = [
+            (EX, "alice"),
+            (EX_A, "b/c"),
+            (DUP, "carol"),
+            (EX_C, "/d"),
+            (namespaces::EMPTY, "urn:isbn:123"),
+            (namespaces::OVERFLOW, "https://example.org/zed"),
+        ];
+
+        let cache_dir = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+        store.set_ns_split_mode(NsSplitMode::MostGranular);
+        // Full-IRI namespaces have no prefix, as in a real store.
+        store.dicts.namespace_codes = Arc::new(HashMap::from([
+            (EX, "https://example.org/".to_string()),
+            (EX_A, "https://example.org/a/".to_string()),
+            (DUP, "https://example.org/".to_string()),
+            (EX_C, "https://example.org/c".to_string()),
+        ]));
+        store.dicts.namespace_reverse = Arc::new(HashMap::from([
+            ("https://example.org/".to_string(), EX),
+            ("https://example.org/a/".to_string(), EX_A),
+            ("https://example.org/c/".to_string(), EX_C),
+        ]));
+        let mut reverse = Vec::new();
+        for (ns_code, suffix) in subjects {
+            store.dicts.subject_forward_packs.insert(
+                ns_code,
+                ForwardPackReader::from_memory(vec![Arc::from(
+                    make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
+                )])
+                .unwrap(),
+            );
+            reverse.push(ReverseEntry {
+                key: subject_reverse_key(ns_code, suffix.as_bytes()),
+                id: SubjectId::new(ns_code, 1).as_u64(),
+            });
+        }
+        reverse.sort_by(|a, b| a.key.cmp(&b.key));
+        let tree = Arc::new(build_reverse_reader(reverse));
+        store.dicts.subject_reverse_tree = Some(Arc::clone(&tree));
+        let store = Arc::new(store);
+        let view = BinaryGraphView::new(Arc::clone(&store), 0);
+
+        for (ns_code, suffix) in subjects {
+            let s_id = SubjectId::new(ns_code, 1).as_u64();
+            let iri = store.resolve_subject_iri(s_id).unwrap();
+            let expected = store
+                .find_subject_sid(&iri)
+                .unwrap()
+                .unwrap_or_else(|| store.encode_iri(&iri));
+            let lookups = tree.cache_hits();
+            assert_eq!(
+                view.resolve_subject_sid(s_id).unwrap(),
+                expected,
+                "{suffix}"
+            );
+            let lookups = tree.cache_hits() - lookups;
+            if ns_code == EX {
+                assert_eq!(expected, Sid::new(EX, "alice"));
+                assert_eq!(lookups, 0, "a canonical subject needs no reverse lookup");
+            } else {
+                assert!(lookups > 0, "{suffix} takes the reverse lookup");
+            }
+        }
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

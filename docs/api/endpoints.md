@@ -2539,7 +2539,7 @@ POST /rebase
 - `200 OK` - Rebase completed successfully
 - `400 Bad Request` - Cannot rebase main, invalid strategy, or missing branch point
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Rebase aborted due to conflict (abort strategy)
+- `409 Conflict` - Rebase aborted due to conflict (abort strategy), or refused by the target's config checks (a config group the rebase would split, a second value for a single-valued setting, or a write to another branch's config or txn-meta graph)
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2629,7 +2629,7 @@ POST /merge
 - `200 OK` - Merge completed successfully
 - `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
 - `404 Not Found` - Ledger or branch does not exist
-- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, or the target HEAD changed during commit publishing
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, the target HEAD changed during commit publishing, or the merge is refused by the target's config checks (a config group the merge would split, a second value for a single-valued setting, a write to the source branch's own config or txn-meta graph, or a change to the target's own config or txn-meta graph from the source branch)
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2677,7 +2677,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `include_changes` | bool | No | When true, includes the aggregate **netted** change set the merge would apply (source side, ancestor..source-head) as `changes`. Defaults to false. Costs one full commit load per commit in the source divergence; the walk is shared with the conflict computation when both are requested. |
 | `max_changes` | number | No | Cap on change entries returned, counted in **flakes** and cut at subject boundaries (default 500; server clamps to a hard maximum of 5,000). A single subject larger than the cap is returned whole. `0` is a valid "diff stats" mode: exact counts, no payload. Bounds response size, **not** the replay walk. |
 | `changes_after_subject` | string | No | Pagination cursor: return only subjects whose full IRI sorts strictly after this value. Pass the previous response's `changes.next_cursor`. Each page re-pays the full replay + netting cost. Requires `include_changes=true`. |
-| `include_validation` | bool | No | When true (the default), stages the strategy-resolved change set on the target and validates it against the target's SHACL configuration and shapes exactly as `POST /merge` would, reporting the outcome as `validation` and folding it into `mergeable`. Costs a target-state load plus the validation pass, plus the source replay when `include_changes` is false. Set false for count-only previews. |
+| `include_validation` | bool | No | When true (the default), stages the strategy-resolved change set on the target and validates it against the target's configuration (SHACL shapes and uniqueness constraints) exactly as `POST /merge` would, reporting the outcome as `validation` and folding it into `mergeable`. Costs a target-state load plus the validation pass, plus the source replay when `include_changes` is false. Set false for count-only previews. |
 
 **Response body (200 OK):**
 
@@ -2741,7 +2741,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `behind` | object | Commits on target not on source |
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
 | `mergeable` | bool | Whether the strategy and the shapes both accept the merge: the selected strategy can be applied without aborting (false for `strategy=abort` with conflicts) **and**, when `validation` is present, the merged state conforms to the target's shapes. Commit-time conditions such as novelty backpressure are outside it. With `include_validation=false` it is the strategy/conflict signal alone. |
-| `validation` | object | Present iff `include_validation=true` (the default) and the merge is not a fast-forward. `{ "conforms": bool, "report"?: string }`, the same SHACL outcome `POST /merge` would produce for this strategy; `report` is present only when `conforms` is false and is the message the merge would fail with. A fast-forward adopts commits already validated when they were authored, so it carries no `validation`. |
+| `validation` | object | Present iff `include_validation=true` (the default) and the merge validates: always for a merge that is not a fast-forward, and for a fast-forward when the target's config enables SHACL or uniqueness, or the adopted commits carry config settings (config fields, or writes to a config or txn-meta graph of this ledger; an edge annotation's `f:reifies*` is not one). `{ "conforms": bool, "report"?: string }`, the same outcome `POST /merge` would produce for this strategy (a SHACL report, a uniqueness violation, or a refusal naming a config group the merge would split or give a second value); `report` is present only when `conforms` is false and is the message the merge would fail with. Any other fast-forward adopts its commits unvalidated and carries no `validation`. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
 | `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
 

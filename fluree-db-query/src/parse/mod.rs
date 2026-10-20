@@ -23,6 +23,7 @@ pub mod error;
 pub mod filter_common;
 pub mod filter_data;
 pub mod filter_sexpr;
+pub mod graph_name;
 pub mod lower;
 pub mod node_map;
 pub mod options;
@@ -42,6 +43,7 @@ pub use ast::{
 };
 pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
 pub use error::{ParseError, Result};
+pub use graph_name::{classify_written_graph_name, GraphNameEnv, WrittenGraphName};
 pub(crate) use lower::{lower_query, SelectMode};
 pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
@@ -52,7 +54,7 @@ use crate::var_registry::VarRegistry;
 use ast::{UnresolvedColumn, UnresolvedPathExpr, UnresolvedProjection};
 use fluree_graph_json_ld::{parse_context, ParsedContext};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Map from context term name to its parsed `@path` expression.
@@ -63,6 +65,15 @@ pub type PathAliasMap = HashMap<String, UnresolvedPathExpr>;
 
 // Re-export is_variable from node_map for use within this module
 use node_map::is_variable;
+
+/// [`parse_query_ast_in_dataset`] with no dataset names beyond the body's.
+#[cfg(test)]
+pub(crate) fn parse_query_ast(
+    json: &JsonValue,
+    strict_override: Option<bool>,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    parse_query_ast_in_dataset(json, strict_override, &HashSet::new())
+}
 
 /// Parse a JSON-LD query into an unresolved AST and determine the select mode.
 ///
@@ -77,9 +88,13 @@ use node_map::is_variable;
 ///
 /// A tuple of `(UnresolvedQuery, SelectMode)` where the mode is derived from
 /// the query's select/selectOne/construct/ask key.
-pub(crate) fn parse_query_ast(
+///
+/// A `["graph", …]` name in `dataset_names` (a dataset built outside the
+/// body) is kept as written, as one the body's own `fromNamed` spells is.
+pub(crate) fn parse_query_ast_in_dataset(
     json: &JsonValue,
     strict_override: Option<bool>,
+    dataset_names: &HashSet<String>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
     // M1b: read-side firewall on user-authored `f:reifies*` IRIs.
     // The IR-level expansion in `where_plan.rs::expand_edge_annotation_patterns`
@@ -99,6 +114,8 @@ pub(crate) fn parse_query_ast(
         &mut subject_counter,
         &mut nested_counter,
         strict_override,
+        None,
+        dataset_names,
     )
 }
 
@@ -191,11 +208,18 @@ fn scan_query_for_reifies_iris(
     Ok(())
 }
 
-fn parse_query_ast_internal(
+/// Parse a query object. A subquery passes the context of the `where` it is
+/// part of as `parent`: it then resolves graph names as that `where` does
+/// (an update's ledger, `fromNamed` aliases and `"default"` by name), inside
+/// the same enclosing graphs, and a read of the default graph by name in it
+/// is recorded on `parent`.
+pub(crate) fn parse_query_ast_internal(
     json: &JsonValue,
     subject_counter: &mut u32,
     nested_counter: &mut u32,
     strict_override: Option<bool>,
+    parent: Option<&JsonLdParseCtx>,
+    dataset_names: &HashSet<String>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
     let obj = json
         .as_object()
@@ -213,8 +237,62 @@ fn parse_query_ast_internal(
     // compact IRIs inside @path expressions honor `opts.strictCompactIri`.
     let parse_policy = policy::resolve_parse_policy(strict_override, obj);
     let path_aliases = extract_path_aliases(context_val, &context, parse_policy)?;
-    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy);
+    // A node-level `@graph` in `where` can name a `fromNamed` alias, which
+    // must stay the alias rather than expand as an IRI.
+    let mut graph_names = GraphNameEnv {
+        ledger_id: None,
+        aliases: query_from_named_aliases(obj),
+        default_by_name: false,
+    };
+    // A `["graph", …]` name the dataset spells is kept as written: the
+    // body's own `fromNamed`, the dataset the query runs against, and an
+    // enclosing query's names.
+    let mut names = body_dataset_names(obj);
+    names.extend(dataset_names.iter().cloned());
+    if let Some(parent) = parent {
+        let own = std::mem::replace(&mut graph_names, parent.graph_names.clone()).aliases;
+        for (alias, iri) in own {
+            graph_names.aliases.entry(alias).or_insert(iri);
+        }
+        names.extend(parent.dataset_names.iter().cloned());
+    }
+    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy)
+        .with_graph_names(graph_names)
+        .with_dataset_names(names);
+    if let Some(parent) = parent {
+        ctx.enclosing_graphs.store(
+            parent
+                .enclosing_graphs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let parsed = parse_query_body(
+        obj,
+        context_val,
+        &context,
+        &ctx,
+        subject_counter,
+        nested_counter,
+    );
+    if let Some(parent) = parent {
+        if ctx.reads_ledger_default() {
+            parent.note_reads_ledger_default();
+        }
+    }
+    parsed
+}
 
+/// The query object `obj` after its `@context`: select, `values`, `where`
+/// and options, parsed with `ctx`.
+fn parse_query_body(
+    obj: &serde_json::Map<String, JsonValue>,
+    context_val: &JsonValue,
+    context: &ParsedContext,
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<(UnresolvedQuery, SelectMode)> {
     let mut query = UnresolvedQuery::new(context.clone());
 
     // Store original context JSON for CONSTRUCT output (only if not null)
@@ -227,7 +305,7 @@ fn parse_query_ast_internal(
         return parse_construct_query(
             obj,
             construct_val,
-            &ctx,
+            ctx,
             query,
             subject_counter,
             nested_counter,
@@ -247,7 +325,7 @@ fn parse_query_ast_internal(
         let object_var_parsing = options::parse_object_var_parsing(obj);
         where_clause::parse_where_with_counters(
             ask_val,
-            &ctx,
+            ctx,
             &mut query,
             subject_counter,
             nested_counter,
@@ -261,8 +339,8 @@ fn parse_query_ast_internal(
         query.options.group_by = options::parse_group_by(obj)?;
         query.options.having = having;
         query.options.aggregates = having_aggregates;
-        parse_top_level_values(obj, &ctx, &mut query)?;
-        where_clause::resolve_atoms_outside_where(&mut query, &ctx);
+        parse_top_level_values(obj, ctx, &mut query)?;
+        where_clause::resolve_atoms_outside_where(&mut query, ctx);
         // `ask` is true when a solution remains after `offset` and `limit`
         // (`limit: 0` is false); one is enough, so the limit is at most 1.
         query.options.offset = options::parse_offset(obj)?;
@@ -304,7 +382,7 @@ fn parse_query_ast_internal(
     if select.as_str() == Some("*") {
         query.select = UnresolvedProjection::Wildcard;
     } else {
-        parse_select(select, &ctx, &mut query)?;
+        parse_select(select, ctx, &mut query)?;
     }
 
     // Parse depth parameter and apply to every hydration column.
@@ -317,7 +395,7 @@ fn parse_query_ast_internal(
         }
     }
 
-    parse_top_level_values(obj, &ctx, &mut query)?;
+    parse_top_level_values(obj, ctx, &mut query)?;
 
     // Parse where clause.
     //
@@ -327,7 +405,7 @@ fn parse_query_ast_internal(
     if let Some(where_clause) = obj.get("where") {
         where_clause::parse_where_with_counters(
             where_clause,
-            &ctx,
+            ctx,
             &mut query,
             subject_counter,
             nested_counter,
@@ -355,7 +433,7 @@ fn parse_query_ast_internal(
     query.options = opts;
     // SELECT computations and HAVING parse without the `@context`; give them
     // the same compact-IRI resolution the WHERE clause gets.
-    where_clause::resolve_atoms_outside_where(&mut query, &ctx);
+    where_clause::resolve_atoms_outside_where(&mut query, ctx);
 
     // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
     if query.options.order_by.is_empty() && !query.options.group_by.is_empty() {
@@ -444,6 +522,49 @@ pub(crate) fn extract_path_aliases(
     let tmp_ctx = JsonLdParseCtx::new(parsed_context.clone(), PathAliasMap::new(), policy);
     extract_path_aliases_into(context_val, &tmp_ctx, &mut aliases)?;
     Ok(aliases)
+}
+
+/// The names a query's `fromNamed` (or legacy `from-named`) gives its named
+/// graphs, which `where` graph patterns may use: the object form's keys, and
+/// the array form's strings, `alias`es and `@id`s. Each maps to the graph IRI
+/// when the entry gives one, else to the name itself.
+fn query_from_named_aliases(obj: &serde_json::Map<String, JsonValue>) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let graph_of = |entry: &JsonValue| {
+        entry
+            .get("@graph")
+            .or_else(|| entry.get("graph"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+    };
+    let mut add = |name: &str, iri: Option<String>| {
+        aliases.insert(name.to_string(), iri.unwrap_or_else(|| name.to_string()));
+    };
+    match obj.get("fromNamed").or_else(|| obj.get("from-named")) {
+        Some(JsonValue::Object(entries)) => {
+            for (alias, entry) in entries {
+                add(alias, graph_of(entry));
+            }
+        }
+        Some(JsonValue::String(name)) => add(name, None),
+        Some(JsonValue::Array(items)) => {
+            for item in items {
+                match item {
+                    JsonValue::String(name) => add(name, None),
+                    JsonValue::Object(entry) => {
+                        for key in ["alias", "@id"] {
+                            if let Some(name) = entry.get(key).and_then(JsonValue::as_str) {
+                                add(name, graph_of(item));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    aliases
 }
 
 /// Recursive helper that accumulates path aliases from a context value.
@@ -550,17 +671,12 @@ fn parse_construct_query(
     let template_patterns = match construct_val {
         JsonValue::Bool(true) => {
             // Shorthand: use the WHERE clause's triples (and their edge
-            // annotations) as the template
+            // annotations, and the graph blocks holding them) as the template
             query
                 .patterns
                 .iter()
-                .filter(|p| {
-                    matches!(
-                        p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
-                    )
-                })
                 .cloned()
+                .filter_map(construct_template_pattern)
                 .collect()
         }
         JsonValue::Bool(false) => {
@@ -607,6 +723,38 @@ fn parse_top_level_values(
     Ok(())
 }
 
+/// Every string in the query's `fromNamed` (or legacy `from-named`), at the
+/// top level or under `opts`: aliases, ledger and graph source names, and
+/// graph selectors. A `graph` clause naming one of them as written means
+/// it, even where it reads as a compact IRI.
+fn body_dataset_names(obj: &serde_json::Map<String, JsonValue>) -> HashSet<String> {
+    fn collect(value: &JsonValue, names: &mut std::collections::HashSet<String>) {
+        match value {
+            JsonValue::String(s) => {
+                names.insert(s.clone());
+            }
+            JsonValue::Array(items) => items.iter().for_each(|v| collect(v, names)),
+            JsonValue::Object(map) => {
+                for (key, v) in map {
+                    names.insert(key.clone());
+                    collect(v, names);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    let opts = obj.get("opts").and_then(JsonValue::as_object);
+    for scope in std::iter::once(obj).chain(opts) {
+        for key in ["fromNamed", "from-named"] {
+            if let Some(value) = scope.get(key) {
+                collect(value, &mut names);
+            }
+        }
+    }
+    names
+}
+
 /// Parse a CONSTRUCT template (explicit form)
 ///
 /// Parses the template node-map(s) into unresolved triple patterns, edge
@@ -635,6 +783,24 @@ fn parse_construct_template(
     }
 }
 
+/// A pattern a CONSTRUCT template node produces, kept when it is template
+/// output: a triple or an edge annotation, and a graph block (a node's own
+/// `@graph` is GRAPH sugar, as in a `where`) holding them. Other patterns a
+/// node map can produce are not output.
+fn construct_template_pattern(pattern: UnresolvedPattern) -> Option<UnresolvedPattern> {
+    match pattern {
+        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. } => Some(pattern),
+        UnresolvedPattern::Graph { name, patterns } => Some(UnresolvedPattern::Graph {
+            name,
+            patterns: patterns
+                .into_iter()
+                .filter_map(construct_template_pattern)
+                .collect(),
+        }),
+        _ => None,
+    }
+}
+
 fn parse_construct_items(
     items: &[JsonValue],
     ctx: &JsonLdParseCtx,
@@ -654,12 +820,12 @@ fn parse_construct_items(
                     nested_counter,
                     true,
                 )?;
-                patterns.extend(temp_query.patterns.into_iter().filter(|p| {
-                    matches!(
-                        p,
-                        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. }
-                    )
-                }));
+                patterns.extend(
+                    temp_query
+                        .patterns
+                        .into_iter()
+                        .filter_map(construct_template_pattern),
+                );
             }
             JsonValue::Array(arr) if arr.first().and_then(JsonValue::as_str) == Some("graph") => {
                 let name = arr.get(1).and_then(JsonValue::as_str).ok_or_else(|| {
@@ -1487,7 +1653,21 @@ pub fn parse_query<E: IriEncoder>(
     vars: &mut VarRegistry,
     strict_override: Option<bool>,
 ) -> Result<Query> {
-    let (ast, select_mode) = parse_query_ast(json, strict_override)?;
+    parse_query_in_dataset(json, encoder, vars, strict_override, &HashSet::new())
+}
+
+/// [`parse_query`] for a query run against a dataset built outside its body
+/// (a Rust `DataSetDb`, or a graph source a `from` registers): a
+/// `["graph", …]` name in `dataset_names` is kept as written rather than
+/// expanded as a compact IRI.
+pub fn parse_query_in_dataset<E: IriEncoder>(
+    json: &JsonValue,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    strict_override: Option<bool>,
+    dataset_names: &HashSet<String>,
+) -> Result<Query> {
+    let (ast, select_mode) = parse_query_ast_in_dataset(json, strict_override, dataset_names)?;
     let mut query = lower_query(ast, encoder, vars, select_mode)?;
     // The JSON-LD query surface projects a variable its grouping does not
     // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
@@ -1516,6 +1696,47 @@ mod tests {
     /// Helper to extract the triple pattern from an UnresolvedPattern
     fn triple(p: &UnresolvedPattern) -> &UnresolvedTriplePattern {
         p.as_triple().expect("Expected UnresolvedPattern::Triple")
+    }
+
+    /// A node-level `@graph` in a query's `where` can name a `fromNamed`
+    /// alias, which stays the alias even where `@base` or a prefix could
+    /// expand it; any other compact name expands.
+    #[test]
+    fn node_level_graph_in_query_keeps_from_named_aliases() {
+        let graph_name = |query: JsonValue| {
+            let (ast, _) = parse_query_ast(&query, None).unwrap();
+            match &ast.patterns[..] {
+                [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+                other => panic!("expected one GRAPH pattern, got {other:?}"),
+            }
+        };
+        let context = json!({"ex": "http://example.org/", "@base": "http://base.example/"});
+        for (from_named, alias) in [
+            (
+                json!({"products": {"@id": "mydb:main", "@graph": "http://example.org/p"}}),
+                "products",
+            ),
+            (json!(["mydb:main"]), "mydb:main"),
+            (json!([{"@id": "mydb:main", "alias": "p2"}]), "p2"),
+        ] {
+            assert_eq!(
+                graph_name(json!({
+                    "@context": context,
+                    "fromNamed": from_named,
+                    "select": ["?s"],
+                    "where": {"@id": "?s", "@graph": alias, "ex:p": "?o"}
+                })),
+                alias
+            );
+        }
+        assert_eq!(
+            graph_name(json!({
+                "@context": context,
+                "select": ["?s"],
+                "where": {"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}
+            })),
+            "http://example.org/g"
+        );
     }
 
     #[test]
