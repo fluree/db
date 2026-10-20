@@ -46,9 +46,14 @@ pub const G2: &str = "urn:g2";
 ///   in g1 and g2 (every `xsd:decimal` is a NumBig arena handle, numbered per
 ///   graph, so all three are handle 0 of their graph's arena);
 /// - triangles over `ex:knows`: t1 inside g1, t2 spanning g1 and g2 (its
-///   closing edge `t2c → t2a` is in g2), t3 in g1 and again in g2.
+///   closing edge `t2c → t2a` is in g2), t3 in g1 and again in g2;
+/// - a constant that matches facts of three datatypes: `?s ex:m 2` matches
+///   `2` (`xsd:integer`), `2.0e0` (`xsd:double`) and `"2"^^xsd:short`. `q1`
+///   holds `2` in g1 and `2.0e0` in g2 (two facts), `q2` holds `2` in both
+///   (one fact).
 pub const FIXTURE_A: &str = r#"
 @prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 ex:a1 ex:n 1 ; ex:label "a1" .
 ex:a2 ex:n 0 ; ex:label "a2" .
 ex:k0 ex:kind ex:T1 .
@@ -63,6 +68,7 @@ GRAPH <urn:g1> {
   ex:t1a ex:knows ex:t1b . ex:t1b ex:knows ex:t1c . ex:t1c ex:knows ex:t1a .
   ex:t2a ex:knows ex:t2b . ex:t2b ex:knows ex:t2c .
   ex:t3a ex:knows ex:t3b . ex:t3b ex:knows ex:t3c . ex:t3c ex:knows ex:t3a .
+  ex:q1 ex:m 2 . ex:q2 ex:m 2 .
 }
 GRAPH <urn:g2> {
   ex:s1 ex:n 2 .
@@ -75,6 +81,7 @@ GRAPH <urn:g2> {
   ex:L ex:items ( "v" "v" ) .
   ex:t2c ex:knows ex:t2a .
   ex:t3a ex:knows ex:t3b . ex:t3b ex:knows ex:t3c . ex:t3c ex:knows ex:t3a .
+  ex:q1 ex:m 2.0e0 . ex:q2 ex:m 2 . ex:q3 ex:m 2.0e0 . ex:q4 ex:m "2"^^xsd:short .
 }
 "#;
 
@@ -382,6 +389,9 @@ pub enum Shape {
     ExistsInExpression,
     /// D: `COUNT(?s)` over `?s ex:kind ex:T1`, the bound-object count.
     BoundObjectCount,
+    /// D′: `COUNT(?s)` over `?s ex:m 2`, a bound-object count whose constant
+    /// matches facts of three numeric datatypes.
+    BoundNumericCount,
     /// E: `COUNT(?s)` per predicate over `?s ?p ?o`.
     PerPredicateCount,
     /// B: the `ex:knows` triangle, the cyclic join.
@@ -393,6 +403,7 @@ pub enum Shape {
 pub const SHAPES: &[Shape] = &[
     Shape::ExistsInExpression,
     Shape::BoundObjectCount,
+    Shape::BoundNumericCount,
     Shape::PerPredicateCount,
     Shape::Triangle,
     Shape::GroupByObject,
@@ -415,6 +426,7 @@ impl Shape {
         match self {
             Shape::ExistsInExpression => "C exists in an expression",
             Shape::BoundObjectCount => "D bound-object count",
+            Shape::BoundNumericCount => "D′ numeric bound-object count",
             Shape::PerPredicateCount => "E per-predicate count",
             Shape::Triangle => "B triangle",
             Shape::GroupByObject => "A GROUP BY object",
@@ -446,6 +458,15 @@ impl Shape {
                 sparql_group_by: "",
                 jsonld_select: &["(as (count ?s) ?c)"],
                 jsonld_where: || json!([{"@id": "?s", "ex:kind": {"@id": "ex:T1"}}]),
+                jsonld_group_by: &[],
+            },
+            Shape::BoundNumericCount => Parts {
+                columns: &["c"],
+                sparql_select: "(COUNT(?s) AS ?c)",
+                sparql_body: "?s ex:m 2",
+                sparql_group_by: "",
+                jsonld_select: &["(as (count ?s) ?c)"],
+                jsonld_where: || json!([{"@id": "?s", "ex:m": 2}]),
                 jsonld_group_by: &[],
             },
             Shape::PerPredicateCount => Parts {
@@ -650,9 +671,10 @@ fn triangles(ns: &[u8]) -> Rows {
 /// The answer to `shape` over `graphs` of the fixture in `state`, written by
 /// hand from [`FIXTURE_A`], [`FIXTURE_OTHER`] and [`WRITE_TO_G2`].
 ///
-/// A default graph of two or more graphs is their set union (SPARQL §13.2):
-/// a triple two members hold is one solution, and so are two list items with
-/// the same value. One graph alone is a bag: its list items stay two rows.
+/// A default graph of two or more graphs is the union of their facts (AJ-66):
+/// a fact two members both hold is one solution. A fact is identified with its
+/// list position, so a list's repeated value stays two rows in a union, as in
+/// one graph.
 pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
     // With the write at t 2 (Novelty, Indexed2), g2 holds k4, `s3 n 4` and all
     // of t2.
@@ -704,6 +726,19 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                 };
                 rows(&[&[&n.to_string()]])
             }
+            // Facts `?s ex:m v` with v numerically 2, any datatype. Over a
+            // union a fact two members both hold counts once (AJ-66); q1's
+            // integer and double are two facts.
+            Shape::BoundNumericCount => {
+                let n = match graphs {
+                    Graphs::G0 | Graphs::G0Other | Graphs::Empty => 0,
+                    Graphs::G1 => 2,                    // q1 int, q2 int
+                    Graphs::G2 => 4,                    // q1 dbl, q2 int, q3 dbl, q4 short
+                    Graphs::G1G2 | Graphs::G0G1G2 => 5, // q1 int, q1 dbl, q2 int (both), q3 dbl, q4 short
+                    Graphs::PerNamedGraph => unreachable!(),
+                };
+                rows(&[&[&n.to_string()]])
+            }
             // Triples per predicate.
             Shape::PerPredicateCount => {
                 let counts: &[(&str, u32)] = match graphs {
@@ -714,6 +749,7 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                         ("kind", 2),
                         ("big", 1),
                         ("knows", 8),
+                        ("m", 2),
                     ],
                     // A bag: L's two list items are two rows.
                     Graphs::G2 if w => &[
@@ -724,6 +760,7 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                         ("big", 1),
                         ("items", 2),
                         ("knows", 6),
+                        ("m", 4),
                     ],
                     Graphs::G2 => &[
                         ("n", 2),
@@ -733,17 +770,21 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                         ("big", 1),
                         ("items", 2),
                         ("knows", 4),
+                        ("m", 4),
                     ],
-                    // A set: `s2 n 2`, `k1 kind`, `b big 2.5` and t3 once each;
-                    // L's list items one row; the write's t2 edges are g1's.
+                    // `s2 n 2`, `k1 kind`, `b big 2.5`, t3 and `q2 m 2` once
+                    // each (both members hold them); L's two list items stay
+                    // two facts, and so do q1's `m 2` and `m 2.0e0` (AJ-66);
+                    // the write's t2 edges are g1's.
                     Graphs::G1G2 if w => &[
                         ("n", 5),
                         ("label", 2),
                         ("kind", 4),
                         ("big", 1),
                         ("only", 1),
-                        ("items", 1),
+                        ("items", 2),
                         ("knows", 9),
+                        ("m", 5),
                     ],
                     Graphs::G1G2 => &[
                         ("n", 4),
@@ -751,8 +792,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                         ("kind", 3),
                         ("big", 1),
                         ("only", 1),
-                        ("items", 1),
+                        ("items", 2),
                         ("knows", 9),
+                        ("m", 5),
                     ],
                     // g0 adds `n` ×2, `label` ×2, `kind` ×1, and `b big 1.5`,
                     // a value g1 and g2 do not hold (all three are NumBig
@@ -763,8 +805,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                         ("kind", 5),
                         ("big", 2),
                         ("only", 1),
-                        ("items", 1),
+                        ("items", 2),
                         ("knows", 9),
+                        ("m", 5),
                     ],
                     Graphs::G0G1G2 => &[
                         ("n", 6),
@@ -772,8 +815,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                         ("kind", 4),
                         ("big", 2),
                         ("only", 1),
-                        ("items", 1),
+                        ("items", 2),
                         ("knows", 9),
+                        ("m", 5),
                     ],
                     Graphs::G0Other => &[("n", 3), ("label", 3), ("kind", 2), ("big", 1)],
                     Graphs::Empty => &[],
