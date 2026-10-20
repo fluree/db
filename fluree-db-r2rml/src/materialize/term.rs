@@ -630,14 +630,17 @@ fn format_date(days: i32) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Format timestamp (microseconds since epoch) as ISO 8601
+/// Format timestamp (microseconds since epoch) as ISO 8601, with six
+/// fractional digits when the microseconds are not zero. Divisions round
+/// down, so an instant before 1970 falls in the second and the day at or
+/// before it: -1 µs is `1969-12-31T23:59:59.999999Z`.
 fn format_timestamp(micros: i64) -> String {
-    let seconds = micros / 1_000_000;
-    let micros_part = (micros % 1_000_000).abs();
+    let seconds = micros.div_euclid(1_000_000);
+    let micros_part = micros.rem_euclid(1_000_000);
 
     // Days since epoch
-    let days_since_epoch = seconds / 86400;
-    let time_of_day = (seconds % 86400 + 86400) % 86400; // Handle negative
+    let days_since_epoch = seconds.div_euclid(86_400);
+    let time_of_day = seconds.rem_euclid(86_400);
 
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
@@ -1007,6 +1010,26 @@ pub fn fill_join_key_from_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timestamp renders on its own day, before 1970 too, and keeps the
+    /// sign of its fraction: the microsecond a nanosecond reader rounds
+    /// -500 ns down to is the last one of 1969. Later instants render as
+    /// they always have, six fractional digits or none.
+    #[test]
+    fn a_timestamp_before_1970_renders_on_its_own_day() {
+        assert_eq!(format_timestamp(-3_600_000_000), "1969-12-31T23:00:00Z");
+        assert_eq!(format_timestamp(-1), "1969-12-31T23:59:59.999999Z");
+        assert_eq!(format_timestamp(-86_400_000_000), "1969-12-31T00:00:00Z");
+        assert_eq!(
+            format_timestamp(-86_400_000_001),
+            "1969-12-30T23:59:59.999999Z"
+        );
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_timestamp(1_577_836_800_123_000),
+            "2020-01-01T00:00:00.123000Z"
+        );
+    }
 
     #[test]
     fn test_expand_template_simple() {

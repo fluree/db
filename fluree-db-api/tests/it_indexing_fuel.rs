@@ -120,12 +120,7 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
     )
     .await
     .expect("rebuild");
-    fluree
-        .publisher()
-        .expect("publisher")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish");
+    crate::support::publish_built_index(&fluree, ledger_id, result.index_t, &result.root_id).await;
 
     // Now go through `build_index_for_record_with_tracker` — it should hit the
     // already-current early return and report Some(0.0) (no CAS work, but the
