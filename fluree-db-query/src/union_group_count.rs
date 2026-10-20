@@ -103,6 +103,8 @@ pub(crate) fn count_groups_over_union(
             Ok(merged) => merged.with_tracker(&ctx.tracker),
             Err(decline) => return Ok(Err(decline.fallback())),
         };
+    // A graph that holds rows of `<p>`, whose view decodes the keys.
+    let decode_graph = merged.members_in_range().first().copied();
 
     // Runs of one encoded key: `(o_type, o_key)` for the object, `(0, s_id)`
     // for the subject. The merge is sorted by the key, so each key is one run.
@@ -130,14 +132,14 @@ pub(crate) fn count_groups_over_union(
     // Decode each run's key as a member scan of the union binds it (eagerly:
     // a scope of several graphs has no graph view to decode it later), and
     // fold the runs into groups by GROUP BY's own key. An arena-backed object
-    // was declined above, so any member's view decodes the same term.
-    let view = BinaryGraphView::with_novelty(
-        Arc::clone(store),
-        set.members()[0].g_id(),
-        ctx.dict_novelty.clone(),
-    )
-    .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
-    .with_tracker(ctx.tracker.clone());
+    // was declined above, so the view of any member that holds rows decodes
+    // the same term.
+    let Some(g_id) = decode_graph.filter(|_| !runs.is_empty()) else {
+        return Ok(Ok(Vec::new()));
+    };
+    let view = BinaryGraphView::with_novelty(Arc::clone(store), g_id, ctx.dict_novelty.clone())
+        .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+        .with_tracker(ctx.tracker.clone());
     let norm = equality_norm(ctx);
     let (dicts, gv) = EqualityNorm::parts(&norm);
     let mut groups: hashbrown::HashMap<GroupKeyOwned, CountGroup, FxBuildHasher> =
