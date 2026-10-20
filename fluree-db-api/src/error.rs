@@ -1071,7 +1071,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 48
+    const VARIANTS: usize = 49
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + cfg!(feature = "iceberg") as usize;
