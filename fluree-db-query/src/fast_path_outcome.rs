@@ -57,6 +57,9 @@ pub enum FastPathFallback {
     /// rows of one fact can be separated there, so dropping adjacent
     /// duplicates would not remove every one.
     ListRowsInPost,
+    /// A lane over several graphs met a member with no index branch for the
+    /// order it reads.
+    NoBranch,
 }
 
 impl FastPathOutcome {
@@ -72,6 +75,7 @@ impl FastPathOutcome {
             FastPathOutcome::Fallback(FastPathFallback::ListRowsInPost) => {
                 "fallback:list_rows_in_post"
             }
+            FastPathOutcome::Fallback(FastPathFallback::NoBranch) => "fallback:no_branch",
         }
     }
 }
