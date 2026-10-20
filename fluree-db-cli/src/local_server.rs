@@ -53,27 +53,20 @@ pub(crate) fn read_meta(data_dir: &Path) -> Option<ServerMeta> {
 pub(crate) struct LocalServer {
     pub pid: u32,
     listen_addr: String,
+    /// It holds the storage's lock, so this CLI cannot open the storage.
+    pub holds_storage: bool,
 }
 
 impl LocalServer {
-    /// The server `server.meta.json` names, when it is alive, is a Fluree
-    /// server, and serves the storage this CLI would open.
+    /// The server `server.meta.json` names, when it serves the storage this
+    /// CLI would open and is running.
+    ///
+    /// A server that locks its storage is running exactly while it holds the
+    /// lock, which a crash cannot leave behind; a recorded pid can be reused.
+    /// Any other server (a connection config, a peer, one `restart` launched)
+    /// is running while its pid is alive and a Fluree server's.
     pub fn find(dirs: &FlureeDir) -> Option<Self> {
         let meta = read_meta(dirs.data_dir())?;
-        if !is_process_alive(meta.pid) {
-            notice(format!(
-                "local server (pid {}) is no longer running; executing directly",
-                meta.pid
-            ));
-            return None;
-        }
-        if !is_fluree_process(meta.pid) {
-            notice(format!(
-                "pid {} is not a Fluree server; executing directly",
-                meta.pid
-            ));
-            return None;
-        }
         let ours = config::resolve_storage_path(dirs);
         if meta.connection_config.is_none()
             && !meta.storage_path.is_empty()
@@ -87,9 +80,40 @@ impl LocalServer {
             ));
             return None;
         }
+        let gone = || {
+            notice(format!(
+                "local server (pid {}) is no longer running; executing directly",
+                meta.pid
+            ));
+            None
+        };
+        let holds_storage = match meta.locked_root.as_ref().map(|_| probe(&ours)) {
+            Some(Probe::Free) => return gone(),
+            Some(Probe::Held(holder)) => {
+                // The holder is unknown where the lock file cannot be read.
+                if holder.map_or(!is_process_alive(meta.pid), |pid| pid != meta.pid) {
+                    return gone();
+                }
+                true
+            }
+            Some(Probe::Unknown) | None => {
+                if !is_process_alive(meta.pid) {
+                    return gone();
+                }
+                if !is_fluree_process(meta.pid) {
+                    notice(format!(
+                        "pid {} is not a Fluree server; executing directly",
+                        meta.pid
+                    ));
+                    return None;
+                }
+                false
+            }
+        };
         Some(Self {
             pid: meta.pid,
             listen_addr: meta.listen_addr,
+            holds_storage,
         })
     }
 
@@ -120,7 +144,28 @@ pub(crate) fn route(dirs: &FlureeDir) -> Option<LocalServer> {
     LocalServer::find(dirs)
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+/// What a storage root's lock says about who holds it.
+enum Probe {
+    Free,
+    Held(Option<u32>),
+    /// The lock cannot tell: the filesystem cannot lock, or taking it failed.
+    Unknown,
+}
+
+fn probe(root: &Path) -> Probe {
+    // Taking the lock would create a root that does not exist.
+    if !root.is_dir() {
+        return Probe::Free;
+    }
+    match fluree_db_core::RootLock::acquire(root) {
+        Ok(lock) if lock.is_locked() => Probe::Free,
+        Ok(_) => Probe::Unknown,
+        Err(fluree_db_core::RootLockError::Held { holder }) => Probe::Held(holder),
+        Err(_) => Probe::Unknown,
+    }
+}
+
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
@@ -172,4 +217,133 @@ pub(crate) fn is_fluree_process(pid: u32) -> bool {
 #[cfg(not(unix))]
 pub(crate) fn is_fluree_process(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Project {
+        _dir: tempfile::TempDir,
+        dirs: FlureeDir,
+        storage: PathBuf,
+    }
+
+    fn project() -> Project {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = FlureeDir::unified(dir.path().join(".fluree"));
+        let storage = config::resolve_storage_path(&dirs);
+        fs::create_dir_all(&storage).unwrap();
+        Project {
+            _dir: dir,
+            dirs,
+            storage,
+        }
+    }
+
+    /// Record a server on the project's storage, as `server run` does.
+    fn record(project: &Project, pid: u32, locks_storage: bool, connection_config: Option<&str>) {
+        let meta = ServerMeta {
+            pid,
+            listen_addr: "127.0.0.1:8090".into(),
+            storage_path: project.storage.display().to_string(),
+            connection_config: connection_config.map(Into::into),
+            bolt_listen_addr: None,
+            config_path: None,
+            started_at: String::new(),
+            args: Vec::new(),
+            locked_root: locks_storage.then(|| project.storage.clone()),
+        };
+        fs::write(
+            meta_path(project.dirs.data_dir()),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A live process whose command line reads as a Fluree server's, as a
+    /// pid reused after a crash can.
+    #[cfg(unix)]
+    struct LookAlike(std::process::Child);
+
+    #[cfg(unix)]
+    impl LookAlike {
+        fn spawn() -> Self {
+            // `sh -c` names its script after the next argument; `; :` keeps
+            // it from exec'ing into `sleep`, which would drop that name.
+            let child = std::process::Command::new("sh")
+                .args(["-c", "sleep 60; :", "fluree-server"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let look_alike = Self(child);
+            assert!(is_process_alive(pid) && is_fluree_process(pid));
+            look_alike
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LookAlike {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_server_is_found_while_it_holds_the_storage() {
+        let project = project();
+        let _server = fluree_db_core::RootLock::acquire(&project.storage).unwrap();
+        record(&project, std::process::id(), true, None);
+
+        let found = LocalServer::find(&project.dirs).expect("the server holds the storage");
+        assert!(found.holds_storage);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_whose_storage_is_free_is_gone_though_its_pid_lives() {
+        let project = project();
+        let reused = LookAlike::spawn();
+        record(&project, reused.pid(), true, None);
+
+        assert!(LocalServer::find(&project.dirs).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_whose_storage_another_process_holds_is_gone() {
+        let project = project();
+        let reused = LookAlike::spawn();
+        let _other = fluree_db_core::RootLock::acquire(&project.storage).unwrap();
+        record(&project, reused.pid(), true, None);
+
+        assert!(LocalServer::find(&project.dirs).is_none());
+    }
+
+    /// A connection-config server never locks the project's storage.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_does_not_lock_the_storage_is_found_by_its_pid() {
+        let project = project();
+        let server = LookAlike::spawn();
+        record(&project, server.pid(), false, Some("connection.jsonld"));
+
+        let found = LocalServer::find(&project.dirs).expect("found by its pid");
+        assert!(!found.holds_storage);
+    }
+
+    #[test]
+    fn finding_a_server_does_not_create_the_storage() {
+        let project = project();
+        fs::remove_dir(&project.storage).unwrap();
+        record(&project, std::process::id(), true, None);
+
+        assert!(LocalServer::find(&project.dirs).is_none());
+        assert!(!project.storage.exists());
+    }
 }

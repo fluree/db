@@ -7,7 +7,9 @@
 use crate::cli::ServerAction;
 use crate::config;
 use crate::error::{CliError, CliResult};
-use crate::local_server::{is_fluree_process, is_process_alive, meta_path, read_meta, ServerMeta};
+use crate::local_server::{
+    is_fluree_process, is_process_alive, meta_path, read_meta, same_path, ServerMeta,
+};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_server::config_file::load_and_merge_config;
@@ -210,7 +212,7 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         storage_path: server_config
             .storage_path
             .as_deref()
-            .map(recorded_path)
+            .map(|path| recorded_path(path).display().to_string())
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: server_config
             .connection_config
@@ -220,18 +222,16 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: Vec::new(),
-        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
+        locked_root: server_config.owned_storage_path().map(recorded_path),
     }
 }
 
 /// A path as `server.meta.json` records it: absolute, so a command run from
 /// any directory compares it with its own storage.
-fn recorded_path(path: &Path) -> String {
+fn recorded_path(path: &Path) -> PathBuf {
     fs::canonicalize(path)
         .or_else(|_| std::path::absolute(path))
         .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
 }
 
 fn write_meta(meta_file: &Path, meta: &ServerMeta) {
@@ -354,7 +354,7 @@ async fn run_start(
         storage_path: server_config
             .storage_path
             .as_deref()
-            .map(recorded_path)
+            .map(|path| recorded_path(path).display().to_string())
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: server_config
             .connection_config
@@ -364,7 +364,7 @@ async fn run_start(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args,
-        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
+        locked_root: server_config.owned_storage_path().map(recorded_path),
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| CliError::Server(format!("failed to serialize metadata: {e}")))?;
@@ -426,8 +426,17 @@ fn already_running(server_config: &ServerConfig, recorded: Option<&Recorded>) ->
             .map(|r| running(r.pid));
     };
     match fluree_db_core::RootLock::acquire(root) {
-        Ok(_probe) => recorded
-            .filter(|r| r.locked_root.as_deref() != Some(root) && is_process_alive(r.pid))
+        Ok(probe) if probe.is_locked() => recorded
+            .filter(|r| {
+                !r.locked_root
+                    .as_deref()
+                    .is_some_and(|locked| same_path(locked, root))
+                    && is_process_alive(r.pid)
+            })
+            .map(|r| running(r.pid)),
+        // Opened unprotected, so the lock cannot tell and the pid answers.
+        Ok(_) => recorded
+            .filter(|r| is_process_alive(r.pid))
             .map(|r| running(r.pid)),
         Err(fluree_db_core::RootLockError::Unsupported(error)) => Some(format!(
             "storage {} is on a filesystem that cannot lock it ({error}); set {}=true to \
@@ -530,7 +539,7 @@ async fn run_start_with_child_args(
         storage_path: child_args
             .windows(2)
             .find(|w| w[0] == "--storage-path")
-            .map(|w| recorded_path(Path::new(&w[1])))
+            .map(|w| recorded_path(Path::new(&w[1])).display().to_string())
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: child_args
             .windows(2)
@@ -1671,6 +1680,29 @@ mod tests {
             already_running(&file_backed(dir.path()), Some(&reused)),
             None
         );
+    }
+
+    /// A `start` run from another directory can name the root another way.
+    #[test]
+    fn start_ignores_a_live_pid_recorded_for_the_free_root_under_another_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let reused = recorded(Some(&dir.path().join("sub").join("..")));
+
+        assert_eq!(
+            already_running(&file_backed(dir.path()), Some(&reused)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_server_records_the_root_it_locks_as_an_absolute_path() {
+        let meta = foreground_meta(&file_backed(Path::new("relative/storage")), None);
+
+        let root = meta
+            .locked_root
+            .expect("a file-backed server locks its root");
+        assert!(root.is_absolute(), "{}", root.display());
     }
 
     /// A connection-config server, or one on other storage, leaves this

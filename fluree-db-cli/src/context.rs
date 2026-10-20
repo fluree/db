@@ -615,8 +615,10 @@ async fn open_waiting(
         let fluree_db_api::ApiError::StorageInUse { root, holder } = &error else {
             return Err(fatal(error));
         };
-        let server = crate::local_server::LocalServer::find(dirs).map(|server| server.pid);
-        if let Some(server) = holder.filter(|pid| server == Some(*pid)) {
+        let server = crate::local_server::LocalServer::find(dirs)
+            .filter(|server| server.holds_storage || *holder == Some(server.pid))
+            .map(|server| server.pid);
+        if let Some(server) = server {
             // A command that can go through the server only gets here
             // under `--direct`.
             let hint = if direct() {

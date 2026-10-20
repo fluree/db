@@ -180,10 +180,12 @@ instead of opening the storage beside it. This applies to:
   `bm25`, `sql`, `delta`, `iceberg` and `multi-query`.
 
 The CLI finds the server through `.fluree/server.meta.json`, which the server writes when it starts
-and removes when it stops. It routes to that server only when its process is alive, is a Fluree
-server, and serves the storage this project's commands would otherwise open; a server started on
-another `--storage-path` is left alone. The choice is made before anything opens the storage. When
-a command is routed, you'll see a hint on stderr:
+and removes when it stops. It routes to that server only when it serves the storage this project's
+commands would otherwise open, so a server started on another `--storage-path` is left alone, and
+only while it runs. A server on file storage runs for as long as it holds that storage's lock; for
+any other server, such as one on a connection config, its process must be alive and a Fluree
+server. The choice is made before anything opens the storage. When a command is routed, you'll see
+a hint on stderr:
 
 ```
   server: routing through local server at 0.0.0.0:8090 (use --direct to bypass)
@@ -205,7 +207,10 @@ fluree query --direct 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
 
 ### Crash detection
 
-If the server has crashed or been killed, the CLI detects the stale PID and falls back to direct execution with a notice:
+If the server has crashed or been killed, the CLI finds its storage no longer locked (or, for a
+server that does not lock its storage, its PID gone) and falls back to direct execution with a
+notice. For a server on file storage this holds even once the system has given its PID to another
+process:
 
 ```
   notice: local server (pid 12345) is no longer running; executing directly
