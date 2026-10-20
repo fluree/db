@@ -663,7 +663,6 @@ impl<'l> CurrentFacts<'l> {
     /// one graph share one decision between per-slot novelty seeks and a
     /// single filtered novelty walk.
     pub async fn of_slots(&self, slots: &[Slot]) -> Result<Vec<Vec<StoredFact>>> {
-        crate::check_index_loaded(&self.ledger.snapshot)?;
         let novelty = NoveltyPlan::for_slots(self.ledger, slots, self.to_t);
         let mut out = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -825,7 +824,6 @@ impl<'l> CurrentFacts<'l> {
         g_sid: Option<&Sid>,
         s: &Sid,
     ) -> Result<Vec<StoredFact>> {
-        crate::check_index_loaded(&self.ledger.snapshot)?;
         let mut flakes = self
             .base(g_id, RangeMatch::new().with_subject(s.clone()))
             .await?;
@@ -892,7 +890,11 @@ impl<'l> CurrentFacts<'l> {
     /// Persisted-index rows matching `rm` in graph `g_id`, read through
     /// `NoOverlay`: one leaf seek, no novelty translation. At genesis (no
     /// index yet) there is no provider and the answer is empty.
+    ///
+    /// Every reader that reads the index reads it here, so this is where an
+    /// index this process has not loaded is refused.
     async fn base(&self, g_id: GraphId, rm: RangeMatch) -> Result<Vec<Flake>> {
+        crate::check_index_loaded(&self.ledger.snapshot)?;
         Ok(range_with_overlay(
             &self.ledger.snapshot,
             g_id,
@@ -1921,6 +1923,20 @@ mod tests {
         );
         refused(facts.of_subject(0, None, &sid("a")).await);
         refused(facts.whole_graph(0, None, None, None).await);
+        let named = flake("a", "b", "x", 1, true, None);
+        let items = [(slot(0, None, "a", "b"), &named)];
+        refused(
+            facts
+                .named_by(&items)
+                .await
+                .map(|v| v.into_iter().flatten().collect()),
+        );
+        refused(
+            facts
+                .all_named_by(&items)
+                .await
+                .map(|mut v| v.pop().unwrap_or_default()),
+        );
     }
 
     fn slot(g_id: GraphId, g_sid: Option<&Sid>, s: &str, p: &str) -> Slot {
