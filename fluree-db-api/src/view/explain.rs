@@ -2,7 +2,7 @@
 
 use crate::query::helpers::parse_jsonld_query;
 use crate::view::GraphDb;
-use crate::{ApiError, Fluree, Result};
+use crate::{ApiError, Fluree, QueryExecutionOptions, Result, Tracker};
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider};
 use fluree_db_query::datalog_rules::{ExplainTarget, Explanation};
@@ -46,8 +46,24 @@ impl Fluree {
     /// ```
     ///
     /// An explanation shows premises whatever a policy would hide, so a view
-    /// under a non-root policy is refused.
+    /// under a non-root policy is refused, including the ledger's configured
+    /// default policy.
     pub async fn explain_derived(&self, db: &GraphDb, request: &JsonValue) -> Result<Explanation> {
+        self.explain_derived_with_options(db, request, &QueryExecutionOptions::default(), None)
+            .await
+    }
+
+    /// [`Self::explain_derived`] for a host's request: `options.cancellation`
+    /// stops the materialization and the replays, and `tracker` charges
+    /// their fuel.
+    pub async fn explain_derived_with_options(
+        &self,
+        db: &GraphDb,
+        request: &JsonValue,
+        options: &QueryExecutionOptions,
+        tracker: Option<&Tracker>,
+    ) -> Result<Explanation> {
+        let db = &self.wrap_policy_defaults(db.clone()).await?;
         if !db.is_root() {
             return Err(ApiError::invalid_query(
                 "an explanation shows its premises whatever a policy would hide; ask with an \
@@ -102,7 +118,10 @@ impl Fluree {
             &executable.reasoning.modes,
             executable.reasoning.rules_source_g_id,
             db.binary_store.as_ref(),
-            QueryRequest::default(),
+            QueryRequest {
+                tracker,
+                cancellation: options.cancellation.as_ref(),
+            },
             &target,
         )
         .await?)

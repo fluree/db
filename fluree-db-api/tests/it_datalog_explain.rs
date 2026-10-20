@@ -449,3 +449,153 @@ async fn language_tagged_facts_stay_distinct() {
         ]
     );
 }
+
+/// A 400-node chain whose closure materializes as one traversal (tens of
+/// thousands of facts), while replaying the closing rule's body joins the
+/// whole closure with itself (millions of rows).
+async fn chain_closure_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let graph: Vec<Value> = (0..399)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:next": {"@id": format!("ex:n{}", i + 1)}}))
+        .collect();
+    ledger_with(
+        fluree,
+        ledger_id,
+        json!({"@context": ex_ctx(), "@graph": graph}),
+    )
+    .await
+}
+
+fn chain_closure_rules() -> Value {
+    json!([
+        {"@context": ex_ctx(), "@id": "ex:step",
+         "where": {"@id": "?x", "ex:next": "?y"},
+         "insert": {"@id": "?x", "ex:reach": {"@id": "?y"}}},
+        {"@context": ex_ctx(), "@id": "ex:close",
+         "where": [{"@id": "?x", "ex:reach": "?y"}, {"@id": "?y", "ex:reach": "?z"}],
+         "insert": {"@id": "?x", "ex:reach": {"@id": "?z"}}}
+    ])
+}
+
+fn chain_closure_request(max_seconds: u64) -> Value {
+    json!({
+        "@context": ex_ctx(),
+        "reasoning": "datalog",
+        "reasoningBudget": {"maxSeconds": max_seconds},
+        "rules": chain_closure_rules(),
+        "explain": {"@id": "ex:n0", "ex:reach": {"@id": "ex:n399"}}
+    })
+}
+
+/// Replays run under the reasoning budget as the run's rule bodies do: one
+/// that outlasts it stops, and the explanation says it is incomplete.
+#[tokio::test]
+async fn a_replay_stops_at_the_reasoning_deadline() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = chain_closure_ledger(&fluree, "datalog/explain-deadline:main").await;
+    let started = std::time::Instant::now();
+    let explanation = explain_with(&fluree, &ledger, chain_closure_request(2)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(explanation.facts.len(), 1, "the run derives the fact");
+    assert!(!explanation.complete, "the replay was stopped");
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "a 2s budget, the explanation ran {elapsed:?}"
+    );
+}
+
+/// A host's cancellation reaches the replays: an explanation cancelled while
+/// it replays fails with the cancellation rather than finishing.
+#[tokio::test]
+async fn a_cancelled_explanation_stops_its_replays() {
+    use fluree_db_api::{QueryCancellation, QueryCancellationReason, QueryExecutionOptions};
+
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = chain_closure_ledger(&fluree, "datalog/explain-cancel:main").await;
+    // Materialize first, so the explanation reads the cached run and the
+    // cancellation lands while it replays.
+    crate::support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ex_ctx(),
+            "select": "?y",
+            "where": {"@id": "ex:n0", "ex:reach": "?y"},
+            "reasoning": "datalog",
+            "reasoningBudget": {"maxSeconds": 60},
+            "rules": chain_closure_rules()
+        }),
+    )
+    .await
+    .expect("materialize");
+
+    let handle = QueryCancellation::new();
+    let options = QueryExecutionOptions::new().with_cancellation(handle.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        handle.cancel_with(QueryCancellationReason::ClientDisconnected);
+    });
+    let started = std::time::Instant::now();
+    let err = fluree
+        .explain_derived_with_options(
+            &graphdb_from_ledger(&ledger),
+            &chain_closure_request(60),
+            &options,
+            None,
+        )
+        .await
+        .expect_err("the explanation was cancelled");
+    let elapsed = started.elapsed();
+    assert!(err.to_string().contains("client_disconnected"), "{err}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "cancelled after 300ms, the explanation ran {elapsed:?}"
+    );
+}
+
+/// The ledger's configured default policy counts as a restriction: a view
+/// from `fluree.db` carries no policy wrapper of its own, yet an explanation
+/// on it is refused as on a wrapped one.
+#[tokio::test]
+async fn a_ledger_default_policy_refuses_an_explanation() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger_id = "datalog/explain-config-policy:main";
+    let ledger = ledger_with(
+        &fluree,
+        ledger_id,
+        json!({"@context": ex_ctx(), "@id": "ex:acct1", "ex:risk": "high"}),
+    )
+    .await;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:policyDefaults <urn:config:policy> .
+                <urn:config:policy> f:defaultAllow false .
+            }}
+            "
+        ))
+        .execute()
+        .await
+        .expect("config");
+    let view = fluree.db(ledger_id).await.expect("view");
+    let err = fluree
+        .explain_derived(
+            &view,
+            &json!({
+                "@context": ex_ctx(),
+                "reasoning": "datalog",
+                "rules": [{"@context": ex_ctx(),
+                           "where": {"@id": "?a", "ex:risk": "high"},
+                           "insert": {"@id": "?a", "@type": "ex:Flagged"}}],
+                "explain": {"@id": "ex:acct1", "@type": "ex:Flagged"}
+            }),
+        )
+        .await
+        .expect_err("refused");
+    assert!(err.to_string().contains("unrestricted"), "{err}");
+}

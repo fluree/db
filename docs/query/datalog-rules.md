@@ -572,10 +572,13 @@ reads transaction metadata) cannot be replayed: the explanation names it in
 `not_replayed`, and a fact only it derived appears without derivations, as
 does a fact OWL 2 RL entailed. The explanation also records the snapshot
 `t`, a hash of the rule set, the evaluation time `NOW()` returned, and
-whether the run was complete; a capped run's conclusions may be missing
-facts. Premises appear whatever a policy
-would hide, so a view under a non-root policy is refused. The shape of the
-result is experimental.
+whether it is complete: a capped run's conclusions may be missing facts.
+Replays run under the same reasoning budget, measured from the start of the
+explanation, and one the time limit stops leaves the explanation incomplete.
+`explain_derived_with_options` takes a host's cancellation, which stops the
+explanation with an error, and a fuel tracker. Premises appear whatever a
+policy would hide, so a view under a non-root policy is refused, the ledger's
+configured default policy included. The shape of the result is experimental.
 
 ## Examples
 

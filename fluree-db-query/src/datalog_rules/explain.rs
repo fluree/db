@@ -14,10 +14,12 @@ use super::execute::{collect_body, instantiate, RuleExecutionEnv};
 use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
+use crate::execute::QueryRequest;
 use crate::ir::pattern::produced_vars_of;
 use crate::ir::{Expression, Function, GraphName, Grouping, Pattern, QueryOutput, Ref, Term};
 use crate::var_registry::{VarId, VarRegistry};
 use crate::ContextConfig;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
@@ -49,8 +51,9 @@ pub struct Explanation {
     /// When the rules read the clock, the time `NOW()` returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluation_time: Option<String>,
-    /// Whether the run reached its fixpoint. A capped run may be missing
-    /// conclusions.
+    /// Whether the run reached its fixpoint and every replay finished
+    /// within the reasoning budget. A capped run may be missing conclusions;
+    /// a replay the deadline stopped may be missing derivations.
     pub complete: bool,
     pub facts: Vec<ExplainedFact>,
     /// Rules that may derive these facts but whose bodies cannot be replayed
@@ -161,7 +164,10 @@ pub(crate) fn materialized_facts(
 
 /// Explain `materialized`, the facts `target` names that the run derived.
 /// `view` reads asserted and derived facts together; `base` reads asserted
-/// facts only. Returns the facts and the rules that could not be replayed.
+/// facts only. Replays run until `deadline`, as the run's rule bodies did: the
+/// request's cancellation fails the explanation, the deadline leaves it
+/// incomplete. Returns the facts, the rules that could not be replayed, and
+/// whether every replay finished.
 pub(crate) async fn explain_facts(
     view: GraphDbRef<'_>,
     base: GraphDbRef<'_>,
@@ -169,7 +175,8 @@ pub(crate) async fn explain_facts(
     env: RuleExecutionEnv<'_>,
     target: &ExplainTarget,
     materialized: &[Flake],
-) -> Result<(Vec<ExplainedFact>, Vec<String>)> {
+    deadline: Option<Instant>,
+) -> Result<(Vec<ExplainedFact>, Vec<String>, bool)> {
     let graph = target.graph.as_deref();
     let mut facts: Vec<(&Flake, ExplainedFact)> = Vec::new();
     for flake in materialized {
@@ -187,8 +194,31 @@ pub(crate) async fn explain_facts(
         facts.push((flake, fact));
     }
 
+    // Nothing the run derived, so no replayed row can explain anything.
+    if facts.is_empty() {
+        return Ok((Vec::new(), Vec::new(), true));
+    }
+
+    let request = env.request;
+    let replay = request
+        .cancellation
+        .cloned()
+        .unwrap_or_default()
+        .with_deadline_inside(deadline);
+    let env = RuleExecutionEnv {
+        request: QueryRequest {
+            cancellation: Some(&replay),
+            ..request
+        },
+        ..env
+    };
+    let past_deadline = || deadline.is_some_and(|d| Instant::now() >= d);
+    let timed_out =
+        |e: &QueryError| matches!(e, QueryError::Cancelled { .. }) && request.cancelled().is_none();
+
     let mut not_replayed = Vec::new();
-    for rule in rule_set.iter_in_order() {
+    let mut complete = true;
+    'rules: for rule in rule_set.iter_in_order() {
         let heads: Vec<&RuleHead> = rule
             .heads
             .iter()
@@ -201,7 +231,18 @@ pub(crate) async fn explain_facts(
             not_replayed.push(rule.name.clone());
             continue;
         }
-        let batches = body_rows(view, rule, rule.body.query.clone(), env).await?;
+        if past_deadline() {
+            complete = false;
+            break;
+        }
+        let batches = match body_rows(view, rule, rule.body.query.clone(), env).await {
+            Ok(batches) => batches,
+            Err(e) if timed_out(&e) => {
+                complete = false;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         for batch in &batches {
             for row in 0..batch.len() {
                 for head in &heads {
@@ -212,8 +253,14 @@ pub(crate) async fn explain_facts(
                     else {
                         continue;
                     };
-                    fact.derivations
-                        .push(derivation(view, base, rule, env, batch, row).await?);
+                    match derivation(view, base, rule, env, batch, row).await {
+                        Ok(derivation) => fact.derivations.push(derivation),
+                        Err(e) if timed_out(&e) => {
+                            complete = false;
+                            break 'rules;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
@@ -221,6 +268,7 @@ pub(crate) async fn explain_facts(
     Ok((
         facts.into_iter().map(|(_, fact)| fact).collect(),
         not_replayed,
+        complete,
     ))
 }
 

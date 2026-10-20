@@ -364,8 +364,13 @@ asserted facts to mark them derived or not), its `NOT EXISTS` patterns
 instantiated as absences with their graph scope, and, for a grouped
 subquery, the subquery's patterns re-run without grouping, inside the
 `GRAPH` block that encloses the subquery, and filtered to the row's group
-key. Explanations are one step and are not cached. They expose
-premises regardless of policy, so the API refuses a non-root view.
+key. Replays run only when the run derived a matching fact, under the
+reasoning budget's deadline measured from the start of the explanation and
+under the request's cancellation and tracker: the deadline marks the
+explanation incomplete, a cancellation fails it. Explanations are one step
+and are not cached. They expose premises regardless of policy, so the API
+refuses a non-root view, checked after the ledger's default policy is
+applied.
 
 ## Why not keep the old matcher and extend it
 

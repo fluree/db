@@ -622,6 +622,10 @@ pub async fn explain_derived_facts(
                 .to_string(),
         ));
     }
+    // The whole explanation runs under the reasoning budget's time limit:
+    // what materializing leaves of it bounds the replays.
+    let deadline =
+        fluree_db_core::clock::Instant::now().checked_add(reasoning_budget(reasoning).max_duration);
     let outcome =
         compute_derived_facts(base_db, reasoning, rules_source_g_id, binary_store, request).await?;
     let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
@@ -653,13 +657,21 @@ pub async fn explain_derived_facts(
         evaluation_time: evaluation_time.as_ref(),
         request,
     };
-    let (facts, not_replayed) =
-        explain_facts(view, base_db, &rule_set, env, target, &materialized).await?;
+    let (facts, not_replayed, replayed) = explain_facts(
+        view,
+        base_db,
+        &rule_set,
+        env,
+        target,
+        &materialized,
+        deadline,
+    )
+    .await?;
     Ok(Explanation {
         t: base_db.t,
         rule_set: format!("{:016x}", rule_set.content_hash()),
         evaluation_time: diagnostics.evaluation_time,
-        complete: !diagnostics.capped,
+        complete: !diagnostics.capped && replayed,
         facts,
         not_replayed,
     })
