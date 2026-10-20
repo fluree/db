@@ -50,6 +50,7 @@ use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use rustc_hash::{FxBuildHasher, FxHashSet};
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::Instrument;
@@ -994,19 +995,19 @@ impl Operator for GroupAggregateOperator {
             && !self.group_key_indices.is_empty()
             && !self.agg_specs.is_empty()
         {
-            // `None` for `COUNT(*)`, `Some(?v)` for `COUNT(?v)`; any other
-            // aggregate leaves the rows to the loops below.
-            let row_counts: Option<Vec<Option<VarId>>> = self
+            if self
                 .agg_specs
                 .iter()
-                .map(|spec| match spec.function {
-                    AggregateFn::CountAll => Some(None),
-                    AggregateFn::Count(v) => Some(Some(v)),
-                    _ => None,
-                })
-                .collect();
-            if let Some(row_counts) = row_counts {
-                let bound_vars: Vec<VarId> = row_counts.into_iter().flatten().collect();
+                .all(|spec| matches!(spec.function, AggregateFn::CountAll | AggregateFn::Count(_)))
+            {
+                let bound_vars: SmallVec<[VarId; 4]> = self
+                    .agg_specs
+                    .iter()
+                    .filter_map(|spec| match spec.function {
+                        AggregateFn::Count(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect();
                 let group_vars = &self.in_schema[..self.group_key_indices.len()];
                 if let Some(groups) = self
                     .child
