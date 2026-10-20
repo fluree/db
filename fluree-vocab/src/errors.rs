@@ -303,6 +303,9 @@ pub const INDEXING_DISABLED: &str = "err:system/IndexingDisabled";
 /// Reindex conflict
 pub const REINDEX_CONFLICT: &str = "err:system/ReindexConflict";
 
+/// The file storage root is held by another open instance
+pub const STORAGE_IN_USE: &str = "err:system/StorageInUse";
+
 /// Cross-ledger model dependency could not be resolved or used.
 ///
 /// Surfaces from `f:GraphRef` with `f:ledger` pointing at a model
