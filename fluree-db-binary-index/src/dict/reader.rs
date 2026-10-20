@@ -1355,6 +1355,32 @@ mod tests {
             probes
         }
 
+        /// A pack that cannot be read by range, opened while a leaf is being
+        /// fenced, gives the fence pool back before the leaf is noted as
+        /// fenced: the lookup still uses the leaf, and the pool given back
+        /// does not keep it.
+        #[test]
+        fn a_leaf_fenced_as_the_pool_is_given_back_is_not_kept() {
+            let cs = SegmentedContentStore::new(true);
+            let (leaves, _) = built(entries());
+            let kind = ContentKind::DictBlob {
+                dict: DictKind::SubjectReverse,
+            };
+            let cid = cs.put_sync(kind, &leaves[0].1);
+            let source = cs.get_local_ranged(&cid).unwrap().expect("ranged");
+            let cache = LeafletCache::with_reservable_budget(16 << 20, Some(4 << 20));
+            let leaf = cache
+                .try_get_or_load_fenced_leaf(7, || {
+                    cache.note_unrangeable_pack();
+                    Ok(FencedLeaf::open(source, FENCE_SPACING)?.map(Arc::new))
+                })
+                .unwrap();
+            assert!(leaf.is_some(), "fenced for this lookup");
+            assert!(!cache.holds_fences(), "the pool was given back");
+            cache.run_pending_tasks();
+            assert_eq!(cache.fenced_leaf_memory().leaves, 0, "and keeps nothing");
+        }
+
         /// Every fenced lookup finds exactly what a whole-leaf lookup finds,
         /// with fences closer than, at, and wider than the 4 KiB read unit,
         /// so entries spanning units are read across them.

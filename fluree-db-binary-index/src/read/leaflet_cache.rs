@@ -1294,7 +1294,20 @@ impl LeafletCache {
             }
             Ok(leaf)
         };
-        in_blocking_region(|| self.fenced_leaves.try_get_with(key, open)).map_err(arc_io_error)
+        let leaf = in_blocking_region(|| self.fenced_leaves.try_get_with(key, open))
+            .map_err(arc_io_error)?;
+        // A stage change that gave the pool back while this leaf was opening
+        // read `fenced` before it was set, so the leaf is taken out again;
+        // under the stage lock, so a change still to come reads it set.
+        let _moving = self
+            .stages
+            .moving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.holds_fences() {
+            self.fenced_leaves.invalidate(&key);
+        }
+        Ok(leaf)
     }
 
     /// A ranged source's read unit, if cached; never loads.
