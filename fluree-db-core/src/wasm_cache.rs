@@ -218,6 +218,18 @@ impl<K: Hash + Eq, V: Clone> Cache<K, V> {
         }
     }
 
+    /// Drop `key`'s entry, if any.
+    pub fn invalidate<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut inner = self.shared.inner.lock();
+        if let Some((_, weight)) = inner.map.pop(key) {
+            inner.weighted -= u64::from(weight);
+        }
+    }
+
     pub fn invalidate_all(&self) {
         let mut inner = self.shared.inner.lock();
         inner.map.clear();
@@ -245,6 +257,21 @@ impl<K: Hash + Eq, V: Clone> Cache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidate_drops_one_entry_and_its_weight() {
+        let cache: Cache<u32, u32> = Cache::builder()
+            .weigher(|_, v: &u32| *v)
+            .max_capacity(100)
+            .build();
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.invalidate(&1);
+        cache.invalidate(&3);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(20));
+        assert_eq!((cache.entry_count(), cache.weighted_size()), (1, 20));
+    }
 
     #[test]
     fn entry_count_budget_evicts_lru() {

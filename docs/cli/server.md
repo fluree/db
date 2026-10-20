@@ -243,6 +243,7 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 cors_enabled = true
 # cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_dictionary_max_mb = 2048  # encrypted storage: part of the cache budget for whole dictionary packs, given back if unusable; default: 60%
 
 [server.indexing]
 enabled = true

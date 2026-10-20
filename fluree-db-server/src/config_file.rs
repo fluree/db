@@ -66,6 +66,7 @@ pub struct ServerFileConfig {
     pub graphql_max_depth: Option<usize>,
     pub graphql_max_complexity: Option<usize>,
     pub cache_max_mb: Option<usize>,
+    pub cache_dictionary_max_mb: Option<usize>,
     pub disk_cache_max_mb: Option<usize>,
 
     /// Colon-separated absolute directories under which catalog-less Iceberg
@@ -441,6 +442,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "query_refresh_enabled",
     "query_refresh_ttl_ms",
     "cache_max_mb",
+    "cache_dictionary_max_mb",
     "disk_cache_max_mb",
     "iceberg_local_roots",
     "indexing_enabled",
@@ -578,6 +580,11 @@ pub fn apply_to_server_config(
     if is_default("cache_max_mb") {
         if let Some(v) = file.cache_max_mb {
             config.cache_max_mb = Some(v);
+        }
+    }
+    if is_default("cache_dictionary_max_mb") {
+        if let Some(v) = file.cache_dictionary_max_mb {
+            config.cache_dictionary_max_mb = Some(v);
         }
     }
     if is_default("disk_cache_max_mb") {
@@ -1180,6 +1187,30 @@ mod tests {
             assert_eq!(data.audience.as_deref(), Some(audience));
             assert_eq!(data.trusted_issuers, ["did:key:file"]);
             assert!(data.validate().is_ok());
+        }
+    }
+
+    /// The dictionary allowance comes from the config file unless the
+    /// command line sets it.
+    #[test]
+    fn the_dictionary_allowance_settles_by_source() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[server]\ncache_dictionary_max_mb = 3000\n").unwrap();
+        let section = load_config(&path).unwrap().server.unwrap();
+        for (args, expected) in [
+            (vec!["fluree-server"], Some(3000)),
+            (
+                vec!["fluree-server", "--cache-dictionary-max-mb", "1000"],
+                Some(1000),
+            ),
+        ] {
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            apply_to_server_config(&section, &mut config, &matches);
+            assert_eq!(config.cache_dictionary_max_mb, expected);
         }
     }
 

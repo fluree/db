@@ -366,6 +366,10 @@ On every backend, after the rollback:
   are all kept: `fluree reindex <ledger>` on 4.2 rebuilds the index from them.
 - A ledger hard-dropped or purged since the upgrade is listed again, but its
   files are gone. Drop it again on 4.2.
+- On an encrypted store, a key rotation run since the upgrade rewrote the
+  blobs on the retired key, commits included, in an envelope 4.2 cannot read;
+  see [Storage Encryption](../security/encryption.md#performance-considerations).
+  Their ledgers neither load nor reindex on 4.2.
 
 ## A newer release on the same store
 

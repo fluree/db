@@ -506,3 +506,159 @@ async fn a_resumed_sweep_keeps_its_place_when_a_ledger_before_it_is_dropped() {
     assert_eq!(done.state, KeyRotationState::Completed, "{done:?}");
     assert_eq!(done.completion.expect("verified").remaining_on_retired, 0);
 }
+
+/// Version 1 and version 2 envelopes among the files under `root`.
+fn envelope_versions(root: &Path) -> (usize, usize) {
+    let mut counts = (0, 0);
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read");
+            match (bytes.starts_with(fluree_db_crypto::MAGIC), bytes.get(4)) {
+                (true, Some(1)) => counts.0 += 1,
+                (true, Some(2)) => counts.1 += 1,
+                _ => {}
+            }
+        }
+    }
+    counts
+}
+
+/// Rewrite every envelope under `root` as version 1, as releases before
+/// segmented envelopes wrote them.
+async fn rewrite_as_version_1(root: &Path, key: &str, key_id: u32) {
+    use fluree_db_crypto::{EncryptedStorage, EncryptionKey, StaticKeyProvider};
+    let storage = EncryptedStorage::new(
+        fluree_db_core::FileStorage::new(root),
+        StaticKeyProvider::new(EncryptionKey::from_base64(key, key_id).expect("key")),
+    )
+    .writing_version_1_envelopes();
+    for address in storage.list_prefix("fluree:file://").await.expect("list") {
+        // Not an envelope: nameservice records, locks.
+        let Ok(plaintext) = storage.read_bytes(&address).await else {
+            continue;
+        };
+        storage
+            .write_bytes(&address, &plaintext)
+            .await
+            .expect("rewrite");
+    }
+}
+
+/// Whether a client's leaflet cache holds entries of `kind`.
+fn holds(fluree: &Fluree, kind: &str) -> bool {
+    fluree
+        .leaflet_cache()
+        .occupancy()
+        .iter()
+        .any(|(k, n, _)| *k == kind && *n > 0)
+}
+
+/// A store older releases wrote, every blob a version 1 envelope, reads as
+/// before, its leaves decrypted whole. New writes land beside it as version
+/// 2; after a reindex every leaf and dictionary pack a query reads is version
+/// 2, read by range; a rotation rewrites whatever is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_1_store_reads_and_moves_to_version_2() {
+    let data = tempfile::TempDir::new().expect("tempdir");
+    {
+        let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+        seed(&fluree, "old", 40).await;
+    }
+    rewrite_as_version_1(data.path(), KEY1, 1).await;
+    let (v1, v2) = envelope_versions(data.path());
+    assert!(v1 > 0 && v2 == 0, "{v1} version 1, {v2} version 2");
+
+    let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+    assert_eq!(count_things(&fluree, "old").await, 40);
+    assert!(holds(&fluree, "leaf-bytes-heap") && !holds(&fluree, "ranged-leaf"));
+    let ledger = fluree.ledger("old:main").await.expect("ledger");
+    let tx = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": (40..50).map(|i| json!({
+            "@id": format!("ex:old-{i}"),
+            "@type": "ex:Thing",
+            "ex:name": format!("old {i}")
+        })).collect::<Vec<_>>()
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+    support::build_and_publish_index(&fluree, "old:main").await;
+    assert_eq!(count_things(&fluree, "old").await, 50);
+    let (mixed_v1, mixed_v2) = envelope_versions(data.path());
+    assert!(
+        mixed_v1 > 0 && mixed_v2 > 0,
+        "mixed: {mixed_v1} / {mixed_v2}"
+    );
+
+    fluree
+        .reindex("old:main", Default::default())
+        .await
+        .expect("reindex");
+    drop(fluree);
+    let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+    assert_eq!(count_things(&fluree, "old").await, 50);
+    assert!(
+        holds(&fluree, "ranged-leaf") && !holds(&fluree, "leaf-bytes-heap"),
+        "the reindexed index is read by range"
+    );
+    assert!(
+        fluree.leaflet_cache().dictionary_allowance().capacity() > 0,
+        "its dictionary packs too: a pack that could not be read by range would give the allowance back"
+    );
+    drop(fluree);
+
+    let fluree = client(data.path(), &[(1, KEY1), (2, KEY2)], 2).await;
+    let rotated = run_to_end(&fluree, opts(1)).await;
+    assert_eq!(rotated.state, KeyRotationState::Completed);
+    assert_eq!(
+        envelope_versions(data.path()).0,
+        0,
+        "nothing left on version 1"
+    );
+    drop(fluree);
+    let fluree = client(data.path(), &[(2, KEY2)], 2).await;
+    assert_eq!(count_things(&fluree, "old").await, 50);
+}
+
+/// Queries running while a rotation replaces the ciphertext under them —
+/// through the client running it, and through fresh clients opening the
+/// files mid-sweep — read the same answers throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_during_a_rotation_see_the_same_data() {
+    let data = tempfile::TempDir::new().expect("tempdir");
+    {
+        let fluree = client(data.path(), &[(1, KEY1)], 1).await;
+        seed(&fluree, "live", 300).await;
+    }
+    let keys = [(1, KEY1), (2, KEY2)];
+    let fluree = client(data.path(), &keys, 2).await;
+    assert_eq!(count_things(&fluree, "live").await, 300);
+    fluree
+        .start_key_rotation(KeyRotationOptions {
+            max_bytes_per_sec: Some(32 * 1024),
+            ..opts(1)
+        })
+        .await
+        .expect("start");
+    let mut during = 0;
+    while fluree
+        .key_rotation_status()
+        .await
+        .expect("status")
+        .active_here
+    {
+        assert_eq!(count_things(&fluree, "live").await, 300);
+        let fresh = client(data.path(), &keys, 2).await;
+        assert_eq!(count_things(&fresh, "live").await, 300);
+        during += 1;
+    }
+    let done = wait_done(&fluree).await;
+    assert_eq!(done.state, KeyRotationState::Completed);
+    assert!(during >= 3, "only {during} reads overlapped the sweep");
+    assert_eq!(count_things(&fluree, "live").await, 300);
+}

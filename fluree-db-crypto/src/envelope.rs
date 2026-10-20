@@ -164,15 +164,11 @@ pub fn parse_header(envelope: &[u8]) -> Result<ParsedHeader> {
     Ok(ParsedHeader { key_id, nonce })
 }
 
-/// The key id recorded in an envelope, from its header bytes alone.
-///
-/// Accepts a prefix as short as [`HEADER_LEN`], so a caller can classify a
-/// blob by key with a ranged read of its first bytes and no decryption.
-/// Validates magic, version and algorithm like [`parse_header`].
-pub fn key_id_of_header(prefix: &[u8]) -> Result<u32> {
-    if prefix.len() < HEADER_LEN {
+/// The format version of an envelope, from its magic and version bytes.
+pub fn envelope_version(prefix: &[u8]) -> Result<u8> {
+    if prefix.len() <= VERSION_OFFSET {
         return Err(EncryptionError::invalid_format(
-            "header prefix too short for an envelope",
+            "ciphertext too short for valid envelope",
         ));
     }
     if &prefix[MAGIC_OFFSET..MAGIC_OFFSET + MAGIC_LEN] != MAGIC {
@@ -180,12 +176,31 @@ pub fn key_id_of_header(prefix: &[u8]) -> Result<u32> {
             "not a Fluree encrypted object (magic mismatch)",
         ));
     }
-    if prefix[VERSION_OFFSET] != VERSION {
+    Ok(prefix[VERSION_OFFSET])
+}
+
+/// The key id recorded in an envelope, from its header bytes alone.
+///
+/// Accepts a prefix as short as [`HEADER_LEN`], so a caller can classify a
+/// blob by key with a ranged read of its first bytes and no decryption. The
+/// key id sits at the same offset in both envelope versions. Validates magic,
+/// version and algorithm like [`parse_header`].
+pub fn key_id_of_header(prefix: &[u8]) -> Result<u32> {
+    if prefix.len() < HEADER_LEN {
         return Err(EncryptionError::invalid_format(
-            "unsupported envelope version",
+            "header prefix too short for an envelope",
         ));
     }
-    if prefix[ALG_OFFSET] != ALG_AES256_GCM {
+    let alg = match envelope_version(prefix)? {
+        VERSION => ALG_AES256_GCM,
+        crate::segmented::VERSION => crate::segmented::ALG_AES256_GCM_HKDF_SHA256,
+        _ => {
+            return Err(EncryptionError::invalid_format(
+                "unsupported envelope version",
+            ))
+        }
+    };
+    if prefix[ALG_OFFSET] != alg {
         return Err(EncryptionError::invalid_format(
             "unsupported encryption algorithm",
         ));

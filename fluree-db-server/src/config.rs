@@ -554,6 +554,12 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_CACHE_MAX_MB")]
     pub cache_max_mb: Option<usize>,
 
+    /// On encrypted storage, the MB of the cache budget that forward
+    /// dictionary packs may hold decrypted whole (default: 60% of it), given
+    /// back to the leaflet cache if the data cannot use it.
+    #[arg(long, env = "FLUREE_CACHE_DICTIONARY_MAX_MB")]
+    pub cache_dictionary_max_mb: Option<usize>,
+
     /// On-disk cache budget in MB, shared globally across Fluree object storage
     /// and Iceberg data files (default: auto-detect from available disk; `0`
     /// disables). `FLUREE_DISK_CACHE_BUDGET_BYTES` (bytes) still overrides this.
@@ -976,6 +982,7 @@ impl Default for ServerConfig {
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             orphan_sweep_interval_secs: 0,
             cache_max_mb: None,
+            cache_dictionary_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,

@@ -354,7 +354,9 @@ fn arrow_column_to_values(
                     column!(TimestampMillisecondArray, |v| to_value(v * 1_000))
                 }
                 TimeUnit::Microsecond => column!(TimestampMicrosecondArray, to_value),
-                TimeUnit::Nanosecond => column!(TimestampNanosecondArray, |v| to_value(v / 1_000)),
+                TimeUnit::Nanosecond => column!(TimestampNanosecondArray, |v| to_value(
+                    fluree_db_core::temporal::micros_from_epoch_nanos(v)
+                )),
             }
         }
         _ => vec![None; num_rows],
@@ -607,6 +609,22 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
 #[cfg(test)]
 mod direct_decode_tests {
     use super::*;
+
+    /// A nanosecond timestamp is held to the microsecond at or before it, as
+    /// a dateTime is, before 1970 too.
+    #[test]
+    fn nanosecond_timestamps_round_down_to_the_microsecond() {
+        let nanos = TimestampNanosecondArray::from(vec![1_500, -1_500, -1_000, 0, -1]);
+        let values = arrow_column_to_values(&nanos, &FieldType::Timestamp, 5);
+        let micros: Vec<i64> = values
+            .into_iter()
+            .map(|v| match v {
+                Some(ColumnValue::Timestamp(m)) => m,
+                other => panic!("not a timestamp: {other:?}"),
+            })
+            .collect();
+        assert_eq!(micros, [1, -2, -1, 0, -1]);
+    }
 
     /// Exercise the production decoder with compressed, delta-packed integer
     /// pages. Millisecond time values must be normalized before BOTH filtering

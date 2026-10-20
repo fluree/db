@@ -54,6 +54,7 @@ query_min_t_timeout_ms = 5000
 graphql_max_depth = 15         # GraphQL nesting depth; 0 disables
 graphql_max_complexity = 1000  # GraphQL fields per document; 0 disables
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_dictionary_max_mb = 2048  # encrypted storage: part of cache_max_mb for whole dictionary packs, given back if unusable; default: 60%
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
 # iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
 
@@ -1042,6 +1043,8 @@ fluree server run \
 | `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
+| `FLUREE_CACHE_DICTIONARY_MAX_MB`        | Encrypted storage: the part of the cache budget dictionary packs may hold decrypted whole. Given back to the leaflet cache when the data cannot use it (version 1 envelopes, remote reads). Capped at 90% of the cache budget | 60% of the cache budget |
+| `FLUREE_IO_STATS`                       | Diagnostic: count artifact reads and decryption work per process, for investigating storage costs. Off costs one atomic load per read; on, every count takes a process-wide lock, so timings taken with it on are not comparable to those without. Counts carry artifact kinds only, never addresses, plaintext or keys | Off |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
 | `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
 | `FLUREE_REMOTE_LEAF_FETCH`              | How index leaves are read from remote storage (S3, HTTP). `whole` fetches a leaf in one request on first access, shared by concurrent readers and kept in the disk cache; `ranged` reads the header and directory, then byte ranges per leaflet, until the leaf is reopened or scanned | `whole` |

@@ -918,6 +918,18 @@ where
         }
     }
 
+    fn get_local_ranged(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<Arc<dyn fluree_db_core::RangeSource>>, fluree_db_core::Error>
+    {
+        if Self::route_to_commit(address) {
+            self.commit.get_local_ranged(address)
+        } else {
+            self.index.get_local_ranged(address)
+        }
+    }
+
     fn permits_plaintext_cache(&self) -> bool {
         self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
     }
@@ -1181,6 +1193,14 @@ impl StorageRead for AddressIdentifierResolverStorage {
         address: &str,
     ) -> std::result::Result<Option<fluree_db_core::ContentBytes>, fluree_db_core::Error> {
         self.route(address).get_local(address)
+    }
+
+    fn get_local_ranged(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<Arc<dyn fluree_db_core::RangeSource>>, fluree_db_core::Error>
+    {
+        self.route(address).get_local_ranged(address)
     }
 
     fn permits_plaintext_cache(&self) -> bool {
@@ -1645,12 +1665,30 @@ fn default_indexing_builder_config() -> IndexingBuilderConfig {
     }
 }
 
+/// The leaflet cache for `config`'s budget. On encrypted storage part of it
+/// starts reserved for the dictionary allowance and fenced reverse leaves,
+/// and goes back to the leaflet cache as far as the data opened cannot use
+/// them; unencrypted storage gives leaflets all of it.
 fn make_leaflet_cache(
     config: &fluree_db_connection::ConnectionConfig,
+    backend: &StorageBackend,
 ) -> std::sync::Arc<fluree_db_binary_index::LeafletCache> {
-    std::sync::Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(
-        config.cache.max_mb as u64,
-    ))
+    const MB: u64 = 1024 * 1024;
+    let budget = (config.cache.max_mb as u64).saturating_mul(MB);
+    let encrypted = backend
+        .admin_storage()
+        .is_some_and(|storage| storage.encryption_admin().is_some());
+    std::sync::Arc::new(if encrypted {
+        fluree_db_binary_index::LeafletCache::with_reservable_budget(
+            budget,
+            config
+                .cache
+                .dictionary_max_mb
+                .map(|mb| (mb as u64).saturating_mul(MB)),
+        )
+    } else {
+        fluree_db_binary_index::LeafletCache::with_max_bytes(budget)
+    })
 }
 
 /// Build a `RemoteServiceExecutor` from the connection registry, if any connections are registered.
@@ -2217,7 +2255,16 @@ impl FlureeBuilder {
     /// By default, cache size is calculated automatically based on 50% of
     /// available system memory. Use this method to override with a specific MB limit.
     pub fn cache_max_mb(mut self, max_mb: usize) -> Self {
-        self.config.cache = fluree_db_connection::CacheConfig::with_max_mb(max_mb);
+        self.config.cache.max_mb = max_mb;
+        self
+    }
+
+    /// On encrypted storage, set how many MB of the cache budget forward
+    /// dictionary packs may hold decrypted whole, by default 60% of it. Data
+    /// that cannot use it (version 1 envelopes, remote reads) gives it back
+    /// to the leaflet cache; unencrypted storage never reserves it.
+    pub fn cache_dictionary_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.cache.dictionary_max_mb = Some(max_mb);
         self
     }
 
@@ -3340,7 +3387,7 @@ impl FlureeBuilder {
         } = parts;
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let backend = with_artifact_cache(backend, ledger_cache_config.as_ref());
-        let leaflet_cache = make_leaflet_cache(&config);
+        let leaflet_cache = make_leaflet_cache(&config, &backend);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
         // Register SPARQL lowering hooks for f:sparql policy queries and
@@ -3786,7 +3833,7 @@ impl Fluree {
         backend: StorageBackend,
         nameservice: NameServiceMode,
     ) -> Self {
-        let leaflet_cache = make_leaflet_cache(&config);
+        let leaflet_cache = make_leaflet_cache(&config, &backend);
         Self {
             config,
             backend: with_artifact_cache(backend, None),

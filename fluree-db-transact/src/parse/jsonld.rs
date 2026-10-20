@@ -683,7 +683,6 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
-        ctx.ill_typed_as_stored = true;
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -1080,9 +1079,6 @@ struct TemplateParseCtx<'a> {
     fixed_root: Option<GraphScope>,
     /// The document's anonymous-node labels.
     blanks: &'a mut BlankIssuer,
-    /// Delete templates keep an ill-typed literal's lexical form as stored
-    /// (see [`coerce_value_with_datatype`]) instead of refusing it.
-    ill_typed_as_stored: bool,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -1111,7 +1107,6 @@ impl<'a> TemplateParseCtx<'a> {
             role,
             fixed_root: None,
             blanks,
-            ill_typed_as_stored: false,
         }
     }
 
@@ -1603,8 +1598,7 @@ fn parse_values_cell(
                 }
 
                 let expanded_type = expand_datatype_iri(type_val, context, strict)?;
-                let parsed =
-                    coerce_value_with_datatype(value_val, &expanded_type, ns_registry, false)?;
+                let parsed = coerce_value_with_datatype(value_val, &expanded_type, ns_registry)?;
                 return Ok(parsed.term);
             }
 
@@ -2068,7 +2062,6 @@ fn parse_expanded_value_with_ctx(
                     ctx.ns_registry,
                     ctx.object_var_parsing,
                     ctx.strict_compact_iri,
-                    ctx.ill_typed_as_stored,
                 );
             }
 
@@ -2238,7 +2231,6 @@ fn parse_literal_value_with_meta(
     ns_registry: &mut NamespaceRegistry,
     object_var_parsing: bool,
     strict: bool,
-    ill_typed_as_stored: bool,
 ) -> Result<ParsedValue> {
     // Check for @type first - always route through typed coercion when present
     if let Some(type_val) = obj.get("@type") {
@@ -2276,12 +2268,7 @@ fn parse_literal_value_with_meta(
             };
 
             // Route all @value types through typed coercion
-            return coerce_value_with_datatype(
-                val,
-                resolved_type,
-                ns_registry,
-                ill_typed_as_stored,
-            );
+            return coerce_value_with_datatype(val, resolved_type, ns_registry);
         }
     }
 
@@ -2345,30 +2332,16 @@ fn parse_literal_value_with_meta(
 /// - Boolean @value + xsd:string → ERROR
 /// - Numeric @value + xsd:boolean → ERROR
 /// - Integer subtypes enforce range bounds (e.g., xsd:byte must be -128 to 127)
-///
-/// With `ill_typed_as_stored` (delete templates), a string `@value` the
-/// datatype does not accept is kept as a string with the declared datatype,
-/// the form a Turtle write stores an ill-typed literal in: a DELETE names
-/// what is stored, and a term that is not stored retracts nothing.
 fn coerce_value_with_datatype(
     val: &Value,
     type_iri: &str,
     ns_registry: &mut NamespaceRegistry,
-    ill_typed_as_stored: bool,
 ) -> Result<ParsedValue> {
     let datatype_sid = ns_registry.sid_for_iri(type_iri);
 
     // Delegate to core coercion module
-    let flake_value = match (
-        fluree_db_core::coerce::coerce_json_value(val, type_iri),
-        val,
-    ) {
-        (Ok(value), _) => value,
-        (Err(_), Value::String(lexical)) if ill_typed_as_stored => {
-            FlakeValue::String(lexical.clone())
-        }
-        (Err(e), _) => return Err(TransactError::Parse(e.message)),
-    };
+    let flake_value = fluree_db_core::coerce::coerce_json_value(val, type_iri)
+        .map_err(|e| TransactError::Parse(e.message))?;
 
     Ok(ParsedValue::new(TemplateTerm::Value(flake_value))
         .with_dtc(DatatypeConstraint::Explicit(datatype_sid)))

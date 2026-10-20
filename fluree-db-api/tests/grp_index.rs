@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_custom_datatype_limit.rs"]
 mod it_custom_datatype_limit;
+#[path = "it_delete_survives_index_build.rs"]
+mod it_delete_survives_index_build;
 #[path = "it_disk_cache_locality.rs"]
 mod it_disk_cache_locality;
 #[path = "it_duration_index_roundtrip.rs"]
