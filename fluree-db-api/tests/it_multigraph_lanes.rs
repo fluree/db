@@ -16,7 +16,8 @@ mod span_capture;
 mod multigraph;
 
 use multigraph::{
-    assert_routing, check, Fixture, Graphs, Rows, Run, Scope, Shape, State, Surface, SCOPES, SHAPES,
+    assert_routing, check, Fixture, Graphs, Kind, Rows, Run, Scope, Shape, State, Surface, SCOPES,
+    SHAPES,
 };
 
 /// Every shape, scope and surface over fixture A in `state`.
@@ -84,9 +85,10 @@ fn a_declined(run: &Run, outcome: &str, failures: &mut Vec<String>) {
 /// Lane A's shape (`COUNT(*)` in SPARQL, `COUNT(?s)` in JSON-LD) in every
 /// scope of fixture A in `state`: the answer by hand with fast paths on and
 /// off, and the routing. The union lane answers a current scope of several
-/// graphs and the empty one; a scope with novelty or read below the index
-/// declines it with `Novelty`; the one-graph lane answers one graph; neither
-/// answers a GRAPH scope (not the shape) or two ledgers.
+/// graphs, one of them an empty default graph or not, and the scope of none;
+/// a scope with novelty or read below the index declines it with `Novelty`;
+/// the one-graph lane answers one graph; neither answers a GRAPH scope (not
+/// the shape) or two ledgers.
 async fn lane_a(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -102,19 +104,22 @@ async fn lane_a(state: State) {
             let run = check(&fx, scope, Shape::GroupByObject, surface, &mut failures).await;
             runs += 1;
             let current = state != State::Novelty && scope != Scope::TimeTravel;
-            match scope.graphs() {
-                Graphs::G1G2 | Graphs::G0G1G2 if current => {
+            match scope.kind() {
+                // A member the index holds nothing for (the empty default
+                // graph) contributes nothing; it is no reason to decline.
+                Kind::Union if current => {
                     assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures);
                 }
-                Graphs::G1G2 | Graphs::G0G1G2 => {
+                Kind::Union => {
                     assert_routing(&run, &[], &[A_UNION, A_ONE], &mut failures);
                     a_declined(&run, "fallback:novelty", &mut failures);
                 }
-                Graphs::Empty => assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures),
-                Graphs::G0 | Graphs::G1 => {
-                    assert_routing(&run, &[A_ONE], &[A_UNION], &mut failures)
+                Kind::Empty => assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures),
+                // A GRAPH scope groups a pattern inside GRAPH: not the shape.
+                Kind::One if matches!(scope.graphs(), Graphs::G0 | Graphs::G1) => {
+                    assert_routing(&run, &[A_ONE], &[A_UNION], &mut failures);
                 }
-                Graphs::G2 | Graphs::PerNamedGraph | Graphs::G0Other => {
+                Kind::One | Kind::None => {
                     assert_routing(&run, &[], &[A_UNION, A_ONE], &mut failures);
                 }
             }
@@ -557,7 +562,7 @@ async fn lane_a_answers_to_the_kill_switch() {
 /// over the plain ledger's default graph alone the one-graph lane answers.
 #[tokio::test(flavor = "current_thread")]
 async fn lane_a_cypher_over_the_union_default_graph() {
-    use multigraph::{jsonld_rows, rows, LEDGER, UNION_LEDGER};
+    use multigraph::{jsonld_rows, rows, EMPTY_G0_UNION_LEDGER, LEDGER, UNION_LEDGER};
     let fx = Fixture::build(State::Indexed).await;
     let kind = "`http://example.org/kind`";
     let knows = "`http://example.org/knows`";
@@ -581,6 +586,12 @@ async fn lane_a_cypher_over_the_union_default_graph() {
                 &["t3b", "1"],
                 &["t3c", "1"],
             ]),
+        ),
+        // A union whose default graph holds nothing: g1 and g2.
+        (
+            EMPTY_G0_UNION_LEDGER,
+            format!("MATCH (s)-[:{kind}]->(k) RETURN k, count(s) AS c"),
+            rows(&[&["T1", "3"]]),
         ),
         (
             LEDGER,
@@ -617,7 +628,7 @@ async fn lane_a_cypher_over_the_union_default_graph() {
                 Err(e) => failures.push(format!("{}: {lane}: failed: {e}", run.label)),
             }
         }
-        if ledger == UNION_LEDGER {
+        if ledger != LEDGER {
             assert_routing(&run, &[A_UNION], &[A_ONE], &mut failures);
         } else {
             assert_routing(&run, &[A_ONE], &[A_UNION], &mut failures);
