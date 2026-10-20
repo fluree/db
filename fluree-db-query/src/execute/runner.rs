@@ -145,6 +145,22 @@ pub struct PreparedExecution {
     pub reasoning_active: bool,
 }
 
+/// The request a query is prepared for. Preparing a query that reasons
+/// materializes derived facts; with these, that work is charged to the
+/// request's fuel and stops when the request is cancelled.
+#[derive(Clone, Copy, Default)]
+pub struct QueryRequest<'a> {
+    pub tracker: Option<&'a Tracker>,
+    pub cancellation: Option<&'a QueryCancellation>,
+}
+
+impl QueryRequest<'_> {
+    /// Why the request was cancelled, if it was.
+    pub fn cancelled(&self) -> Option<fluree_db_core::QueryCancellationReason> {
+        self.cancellation.and_then(QueryCancellation::reason)
+    }
+}
+
 /// Inputs that the preparation phase needs to know up front.
 ///
 /// Lives here rather than as loose parameters so that future planner inputs
@@ -161,6 +177,8 @@ pub struct PrepareConfig<'a> {
     /// spans several ledgers runs without one, so nothing may be rewritten
     /// into an operator that reads it.
     pub binary_scans: bool,
+    /// The request being prepared for (see [`QueryRequest`]).
+    pub request: QueryRequest<'a>,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -175,6 +193,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current(),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -191,6 +210,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -205,6 +225,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::history(),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -212,6 +233,19 @@ impl<'a> PrepareConfig<'a> {
     /// [`Self::binary_scans`]).
     pub fn without_binary_scans(mut self) -> Self {
         self.binary_scans = false;
+        self
+    }
+
+    /// Prepare for a request with this tracker and cancellation handle.
+    pub fn for_request(
+        mut self,
+        tracker: Option<&'a Tracker>,
+        cancellation: Option<&'a QueryCancellation>,
+    ) -> Self {
+        self.request = QueryRequest {
+            tracker,
+            cancellation,
+        };
         self
     }
 }
@@ -321,13 +355,11 @@ pub async fn prepare_execution_with_config(
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
             let derived_outcome = compute_derived_facts(
-                db.snapshot,
-                db.g_id,
-                effective_overlay,
-                db.t,
+                GraphDbRef::new(db.snapshot, db.g_id, effective_overlay, db.t),
                 &reasoning,
                 query.reasoning.rules_source_g_id,
                 binary_store,
+                config.request,
             )
             .await?;
 
@@ -715,6 +747,9 @@ pub struct ContextConfig<'a, 'b> {
     /// `@vocab` prefix a Cypher query was lowered against (from
     /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return (see
+    /// [`ExecutionContext::evaluation_time`]).
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, the injected true-wildcard crawl scan renders R2RML
     /// `RefObjectMap` objects by templating the parent IRI from the child row's
     /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
@@ -794,6 +829,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             derived_facts: diag.facts_derived as u64,
             iterations: diag.iterations as u64,
             duration_ms: diag.duration.as_millis() as u64,
+            capped_rules: diag.capped_rules.clone(),
+            pending_rules: diag.pending_rules.clone(),
+            evaluation_time: diag.evaluation_time.clone(),
         });
     }
 
@@ -809,15 +847,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
 
     // Dataset execution scans through per-graph `GraphRef`s, not the
     // top-level context overlay — splice the derived-facts overlay into
-    // every ref matching the primary execution view, or datalog / OWL2-RL
-    // derived facts are invisible to dataset queries.
+    // every ref matching the primary execution view, and every named graph
+    // of the same ledger a rule derived into, or datalog / OWL2-RL derived
+    // facts are invisible to dataset queries.
     let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
-        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
-            db.snapshot.ledger_id.as_str(),
-            db.g_id,
-            db.t,
-            effective_overlay,
-        )),
+        (Some(ds), Some(reasoning)) => {
+            let mut graphs = vec![db.g_id];
+            graphs.extend(reasoning.derived().graph_ids().filter(|g| *g != db.g_id));
+            Some(ds.with_overlay_for_graphs(
+                db.snapshot.ledger_id.as_str(),
+                &graphs,
+                db.t,
+                effective_overlay,
+            ))
+        }
         _ => None,
     };
 
@@ -900,6 +943,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(vocab) = config.cypher_vocab.clone() {
         ctx.cypher_vocab = Some(vocab);
     }
+    ctx.evaluation_time = config.evaluation_time.clone();
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);
     }
@@ -977,7 +1021,8 @@ pub async fn execute<'a>(
 ) -> Result<Vec<Batch>> {
     // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
     // the dataset paths do, so the members' scans deduplicate on full rows.
-    let mut prepare_config = PrepareConfig::default();
+    let mut prepare_config =
+        PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
     prepare_config.planning = prepare_config.planning.with_dataset_scope(config.dataset);
     let prepared = prepare_execution_with_config(db, query, &prepare_config)
         .await

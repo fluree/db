@@ -50,6 +50,9 @@ impl Closure {
         let [head] = rule.heads.as_slice() else {
             return None;
         };
+        if head.graph.is_some() {
+            return None;
+        }
         let (HeadTerm::Var(x), HeadTerm::Sid(r), HeadTerm::Var(z)) =
             (&head.subject, &head.predicate, &head.object)
         else {

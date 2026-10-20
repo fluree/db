@@ -90,6 +90,39 @@ async fn main() -> Result<()> {
 `build_async()` replays the storage's write-ahead log without blocking the async runtime.
 `build()` builds the same instance from synchronous code that has entered a Tokio runtime (for example with `Runtime::enter`), replaying the log on the calling thread.
 
+### One instance per storage directory
+
+An instance owns its storage directory. Share it within a process by cloning it: `Fluree` is
+cheap to clone, and clones share its caches, its per-ledger write locks and its indexer. Two
+instances on one directory, in one process or two, are not coordinated: each serves its own
+cached state, and both index and sweep the same files.
+
+`with_storage_lock()` makes that a startup error. The instance locks the directory, and building
+another one on it, in any process, fails with `ApiError::StorageInUse`. The lock lasts as long as
+the instance: it is released once the instance and every clone of it are dropped, or when the
+process exits, however it exits. A filesystem that cannot lock fails the build; see
+[One process per directory](../operations/storage.md#one-process-per-directory).
+
+```rust
+let fluree = FlureeBuilder::file("./data").with_storage_lock().build_async().await?;
+```
+
+Where code that opens storage cannot easily pass an instance around, `SharedFluree::open` returns
+the one instance this process keeps for a directory, opening it, with the lock, on first use.
+Handles dereference to `Fluree`. They own its lifecycle: the instance shuts down once the last
+handle is closed or dropped, `disconnect()` on it does nothing, and a `Fluree` cloned from a handle
+keeps the directory locked until that clone is dropped too:
+
+```rust
+use fluree_db_api::{SharedFluree, SharedOptions};
+
+let fluree = SharedFluree::open("./data", SharedOptions::default()).await?;
+fluree.create_ledger("mydb").await?;
+fluree.close().await;
+```
+
+To use one directory from several processes, run a [server](../operations/running-fluree.md) on it.
+
 ### Bulk import (high throughput)
 
 For initial ledger bootstraps (large Turtle or JSON-LD datasets), Fluree exposes a bulk import
