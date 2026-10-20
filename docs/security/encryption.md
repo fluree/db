@@ -581,8 +581,9 @@ its session directory behind
   connection, so after reindexing such data, restart to have the allowance
   again. Set the allowance with `cacheDictionaryMaxMb` (or
   `FlureeBuilder::cache_dictionary_max_mb`); one smaller than a pack or two
-  holds none. Unencrypted storage gives all of `cacheMaxMb` to the leaflet
-  cache.
+  holds none, and one above 90% of `cacheMaxMb` is capped at 90%, with a
+  warning, so the leaflet cache keeps the rest. Unencrypted storage gives all
+  of `cacheMaxMb` to the leaflet cache.
 - **Warm-up**: a dictionary pack starts out read by range and is promoted only
   after its misses have decrypted about its own size, so the first passes over
   a working set are slower than later ones. After a workload moves away and

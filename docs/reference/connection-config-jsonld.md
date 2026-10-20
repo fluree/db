@@ -71,7 +71,8 @@ Supported:
 - `cacheMaxMb` (supports `ConfigurationValue`)
 - `cacheDictionaryMaxMb` (supports `ConfigurationValue`): on encrypted storage,
   the part of `cacheMaxMb` that dictionary packs may hold decrypted whole
-  (default 60%), given back to the leaflet cache if the data cannot use it; see
+  (default 60%, at most 90%), given back to the leaflet cache if the data
+  cannot use it; see
   [Storage Encryption](../security/encryption.md#performance-considerations)
 - `indexStorage` (required): reference to a `Storage` node
 - `commitStorage` (optional): reference to a `Storage` node

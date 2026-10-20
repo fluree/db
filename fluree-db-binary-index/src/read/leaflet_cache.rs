@@ -564,6 +564,11 @@ fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
 /// gives the dictionary allowance unless configured otherwise.
 pub const DEFAULT_DICTIONARY_PERCENT: u64 = 60;
 
+/// The most of the cache budget, in percent, a configured dictionary
+/// allowance takes: the leaflet pool, which every other read goes through,
+/// keeps the rest.
+pub const MAX_DICTIONARY_PERCENT: u64 = 90;
+
 /// Share of the leaflet budget for fenced reverse leaves.
 const FENCED_LEAF_BUDGET_DIVISOR: u64 = 32;
 
@@ -874,15 +879,27 @@ impl LeafletCache {
 
     /// A cache of `max_bytes` for storage that decrypts on read: a
     /// fenced-leaf pool and a dictionary allowance of `dictionary_cap` (by
-    /// default [`DEFAULT_DICTIONARY_PERCENT`] of the budget) are reserved out
-    /// of it, and given back to the leaflet pool as far as its data turns
-    /// out unable to use them (see [`Stages`]).
+    /// default [`DEFAULT_DICTIONARY_PERCENT`] of the budget, and at most
+    /// [`MAX_DICTIONARY_PERCENT`]) are reserved out of it, and given back to
+    /// the leaflet pool as far as its data turns out unable to use them (see
+    /// [`Stages`]).
     pub fn with_reservable_budget(max_bytes: u64, dictionary_cap: Option<u64>) -> Self {
-        let dictionary = dictionary_cap
-            .unwrap_or(
-                (u128::from(max_bytes) * u128::from(DEFAULT_DICTIONARY_PERCENT) / 100) as u64,
-            )
-            .min(max_bytes);
+        let share = |percent: u64| (u128::from(max_bytes) * u128::from(percent) / 100) as u64;
+        let ceiling = share(MAX_DICTIONARY_PERCENT);
+        let dictionary = match dictionary_cap {
+            None => share(DEFAULT_DICTIONARY_PERCENT),
+            Some(cap) if cap > ceiling => {
+                tracing::warn!(
+                    cache_dictionary_max_mb = cap >> 20,
+                    cache_max_mb = max_bytes >> 20,
+                    using_mb = ceiling >> 20,
+                    "cacheDictionaryMaxMb would leave the leaflet cache too little of \
+                     cacheMaxMb; capped at {MAX_DICTIONARY_PERCENT}% of it"
+                );
+                ceiling
+            }
+            Some(cap) => cap,
+        };
         Self::with_stages(
             max_bytes,
             fenced_leaf_budget(max_bytes - dictionary),
@@ -1746,6 +1763,31 @@ mod tests {
             ),
             (0, 0)
         );
+    }
+
+    /// A configured allowance past [`MAX_DICTIONARY_PERCENT`] of the budget,
+    /// up to and beyond all of it, is capped there, so the leaflet pool keeps
+    /// the rest and still caches; one within it is taken as configured.
+    #[test]
+    fn an_allowance_past_its_share_leaves_the_leaflet_pool_the_rest() {
+        let mib = 1u64 << 20;
+        let budget = 64 * mib;
+        let ceiling = budget * MAX_DICTIONARY_PERCENT / 100;
+        for cap in [ceiling + 1, budget, 2 * budget, u64::MAX] {
+            let cache = LeafletCache::with_reservable_budget(budget, Some(cap));
+            let fences = cache.fenced_leaves.policy().max_capacity().unwrap();
+            assert_eq!(cache.dictionary_allowance().capacity(), ceiling, "{cap}");
+            assert_eq!(fences, (budget - ceiling) / 32);
+            assert_eq!(leaflet_capacity(&cache), budget - ceiling - fences);
+            cache.insert_dict_leaf(1, Arc::from(vec![7u8; 1024]));
+            cache.run_pending_tasks();
+            assert!(
+                cache.get_dict_leaf(1).is_some(),
+                "{cap}: the leaflet pool caches"
+            );
+        }
+        let within = LeafletCache::with_reservable_budget(budget, Some(ceiling));
+        assert_eq!(within.dictionary_allowance().capacity(), ceiling);
     }
 
     /// Readers and writers of the cache keep going while it gives back its
