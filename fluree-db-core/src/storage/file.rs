@@ -1172,7 +1172,9 @@ impl FileStorage {
     /// closed segments on its own schedule. Its flushes count in
     /// [`Self::fsyncs_issued`], so a test that counts the flushes of its own
     /// writes pauses it first. Returns once any pass under way has finished.
-    /// Attaches the log.
+    /// Attaches the log. Only with the `test-hooks` feature (or in this
+    /// crate's own tests).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn pause_wal_background_for_test(&self, paused: bool) -> Result<()> {
         let _root = futures::executor::block_on(self.root_gate()?.write_owned());

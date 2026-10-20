@@ -167,6 +167,9 @@ wiremock = { workspace = true }
 # builds keep the feature off and compile the pre-residency read path.
 fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
 fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+# WAL background-thread hooks for the flush-count tests (it_wal): dev-only,
+# so production builds do not compile them.
+fluree-db-core = { path = "../fluree-db-core", features = ["test-hooks"] }
 
 [[test]]
 name = "it_residency_retry"

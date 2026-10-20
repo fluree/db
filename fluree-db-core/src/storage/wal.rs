@@ -496,9 +496,11 @@ pub(super) struct Wal {
     hold_segments: AtomicBool,
     /// Test hook: the background thread does nothing while set, so a test
     /// counting the flushes of its own writes counts only those.
+    #[cfg(any(test, feature = "test-hooks"))]
     background_paused: AtomicBool,
     /// Held for each pass of the background thread, so pausing it can wait
     /// out a pass already under way.
+    #[cfg(any(test, feature = "test-hooks"))]
     background_pass: Mutex<()>,
     /// Owned logs flush every append: on a shared root nothing later flushes
     /// on a payload's behalf, because the head lives in Raft, not in a file.
@@ -1247,7 +1249,9 @@ impl Wal {
             lock: Mutex::new(Some(lock)),
             crashed: AtomicBool::new(false),
             hold_segments: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
             background_paused: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
             background_pass: Mutex::new(()),
             poisoned: AtomicBool::new(false),
             retiring: Mutex::new(()),
@@ -1634,14 +1638,16 @@ impl Wal {
     }
 
     fn tick(&self) -> io::Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
         let _pass = self
             .background_pass
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.crashed.load(Ordering::Acquire)
-            || self.poisoned.load(Ordering::Acquire)
-            || self.background_paused.load(Ordering::Acquire)
-        {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.background_paused.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.crashed.load(Ordering::Acquire) || self.poisoned.load(Ordering::Acquire) {
             return Ok(());
         }
         let hold = self.hold_segments.load(Ordering::Acquire);
@@ -1685,7 +1691,7 @@ impl Wal {
     /// Pause or resume the background thread: while paused it flushes,
     /// rotates and retires nothing. Pausing returns once any pass already
     /// under way has finished, so no flush of the thread's lands after it.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn pause_background(&self, paused: bool) {
         self.background_paused.store(paused, Ordering::Release);
         drop(
