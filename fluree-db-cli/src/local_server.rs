@@ -277,7 +277,15 @@ mod tests {
                 .unwrap();
             let pid = child.id();
             let look_alike = Self(child);
-            assert!(is_process_alive(pid) && is_fluree_process(pid));
+            // Right after `spawn` it may not read as one yet (seen on Linux CI).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !(is_process_alive(pid) && is_fluree_process(pid)) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pid {pid} never read as a Fluree server"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             look_alike
         }
 
