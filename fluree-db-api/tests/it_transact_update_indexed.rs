@@ -18,7 +18,59 @@
 use crate::support::{
     query_sparql, start_background_indexer_local, trigger_index_and_wait_outcome,
 };
-use fluree_db_api::{FlureeBuilder, IndexConfig};
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, ReindexOptions};
+use fluree_db_core::comparator::IndexType;
+use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest, Sid};
+
+/// The `(o, dt)` of every `ex:p` value of `ex:s` in `graph` (None = default)
+/// that `ledger` holds as current facts.
+async fn held_terms(ledger: &LedgerState, graph: Option<&str>) -> Vec<(FlakeValue, Sid)> {
+    let g_id = match graph {
+        None => 0,
+        Some(iri) => ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .expect("graph"),
+    };
+    let s = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/s")
+        .expect("subject");
+    let p = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/p")
+        .expect("predicate");
+    range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject_predicate(s, p),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("range")
+    .into_iter()
+    .filter(|f| f.op && f.o != FlakeValue::String("keep".into()))
+    .map(|f| (f.o, f.dt))
+    .collect()
+}
+
+/// The `(o, dt)` of every `ex:p` retraction in `ledger`'s novelty.
+fn retracted_terms(ledger: &LedgerState) -> Vec<(FlakeValue, Sid)> {
+    let p = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/p")
+        .expect("predicate");
+    ledger
+        .novelty
+        .iter_flakes(IndexType::Spot)
+        .filter(|f| !f.op && f.p == p)
+        .map(|f| (f.o.clone(), f.dt.clone()))
+        .collect()
+}
 
 /// The `INSERT x ; DELETE x` fold nets to a retract of a fact the base
 /// never contained. The commit's novelty carries that dangling retract and
@@ -334,4 +386,419 @@ async fn multi_op_reversal_nets_against_an_indexed_named_graph() {
         .map(|b| b["o"]["value"].as_str().expect("value"))
         .collect();
     assert_eq!(values, vec!["y"], "{json}");
+}
+
+/// A value the index keeps with less detail than written (a big integer's
+/// XSD subtype; a `dateTime` written past the microsecond, read to it) is one
+/// fact to storage
+/// however it is written, and a reversal nets by that fact. Read cold, so
+/// the base holds the value in the index alone: deleting and re-inserting it
+/// commits nothing and keeps it, and inserting and deleting it deletes it,
+/// in the default graph and in a named one, before and after the next
+/// index build. The retraction names the value as the index stores it.
+#[tokio::test]
+async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    let values = [
+        "\"123456789012345678901234567890\"^^xsd:nonNegativeInteger",
+        "\"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime",
+    ];
+    let mut failures = Vec::new();
+    for value in values {
+        for graph in [None, Some("ex:g")] {
+            for reinsert in [true, false] {
+                let wrap = |triples: String| match graph {
+                    Some(g) => format!("GRAPH {g} {{ {triples} }}"),
+                    None => triples,
+                };
+                let tmp = tempfile::TempDir::new().expect("tempdir");
+                let path = tmp.path().to_string_lossy().to_string();
+                let ledger_id = "it/multiop-lossy:main";
+                {
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+                    fluree.create_ledger(ledger_id).await.expect("create");
+                    let seed = format!(
+                        "{PFX}INSERT DATA {{ {} }}",
+                        wrap(format!("ex:s ex:p {value} , \"keep\" ."))
+                    );
+                    fluree
+                        .graph(ledger_id)
+                        .transact()
+                        .sparql_update(&seed)
+                        .commit()
+                        .await
+                        .expect("seed");
+                    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+                }
+                let x = wrap(format!("ex:s ex:p {value} ."));
+                let update = if reinsert {
+                    format!("{PFX}DELETE DATA {{ {x} }} ;\nINSERT DATA {{ {x} }}")
+                } else {
+                    format!("{PFX}INSERT DATA {{ {x} }} ;\nDELETE DATA {{ {x} }}")
+                };
+                let read = |path: String| {
+                    let q = format!(
+                        "{PFX}SELECT (COUNT(?o) AS ?n) WHERE {{ {} }}",
+                        wrap("ex:s ex:p ?o .".to_string())
+                    );
+                    async move {
+                        let fluree = FlureeBuilder::file(path).build().expect("reload");
+                        let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+                        let json = query_sparql(&fluree, &ledger, &q)
+                            .await
+                            .expect("query")
+                            .to_sparql_json(&ledger.snapshot)
+                            .expect("json");
+                        json["results"]["bindings"][0]["n"]["value"]
+                            .as_str()
+                            .expect("count")
+                            .to_string()
+                    }
+                };
+                let graph_iri = graph.map(|_| "http://example.org/ns/g");
+                let (receipt, stored, retracted) = {
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .build()
+                        .expect("cold reload");
+                    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+                    let stored = held_terms(&ledger, graph_iri).await;
+                    let receipt = fluree
+                        .graph(ledger_id)
+                        .transact()
+                        .sparql_update(&update)
+                        .commit()
+                        .await
+                        .expect("commit")
+                        .receipt;
+                    let reloaded = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let ledger = reloaded.ledger(ledger_id).await.expect("ledger");
+                    (receipt, stored, retracted_terms(&ledger))
+                };
+                let want_retracted = if reinsert { Vec::new() } else { stored.clone() };
+                if stored.len() != 1 || retracted != want_retracted {
+                    failures.push(format!(
+                        "{value} in {} ({}): stored {stored:?}, retracted {retracted:?}",
+                        graph.unwrap_or("the default graph"),
+                        if reinsert {
+                            "DELETE ; INSERT"
+                        } else {
+                            "INSERT ; DELETE"
+                        },
+                    ));
+                }
+                let after = read(path.clone()).await;
+                {
+                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+                }
+                let reindexed = read(path.clone()).await;
+                let (want_commit, want_count) = if reinsert {
+                    ((1, 0, 0), "2")
+                } else {
+                    ((2, 1, 1), "1")
+                };
+                let got = (
+                    (receipt.t, receipt.flake_count, receipt.retract_count),
+                    after.as_str(),
+                    reindexed.as_str(),
+                );
+                if got != (want_commit, want_count, want_count) {
+                    failures.push(format!(
+                        "{value} in {} ({}): (t, flakes, retracts), values, values after \
+                         reindex = {got:?}; expected {:?}",
+                        graph.unwrap_or("the default graph"),
+                        if reinsert {
+                            "DELETE ; INSERT"
+                        } else {
+                            "INSERT ; DELETE"
+                        },
+                        (want_commit, want_count, want_count)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The kind of value [`multi_op_last_op_matrix`] writes.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    /// An integer too large for 64 bits, under XSD integer subtypes.
+    BigInteger = 0,
+    /// A `dateTime` written with digits past the microsecond. Its spellings
+    /// are one term once read, so a base holding a second spelling holds one
+    /// term of it; only a big integer's spellings tell those bases apart.
+    DateTime = 1,
+}
+
+/// The state a multi-operation update starts from, for
+/// [`multi_op_last_op_matrix`].
+#[derive(Clone, Copy, Debug)]
+enum Base {
+    Absent,
+    Novelty,
+    Indexed,
+    /// Never indexed; novelty holds the value under two spellings, asserted
+    /// by two requests (#2090).
+    TwoTermsInNovelty,
+    /// The index holds the value; novelty a later spelling of it.
+    IndexedThenNovelty,
+}
+
+/// Every first and last op of a multi-operation update over a value the index
+/// keeps less of, from `base`: the value is there afterwards exactly when the
+/// last operation inserts it, whatever subtype (or digits past the
+/// microsecond) each operation writes it with, read in process, after a
+/// reload and after the next incremental and full index builds. A retraction
+/// that survives the fold names the value as the base stores it, under every
+/// term the base holds it by.
+///
+/// The sequences cover every one- and two-op sequence over the stored
+/// spelling and another, so each first and last op is tried with the same
+/// term and with another term of the value, either way round; every
+/// three-op sequence whose first and last ops spell it differently; and
+/// longer ones. The one- and two-op sequences also run as separate
+/// requests, one commit per op: a `DELETE DATA` naming one spelling of a
+/// value the ledger holds under another names that stored fact.
+async fn multi_op_last_op_matrix(base: Base, kind: Kind) {
+    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+    // (stored, then three more spellings of the same value)
+    let values = [
+        [
+            "\"123456789012345678901234567890\"^^xsd:integer",
+            "\"123456789012345678901234567890\"^^xsd:nonNegativeInteger",
+            "\"123456789012345678901234567890\"^^xsd:positiveInteger",
+        ],
+        [
+            "\"2020-01-01T00:00:00.123456Z\"^^xsd:dateTime",
+            "\"2020-01-01T00:00:00.123456789Z\"^^xsd:dateTime",
+            "\"2020-01-01T00:00:00.1234561Z\"^^xsd:dateTime",
+        ],
+    ];
+    // (true = INSERT DATA, false = DELETE DATA, spelling)
+    let mut sequences: Vec<Vec<(bool, usize)>> = Vec::new();
+    let mut push = |ops: Vec<(bool, usize)>| {
+        if !sequences.contains(&ops) {
+            sequences.push(ops);
+        }
+    };
+    let ops = [true, false];
+    for a in ops {
+        for x in [0, 1] {
+            push(vec![(a, x)]);
+            for b in ops {
+                for y in [0, 1] {
+                    push(vec![(a, x), (b, y)]);
+                }
+            }
+        }
+    }
+    for a in ops {
+        for m in ops {
+            for b in ops {
+                for (x, y) in [(0, 1), (1, 0)] {
+                    push(vec![(a, x), (m, 2), (b, y)]);
+                }
+            }
+        }
+    }
+    for longer in [
+        vec![(true, 2)],
+        vec![(false, 0), (true, 1), (false, 1), (true, 2)],
+        vec![(true, 1), (false, 1), (true, 2), (false, 2)],
+    ] {
+        push(longer);
+    }
+    let count = |fluree: fluree_db_api::Fluree, ledger_id: String| async move {
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+        let q = format!("{PFX}SELECT (COUNT(?o) AS ?n) WHERE {{ ex:s ex:p ?o }}");
+        let json = query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("query")
+            .to_sparql_json(&ledger.snapshot)
+            .expect("json");
+        json["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .expect("count")
+            .to_string()
+    };
+    let mut failures = Vec::new();
+    let mut case = 0;
+    let spellings = &values[kind as usize];
+    for (ops, split) in sequences
+        .iter()
+        .flat_map(|ops| [(ops, false), (ops, true)])
+        .filter(|(ops, split)| !split || ops.len() <= 2)
+    {
+        case += 1;
+        let ledger_id = &format!("it/multiop-last-op-{base:?}-{kind:?}-{case}:main");
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().to_string_lossy().to_string();
+        let fluree = FlureeBuilder::file(path.clone())
+            .without_indexing()
+            .build()
+            .expect("build");
+        fluree.create_ledger(ledger_id).await.expect("create");
+        let seed = match base {
+            Base::Absent => format!("{PFX}INSERT DATA {{ ex:s ex:q \"keep\" }}"),
+            _ => format!(
+                "{PFX}INSERT DATA {{ ex:s ex:p {} ; ex:q \"keep\" }}",
+                spellings[0]
+            ),
+        };
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&seed)
+            .commit()
+            .await
+            .expect("seed");
+        let fluree = if let Base::Indexed | Base::IndexedThenNovelty = base {
+            crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+            FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("cold reload")
+        } else {
+            fluree
+        };
+        if let Base::TwoTermsInNovelty | Base::IndexedThenNovelty = base {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(&format!(
+                    "{PFX}INSERT DATA {{ ex:s ex:p {} }}",
+                    spellings[1]
+                ))
+                .commit()
+                .await
+                .expect("second spelling");
+        }
+        let op_texts: Vec<String> = ops
+            .iter()
+            .map(|(insert, n)| {
+                format!(
+                    "{} DATA {{ ex:s ex:p {} }}",
+                    if *insert { "INSERT" } else { "DELETE" },
+                    spellings[*n]
+                )
+            })
+            .collect();
+        let update = op_texts.join(" ;\n");
+        let requests = if split {
+            op_texts.clone()
+        } else {
+            vec![update.clone()]
+        };
+        for request in requests {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(&format!("{PFX}{request}"))
+                .commit()
+                .await
+                .expect("update");
+        }
+        let want = if ops.last().expect("an op").0 {
+            "1"
+        } else {
+            "0"
+        };
+        let reload = || {
+            FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload")
+        };
+        let in_process = count(fluree, ledger_id.clone()).await;
+        let reloaded = count(reload(), ledger_id.clone()).await;
+        let incremental = {
+            crate::support::build_and_publish_index(&reload(), ledger_id).await;
+            count(reload(), ledger_id.clone()).await
+        };
+        // `reindex` replaces the index of the same `t` the
+        // incremental build published; `publish_index` would keep it.
+        let rebuilt = {
+            reload()
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .expect("full rebuild");
+            count(reload(), ledger_id.clone()).await
+        };
+        // Novelty holds each term of a value as its own fact until
+        // the next build (#2090), so a value it holds and asserts
+        // under another subtype reads twice before then, as after an
+        // `INSERT DATA` of that subtype alone.
+        // So can two spellings that separate requests assert.
+        let asserted: std::collections::HashSet<usize> = ops
+            .iter()
+            .filter(|(insert, _)| *insert)
+            .map(|(_, n)| *n)
+            .collect();
+        let two_terms_in_novelty = want == "1"
+            && (matches!(base, Base::Novelty | Base::TwoTermsInNovelty)
+                || (split && matches!(base, Base::Absent) && asserted.len() > 1));
+        let unbuilt_ok = |n: &String| {
+            n == want || (two_terms_in_novelty && n.parse::<u32>().is_ok_and(|n| n > 1))
+        };
+        let got = [in_process, reloaded, incremental, rebuilt];
+        if !got[..2].iter().all(unbuilt_ok) || got[2..].iter().any(|n| n != want) {
+            failures.push(format!(
+                "{base:?} base, {}{}: values in process, reloaded, after an \
+                         incremental build, after a rebuild = {got:?}; expected {want} each{}",
+                update.replace('\n', " "),
+                if split { " (one request per op)" } else { "" },
+                if two_terms_in_novelty {
+                    " (more than one before a build)"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value() {
+    multi_op_last_op_matrix(Base::Absent, Kind::BigInteger).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value_held_in_novelty() {
+    multi_op_last_op_matrix(Base::Novelty, Kind::BigInteger).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_an_indexed_value() {
+    multi_op_last_op_matrix(Base::Indexed, Kind::BigInteger).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_a_value_held_under_two_subtypes() {
+    multi_op_last_op_matrix(Base::TwoTermsInNovelty, Kind::BigInteger).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_an_indexed_value_with_a_later_subtype() {
+    multi_op_last_op_matrix(Base::IndexedThenNovelty, Kind::BigInteger).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_a_datetime() {
+    multi_op_last_op_matrix(Base::Absent, Kind::DateTime).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_a_datetime_held_in_novelty() {
+    multi_op_last_op_matrix(Base::Novelty, Kind::DateTime).await;
+}
+
+#[tokio::test]
+async fn a_multi_op_update_ends_where_its_last_op_leaves_an_indexed_datetime() {
+    multi_op_last_op_matrix(Base::Indexed, Kind::DateTime).await;
 }

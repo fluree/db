@@ -1,6 +1,6 @@
 # Vocabulary
 
-Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally use DoCO (`doco:`, `http://purl.org/spar/doco/`), the pattern ontology it extends (`po:`, `http://www.essepuntato.it/2008/12/pattern#`) and NIF (`nif:`, `http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#`). The structure terms are those of the parsing engine and are documented in full in [fluree-doc-parse](https://github.com/fluree/fluree-doc-parse); the terms below are what the ingest adds.
+Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally use DoCO (`doco:`, `http://purl.org/spar/doco/`), the pattern ontology it extends (`po:`, `http://www.essepuntato.it/2008/12/pattern#`), NIF (`nif:`, `http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#`), Dublin Core (`dcterms:`, `http://purl.org/dc/terms/`) and FOAF (`foaf:`, `http://xmlns.com/foaf/0.1/`) for the document root's class. The structure terms are those of the parsing engine and are documented in full in its [vocabulary reference](https://github.com/fluree/fluree-doc-parse/blob/main/docs/reference/vocabulary.md); the terms below are what the ingest adds.
 
 ## Classes
 
@@ -20,7 +20,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:text` | string | The chunk's text, whitespace collapsed. |
 | `doc:headerPath` | string | Section titles above it, outermost first, joined with ` / `. Absent when there are none. |
 | `doc:sourceElement` | IRI, repeated | The elements it was built from, in order. |
-| `doc:sourceDocument` | IRI | The document. Also on every element. |
+| `doc:sourceDocument` | IRI | The document. Also on every structure node but a table cell, which is reached through its table. |
 | `doc:embedding` | `@vector` | Its embedding, when produced. |
 
 ## Document properties
@@ -85,4 +85,4 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 
 ## Structure terms used by the chunker
 
-`doco:Document`, `doco:BodyMatter`, `doco:Section`, `doco:SectionTitle`, `doco:Title`, `doco:Paragraph`, `doco:ListItem`, `doco:Caption`, `doco:Table`, `doc:TableCell` (`doc:cellValue`, `doc:rowHeader`, `doc:columnHeader`, `doc:rowIndex`, `doc:columnIndex`), `po:contains`, `nif:isString`, `nif:beginIndex`, `nif:endIndex`, `doc:sectionLevel`, `doc:pageIndex`, `doc:bbox`, `doc:pages`, `doc:evidence`, `doc:provenance`.
+The chunker starts at the `foaf:Document` root and follows `po:contains`, visiting a node's `po:containsAsHeader` child first. It takes text from `doco:Title` and `doco:Paragraph` (`nif:isString`, else `rdfs:label`), turns each `doco:Section`'s `doco:SectionTitle` and `doc:sectionLevel` into the header path, and reads each `doc:TableCell` as `doc:cellValue` with its `doc:rowHeader` and `doc:columnHeader`. Every other node is a container it walks through. See [What gets built](../concepts/what-gets-built.md#the-structure-graph) for the rest of the structure graph.

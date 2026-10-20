@@ -34,6 +34,8 @@ mod it_named_graph_conflict_retractions;
 mod it_profile_ledger;
 #[path = "it_push_after_merge.rs"]
 mod it_push_after_merge;
+#[path = "it_push_retraction_validation.rs"]
+mod it_push_retraction_validation;
 #[path = "it_read_your_writes.rs"]
 mod it_read_your_writes;
 #[path = "it_rebase.rs"]

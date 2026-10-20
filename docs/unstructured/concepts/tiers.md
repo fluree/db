@@ -2,12 +2,14 @@
 
 The pipeline is the same everywhere: parse, chunk, embed, write, index. What a tier changes is where the models come from and how much of the work runs on your machine.
 
-What each tier reads, on the [public benchmark](../README.md#how-well-does-it-read) the parsing engine is scored on (200 PDFs, 2026-08-01):
+What each tier reads, on the [public benchmark](../README.md#how-well-does-it-read) the parsing engine is scored on (200 PDFs, 2026-10-07):
 
 | Reading | Overall | Typical cost per document |
 |---|---|---|
-| Deterministic only — the local tier | 0.892 (third of seventeen engines) | ~8 ms, CPU |
-| With a vision model for pages and regions the deterministic pass could not read — a `vlm` slot or a Fluree AI account | 0.933 (first) | ~1.5 s averaged over the corpus; 113 of 200 documents never call the model |
+| Deterministic only — the local tier | 0.895 (third of seventeen engines) | ~8 ms, CPU |
+| With a vision model reading the pages and regions the deterministic pass could not | not measured as `fluree doc` runs it | 113 of 200 documents never call the model |
+
+The engine's best score, 0.934 and first of seventeen, is its full cascade: a layout detector arbitrating headings and table regions (0.903 on its own), then Gemini reading what was escalated. `fluree doc` runs no layout detector and reads with whichever vision model is configured, so that score is not a measurement of either model tier here.
 
 ## Local only
 
