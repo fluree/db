@@ -327,6 +327,11 @@ DELETE { ex:alice schema:age 30 } INSERT { ex:alice schema:age 30 } WHERE {}
 stores `ex:alice schema:age 30` if it was absent, and commits nothing if it
 was present.
 
+The same holds when the `WHERE` has several solutions and the templates are
+instantiated once for each: a triple that any solution inserts is kept,
+however many solutions delete it, and a commit holds only the triples whose
+stored state changes.
+
 Once a fact is indexed, a DELETE is matched against what the index stores,
 which is less than was written for two kinds of value: an integer too large
 for 64 bits keeps no XSD subtype, and a `dateTime` or `time` keeps six

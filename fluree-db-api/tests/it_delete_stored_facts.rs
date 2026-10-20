@@ -518,6 +518,150 @@ async fn witnessed_delete_of_an_indexed_big_integer_in_a_named_graph() {
 }
 
 // =============================================================================
+// A fact the update both deletes and inserts is kept, whatever the rows
+// =============================================================================
+
+/// `ex:s ex:p "v"`, in `graph` when one is given, and three items: a WHERE
+/// over the items has three rows, and only `ex:i1`'s binds `?keep`.
+fn kept_seed(graph: Option<&str>) -> JsonValue {
+    let mut fact = json!({"@id": "ex:s", "ex:p": "v"});
+    if let Some(g) = graph {
+        fact["@graph"] = json!(g);
+    }
+    json!({"@graph": [
+        fact,
+        {"@id": "ex:i1", "ex:kind": "item", "ex:keeps": {"@id": "ex:s"}},
+        {"@id": "ex:i2", "ex:kind": "item"},
+        {"@id": "ex:i3", "ex:kind": "item"}
+    ]})
+}
+
+/// The constant DELETE names the fact on all three rows, the INSERT on the
+/// one row that binds `?keep`. The fact is in the update's insert set, so
+/// under `(DS − D) ∪ I` it stays. Netting each fact by how many rows named
+/// it on each side kept the surplus retraction and deleted it.
+#[tokio::test]
+async fn a_fact_deleted_on_more_rows_than_it_is_inserted_on_is_kept() {
+    for indexed in [false, true] {
+        for graph in [None, Some(G1)] {
+            let wrap = |body: &str| match graph {
+                None => body.to_string(),
+                Some(g) => format!("GRAPH <{g}> {{ {body} }}"),
+            };
+            let sparql = [
+                format!(
+                    "DELETE {{ {} }} INSERT {{ {} }} \
+                     WHERE {{ ?i ex:kind \"item\" OPTIONAL {{ ?i ex:keeps ?keep }} }}",
+                    wrap("ex:s ex:p \"v\""),
+                    wrap("?keep ex:p \"v\""),
+                ),
+                format!(
+                    "DELETE {{ {} }} INSERT {{ {} }} \
+                     WHERE {{ VALUES (?x ?keep) {{ (1 ex:s) (2 UNDEF) (3 UNDEF) }} }}",
+                    wrap("ex:s ex:p \"v\""),
+                    wrap("?keep ex:p \"v\""),
+                ),
+            ];
+            for body in sparql {
+                let (_d, fluree, ledger) = seeded("kept-sparql", kept_seed(graph), indexed).await;
+                let t = ledger.t();
+                let r = sparql_update(&fluree, ledger, &body).await;
+                let what = format!("{body} (indexed={indexed})");
+                no_commit(&r, t, &what);
+                assert_eq!(graph_objects(&r.ledger, graph).await, ["v"], "{what}");
+            }
+
+            let template = |node: JsonValue| match graph {
+                None => node,
+                Some(g) => json!([["graph", g, node]]),
+            };
+            let (_d, fluree, ledger) = seeded("kept-jsonld", kept_seed(graph), indexed).await;
+            let t = ledger.t();
+            let r = jsonld_update(
+                &fluree,
+                ledger,
+                json!({
+                    "where": [
+                        {"@id": "?i", "ex:kind": "item"},
+                        ["optional", {"@id": "?i", "ex:keeps": "?keep"}]
+                    ],
+                    "delete": template(json!({"@id": "ex:s", "ex:p": "v"})),
+                    "insert": template(json!({"@id": "?keep", "ex:p": "v"}))
+                }),
+            )
+            .await;
+            let what = format!("JSON-LD, graph={graph:?}, indexed={indexed}");
+            no_commit(&r, t, &what);
+            assert_eq!(graph_objects(&r.ledger, graph).await, ["v"], "{what}");
+        }
+    }
+}
+
+/// `ex:a ex:v 1 . ex:b ex:v 2`.
+fn restated_seed() -> JsonValue {
+    json!({"@graph": [{"@id": "ex:a", "ex:v": 1}, {"@id": "ex:b", "ex:v": 2}]})
+}
+
+/// Every `?s ex:v ?o`, as `s=o`, sorted.
+async fn v_values(fluree: &Fluree, ledger: &LedgerState) -> Vec<String> {
+    let q = format!("SELECT ?s ?o WHERE {{ ?s <{EX}v> ?o }}");
+    let result = support::query_sparql(fluree, ledger, &q)
+        .await
+        .expect("query");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let mut rows: Vec<String> = json
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            let s = r[0].as_str().expect("subject");
+            format!("{}={}", s.rsplit([':', '/']).next().unwrap_or(s), r[1])
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Replaces every `ex:v` with `ex:a ex:v 1 . ex:b ex:v 3`: the constant
+/// INSERT is instantiated on every WHERE row.
+async fn replace_v(fluree: &Fluree, ledger: LedgerState, sparql: bool) -> TransactResult {
+    if sparql {
+        let body =
+            "DELETE { ?s ex:v ?o } INSERT { ex:a ex:v 1 . ex:b ex:v 3 } WHERE { ?s ex:v ?o }";
+        sparql_update(fluree, ledger, body).await
+    } else {
+        let txn = json!({
+            "where": {"@id": "?s", "ex:v": "?o"},
+            "delete": {"@id": "?s", "ex:v": "?o"},
+            "insert": [{"@id": "ex:a", "ex:v": 1}, {"@id": "ex:b", "ex:v": 3}]
+        });
+        jsonld_update(fluree, ledger, txn).await
+    }
+}
+
+/// Over two rows the INSERT names the unchanged `ex:a ex:v 1` twice while
+/// the DELETE retracts it once. The commit holds only the change to `ex:b`,
+/// and restating both facts as they are commits nothing.
+#[tokio::test]
+async fn a_fact_inserted_on_more_rows_than_it_is_deleted_on_is_not_asserted_again() {
+    for indexed in [false, true] {
+        for sparql in [true, false] {
+            let (_d, fluree, ledger) =
+                seeded(&format!("restated-{sparql}"), restated_seed(), indexed).await;
+            let what = format!("sparql={sparql}, indexed={indexed}");
+            let r = replace_v(&fluree, ledger, sparql).await;
+            assert_eq!(r.receipt.flake_count, 2, "{what}: retract b=2, assert b=3");
+            assert_eq!(v_values(&fluree, &r.ledger).await, ["a=1", "b=3"], "{what}");
+
+            let t = r.ledger.t();
+            let r = replace_v(&fluree, r.ledger, sparql).await;
+            no_commit(&r, t, &format!("{what}, restating both"));
+            assert_eq!(v_values(&fluree, &r.ledger).await, ["a=1", "b=3"], "{what}");
+        }
+    }
+}
+
+// =============================================================================
 // Indexed facts are named by their index key
 // =============================================================================
 
