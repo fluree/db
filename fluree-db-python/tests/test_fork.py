@@ -112,3 +112,36 @@ def test_a_child_forked_after_the_engine_started_refuses_it(tmp_path):
     """)
     assert lines[0].startswith("ERR") and "forked after Fluree started" in lines[0] and "'spawn'" in lines[0]
     assert lines[1:] == ["STATUS 0", "SPAWN [[]]", "PARENT [['A']]"]
+
+
+def test_a_forked_child_does_not_keep_the_directory_locked(tmp_path):
+    # A child forked while the directory is open shares the lock's open file,
+    # yet the directory is free once its parent exits without closing it, or
+    # closes it.
+    lines = run(tmp_path, """
+        started_r, started_w = os.pipe()
+        release_r, release_w = os.pipe()
+
+        def fork_idle_child():
+            if os.fork() == 0:
+                os.close(release_w)
+                os.write(started_w, b"s")
+                os.read(release_r, 1)
+                os._exit(0)
+            os.read(started_r, 1)
+
+        holder = os.fork()
+        if holder == 0:
+            conn, people = started(path)
+            fork_idle_child()
+            os._exit(0)  # holding the directory, without closing it
+        os.waitpid(holder, 0)
+        report(lambda: fluree.connect(path).ledgers())
+
+        conn = fluree.connect(path)
+        fork_idle_child()
+        conn.close()
+        report(lambda: fluree.connect(path).ledgers())
+        os.close(release_w)
+    """)
+    assert lines == ["OK ['people:main']", "OK ['people:main']"]

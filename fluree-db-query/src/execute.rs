@@ -54,6 +54,7 @@ pub use where_plan::{expand_edge_annotation_patterns, expand_edge_annotation_pat
 
 // Re-export operator tree builder and runner for custom execution pipelines
 pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
+pub use reasoning_prep::explain_derived_facts;
 pub use runner::{run_operator, run_operator_streaming};
 
 // Re-export pushdown utilities for tests
@@ -64,7 +65,7 @@ pub use pushdown::{
 
 pub use runner::{
     prepare_execution, prepare_execution_with_binary_store, prepare_execution_with_config,
-    PrepareConfig,
+    PrepareConfig, QueryRequest,
 };
 
 #[cfg(test)]

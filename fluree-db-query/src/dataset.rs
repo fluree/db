@@ -277,9 +277,25 @@ impl<'a> DataSet<'a> {
     where
         'a: 'b,
     {
+        self.with_overlay_for_graphs(ledger_id, &[g_id], to_t, overlay)
+    }
+
+    /// [`with_overlay_for_graph`](Self::with_overlay_for_graph) for every
+    /// graph in `g_ids` of the same ledger and `to_t`.
+    pub fn with_overlay_for_graphs<'b>(
+        &self,
+        ledger_id: &str,
+        g_ids: &[GraphId],
+        to_t: i64,
+        overlay: &'b dyn OverlayProvider,
+    ) -> DataSet<'b>
+    where
+        'a: 'b,
+    {
         let patch = |graph: &GraphRef<'a>| -> GraphRef<'b> {
-            let matches =
-                graph.ledger_id.as_ref() == ledger_id && graph.g_id == g_id && graph.to_t == to_t;
+            let matches = graph.ledger_id.as_ref() == ledger_id
+                && g_ids.contains(&graph.g_id)
+                && graph.to_t == to_t;
             GraphRef {
                 snapshot: graph.snapshot,
                 g_id: graph.g_id,

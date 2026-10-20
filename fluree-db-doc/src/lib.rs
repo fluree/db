@@ -3,9 +3,9 @@
 //! A folder of documents goes in; what comes out, per document, is ready to
 //! transact into a ledger:
 //!
-//! 1. a DoCO structure graph (sections, paragraphs, table cells, with
-//!    character offsets and page/bbox provenance) from the
-//!    `fluree-doc-parse` engine, escalating pixel-only regions to a
+//! 1. a DoCO structure graph (sections, paragraphs, lists, table cells,
+//!    with character offsets and, for a PDF, page and bounding box) from
+//!    the `fluree-doc-parse` engine, escalating pixel-only regions to a
 //!    configured vision model when one is set;
 //! 2. retrieval chunks cut along that structure, each citing the elements
 //!    it was built from and carrying its section path;
@@ -18,7 +18,7 @@
 //! Every model call is optional and cached. With nothing configured the
 //! pipeline is deterministic and makes no network connection.
 //!
-//! The ledger write, the vector/BM25 index steps and the CLI surface live in
+//! The ledger write, the full-text index and the CLI surface live in
 //! `fluree-db-cli`; this crate owns the document side and stays free of the
 //! database.
 
@@ -45,7 +45,9 @@ pub use embed::EmbeddingClient;
 pub use escalate::VlmReader;
 pub use extract::{ExtractOptions, Extractor, RelationMode, ResolvePolicy};
 pub use gazetteer::{Gazetteer, Mention};
-pub use ingest::{collect_inputs, prepare, IngestOptions, PreparedDocument, SourceMeta};
+pub use ingest::{
+    collect_inputs, parse_file, prepare, IngestOptions, PreparedDocument, SourceMeta,
+};
 pub use llm::LlmClient;
 pub use model::Model;
 pub use parse::{ParsedDocument, SourceKind};

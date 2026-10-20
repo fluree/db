@@ -53,16 +53,17 @@ pub fn parse_query_time_rule(
     snapshot: &LedgerSnapshot,
     index: usize,
 ) -> Result<DatalogRule> {
-    let synthetic_id = || Sid::new(0, format!("_:query_rule_{index}"));
+    // The rule's `@id` names it in diagnostics; an unnamed rule gets its
+    // position.
+    let rule_id = match json.get("@id").and_then(|v| v.as_str()) {
+        Some(id_str) => Sid::new(0, id_str),
+        None => Sid::new(0, format!("_:query_rule_{index}")),
+    };
 
     if let Some(f_rule) = json
         .get("f:rule")
         .or_else(|| json.get(fluree_vocab::fluree::RULE))
     {
-        let rule_id = match json.get("@id").and_then(|v| v.as_str()) {
-            Some(id_str) => Sid::new(0, id_str),
-            None => synthetic_id(),
-        };
         if let Some(source) = as_sparql_typed_value(f_rule) {
             return parse_sparql_rule(&rule_id, source, snapshot, RuleOrigin::QueryTime);
         }
@@ -76,7 +77,6 @@ pub fn parse_query_time_rule(
         );
     }
 
-    let rule_id = synthetic_id();
     if let Some(source) = as_sparql_typed_value(json) {
         return parse_sparql_rule(&rule_id, source, snapshot, RuleOrigin::QueryTime);
     }
@@ -221,17 +221,38 @@ pub(super) fn parse_sparql_rule(
             "the CONSTRUCT template has no triple patterns",
         ));
     }
-    if template.names_graphs() || !template.reifications().is_empty() {
+    if !template.reifications().is_empty() {
         return Err(invalid(
             &label,
-            "the CONSTRUCT template writes into a named graph or annotates an edge; a rule \
-             head can only infer default-graph triples",
+            "the CONSTRUCT template annotates an edge; a rule head derives plain triples \
+             only, so it cannot mint an edge annotation",
         ));
     }
     let heads = template
         .patterns()
         .iter()
-        .map(|tp| head_from_triple(tp, snapshot, &label))
+        .enumerate()
+        .map(|(i, tp)| {
+            let mut head = head_from_triple(tp, snapshot, &label)?;
+            head.graph = match template.graph(i) {
+                None => None,
+                Some(Ref::Iri(iri)) => Some(named_head_graph(iri.to_string(), &label)?),
+                Some(Ref::Sid(sid)) => {
+                    let iri = snapshot
+                        .decode_sid(sid)
+                        .ok_or_else(|| invalid(&label, "cannot decode the template's graph IRI"))?;
+                    Some(named_head_graph(iri, &label)?)
+                }
+                Some(Ref::Var(_)) => {
+                    return Err(invalid(
+                        &label,
+                        "the CONSTRUCT template's GRAPH is a variable; a rule head derives \
+                         into a fixed graph, so name it with a constant IRI",
+                    ))
+                }
+            };
+            Ok(head)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     build_rule(
@@ -267,6 +288,7 @@ fn build_rule(
     validate::validate_body(&query, snapshot, &label, origin)?;
     let body_vars = validate::body_vars(&query);
     validate::check_range_restriction(&heads, &body_vars, &vars, &label)?;
+    validate::check_negation_safety(&query.patterns, &vars, &label)?;
     validate::warn_iri_vs_literal(&query, &vars, &label);
 
     // The body projects every variable it binds; a rule has no modifiers of
@@ -329,6 +351,10 @@ fn parse_heads(
     Ok(heads)
 }
 
+/// Parse one insert node into `heads`. A node names the graph its triples
+/// are derived into the way a transaction node does, with `"@graph": "<iri>"`;
+/// a JSON-LD named graph object `{"@id": <iri>, "@graph": [nodes]}` puts its
+/// nodes there. Nodes nested in object position inherit the graph.
 fn parse_head_node(
     map: &serde_json::Map<String, JsonValue>,
     ctx: &JsonLdParseCtx,
@@ -338,7 +364,12 @@ fn parse_head_node(
     heads: &mut Vec<RuleHead>,
 ) -> Result<()> {
     if let Some(JsonValue::Array(nodes)) = map.get("@graph") {
+        let graph = match map.get("@id") {
+            Some(id) => Some(head_graph(id, ctx, label)?),
+            None => None,
+        };
         for node in nodes {
+            let first = heads.len();
             match node {
                 JsonValue::Object(inner) => {
                     parse_head_node(inner, ctx, snapshot, vars, label, heads)?;
@@ -350,10 +381,85 @@ fn parse_head_node(
                     ))
                 }
             }
+            assign_graph(&mut heads[first..], graph.as_ref());
         }
         return Ok(());
     }
+    let graph = match map.get("@graph") {
+        Some(value) => Some(head_graph(value, ctx, label)?),
+        None => None,
+    };
+    let first = heads.len();
+    parse_head_triples(map, ctx, snapshot, vars, label, heads)?;
+    assign_graph(&mut heads[first..], graph.as_ref());
+    Ok(())
+}
 
+/// Give every head that names no graph of its own `graph`.
+fn assign_graph(heads: &mut [RuleHead], graph: Option<&Arc<str>>) {
+    if let Some(graph) = graph {
+        for head in heads.iter_mut().filter(|h| h.graph.is_none()) {
+            head.graph = Some(graph.clone());
+        }
+    }
+}
+
+/// A head's graph: a constant IRI, compact or absolute, or `{"@id": …}`.
+fn head_graph(value: &JsonValue, ctx: &JsonLdParseCtx, label: &str) -> Result<Arc<str>> {
+    let raw = match value {
+        JsonValue::String(s) => s.as_str(),
+        JsonValue::Object(map) => map.get("@id").and_then(JsonValue::as_str).ok_or_else(|| {
+            invalid(
+                label,
+                format!("a head's @graph must name an IRI, got {value}"),
+            )
+        })?,
+        other => {
+            return Err(invalid(
+                label,
+                format!("a head's @graph must name an IRI, got {other}"),
+            ))
+        }
+    };
+    if raw.starts_with('?') {
+        return Err(invalid(
+            label,
+            format!(
+                "a rule head derives into a fixed graph; `{raw}` is a variable. Name the \
+                 graph with a constant IRI"
+            ),
+        ));
+    }
+    let (iri, _) = ctx
+        .expand_id(raw)
+        .map_err(|e| invalid(label, format!("invalid graph IRI `{raw}`: {e}")))?;
+    named_head_graph(iri, label)
+}
+
+/// A head graph IRI, refusing the name of the default graph: deriving into
+/// the graph the rules run against means naming no graph.
+fn named_head_graph(iri: String, label: &str) -> Result<Arc<str>> {
+    if iri == fluree_db_core::graph_registry::DEFAULT_GRAPH_IRI {
+        return Err(invalid(
+            label,
+            format!(
+                "a rule head names the default graph <{iri}>; leave the graph out to derive \
+                 into the graph the rules run against"
+            ),
+        ));
+    }
+    Ok(iri.into())
+}
+
+/// The triples of one insert node, its own `@graph` aside.
+fn parse_head_triples(
+    map: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    snapshot: &LedgerSnapshot,
+    vars: &VarRegistry,
+    label: &str,
+    heads: &mut Vec<RuleHead>,
+) -> Result<()> {
     let id_val = map.get("@id").ok_or_else(|| {
         invalid(
             label,
@@ -384,6 +490,7 @@ fn parse_head_node(
                         subject: subject.clone(),
                         predicate: predicate.clone(),
                         object,
+                        graph: None,
                     });
                 }
             }
@@ -401,6 +508,7 @@ fn parse_head_node(
                         subject: subject.clone(),
                         predicate: predicate.clone(),
                         object,
+                        graph: None,
                     });
                 }
             }
@@ -420,6 +528,7 @@ fn parse_head_node(
                         subject: subject.clone(),
                         predicate: predicate.clone(),
                         object,
+                        graph: None,
                     });
                 }
             }
@@ -727,6 +836,7 @@ fn head_from_triple(
         subject,
         predicate,
         object,
+        graph: None,
     })
 }
 

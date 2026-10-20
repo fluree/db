@@ -432,7 +432,11 @@ pub async fn stage_with_graph_delta(
 
         // A `WITH`/`graph` template default that is this ledger's own address
         // writes the ledger's default graph, the graph the WHERE reads for it.
-        template_default_address_to_default_graph(&mut txn, &ledger.snapshot.ledger_id);
+        template_default_address_to_default_graph(
+            &mut txn,
+            &ledger.snapshot.ledger_id,
+            &ns_registry,
+        );
 
         // B2 (data writes): `#txn-meta` is never a write target (see
         // `refuse_txn_meta_write`). `txn.write_graphs` holds the fixed write
@@ -900,13 +904,30 @@ pub(crate) fn refuse_default_graph_name(iri: &str) -> Result<()> {
 /// write half agree: the templates that took the default write the default
 /// graph, and the IRI is not registered as a named graph unless a template
 /// names it itself. Templates that name their graph are left alone.
-fn template_default_address_to_default_graph(txn: &mut Txn, ledger_id: &fluree_db_core::LedgerId) {
+///
+/// An annotated edge written in the template default carries the reifier
+/// anchor `(reifier, f:reifiesGraph, <iri>)` (`GraphScope::emit`). Once the
+/// edge moves to the default graph the anchor would name a graph the edge is
+/// not in, so it is dropped: a default-graph bundle has no anchor.
+fn template_default_address_to_default_graph(
+    txn: &mut Txn,
+    ledger_id: &fluree_db_core::LedgerId,
+    ns: &NamespaceRegistry,
+) {
     let Some(iri) = txn.template_default_graph.clone() else {
         return;
     };
     if !names_default_graph(ledger_id, &iri) {
         return;
     }
+    let address = ns.lookup_sid_for_iri(&iri);
+    let is_anchor_for_address = |template: &TripleTemplate| {
+        template.graph_from_template_default
+            && matches!(&template.predicate, TemplateTerm::Sid(p) if fluree_db_core::is_reifies_graph(p))
+            && matches!((&template.object, &address), (TemplateTerm::Sid(o), Some(a)) if o == a)
+    };
+    txn.insert_templates.retain(|t| !is_anchor_for_address(t));
+    txn.delete_templates.retain(|t| !is_anchor_for_address(t));
     let mut named_by_a_template = false;
     for template in txn
         .insert_templates
@@ -1981,9 +2002,29 @@ async fn stream_where_into_accumulator(
         lower_where_patterns(&txn.where_patterns, &ledger.snapshot, &mut txn.vars)?
     };
 
-    // If VALUES clause present, prepend it as first pattern (seeds the join)
+    // If VALUES clause present, prepend it as first pattern (seeds the join).
+    //
+    // The where reads every IRI in the ledger's encoding, the one a where
+    // VALUES lowers to. The update encoded its top-level `values` as it
+    // encodes its templates, with the transaction's registry, which gives a
+    // namespace the ledger has not registered a new code the where cannot
+    // decode; such an IRI enters the where in the ledger encoder's fallback
+    // form, `Sid(EMPTY, iri)`, and a write stores it under its canonical
+    // code (`FlakeGenerator`).
     if let Some(inline_values) = &txn.values {
-        let values_pattern = inline_values_to_pattern(inline_values)?;
+        let in_ledger_encoding = |sid: &Sid| -> Sid {
+            let code = sid.namespace_code;
+            if fluree_vocab::namespaces::is_full_iri(code)
+                || ledger.snapshot.namespaces().contains_key(&code)
+            {
+                return sid.clone();
+            }
+            match generator.decode_sid(sid) {
+                Some(iri) => Sid::new(fluree_vocab::namespaces::EMPTY, iri),
+                None => sid.clone(),
+            }
+        };
+        let values_pattern = inline_values_to_pattern(inline_values, in_ledger_encoding)?;
         query_patterns.insert(0, values_pattern);
     }
 
@@ -2195,6 +2236,17 @@ async fn stream_where_into_accumulator(
             if let Some(alias) = alias {
                 named.push((alias.into(), g_id, false, iri));
             }
+        }
+        // A where node's `"@graph": "default"` reads the default graph as
+        // `GRAPH <urn:default>`, which a restricting `fromNamed` does not
+        // take away.
+        if txn.update_where_names_ledger_default
+            && !named
+                .iter()
+                .any(|(name, ..)| name.as_ref() == fluree_db_core::DEFAULT_GRAPH_IRI)
+        {
+            let name: Arc<str> = fluree_db_core::DEFAULT_GRAPH_IRI.into();
+            named.push((name.clone(), 0, false, name));
         }
     } else {
         // The ambient graph store. Reserved system graphs (txn-meta, config)
@@ -2632,12 +2684,22 @@ fn template_term_to_binding(term: &TemplateTerm) -> Result<Binding> {
 }
 
 /// Convert InlineValues to Pattern::Values
-fn inline_values_to_pattern(values: &InlineValues) -> Result<Pattern> {
+fn inline_values_to_pattern(
+    values: &InlineValues,
+    in_ledger_encoding: impl Fn(&Sid) -> Sid,
+) -> Result<Pattern> {
     let vars = values.vars.clone();
     let rows: Result<Vec<Vec<Binding>>> = values
         .rows
         .iter()
-        .map(|row| row.iter().map(template_term_to_binding).collect())
+        .map(|row| {
+            row.iter()
+                .map(|term| match term {
+                    TemplateTerm::Sid(sid) => Ok(Binding::sid(in_ledger_encoding(sid))),
+                    other => template_term_to_binding(other),
+                })
+                .collect()
+        })
         .collect();
     Ok(Pattern::Values { vars, rows: rows? })
 }
@@ -2932,12 +2994,9 @@ impl ShaclValidationOutcome {
 /// Validate a staged [`StagedLedger`] against SHACL shapes, each focus node
 /// in the graph staging routed its flakes to.
 ///
-/// `per_graph_policy`:
-/// - `None` = treat every graph containing staged flakes as `Reject` mode
-///   (legacy / unconditional reject — matches commit-transfer's previous
-///   behavior and shapes-exist heuristic).
-/// - `Some(map)` = only graphs in the map are validated; their mode comes
-///   from the map. Graphs absent from the map are skipped (disabled).
+/// `per_graph_policy` names the graphs that participate: only graphs in the
+/// map are validated, each in the mode the map gives it. Graphs absent from
+/// the map are skipped, so an empty map validates nothing.
 ///
 /// Returns a [`ShaclValidationOutcome`] split into reject / warn buckets.
 /// The caller decides whether to propagate an error, log warnings, or both.
@@ -2948,13 +3007,13 @@ pub async fn validate_view_with_shacl(
     shacl_cache: std::sync::Arc<ShaclCache>,
     hierarchy: Option<fluree_db_core::SchemaHierarchy>,
     tracker: Option<&fluree_db_core::Tracker>,
-    per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
+    per_graph_policy: &HashMap<GraphId, ShaclGraphPolicy>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
     sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ShaclValidationOutcome> {
-    // Fast path: if there are no SHACL shapes, elide validation entirely.
-    if shacl_cache.is_empty() {
+    // Fast path: no shapes or no participating graph, nothing to validate.
+    if shacl_cache.is_empty() || per_graph_policy.is_empty() {
         return Ok(ShaclValidationOutcome::default());
     }
 
@@ -2972,26 +3031,24 @@ pub async fn validate_view_with_shacl(
     let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
         .with_membership_graphs(membership_g_ids.to_vec())
         .with_constraint_failures(std::sync::Arc::clone(&constraint_failures));
-    let enabled_graphs: Option<HashSet<GraphId>> =
-        per_graph_policy.map(|m| m.keys().copied().collect());
+    let enabled_graphs: HashSet<GraphId> = per_graph_policy.keys().copied().collect();
     let report = validate_staged_nodes(
         view,
         &engine,
         tracker,
-        enabled_graphs.as_ref(),
+        &enabled_graphs,
         cross_ledger,
         sparql_iri_encoder,
     )
     .await?;
 
-    // A graph's validation mode. When per_graph_policy is None, every graph
-    // is in Reject mode.
-    let mode_of = |g_id: Option<GraphId>| match (per_graph_policy, g_id) {
-        (Some(m), Some(g_id)) => m
-            .get(&g_id)
-            .map(|p| p.mode)
-            .unwrap_or(fluree_db_core::ledger_config::ValidationMode::Reject),
-        _ => fluree_db_core::ledger_config::ValidationMode::Reject,
+    // A graph's validation mode: the participating graph's, and Reject for a
+    // result tagged with no graph.
+    let mode_of = |g_id: Option<GraphId>| {
+        g_id.and_then(|g_id| per_graph_policy.get(&g_id))
+            .map_or(fluree_db_core::ledger_config::ValidationMode::Reject, |p| {
+                p.mode
+            })
     };
 
     // A constraint that cannot run, on a Violation shape in a Reject-mode
@@ -3052,7 +3109,7 @@ async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
     tracker: Option<&fluree_db_core::Tracker>,
-    enabled_graphs: Option<&HashSet<GraphId>>,
+    enabled_graphs: &HashSet<GraphId>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
     sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ValidationReport> {
@@ -3112,15 +3169,13 @@ async fn validate_staged_nodes(
     let mut all_results = Vec::new();
 
     for (g_id, subjects) in &subjects_by_graph {
-        // Per-graph enable/disable: when the caller supplies an explicit
-        // enabled set, graphs not in the set are skipped. Subjects staged in
-        // a disabled graph therefore receive no shape validation from this
-        // transaction, which matches the documented `shacl.enabled: false`
-        // semantics for that graph (`override-control.md`).
-        if let Some(enabled) = enabled_graphs {
-            if !enabled.contains(g_id) {
-                continue;
-            }
+        // Per-graph enable/disable: graphs not in the enabled set are
+        // skipped. Subjects staged in a disabled graph therefore receive no
+        // shape validation from this transaction, which matches the
+        // documented `shacl.enabled: false` semantics for that graph
+        // (`override-control.md`).
+        if !enabled_graphs.contains(g_id) {
+            continue;
         }
 
         // Build GraphDbRef for this graph.

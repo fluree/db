@@ -707,7 +707,7 @@ impl crate::Fluree {
             .await?;
         outcome.into_result_with(|report| {
             format!(
-                "replaying commit t={} would violate the source branch's shapes:\n{report}",
+                "replaying commit t={} was refused:\n{report}",
                 original_commit.t
             )
         })?;

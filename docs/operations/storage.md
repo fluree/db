@@ -409,6 +409,11 @@ A filesystem that cannot lock (some network and FUSE mounts) fails to open. Set
 `FLUREE_STORAGE_ALLOW_UNLOCKED=true` to open it anyway, without protection from a second process.
 Any other error taking the lock, such as a lock file the process may not write, fails the open too.
 
+A lock keeps out only the processes whose operating system sees it. A container and its host that
+share a directory through a Docker Desktop bind mount both take the lock without error, as do two
+machines on an NFS mount with local-only locking (`nolock` or `local_lock`). Neither is refused, so
+make sure only one of them opens the directory.
+
 ### Durability
 
 **Filesystem syncing (FSYNC) is on by default.** Fluree flushes committed data

@@ -90,13 +90,18 @@ impl SharedFluree {
     /// Joining refuses `options` that differ from the open instance's. A root
     /// whose last handle is still shutting down is waited for, then opened
     /// afresh. A root that another process holds fails with
-    /// [`ApiError::StorageInUse`].
+    /// [`ApiError::StorageInUse`]. The build runs as a task of its own, so a
+    /// cancelled open leaves the next one to wait for it.
     pub async fn open(path: impl AsRef<Path>, options: SharedOptions) -> Result<Self> {
         let key = canonical_root(path.as_ref())?;
         loop {
             match Self::next_step(&key) {
                 Step::Join(root) => return Self::join(root, options),
-                Step::Start(opened) => return Self::start(key, options, opened).await,
+                Step::Start(opened) => {
+                    return tokio::spawn(Self::start(key, options, opened))
+                        .await
+                        .map_err(|e| ApiError::internal(format!("opening storage failed: {e}")))?
+                }
                 Step::Wait(mut settled) => while settled.changed().await.is_ok() {},
             }
         }
@@ -120,8 +125,8 @@ impl SharedFluree {
                 return Step::Start(opened);
             }
         };
-        // A slot whose sender is gone was abandoned (its opener was
-        // cancelled, or its shutdown panicked): clear it and look again.
+        // A slot whose sender is gone was abandoned (its build or its
+        // shutdown panicked): clear it and look again.
         if pending.has_changed().is_err() {
             roots.remove(key);
             drop(roots);
@@ -409,6 +414,38 @@ mod tests {
         assert!(settled.is_ok(), "the shutdown stopped with its caller");
         let next_owner = lock_separately(dir.path()).expect("the shutdown released the root");
         next_owner.disconnect().await;
+    }
+
+    /// One blocking thread, held busy, queues the first open's WAL replay,
+    /// so that open is cancelled while its build holds the root.
+    #[test]
+    fn reopening_after_a_cancelled_open_waits_for_its_build() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+            });
+            let cancelled = tokio::time::timeout(std::time::Duration::ZERO, open(dir.path())).await;
+            assert!(cancelled.is_err(), "the replay was meant to be queued");
+
+            let mut reopen = std::pin::pin!(SharedFluree::open(dir.path(), without_indexing()));
+            let first_poll = tokio::time::timeout(std::time::Duration::ZERO, reopen.as_mut()).await;
+            release.send(()).unwrap();
+            busy.await.unwrap();
+            let reopened = match first_poll {
+                Ok(result) => result,
+                Err(_) => reopen.await,
+            }
+            .unwrap_or_else(|e| panic!("reopen after a cancelled open: {e}"));
+            reopened.close().await;
+        });
     }
 
     #[tokio::test(flavor = "multi_thread")]

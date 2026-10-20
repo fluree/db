@@ -740,7 +740,13 @@ writes, read between them, and commit them as one commit, use a
 Each `stage` applies its write over the ones before it (an update's `WHERE`
 sees an earlier insert), and is validated as it is staged: a write that fails
 to parse, is denied by policy, or violates SHACL returns an error and is left
-out, and the transaction carries on without it. `db()` reads the staged state.
+out, and the transaction carries on without it. Which shapes, uniqueness
+constraints and config apply is read once, from the state the transaction
+began on: a write that changes them does not change how a later write in the
+same transaction is checked. A model ledger the config names is read at the
+head the transaction's first lookup of it found. The config checks (a setting group split across
+graphs, a second value for a single-valued setting) run once, on what the
+transaction commits. `db()` reads the staged state.
 `commit` writes everything as one commit, keeping only the net change: a fact
 one write adds and a later one removes is not committed. If another commit
 lands first, a transaction that was never read is re-based over it when they
@@ -1355,8 +1361,11 @@ async fn main() -> Result<()> {
 ```
 
 `validation` is present for every non-fast-forward preview unless
-`MergePreviewOpts::include_validation` is `false`. A fast-forward adopts
-commits that were validated when they were authored, so it carries none.
+`MergePreviewOpts::include_validation` is `false`, and for a fast-forward
+when the target's config enables SHACL or uniqueness, or the commits it
+adopts carry config settings (a field the config reader reads, or a write to a config or txn-meta graph of this ledger): the merge checks them
+against the target's config as it is before the merge. Any other
+fast-forward carries none.
 
 #### Tuning the preview
 

@@ -113,10 +113,23 @@ There are two ways to target graphs in `insert` / `delete` templates:
 ```
 
 Notes:
-- `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
+- `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`), a compact IRI your `@context` expands, or a `fromNamed` alias. Relative graph names are refused. Two keywords name built-in graphs: `"default"` (the default graph) and `"config"` (the ledger's config graph).
 - The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
-- `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `["graph", "urn:default", …]` pattern in the `where`. A per-node `@graph` or a `["graph", …]` template naming `urn:default` is refused with a `400`, since the default graph is not a named graph.
+- `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `where` graph pattern (`["graph", "urn:default", …]`, or a node's `"@graph": "urn:default"`). In a template, a node's `@graph` or a `["graph", …]` naming `urn:default` is refused with a `400`, since the default graph is not a named graph. A `fromNamed` alias spelled `urn:default` that names another graph is refused with a `400` too: the name already means the default graph (listing `urn:default` itself is fine).
+- A node's graph covers the nodes nested in it: every template a node and its nested nodes produce goes to the node's `@graph`, or the enclosing scope's graph when it has none. A nested node's own `@graph` wins for its subtree, so `"@graph": "default"` on a nested node sends that subtree to the default graph.
+- A graph name can be a WHERE variable, as with SPARQL `GRAPH ?g`: `"@graph": "?g"` (or `["graph", "?g", ...]`) writes into the graph `?g` is bound to for each solution. Variables are accepted only in update templates.
+- A node-level `@graph` in `where` (on a top-level or a nested node) resolves its name exactly as in `insert` and `delete`: a compact IRI expands against the `@context`, a `fromNamed` alias matches its graph, `"config"` and `"txn-meta"` name this ledger's graphs, and `"default"` names the ledger's default graph, as `"urn:default"` does, also when a top-level `graph` or `from` gives the where another default graph (an update's `where` never reads a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph)). So `{"where": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}, "delete": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}}` deletes what an insert with the same `"@graph": "ex:g"` wrote, and `{"graph": "ex:g", "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"}, "delete": {"@id": "?s", "@graph": "default", "ex:p": "?o"}, "insert": {"@id": "?s", "ex:p": "?o"}}` moves `ex:p` from the default graph into `ex:g`. A `where` pattern cannot leave the graph an enclosing selector chose, so `"default"` inside one is refused. A `["query", …]` subquery in `where` names graphs as the `where` around it does: the same aliases and keywords, and the same refusal inside an enclosing graph. A request's `opts.unionDefaultGraph` is refused on an update with a `400`, as a SPARQL update refuses the `union-default-graph` pragma.
+- Edge annotations (`@annotation`) inside a template follow their edge into its graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "where":  [["graph", "?g", { "@id": "ex:event1", "ex:status": "?old" }]],
+  "delete": [["graph", "?g", { "@id": "ex:event1", "ex:status": "?old" }]],
+  "insert": [["graph", "?g", { "@id": "ex:event1", "ex:status": "closed" }]]
+}
+```
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)
 
@@ -138,7 +151,7 @@ Notes:
 - `from` can be:
   - a string graph IRI (shorthand for `{"graph": "<iri>"}`)
   - an object with `{"graph": "<iri>"}` (or `{"graph": ["<iri1>", "<iri2>"]}`)
-  - an array of graph IRIs/selectors (multiple graphs are evaluated as a merged default graph)
+  - an array of graph IRIs/selectors (multiple graphs are evaluated as a merged default graph); `"default"` (or `"urn:default"`) in the array adds the default graph to the merge
 - A `from` graph that doesn't exist contributes nothing, so a lone unknown `from` graph gives the `where` an empty default graph.
 - If your `insert` / `delete` templates write into the same graph as the top-level `graph`, you can omit per-template graph selection. The top-level `graph` becomes the default target for templates that don't specify `@graph` (or `["graph", ...]` sugar).
 - If you want to write to **multiple** graphs in one update, keep a top-level `graph` as the default (optional) and use per-template `["graph", ...]` for the exceptions.
@@ -173,11 +186,12 @@ Example: read from one graph, write to two graphs
 Use `fromNamed` to allow (and optionally alias) named graphs for `where` `["graph", ...]` patterns:
 
 Notes:
-- In `where` GRAPH patterns, you can reference the graph by **alias** (e.g. `"g2"`) or by the **graph IRI** (e.g. `"http://example.org/g2"`). Aliases are just convenience names for matching.
+- In `where` `["graph", …]` patterns, you can reference the graph by **alias** (e.g. `"g2"`), by the **graph IRI** (e.g. `"http://example.org/g2"`), or by a compact IRI your `@context` expands. A name a `fromNamed` entry spells (its alias, or its graph as listed) is taken as written, even when it reads as a compact IRI. Aliases are just convenience names for matching. A node-level `@graph` in `where` also takes compact IRIs and the keywords, as templates do (see the notes above).
 - In `insert` / `delete` templates, graph selection is a **write target**. You can use:
   - the full graph IRI (`"http://example.org/g2"`)
   - a compact IRI/term that expands via `@context` (e.g. `"ex:g2"`)
   - the `fromNamed` **alias** (e.g. `"g2"`) for consistency within the same update transaction
+- Each name in `fromNamed` (a graph's IRI, its alias, and the name it is listed by) must mean one graph across the list, as a query's dataset aliases must: a list that gives one name to two graphs is refused with a `400`, since the `where` and the templates would read it differently. Listing one graph twice is fine.
 
 ```json
 {

@@ -34,6 +34,9 @@ pub(crate) struct ServerMeta {
     /// The raw args passed to the `_child` process (for `restart`).
     #[serde(default)]
     pub args: Vec<String>,
+    /// The storage root the server locks, if it locks one.
+    #[serde(default)]
+    pub locked_root: Option<PathBuf>,
 }
 
 pub(crate) fn meta_path(data_dir: &Path) -> PathBuf {

@@ -959,6 +959,17 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         // Docs are embedded in the binary — no project directory needed.
         Commands::Docs { action } => commands::docs::run(action),
 
+        // Writes no ledger, so a project is optional: one found (or the
+        // global config) supplies `[doc]` and the cache.
+        Commands::Doc {
+            action: cli::DocAction::Parse(args),
+        } => {
+            let fluree_dir = match config_path {
+                Some(_) => Some(config::require_fluree_dir_or_global(config_path)?),
+                None => config::find_or_global_fluree_dir(),
+            };
+            commands::doc::run_parse(args, fluree_dir.as_ref()).await
+        }
         Commands::Doc { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::doc::run(action, &fluree_dir).await
