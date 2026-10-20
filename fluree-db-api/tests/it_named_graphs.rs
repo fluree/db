@@ -3935,7 +3935,10 @@ async fn test_writes_through_the_ledger_address_name_the_default_graph() {
         )
         .await
         .expect_err("a node @graph with an undefined prefix, no address of this ledger");
-    assert!(err.to_string().contains("does not define"), "{err}");
+    assert!(
+        err.to_string().contains("prefix 'exx' is not defined"),
+        "{err}"
+    );
     let ledger = fluree.ledger(ledger_id).await.expect("reload");
     let err = fluree
         .update(
@@ -3948,7 +3951,10 @@ async fn test_writes_through_the_ledger_address_name_the_default_graph() {
         )
         .await
         .expect_err("an undefined prefix that is no address of this ledger");
-    assert!(err.to_string().contains("does not define"), "{err}");
+    assert!(
+        err.to_string().contains("prefix 'exx' is not defined"),
+        "{err}"
+    );
     // `CREATE GRAPH` at the address is the default graph, which exists.
     let ledger = fluree.ledger(ledger_id).await.expect("reload");
     run_sparql_update(&fluree, ledger, &format!("CREATE GRAPH <{ledger_id}>")).await;
