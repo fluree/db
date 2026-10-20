@@ -3033,6 +3033,126 @@ async fn numeric_object_count_over_one_graph_and_a_union() {
     failures.assert_none();
 }
 
+/// A union member the index holds nothing of: the default graph of a ledger
+/// whose facts are all in named graphs. The index has no branch for it, and
+/// with no novelty it holds no fact, so it adds nothing to a union: the union
+/// lanes answer as if it were absent, and none declines for it.
+///
+/// g2: a and b `T`, c `U`, a's label. g3: a (the identical triple) and d `T`,
+/// d's label.
+#[tokio::test(flavor = "current_thread")]
+async fn union_lanes_over_a_member_with_no_index() {
+    let ledger_id = "it/union-member-no-index:main";
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g2> {
+            ex:a ex:kind ex:T ; ex:label "a" .
+            ex:b ex:kind ex:T .
+            ex:c ex:kind ex:U .
+        }
+        GRAPH <urn:g3> {
+            ex:a ex:kind ex:T .
+            ex:d ex:kind ex:T ; ex:label "d" .
+        }
+    "#;
+    let (fluree, handle) = indexed_trig_ledger(ledger_id, trig).await;
+    {
+        use fluree_db_binary_index::RunSortOrder;
+        let view = handle.snapshot().await;
+        let store = view.binary_store.as_ref().expect("indexed");
+        for order in [RunSortOrder::Psot, RunSortOrder::Post] {
+            assert!(
+                store.branch_for_order(0, order).is_none(),
+                "the case under test: the default graph has no {order:?} branch"
+            );
+        }
+    }
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let mut failures = Failures::default();
+    let run = |query: String| {
+        let fluree = &fluree;
+        let handle = &handle;
+        async move {
+            db(handle)
+                .await
+                .query(fluree)
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let from_all = format!("FROM <{ledger_id}> FROM <urn:g2> FROM <urn:g3>");
+    for (scope, prologue, ds) in [
+        ("M1 union default graph", UNION_PRAGMA, ""),
+        ("M2 FROM default + g2 + g3", "", from_all.as_str()),
+    ] {
+        let label = format!("{scope}: FILTER(EXISTS && ...)");
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match run(format!(
+            "{prologue}{PREFIXES}SELECT ?x {ds} WHERE {{ ?x ex:kind ?k \
+             FILTER(EXISTS {{ ?x ex:label ?l }} && ?k != ex:U) }}"
+        ))
+        .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["x"]), rows(&[&["a"], &["d"]]), &label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        check_exists_routing(
+            &mut failures,
+            &label,
+            &exists_stamps(&store, before),
+            ExistsLane::Union,
+        );
+
+        let label = format!("{scope}: the bound-object count");
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match run(format!(
+            "{prologue}{PREFIXES}SELECT (COUNT(?s) AS ?n) {ds} WHERE {{ ?s ex:kind ex:T }}"
+        ))
+        .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["n"]), rows(&[&["3"]]), &label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        check_object_count_routing(
+            &mut failures,
+            &label,
+            &store,
+            before,
+            ObjectCount::Union(Some("merge")),
+        );
+
+        let label = format!("{scope}: the grouped top-k");
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match run(format!(
+            "{prologue}{PREFIXES}SELECT ?o (COUNT(?s) AS ?n) {ds} \
+             WHERE {{ ?s ex:kind ?o }} GROUP BY ?o ORDER BY DESC(?n) LIMIT 5"
+        ))
+        .await
+        {
+            Ok(json) => failures.eq(
+                sparql_rows(&json, &["o", "n"]),
+                rows(&[&["T", "3"], &["U", "1"]]),
+                &label,
+            ),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        check_count_routing(
+            &mut failures,
+            &label,
+            &store,
+            before,
+            TOPK_SITES,
+            ObjectCount::Union(None),
+        );
+    }
+    failures.assert_none();
+}
+
 /// One count-lane case: the lane's routing site, a label, the query, its
 /// columns, the answer, and whether the lane must answer (`true`) or decline.
 type CountLaneCase = (
