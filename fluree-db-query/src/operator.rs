@@ -24,7 +24,7 @@ pub struct CountGroup {
 }
 
 /// What one row of a triple pattern's scan needs beside its bindings to name
-/// the fact it matched. Storage's fact identity (AJ-66) is one fact per value
+/// the fact it matched. Storage's fact identity is one fact per value
 /// and list position. The bindings carry neither the term a constant object
 /// matched (a constant can match terms of several datatypes: `1` matches
 /// `1` and `1.0e0`) nor the list position, so two facts can bind one row.
