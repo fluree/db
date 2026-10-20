@@ -13,7 +13,7 @@ use crate::{
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
-    ContentId, ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
+    ContentId, ContentStore, DictNovelty, IndexType, LedgerId, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
     DEFAULT_GRAPH_IRI, TXN_META_GRAPH_ID,
 };
 use fluree_db_query::ir::ReasoningModes;
@@ -50,22 +50,24 @@ enum GraphRef {
 /// the ledger cache did not serve the load (a `t` below the head; a
 /// connection built `without_ledger_caching`, as the CLI's is), and could read
 /// one ledger at two `t`s when a commit landed between two loads.
+///
+/// Keyed by the parsed [`LedgerId`], so `ledger` and `ledger:main` are one
+/// ledger here.
 #[derive(Default)]
 pub(crate) struct LedgerLoads {
-    loads: Vec<(String, Option<TimeSpec>, GraphDb)>,
+    loads: Vec<(LedgerId, Option<TimeSpec>, GraphDb)>,
 }
 
 impl LedgerLoads {
-    fn get(&self, ledger_id: &str, spec: Option<&TimeSpec>) -> Option<GraphDb> {
+    fn get(&self, ledger_id: &LedgerId, spec: Option<&TimeSpec>) -> Option<GraphDb> {
         self.loads
             .iter()
             .find(|(id, at, _)| id == ledger_id && at.as_ref() == spec)
             .map(|(_, _, view)| view.clone())
     }
 
-    fn insert(&mut self, ledger_id: &str, spec: Option<&TimeSpec>, view: &GraphDb) {
-        self.loads
-            .push((ledger_id.to_owned(), spec.cloned(), view.clone()));
+    fn insert(&mut self, ledger_id: LedgerId, spec: Option<&TimeSpec>, view: &GraphDb) {
+        self.loads.push((ledger_id, spec.cloned(), view.clone()));
     }
 }
 
@@ -617,14 +619,19 @@ impl Fluree {
         loads: &mut LedgerLoads,
     ) -> Result<GraphDb> {
         let (ledger_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let view = match loads.get(ledger_id, spec) {
+        // An id that does not parse is loaded on its own and not shared; the
+        // load reports it as it always has.
+        let key = LedgerId::parse(ledger_id).ok();
+        let view = match key.as_ref().and_then(|key| loads.get(key, spec)) {
             Some(view) => view,
             None => {
                 let view = match spec {
                     None => self.load_graph_db(ledger_id).await?,
                     Some(spec) => self.load_graph_db_at(ledger_id, spec.clone()).await?,
                 };
-                loads.insert(ledger_id, spec, &view);
+                if let Some(key) = key {
+                    loads.insert(key, spec, &view);
+                }
                 view
             }
         };

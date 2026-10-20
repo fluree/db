@@ -407,5 +407,16 @@ async fn from_several_graphs_shares_one_load_of_the_ledger() {
         scope_of(&uncached, &from_two_graphs(Some(1))).await,
         "query=union/2/stale",
     );
+    // One ledger spelled two ways (`it/index-scope` names the `main` branch).
+    let spelled_twice = DatasetSpec::new()
+        .with_default(
+            GraphSource::new("it/index-scope").with_graph(GraphSelector::Iri("urn:g1".into())),
+        )
+        .with_default(GraphSource::new(LEDGER).with_graph(GraphSelector::Iri("urn:g2".into())));
+    expect(
+        "without the ledger cache, one ledger spelled two ways",
+        scope_of(&uncached, &spelled_twice).await,
+        "query=union/2/current",
+    );
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
