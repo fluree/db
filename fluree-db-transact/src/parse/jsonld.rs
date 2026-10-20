@@ -14,8 +14,8 @@
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
 use crate::ir::{
-    GraphName, GraphScope, GraphSel, InlineValues, TemplateGraph, TemplateTerm, TripleTemplate,
-    Txn, TxnOpts, TxnType, WriteGraphs,
+    AddressName, GraphName, GraphScope, GraphSel, InlineValues, TemplateGraph, TemplateTerm,
+    TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::dataset_ref::GraphIri;
@@ -441,7 +441,7 @@ fn parse_data(
         .with_vars(vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    (txn.write_graphs, txn.address_graph_names) = write_graphs.into_parts();
+    txn.write_graphs = write_graphs.into_iris();
     Ok(txn)
 }
 
@@ -574,7 +574,7 @@ fn parse_update(
         .with_vars(clauses.vars)
         .with_opts(opts)
         .with_txn_meta(txn_meta);
-    (txn.write_graphs, txn.address_graph_names) = clauses.write_graphs.into_parts();
+    txn.write_graphs = clauses.write_graphs.into_iris();
     txn.update_where_default_graph_iris = Some(where_default_graph_iris);
     txn.update_where_named_graphs = where_named_graphs;
     txn.update_where_names_ledger_default = reads_ledger_default_by_name;
@@ -1141,31 +1141,25 @@ impl<'a> TemplateParseCtx<'a> {
     /// 4. Anything else expands as a node identifier (`@id`-style,
     ///    `@base`-relative) and must be an absolute IRI.
     ///
-    /// Under strict compact-IRI checking, a name whose prefix the `@context`
-    /// does not define is refused, unless it reads as a ledger address
-    /// (`mydb:main`, `mydb:main#<g>`): that is kept as written and noted
-    /// ([`WriteGraphs::note_address_name`]), and staging accepts it only as
-    /// this ledger's own address, the way a `from` source reads.
+    /// A name that expands to no absolute IRI (no scheme, as `mydb#config`, or
+    /// under strict compact-IRI checking a prefix the `@context` does not
+    /// define, as `mydb:main`) but is an address of the ledger being written is
+    /// that address ([`GraphName::Address`]), the way a `from` source reads;
+    /// any other is refused as it is.
     fn resolve_graph_name(&mut self, raw: &str, role: GraphRole) -> Result<GraphName> {
         use fluree_db_query::parse::WrittenGraphName as W;
-        let classify = |strict: bool| {
-            fluree_db_query::parse::classify_written_graph_name(
-                raw,
-                self.from_named_aliases,
-                self.context,
-                strict,
-            )
-        };
-        let written = match classify(self.strict_compact_iri) {
+        let written = match fluree_db_query::parse::classify_written_graph_name(
+            raw,
+            self.from_named_aliases,
+            self.context,
+            self.strict_compact_iri,
+        ) {
             Ok(written) => written,
-            Err(_) if self.strict_compact_iri && reads_as_ledger_address(raw) => {
-                let written = classify(false)?;
-                if let W::Expanded(iri) = &written {
-                    self.write_graphs.note_address_name(iri);
-                }
-                written
+            Err(refused) => {
+                return AddressName::parse(raw, self.ledger_id)
+                    .map(GraphName::Address)
+                    .ok_or_else(|| refused.into())
             }
-            Err(refused) => return Err(refused.into()),
         };
         match written {
             W::Var(var) => match role {
@@ -1179,9 +1173,9 @@ impl<'a> TemplateParseCtx<'a> {
                      a graph IRI, not the variable {raw:?}"
                 ))),
             },
-            W::Alias { iri, .. } => named_graph(raw, iri),
+            W::Alias { iri, .. } => self.named_graph(raw, iri),
             W::Default => Ok(GraphName::Default),
-            W::Config => named_graph(
+            W::Config => self.named_graph(
                 raw,
                 &fluree_db_core::graph_registry::config_graph_iri(self.ledger_id),
             ),
@@ -1190,7 +1184,7 @@ impl<'a> TemplateParseCtx<'a> {
                  target; transaction metadata goes in the \"txn-meta\" sidecar",
                 fluree_db_core::graph_registry::txn_meta_graph_iri(self.ledger_id)
             ))),
-            W::Expanded(iri) => named_graph(raw, &iri),
+            W::Expanded(iri) => self.named_graph(raw, &iri),
         }
     }
 
@@ -1219,8 +1213,24 @@ impl<'a> TemplateParseCtx<'a> {
                     .to_string(),
             ));
         }
-        let name = named_graph(iri, iri)?;
+        let name = self.named_graph(iri, iri)?;
         Ok((!empty).then(|| self.write_graphs.scope(name)))
+    }
+
+    /// A graph named by `raw`, resolved to `iri`: that IRI when it is
+    /// absolute, else the address of this ledger `iri` is
+    /// ([`GraphName::Address`]).
+    fn named_graph(&self, raw: &str, iri: &str) -> Result<GraphName> {
+        GraphIri::parse(iri).map(GraphName::Iri).or_else(|e| {
+            AddressName::parse(iri, self.ledger_id)
+                .map(GraphName::Address)
+                .ok_or_else(|| {
+                    TransactError::Parse(format!(
+                        "graph {raw:?} does not name an absolute IRI ({e}); use a full IRI, a \
+                         compact IRI whose prefix the @context defines, \"default\", or \"config\""
+                    ))
+                })
+        })
     }
 
     /// The scope a graph selector written in this clause opens.
@@ -1236,22 +1246,6 @@ impl<'a> TemplateParseCtx<'a> {
             _ => Ok(scope),
         }
     }
-}
-
-/// Whether a graph name reads as a ledger address (`mydb`, `mydb:main`,
-/// `urn:fluree:mydb:main#<g>`): see [`TemplateParseCtx::resolve_graph_name`].
-fn reads_as_ledger_address(value: &str) -> bool {
-    fluree_db_core::MemberRef::parse(value).is_ok_and(|member| member.address().is_some())
-}
-
-/// A graph named by `raw`, resolved to `iri`, which must be absolute.
-fn named_graph(raw: &str, iri: &str) -> Result<GraphName> {
-    GraphIri::parse(iri).map(GraphName::Iri).map_err(|e| {
-        TransactError::Parse(format!(
-            "graph {raw:?} does not name an absolute IRI ({e}); use a full IRI, a compact IRI \
-             whose prefix the @context defines, \"default\", or \"config\""
-        ))
-    })
 }
 
 /// First blank-node label appearing in any template term, if one exists.

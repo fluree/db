@@ -740,17 +740,6 @@ pub async fn stage_with_graph_delta(
                 iri,
             )
         };
-        // A graph name the JSON-LD parser kept as written only because it
-        // reads as a ledger address must be an address of this ledger.
-        if let Some(name) = txn.address_graph_names.iter().find(|name| {
-            !TargetLedger::new(&ledger.snapshot.ledger_id, &graph_names).names_this_ledger(name)
-        }) {
-            return Err(TransactError::Parse(format!(
-                "graph \"{name}\" is a compact IRI whose prefix the @context does not define \
-                 (strict compact-IRI mode), and no address of this ledger ('{}')",
-                ledger.snapshot.ledger_id
-            )));
-        }
         resolve_write_graphs(&mut txn, &write_table, &mut ns_registry)?;
 
         // B2 (data writes): `#txn-meta` is never a write target (see

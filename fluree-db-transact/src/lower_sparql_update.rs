@@ -1084,7 +1084,6 @@ fn lower_insert_data(
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
-        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1141,7 +1140,6 @@ fn lower_delete_data(
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
-        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1246,7 +1244,6 @@ fn lower_delete_where(
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
-        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1313,7 +1310,6 @@ fn lower_delete_where_with_graphs(
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
-        address_graph_names: BTreeSet::new(),
     })
 }
 
@@ -1569,7 +1565,6 @@ fn lower_modify(
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
-        address_graph_names: BTreeSet::new(),
     })
 }
 

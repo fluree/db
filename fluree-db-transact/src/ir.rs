@@ -229,14 +229,6 @@ pub struct Txn {
     /// Reserved system graphs are rejected at staging. `None` for every
     /// ordinary transaction.
     pub sync_graph: Option<GraphSel>,
-
-    /// Graph names a JSON-LD update wrote as a ledger address that strict
-    /// compact-IRI expansion refuses (`"graph": "mydb:main"` with no `mydb`
-    /// prefix in the `@context`). The parser keeps each as written, as it
-    /// keeps a `from` source, and staging accepts it only as an address of
-    /// the ledger being written (its default graph, or `L#<g>`); any other is
-    /// the undefined-prefix error strict expansion would have raised.
-    pub address_graph_names: BTreeSet<String>,
 }
 
 /// A SPARQL graph-management operation, executed by whole-graph scan/re-home
@@ -322,7 +314,6 @@ impl Txn {
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
-            address_graph_names: BTreeSet::new(),
         }
     }
 
@@ -586,16 +577,45 @@ pub enum TemplateGraph {
 }
 
 /// A write-side graph name after resolution: the default graph, a named
-/// graph by absolute IRI (the ledger's config graph included), or a WHERE
-/// variable (`GRAPH ?g`, update templates only).
+/// graph by absolute IRI (the ledger's config graph included), a ledger
+/// address, or a WHERE variable (`GRAPH ?g`, update templates only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphName {
     /// The default graph.
     Default,
     /// A named graph.
     Iri(fluree_db_core::dataset_ref::GraphIri),
+    /// An address of the ledger being written that expands to no absolute IRI.
+    Address(AddressName),
     /// The graph a WHERE variable binds.
     Var(VarId),
+}
+
+/// A graph name written as an address of the ledger being written that
+/// expands to no absolute IRI: `mydb#config` or a bare `mydb` (no scheme), or
+/// `mydb:main` under strict compact-IRI checking with no `mydb` prefix in the
+/// `@context`. It is kept as written, as a `from` source is, and staging reads
+/// it through the ledger's graph-position table like any graph IRI (the
+/// ledger's own address writes its default graph, `L#config` the config
+/// graph, `L#<g>` the graph `<g>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressName(Arc<str>);
+
+impl AddressName {
+    /// `written`, if it is an address of the ledger `ledger_id`, in any
+    /// spelling. Another ledger's address is not one: it stays the name it
+    /// is, which expands to no absolute IRI.
+    pub fn parse(written: &str, ledger_id: &str) -> Option<Self> {
+        let ledger = fluree_db_core::LedgerId::parse(ledger_id).ok()?;
+        let no_graphs = |_: &str| None;
+        fluree_db_core::TargetLedger::new(&ledger, &no_graphs)
+            .names_this_ledger(written)
+            .then(|| Self(written.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The graph every template of one lexical scope is written to.
@@ -693,8 +713,6 @@ pub(crate) fn is_reifies_subject(p: &Sid) -> bool {
 #[derive(Debug, Default)]
 pub struct WriteGraphs {
     interned: std::collections::HashMap<String, Arc<str>>,
-    /// See [`Txn::address_graph_names`].
-    address_names: BTreeSet<String>,
 }
 
 impl WriteGraphs {
@@ -710,33 +728,29 @@ impl WriteGraphs {
             GraphName::Var(var) => GraphScope {
                 graph: TemplateGraph::Var(var),
             },
-            GraphName::Iri(iri) => {
-                let interned = match self.interned.get(iri.as_str()) {
-                    Some(interned) => Arc::clone(interned),
-                    None => {
-                        let interned = Arc::clone(iri.as_arc());
-                        self.interned
-                            .insert(iri.as_str().to_string(), Arc::clone(&interned));
-                        interned
-                    }
-                };
-                GraphScope {
-                    graph: TemplateGraph::Iri(interned),
-                }
+            GraphName::Iri(iri) => GraphScope {
+                graph: TemplateGraph::Iri(self.intern(iri.as_arc())),
+            },
+            GraphName::Address(address) => GraphScope {
+                graph: TemplateGraph::Iri(self.intern(&address.0)),
+            },
+        }
+    }
+
+    /// `name`, registered as a write target, shared with every scope of it.
+    fn intern(&mut self, name: &Arc<str>) -> Arc<str> {
+        match self.interned.get(&**name) {
+            Some(interned) => Arc::clone(interned),
+            None => {
+                self.interned.insert(name.to_string(), Arc::clone(name));
+                Arc::clone(name)
             }
         }
     }
 
-    /// Note a graph name kept as written because it reads as a ledger
-    /// address that strict expansion refuses ([`Txn::address_graph_names`]).
-    pub fn note_address_name(&mut self, name: &str) {
-        self.address_names.insert(name.to_string());
-    }
-
-    /// The registered named-graph IRIs, for [`Txn::write_graphs`], and the
-    /// names kept as ledger addresses, for [`Txn::address_graph_names`].
-    pub fn into_parts(self) -> (BTreeSet<String>, BTreeSet<String>) {
-        (self.interned.into_keys().collect(), self.address_names)
+    /// The registered named-graph IRIs, for [`Txn::write_graphs`].
+    pub fn into_iris(self) -> BTreeSet<String> {
+        self.interned.into_keys().collect()
     }
 }
 

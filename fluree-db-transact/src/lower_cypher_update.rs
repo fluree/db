@@ -222,7 +222,6 @@ impl<'a> CypherLowering<'a> {
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
-            address_graph_names: Default::default(),
         }
     }
 
