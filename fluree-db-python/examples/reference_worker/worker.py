@@ -15,8 +15,9 @@ make up the example program, a claims review:
     retained extractions and reference data, at an explicit evaluation time.
     It never calls the model, so a new gate version replays over the same
     pinned inputs. Evidence that is missing (no text, no extraction, fewer
-    documents than the case expects) makes a case ``indeterminate``; it is
-    never read as the absence of a problem.
+    documents than the case expects), ambiguous (two texts for one document)
+    or partial (a vendor without an amount) makes a case ``indeterminate``;
+    it is never read as the absence of a problem.
 
 Every run records what it read and how: the ledger and transaction its
 inputs were pinned to, the evaluation time, the program, code, engine and
@@ -119,34 +120,59 @@ def pin(ledger: fluree.Ledger, manifest: Manifest) -> fluree.Snapshot:
 
 @dataclass(frozen=True)
 class Document:
+    """A document with every received time and text it has. Each should have
+    one; a document with two is ambiguous evidence, not two documents."""
+
     iri: str
-    received: datetime | None
-    text: str | None
+    received: tuple[datetime, ...]
+    texts: tuple[str, ...]
+
+    @property
+    def text(self) -> str | None:
+        """The document's text, if it has exactly one."""
+        return self.texts[0] if len(self.texts) == 1 else None
 
 
 @dataclass(frozen=True)
 class Case:
     iri: str
-    expected: int
+    expected: tuple[int, ...]
     documents: tuple[Document, ...]
 
 
 def cases(snapshot: fluree.Snapshot) -> list[Case]:
-    """Every case, with the number of documents it expects and those it has."""
+    """Every case, with the number of documents it expects and those it has.
+
+    The query returns a row for each combination of a case's and a
+    document's values, so the rows are grouped by case and by document."""
     rows = snapshot.query(
         PREFIXES + "SELECT ?case ?expected ?doc ?received ?text WHERE { "
         "?case a ex:Case ; ex:expectedDocuments ?expected . "
         "OPTIONAL { ?doc ex:case ?case "
         "  OPTIONAL { ?doc ex:receivedAt ?received } OPTIONAL { ?doc ex:text ?text } } }"
     )
-    expected: dict[str, int] = {}
-    docs: dict[str, list[Document]] = {}
+    expected: dict[str, set[int]] = {}
+    docs: dict[str, dict[str, tuple[set[datetime], set[str]]]] = {}
     for case, count, doc, received, text in rows:
-        expected[case] = count
-        found = docs.setdefault(case, [])
+        expected.setdefault(case, set()).add(count)
+        found = docs.setdefault(case, {})
         if doc is not None:
-            found.append(Document(doc, received, text))
-    return [Case(iri, expected[iri], tuple(docs[iri])) for iri in sorted(expected)]
+            times, texts = found.setdefault(doc, (set(), set()))
+            if received is not None:
+                times.add(received)
+            if text is not None:
+                texts.add(text)
+    return [
+        Case(
+            iri,
+            tuple(sorted(expected[iri])),
+            tuple(
+                Document(doc, tuple(sorted(times)), tuple(sorted(texts)))
+                for doc, (times, texts) in sorted(docs[iri].items())
+            ),
+        )
+        for iri in sorted(expected)
+    ]
 
 
 def retained_extractions(snapshot: fluree.Snapshot, graph: str) -> dict[tuple[str, str, str], dict[str, Any]]:
@@ -191,23 +217,39 @@ def reference_data(snapshot: fluree.Snapshot) -> Reference:
     return Reference(frozenset(name for (name,) in vendors), Decimal(str(threshold[0][0])))
 
 
+FIELDS = ("vendor", "amount")
+
+
 def gaps(case: Case, extraction_of: Callable[[Document], Extraction | None], clock: datetime) -> list[str]:
-    """Why the evidence for a case is incomplete at ``clock``."""
-    found = [f"missing-received-time:{d.iri}" for d in case.documents if d.received is None]
+    """Why the evidence for a case is incomplete or ambiguous at ``clock``."""
+    found: list[str] = []
+    for doc in case.documents:
+        if not doc.received:
+            found.append(f"missing-received-time:{doc.iri}")
+        elif len(doc.received) > 1:
+            found.append(f"ambiguous-received-time:{doc.iri}")
     received = received_by(case, clock)
-    if len(received) < case.expected:
-        found.append(f"incomplete-coverage:{len(received)}/{case.expected}")
+    if len(case.expected) > 1:
+        found.append("ambiguous-expected-documents")
+    elif len(received) < case.expected[0]:
+        found.append(f"incomplete-coverage:{len(received)}/{case.expected[0]}")
     for doc in received:
-        if doc.text is None:
+        if not doc.texts:
             found.append(f"missing-text:{doc.iri}")
-        elif extraction_of(doc) is None:
+        elif len(doc.texts) > 1:
+            found.append(f"ambiguous-text:{doc.iri}")
+        elif (extraction := extraction_of(doc)) is None:
             found.append(f"missing-extraction:{doc.iri}")
+        elif 0 < sum(extraction.get(key) is not None for key in FIELDS) < len(FIELDS):
+            # The model read some fields and not others; a missing vendor is
+            # not an approved one, and a missing amount is not zero.
+            found.append(f"partial-extraction:{doc.iri}")
     return found
 
 
 def received_by(case: Case, clock: datetime) -> list[Document]:
-    """The documents that had arrived at ``clock``; later ones do not count yet."""
-    return [d for d in case.documents if d.received is not None and d.received <= clock]
+    """The documents known to have arrived at ``clock``; later ones do not count yet."""
+    return [d for d in case.documents if len(d.received) == 1 and d.received[0] <= clock]
 
 
 def per_document_limit(amounts: list[Decimal], limit: Decimal) -> bool:
@@ -321,7 +363,7 @@ def run_extract(ledger: fluree.Ledger, manifest: Manifest, model: Model) -> Publ
     nodes = []
     for doc in (d for case in cases(snapshot) for d in case.documents):
         if doc.text is None:
-            continue
+            continue  # no text, or several: the gate reports it
         digest = text_hash(doc.text)
         extraction: Extraction | None = retained.get((doc.iri, manifest.model, digest))
         if extraction is None:
@@ -334,7 +376,7 @@ def run_extract(ledger: fluree.Ledger, manifest: Manifest, model: Model) -> Publ
             W + "model": manifest.model,
             W + "textHash": digest,
         }
-        for key in ("vendor", "amount"):
+        for key in FIELDS:
             if extraction.get(key) is not None:
                 node[W + key] = extraction[key]
         nodes.append(node)
@@ -376,11 +418,12 @@ INVOICE = re.compile(r"from (?P<vendor>[A-Z][\w ]*?) for (?P<amount>\d+(?:\.\d+)
 
 
 def toy_model(text: str) -> Extraction | None:
-    """Reads ``from <Vendor> for <amount>``; finding neither is a result too."""
+    """Reads ``from <Vendor> for <amount>``. Text that is not an invoice has
+    nothing to extract; an invoice it cannot read gets no answer."""
     match = INVOICE.search(text)
-    if match is None:
-        return {}
-    return {"vendor": match["vendor"], "amount": Decimal(match["amount"])}
+    if match is not None:
+        return {"vendor": match["vendor"], "amount": Decimal(match["amount"])}
+    return None if "invoice" in text.lower() else {}
 
 
 def main(argv: list[str] | None = None) -> None:

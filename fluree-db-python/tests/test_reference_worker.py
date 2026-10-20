@@ -6,6 +6,7 @@ import dataclasses
 import importlib.util
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,55 @@ def test_retained_extractions_are_reused_until_the_text_changes(ledger):
     assert model.calls == ["Invoice from Acme for 900.00"]
 
 
+def test_a_document_with_two_values_is_one_ambiguous_document(ledger):
+    """A second text is not a second document, and its extraction is not
+    mixed with the first's; nor is a second received time or count."""
+    ledger.update(
+        P + 'INSERT DATA { ex:doc4a ex:text "Invoice from Acme for 20.00" . '
+        'ex:doc3a ex:text "Invoice from Acme for 5000.00" . '
+        'ex:doc1b ex:receivedAt "2026-06-21T10:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> . '
+        "ex:case2 ex:expectedDocuments 3 }"
+    )
+    model = Model()
+    worker.run_extract(ledger, MANIFEST, model)
+    assert len(model.calls) == 5  # neither of doc3a's texts, nor doc4a's
+    extracted = ledger.query(P + f"SELECT ?doc WHERE {{ GRAPH <{EXTRACTIONS}> {{ ?x w:document ?doc }} }}")
+    assert not {EX + "doc3a", EX + "doc4a"} & {doc for (doc,) in extracted}
+
+    worker.run_gate(ledger, MANIFEST)
+    found = outcomes(ledger)
+    assert found["case1"] == ("indeterminate", ["ambiguous-received-time:ex:doc1b", "incomplete-coverage:1/2"])
+    assert found["case2"] == ("indeterminate", ["ambiguous-expected-documents"])
+    assert found["case3"] == ("indeterminate", ["ambiguous-text:ex:doc3a"])
+    assert found["case4"] == ("indeterminate", ["ambiguous-text:ex:doc4a", "incomplete-coverage:1/2"])
+
+
+def test_a_partial_extraction_is_not_a_clearance(ledger):
+    """A vendor without an amount, or an amount without a vendor, leaves the
+    gate unable to check the other."""
+
+    def model(text):
+        found = worker.toy_model(text)
+        if "Initech" in text:
+            return {"amount": found["amount"]}
+        if "Acme for 10.00" in text:
+            return {"vendor": found["vendor"]}
+        return found
+
+    worker.run_extract(ledger, MANIFEST, model)
+    worker.run_gate(ledger, MANIFEST)
+    found = outcomes(ledger)
+    assert found["case3"] == ("indeterminate", ["partial-extraction:ex:doc3a"])
+    assert found["case4"] == ("indeterminate", ["incomplete-coverage:1/2", "partial-extraction:ex:doc4a"])
+    assert found["case6"] == ("cleared", [])  # nothing to extract is a complete answer
+
+
+def test_the_toy_model_does_not_answer_for_an_invoice_it_cannot_read():
+    assert worker.toy_model("Invoice from Initech for 50.00") == {"vendor": "Initech", "amount": Decimal("50.00")}
+    assert worker.toy_model("Invoice from Initech for $50.00") is None
+    assert worker.toy_model("Thank you for your order.") == {}
+
+
 def test_unavailable_evidence_is_never_a_clearance(ledger):
     model = Model(unavailable={"Thank you for your order."})
     worker.run_extract(ledger, MANIFEST, model)
@@ -172,7 +222,10 @@ def test_a_failed_run_leaves_the_previous_generation(ledger):
     t = ledger.snapshot().t
 
     model.broken = True
-    ledger.update(P + 'INSERT DATA { ex:doc6a ex:text "Invoice from Acme for 5.00" }')
+    ledger.update(
+        P + 'DELETE { ex:doc6a ex:text ?t } INSERT { ex:doc6a ex:text "Invoice from Acme for 5.00" } '
+        "WHERE { ex:doc6a ex:text ?t }"
+    )
     with pytest.raises(RuntimeError, match="the model is down"):
         worker.run_extract(ledger, MANIFEST, model)
     assert ledger.snapshot().t == t + 1

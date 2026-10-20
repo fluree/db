@@ -38,8 +38,10 @@ A stage that follows it can be rerun, replayed and audited:
   started from refuses to publish over it.
 - **Missing evidence is not an answer.** A document with no text, an
   extraction the model could not produce, or fewer documents than a case
-  expects makes the case `indeterminate`. Only a completed search that finds
-  nothing counts as nothing found.
+  expects makes the case `indeterminate`. So does evidence that is
+  ambiguous or partial: a document with two texts or two received times, or
+  an extraction with a vendor and no amount, or an amount and no vendor.
+  Only a completed search that finds nothing counts as nothing found.
 
 ## The example program
 
@@ -75,7 +77,9 @@ with fluree.connect("./data") as conn:
 ```
 
 `toy_model` stands in for a real model. Pass any function from text to a
-dict of extracted fields, or `None` when it cannot answer.
+dict of extracted fields, or `None` when it cannot answer. The toy model
+returns `{}` for text that is not an invoice, and `None` for an invoice it
+cannot read.
 
 The example directory has the worker, a manifest and sample data. To run it
 from the command line:
