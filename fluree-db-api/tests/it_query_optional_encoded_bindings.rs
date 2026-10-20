@@ -2672,10 +2672,10 @@ async fn object_count_over_one_graph_and_a_union() {
         check_object_count_routing(&mut failures, label, &store, before, lane);
     }
 
-    // The grouped twin: `GROUP BY ?o` with `COUNT(?s)`, top k. Over a union
-    // its dedup key is the row `(?s, ?o)`, so a group counts the distinct
-    // subjects holding that object in some member, and two datatypes of one
-    // number are two groups.
+    // The grouped twin: `GROUP BY ?o` with `COUNT(?s)`, top k. Over a union a
+    // group counts the facts holding that object in some member, each once
+    // (one fact per value and list position), and two datatypes of one number
+    // are two groups.
     let topk = |prologue: &str, ds: &str, pred: &str| {
         format!(
             "{prologue}{PREFIXES}SELECT ?o (COUNT(?s) AS ?n) {ds} \
