@@ -106,6 +106,7 @@ pub async fn run(
                 {
                     print_link_reindex_warning(&remote_alias);
                 }
+                print_config_diagnostics(&info);
 
                 // Print full JSON if there are stats
                 if info.get("stats").is_some() {
@@ -158,6 +159,24 @@ pub async fn run(
                     }
                     None => println!("Index ID:       (none)"),
                 }
+                // Only the config diagnostics, not the full ledger-info stats:
+                // the ledger is loaded, and its config graph read.
+                let diagnostics = match fluree.ledger(&ledger_id).await {
+                    Ok(ledger) => fluree_db_api::config_resolver::diagnose(
+                        &ledger.snapshot,
+                        ledger.novelty.as_ref(),
+                        ledger.t(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                match diagnostics {
+                    Ok(diagnostics) => print_config_diagnostics(
+                        &serde_json::json!({ "configDiagnostics": diagnostics }),
+                    ),
+                    Err(e) => eprintln!("warning: config diagnostics unavailable: {e}"),
+                }
             } else if let Some(gs) = fluree.nameservice().lookup_graph_source(&ledger_id).await? {
                 if graph.is_some() {
                     return Err(CliError::Usage(
@@ -183,4 +202,28 @@ fn print_link_reindex_warning(ledger: &str) {
         "Warning:        index predates RDF 1.2 triple-term links; annotations cannot be \
          read until `fluree reindex {ledger}`"
     );
+}
+
+/// Degenerate config-graph state (ledger info's `configDiagnostics`),
+/// printed only when there is some: for a local ledger, and for a tracked
+/// one from the server's ledger info.
+fn print_config_diagnostics(info: &serde_json::Value) {
+    let Some(diagnostics) = info
+        .get("configDiagnostics")
+        .and_then(serde_json::Value::as_array)
+        .filter(|d| !d.is_empty())
+    else {
+        return;
+    };
+    println!();
+    println!("Config diagnostics:");
+    for diagnostic in diagnostics {
+        println!(
+            "  - {}",
+            diagnostic
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        );
+    }
 }

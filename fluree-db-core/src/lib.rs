@@ -34,6 +34,7 @@ pub mod comparator;
 pub mod conflict_key;
 pub mod content_id;
 pub mod content_kind;
+pub mod dataset_ref;
 pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
@@ -221,7 +222,10 @@ pub use storage::{
     STORAGE_METHOD_S3,
 };
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use storage::{FileStorage, STORAGE_METHOD_FILE};
+pub use storage::{
+    FileStorage, RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE,
+    STORAGE_METHOD_FILE,
+};
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
 pub use tracking::{

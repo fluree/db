@@ -260,6 +260,7 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         | SubmissionError::CommitNotFound { message }
         | SubmissionError::Fenced { message }
         | SubmissionError::LifecycleConflict { message }
+        | SubmissionError::ConfigUnavailable { message }
         | SubmissionError::CommitContention { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
@@ -1604,6 +1605,12 @@ mod tests {
             message: "d".into()
         }
         .is_settled());
+        // A config read failure is decided before commit construction too:
+        // settled, so a keyed retry re-executes the submission.
+        assert!(SubmissionError::ConfigUnavailable {
+            message: "c".into()
+        }
+        .is_settled());
     }
 
     /// The `execution_failure` flattening must route novelty refusals by
@@ -1647,6 +1654,18 @@ mod tests {
         assert!(matches!(
             f(ApiError::Transact(TransactError::EmptyTransaction)),
             SubmissionError::Execution { status: 400, .. }
+        ));
+        // A config read failure keeps its identity through the flattening,
+        // from the staging lanes and from the policy context alike.
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::ConfigUnavailable(
+                "read failed".into()
+            ))),
+            SubmissionError::ConfigUnavailable { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::ConfigUnavailable("read failed".into())),
+            SubmissionError::ConfigUnavailable { .. }
         ));
     }
 

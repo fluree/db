@@ -222,6 +222,7 @@ impl Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
         skolem_txn_id: Option<String>,
+        request: Option<&crate::tx::RequestGovernance>,
     ) -> Result<SequentialOutcome> {
         let update = &plan.update;
         let span = plan.span;
@@ -240,7 +241,12 @@ impl Fluree {
         // reconstructible for row threading.
         let skolem_base = skolem_txn_id.unwrap_or_else(crate::cypher_write::fresh_skolem_txn_id);
 
-        let mut stager = SequentialStager::new(ledger);
+        // Inside an enclosing request (a transaction), its governance and its
+        // config guard apply; otherwise this statement is the request.
+        let mut stager = match request {
+            Some(request) => SequentialStager::within(ledger, request),
+            None => SequentialStager::new(ledger),
+        };
 
         // ---- 1. Read prefix → initial row table --------------------------
         let mut table = if update.read_clauses.is_empty() {

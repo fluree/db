@@ -1,14 +1,12 @@
 //! End-to-end cross-ledger SHACL shape enforcement.
 //!
 //! Data ledger D's `#config` declares `f:shapesSource` with
-//! `f:ledger` pointing at model ledger M's shapes graph. The
-//! cross-ledger dispatch happens at the API boundary
-//! (`stage_with_config_shacl`): we resolve M's shapes to an
-//! IRI-form wire artifact before staging, thread the wire into
-//! `StagedShaclContext`, then at SHACL validation time compile
-//! the wire against the *staged* `NamespaceRegistry` (which has
-//! D's snapshot namespaces plus any IRIs the in-flight
-//! transaction introduced).
+//! `f:ledger` pointing at model ledger M's shapes graph. The SHACL
+//! pass (`apply_shacl_policy_to_staged_view`) resolves M's shapes to
+//! an IRI-form wire artifact once a graph the transaction writes has
+//! SHACL enabled, then compiles the wire against the *staged*
+//! `NamespaceRegistry` (which has D's snapshot namespaces plus any
+//! IRIs the in-flight transaction introduced).
 
 #![cfg(all(feature = "native", feature = "shacl"))]
 
@@ -1052,6 +1050,82 @@ async fn recreated_model_ledger_shapes_reject_what_the_cached_compile_passed() {
     );
 }
 
+/// A transaction reads a model ledger at the head its first cross-ledger
+/// lookup found, for every operation it stages, as it reads its own ledger's
+/// governance from the state it began on: a shape the model activates while
+/// the transaction is open does not apply to the transaction's later
+/// operations, also after a rollback stages the earlier ones again. A
+/// transaction begun after that enforces it.
+#[tokio::test]
+async fn a_transaction_reads_a_model_ledger_at_one_head() {
+    use fluree_db_api::{CommitOpts, TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/txn-head-model:main";
+    let data_id = "test/cross-ledger-shapes/txn-head-data:main";
+    seed_person_name_shape(&fluree, model_id, false).await;
+    seed_shapes_source_config(&fluree, data_id, model_id, "").await;
+    let person = |id: &str, name: Option<&str>| {
+        let mut node = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": id,
+            "@type": "ex:Person"
+        });
+        if let Some(name) = name {
+            node["ex:name"] = json!(name);
+        }
+        TxnOperation::Insert(node)
+    };
+
+    let mut txn = fluree
+        .begin_transaction(data_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(person("ex:alice", Some("Alice")))
+        .await
+        .expect("the first operation reads M, whose shape is deactivated");
+    fluree
+        .graph(model_id)
+        .transact()
+        .upsert_turtle(
+            r"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://example.org/ns/> .
+            GRAPH <http://example.org/governance/shapes> {
+                ex:PersonShape sh:deactivated false .
+            }
+        ",
+        )
+        .commit()
+        .await
+        .expect("M activates its shape");
+    let savepoint = txn.savepoint();
+    txn.stage(person("ex:dave", Some("Dave")))
+        .await
+        .expect("a named Person conforms under either head");
+    txn.rollback_to(savepoint)
+        .await
+        .expect("rolling back stages the first operation again");
+    txn.stage(person("ex:bob", None))
+        .await
+        .expect("a later operation reads M at the head the first one read");
+    txn.commit(CommitOpts::default())
+        .await
+        .expect("the transaction commits");
+
+    let mut txn = fluree
+        .begin_transaction(data_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    let err = match txn.stage(person("ex:carol", None)).await {
+        Err(err) => err,
+        Ok(()) => txn
+            .commit(CommitOpts::default())
+            .await
+            .expect_err("a new transaction reads M's new head"),
+    };
+    assert_shacl_violation(err, "a transaction begun after M's change");
+}
+
 const US_STATE_SHAPES_GRAPH: &str = "http://example.org/governance/shapes";
 
 /// Commit model ledger `model`: a shape whose `ex:homeState` must be an
@@ -1201,4 +1275,242 @@ async fn self_referencing_shapes_source_does_not_deadlock_a_locked_write() {
         .expect("the write completed instead of waiting on its own ledger lock")
         .expect_err("a Person without a name is rejected by the self-referenced shape");
     assert_shacl_violation(err, "self-referencing shapes source");
+}
+
+// =============================================================================
+// A model ledger that goes away: validation artifacts resolve only where SHACL
+// is enabled, and a config-only write never needs them
+// =============================================================================
+
+/// Model ledger M with the `ex:PersonShape` shapes graph, and data ledger D
+/// whose config points `f:shapesSource` at it with `f:shaclEnabled` set to
+/// `enabled`; then M is dropped. Returns D's id and M's name.
+async fn seed_then_drop_shapes_model(
+    fluree: &fluree_db_api::Fluree,
+    tag: &str,
+    enabled: bool,
+) -> (String, String) {
+    let model_name = format!("test/xl-dropped/{tag}-model");
+    let model_id = format!("{model_name}:main");
+    let data_id = format!("test/xl-dropped/{tag}-data:main");
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(genesis_ledger(fluree, &model_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix sh:  <http://www.w3.org/ns/shacl#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:PersonShape rdf:type sh:NodeShape ;
+                               sh:targetClass ex:Person ;
+                               sh:property ex:pshape_name .
+                ex:pshape_name sh:path ex:name ;
+                               sh:minCount 1 .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M shapes");
+    fluree
+        .stage_owned(genesis_ledger(fluree, &data_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled {enabled} .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+            }}
+        ",
+            config_iri = config_graph_iri(&data_id),
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger SHACL config");
+    fluree
+        .drop_ledger(&model_name, fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop M");
+    (data_id, model_name)
+}
+
+fn nameless_person(id: &str) -> serde_json::Value {
+    json!({"@context": {"ex": "http://example.org/ns/"}, "@id": id, "@type": "ex:Person"})
+}
+
+/// The dropped-model brick: with SHACL disabled, the configured shapes source
+/// is never resolved, so dropping the model ledger it names blocks nothing.
+/// A data write and a config write both commit.
+#[tokio::test]
+async fn dropped_shapes_model_does_not_block_writes_where_shacl_is_off() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (data_id, _) = seed_then_drop_shapes_model(&fluree, "off", false).await;
+
+    fluree
+        .graph(&data_id)
+        .transact()
+        .insert(&nameless_person("ex:alice"))
+        .commit()
+        .await
+        .expect("SHACL is off: the data write never resolves the dropped model");
+    fluree
+        .graph(&data_id)
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ GRAPH <{}> {{ <urn:cfg:shacl> f:validationMode f:ValidationWarn }} }}",
+            config_graph_iri(&data_id)
+        ))
+        .commit()
+        .await
+        .expect("a config write never resolves the dropped model");
+}
+
+/// Where SHACL is enabled, a data write whose shapes model is gone fails
+/// closed and names the model. The config repair that disables SHACL commits
+/// (a config-only write is never validated), through JSON-LD and through
+/// SPARQL alike, and data writes commit after it.
+#[tokio::test]
+async fn dropped_shapes_model_fails_closed_and_the_config_repair_commits() {
+    for surface in ["json-ld", "sparql"] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let (data_id, model_name) =
+            seed_then_drop_shapes_model(&fluree, &format!("on-{surface}"), true).await;
+
+        let err = fluree
+            .graph(&data_id)
+            .transact()
+            .insert(&nameless_person("ex:alice"))
+            .commit()
+            .await
+            .expect_err("SHACL is on and its shapes source is gone: fail closed");
+        assert!(
+            err.to_string().contains(&model_name),
+            "{surface}: the refusal names the missing model ledger: {err}"
+        );
+
+        match surface {
+            "json-ld" => fluree
+                .graph(&data_id)
+                .transact()
+                .upsert(&json!({
+                    "@context": {"f": "https://ns.flur.ee/db#"},
+                    "@id": "urn:cfg:shacl",
+                    "@graph": "config",
+                    "f:shaclEnabled": false
+                }))
+                .commit()
+                .await
+                .expect("json-ld: the config repair commits"),
+            _ => fluree
+                .graph(&data_id)
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#> \
+                     DELETE {{ GRAPH <{cfg}> {{ <urn:cfg:shacl> f:shaclEnabled ?on }} }} \
+                     INSERT {{ GRAPH <{cfg}> {{ <urn:cfg:shacl> f:shaclEnabled false }} }} \
+                     WHERE {{ GRAPH <{cfg}> {{ <urn:cfg:shacl> f:shaclEnabled ?on }} }}",
+                    cfg = config_graph_iri(&data_id)
+                ))
+                .commit()
+                .await
+                .expect("sparql: the config repair commits"),
+        };
+
+        fluree
+            .graph(&data_id)
+            .transact()
+            .insert(&nameless_person("ex:bob"))
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{surface}: after the repair data writes commit: {e}"));
+    }
+}
+
+/// A cross-ledger `f:schemaSource` (the ontology SHACL targeting reads) whose
+/// model ledger is gone blocks nothing while SHACL is off: the transaction
+/// path resolves it only for SHACL, and a policy context that would read it
+/// is built only where policy applies.
+#[tokio::test]
+async fn dropped_schema_model_does_not_block_writes_where_shacl_is_off() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_name = "test/xl-dropped/schema-model";
+    let model_id = format!("{model_name}:main");
+    let data_id = "test/xl-dropped/schema-data:main";
+    let ontology_graph_iri = "http://example.org/governance/ontology";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, &model_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{ontology_graph_iri}> {{ ex:Manager rdfs:subClassOf ex:Employee . }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M ontology");
+    let data = fluree
+        .stage_owned(genesis_ledger(&fluree, data_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig ;
+                               f:reasoningDefaults <urn:cfg:reason> .
+                <urn:cfg:reason> f:schemaSource <urn:cfg:schema-ref> .
+                <urn:cfg:schema-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:schema-src> .
+                <urn:cfg:schema-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{ontology_graph_iri}> .
+            }}
+        ",
+            config_iri = config_graph_iri(data_id),
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger schema config")
+        .ledger;
+    fluree
+        .drop_ledger(model_name, fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop M");
+
+    // No policy input: no policy context, so nothing reads the schema.
+    let policy = fluree_db_api::build_transact_policy_context(
+        &fluree,
+        &data.snapshot,
+        data.novelty.as_ref(),
+        Some(data.novelty.as_ref()),
+        data.t(),
+        &fluree_db_api::GovernanceOptions::default(),
+    )
+    .await
+    .expect("a write without policy does not resolve the schema source");
+    assert!(policy.is_none());
+
+    fluree
+        .graph(data_id)
+        .transact()
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:grace",
+            "@type": "ex:Manager"
+        }))
+        .commit()
+        .await
+        .expect("SHACL is off: the data write never resolves the dropped ontology model");
 }

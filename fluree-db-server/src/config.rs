@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use fluree_db_api::server_defaults;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Server operating mode
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -451,6 +451,13 @@ pub struct ServerConfig {
     /// settling it against other sources so startup can warn. Not an option.
     #[arg(skip)]
     pub memory_displaced: Option<String>,
+
+    /// Hold the file storage root's lock while the server runs, so a second
+    /// server or another process cannot open it meanwhile. Set by the CLI's
+    /// `server run` and `server start`; embedders opt in. Not an option.
+    /// Only a server that [owns its root](Self::owns_storage_root) takes it.
+    #[arg(skip)]
+    pub storage_lock: bool,
 
     /// Enable CORS (Cross-Origin Resource Sharing). On by default;
     /// `--cors-enabled=false` turns it off.
@@ -970,6 +977,7 @@ impl Default for ServerConfig {
             connection_config: None,
             memory: false,
             memory_displaced: None,
+            storage_lock: false,
             iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
@@ -1076,6 +1084,27 @@ impl ServerConfig {
     /// Create config from CLI args
     pub fn from_args() -> Self {
         Self::parse()
+    }
+
+    /// Whether this server is the only process meant to open its storage
+    /// root, and so locks it when [`Self::storage_lock`] asks. A
+    /// shared-storage peer reads its transaction server's root, and Raft
+    /// nodes share one payload root, both on purpose.
+    pub fn owns_storage_root(&self) -> bool {
+        #[cfg(feature = "raft")]
+        if self.raft_enabled {
+            return false;
+        }
+        self.server_role != ServerRole::Peer
+    }
+
+    /// The local directory a server it owns would lock: file storage named
+    /// by `storage_path`. A connection config's storage is not resolved here.
+    pub fn owned_storage_path(&self) -> Option<&Path> {
+        if !self.owns_storage_root() || self.memory || self.connection_config.is_some() {
+            return None;
+        }
+        self.storage_path.as_deref()
     }
 
     /// The storage the server builds from this config, for logs and

@@ -91,8 +91,8 @@ impl Function {
             Function::Pow => numeric::eval_pow(args, row, ctx),
 
             // DateTime functions
-            Function::Now => datetime::eval_now(args),
-            Function::Today => datetime::eval_today(args),
+            Function::Now => datetime::eval_now(args, ctx),
+            Function::Today => datetime::eval_today(args, ctx),
             Function::Year => datetime::eval_year(args, row, ctx),
             Function::Month => datetime::eval_month(args, row, ctx),
             Function::Day => datetime::eval_day(args, row, ctx),

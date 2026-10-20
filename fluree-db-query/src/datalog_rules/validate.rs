@@ -1,5 +1,7 @@
-//! Rule validation: the monotonicity rule, range restriction, and the
-//! fail-closed filter-operand checks.
+//! Rule validation: which constructs a rule body may use, the safety rules
+//! for negation and range restriction, and the fail-closed filter-operand
+//! checks. Whether a program's negation is stratifiable is a property of the
+//! whole program, checked by dependency analysis.
 //!
 //! Every rejection is an error naming the rule and the construct. A rule that
 //! quietly derives less than it was written to is the worst outcome — see
@@ -31,8 +33,10 @@ pub(super) fn validate_body(
     if query.grouping.is_some() {
         return Err(reject(
             rule,
-            "the body uses GROUP BY / aggregates, which are not allowed in a rule body \
-             (a fixpoint cannot evaluate them monotonically)",
+            "the body uses GROUP BY / aggregates at its top level, where the head could \
+             only read the group keys. Aggregate in a subquery instead (SPARQL \
+             `{ SELECT ?k (COUNT(?x) AS ?n) WHERE { … } GROUP BY ?k }`, JSON-LD \
+             `[\"query\", {…}]`) and use its outputs in the head",
         ));
     }
     // Same reasoning as the subquery arm below, for the rule's own body:
@@ -60,6 +64,116 @@ pub(super) fn validate_body(
     Ok(())
 }
 
+/// A variable a negation shares with the rest of its group must be bound by a
+/// positive pattern of that group (or of the group the negation is nested
+/// in). `NOT EXISTS` tests the values the body has bound; a variable no
+/// positive pattern binds would mean "any value" inside the negation while
+/// meaning something else outside it.
+pub(super) fn check_negation_safety(
+    patterns: &[Pattern],
+    vars: &VarRegistry,
+    rule: &str,
+) -> Result<()> {
+    negation_safety(patterns, &HashSet::new(), vars, rule)
+}
+
+fn negation_safety(
+    patterns: &[Pattern],
+    outer_bound: &HashSet<VarId>,
+    vars: &VarRegistry,
+    rule: &str,
+) -> Result<()> {
+    let mut bound = outer_bound.clone();
+    bound.extend(patterns.iter().flat_map(Pattern::produced_vars));
+    for (i, pattern) in patterns.iter().enumerate() {
+        let mut negated = Vec::new();
+        match pattern {
+            Pattern::NotExists(inner) => {
+                negated.extend(inner.iter().flat_map(Pattern::referenced_vars));
+                negation_safety(inner, &bound, vars, rule)?;
+            }
+            Pattern::Exists(inner) => negation_safety(inner, &bound, vars, rule)?,
+            Pattern::Filter(expr) => {
+                negated_exists_vars(expr, false, &mut negated);
+                for inner in exists_groups(expr) {
+                    negation_safety(inner, &bound, vars, rule)?;
+                }
+            }
+            // A nested group is evaluated on its own before it joins, so its
+            // negations can only lean on what it binds itself.
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    negation_safety(branch, &HashSet::new(), vars, rule)?;
+                }
+            }
+            Pattern::Graph {
+                patterns: inner, ..
+            }
+            | Pattern::DefaultGraphSource { patterns: inner } => {
+                negation_safety(inner, &HashSet::new(), vars, rule)?;
+            }
+            Pattern::Subquery(sub) => negation_safety(&sub.patterns, &HashSet::new(), vars, rule)?,
+            _ => {}
+        }
+        if negated.is_empty() {
+            continue;
+        }
+        let elsewhere: HashSet<VarId> = patterns
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .flat_map(|(_, p)| p.referenced_vars())
+            .chain(outer_bound.iter().copied())
+            .collect();
+        if let Some(var) = negated
+            .into_iter()
+            .find(|v| elsewhere.contains(v) && !bound.contains(v))
+        {
+            return Err(reject(
+                rule,
+                &format!(
+                    "{} appears inside NOT EXISTS and elsewhere in the body, but no positive \
+                     pattern binds it, so the negation would test \"no value at all\" rather \
+                     than the value the rest of the body uses. Bind it with a positive pattern \
+                     in the same group",
+                    vars.name(var)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Variables referenced inside an `EXISTS` that `expr` negates.
+fn negated_exists_vars(expr: &Expression, negated: bool, out: &mut Vec<VarId>) {
+    match expr {
+        Expression::Exists {
+            patterns,
+            negated: inner,
+        } => {
+            if negated != *inner {
+                out.extend(patterns.iter().flat_map(Pattern::referenced_vars));
+            }
+        }
+        Expression::Call { func, args } => {
+            let negated = negated ^ matches!(func, Function::Not);
+            for arg in args {
+                negated_exists_vars(arg, negated, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The pattern groups of the `EXISTS` expressions directly inside `expr`.
+fn exists_groups(expr: &Expression) -> Vec<&[Pattern]> {
+    match expr {
+        Expression::Exists { patterns, .. } => vec![patterns.as_slice()],
+        Expression::Call { args, .. } => args.iter().flat_map(exists_groups).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn walk_patterns(
     patterns: &[Pattern],
     snapshot: &LedgerSnapshot,
@@ -69,13 +183,19 @@ fn walk_patterns(
     for pattern in patterns {
         match pattern {
             Pattern::Optional(_) => {
-                return Err(non_monotonic(rule, "OPTIONAL"));
+                return Err(reject(
+                    rule,
+                    "the body uses OPTIONAL, which is not allowed in a rule body: a left \
+                     join's unmatched rows leave variables unbound, and a fixpoint cannot \
+                     evaluate that soundly",
+                ));
             }
             Pattern::Minus(_) => {
-                return Err(non_monotonic(rule, "MINUS"));
-            }
-            Pattern::NotExists(_) => {
-                return Err(non_monotonic(rule, "NOT EXISTS (`not-exists`)"));
+                return Err(reject(
+                    rule,
+                    "the body uses MINUS, which is not allowed in a rule body; write the \
+                     negation as NOT EXISTS (`not-exists`), which rules support",
+                ));
             }
             Pattern::Filter(expr) => check_expr(expr, snapshot, rule, ExprPos::Positive, origin)?,
             // A bound value is not a truth value: an `EXISTS` here is
@@ -93,6 +213,7 @@ fn walk_patterns(
                 }
             }
             Pattern::Exists(inner)
+            | Pattern::NotExists(inner)
             | Pattern::Graph {
                 patterns: inner, ..
             }
@@ -128,20 +249,18 @@ fn walk_patterns(
             Pattern::GeoSearch(_) => return Err(non_local(rule, "a geo search")),
             Pattern::S2Search(_) => return Err(non_local(rule, "an S2 cell search")),
             Pattern::Subquery(sub) => {
-                // A subquery carries its own modifiers, and two of them break a
-                // fixpoint. GROUP BY / aggregates are non-monotonic for the
-                // same reason the top-level check rejects them. LIMIT and
-                // OFFSET are worse than unsupported: which solutions survive a
-                // slice depends on how much has been derived so far, so the
-                // rule's output changes with round order and the result is then
+                // A subquery carries its own modifiers. GROUP BY / aggregates
+                // are allowed: their reads count as aggregated, and
+                // stratification runs the rule only once they are complete.
+                // LIMIT and OFFSET are not: which solutions survive a slice
+                // depends on how much has been derived so far, so the rule's
+                // output changes with round order and the result is then
                 // cached. DISTINCT and ORDER BY are safe — neither changes the
                 // solution SET as derivation grows, and heads dedup anyway.
-                if sub.grouping.is_some() {
-                    return Err(reject(
-                        rule,
-                        "a subquery in the body uses GROUP BY / aggregates, which are not \
-                         allowed in a rule body (a fixpoint cannot evaluate them monotonically)",
-                    ));
+                if let Some(grouping) = &sub.grouping {
+                    for expr in super::dependency::grouping_expressions(grouping) {
+                        check_expr(expr, snapshot, rule, ExprPos::Opaque, origin)?;
+                    }
                 }
                 if let Some(what) = sub
                     .limit
@@ -185,17 +304,6 @@ fn non_local(rule: &str, construct: &str) -> QueryError {
     )
 }
 
-fn non_monotonic(rule: &str, construct: &str) -> QueryError {
-    reject(
-        rule,
-        &format!(
-            "the body uses {construct}, which is not allowed in a rule body: a fixpoint \
-             cannot evaluate negation or left joins soundly without stratification, so \
-             the rule is rejected rather than run over a wrong answer"
-        ),
-    )
-}
-
 /// Where an expression's truth value ends up, which is what decides whether
 /// an `EXISTS` inside it is monotone.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -206,7 +314,7 @@ enum ExprPos {
     /// monotone and allowed.
     Positive,
     /// The value is negated an odd number of times. An `EXISTS` here excludes
-    /// rows, which a fixpoint cannot evaluate soundly without stratification.
+    /// rows: allowed, and its reads count as negated for stratification.
     Negative,
     /// Anywhere else: a comparison operand, an `IF` branch, a function
     /// argument, a bound value. The truth value is consumed by something this
@@ -267,16 +375,17 @@ fn check_expr(
             // flipped by `ExprPos::negated`.
             let effective = if *inner { pos.negated() } else { pos };
             match effective {
-                ExprPos::Positive => walk_patterns(patterns, snapshot, rule, origin),
-                ExprPos::Negative => Err(non_monotonic(rule, "NOT EXISTS inside FILTER")),
+                ExprPos::Positive | ExprPos::Negative => {
+                    walk_patterns(patterns, snapshot, rule, origin)
+                }
                 ExprPos::Opaque => Err(reject(
                     rule,
                     "the body uses EXISTS somewhere its truth value is not read directly — \
                      as a comparison operand, an IF branch, a function argument, or a bound \
                      variable. Written that way it can be negated (`EXISTS {…} = false`, \
-                     `IF(EXISTS {…}, false, true)`, `BIND(EXISTS {…} AS ?e) FILTER(!?e)`), and \
-                     a fixpoint cannot evaluate negation soundly without stratification. Use \
-                     EXISTS as the filter condition itself, optionally under AND / OR",
+                     `IF(EXISTS {…}, false, true)`, `BIND(EXISTS {…} AS ?e) FILTER(!?e)`) \
+                     where stratification cannot see it. Use EXISTS or NOT EXISTS as the \
+                     filter condition itself, optionally under AND / OR / NOT",
                 )),
             }
         }

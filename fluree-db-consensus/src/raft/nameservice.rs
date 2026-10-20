@@ -2710,6 +2710,9 @@ mod tests {
                 derived_facts: 42,
                 iterations: 3,
                 duration_ms: 17,
+                capped_rules: Vec::new(),
+                pending_rules: Vec::new(),
+                evaluation_time: None,
             }),
             sql: None,
             sql_elided: None,
@@ -2790,6 +2793,9 @@ mod tests {
                 derived_facts: 10,
                 iterations: 1,
                 duration_ms: 5,
+                capped_rules: Vec::new(),
+                pending_rules: Vec::new(),
+                evaluation_time: None,
             }),
             sql: None,
             sql_elided: None,
@@ -3053,6 +3059,9 @@ mod tests {
             derived_facts: 42,
             iterations: 3,
             duration_ms: 17,
+            capped_rules: vec!["ex:rule".to_string()],
+            pending_rules: vec!["ex:later".to_string()],
+            evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -3136,7 +3145,14 @@ mod tests {
             derived_facts: rt_derived_facts,
             iterations: rt_iterations,
             duration_ms: rt_duration_ms,
+            capped_rules: rt_capped_rules,
+            pending_rules: rt_pending_rules,
+            evaluation_time: rt_evaluation_time,
         } = rt_reasoning.expect("reasoning Some on round-trip");
+        // Not carried by the recorded mirror: adding them would change the
+        // wire form of records already in the log.
+        assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());
+        assert_eq!(rt_evaluation_time, None);
         let original_reasoning = original_tally.reasoning.expect("reasoning populated above");
         assert_eq!(rt_capped, original_reasoning.capped);
         assert_eq!(rt_capped_reason, original_reasoning.capped_reason);

@@ -359,7 +359,7 @@ async fn variable_predicates_paths_and_nested_exists_are_read() {
 }
 
 #[tokio::test]
-async fn rules_calling_volatile_functions_are_not_repeatable() {
+async fn rules_generating_values_are_not_repeatable_but_now_is() {
     let ledger = ledger().await;
     let program = Program::parse(
         &ledger,
@@ -389,9 +389,20 @@ async fn rules_calling_volatile_functions_are_not_repeatable() {
             .repeatable
     };
     assert!(repeatable("ex:plain"));
-    for volatile in ["ex:stampsNow", "ex:mintsId", "ex:samples"] {
+    for volatile in ["ex:mintsId", "ex:samples"] {
         assert!(!repeatable(volatile), "{volatile} must not be repeatable");
     }
+    // Every rule body in a run sees one evaluation time, so NOW() repeats.
+    let footprint = program
+        .dependencies
+        .footprint(program.index("ex:stampsNow"));
+    assert!(footprint.repeatable && footprint.reads_clock);
+    assert!(
+        !program
+            .dependencies
+            .footprint(program.index("ex:plain"))
+            .reads_clock
+    );
 }
 
 /// A path that can match zero hops pairs every term in the graph with itself,

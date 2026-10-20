@@ -16,6 +16,2274 @@ fn config_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")
 }
 
+/// Commit a JSON-LD insert without the API's post-staging checks (SHACL,
+/// uniqueness, the config guard): the way history written before those
+/// checks existed reaches a ledger. Seeds degenerate config state.
+async fn commit_unchecked(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    doc: &serde_json::Value,
+) -> fluree_db_api::LedgerState {
+    let ledger_id = ledger.snapshot.ledger_id.to_string();
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::parse_transaction(
+        doc,
+        fluree_db_transact::TxnType::Insert,
+        fluree_db_transact::TxnOpts::default(),
+        &mut ns,
+        &ledger_id,
+    )
+    .expect("parse");
+    let (view, ns) =
+        fluree_db_transact::stage(ledger, txn, ns, fluree_db_transact::StageOptions::new())
+            .await
+            .expect("stage");
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree.default_index_config(),
+            fluree_db_api::CommitOpts::default(),
+        )
+        .await
+        .expect("commit")
+        .1
+}
+
+/// The codes of a ledger's `configDiagnostics` (ledger info), sorted.
+async fn config_diagnostic_codes(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec<String> {
+    let info = fluree
+        .ledger_info(ledger_id)
+        .execute()
+        .await
+        .expect("ledger info");
+    let mut codes: Vec<String> = info
+        .get("configDiagnostics")
+        .and_then(serde_json::Value::as_array)
+        .map(|d| {
+            d.iter()
+                .filter_map(|d| d["code"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    codes.sort();
+    codes
+}
+
+/// A config with two `f:shaclDefaults` values: the group whose IRI sorts first
+/// is empty in `#config` (its field was written to the default graph, the
+/// #1979 shape), the other is the corrected group. Written without the config
+/// guard, as a config re-inserted before the guard existed would be.
+async fn seed_double_shacl_pointer(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+) -> fluree_db_api::LedgerState {
+    commit_unchecked(
+        fluree,
+        ledger,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {
+                    "@id": "urn:it:cfg:ledger",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:shaclDefaults": [
+                        {"@id": "urn:it:cfg:a-empty"},
+                        {"@id": "urn:it:cfg:b-full", "f:shaclEnabled": true}
+                    ]
+                },
+                {"@id": "urn:it:cfg:a-empty", "f:shaclEnabled": true}
+            ]
+        }),
+    )
+    .await
+}
+
+/// A double group pointer resolves deterministically to the non-empty group
+/// (lowest IRI among the non-empty ones). The first binding used to win,
+/// which here is the empty group: SHACL read as disabled.
+#[tokio::test]
+async fn reader_picks_the_non_empty_group_of_a_double_pointer() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-double-pointer:main";
+    seed_double_shacl_pointer(&fluree, genesis_ledger(&fluree, ledger_id).await).await;
+    let view = fluree.db(ledger_id).await.unwrap();
+    let shacl = view
+        .ledger_config()
+        .and_then(|c| c.shacl.clone())
+        .expect("a SHACL group is read");
+    assert_eq!(shacl.enabled, Some(true), "the populated group wins");
+}
+
+/// Ledger info reports the degenerate state: the ambiguous pointer, the
+/// empty group, and the fields stranded in the default graph.
+#[tokio::test]
+async fn diagnostics_report_empty_stranded_and_ambiguous_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics:main";
+    seed_double_shacl_pointer(&fluree, genesis_ledger(&fluree, ledger_id).await).await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["ambiguous-pointer", "empty-group", "stranded-fields"]
+    );
+}
+
+/// The query group is diagnosed like every setting group: one whose
+/// `f:unionDefaultGraph` was written outside the config graph reads as empty,
+/// with its field stranded.
+#[tokio::test]
+async fn diagnostics_report_an_empty_query_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-query:main";
+    commit_unchecked(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {
+                    "@id": "urn:it:cfg:ledger",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:queryDefaults": {"@id": "urn:it:cfg:query"}
+                },
+                {"@id": "urn:it:cfg:query", "f:unionDefaultGraph": true}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["empty-group", "stranded-fields"]
+    );
+    let view = fluree.db(ledger_id).await.unwrap();
+    assert!(
+        view.ledger_config().and_then(|c| c.query.clone()).is_none(),
+        "an empty query group reads as absent"
+    );
+}
+
+/// Shapes with no config enabling SHACL are reported ("shapes present; SHACL
+/// enforcement not configured"); enabling SHACL on the existing config
+/// subject clears it.
+#[tokio::test]
+async fn diagnostics_report_shapes_without_enforcement() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-shapes:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["shacl-not-configured"]
+    );
+
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:it:cfg:ledger",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"f:shaclEnabled": true}
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+
+    // An untyped shape (a target predicate and no `sh:NodeShape` type) is a
+    // shape the compiler enforces where SHACL is on, so it is reported too.
+    let ledger_id = "it/config-diagnostics-untyped-shape:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@id": "ex:PersonShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": {"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["shacl-not-configured"]
+    );
+
+    // SHACL switched off in the config is the ledger's posture, not a gap.
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:it:cfg:ledger",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"f:shaclEnabled": false}
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+}
+
+/// SHACL enabled for one graph only is configured: the shapes are enforced
+/// there, so no "not configured" diagnostic is reported.
+#[tokio::test]
+async fn diagnostics_count_shacl_enabled_for_one_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-graph-shacl:main";
+    fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {
+                    "f": "https://ns.flur.ee/db#",
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@graph": [
+                    {
+                        "@id": "ex:PersonShape",
+                        "@type": "sh:NodeShape",
+                        "sh:targetClass": {"@id": "ex:Person"}
+                    },
+                    {
+                        "@id": "urn:it:cfg:ledger",
+                        "@type": "f:LedgerConfig",
+                        "@graph": "config",
+                        "f:graphOverrides": {
+                            "@id": "urn:it:cfg:scratch",
+                            "@type": "f:GraphConfig",
+                            "f:targetGraph": {"@id": "http://example.org/scratch"},
+                            "f:shaclDefaults": {"f:shaclEnabled": true}
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+}
+
+/// Two graph overrides for one graph: the reader uses one of them, and ledger
+/// info says so.
+#[tokio::test]
+async fn diagnostics_report_duplicate_graph_overrides() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-dup-override:main";
+    let cfg = config_graph_iri(ledger_id);
+    fluree
+        .stage_owned(genesis_ledger(&fluree, ledger_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{cfg}> {{
+                <urn:config:main> rdf:type f:LedgerConfig ;
+                    f:graphOverrides <urn:config:a>, <urn:config:b> .
+                <urn:config:a> rdf:type f:GraphConfig ;
+                    f:targetGraph <http://example.org/scratch> ;
+                    f:shaclDefaults <urn:config:a-shacl> .
+                <urn:config:a-shacl> f:shaclEnabled true .
+                <urn:config:b> rdf:type f:GraphConfig ;
+                    f:targetGraph <http://example.org/scratch> ;
+                    f:shaclDefaults <urn:config:b-shacl> .
+                <urn:config:b-shacl> f:shaclEnabled false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("config write");
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["duplicate-graph-override"]
+    );
+}
+
+/// A clean config has no diagnostics (the field is omitted).
+#[tokio::test]
+async fn diagnostics_are_empty_for_a_clean_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-clean:main";
+    fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:it:cfg:ledger",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:policyDefaults": {"f:defaultAllow": true}
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(config_diagnostic_codes(&fluree, ledger_id).await.is_empty());
+}
+
+// =============================================================================
+// Config guard: degenerate config writes are refused
+// =============================================================================
+
+/// The message of a config write the guard refused, checked to render as a
+/// parse error (the class clients map to a 400).
+fn config_guard_refusal(err: fluree_db_api::ApiError) -> String {
+    match err {
+        fluree_db_api::ApiError::Transact(e @ fluree_db_transact::TransactError::Parse(_)) => {
+            let message = e.to_string();
+            assert!(message.starts_with("Parse error: "), "{message}");
+            message
+        }
+        other => panic!("expected a config guard refusal, got {other:?}"),
+    }
+}
+
+/// A config group whose fields land outside the config graph reads as empty,
+/// so the write is refused, on each surface that can split one: a SPARQL blank
+/// node shared across a GRAPH boundary, a TriG group named in the config graph
+/// with its fields in the default graph, and a JSON-LD group explicitly scoped
+/// to the default graph.
+#[tokio::test]
+async fn config_guard_refuses_a_group_split_across_graphs() {
+    let ledger_id = "it/config-guard-split:main";
+    let cfg = config_graph_iri(ledger_id);
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let err = sparql_update(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ \
+               GRAPH <{cfg}> {{ <urn:config:main> a f:LedgerConfig ; f:shaclDefaults _:g }} \
+               _:g f:shaclEnabled true \
+             }}"
+        ),
+    )
+    .await
+    .expect_err("SPARQL: a blank group split across graphs");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:shaclDefaults")
+            && message.contains("f:shaclEnabled")
+            && message.contains("the default graph"),
+        "{message}"
+    );
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let err = fluree
+        .stage_owned(genesis_ledger(&fluree, ledger_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{cfg}> {{
+                <urn:config:main> rdf:type f:LedgerConfig ;
+                                  f:shaclDefaults <urn:config:shacl> .
+            }}
+            <urn:config:shacl> f:shaclEnabled true .
+        "
+        ))
+        .execute()
+        .await
+        .expect_err("TriG: the group's fields outside the config graph");
+    config_guard_refusal(err);
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let err = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {
+                    "@id": "urn:config:shacl",
+                    "@graph": "default",
+                    "f:shaclEnabled": true
+                }
+            }),
+        )
+        .await
+        .expect_err("JSON-LD: a group explicitly scoped out of the config graph");
+    config_guard_refusal(err);
+}
+
+/// The same split cannot be reached in two accepted writes, in either order:
+/// the edge first and the fields later outside the config graph (the #1979
+/// shape: a policy group's `f:defaultAllow false` lost), or the fields first
+/// outside it and the edge later. Moving the fields into the config graph in
+/// the transaction that adds the edge is accepted.
+#[tokio::test]
+async fn config_guard_refuses_a_group_split_across_transactions() {
+    let ledger_id = "it/config-guard-split-txns:main";
+    let cfg = config_graph_iri(ledger_id);
+    let f_ctx = json!({"f": "https://ns.flur.ee/db#"});
+
+    // Edge first, fields later.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = sparql_update(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ GRAPH <{cfg}> {{ \
+               <urn:config:main> a f:LedgerConfig ; f:policyDefaults <urn:config:policy> \
+             }} }}"
+        ),
+    )
+    .await
+    .expect("the edge alone")
+    .ledger;
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({"@context": f_ctx, "@id": "urn:config:policy", "f:defaultAllow": false}),
+        )
+        .await
+        .expect_err("the group's fields outside the config graph");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:policyDefaults")
+            && message.contains("f:defaultAllow")
+            && message.contains("the default graph"),
+        "{message}"
+    );
+
+    // Fields first, edge later.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({"@context": f_ctx, "@id": "urn:config:shacl", "f:shaclEnabled": true}),
+        )
+        .await
+        .expect("f: data in the default graph, not yet part of any config")
+        .ledger;
+    let edge = format!(
+        "PREFIX f: <https://ns.flur.ee/db#> \
+         INSERT DATA {{ GRAPH <{cfg}> {{ \
+           <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> \
+         }} }}"
+    );
+    let err = sparql_update(&fluree, ledger.clone(), &edge)
+        .await
+        .expect_err("an edge to a group whose fields are in the default graph");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:shaclDefaults")
+            && message.contains("f:shaclEnabled")
+            && message.contains("the default graph"),
+        "{message}"
+    );
+
+    // The same edge, moving the fields into the config graph with it.
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ <urn:config:shacl> f:shaclEnabled true }} \
+             INSERT {{ GRAPH <{cfg}> {{ \
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> . \
+               <urn:config:shacl> f:shaclEnabled true \
+             }} }} WHERE {{}}"
+        ),
+    )
+    .await
+    .expect("the repair moves the fields with the edge")
+    .ledger;
+    let view = fluree.db(ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.clone())
+            .and_then(|s| s.enabled),
+        Some(true)
+    );
+    let _ = ledger;
+}
+
+// -----------------------------------------------------------------------------
+// The guard on branch operations: they re-check the target's config groups.
+// -----------------------------------------------------------------------------
+
+/// The message of a branch operation the guard refused: a conflict with the
+/// target's state, naming the group and the repair.
+fn branch_op_refusal(err: fluree_db_api::ApiError, group: &str) -> String {
+    assert_eq!(err.status_code(), 409, "{err}");
+    let message = match err {
+        fluree_db_api::ApiError::BranchConflict(message) => message,
+        other => panic!("expected a branch conflict, got {other:?}"),
+    };
+    assert!(message.contains(group), "{message}");
+    assert!(
+        message.contains("Repairing a config split across graphs"),
+        "{message}"
+    );
+    message
+}
+
+/// A ledger `name` with one data node, and a `dev` branch of it.
+async fn ledger_with_branch(
+    fluree: &fluree_db_api::Fluree,
+    name: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:seed", "ex:p": 1}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    main
+}
+
+/// A config linking the SHACL group `urn:config:shacl`, which has no fields
+/// yet.
+fn config_linking_the_shacl_group() -> serde_json::Value {
+    json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "urn:config:main",
+        "@type": "f:LedgerConfig",
+        "@graph": "config",
+        "f:shaclDefaults": {"@id": "urn:config:shacl"}
+    })
+}
+
+/// `urn:config:shacl f:shaclEnabled true`, written to the default graph.
+fn shacl_group_field_in_the_default_graph() -> serde_json::Value {
+    json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "urn:config:shacl",
+        "f:shaclEnabled": true
+    })
+}
+
+/// Config written on a branch is in that branch's own config graph
+/// (`urn:fluree:<name>:<branch>#config`) and configures that branch only. A
+/// merge or fast-forward carrying it to another branch is refused, naming the
+/// branch and the graph, rather than landing it in an ordinary graph of the
+/// target where it would never be read; the preview reports it. Merging the
+/// other way, from the branch a branch was created from, is not refused:
+/// that parent's config graph is already an ordinary graph on the branch.
+#[tokio::test]
+async fn a_merge_carrying_config_written_on_another_branch_is_refused() {
+    let edits = [
+        // A whole config of the branch's own.
+        "<urn:config:dev> a f:LedgerConfig ; f:shaclDefaults <urn:config:devshacl> .
+         <urn:config:devshacl> f:shaclEnabled false .",
+        // A setting on a group main's config links.
+        "<urn:config:shacl> f:validationMode f:ValidationWarn .",
+    ];
+    for (i, edit) in edits.into_iter().enumerate() {
+        for fast_forward in [true, false] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let name = format!("it-config-branch-own-{i}-{fast_forward}");
+            let ledger = fluree.create_ledger(&name).await.unwrap();
+            let main = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&format!(
+                    "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+                     ex:seed ex:p 1 .
+                     GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+                       f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}",
+                    config_graph_iri(&format!("{name}:main"))
+                ))
+                .execute()
+                .await
+                .expect("main's config")
+                .ledger;
+            fluree
+                .create_branch(&name, "dev", None, None)
+                .await
+                .unwrap();
+            let dev_cfg = config_graph_iri(&format!("{name}:dev"));
+            let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+            fluree
+                .stage_owned(dev)
+                .upsert_turtle(&format!(
+                    "@prefix f: <https://ns.flur.ee/db#> . GRAPH <{dev_cfg}> {{ {edit} }}"
+                ))
+                .execute()
+                .await
+                .expect("dev configures itself");
+            if !fast_forward {
+                fluree
+                    .insert(main, &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}))
+                    .await
+                    .unwrap();
+            }
+            let preview = fluree
+                .merge_preview_with(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::MergePreviewOpts::default(),
+                )
+                .await
+                .expect("preview");
+            assert!(
+                !preview.mergeable,
+                "{i}/{fast_forward}: the preview refuses"
+            );
+            let err = fluree
+                .merge_branch(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::ConflictStrategy::default(),
+                )
+                .await
+                .expect_err("a merge carrying dev's config");
+            assert_eq!(err.status_code(), 409, "{i}/{fast_forward}: {err}");
+            let message = err.to_string();
+            assert!(
+                message.contains("branch dev's config graph") && message.contains(&dev_cfg),
+                "{i}/{fast_forward}: {message}"
+            );
+            let view = fluree.db(&format!("{name}:main")).await.unwrap();
+            assert_eq!(
+                view.ledger_config()
+                    .and_then(|c| c.shacl.as_ref())
+                    .and_then(|s| s.enabled),
+                Some(true),
+                "{i}/{fast_forward}: main's config is untouched"
+            );
+        }
+    }
+
+    // From the parent: main's config change after the fork merges into dev.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-branch-parent";
+    let main = ledger_with_branch(&fluree, name).await;
+    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:d", "ex:p": 1}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .stage_owned(main)
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{}> {{ <urn:config:main> a f:LedgerConfig ;
+               f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled true . }}",
+            config_graph_iri(&format!("{name}:main"))
+        ))
+        .execute()
+        .await
+        .expect("main's config");
+    fluree
+        .merge_branch(
+            name,
+            "main",
+            Some("dev"),
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("main's history merges into dev");
+
+    // Plain data a branch wrote to its own config graph is refused the same
+    // way, also into a target whose config governs no writes, where a
+    // fast-forward is checked only when its commits carry config settings.
+    for fast_forward in [true, false] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = format!("it-config-branch-own-data-{fast_forward}");
+        let ledger = fluree.create_ledger(&name).await.unwrap();
+        let main = fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:seed", "ex:p": 1}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        fluree
+            .create_branch(&name, "dev", None, None)
+            .await
+            .unwrap();
+        let dev_cfg = config_graph_iri(&format!("{name}:dev"));
+        fluree
+            .graph(&format!("{name}:dev"))
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix ex: <http://example.org/> . GRAPH <{dev_cfg}> {{ ex:note ex:p 1 . }}"
+            ))
+            .commit()
+            .await
+            .expect("dev writes data to its config graph");
+        if !fast_forward {
+            fluree
+                .insert(
+                    main,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}),
+                )
+                .await
+                .unwrap();
+        }
+        let err = fluree
+            .merge_branch(
+                &name,
+                "dev",
+                None,
+                fluree_db_api::ConflictStrategy::default(),
+            )
+            .await
+            .expect_err("a merge carrying dev's config graph data");
+        assert_eq!(err.status_code(), 409, "{fast_forward}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("branch dev's config graph") && message.contains(&dev_cfg),
+            "{fast_forward}: {message}"
+        );
+    }
+}
+
+/// A merge may not change the target's own config or txn-meta graph with
+/// what another branch wrote there: on the branch, the target's system graph
+/// IRIs name ordinary graphs, so a value written (or deleted) there is data,
+/// not a change to the target's config. A fast-forward and a general merge
+/// are refused (409), the preview says so, and the target's config is
+/// untouched, also into a target whose config governs no writes.
+#[tokio::test]
+async fn a_merge_changing_the_targets_system_graph_from_another_branch_is_refused() {
+    let edits = [
+        (
+            "a setting replaced",
+            true,
+            "config",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled false } }",
+        ),
+        (
+            "a setting deleted",
+            true,
+            "config",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } }",
+        ),
+        (
+            "commit metadata written",
+            true,
+            "txn-meta",
+            "INSERT DATA { GRAPH <TXN> { <urn:x:commit> f:message \"from dev\" } }",
+        ),
+        (
+            "commit metadata written, into a target that governs no writes",
+            false,
+            "txn-meta",
+            "INSERT DATA { GRAPH <TXN> { <urn:x:commit> f:message \"from dev\" } }",
+        ),
+    ];
+    for (i, (what, governed, role, edit)) in edits.into_iter().enumerate() {
+        for fast_forward in [true, false] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let name = format!("it-config-branch-target-{i}-{fast_forward}");
+            let ledger = fluree.create_ledger(&name).await.unwrap();
+            let main_id = format!("{name}:main");
+            let main_cfg = config_graph_iri(&main_id);
+            let main_txn = fluree_db_core::graph_registry::txn_meta_graph_iri(&main_id);
+            let main = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&format!(
+                    "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+                     ex:seed ex:p 1 .
+                     GRAPH <{main_cfg}> {{ <urn:config:main> a f:LedgerConfig ;
+                       f:shaclDefaults <urn:config:shacl> . <urn:config:shacl> f:shaclEnabled {governed} . }}"
+                ))
+                .execute()
+                .await
+                .expect("main's config")
+                .ledger;
+            fluree
+                .create_branch(&name, "dev", None, None)
+                .await
+                .unwrap();
+            fluree
+                .graph(&format!("{name}:dev"))
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#> {}",
+                    edit.replace("CFG", &main_cfg).replace("TXN", &main_txn)
+                ))
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{what}: an ordinary graph on dev: {e}"));
+            if !fast_forward {
+                fluree
+                    .insert(main, &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 2}))
+                    .await
+                    .unwrap();
+            }
+            let case = format!("{what}/{fast_forward}");
+            let preview = fluree
+                .merge_preview_with(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::MergePreviewOpts::default(),
+                )
+                .await
+                .expect("preview");
+            assert!(!preview.mergeable, "{case}: the preview refuses");
+            let err = fluree
+                .merge_branch(
+                    &name,
+                    "dev",
+                    None,
+                    fluree_db_api::ConflictStrategy::default(),
+                )
+                .await
+                .expect_err(&case);
+            assert_eq!(err.status_code(), 409, "{case}: {err}");
+            let message = err.to_string();
+            let graph = if role == "config" {
+                &main_cfg
+            } else {
+                &main_txn
+            };
+            assert!(
+                message.contains(&format!("this branch's {role} graph")) && message.contains(graph),
+                "{case}: {message}"
+            );
+            let view = fluree.db(&main_id).await.unwrap();
+            assert_eq!(
+                view.ledger_config()
+                    .and_then(|c| c.shacl.as_ref())
+                    .and_then(|s| s.enabled),
+                Some(governed),
+                "{case}: main's config is untouched"
+            );
+        }
+    }
+}
+
+/// A merge may not split one of the target's config groups. After the fork
+/// the target links a group from its config graph, and the branch writes the
+/// group's field in the default graph (through JSON-LD, or SPARQL). Each
+/// write is accepted where it is made; the merge that would bring them
+/// together is refused, naming the group and the repair, and its preview
+/// says so.
+#[tokio::test]
+async fn config_guard_refuses_a_merge_that_splits_a_group() {
+    for (i, sparql) in [false, true].into_iter().enumerate() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = format!("it-config-guard-merge-split-{i}");
+        let main = ledger_with_branch(&fluree, &name).await;
+        fluree
+            .insert(main, &config_linking_the_shacl_group())
+            .await
+            .expect("the target links the group");
+        let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+        if sparql {
+            sparql_update(
+                &fluree,
+                dev,
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT DATA { <urn:config:shacl> f:shaclEnabled true }",
+            )
+            .await
+            .expect("the branch writes the field");
+        } else {
+            fluree
+                .insert(dev, &shacl_group_field_in_the_default_graph())
+                .await
+                .expect("the branch writes the field");
+        }
+
+        let preview = fluree
+            .merge_preview(&name, "dev", None)
+            .await
+            .expect("preview");
+        assert!(!preview.fast_forward);
+        assert!(!preview.mergeable);
+        let validation = preview.validation.expect("the merge validates");
+        assert!(!validation.conforms);
+        let report = validation.report.unwrap_or_default();
+        assert!(report.contains("urn:config:shacl"), "{report}");
+
+        let err = fluree
+            .merge_branch(
+                &name,
+                "dev",
+                None,
+                fluree_db_api::ConflictStrategy::default(),
+            )
+            .await
+            .expect_err("the merge would split the group");
+        branch_op_refusal(err, "urn:config:shacl");
+    }
+}
+
+/// A fast-forward may not split one of the target's config groups either. The
+/// target links a group before the fork; the branch carries the group's field
+/// in the default graph from before these checks (seeded unchecked, as that
+/// history reaches a ledger). The fast-forward is refused until the config is
+/// repaired, and its preview says so.
+#[tokio::test]
+async fn config_guard_refuses_a_fast_forward_carrying_a_split_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-ff-split";
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    fluree
+        .insert(ledger, &config_linking_the_shacl_group())
+        .await
+        .expect("the target links the group");
+    fluree.create_branch(name, "dev", None, None).await.unwrap();
+    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+    commit_unchecked(&fluree, dev, &shacl_group_field_in_the_default_graph()).await;
+
+    let preview = fluree
+        .merge_preview(name, "dev", None)
+        .await
+        .expect("preview");
+    assert!(preview.fast_forward);
+    assert!(!preview.mergeable);
+    let validation = preview
+        .validation
+        .expect("a fast-forward carrying config settings is checked");
+    assert!(!validation.conforms);
+
+    let err = fluree
+        .merge_branch(
+            name,
+            "dev",
+            None,
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect_err("the fast-forward would split the group");
+    branch_op_refusal(err, "urn:config:shacl");
+}
+
+/// A revert may not split a config group: undoing the repair of a split config
+/// (the #1979 state, seeded unchecked, then repaired with the recipe that moves
+/// the fields into the config graph) would put the field back where the reader
+/// does not look. The revert is refused, and its preview says so.
+#[tokio::test]
+async fn config_guard_refuses_a_revert_that_undoes_a_repair() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-revert-repair";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let ledger = commit_unchecked(
+        &fluree,
+        ledger,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {
+                    "@id": "urn:config:main",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:shaclDefaults": {"@id": "urn:config:shacl"}
+                },
+                {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            ]
+        }),
+    )
+    .await;
+    let repair = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#>
+             DELETE {{ ?n ?p ?o }}
+             INSERT {{ GRAPH <{cfg}> {{ ?n ?p ?o }} }}
+             WHERE {{ GRAPH <{cfg}> {{ ?parent f:shaclDefaults ?n }} ?n ?p ?o . }}"
+        ),
+    )
+    .await
+    .expect("the repair commits");
+    let commit = fluree_db_api::CommitRef::Exact(repair.receipt.commit_id.clone());
+
+    let preview = fluree
+        .revert_commit_preview(name, "main", commit.clone())
+        .await
+        .expect("preview");
+    assert!(!preview.revertable);
+    let validation = preview.validation.expect("the revert validates");
+    assert!(!validation.conforms);
+
+    let err = fluree
+        .revert_commit(name, "main", commit, fluree_db_api::ConflictStrategy::Abort)
+        .await
+        .expect_err("the revert would split the group again");
+    branch_op_refusal(err, "urn:config:shacl");
+}
+
+/// The re-check does not stand in the way of a merge that leaves the target's
+/// config groups whole: the target changes its config after the fork while
+/// the branch writes data, an `f:enforceUnique` annotation among it, which
+/// the guard looks at and accepts. The merge commits.
+#[tokio::test]
+async fn config_guard_merges_a_branch_while_the_target_changes_its_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-merge-clean";
+    let main = ledger_with_branch(&fluree, name).await;
+    fluree
+        .insert(
+            main,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:transactDefaults": {"@id": "urn:config:transact", "f:uniqueEnabled": true}
+            }),
+        )
+        .await
+        .expect("the target changes its config");
+    let dev = fluree.ledger(&format!("{name}:dev")).await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "ex:email", "f:enforceUnique": true},
+                    {"@id": "ex:u1", "ex:email": "a@x"}
+                ]
+            }),
+        )
+        .await
+        .expect("the branch writes data");
+
+    let preview = fluree
+        .merge_preview(name, "dev", None)
+        .await
+        .expect("preview");
+    assert!(!preview.fast_forward);
+    assert!(preview.mergeable);
+    fluree
+        .merge_branch(
+            name,
+            "dev",
+            None,
+            fluree_db_api::ConflictStrategy::default(),
+        )
+        .await
+        .expect("the merge leaves the config groups whole");
+}
+
+/// A revert that leaves the config groups whole is accepted: switching SHACL
+/// off and reverting that brings the setting back, with one value.
+#[tokio::test]
+async fn config_guard_accepts_a_revert_of_a_config_change() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it-config-guard-revert-clean";
+    let ledger = fluree.create_ledger(name).await.unwrap();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let change = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:shacl",
+                "@graph": "config",
+                "f:shaclEnabled": false
+            }),
+        )
+        .await
+        .expect("switch SHACL off");
+    fluree
+        .revert_commit(
+            name,
+            "main",
+            fluree_db_api::CommitRef::Exact(change.receipt.commit_id),
+            fluree_db_api::ConflictStrategy::Abort,
+        )
+        .await
+        .expect("the revert leaves one value");
+    let view = fluree.db(&format!("{name}:main")).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.clone())
+            .and_then(|s| s.enabled),
+        Some(true)
+    );
+}
+
+/// A config typed outside the config graph is never read, so the write is
+/// refused: the JSON-LD shape `concepts/reasoning.md` showed (no graph, so the
+/// default graph), and the same config through Turtle insert.
+#[tokio::test]
+async fn config_guard_refuses_a_config_typed_outside_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-guard-inert:main";
+    let err = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "f:reasoningDefaults": {"f:reasoningModes": {"@id": "f:rdfs"}}
+            }),
+        )
+        .await
+        .expect_err("a config in the default graph has no effect");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains(&config_graph_iri(ledger_id)) && message.contains("the default graph"),
+        "{message}"
+    );
+
+    let err = fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, "it/config-guard-inert-ttl:main").await,
+            "@prefix f: <https://ns.flur.ee/db#> . <urn:config:main> a f:LedgerConfig .",
+        )
+        .await
+        .expect_err("Turtle insert: a config in the default graph has no effect");
+    config_guard_refusal(err);
+}
+
+/// The guard runs on a branch as it does on main: a config typed outside the
+/// config graph is refused, and `"@graph": "config"` takes it.
+#[tokio::test]
+async fn config_guard_runs_on_a_branch() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("it-config-guard-branch")
+        .await
+        .unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:seed", "ex:p": 1}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("it-config-guard-branch", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("it-config-guard-branch:dev").await.unwrap();
+    let config = |graph: &str| {
+        json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": "urn:config:main",
+            "@type": "f:LedgerConfig",
+            "@graph": graph,
+            "f:shaclDefaults": {"f:shaclEnabled": true}
+        })
+    };
+
+    let err = fluree
+        .insert(dev.clone(), &config("default"))
+        .await
+        .expect_err("a config typed outside the config graph");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("f:LedgerConfig"), "{message}");
+
+    fluree
+        .insert(dev, &config("config"))
+        .await
+        .expect("the config graph takes it");
+}
+
+/// A single-valued setting the config graph would hold two values of is
+/// refused (a re-insert with a new value), while an identical re-insert and
+/// an upsert are not. A second `f:LedgerConfig` subject is refused too.
+#[tokio::test]
+async fn config_guard_refuses_a_second_value_for_a_single_valued_setting() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-guard-values:main";
+    let group = |enabled: bool| {
+        json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": "urn:config:shacl",
+            "@graph": "config",
+            "f:shaclEnabled": enabled
+        })
+    };
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:shaclDefaults": {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            }),
+        )
+        .await
+        .expect("first config write")
+        .ledger;
+
+    let err = fluree
+        .insert(ledger.clone(), &group(false))
+        .await
+        .expect_err("a second value for f:shaclEnabled");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:shaclEnabled") && message.contains("upsert"),
+        "{message}"
+    );
+
+    let ledger = fluree
+        .insert(ledger, &group(true))
+        .await
+        .expect("an identical re-insert adds no value")
+        .ledger;
+    let ledger = fluree
+        .upsert(ledger, &group(false))
+        .await
+        .expect("an upsert replaces the value")
+        .ledger;
+    let view = fluree.db(ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.clone())
+            .and_then(|s| s.enabled),
+        Some(false)
+    );
+
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:other",
+                "@type": "f:LedgerConfig",
+                "@graph": "config"
+            }),
+        )
+        .await
+        .expect_err("a second f:LedgerConfig subject");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("f:LedgerConfig"), "{message}");
+}
+
+/// The query group is a setting group like the others: its
+/// `f:unionDefaultGraph` belongs in the config graph with the edge (R1), and
+/// takes one value (R3).
+#[tokio::test]
+async fn config_guard_checks_the_query_defaults_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let err = fluree
+        .insert(
+            genesis_ledger(&fluree, "it/config-guard-query-split:main").await,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:queryDefaults": {
+                    "@id": "urn:config:query",
+                    "@graph": "default",
+                    "f:unionDefaultGraph": true
+                }
+            }),
+        )
+        .await
+        .expect_err("a query group split across graphs");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:queryDefaults") && message.contains("f:unionDefaultGraph"),
+        "{message}"
+    );
+
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, "it/config-guard-query-values:main").await,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:main",
+                "@type": "f:LedgerConfig",
+                "@graph": "config",
+                "f:queryDefaults": {"@id": "urn:config:query", "f:unionDefaultGraph": true}
+            }),
+        )
+        .await
+        .expect("the query group")
+        .ledger;
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "urn:config:query",
+                "@graph": "config",
+                "f:unionDefaultGraph": false
+            }),
+        )
+        .await
+        .expect_err("a second value for f:unionDefaultGraph");
+    let message = config_guard_refusal(err);
+    assert!(
+        message.contains("f:unionDefaultGraph") && message.contains("upsert"),
+        "{message}"
+    );
+}
+
+/// A multi-operation SPARQL update on `name` (created here, seeded with
+/// `trig`): every operation is governed by the state before the request.
+async fn seed_multi_op_ledger(fluree: &fluree_db_api::Fluree, name: &str, trig: &str) -> String {
+    fluree.create_ledger(name).await.expect("create");
+    let ledger_id = format!("{name}:main");
+    fluree
+        .graph(&ledger_id)
+        .transact()
+        .upsert_turtle(trig)
+        .commit()
+        .await
+        .expect("seed");
+    ledger_id
+}
+
+async fn multi_op(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    sparql: &str,
+) -> fluree_db_api::Result<fluree_db_api::TransactResultRef> {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(sparql)
+        .commit()
+        .await
+}
+
+/// Every operation of a multi-operation update is checked against the config,
+/// shapes and uniqueness constraints in effect before the request, as a
+/// single transaction is: an earlier operation that turns enforcement off, or
+/// removes the shape or constraint, does not admit a later operation's data,
+/// even when the request turns it back on. Enforcement switched on inside the
+/// request does not apply to it either, as in one transaction.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn multi_operation_update_is_governed_by_the_state_before_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let shacl_seed = |cfg: &str, enabled: bool| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+             @prefix ex: <http://example.org/> .
+             ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+               sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled {enabled} .
+             }}"
+        )
+    };
+    let prefixes = "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                    PREFIX sh: <http://www.w3.org/ns/shacl#>";
+    for (i, (what, ops)) in [
+        (
+            "SHACL off, then the violation",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { ex:bad a ex:Person }",
+        ),
+        (
+            "SHACL off, the violation, SHACL back on",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } } ;
+             INSERT DATA { ex:bad a ex:Person } ;
+             INSERT DATA { GRAPH <CFG> { <urn:config:shacl> f:shaclEnabled true } }",
+        ),
+        (
+            "the shape removed, then the violation",
+            "DELETE WHERE { ex:PersonShape sh:targetClass ex:Person } ;
+             INSERT DATA { ex:bad a ex:Person }",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("it/multi-op-governed-shacl-{i}");
+        let cfg = config_graph_iri(&format!("{name}:main"));
+        let ledger_id = seed_multi_op_ledger(&fluree, &name, &shacl_seed(&cfg, true)).await;
+        let err = multi_op(
+            &fluree,
+            &ledger_id,
+            &format!("{prefixes} {}", ops.replace("CFG", &cfg)),
+        )
+        .await
+        .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "{what}: {err:?}"
+        );
+    }
+
+    // Enabled inside the request: not in effect for it.
+    let name = "it/multi-op-governed-shacl-enable";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &shacl_seed(&cfg, false)).await;
+    multi_op(
+        &fluree,
+        &ledger_id,
+        &format!(
+            "{prefixes}
+             DELETE DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled true }} }} ;
+             INSERT DATA {{ ex:early a ex:Person }}"
+        ),
+    )
+    .await
+    .expect("enforcement switched on inside the request does not apply to it");
+    let err = multi_op(
+        &fluree,
+        &ledger_id,
+        &format!("{prefixes} INSERT DATA {{ ex:late a ex:Person }}"),
+    )
+    .await
+    .expect_err("it applies to the next request");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "{err:?}"
+    );
+}
+
+/// The same for uniqueness, switched off in config or by removing the
+/// property's `f:enforceUnique` annotation (data in the default graph).
+#[tokio::test]
+async fn multi_operation_update_is_governed_by_the_state_before_it_for_uniqueness() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (what, off, on)) in [
+        (
+            "uniqueness off in config",
+            "DELETE DATA { GRAPH <CFG> { <urn:config:tx> f:uniqueEnabled true } }",
+            "INSERT DATA { GRAPH <CFG> { <urn:config:tx> f:uniqueEnabled true } }",
+        ),
+        (
+            "the constraint annotation removed",
+            "DELETE DATA { ex:email f:enforceUnique true }",
+            "INSERT DATA { ex:email f:enforceUnique true }",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("it/multi-op-governed-unique-{i}");
+        let cfg = config_graph_iri(&format!("{name}:main"));
+        let ledger_id = seed_multi_op_ledger(
+            &fluree,
+            &name,
+            &format!(
+                "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+                 ex:email f:enforceUnique true .
+                 ex:u1 ex:email \"a@x\" .
+                 GRAPH <{cfg}> {{
+                   <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:tx> .
+                   <urn:config:tx> f:uniqueEnabled true .
+                 }}"
+            ),
+        )
+        .await;
+        let err = multi_op(
+            &fluree,
+            &ledger_id,
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                 {} ; INSERT DATA {{ ex:u2 ex:email \"a@x\" }} ; {}",
+                off.replace("CFG", &cfg),
+                on.replace("CFG", &cfg)
+            ),
+        )
+        .await
+        .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+                )
+            ),
+            "{what}: {err:?}"
+        );
+    }
+}
+
+/// The config guard judges a multi-operation update by what it commits, not
+/// by the order of its operations: replacing a single-valued setting by
+/// inserting the new value before deleting the old one is accepted, and a
+/// request whose result holds two values is still refused.
+#[tokio::test]
+async fn multi_operation_update_is_guarded_on_its_result() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = |cfg: &str| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled true .
+             }}"
+        )
+    };
+    let name = "it/multi-op-guard-result";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    multi_op(
+        &fluree,
+        &ledger_id,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#>
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             DELETE DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled true }} }}"
+        ),
+    )
+    .await
+    .expect("insert-then-delete leaves one value");
+    let view = fluree.db(&ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.as_ref())
+            .and_then(|s| s.enabled),
+        Some(false)
+    );
+
+    let name = "it/multi-op-guard-result-refused";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let err = multi_op(
+        &fluree,
+        &ledger_id,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             INSERT DATA {{ ex:x ex:p 1 }}"
+        ),
+    )
+    .await
+    .expect_err("two values in the result");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("f:shaclEnabled"), "{message}");
+}
+
+/// A transaction ([`fluree_db_api::Transaction`]) is governed like a
+/// multi-operation update: every operation it stages, a whole multi-operation
+/// SPARQL update or a Cypher statement included, reads SHACL and the config
+/// from the state the transaction began on, its shapes and uniqueness
+/// constraints as well as its config. An operation that turns SHACL off, or
+/// removes a shape or a property's `f:enforceUnique`, does not admit a later
+/// one's violating data; one that turns SHACL on, or adds `f:enforceUnique`,
+/// does not apply it to the transaction.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn transaction_is_governed_by_the_state_it_began_on() {
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let shacl_seed = |cfg: &str, enabled: bool| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+             @prefix ex: <http://example.org/> .
+             ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+               sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled {enabled} .
+             }}"
+        )
+    };
+    let flip = |cfg: &str, from: bool, to: bool| {
+        format!(
+            "PREFIX f: <https://ns.flur.ee/db#>
+             DELETE DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled {from} }} }} ;
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled {to} }} }}"
+        )
+    };
+    let violating = || {
+        TxnOperation::Insert(json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:nameless",
+            "@type": "ex:Person"
+        }))
+    };
+
+    // SHACL on: turning it off in the transaction does not admit the data,
+    // whether the data is its own operation, a Cypher statement, or a later
+    // operation of the same SPARQL update.
+    for (case, data) in [
+        ("JSON-LD", Some(violating())),
+        ("Cypher", None),
+        ("in the same SPARQL update", None),
+        ("in a later multi-operation SPARQL update", None),
+    ] {
+        let name = format!("it/txn-gov-on-{}", case.replace(' ', "-"));
+        let cfg = config_graph_iri(&format!("{name}:main"));
+        let ledger_id = seed_multi_op_ledger(&fluree, &name, &shacl_seed(&cfg, true)).await;
+        let mut txn = fluree
+            .begin_transaction(&ledger_id, TransactionOptions::default())
+            .await
+            .expect("begin");
+        let result = match (case, data) {
+            (_, Some(data)) => {
+                txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, true, false), None))
+                    .await
+                    .expect("the config change stages");
+                txn.stage(data).await
+            }
+            ("Cypher", None) => {
+                txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, true, false), None))
+                    .await
+                    .expect("the config change stages");
+                txn.stage_cypher("CREATE (:`http://example.org/Person`)", None)
+                    .await
+                    .map(|_| ())
+            }
+            ("in a later multi-operation SPARQL update", None) => {
+                txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, true, false), None))
+                    .await
+                    .expect("the config change stages");
+                txn.stage(TxnOperation::SparqlUpdate(
+                    "PREFIX ex: <http://example.org/>
+                     INSERT DATA { ex:other ex:p 1 } ;
+                     INSERT DATA { ex:nameless a ex:Person }"
+                        .to_string(),
+                    None,
+                ))
+                .await
+            }
+            _ => {
+                let both = format!(
+                    "{} ;
+                     PREFIX ex: <http://example.org/>
+                     INSERT DATA {{ ex:nameless a ex:Person }}",
+                    flip(&cfg, true, false)
+                );
+                txn.stage(TxnOperation::SparqlUpdate(both, None)).await
+            }
+        };
+        let err = result.expect_err(case);
+        assert!(err.to_string().contains("SHACL"), "{case}: {err}");
+    }
+
+    // SHACL off: turning it on in the transaction does not apply it to the
+    // transaction's own data.
+    let name = "it/txn-gov-off";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &shacl_seed(&cfg, false)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(flip(&cfg, false, true), None))
+        .await
+        .expect("the config change stages");
+    txn.stage(violating())
+        .await
+        .expect("not enforced within the transaction that enables it");
+    txn.commit(Default::default()).await.expect("commit");
+
+    // The shape removed in the transaction still applies to it.
+    let name = "it/txn-gov-shape-removed";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &shacl_seed(&cfg, true)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(
+        "PREFIX sh: <http://www.w3.org/ns/shacl#> PREFIX ex: <http://example.org/>
+         DELETE DATA { ex:PersonShape sh:targetClass ex:Person }"
+            .to_string(),
+        None,
+    ))
+    .await
+    .expect("the shape change stages");
+    let err = txn.stage(violating()).await.expect_err("shape removed");
+    assert!(err.to_string().contains("SHACL"), "shape removed: {err}");
+
+    // Uniqueness: a constraint removed in the transaction still applies to
+    // it, and one added does not yet.
+    let unique_seed = |cfg: &str, annotated: bool| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             {}
+             ex:u1 ex:email \"a@x\" .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:tx> .
+               <urn:config:tx> f:uniqueEnabled true .
+             }}",
+            if annotated {
+                "ex:email f:enforceUnique true ."
+            } else {
+                ""
+            }
+        )
+    };
+    let annotation = |op: &str| {
+        TxnOperation::SparqlUpdate(
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+                 {op} DATA {{ ex:email f:enforceUnique true }}"
+            ),
+            None,
+        )
+    };
+    let duplicate = || {
+        TxnOperation::Insert(json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:u2",
+            "ex:email": "a@x"
+        }))
+    };
+    let name = "it/txn-gov-unique-removed";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &unique_seed(&cfg, true)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(annotation("DELETE"))
+        .await
+        .expect("the constraint change stages");
+    let err = txn
+        .stage(duplicate())
+        .await
+        .expect_err("constraint removed");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "constraint removed: {err:?}"
+    );
+
+    let name = "it/txn-gov-unique-added";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &unique_seed(&cfg, false)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(annotation("INSERT"))
+        .await
+        .expect("the constraint change stages");
+    txn.stage(duplicate())
+        .await
+        .expect("not enforced within the transaction that adds it");
+    txn.commit(Default::default()).await.expect("commit");
+}
+
+/// A transaction's config guard judges what it commits, once, as a
+/// multi-operation update's does: a second value inserted before the old one
+/// is deleted commits; a second value left in the result is refused when the
+/// transaction commits.
+#[tokio::test]
+async fn transaction_is_guarded_on_its_result() {
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let seed = |cfg: &str| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <{cfg}> {{
+               <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+               <urn:config:shacl> f:shaclEnabled true .
+             }}"
+        )
+    };
+    let stage = |cfg: &str, op: &str| {
+        TxnOperation::SparqlUpdate(
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 {op} DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled {} }} }}",
+                op == "DELETE"
+            ),
+            None,
+        )
+    };
+
+    let name = "it/txn-guard-result";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(stage(&cfg, "INSERT"))
+        .await
+        .expect("insert false");
+    txn.stage(stage(&cfg, "DELETE")).await.expect("delete true");
+    txn.commit(Default::default())
+        .await
+        .expect("insert-then-delete leaves one value");
+    let view = fluree.db(&ledger_id).await.unwrap();
+    assert_eq!(
+        view.ledger_config()
+            .and_then(|c| c.shacl.as_ref())
+            .and_then(|s| s.enabled),
+        Some(false)
+    );
+
+    // The same when the second value comes from a multi-operation update:
+    // that update's own result is not guarded on its own, only the
+    // transaction's.
+    let name = "it/txn-guard-result-nested";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(
+        format!(
+            "PREFIX f: <https://ns.flur.ee/db#> PREFIX ex: <http://example.org/>
+             INSERT DATA {{ GRAPH <{cfg}> {{ <urn:config:shacl> f:shaclEnabled false }} }} ;
+             INSERT DATA {{ ex:x ex:p 1 }}"
+        ),
+        None,
+    ))
+    .await
+    .expect("the guard waits for the transaction's result");
+    txn.stage(stage(&cfg, "DELETE")).await.expect("delete true");
+    txn.commit(Default::default())
+        .await
+        .expect("one value in the transaction's result");
+
+    let name = "it/txn-guard-result-refused";
+    let cfg = config_graph_iri(&format!("{name}:main"));
+    let ledger_id = seed_multi_op_ledger(&fluree, name, &seed(&cfg)).await;
+    let mut txn = fluree
+        .begin_transaction(&ledger_id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(stage(&cfg, "INSERT"))
+        .await
+        .expect("the guard waits for the result");
+    txn.stage(TxnOperation::Insert(json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:x",
+        "ex:p": 1
+    })))
+    .await
+    .expect("data stages");
+    let err = txn
+        .commit(Default::default())
+        .await
+        .expect_err("two values in the result");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("f:shaclEnabled"), "{message}");
+}
+
+/// A repair recipe exactly as `docs/ledger-config/writing-config.md` gives
+/// it, for `ledger_id`: the first (`which` 0) starts from the config subject
+/// in the config graph, the second from the recommended subject when the
+/// config graph holds none.
+#[cfg(feature = "shacl")]
+fn docs_repair_recipe(ledger_id: &str, which: usize) -> String {
+    let doc = include_str!("../../docs/ledger-config/writing-config.md");
+    let section = doc
+        .split_once("## Repairing a config split across graphs")
+        .expect("the repair section")
+        .1;
+    let recipe = section
+        .split("```sparql")
+        .nth(which + 1)
+        .and_then(|rest| rest.split_once("```"))
+        .expect("the recipe")
+        .0;
+    recipe
+        .replace("urn:fluree:mydb:main#config", &config_graph_iri(ledger_id))
+        .replace(
+            "urn:fluree:mydb:main:config:ledger",
+            &format!("urn:fluree:{ledger_id}:config:ledger"),
+        )
+}
+
+/// The repair recipe (`docs/ledger-config/writing-config.md`, run as the docs
+/// give it) restores each config the pre-fix JSON-LD parser could split
+/// across graphs: a setting group's fields in the default graph; the config
+/// subject's own group link and group there; a per-graph override's target
+/// and groups there; a group partly in the config graph; an anonymous group
+/// (a blank node, as the documented JSON-LD form wrote it); and (with the second
+/// recipe) a whole config on the recommended subject in the default graph,
+/// untyped, with no config subject in the config graph. Before the repair
+/// each reads without its SHACL setting (the forbidden record commits) and
+/// ledger info reports `stranded-fields`; after it, nothing is stranded and
+/// SHACL enforces again.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn repair_recipe_restores_a_split_config() {
+    let shape = json!({
+        "@id": "ex:PersonShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+    });
+    let cases: Vec<(&str, Option<&str>, Vec<serde_json::Value>)> = vec![
+        (
+            "the whole config on the recommended subject in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:fluree:{ledger}:config:ledger",
+                       "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "a group's fields in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true,
+                       "f:validationMode": {"@id": "f:ValidationReject"}}),
+            ],
+        ),
+        (
+            "the config subject's group link and group in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config"}),
+                json!({"@id": "urn:config:main", "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "a per-graph override's target and group in the default graph",
+            Some("ex:g"),
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:graphOverrides": {"@id": "urn:config:g"}}),
+                json!({"@id": "urn:config:g", "@type": "f:GraphConfig",
+                       "f:targetGraph": {"@id": "ex:g"},
+                       "f:shaclDefaults": {"@id": "urn:config:gshacl"}}),
+                json!({"@id": "urn:config:gshacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "a group partly in the config graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:shaclDefaults": {"@id": "urn:config:shacl"}}),
+                json!({"@id": "urn:config:shacl", "@graph": "config",
+                       "f:validationMode": {"@id": "f:ValidationReject"}}),
+                json!({"@id": "urn:config:shacl", "f:shaclEnabled": true}),
+            ],
+        ),
+        (
+            "an anonymous group (a blank node) in the default graph",
+            None,
+            vec![
+                json!({"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                       "f:shaclDefaults": {"@id": "_:group"}}),
+                json!({"@id": "_:group", "f:shaclEnabled": true,
+                       "f:validationMode": {"@id": "f:ValidationReject"}}),
+            ],
+        ),
+    ];
+    for (i, (what, data_graph, config)) in cases.into_iter().enumerate() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/config-repair-recipe-{i}:main");
+        let forbidden = |id: &str| {
+            let mut doc =
+                json!({"@context": {"ex": "http://example.org/"}, "@id": id, "@type": "ex:Person"});
+            if let Some(g) = data_graph {
+                doc["@graph"] = json!(g);
+            }
+            doc
+        };
+        let mut seed = vec![shape.clone()];
+        seed.extend(config.into_iter().map(|node| {
+            let node = node.to_string().replace("{ledger}", &ledger_id);
+            serde_json::from_str::<serde_json::Value>(&node).unwrap()
+        }));
+        let recipe = docs_repair_recipe(&ledger_id, usize::from(i == 0));
+        // The state as the pre-fix parser (and writes before the config guard)
+        // left it, seeded unchecked, as that history reaches a ledger.
+        let ledger = commit_unchecked(
+            &fluree,
+            genesis_ledger(&fluree, &ledger_id).await,
+            &json!({
+                "@context": {
+                    "f": "https://ns.flur.ee/db#",
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@graph": seed
+            }),
+        )
+        .await;
+        assert!(
+            config_diagnostic_codes(&fluree, &ledger_id)
+                .await
+                .contains(&"stranded-fields".to_string()),
+            "{what}: reported before the repair"
+        );
+        let ledger = fluree
+            .insert(ledger, &forbidden("ex:before"))
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the split setting is not in effect: {e}"))
+            .ledger;
+
+        let ledger = sparql_update(&fluree, ledger, &recipe)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the repair recipe commits: {e}"))
+            .ledger;
+
+        assert!(
+            !config_diagnostic_codes(&fluree, &ledger_id)
+                .await
+                .contains(&"stranded-fields".to_string()),
+            "{what}: nothing stranded after the repair"
+        );
+        let err = fluree
+            .insert(ledger, &forbidden("ex:after"))
+            .await
+            .expect_err(what);
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "{what}: {err:?}"
+        );
+    }
+}
+
+/// Fields of the ledger's config subject belong in the config graph like a
+/// group's: written without it (JSON-LD with no `@graph`, SPARQL `INSERT
+/// DATA` with no `GRAPH`), they would never be read, so the write is
+/// refused, naming the config subject and the config graph. So is typing a
+/// subject `f:LedgerConfig` in the config graph whose config fields already
+/// sit in another graph.
+#[tokio::test]
+async fn config_guard_refuses_fields_of_the_config_subject_outside_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, form) in ["jsonld", "sparql"].into_iter().enumerate() {
+        let name = format!("it/config-guard-root-{i}");
+        fluree.create_ledger(&name).await.unwrap();
+        let ledger_id = format!("{name}:main");
+        let cfg = config_graph_iri(&ledger_id);
+        let root = format!("urn:fluree:{ledger_id}:config:ledger");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix f: <https://ns.flur.ee/db#> . GRAPH <{cfg}> {{ <{root}> a f:LedgerConfig . }}"
+            ))
+            .commit()
+            .await
+            .expect("the config subject");
+        let result = if form == "jsonld" {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"f": "https://ns.flur.ee/db#"},
+                    "@id": root,
+                    "f:shaclDefaults": {"f:shaclEnabled": true}
+                }))
+                .commit()
+                .await
+        } else {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#>
+                     INSERT DATA {{ <{root}> f:shaclDefaults <urn:x:shacl> .
+                                    <urn:x:shacl> f:shaclEnabled true . }}"
+                ))
+                .commit()
+                .await
+        };
+        let message = config_guard_refusal(result.expect_err(form));
+        assert!(
+            message.contains("config subject") && message.contains(&cfg),
+            "{form}: {message}"
+        );
+    }
+
+    // The reverse order: the fields first (no config yet), then the typing.
+    let name = "it/config-guard-root-late";
+    fluree.create_ledger(name).await.unwrap();
+    let ledger_id = format!("{name}:main");
+    let cfg = config_graph_iri(&ledger_id);
+    fluree
+        .graph(&ledger_id)
+        .transact()
+        .insert(&json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": "urn:config:main",
+            "f:shaclDefaults": {"@id": "urn:config:shacl"}
+        }))
+        .commit()
+        .await
+        .expect("an f: field on a subject that is not config yet is data");
+    let err = fluree
+        .graph(&ledger_id)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> . GRAPH <{cfg}> {{ <urn:config:main> a f:LedgerConfig . }}"
+        ))
+        .commit()
+        .await
+        .expect_err("typing it in the config graph would leave its group link outside");
+    let message = config_guard_refusal(err);
+    assert!(message.contains("already has fields"), "{message}");
+}
+
+/// The conventional config subject (`urn:fluree:<ledger>:config:ledger`) is
+/// the config subject by its IRI, before the config graph holds it: on a
+/// ledger with no config, its fields written without the config graph would
+/// never be read, so the write is refused (JSON-LD with no `@graph`, SPARQL
+/// `INSERT DATA` with no `GRAPH`), naming the config graph. Written past the
+/// guard (data from an earlier release), ledger info reports them.
+#[tokio::test]
+async fn config_guard_refuses_the_conventional_config_subject_outside_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, form) in ["jsonld", "sparql"].into_iter().enumerate() {
+        let name = format!("it/config-guard-conventional-{i}");
+        fluree.create_ledger(&name).await.unwrap();
+        let ledger_id = format!("{name}:main");
+        let cfg = config_graph_iri(&ledger_id);
+        let root = format!("urn:fluree:{ledger_id}:config:ledger");
+        let result = if form == "jsonld" {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .insert(&json!({
+                    "@context": {"f": "https://ns.flur.ee/db#"},
+                    "@id": root,
+                    "f:shaclDefaults": {"@id": "urn:x:shacl", "f:shaclEnabled": true}
+                }))
+                .commit()
+                .await
+        } else {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .sparql_update(&format!(
+                    "PREFIX f: <https://ns.flur.ee/db#>
+                     INSERT DATA {{ <{root}> f:shaclDefaults <urn:x:shacl> .
+                                    <urn:x:shacl> f:shaclEnabled true . }}"
+                ))
+                .commit()
+                .await
+        };
+        let message = config_guard_refusal(result.expect_err(form));
+        assert!(
+            message.contains("config subject") && message.contains(&root) && message.contains(&cfg),
+            "{form}: {message}"
+        );
+    }
+
+    let ledger_id = "it/config-diagnostics-conventional:main";
+    let root = format!("urn:fluree:{ledger_id}:config:ledger");
+    commit_unchecked(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@id": root,
+            "f:shaclDefaults": {"@id": "urn:x:shacl", "f:shaclEnabled": true}
+        }),
+    )
+    .await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["stranded-fields"]
+    );
+}
+
+/// Ledger info reports every config node with config fields outside the
+/// config graph, not only empty groups: a per-graph override whose target and
+/// groups were written to the default graph (reported, with the override the
+/// reader skips for want of a target), and a group partly in the config
+/// graph.
+#[tokio::test]
+async fn diagnostics_report_every_stranded_config_node() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-diagnostics-override:main";
+    commit_unchecked(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#", "ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                 "f:graphOverrides": {"@id": "urn:config:g"}},
+                {"@id": "urn:config:g", "@type": "f:GraphConfig",
+                 "f:targetGraph": {"@id": "ex:g"},
+                 "f:shaclDefaults": {"@id": "urn:config:gshacl"}},
+                {"@id": "urn:config:gshacl", "f:shaclEnabled": true}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["empty-group", "stranded-fields"]
+    );
+
+    let ledger_id = "it/config-diagnostics-partial:main";
+    commit_unchecked(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {"@id": "urn:config:main", "@type": "f:LedgerConfig", "@graph": "config",
+                 "f:shaclDefaults": {"@id": "urn:config:shacl"}},
+                {"@id": "urn:config:shacl", "@graph": "config",
+                 "f:validationMode": {"@id": "f:ValidationReject"}},
+                {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(
+        config_diagnostic_codes(&fluree, ledger_id).await,
+        ["stranded-fields"]
+    );
+}
+
 // =============================================================================
 // Test 1: config graph reserved at g_id=2
 // =============================================================================
@@ -96,7 +2364,7 @@ async fn config_write_trig_roundtrip() {
 // =============================================================================
 
 #[tokio::test]
-async fn config_write_json_ld() {
+async fn config_write_trig_iri_groups() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-jsonld:main";
     let ledger = genesis_ledger(&fluree, ledger_id).await;
@@ -140,6 +2408,91 @@ async fn config_write_json_ld() {
             .map(std::vec::Vec::as_slice),
         Some(["https://ns.flur.ee/db#rdfs".to_string()].as_slice()),
         "reasoning modes should round-trip as full IRIs"
+    );
+}
+
+/// #1979: the JSON-LD recipe in `docs/ledger-config/writing-config.md`,
+/// verbatim apart from the ledger name. The nested `f:shaclDefaults` group
+/// inherits the node's `"@graph"` selector, so all four statements land in
+/// `#config` (two used to land in the default graph, leaving an empty SHACL
+/// group that read as disabled) and the configured SHACL enforces.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn config_write_json_ld_nested_groups_land_in_config() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-jsonld-nested:main";
+    let config_iri = config_graph_iri(ledger_id);
+    let ledger = genesis_ledger(&fluree, ledger_id).await;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#" },
+                "@graph": [
+                    {
+                        "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                        "@type": "f:LedgerConfig",
+                        "@graph": config_iri,
+                        "f:shaclDefaults": {
+                            "f:shaclEnabled": true,
+                            "f:validationMode": { "@id": "f:ValidationReject" }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("documented config write")
+        .ledger;
+
+    let view = fluree.db(ledger_id).await.unwrap();
+    let shacl = view
+        .ledger_config()
+        .and_then(|c| c.shacl.clone())
+        .expect("SHACL group read from #config");
+    assert_eq!(
+        shacl.enabled,
+        Some(true),
+        "f:shaclEnabled landed in #config"
+    );
+    assert_eq!(
+        shacl.validation_mode,
+        Some(fluree_db_core::ledger_config::ValidationMode::Reject),
+        "f:validationMode landed in #config"
+    );
+
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person"
+            }),
+        )
+        .await
+        .expect_err("the record the shape forbids must be refused");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "{err:?}"
     );
 }
 
@@ -966,34 +3319,32 @@ async fn empty_config_returns_none() {
 async fn multiple_configs_lexicographic_tiebreaker() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-tiebreak:main";
-    let ledger = genesis_ledger(&fluree, ledger_id).await;
 
-    let config_iri = config_graph_iri(ledger_id);
-
-    // Write two LedgerConfig nodes: alpha (defaultAllow=false) and beta (defaultAllow=true)
-    let trig = format!(
-        r"
-        @prefix f: <https://ns.flur.ee/db#> .
-        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-
-        GRAPH <{config_iri}> {{
-            <urn:config:alpha> rdf:type f:LedgerConfig .
-            <urn:config:alpha> f:policyDefaults <urn:config:alpha-policy> .
-            <urn:config:alpha-policy> f:defaultAllow false .
-
-            <urn:config:beta> rdf:type f:LedgerConfig .
-            <urn:config:beta> f:policyDefaults <urn:config:beta-policy> .
-            <urn:config:beta-policy> f:defaultAllow true .
-        }}
-    "
-    );
-
-    fluree
-        .stage_owned(ledger)
-        .upsert_turtle(&trig)
-        .execute()
-        .await
-        .expect("config write");
+    // Two LedgerConfig nodes: alpha (defaultAllow=false) and beta
+    // (defaultAllow=true). The config guard refuses a second subject, so they
+    // are seeded the way history written before the guard reaches a ledger.
+    commit_unchecked(
+        &fluree,
+        genesis_ledger(&fluree, ledger_id).await,
+        &json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "@graph": [
+                {
+                    "@id": "urn:config:alpha",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:policyDefaults": {"@id": "urn:config:alpha-policy", "f:defaultAllow": false}
+                },
+                {
+                    "@id": "urn:config:beta",
+                    "@type": "f:LedgerConfig",
+                    "@graph": "config",
+                    "f:policyDefaults": {"@id": "urn:config:beta-policy", "f:defaultAllow": true}
+                }
+            ]
+        }),
+    )
+    .await;
 
     let view = fluree.db(ledger_id).await.unwrap();
     let config = view
@@ -1112,7 +3463,27 @@ async fn shacl_config_disables_validation() {
         .unwrap();
     let ledger = result.ledger;
 
-    // Step 2: Verify violation fails WITHOUT config (shapes-exist heuristic)
+    // Step 2: Enable SHACL in config; the violation fails
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true .
+        }}
+    "
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write should succeed")
+        .ledger;
     let err = fluree
         .insert(
             ledger.clone(),
@@ -1129,11 +3500,10 @@ async fn shacl_config_disables_validation() {
             err,
             fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
         ),
-        "without config, shapes-exist heuristic should trigger SHACL rejection: {err:?}"
+        "with SHACL enabled, the violation is rejected: {err:?}"
     );
 
     // Step 3: Write config disabling SHACL
-    let config_iri = config_graph_iri(ledger_id);
     let trig = format!(
         r"
         @prefix f: <https://ns.flur.ee/db#> .
@@ -1971,16 +4341,18 @@ async fn shacl_reads_the_named_graph_the_write_lands_in() {
 }
 
 // =============================================================================
-// Test 16: SHACL shapes-exist heuristic (no config)
+// Test 16: shapes without config do not enforce (explicit-only SHACL)
 // =============================================================================
 
-/// When no config graph exists but SHACL shapes are present in the database,
-/// the shapes-exist heuristic kicks in and SHACL validation runs (backward compat).
+/// Shapes alone never enable SHACL: a ledger that holds shapes but no config
+/// enabling SHACL accepts the record they forbid (#1979's control).
+/// `config_write_json_ld_nested_groups_land_in_config` refuses the same record
+/// once the documented config enables SHACL.
 #[cfg(feature = "shacl")]
 #[tokio::test]
-async fn shacl_default_shapes_exist_heuristic() {
+async fn shacl_shapes_without_config_do_not_enforce() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/shacl-heuristic:main";
+    let ledger_id = "it/shacl-shapes-only:main";
     let ledger = genesis_ledger(&fluree, ledger_id).await;
 
     // Seed SHACL shapes — no config graph at all
@@ -2007,8 +4379,8 @@ async fn shacl_default_shapes_exist_heuristic() {
         .unwrap();
     let ledger = result.ledger;
 
-    // Violating data should fail — shapes exist → implicit SHACL enablement
-    let err = fluree
+    // The record the shape forbids commits: no config enables SHACL.
+    fluree
         .insert(
             ledger,
             &json!({
@@ -2018,15 +4390,618 @@ async fn shacl_default_shapes_exist_heuristic() {
             }),
         )
         .await
-        .unwrap_err();
+        .expect("no config enables SHACL, so the shapes are not enforced");
+}
 
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+/// Run a SPARQL UPDATE against `ledger`.
+async fn sparql_update(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    sparql: &str,
+) -> fluree_db_api::Result<fluree_db_api::TransactResult> {
+    let ast = fluree_db_sparql::parse_sparql(sparql)
+        .ast
+        .expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE");
+    fluree.stage_owned(ledger).txn(txn).execute().await
+}
+
+/// A shape requiring `ex:name` on every `ex:Person`, in the default graph.
+#[cfg(feature = "shacl")]
+fn person_name_shape() -> serde_json::Value {
+    json!({
+        "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+        "@id": "ex:PersonShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+    })
+}
+
+/// Explicit-only SHACL: whether a ledger that holds shapes enforces them
+/// depends on its config's SHACL group and nothing else. Each config here is
+/// written through SPARQL, the record the shape forbids through SPARQL too.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_posture_is_explicit_only() {
+    let shacl_enabled = |flag: &str| {
+        format!(
+            "<urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> . \
+             <urn:config:shacl> f:shaclEnabled {flag} ."
+        )
+    };
+    let per_graph_only = "<urn:config:main> a f:LedgerConfig ; \
+                            f:graphOverrides <urn:config:ga> . \
+                          <urn:config:ga> a f:GraphConfig ; \
+                            f:targetGraph <http://example.org/g/a> ; \
+                            f:shaclDefaults <urn:config:ga-shacl> . \
+                          <urn:config:ga-shacl> f:shaclEnabled true ."
+        .to_string();
+    // (case, #config content, graph the forbidden record is written to,
+    // whether it is refused)
+    let cases: [(&str, String, Option<&str>, bool); 8] = [
+        (
+            "a config with only reasoning defaults",
+            "<urn:config:main> a f:LedgerConfig ; f:reasoningDefaults <urn:config:r> . \
+             <urn:config:r> f:reasoningModes f:rdfs ."
+                .to_string(),
+            None,
+            false,
         ),
-        "shapes-exist heuristic should trigger SHACL rejection: {err:?}"
-    );
+        (
+            "a bare f:LedgerConfig",
+            "<urn:config:main> a f:LedgerConfig .".to_string(),
+            None,
+            false,
+        ),
+        (
+            "an empty SHACL group (read as absent)",
+            "<urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .".to_string(),
+            None,
+            false,
+        ),
+        ("f:shaclEnabled false", shacl_enabled("false"), None, false),
+        ("f:shaclEnabled true", shacl_enabled("true"), None, true),
+        (
+            "f:shaclEnabled true, write to a named graph",
+            shacl_enabled("true"),
+            Some("http://example.org/g/a"),
+            true,
+        ),
+        (
+            "per-graph f:shaclEnabled true, write to that graph",
+            per_graph_only.clone(),
+            Some("http://example.org/g/a"),
+            true,
+        ),
+        (
+            "per-graph f:shaclEnabled true, write to the default graph",
+            per_graph_only,
+            None,
+            false,
+        ),
+    ];
+    for (case, config, graph, refused) in cases {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = "it/shacl-explicit-only:main";
+        let ledger = fluree
+            .insert(
+                genesis_ledger(&fluree, ledger_id).await,
+                &person_name_shape(),
+            )
+            .await
+            .expect("shape insert")
+            .ledger;
+        let ledger = sparql_update(
+            &fluree,
+            ledger,
+            &format!(
+                "PREFIX f: <https://ns.flur.ee/db#> \
+                 INSERT DATA {{ GRAPH <{}> {{ {config} }} }}",
+                config_graph_iri(ledger_id)
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{case}: config write: {e}"))
+        .ledger;
+
+        let record = "<http://example.org/alice> a <http://example.org/Person> .";
+        let write = match graph {
+            Some(g) => format!("INSERT DATA {{ GRAPH <{g}> {{ {record} }} }}"),
+            None => format!("INSERT DATA {{ {record} }}"),
+        };
+        let result = sparql_update(&fluree, ledger, &write).await;
+        match (refused, result) {
+            (true, Err(err)) => assert!(
+                matches!(
+                    err,
+                    fluree_db_api::ApiError::Transact(
+                        fluree_db_transact::TransactError::ShaclViolation(_)
+                    )
+                ),
+                "{case}: expected a SHACL violation: {err:?}"
+            ),
+            (true, Ok(_)) => panic!("{case}: the forbidden record must be refused"),
+            (false, Err(err)) => panic!("{case}: the record must commit: {err:?}"),
+            (false, Ok(_)) => {}
+        }
+    }
+}
+
+/// `f:shaclEnabled true` with a local `f:shapesSource` naming a graph the
+/// ledger does not have: data writes fail closed, and the config repair
+/// commits (a config-only write resolves no shapes source), after which data
+/// writes commit.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn unknown_local_shapes_source_fails_closed_and_the_config_repair_commits() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-unknown-shapes-graph:main";
+    let config_iri = config_graph_iri(ledger_id);
+    let ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, ledger_id).await)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+                <urn:config:shacl> f:shaclEnabled true .
+                <urn:config:shacl> f:shapesSource <urn:config:shapes-ref> .
+                <urn:config:shapes-ref> rdf:type f:GraphRef ;
+                                        f:graphSource <urn:config:shapes-src> .
+                <urn:config:shapes-src> f:graphSelector <http://example.org/no-such-graph> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("config write")
+        .ledger;
+    let record = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+
+    let err = fluree
+        .insert(ledger.clone(), &record)
+        .await
+        .expect_err("SHACL is on and its shapes graph does not exist: fail closed");
+    assert!(err.to_string().contains("no-such-graph"), "{err}");
+
+    let ledger = sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ GRAPH <{config_iri}> {{ <urn:config:shacl> f:shaclEnabled ?on }} }} \
+             INSERT {{ GRAPH <{config_iri}> {{ <urn:config:shacl> f:shaclEnabled false }} }} \
+             WHERE {{ GRAPH <{config_iri}> {{ <urn:config:shacl> f:shaclEnabled ?on }} }}"
+        ),
+    )
+    .await
+    .expect("the config repair resolves no shapes source and commits")
+    .ledger;
+    fluree
+        .insert(ledger, &record)
+        .await
+        .expect("after the repair data writes commit");
+}
+
+/// A Turtle insert on a ledger that holds shapes but no config enabling SHACL
+/// is not validated (`shacl_turtle_insert_rejected_when_violating` is the
+/// enabled twin).
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_turtle_insert_without_config_is_not_validated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/shacl-turtle-no-config:main").await;
+    let ledger = fluree
+        .insert(ledger, &person_name_shape())
+        .await
+        .expect("shape insert")
+        .ledger;
+    fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> . ex:charlie a ex:Person .",
+        )
+        .await
+        .expect("no config enables SHACL, so the Turtle insert is not validated");
+}
+
+/// Push replays a commit under the receiving ledger's configured posture.
+/// The source commits here skip the source's own checks, so the forbidden
+/// record reaches the receiver either way: where the pushed config enables
+/// SHACL it is refused, and where the ledger only holds shapes it is not.
+/// The receiver is another instance of the same ledger, as in replication.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn push_validates_only_where_config_enables_shacl() {
+    for enabled in [false, true] {
+        let source = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/shacl-push-{enabled}:main");
+        let mut seed = vec![json!({
+            "@id": "ex:PersonShape",
+            "@type": "sh:NodeShape",
+            "sh:targetClass": {"@id": "ex:Person"},
+            "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+        })];
+        if enabled {
+            seed.push(support::shacl_enabled_config_node());
+        }
+        let src = commit_unchecked(
+            &source,
+            genesis_ledger(&source, &ledger_id).await,
+            &json!({
+                "@context": {"sh": "http://www.w3.org/ns/shacl#", "ex": "http://example.org/"},
+                "@graph": seed
+            }),
+        )
+        .await;
+        commit_unchecked(
+            &source,
+            src,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person"
+            }),
+        )
+        .await;
+
+        let target = FlureeBuilder::memory().build_memory();
+        target
+            .create_ledger(&ledger_id)
+            .await
+            .expect("create target");
+        let result = target
+            .push_commits(
+                &ledger_id,
+                newest_commits(&source, &ledger_id, 100).await,
+                &GovernanceOptions::default(),
+                &target.default_index_config(),
+            )
+            .await;
+        match (enabled, result) {
+            (false, Ok(pushed)) => assert_eq!(pushed.accepted, 2),
+            (false, Err(err)) => panic!("shapes without config are not enforced on push: {err}"),
+            (true, Err(err)) => {
+                assert_eq!(err.status_code(), 422, "{err}");
+                assert!(err.to_string().contains("SHACL"), "{err}");
+            }
+            (true, Ok(_)) => panic!("the pushed config enables SHACL: the push must be refused"),
+        }
+    }
+}
+
+/// The newest `limit` commits of `ledger_id`, oldest first, as a push sends
+/// them.
+async fn newest_commits(
+    from: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    limit: usize,
+) -> fluree_db_api::PushCommitsRequest {
+    let handle = from.ledger_cached(ledger_id).await.expect("source handle");
+    let export = from
+        .export_commit_range(
+            &handle,
+            &fluree_db_api::ExportCommitsRequest {
+                limit: Some(limit),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("export commits");
+    let mut commits = export.commits;
+    commits.reverse();
+    fluree_db_api::PushCommitsRequest {
+        commits,
+        blobs: export.blobs,
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    }
+}
+
+#[cfg(feature = "shacl")]
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).expect("copy file");
+        }
+    }
+}
+
+/// A pushed commit is validated in each named graph it writes, under that
+/// graph's config, whether or not the receiving ledger is indexed: a graph
+/// the ledger has registered, one the pushed commits register (in the same
+/// commit or an earlier one of the push), and the default graph alike. The
+/// receiver is an unindexed copy of the sender. SHACL is on ledger-wide and
+/// off for `ex:a` and for `ex:g7`, which no commit has written before the
+/// push; each pushed commit holds a record the shapes forbid, committed at
+/// the source under a requested warn.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn push_validates_each_named_graph_under_its_own_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir.path().join("base");
+    let file_fluree = |path: &std::path::Path| {
+        FlureeBuilder::file(path.to_str().expect("utf-8 path"))
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+    };
+    let name = "it/push-graph-config";
+    let ledger_id = format!("{name}:main");
+    let cfg = config_graph_iri(&ledger_id);
+    {
+        let fluree = file_fluree(&base);
+        fluree.create_ledger(name).await.expect("create");
+        for trig in [
+            format!(
+                "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+                 @prefix ex: <http://example.org/> .
+                 ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+                   sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+                 GRAPH <{cfg}> {{
+                   <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> ;
+                     f:graphOverrides <urn:config:ga>, <urn:config:g7> .
+                   <urn:config:shacl> f:shaclEnabled true .
+                   <urn:config:ga> a f:GraphConfig ; f:targetGraph ex:a ;
+                     f:shaclDefaults <urn:config:gashacl> .
+                   <urn:config:gashacl> f:shaclEnabled false .
+                   <urn:config:g7> a f:GraphConfig ; f:targetGraph ex:g7 ;
+                     f:shaclDefaults <urn:config:g7shacl> .
+                   <urn:config:g7shacl> f:shaclEnabled false .
+                 }}"
+            ),
+            "@prefix ex: <http://example.org/> . GRAPH ex:a { ex:x1 ex:p 1 . }".to_string(),
+            "@prefix ex: <http://example.org/> . GRAPH ex:z { ex:x2 ex:p 2 . }".to_string(),
+        ] {
+            fluree
+                .graph(&ledger_id)
+                .transact()
+                .upsert_turtle(&trig)
+                .commit()
+                .await
+                .expect("seed");
+        }
+        // Retire the root's WAL before copying the root. Dropping the instance
+        // can leave its log live, and the log's flush thread deletes a segment
+        // once the files it covers are on the device, which a copy running at
+        // the same time finds missing.
+        fluree.disconnect().await;
+    }
+
+    let bad = |graph: &str| match graph {
+        "" => "ex:bad a ex:Person".to_string(),
+        g => format!("GRAPH {g} {{ ex:bad a ex:Person }}"),
+    };
+    let fine = |graph: &str| format!("GRAPH {graph} {{ ex:fine ex:p 1 }}");
+    // (case, the pushed commits' INSERT DATA bodies, whether the push is accepted)
+    let cases: Vec<(&str, Vec<String>, bool)> = vec![
+        ("a new graph", vec![bad("ex:g2")], false),
+        (
+            "two new graphs",
+            vec![format!("{} {}", fine("ex:g1"), bad("ex:g2"))],
+            false,
+        ),
+        ("a registered graph", vec![bad("ex:z")], false),
+        ("the default graph", vec![bad("")], false),
+        ("a graph with SHACL off", vec![bad("ex:a")], true),
+        ("a new graph with SHACL off", vec![bad("ex:g7")], true),
+        (
+            "a graph an earlier pushed commit registers",
+            vec![fine("ex:g3"), bad("ex:g3")],
+            false,
+        ),
+    ];
+    for (i, (case, bodies, accepted)) in cases.into_iter().enumerate() {
+        let src_dir = dir.path().join(format!("src-{i}"));
+        let tgt_dir = dir.path().join(format!("tgt-{i}"));
+        copy_dir(&base, &src_dir);
+        copy_dir(&base, &tgt_dir);
+        let source = file_fluree(&src_dir);
+        for body in &bodies {
+            source
+                .graph(&ledger_id)
+                .transact()
+                .txn_opts(fluree_db_api::TxnOpts {
+                    validation_mode: Some(fluree_db_core::ledger_config::ValidationMode::Warn),
+                    ..Default::default()
+                })
+                .sparql_update(&format!(
+                    "PREFIX ex: <http://example.org/> INSERT DATA {{ {body} }}"
+                ))
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{case}: source commit: {e}"));
+        }
+        let target = file_fluree(&tgt_dir);
+        let result = target
+            .push_commits(
+                &ledger_id,
+                newest_commits(&source, &ledger_id, bodies.len()).await,
+                &GovernanceOptions::default(),
+                &target.default_index_config(),
+            )
+            .await;
+        match (accepted, result) {
+            (true, Ok(pushed)) => assert_eq!(pushed.accepted, bodies.len(), "{case}"),
+            (true, Err(err)) => panic!("{case}: SHACL is off for this graph: {err}"),
+            (false, Err(err)) => {
+                assert_eq!(err.status_code(), 422, "{case}: {err}");
+                assert!(err.to_string().contains("SHACL"), "{case}: {err}");
+            }
+            (false, Ok(_)) => panic!("{case}: the shapes apply in this graph"),
+        }
+    }
+}
+
+/// Graphs a push registers are validated apart from the ledger's other
+/// graphs, under the ids the ledger gives them when the commits apply, and
+/// their data reads back from each graph after the ledger reloads. Here a
+/// subject has one email in an existing graph and one in a graph the push
+/// registers; each graph conforms to a one-email shape on its own.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn pushed_graphs_are_validated_apart_from_the_ledgers_other_graphs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_fluree = |path: &std::path::Path| {
+        FlureeBuilder::file(path.to_str().expect("utf-8 path"))
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+    };
+    let name = "it/push-graph-ids";
+    let ledger_id = format!("{name}:main");
+    let cfg = config_graph_iri(&ledger_id);
+    let base = dir.path().join("base");
+    {
+        let fluree = file_fluree(&base);
+        fluree.create_ledger(name).await.expect("create");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .upsert_turtle(&format!(
+                "@prefix f: <https://ns.flur.ee/db#> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+                 @prefix ex: <http://example.org/> .
+                 ex:PersonShape a sh:NodeShape ; sh:targetSubjectsOf ex:email ;
+                   sh:property [ sh:path ex:email ; sh:maxCount 1 ] .
+                 GRAPH <{cfg}> {{
+                   <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+                   <urn:config:shacl> f:shaclEnabled true .
+                 }}
+                 GRAPH ex:m {{ ex:s ex:email \"a@example.org\" . }}"
+            ))
+            .commit()
+            .await
+            .expect("seed");
+        // Retire the root's WAL before copying it, as in the test above.
+        fluree.disconnect().await;
+    }
+    let src_dir = dir.path().join("src");
+    let tgt_dir = dir.path().join("tgt");
+    copy_dir(&base, &src_dir);
+    copy_dir(&base, &tgt_dir);
+    let source = file_fluree(&src_dir);
+    for body in [
+        "GRAPH ex:n1 { ex:t ex:email \"t@example.org\" }",
+        "GRAPH ex:n2 { ex:s ex:email \"b@example.org\" }",
+    ] {
+        source
+            .graph(&ledger_id)
+            .transact()
+            .sparql_update(&format!(
+                "PREFIX ex: <http://example.org/> INSERT DATA {{ {body} }}"
+            ))
+            .commit()
+            .await
+            .expect("source commit");
+    }
+    {
+        let target = file_fluree(&tgt_dir);
+        let pushed = target
+            .push_commits(
+                &ledger_id,
+                newest_commits(&source, &ledger_id, 2).await,
+                &GovernanceOptions::default(),
+                &target.default_index_config(),
+            )
+            .await
+            .expect("each graph conforms on its own");
+        assert_eq!(pushed.accepted, 2);
+    }
+    let reloaded = file_fluree(&tgt_dir);
+    for (graph, email) in [
+        ("m", "a@example.org"),
+        ("n1", "t@example.org"),
+        ("n2", "b@example.org"),
+    ] {
+        let out = reloaded
+            .query_connection(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": format!("{ledger_id}#http://example.org/{graph}"),
+                "select": "?email",
+                "where": {"@id": "?s", "ex:email": "?email"}
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("query graph {graph}: {e}"));
+        let view = reloaded.ledger(&ledger_id).await.expect("reload");
+        let rows = out.to_jsonld(&view.snapshot).expect("jsonld");
+        assert_eq!(rows, json!([email]), "graph {graph}");
+    }
+}
+
+/// A pushed flake in a graph that neither the receiving ledger nor the
+/// pushed commits register has no graph id to apply under, so the push is
+/// refused. Here the sender is a different ledger whose commit writes its
+/// own config graph without registering it (a commit staged and committed
+/// directly, without the transaction path's graph registration).
+#[tokio::test]
+async fn push_refuses_a_graph_nothing_registers() {
+    let source = FlureeBuilder::memory().build_memory();
+    let src_id = "it/push-unregistered-src:main";
+    commit_unchecked(
+        &source,
+        genesis_ledger(&source, src_id).await,
+        &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice"},
+                support::shacl_enabled_config_node()
+            ]
+        }),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tgt_id = "it/push-unregistered-tgt:main";
+    let file_fluree = || {
+        FlureeBuilder::file(dir.path().to_str().expect("utf-8 path"))
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+    };
+    let target = file_fluree();
+    target.create_ledger(tgt_id).await.expect("create target");
+    let result = target
+        .push_commits(
+            tgt_id,
+            newest_commits(&source, src_id, 1).await,
+            &GovernanceOptions::default(),
+            &target.default_index_config(),
+        )
+        .await;
+    match result {
+        Err(err) => {
+            assert_eq!(err.status_code(), 422, "{err}");
+            let message = err.to_string();
+            assert!(
+                message.contains(&config_graph_iri(src_id))
+                    && message.contains("neither this ledger nor the pushed commits register"),
+                "{message}"
+            );
+        }
+        Ok(_) => {
+            let reload = file_fluree().ledger(tgt_id).await.map(|_| ());
+            panic!("accepted a graph nothing registers; the ledger reloads as: {reload:?}");
+        }
+    }
 }
 
 // =============================================================================
@@ -2094,7 +5069,7 @@ async fn shacl_turtle_insert_rejected_when_violating() {
         )
         .await
         .unwrap();
-    let ledger = result.ledger;
+    let ledger = support::enable_shacl(&fluree, result.ledger).await;
 
     // Violating Turtle: an ex:Person with no ex:name.
     let turtle = r"
@@ -2105,7 +5080,7 @@ async fn shacl_turtle_insert_rejected_when_violating() {
     let err = fluree
         .insert_turtle(ledger, turtle)
         .await
-        .expect_err("Turtle insert must honor SHACL reject mode (shapes-exist heuristic)");
+        .expect_err("Turtle insert must honor SHACL reject mode");
 
     assert!(
         matches!(
@@ -2537,6 +5512,54 @@ async fn unique_ref_value_reports_its_iri() {
             ) if value == "http://example.org/badge-7"
         ),
         "{err:?}"
+    );
+}
+
+/// Every write lane runs the same post-staging checks, uniqueness included:
+/// a plain Turtle insert (the streaming lane that skips JSON-LD) refuses the
+/// duplicate a JSON-LD insert refuses. It used to commit it.
+#[tokio::test]
+async fn unique_enforced_on_turtle_insert() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/unique-turtle:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "ex:email", "f:enforceUnique": true},
+                    {"@id": "ex:alice", "ex:email": "alice@example.com"}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = write_unique_config(&fluree, ledger, ledger_id).await.ledger;
+    let t = ledger.t();
+
+    let err = fluree
+        .stage_owned(ledger)
+        .insert_turtle(
+            "<http://example.org/bob> <http://example.org/email> \"alice@example.com\" .",
+        )
+        .execute()
+        .await
+        .expect_err("the Turtle lane enforces uniqueness");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        fluree.ledger(ledger_id).await.unwrap().t(),
+        t,
+        "nothing committed"
     );
 }
 
@@ -4474,77 +7497,6 @@ async fn shacl_txn_validation_mode_ignores_policy_identity() {
     .expect("the verified identity alongside the same policy context is permitted");
 }
 
-/// The shapes-exist heuristic (shapes present, NO config graph) fails closed:
-/// a transaction-requested warn does NOT soften it.
-///
-/// This path never reaches `merge_shacl_opts`, so it consults no
-/// `f:overrideControl` and no identity. Honoring the request here would let
-/// anyone who can write downgrade enforcement on every ledger that has shapes
-/// but no `#config` graph — the back-compat default — with the violations
-/// reduced to a log line.
-#[cfg(feature = "shacl")]
-#[tokio::test]
-async fn shacl_heuristic_without_config_ignores_requested_warn_mode() {
-    use fluree_db_core::ledger_config::ValidationMode;
-
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main").await;
-    // Shapes, deliberately with no config graph written afterwards.
-    let result = fluree
-        .insert(
-            ledger,
-            &json!({
-                "@context": {
-                    "sh": "http://www.w3.org/ns/shacl#",
-                    "ex": "http://example.org/"
-                },
-                "@id": "ex:PersonShape",
-                "@type": "sh:NodeShape",
-                "sh:targetClass": {"@id": "ex:Person"},
-                "sh:property": [{
-                    "sh:path": {"@id": "ex:name"},
-                    "sh:minCount": 1
-                }]
-            }),
-        )
-        .await
-        .expect("shape insert");
-
-    // Baseline: the heuristic enforces without any opt.
-    let err = fluree
-        .insert(result.ledger.clone(), &violating_person())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
-        ),
-        "shapes-exist heuristic must reject: {err:?}"
-    );
-
-    // The same write asking for warn is still rejected — no config group
-    // exists to permit the override, so the request is not honored.
-    let opts = fluree_db_transact::TxnOpts {
-        validation_mode: Some(ValidationMode::Warn),
-        ..Default::default()
-    };
-    let err = fluree
-        .stage_owned(result.ledger)
-        .txn_opts(opts)
-        .insert(&violating_person())
-        .execute()
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
-        ),
-        "requested warn must NOT soften the ungated no-config heuristic: {err:?}"
-    );
-}
-
 /// Strengthening needs no permission: on a warn-mode ledger, a transaction
 /// may request reject for itself even under `f:OverrideNone`.
 #[cfg(feature = "shacl")]
@@ -4925,5 +7877,227 @@ async fn datalog_override_identity_restricted_end_to_end() {
         grandparents_as(&fluree, ledger_id, &query, None).await,
         json!([]),
         "an anonymous request has its rule stripped"
+    );
+}
+
+// =============================================================================
+// Documented config recipes and examples
+// =============================================================================
+
+/// The enable recipes (`docs/ledger-config/writing-config.md#enabling-shacl`):
+/// one attaches `f:shaclDefaults` to the ledger's existing config subject, the
+/// other writes the conventional one when there is none. Either way the shapes
+/// the ledger holds are enforced after it, under one `f:LedgerConfig` subject.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn enable_recipe_enables_shacl_with_or_without_an_existing_config() {
+    for existing in [true, false] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/enable-recipe-{existing}:main");
+        let mut ledger = fluree
+            .insert(
+                genesis_ledger(&fluree, &ledger_id).await,
+                &person_name_shape(),
+            )
+            .await
+            .expect("shape insert")
+            .ledger;
+        if existing {
+            ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({
+                        "@context": {"f": "https://ns.flur.ee/db#"},
+                        "@id": "urn:config:existing",
+                        "@type": "f:LedgerConfig",
+                        "@graph": "config",
+                        "f:policyDefaults": {"f:defaultAllow": true}
+                    }),
+                )
+                .await
+                .expect("existing config")
+                .ledger;
+        }
+        let cfg = config_graph_iri(&ledger_id);
+        let recipe = if existing {
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT {{
+                   GRAPH <{cfg}> {{
+                     ?c f:shaclDefaults <urn:fluree:{ledger_id}:config:shacl> .
+                     <urn:fluree:{ledger_id}:config:shacl> f:shaclEnabled true .
+                   }}
+                 }}
+                 WHERE {{
+                   GRAPH <{cfg}> {{ ?c a f:LedgerConfig }}
+                 }}"
+            )
+        } else {
+            format!(
+                "PREFIX f: <https://ns.flur.ee/db#>
+                 INSERT DATA {{
+                   GRAPH <{cfg}> {{
+                     <urn:fluree:{ledger_id}:config:ledger> a f:LedgerConfig ;
+                       f:shaclDefaults <urn:fluree:{ledger_id}:config:shacl> .
+                     <urn:fluree:{ledger_id}:config:shacl> f:shaclEnabled true .
+                   }}
+                 }}"
+            )
+        };
+        let ledger = sparql_update(&fluree, ledger, &recipe)
+            .await
+            .unwrap_or_else(|e| panic!("existing={existing}: the enable recipe commits: {e}"))
+            .ledger;
+
+        let err = fluree
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:alice", "@type": "ex:Person"}),
+            )
+            .await
+            .expect_err("SHACL is enabled");
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "existing={existing}: {err:?}"
+        );
+        assert!(
+            config_diagnostic_codes(&fluree, &ledger_id)
+                .await
+                .is_empty(),
+            "existing={existing}: one config subject, SHACL configured"
+        );
+    }
+}
+
+/// Examples in `docs/ledger-config/writing-config.md` and
+/// `docs/concepts/reasoning.md`: the JSON-LD named-graph form, the
+/// `"graph": "config"` insert, and an update whose `graph` key scopes its
+/// WHERE clause and templates to the config graph.
+#[tokio::test]
+async fn documented_json_ld_config_forms_write_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-doc-forms:main";
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#" },
+                "@id": config_graph_iri(ledger_id),
+                "@graph": [
+                    {
+                        "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                        "@type": "f:LedgerConfig",
+                        "f:shaclDefaults": { "f:shaclEnabled": false }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("named-graph form")
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "graph": "config",
+                "insert": {
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "f:reasoningDefaults": {
+                        "f:reasoningModes": {"@id": "f:RDFS"},
+                        "f:overrideControl": {"@id": "f:OverrideAll"}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("the reasoning.md insert")
+        .ledger;
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#" },
+                "graph": "config",
+                "where": {
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "f:shaclDefaults": "?group"
+                },
+                "delete": { "@id": "?group", "f:shaclEnabled": false },
+                "insert": { "@id": "?group", "f:shaclEnabled": true }
+            }),
+        )
+        .await
+        .expect("the graph-key update");
+
+    let view = fluree.db(ledger_id).await.unwrap();
+    let config = view.ledger_config().expect("config read");
+    assert_eq!(
+        config.shacl.as_ref().and_then(|s| s.enabled),
+        Some(true),
+        "the update flipped the setting in the config graph"
+    );
+    assert!(
+        config
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.modes.as_ref())
+            .is_some_and(|m| !m.is_empty()),
+        "the reasoning defaults landed in the config graph"
+    );
+}
+
+/// The verification query in `docs/indexing-and-search/fulltext.md`: a
+/// node-level `@graph` in `where` scopes the pattern to the config graph.
+#[tokio::test]
+async fn fulltext_doc_verification_query_reads_the_config_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-doc:main";
+    let cfg = config_graph_iri(ledger_id);
+    let ledger = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id).await,
+            &json!({
+                "@context": { "f": "https://ns.flur.ee/db#", "ex": "http://example.org/" },
+                "@graph": [
+                    {
+                        "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                        "@type": "f:LedgerConfig",
+                        "@graph": cfg,
+                        "f:fullTextDefaults": {
+                            "@type": "f:FullTextDefaults",
+                            "f:defaultLanguage": "en",
+                            "f:property": [
+                                { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } }
+                            ]
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("the fulltext.md config")
+        .ledger;
+    let rows = fluree
+        .query_connection(&json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "from-named": [cfg],
+            "where": [{ "@graph": cfg, "@id": "?cfg", "f:fullTextDefaults": "?defaults" }],
+            "select": ["?cfg", "?defaults"]
+        }))
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "the config row: {rows}"
     );
 }

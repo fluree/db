@@ -6591,3 +6591,176 @@ async fn variable_predicate_scan_hides_legacy_bundles() {
     let ledger = support::commit_legacy_bundle(&fluree, indexed).await;
     check(ledger, "novelty over an index", 4).await;
 }
+
+// =============================================================================
+// Annotation deletes address the edge's graph; reverse-defined terms
+// =============================================================================
+
+/// The annotations reifying `(s, p, o)` in `graph` (or the default graph),
+/// by `@reifies`, which joins the edge itself.
+async fn reifiers_of(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    graph: Option<&str>,
+    s: &str,
+    p: &str,
+    o: &str,
+) -> Vec<JsonValue> {
+    let from = match graph {
+        Some(g) => format!("{ledger_id}#{g}"),
+        None => ledger_id.to_string(),
+    };
+    let q = json!({
+        "@context": ctx(), "from": from, "select": ["?ann"],
+        "where": {"@id": "?ann", "@reifies": {"@id": s, p: {"@id": o}}}
+    });
+    let result = fluree.query_connection(&q).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    result
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// An edge is in its subject's graph, whatever `@graph` its object node
+/// carries, and so is its annotation: deleting the annotated edge with the
+/// same document (by `@id`, or by selector) retracts the annotation there.
+#[tokio::test]
+async fn annotated_edge_delete_addresses_the_edge_graph_not_the_object_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, annotation) in [
+        json!({"@id": "ex:ann", "ex:since": 2020}),
+        json!({"ex:since": 2020}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-object-graph-{i}:main");
+        let node = |annotation: JsonValue| json!({"@id": "ex:a", "ex:knows": {"@id": "ex:b", "@graph": "ex:g2", "@annotation": annotation}});
+        let mut doc = node(json!({"@id": "ex:ann", "ex:since": 2020}));
+        doc["@context"] = ctx();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id).await, &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "the annotation is beside its edge, in the default graph"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(
+                ledger,
+                &json!({"@context": ctx(), "delete": node(annotation)}),
+            )
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "case {i}: the annotation is retracted from the edge's graph"
+        );
+    }
+}
+
+/// A selector-form annotation delete names its graph as any `where` and
+/// template does: `"default"`, a `fromNamed` alias, a compact IRI.
+#[tokio::test]
+async fn selector_annotation_delete_resolves_its_graph_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (graph_name, stored_in, from_named)) in [
+        ("default", None, None),
+        (
+            "two",
+            Some("http://example.org/g2"),
+            Some(json!([{"alias": "two", "graph": "ex:g2"}])),
+        ),
+        ("ex:g2", Some("http://example.org/g2"), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-selector-graph-{i}:main");
+        let mut node = json!({"@context": ctx(), "@id": "ex:a",
+            "ex:knows": {"@id": "ex:b", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}});
+        if stored_in.is_some() {
+            node["@graph"] = json!("ex:g2");
+        }
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id).await, &node)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "{graph_name}: inserted"
+        );
+        let mut delete = json!({"@context": ctx(), "delete": {"@id": "ex:a", "@graph": graph_name,
+            "ex:knows": {"@id": "ex:b", "@annotation": {"ex:since": 2020}}}});
+        if let Some(from_named) = from_named {
+            delete["fromNamed"] = from_named;
+        }
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &delete)
+            .await
+            .expect("selector delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "{graph_name}: the selector delete retracts the annotation"
+        );
+    }
+}
+
+/// An annotation on an edge stated through a term defined with `@reverse`
+/// (or under the `@reverse` keyword) reifies the edge as stored, `mom
+/// ex:child kid`, and the same document deletes it.
+#[tokio::test]
+async fn annotation_on_a_reverse_property_reifies_the_stored_edge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut reverse_ctx = ctx();
+    reverse_ctx["childOf"] = json!({"@reverse": "ex:child"});
+    reverse_ctx["parent"] = json!({"@reverse": "ex:child", "@type": "@id"});
+    for (i, node) in [
+        json!({"@id": "ex:kid", "childOf": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "parent": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "@reverse": {"ex:child": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-reverse-{i}:main");
+        let mut doc = node.clone();
+        doc["@context"] = reverse_ctx.clone();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id).await, &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid").await.len(),
+            1,
+            "case {i}: the annotation reifies the stored edge"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &json!({"@context": reverse_ctx, "delete": node}))
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid")
+                .await
+                .is_empty(),
+            "case {i}: the same document deletes it"
+        );
+    }
+}
