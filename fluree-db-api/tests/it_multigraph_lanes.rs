@@ -469,6 +469,21 @@ async fn lane_a_group_counts_over_from_graphs() {
         ),
         (
             g1g2,
+            // A list repeats `"v"` for one subject: two rows, one subject.
+            GroupCase {
+                label: "COUNT(DISTINCT ?s) of a list's repeated value",
+                sparql: "SELECT ?v (COUNT(*) AS ?k) (COUNT(DISTINCT ?s) AS ?d) {ds} \
+                         WHERE { ?s ex:items ?v } GROUP BY ?v",
+                jsonld: None,
+                columns: &["v", "k", "d"],
+                typed: false,
+                want: rows(&[&["v", "2", "1"]]),
+                fires: false,
+                decline: None,
+            },
+        ),
+        (
+            g1g2,
             GroupCase {
                 label: "a FILTER on the grouped object",
                 sparql: "SELECT ?v (COUNT(*) AS ?k) {ds} WHERE { ?s ex:n ?v FILTER(?v > 1) } \
