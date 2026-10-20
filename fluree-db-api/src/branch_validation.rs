@@ -136,16 +136,18 @@ fn unregistered_graphs(
 /// ([`FlakeValue::index_key_may_merge_terms`]). The net change was folded
 /// from commits written against other states, so it can name such a fact
 /// under a term `state` does not hold it under. An assertion of a fact
-/// `state` holds is dropped, as a restatement; a retraction is renamed to
-/// the stored fact, or dropped when `state` holds none. Otherwise the commit
-/// could hold a retraction and an assertion of one fact at one `t`, which a
-/// commit may not hold (`build_commit` refuses it).
+/// `state` holds is dropped, as a restatement; a retraction retracts the
+/// fact under every term `state` holds it by (novelty holds the subtypes of
+/// one big integer apart until the next index build), or is dropped when
+/// `state` holds none. Otherwise the commit could hold a retraction and an
+/// assertion of one fact at one `t`, which a commit may not hold
+/// (`build_commit` refuses it), or keep a term the change meant to remove.
 ///
 /// Only those kinds are read, one read per slot they touch
-/// ([`CurrentFacts::named_by`]); any other change is returned as is.
+/// ([`CurrentFacts::all_named_by`]); any other change is returned as is.
 ///
 /// [`FlakeValue::index_key_may_merge_terms`]: fluree_db_core::FlakeValue::index_key_may_merge_terms
-/// [`CurrentFacts::named_by`]: fluree_db_transact::CurrentFacts::named_by
+/// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
 async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>> {
     use fluree_db_transact::{CurrentFacts, Slot};
     let asked: Vec<(usize, Slot)> = flakes
@@ -161,15 +163,24 @@ async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>
         .iter()
         .map(|(n, slot)| (slot.clone(), &flakes[*n]))
         .collect();
-    let named = CurrentFacts::new(state).named_by(&items).await?;
+    let named = CurrentFacts::new(state).all_named_by(&items).await?;
     let mut keep = vec![true; flakes.len()];
     let mut renamed = Vec::new();
+    let mut more = Vec::new();
     for ((n, _), held) in asked.iter().zip(named) {
         let flake = &flakes[*n];
-        match (flake.op, held) {
-            (true, Some(_)) | (false, None) => keep[*n] = false,
-            (false, Some(held)) => renamed.push((*n, held.retract(flake.t).into_flake())),
-            (true, None) => {}
+        match (flake.op, held.is_empty()) {
+            (true, false) | (false, true) => keep[*n] = false,
+            (false, false) => {
+                let mut retractions = held
+                    .into_iter()
+                    .map(|fact| fact.retract(flake.t).into_flake());
+                if let Some(first) = retractions.next() {
+                    renamed.push((*n, first));
+                }
+                more.extend(retractions);
+            }
+            (true, true) => {}
         }
     }
     let mut flakes = flakes;
@@ -178,6 +189,7 @@ async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>
     }
     let mut keep = keep.into_iter();
     flakes.retain(|_| keep.next().unwrap_or(true));
+    flakes.extend(more);
     Ok(flakes)
 }
 

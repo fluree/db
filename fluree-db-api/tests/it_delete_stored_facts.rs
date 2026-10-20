@@ -2393,6 +2393,70 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
                 ));
             }
         }
+        // Revert both writes of a value novelty holds under two subtypes
+        // (a ledger never indexed): the net retraction retracts it under
+        // each, so it is gone at once, not only after the next build.
+        if !indexed {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_string_lossy().to_string();
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("build");
+            let name = "it/revert-two-terms";
+            let id = format!("{name}:main");
+            fluree.create_ledger(&id).await.expect("create");
+            write(
+                &fluree,
+                &id,
+                "INSERT DATA { ex:s ex:k \"keep\" }".to_string(),
+            )
+            .await;
+            let first = write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {integer} }}"),
+            )
+            .await;
+            let second = write(
+                &fluree,
+                &id,
+                format!("INSERT DATA {{ ex:s ex:p {nonneg} }}"),
+            )
+            .await;
+            let fluree = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .expect("reload");
+            fluree
+                .revert_commits(
+                    name,
+                    "main",
+                    vec![
+                        CommitRef::Exact(first.commit_id),
+                        CommitRef::Exact(second.commit_id),
+                    ],
+                    ConflictStrategy::TakeSource,
+                )
+                .await
+                .expect("revert");
+            let after = values_of(&path, &id, "ex:p").await;
+            support::rebuild_and_publish_index(
+                &FlureeBuilder::file(path.clone())
+                    .without_indexing()
+                    .build()
+                    .expect("reload"),
+                &id,
+            )
+            .await;
+            let reindexed = values_of(&path, &id, "ex:p").await;
+            if !after.is_empty() || !reindexed.is_empty() {
+                failures.push(format!(
+                    "revert of both subtypes, never indexed: values {after:?}, after a build \
+                     {reindexed:?}; expected none"
+                ));
+            }
+        }
         // Merge a branch that inserts, deletes, and inserts again under
         // another subtype, into a main that moved on meanwhile.
         {

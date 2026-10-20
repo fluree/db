@@ -316,34 +316,39 @@ impl SequentialStager {
     /// the fact, or retracted then re-asserted when it has it. Last-wins
     /// alone would commit the final op — a retraction of a fact the ledger
     /// never held, for `INSERT x ; DELETE x`. Only facts whose first and last
-    /// ops differ are looked up; the base decides because staging still
-    /// stages an assert of a fact already present, so a first-op assert does
-    /// not say what the base held. (A first-op retraction does: staging only
-    /// retracts a stored fact.)
+    /// ops differ are looked up for that; the base decides because staging
+    /// still stages an assert of a fact already present, so a first-op assert
+    /// does not say what the base held. (A first-op retraction does: staging
+    /// only retracts a stored fact.)
     ///
-    /// The base is asked through [`CurrentFacts::named_by`], by the identity
-    /// the fold keyed the fact by. Every retraction that stays names the
-    /// fact as the base stores it, since an earlier operation may have
-    /// written the value with more detail than the index keeps: one whose
-    /// first op asserted is renamed to what the base answers, and one whose
-    /// first op retracted is that first retraction again, which staging
-    /// read from the base.
+    /// The base is asked through [`CurrentFacts::all_named_by`], by the
+    /// identity the fold keyed the fact by. Every retraction that stays
+    /// retracts the fact as the base stores it, under every term the base
+    /// holds it by: an earlier operation may have written the value with
+    /// more detail than the index keeps, and novelty holds the subtypes of
+    /// one big integer apart until the next index build, so the fold's one
+    /// retraction can stand for several stored terms. A fact whose first op
+    /// retracted is that first retraction again, which staging read from the
+    /// base; a big integer's is also asked again, for its other terms.
     ///
-    /// [`CurrentFacts::named_by`]: fluree_db_transact::CurrentFacts::named_by
+    /// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
     async fn drop_reversed_facts(&mut self) -> Result<()> {
         for (i, first) in std::mem::take(&mut self.first_retractions) {
             if !self.folded[i].op {
                 self.folded[i] = first;
             }
         }
-        let reversed: Vec<usize> = (0..self.folded.len())
-            .filter(|&i| self.folded[i].op != self.first_ops[i])
+        let asked: Vec<usize> = (0..self.folded.len())
+            .filter(|&i| {
+                let f = &self.folded[i];
+                f.op != self.first_ops[i] || (!f.op && f.o.index_keys_by_value())
+            })
             .collect();
-        if reversed.is_empty() {
+        if asked.is_empty() {
             return Ok(());
         }
         // A graph the base does not have holds nothing: no slot to ask.
-        let asked: Vec<(usize, fluree_db_transact::Slot)> = reversed
+        let slots: Vec<(usize, fluree_db_transact::Slot)> = asked
             .iter()
             .filter_map(|&i| {
                 let f = &self.folded[i];
@@ -351,39 +356,45 @@ impl SequentialStager {
                     .map(|slot| (i, slot))
             })
             .collect();
-        let items: Vec<(fluree_db_transact::Slot, &fluree_db_core::Flake)> = asked
+        let items: Vec<(fluree_db_transact::Slot, &fluree_db_core::Flake)> = slots
             .iter()
             .map(|(i, slot)| (slot.clone(), &self.folded[*i]))
             .collect();
         let named = fluree_db_transact::CurrentFacts::new(&self.original)
-            .named_by(&items)
+            .all_named_by(&items)
             .await?;
-        let mut stored: HashMap<usize, fluree_db_transact::StoredFact> = asked
+        let mut stored: HashMap<usize, Vec<fluree_db_transact::StoredFact>> = slots
             .iter()
             .zip(named)
-            .filter_map(|((i, _), fact)| fact.map(|fact| (*i, fact)))
+            .map(|((i, _), facts)| (*i, facts))
             .collect();
         let mut keep = vec![true; self.folded.len()];
-        let mut renamed = Vec::new();
-        for i in reversed {
-            let flake = &self.folded[i];
-            let held = stored.remove(&i);
-            keep[i] = flake.op != held.is_some();
-            if let (true, false, Some(held)) = (keep[i], flake.op, held) {
-                let fact = held.flake();
-                if fact.o != flake.o || fact.dt != flake.dt || fact.m != flake.m {
-                    renamed.push((i, held.retract(self.final_t).into_flake()));
+        let mut more = Vec::new();
+        for i in asked {
+            let held = stored.remove(&i).unwrap_or_default();
+            if self.folded[i].op {
+                // Retracted then re-asserted: a restatement when the base
+                // holds the fact.
+                keep[i] = held.is_empty();
+                continue;
+            }
+            let mut retractions = held
+                .into_iter()
+                .map(|fact| fact.retract(self.final_t).into_flake());
+            match retractions.next() {
+                Some(first) => {
+                    self.folded[i] = first;
+                    more.extend(retractions);
                 }
+                // Asserted then retracted, of a fact the base lacks.
+                None => keep[i] = false,
             }
         }
-        for (i, retraction) in renamed {
-            self.folded[i] = retraction;
+        if keep.iter().any(|k| !k) {
+            let mut keep = keep.into_iter();
+            self.folded.retain(|_| keep.next().unwrap_or(true));
         }
-        if keep.iter().all(|k| *k) {
-            return Ok(());
-        }
-        let mut keep = keep.into_iter();
-        self.folded.retain(|_| keep.next().unwrap_or(true));
+        self.folded.extend(more);
         Ok(())
     }
 

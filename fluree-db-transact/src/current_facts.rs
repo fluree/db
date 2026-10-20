@@ -316,6 +316,23 @@ fn same_term(stored: &Flake, intent: &Flake) -> bool {
         && lang_matches(lang_of(stored), lang_of(intent))
 }
 
+/// Whether `a` and `b` hold one big integer, whatever XSD subtype each
+/// carries: storage holds it as one fact per value ([`FactIdentity`]).
+fn same_value(a: &Flake, b: &Flake) -> bool {
+    a.o.index_keys_by_value() && a.o == b.o
+}
+
+/// The hash a big integer is grouped by value with ([`same_value`]); `None`
+/// for any other value.
+fn value_hash(f: &Flake) -> Option<u64> {
+    if !f.o.index_keys_by_value() {
+        return None;
+    }
+    let mut h = FxHasher::default();
+    f.o.hash(&mut h);
+    Some(h.finish())
+}
+
 /// Whether every stored fact a DELETE intent can name is found by reading
 /// the intent's value alone: an IRI or blank-node reference, or a plain
 /// `xsd:string` with no tag. The index keys either by one dictionary id
@@ -783,12 +800,28 @@ impl<'l> CurrentFacts<'l> {
     }
 
     /// The current fact each `(slot, flake)` names, in order: the fact of
-    /// `slot` with `flake`'s identity ([`FactIdentity`]). So a retraction
-    /// written elsewhere, which may carry a term as written where the index
-    /// keeps less of it, names the fact as stored. Each distinct slot is read
-    /// once, and each item is matched by hash, so naming k facts of an
-    /// n-fact slot costs one read of the slot and O(k + n) matching.
+    /// `slot` with `flake`'s identity ([`FactIdentity`]), its own term first.
+    /// So a retraction written elsewhere, which may carry a term as written
+    /// where the index keeps less of it, names the fact as stored. See
+    /// [`Self::all_named_by`] for every term of it.
     pub async fn named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Option<StoredFact>>> {
+        Ok(self
+            .all_named_by(items)
+            .await?
+            .into_iter()
+            .map(|named| named.into_iter().next())
+            .collect())
+    }
+
+    /// Every current fact of each `(slot, flake)`'s identity
+    /// ([`FactIdentity`]), in order: `flake`'s own term first, then the
+    /// slot's other terms of that fact. Novelty holds the subtypes of one big
+    /// integer apart until the next index build, so one fact can be current
+    /// under several terms; a retraction of the fact retracts each. Each
+    /// distinct slot is read once, and each item is matched by hash, so
+    /// naming k facts of an n-fact slot costs one read of the slot and
+    /// O(k + n) matching.
+    pub async fn all_named_by(&self, items: &[(Slot, &Flake)]) -> Result<Vec<Vec<StoredFact>>> {
         let mut slot_index: HashMap<(GraphId, &Sid, &Sid), usize> = HashMap::new();
         let mut slots: Vec<Slot> = Vec::new();
         let item_slots: Vec<usize> = items
@@ -805,17 +838,17 @@ impl<'l> CurrentFacts<'l> {
         let facts = self.of_slots(&slots).await?;
         let ids = FactIdentity::new(self.ledger);
         let mut by_term: Vec<HashMap<&Flake, usize>> = Vec::with_capacity(slots.len());
-        let mut by_key: Vec<HashMap<MergeKey, usize>> = Vec::with_capacity(slots.len());
+        let mut by_key: Vec<HashMap<MergeKey, Vec<usize>>> = Vec::with_capacity(slots.len());
         for (slot, slot_facts) in slots.iter().zip(&facts) {
             let mut slot_p_id = None;
             let mut terms = HashMap::with_capacity(slot_facts.len());
-            let mut keys = HashMap::new();
+            let mut keys: HashMap<MergeKey, Vec<usize>> = HashMap::new();
             for (n, fact) in slot_facts.iter().enumerate() {
                 terms.insert(&fact.flake, n);
                 if fact.flake.o.index_key_may_merge_terms() {
                     let p_id = || *slot_p_id.get_or_insert_with(|| self.keys.p_id(&slot.p));
                     if let Some(key) = ids.key_under(|| Some(slot.g_id), p_id, &fact.flake) {
-                        keys.insert(key, n);
+                        keys.entry(key).or_default().push(n);
                     }
                 }
             }
@@ -824,16 +857,25 @@ impl<'l> CurrentFacts<'l> {
         }
         // By term first: two terms of one key can both be current while
         // novelty holds them, and an item naming one of them exactly names
-        // that one.
+        // that one first.
         Ok(items
             .iter()
             .zip(item_slots)
             .map(|((slot, flake), i)| {
-                let n = by_term[i].get(flake).or_else(|| {
-                    let key = ids.key(Some(slot.g_id), flake)?;
-                    by_key[i].get(&key)
-                });
-                n.map(|&n| facts[i][n].clone())
+                let term = by_term[i].get(flake).copied();
+                let same_key = ids
+                    .key(Some(slot.g_id), flake)
+                    .and_then(|key| by_key[i].get(&key));
+                term.into_iter()
+                    .chain(
+                        same_key
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|&n| Some(n) != term),
+                    )
+                    .map(|n| facts[i][n].clone())
+                    .collect()
             })
             .collect())
     }
@@ -1037,7 +1079,12 @@ type SlotKey = (GraphId, Sid, Sid);
 ///   matches none is retracted as decoded.
 /// - Every other intent — a template constant, `DELETE DATA`, a value bound
 ///   by another pattern — is matched against the stored facts of its slot:
-///   by term, else, for a fact read from the index, by index key. An intent
+///   by term, else by the fact's identity ([`FactIdentity`]), whichever op
+///   of it survived, read from the index or from novelty: a big integer by
+///   value, whatever XSD subtype each term carries, and another kind whose
+///   key can merge terms by its persisted index key. Novelty holds the terms
+///   of one big integer apart until the next index build, so the intent
+///   retracts every term of the fact it names, not just one. An intent
 ///   with a list position names that position. One without names the first
 ///   list entry holding the term, in slot order, else the plain value: the
 ///   contract hydration had, under which a value asserted at N list
@@ -1334,6 +1381,9 @@ impl<'l> DeleteResolver<'l> {
                 }
             } else if let Some(n) = facts.named(&intent.flake, keys) {
                 stats.matched += 1;
+                for m in facts.same_fact(n) {
+                    out.push(facts.facts[m].clone().retract(t));
+                }
                 out.push(facts.facts[n].retract_named(intent.flake, t));
             } else {
                 stats.phantom_intents += 1;
@@ -1373,8 +1423,6 @@ struct SlotFacts {
     /// Its persisted id, for index keys, looked up on first need.
     p_id: Option<Option<u32>>,
     facts: Vec<StoredFact>,
-    /// Whether any fact was read from the index (key matching names those).
-    has_index_rows: bool,
     /// The term hash the term groups are keyed by: [`term_hash`], or one
     /// that collides, for tests.
     hash: fn(&Flake) -> u64,
@@ -1386,6 +1434,9 @@ struct SlotFacts {
     keys: Option<Vec<Option<IndexKey>>>,
     /// A wide slot's facts by index key, grouped with `keys`.
     by_key: Option<Groups<IndexKey>>,
+    /// A wide slot's big integers by value ([`value_hash`]), built when an
+    /// intent first needs them.
+    by_value: Option<Groups<u64>>,
 }
 
 impl SlotFacts {
@@ -1415,13 +1466,13 @@ impl SlotFacts {
             g_id,
             p,
             p_id: None,
-            has_index_rows: facts.iter().any(|f| f.origin == Origin::Index),
             facts,
             hash,
             terms,
             positions,
             keys: None,
             by_key: None,
+            by_value: None,
         }
     }
 
@@ -1462,6 +1513,46 @@ impl SlotFacts {
         self.keys = Some(fact_keys);
     }
 
+    /// Group a wide slot's big integers by value, once.
+    fn ensure_by_value(&mut self) {
+        if self.is_wide() && self.by_value.is_none() {
+            self.by_value = Some(Groups::build(
+                &self.facts,
+                |_, f| value_hash(&f.flake),
+                same_value,
+            ));
+        }
+    }
+
+    /// The slot's other facts that are the same stored fact as fact `n`:
+    /// terms of one big integer at one list position, which novelty holds
+    /// apart until the next index build. Every other kind is one term per
+    /// fact once the read is resolved.
+    fn same_fact(&mut self, n: usize) -> Vec<usize> {
+        if !self.facts[n].flake.o.index_keys_by_value() {
+            return Vec::new();
+        }
+        self.ensure_by_value();
+        let fact = &self.facts[n].flake;
+        let at = list_index_of(fact);
+        let sibling = |m: usize| {
+            m != n
+                && same_value(&self.facts[m].flake, fact)
+                && list_index_of(&self.facts[m].flake) == at
+        };
+        match (&self.by_value, value_hash(fact)) {
+            (Some(groups), Some(h)) => groups
+                .get(h)
+                .map(|g| groups.members(g))
+                .unwrap_or_default()
+                .iter()
+                .map(|&m| m as usize)
+                .filter(|&m| sibling(m))
+                .collect(),
+            _ => (0..self.facts.len()).filter(|&m| sibling(m)).collect(),
+        }
+    }
+
     /// The stored fact a DELETE intent names (see [`DeleteResolver`]).
     fn named(&mut self, intent: &Flake, keys: &IndexKeys) -> Option<usize> {
         let position = list_index_of(intent);
@@ -1470,15 +1561,28 @@ impl SlotFacts {
             Some(terms) => self.first_in(terms.get((self.hash)(intent)), terms, position, by_term),
             None => self.first(position, by_term),
         };
-        if hit.is_some() || !self.has_index_rows {
+        if hit.is_some() {
             return hit;
         }
-        // A fact read from the index is also named by its index key.
+        // Else by the fact's identity, whichever op of it survived: an index
+        // row and a later novelty op of one key are one stored fact, which
+        // the novelty op stands for, and an intent naming the index's term
+        // names it too. A big integer is one fact per value, indexed or not.
+        if intent.o.index_keys_by_value() {
+            self.ensure_by_value();
+            let same = |_: usize, f: &StoredFact| same_value(&f.flake, intent);
+            return match &self.by_value {
+                Some(groups) => {
+                    let group = value_hash(intent).and_then(|h| groups.get(h));
+                    self.first_in(group, groups, position, same)
+                }
+                None => self.first(position, same),
+            };
+        }
         let key = self.key_of(keys, intent)?;
         self.ensure_keys(keys);
         let fact_keys = self.keys.as_deref()?;
-        let by_key =
-            |n: usize, f: &StoredFact| f.origin == Origin::Index && fact_keys[n] == Some(key);
+        let by_key = |n: usize, _: &StoredFact| fact_keys[n] == Some(key);
         match &self.by_key {
             Some(groups) => self.first_in(groups.get(key), groups, position, by_key),
             None => self.first(position, by_key),
