@@ -3955,6 +3955,34 @@ async fn test_writes_through_the_ledger_address_name_the_default_graph() {
         err.to_string().contains("prefix 'exx' is not defined"),
         "{err}"
     );
+    // The JSON-LD twins of the SPARQL refusals above: the parser keeps this
+    // ledger's address as written, and staging's graph-position table refuses
+    // the address at a time and `L#<L>` with no such graph, in every position.
+    for name in [
+        format!("{ledger_id}@t:1"),
+        format!("{ledger_id}#{ledger_id}"),
+    ] {
+        for (position, update) in [
+            (
+                "the graph key",
+                json!({"@context": {"ex": "http://example.org/"}, "graph": name, "insert": {"@id": "ex:s", "ex:p": 1}}),
+            ),
+            (
+                "a [\"graph\", …] item",
+                json!({"@context": {"ex": "http://example.org/"}, "insert": [["graph", name, {"@id": "ex:s", "ex:p": 1}]]}),
+            ),
+        ] {
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            let err = fluree
+                .update(ledger, &update)
+                .await
+                .expect_err(&format!("{name} in {position}"));
+            assert!(
+                err.to_string().contains("names no graph a write can go to"),
+                "{name} in {position}: {err}"
+            );
+        }
+    }
     // `CREATE GRAPH` at the address is the default graph, which exists.
     let ledger = fluree.ledger(ledger_id).await.expect("reload");
     run_sparql_update(&fluree, ledger, &format!("CREATE GRAPH <{ledger_id}>")).await;

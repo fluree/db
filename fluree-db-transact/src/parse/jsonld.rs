@@ -3775,6 +3775,80 @@ mod tests {
         assert!(txn.write_graphs.contains("http://example.org/g1"));
     }
 
+    /// A graph name that expands to no absolute IRI is kept only as an address
+    /// of the ledger being written (`GraphName::Address`). Another ledger's
+    /// address, in every form and every graph position, is refused here at
+    /// parse with the error the name has without that reading; staging never
+    /// sees it.
+    #[test]
+    fn only_this_ledgers_address_is_kept_as_a_graph_name() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let positions = |name: &str| {
+            [
+                (
+                    "the update graph key",
+                    TxnType::Update,
+                    json!({"@context": ctx, "graph": name, "insert": {"@id": "ex:s", "ex:p": 1}}),
+                ),
+                (
+                    "a node @graph",
+                    TxnType::Insert,
+                    json!({"@context": ctx, "@graph": [{"@id": "ex:s", "@graph": name, "ex:p": 1}]}),
+                ),
+                (
+                    "a [\"graph\", …] item",
+                    TxnType::Update,
+                    json!({"@context": ctx, "insert": [["graph", name, {"@id": "ex:s", "ex:p": 1}]]}),
+                ),
+            ]
+        };
+        // This ledger (`test:main`): kept as written, for staging to read
+        // through the graph-position table (which refuses the pin and
+        // `#txn-meta` there).
+        for name in [
+            "test",
+            "test:main",
+            "test#config",
+            "test:main#config",
+            "test:main#http://example.org/g",
+            "test:main@t:1",
+            "test#txn-meta",
+        ] {
+            for (position, txn_type, doc) in positions(name) {
+                let txn = parse_doc(&doc, txn_type)
+                    .unwrap_or_else(|e| panic!("{name} in {position}: {e}"));
+                assert!(
+                    txn.write_graphs.contains(name),
+                    "{name} in {position}: {:?}",
+                    txn.write_graphs
+                );
+            }
+        }
+        // Another ledger: refused at parse, as the name is without the
+        // address reading (an undefined prefix under strict checking, or no
+        // scheme at all).
+        for (name, refusal) in [
+            ("other:main", "is not defined"),
+            ("other:main#config", "is not defined"),
+            ("other:main#http://example.org/g", "is not defined"),
+            ("other:main@t:1", "is not defined"),
+            ("other", "does not name an absolute IRI"),
+            ("other#config", "does not name an absolute IRI"),
+            ("test2#config", "does not name an absolute IRI"),
+            // An unknown keyword is no graph of this ledger's address.
+            ("test:main#foo", "is not defined"),
+            ("test#foo", "does not name an absolute IRI"),
+        ] {
+            for (position, txn_type, doc) in positions(name) {
+                let err = parse_doc(&doc, txn_type)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name} in {position} parsed"))
+                    .to_string();
+                assert!(err.contains(refusal), "{name} in {position}: {err}");
+            }
+        }
+    }
+
     #[test]
     fn invalid_graph_value_refused() {
         let doc = json!({"@id": "http://example.org/s", "@graph": 3, "http://example.org/p": 1});
