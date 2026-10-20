@@ -3104,6 +3104,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-novelty",
  "fluree-db-spatial",
+ "fluree-test-support",
  "fluree-vocab",
  "futures",
  "hex",
@@ -4169,6 +4170,7 @@ name = "fluree-graph-turtle"
 version = "4.2.4"
 dependencies = [
  "fluree-graph-ir",
+ "fluree-test-support",
  "fluree-vocab",
  "rustc-hash",
  "serde_json",
@@ -4265,6 +4267,7 @@ name = "fluree-test-support"
 version = "4.2.4"
 dependencies = [
  "toml",
+ "tracing",
 ]
 
 [[package]]
