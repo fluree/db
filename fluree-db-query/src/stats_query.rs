@@ -56,7 +56,9 @@ use crate::var_registry::VarId;
 use fluree_db_binary_index::arena::numbig::NumBigRepr;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::{BinaryFilter, BinaryIndexStore, ColumnProjection, ColumnSet};
+use fluree_db_binary_index::{
+    BinaryFilter, BinaryIndexStore, ColumnData, ColumnProjection, ColumnSet,
+};
 use fluree_db_core::{FlakeValue, GraphId, OType};
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
@@ -199,27 +201,68 @@ fn count_by_predicate_union(
             }
         }
     }
-    let mut counts = Vec::with_capacity(held.len());
-    for (p_id, holders) in held {
-        // One member's rows of one predicate are distinct facts, unless a
-        // legacy arena gave one value two handles.
-        let count = if holders.members == 1 && !holders.numbig_duplicates {
-            Ok(Ok(holders.rows))
-        } else if holders.numbig {
-            distinct_facts_by_value(set, p_id)
-        } else {
-            distinct_facts(set, p_id).map(|merged| merged.map_err(|decline| decline.fallback()))
-        };
-        match count {
-            Ok(Ok(count)) => counts.push((p_id, count)),
-            Ok(Err(reason)) => return Ok(Err(reason)),
-            Err(e) => {
-                tracing::warn!(error = %e, "count by predicate over several graphs: read failed; declining to generic scan");
-                return Ok(Err(FastPathFallback::GateDeclined));
-            }
+    // How each predicate is counted. A run of consecutive predicates (in
+    // p_id order, the order PSOT leads with) that all need the merge is
+    // merged as one range, so its members' leaves are opened once.
+    let plan: Vec<(u32, Counted)> = held
+        .into_iter()
+        .map(|(p_id, holders)| {
+            // One member's rows of one predicate are distinct facts, unless a
+            // legacy arena gave one value two handles.
+            let counted = if holders.members == 1 && !holders.numbig_duplicates {
+                Counted::Rows(holders.rows)
+            } else if holders.numbig {
+                Counted::ByValue
+            } else {
+                Counted::Merge
+            };
+            (p_id, counted)
+        })
+        .collect();
+    let mut merged: BTreeMap<u32, i64> = BTreeMap::new();
+    for run in plan.chunk_by(|x, y| x.1 == Counted::Merge && y.1 == Counted::Merge) {
+        if run[0].1 != Counted::Merge {
+            continue;
+        }
+        let (first, last) = (run[0].0, run[run.len() - 1].0);
+        match distinct_facts(set, first, last, &mut merged) {
+            Ok(Ok(())) => {}
+            Ok(Err(decline)) => return Ok(Err(decline.fallback())),
+            Err(e) => return Ok(Err(read_failed(e))),
         }
     }
+    let mut counts = Vec::with_capacity(plan.len());
+    for (p_id, counted) in plan {
+        let count = match counted {
+            Counted::Rows(rows) => rows,
+            Counted::Merge => merged.get(&p_id).copied().unwrap_or(0),
+            Counted::ByValue => match distinct_facts_by_value(set, p_id) {
+                Ok(Ok(count)) => count,
+                Ok(Err(reason)) => return Ok(Err(reason)),
+                Err(e) => return Ok(Err(read_failed(e))),
+            },
+        };
+        counts.push((p_id, count));
+    }
     Ok(Ok(counts))
+}
+
+/// How one predicate's count over a union is had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Counted {
+    /// One member holds it: its directory rows.
+    Rows(i64),
+    /// Merged across the members that hold it.
+    Merge,
+    /// Through a set keyed by value: some member holds big numbers for it.
+    ByValue,
+}
+
+/// The decline a failed read stamps: the generic scan runs, and a genuine
+/// fault resurfaces there.
+fn read_failed(e: QueryError) -> FastPathFallback {
+    tracing::warn!(error = %e, "count by predicate over several graphs: read failed; declining to generic scan");
+    FastPathFallback::GateDeclined
 }
 
 /// One predicate across the members of a union: what decides how its count
@@ -237,16 +280,20 @@ struct Holders {
     numbig_duplicates: bool,
 }
 
-/// The number of distinct facts of predicate `p_id` over `set`'s members:
-/// its PSOT rows merged, where the members' copies of one fact are adjacent.
+/// The distinct facts of predicates `first..=last` over `set`'s members,
+/// added to `counts` per predicate: their PSOT rows merged as one range,
+/// where the members' copies of one fact are adjacent, counted by `p_id`.
 fn distinct_facts(
     set: &MemberSet<'_>,
-    p_id: u32,
-) -> Result<std::result::Result<i64, MergeDecline>> {
+    first: u32,
+    last: u32,
+    counts: &mut BTreeMap<u32, i64>,
+) -> Result<std::result::Result<(), MergeDecline>> {
     // The range keys' graph is not compared; each member reads its own.
-    let (min, max) = predicate_range_keys(p_id, 0);
-    let count_only = ColumnProjection {
-        output: ColumnSet::EMPTY,
+    let (min, _) = predicate_range_keys(first, 0);
+    let (_, max) = predicate_range_keys(last, 0);
+    let p_only = ColumnProjection {
+        output: ColumnSet::single(ColumnId::PId),
         internal: ColumnSet::EMPTY,
     };
     let mut merged = match MergedRangeCursor::new(
@@ -255,16 +302,30 @@ fn distinct_facts(
         &min,
         &max,
         BinaryFilter::default(),
-        count_only,
+        p_only,
     ) {
         Ok(merged) => merged,
         Err(decline) => return Ok(Err(decline)),
     };
-    let mut count = 0i64;
     loop {
         match merged.next_batch()? {
-            Ok(Some(batch)) => count += batch.row_count as i64,
-            Ok(None) => return Ok(Ok(count)),
+            Ok(Some(batch)) => match &batch.p_id {
+                // A predicate's leaflets carry it as a constant.
+                ColumnData::Const(p_id) => {
+                    *counts.entry(*p_id).or_default() += batch.row_count as i64;
+                }
+                ColumnData::Block(p_ids) => {
+                    for &p_id in p_ids.iter() {
+                        *counts.entry(p_id).or_default() += 1;
+                    }
+                }
+                ColumnData::AbsentDefault => {
+                    return Err(QueryError::Internal(
+                        "merged predicate range lost its p_id column".to_string(),
+                    ));
+                }
+            },
+            Ok(None) => return Ok(Ok(())),
             Err(decline) => return Ok(Err(decline)),
         }
     }
