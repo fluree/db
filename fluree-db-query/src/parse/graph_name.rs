@@ -47,8 +47,11 @@ pub enum WrittenGraphName<'a> {
 }
 
 /// Classify `raw`: a variable, else a `fromNamed` alias, else a keyword
-/// (from the one keyword table, [`GraphSel::keyword`]), else a node
-/// identifier expanded against `context`.
+/// written as a bare word (from the one keyword table,
+/// [`GraphSel::bare_keyword`]), else a node identifier expanded against
+/// `context`. `urn:default` is such an identifier: a read resolves it to the
+/// default graph through the ledger's graph-position table, and a write
+/// refuses it as a graph's name, where `default` writes the default graph.
 pub fn classify_written_graph_name<'a>(
     raw: &'a str,
     aliases: &'a HashMap<String, String>,
@@ -61,7 +64,7 @@ pub fn classify_written_graph_name<'a>(
     if let Some((alias, iri)) = aliases.get_key_value(raw) {
         return Ok(WrittenGraphName::Alias { alias, iri });
     }
-    match GraphSel::keyword(raw) {
+    match GraphSel::bare_keyword(raw) {
         Some(GraphSel::Default) => Ok(WrittenGraphName::Default),
         Some(GraphSel::Config) => Ok(WrittenGraphName::Config),
         Some(GraphSel::TxnMeta) => Ok(WrittenGraphName::TxnMeta),

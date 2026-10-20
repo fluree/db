@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::db::LedgerSnapshot;
 use fluree_db_core::{CommitId, ContentId};
 use fluree_db_ledger::{HeadTemporal, LedgerState, TypeErasedStore};
@@ -109,6 +109,28 @@ impl CommitRef {
     }
 }
 
+/// A ledger head's graph names, read as [`LedgerView::graph_id_for_iri`]
+/// reads them, without the rest of a view: two shared handles, so taking one
+/// copies nothing ([`LedgerHandle::graph_names`](crate::LedgerHandle::graph_names)).
+#[derive(Clone)]
+pub struct GraphNames {
+    pub(crate) snapshot: Arc<LedgerSnapshot>,
+    pub(crate) binary_store: Option<Arc<BinaryIndexStore>>,
+}
+
+impl GraphNames {
+    /// The graph id registered under `iri`, if any.
+    pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        self.table().graph_id(iri)
+    }
+
+    /// These names as the table every reader resolves a graph name against
+    /// ([`HeadGraphNames`]).
+    pub fn table(&self) -> HeadGraphNames<'_> {
+        HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
+    }
+}
+
 /// Read-only view of a ledger at a point in time.
 ///
 /// Holds no locks. Safe to clone, pass to subtasks, or keep across `.await`
@@ -175,6 +197,15 @@ impl LedgerView {
             binary_store: None,
             head_temporal: state.head_temporal,
         }
+    }
+
+    /// The graph id registered under `iri`, read through [`HeadGraphNames`]:
+    /// the snapshot's graph registry, then the binary index store's. A
+    /// borrowed lookup: nothing is copied, so a request pays O(1) per
+    /// reference however many graphs the ledger holds.
+    pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
+            .graph_id(iri)
     }
 
     /// Get the ledger name (without branch suffix)
