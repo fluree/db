@@ -1,22 +1,17 @@
 //! The rows of one key range in one index order, read from every member of a
 //! [`MemberSet`] and merged into one sorted stream that holds each fact once.
 //!
-//! A default graph of two or more members is the set union of their triples
-//! (SPARQL §13.2). The general plan gets there by draining each member in turn
-//! and dropping every row it has already emitted (`BatchDeduper`), keyed on the
-//! emitted row. That key carries no graph and no list index, so a fact present
-//! in two members is one row, and so is a fact a member holds twice as two
-//! items of one `@list`. This cursor drops the same rows by key alone: a row is
-//! dropped when its fact key `(s_id, p_id, o_type, o_key)` equals the row
-//! emitted before it.
+//! A default graph of two or more members is the set union of their facts
+//! (SPARQL §13.2). A fact is storage's own identity: one fact per value and
+//! list position (AJ-66), so a fact present in two members is one row, while
+//! two items of one `@list` that repeat a value stay two facts. This cursor
+//! drops a row when its fact ([`Key::identity`], the one definition) equals
+//! the row emitted before it.
 //!
-//! **Why adjacency is exact.** After a merge in index order, rows with one
-//! `FactKey` are adjacent whenever `o_i` is the order's last key column: SPOT
-//! and PSOT. POST keys `(p, o_type, o_key, o_i, s)` and OPST keys
-//! `(o_type, o_key, o_i, p, s)`, so two list items of one fact can be separated
-//! by other subjects' rows. A merge in those orders declines
-//! ([`MergeDecline::ListRows`]) at the first list row it meets, and is exact on
-//! the rest: without a list index, their keys put one fact's rows together too.
+//! **Why adjacency is exact.** The identity `(s_id, p_id, o_type, o_key, o_i)`
+//! is every key column of every index order, so after a merge in any order a
+//! fact's copies are adjacent, and one member's rows are distinct facts: only
+//! the first row of a run can repeat the row before it.
 //!
 //! **Arena types.** `(o_type, o_key)` names one term across members for every
 //! `o_type` except the arena-backed ones, whose `o_key` is a handle into an
@@ -34,10 +29,10 @@
 //! the other inputs, found by galloping, so disjoint stretches cost a few
 //! comparisons per run, and interleaved or repeated rows one key read and one
 //! comparison each against the runner-up, plus the choice of the next input
-//! (a scan of the heads for up to four inputs, a heap above). A row is compared with the previous fact only
-//! at the start of a run, or on every row of a batch that holds list rows.
-//! The output is gathered column by column from the runs: a run that is a
-//! whole input batch is shared, not copied.
+//! (a scan of the heads for up to four inputs, a heap above). A row is
+//! compared with the previous fact only at the start of a run. The output is
+//! gathered column by column from the runs: a run that is a whole input batch
+//! is shared, not copied.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -55,6 +50,7 @@ use fluree_db_core::{DecodeKind, OType, Tracker};
 use smallvec::SmallVec;
 
 use crate::error::{QueryError, Result};
+use crate::fast_path_outcome::FastPathFallback;
 use crate::index_scope::MemberSet;
 
 /// Inputs merged by a scan of their heads; above this, by a heap.
@@ -68,9 +64,6 @@ pub enum MergeDecline {
     /// big numbers, vectors and spatial values. Its encoded key does not name
     /// one value across members.
     ArenaType { o_type: u16 },
-    /// A list row (`o_i` set) in an order whose key does not end in `o_i`
-    /// (POST, OPST): two items of one fact need not be adjacent there.
-    ListRows { order: RunSortOrder },
     /// A member has no index branch for the order.
     NoBranch,
     /// A member's index does not answer for it alone: it has novelty, or it
@@ -83,16 +76,17 @@ impl MergeDecline {
     pub fn reason(&self) -> &'static str {
         match self {
             MergeDecline::ArenaType { .. } => "ArenaType",
-            MergeDecline::ListRows {
-                order: RunSortOrder::Post,
-            } => "ListRowsInPost",
-            MergeDecline::ListRows {
-                order: RunSortOrder::Opst,
-            } => "ListRowsInOpst",
-            // SPOT and PSOT collapse list rows and never decline on them.
-            MergeDecline::ListRows { .. } => "ListRows",
             MergeDecline::NoBranch => "NoBranch",
             MergeDecline::Novelty => "Novelty",
+        }
+    }
+
+    /// The fallback a lane's site stamps for this decline.
+    pub fn fallback(&self) -> FastPathFallback {
+        match self {
+            MergeDecline::ArenaType { .. } => FastPathFallback::ArenaType,
+            MergeDecline::NoBranch => FastPathFallback::NoBranch,
+            MergeDecline::Novelty => FastPathFallback::Novelty,
         }
     }
 }
@@ -129,6 +123,8 @@ impl MergedRangeCursor {
     /// A merge of `set`'s members over `[min, max]` (inclusive, in `order`),
     /// each read with `filter`. Output batches carry `projection`'s columns;
     /// the inputs read the identity columns as well, which the merge needs.
+    /// With no column (an empty projection), a batch is a row count alone and
+    /// the merge records nothing to gather: what a counting lane reads.
     ///
     /// Members whose index holds no leaf in the range are left out. Declines
     /// [`MergeDecline::Novelty`] unless every member is current, and
@@ -239,14 +235,14 @@ impl MergedRangeCursor {
                 return Ok(Err(decline));
             }
             self.runs.clear();
-            match self.order {
+            let rows = match self.order {
                 RunSortOrder::Spot => self.merge_round::<Spot>(),
                 RunSortOrder::Psot => self.merge_round::<Psot>(),
                 RunSortOrder::Post => self.merge_round::<Post>(),
                 RunSortOrder::Opst => self.merge_round::<Opst>(),
-            }
-            if !self.runs.is_empty() {
-                return Ok(Ok(Some(self.gather())));
+            };
+            if rows > 0 {
+                return Ok(Ok(Some(self.gather(rows))));
             }
             if self.inputs.iter().all(|input| input.done) {
                 return Ok(Ok(None));
@@ -287,22 +283,19 @@ impl MergedRangeCursor {
                 if let Some(o_type) = first_arena_type(&batch.o_type, start, end) {
                     return Ok(Some(MergeDecline::ArenaType { o_type }));
                 }
-                let list_rows = holds_list_row(&batch.o_i, start, end);
-                if list_rows && matches!(order, RunSortOrder::Post | RunSortOrder::Opst) {
-                    return Ok(Some(MergeDecline::ListRows { order }));
-                }
                 input.batch = Some(batch);
                 input.pos = start;
                 input.end = end;
-                input.list_rows = list_rows;
             }
         }
         Ok(None)
     }
 
     /// Merge the inputs' current batches until one of them is used up,
-    /// recording the rows to emit in `self.runs`.
-    fn merge_round<O: MergeOrder>(&mut self) {
+    /// recording the rows to emit in `self.runs` when a column is wanted.
+    /// Returns how many rows it emits.
+    fn merge_round<O: MergeOrder>(&mut self) -> usize {
+        let record = self.output != ColumnSet::EMPTY;
         let Self {
             inputs, runs, last, ..
         } = self;
@@ -317,10 +310,26 @@ impl MergedRangeCursor {
                 batch: input.batch(),
                 pos: input.pos,
                 end: input.end,
-                list_rows: input.list_rows,
             })
             .collect();
-        let mut out = Emitted { runs, last };
+        // The round ends when the lane whose batch ends lowest runs out, so
+        // it emits nothing past that end (the horizon). A lane whose head is
+        // past it can be neither the smallest head nor a bound this round:
+        // leave it out, so lanes that only wait cost nothing per step.
+        if lanes.len() > 2 {
+            let horizon = lanes
+                .iter()
+                .map(|lane| Key::at(lane.batch, lane.end - 1))
+                .min_by(|x, y| O::cmp(x, y))
+                .expect("two or more lanes");
+            lanes.retain(|lane| O::cmp(&lane.head(), &horizon) != Ordering::Greater);
+        }
+        let mut out = Emitted {
+            runs,
+            last,
+            record,
+            rows: 0,
+        };
         match lanes.as_mut_slice() {
             [] => {}
             [only] => {
@@ -337,11 +346,13 @@ impl MergedRangeCursor {
         for (i, pos) in positions {
             inputs[i].pos = pos;
         }
+        out.rows
     }
 
-    /// The batch of this round's runs, column by column.
-    fn gather(&self) -> ColumnBatch {
-        let row_count: usize = self.runs.iter().map(|r| r.to - r.from).sum();
+    /// The batch of this round's `row_count` rows, gathered column by column
+    /// from its runs; a row count alone when no column is wanted (no runs
+    /// were recorded).
+    fn gather(&self, row_count: usize) -> ColumnBatch {
         let inputs = &self.inputs;
         let runs = &self.runs;
         let wants = |col| self.output.contains(col);
@@ -391,7 +402,6 @@ struct Lane<'b> {
     /// The head; rows `[pos, end)` remain.
     pos: usize,
     end: usize,
-    list_rows: bool,
 }
 
 impl Lane<'_> {
@@ -401,45 +411,47 @@ impl Lane<'_> {
     }
 }
 
-/// Where a round's rows go: the runs to gather, and the fact of the last row
-/// emitted.
+/// Where a round's rows go: the runs to gather, and the identity of the last
+/// row emitted.
 struct Emitted<'a> {
     runs: &'a mut Vec<Run>,
     last: &'a mut Option<FactKey>,
+    /// Record runs to gather from. Without an output column, rows are only
+    /// counted.
+    record: bool,
+    /// The rows emitted this round.
+    rows: usize,
 }
 
 impl Emitted<'_> {
-    /// Emit `lane`'s row `row` alone, whose key is `key`, unless its fact is
-    /// the previous row's.
+    /// Emit `lane`'s row `row` alone, whose key is `key`, unless it is the
+    /// fact emitted last.
     #[inline(always)]
     fn one(&mut self, lane: &Lane<'_>, row: usize, key: Key) {
-        let fact = key.fact();
+        let fact = key.identity();
         if *self.last != Some(fact) {
-            push_run(self.runs, lane.input, row, row + 1);
+            if self.record {
+                push_run(self.runs, lane.input, row, row + 1);
+            }
+            self.rows += 1;
             *self.last = Some(fact);
         }
     }
 
-    /// Emit `lane`'s rows `[from, to)`, the first of which has key `first`,
-    /// dropping each row whose fact is the previous row's.
+    /// Emit `lane`'s rows `[from, to)`, the first of which has key `first`.
+    /// One member's rows are distinct facts, so only the first can be the
+    /// fact emitted last.
     #[inline]
     fn run(&mut self, lane: &Lane<'_>, mut from: usize, to: usize, first: Key) {
-        if lane.list_rows {
-            // List items of one fact sit next to each other here: compare
-            // every row with the one before.
-            for row in from..to {
-                self.one(lane, row, Key::at(lane.batch, row));
-            }
-            return;
-        }
-        // Without list rows, one input's rows are distinct facts, so only the
-        // first can repeat the previous row's.
-        if from < to && *self.last == Some(first.fact()) {
+        if from < to && *self.last == Some(first.identity()) {
             from += 1;
         }
         if from < to {
-            push_run(self.runs, lane.input, from, to);
-            *self.last = Some(Key::at(lane.batch, to - 1).fact());
+            if self.record {
+                push_run(self.runs, lane.input, from, to);
+            }
+            self.rows += to - from;
+            *self.last = Some(Key::at(lane.batch, to - 1).identity());
         }
     }
 }
@@ -482,18 +494,118 @@ fn advance<O: MergeOrder>(
 fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitted<'_>) {
     let (mut head_a, mut head_b) = (a.head(), b.head());
     loop {
-        // The smaller head emits; `a` on a tie.
-        if O::cmp(&head_b, &head_a) == Ordering::Less {
-            match advance::<O>(b, head_b, Some(&head_a), out) {
+        match O::cmp(&head_b, &head_a) {
+            Ordering::Less => match advance::<O>(b, head_b, Some(&head_a), out) {
                 Some(next) => head_b = next,
                 None => return,
-            }
-        } else {
-            match advance::<O>(a, head_a, Some(&head_b), out) {
+            },
+            Ordering::Greater => match advance::<O>(a, head_a, Some(&head_b), out) {
                 Some(next) => head_a = next,
                 None => return,
-            }
+            },
+            // Rows both members hold, the commonest where they overlap.
+            Ordering::Equal => match shared_stretch::<O>(a, b, head_a, None, out) {
+                Some((next_a, next_b)) => (head_a, head_b) = (next_a, next_b),
+                None => return,
+            },
         }
+    }
+}
+
+/// `a` and `b` both hold the row at their heads, whose key is `head`: walk the
+/// rows they both hold in lockstep, while the two stay equal and sort before
+/// `bound` (the smallest of any other heads), `a` emitting each and `b`
+/// stepping past its copy, which would be dropped as a repeat. One key read
+/// per lane and one comparison per row pair. Returns the two new heads, or
+/// `None` when either batch is used up.
+#[inline]
+fn shared_stretch<O: MergeOrder>(
+    a: &mut Lane<'_>,
+    b: &mut Lane<'_>,
+    head: Key,
+    bound: Option<&Key>,
+    out: &mut Emitted<'_>,
+) -> Option<(Key, Key)> {
+    let from = a.pos;
+    if let Some(shared) = constant_shared_prefix::<O>(a, b, bound) {
+        a.pos += shared;
+        b.pos += shared;
+        out.run(a, from, a.pos, head);
+        return (a.pos < a.end && b.pos < b.end).then(|| (a.head(), b.head()));
+    }
+    let next = loop {
+        a.pos += 1;
+        b.pos += 1;
+        if a.pos == a.end || b.pos == b.end {
+            break None;
+        }
+        let (next_a, next_b) = (a.head(), b.head());
+        if next_a != next_b || bound.is_some_and(|t| O::cmp(&next_a, t) != Ordering::Less) {
+            break Some((next_a, next_b));
+        }
+    };
+    out.run(a, from, a.pos, head);
+    next
+}
+
+/// [`shared_stretch`]'s walk on slices: how many rows from both heads (equal)
+/// are equal and, after the first, sort before `bound`, when both batches
+/// carry `p_id`, `o_type` and `o_i` as one constant they agree on (one
+/// predicate's leaflets of one type, without list rows, the common case).
+/// Two rows then differ only in `s_id` and `o_key`, compared as slices.
+/// `None` when the columns are not of that shape.
+#[inline]
+fn constant_shared_prefix<O: MergeOrder>(
+    a: &Lane<'_>,
+    b: &Lane<'_>,
+    bound: Option<&Key>,
+) -> Option<usize> {
+    let (ab, bb) = (a.batch, b.batch);
+    let same_const = matches!((&ab.p_id, &bb.p_id), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
+        && matches!((&ab.o_type, &bb.o_type), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
+        && matches!((&ab.o_i, &bb.o_i), (ColumnData::Const(x), ColumnData::Const(y)) if x == y);
+    if !same_const {
+        return None;
+    }
+    let (
+        ColumnData::Block(a_s),
+        ColumnData::Block(b_s),
+        ColumnData::Block(a_o),
+        ColumnData::Block(b_o),
+    ) = (&ab.s_id, &bb.s_id, &ab.o_key, &bb.o_key)
+    else {
+        return None;
+    };
+    let mut span = (a.end - a.pos).min(b.end - b.pos);
+    if let Some(bound) = bound {
+        // The head always goes; the rows after it only while below `bound`.
+        let below = partition_point(a.pos + 1, a.end, |row| {
+            O::cmp(&Key::at(ab, row), bound) == Ordering::Less
+        });
+        span = span.min(below - a.pos);
+    }
+    let shared = a_s[a.pos..a.pos + span]
+        .iter()
+        .zip(&b_s[b.pos..b.pos + span])
+        .zip(
+            a_o[a.pos..a.pos + span]
+                .iter()
+                .zip(&b_o[b.pos..b.pos + span]),
+        )
+        .take_while(|((sa, sb), (oa, ob))| sa == sb && oa == ob)
+        .count();
+    Some(shared.max(1))
+}
+
+/// Two distinct elements of `slice`, mutably.
+fn two_mut<T>(slice: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
+    debug_assert_ne!(i, j);
+    if i < j {
+        let (left, right) = slice.split_at_mut(j);
+        (&mut left[i], &mut right[0])
+    } else {
+        let (left, right) = slice.split_at_mut(i);
+        (&mut right[0], &mut left[j])
     }
 }
 
@@ -503,21 +615,37 @@ fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
     let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
         lanes.iter().map(Lane::head).collect();
     loop {
-        // The smallest head (the earlier input on a tie) and the smallest of
-        // the others.
+        // The smallest head and the smallest of the others (the earlier lane
+        // on a tie).
         let mut min_at = 0;
-        let mut runner_up: Option<Key> = None;
+        let mut second_at: Option<usize> = None;
         for at in 1..heads.len() {
             if O::cmp(&heads[at], &heads[min_at]) == Ordering::Less {
-                runner_up = Some(heads[min_at]);
+                second_at = Some(min_at);
                 min_at = at;
-            } else if runner_up.is_none_or(|r| O::cmp(&heads[at], &r) == Ordering::Less) {
-                runner_up = Some(heads[at]);
+            } else if second_at.is_none_or(|s| O::cmp(&heads[at], &heads[s]) == Ordering::Less) {
+                second_at = Some(at);
             }
         }
-        match advance::<O>(&mut lanes[min_at], heads[min_at], runner_up.as_ref(), out) {
-            Some(next) => heads[min_at] = next,
-            None => return,
+        let second_at = second_at.expect("two or more lanes");
+        if heads[min_at] == heads[second_at] {
+            // Rows two members hold: walk them in lockstep below the third
+            // head.
+            let third = (0..heads.len())
+                .filter(|&at| at != min_at && at != second_at)
+                .map(|at| heads[at])
+                .min_by(|x, y| O::cmp(x, y));
+            let (a, b) = two_mut(lanes, min_at, second_at);
+            match shared_stretch::<O>(a, b, heads[min_at], third.as_ref(), out) {
+                Some((next_a, next_b)) => (heads[min_at], heads[second_at]) = (next_a, next_b),
+                None => return,
+            }
+        } else {
+            let bound = heads[second_at];
+            match advance::<O>(&mut lanes[min_at], heads[min_at], Some(&bound), out) {
+                Some(next) => heads[min_at] = next,
+                None => return,
+            }
         }
     }
 }
@@ -547,8 +675,6 @@ struct MemberInput {
     /// The next row to merge; rows `[pos, end)` of `batch` remain.
     pos: usize,
     end: usize,
-    /// Whether `batch`'s remaining rows hold a list row.
-    list_rows: bool,
     /// The current batch reaches past the range: none after it can be in it.
     last_batch: bool,
     done: bool,
@@ -562,7 +688,6 @@ impl MemberInput {
             batch: None,
             pos: 0,
             end: 0,
-            list_rows: false,
             last_batch: false,
             done: false,
         }
@@ -679,15 +804,6 @@ fn first_arena_type(o_type: &ColumnData<u16>, from: usize, to: usize) -> Option<
     }
 }
 
-/// Whether rows `[from, to)` hold a list row.
-fn holds_list_row(o_i: &ColumnData<u32>, from: usize, to: usize) -> bool {
-    match o_i {
-        ColumnData::Const(v) => *v != u32::MAX,
-        ColumnData::Block(block) => block[from..to].iter().any(|&v| v != u32::MAX),
-        ColumnData::AbsentDefault => false,
-    }
-}
-
 /// The rows of `batch` within `[min, max]` as `[start, end)`, and whether the
 /// batch reaches past `max`. A cursor emits whole leaflets, so its first and
 /// last ones can hold rows outside its range.
@@ -786,23 +902,29 @@ impl Key {
         }
     }
 
+    /// The fact this row stores: the one definition of what the merge
+    /// deduplicates on. Storage's fact identity (AJ-66) is one fact per value
+    /// and list position, and for a non-arena `o_type` the index key is the
+    /// value, so the identity is the whole key.
     #[inline(always)]
-    fn fact(&self) -> FactKey {
+    fn identity(&self) -> FactKey {
         FactKey {
             s_id: self.s_id,
             o_key: self.o_key,
             p_id: self.p_id,
+            o_i: self.o_i,
             o_type: self.o_type,
         }
     }
 }
 
-/// A fact without its list index: what the general plan's dedup keys on.
+/// A fact's identity in the merge ([`Key::identity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FactKey {
     s_id: u64,
     o_key: u64,
     p_id: u32,
+    o_i: u32,
     o_type: u16,
 }
 
@@ -1024,8 +1146,9 @@ mod tests {
         }
     }
 
-    fn fact(row: &Row) -> (u64, u32, u16, u64) {
-        (row.0, row.1, row.2, row.3)
+    /// A row's fact: every column, the list index included (AJ-66).
+    fn fact(row: &Row) -> Row {
+        *row
     }
 
     /// The merge's contract, checked without its comparator: rows strictly
@@ -1160,56 +1283,38 @@ mod tests {
     }
 
     #[test]
-    fn list_rows_collapse_in_spot_and_psot() {
+    fn list_items_are_facts_of_their_own_in_every_order() {
         // g1 holds "a" twice in one list (o_i 0 and 2) and "b" once (o_i 1);
-        // g2 holds "a" at o_i 1 and as a plain value. One fact "a", one "b".
+        // g2 holds "a" at o_i 0 (the fact g1 holds too), at o_i 1, and as a
+        // plain value. Five facts: one fact per value and list position.
         let g1: Vec<Row> = vec![(1, 5, STR, 10, 0), (1, 5, STR, 11, 1), (1, 5, STR, 10, 2)];
-        let g2: Vec<Row> = vec![(1, 5, STR, 10, 1), (1, 5, STR, 10, NO_LIST)];
-        for order in [RunSortOrder::Spot, RunSortOrder::Psot] {
-            // Across members.
-            let members = vec![member(order, &[&g1[..]]), member(order, &[&g2[..]])];
+        let g2: Vec<Row> = vec![
+            (1, 5, STR, 10, 0),
+            (1, 5, STR, 10, 1),
+            (1, 5, STR, 10, NO_LIST),
+        ];
+        // In POST and OPST, (o, o_i 0, s1), (o, o_i 0, s2), (o, o_i 1, s1):
+        // one subject's two items of one value are not adjacent, and the fact
+        // both members hold is.
+        let h1: Vec<Row> = vec![(1, 6, IRI, 3, 0), (2, 6, IRI, 3, 0), (1, 6, IRI, 3, 1)];
+        let h2: Vec<Row> = vec![(1, 6, IRI, 3, 1)];
+        for order in ORDERS {
+            let members = vec![
+                member(order, &[&g1[..], &h1[..]]),
+                member(order, &[&g2[..], &h2[..]]),
+            ];
             let out = drain(&mut merge(order, members)).unwrap();
-            assert_eq!(
-                out,
-                vec![(1, 5, STR, 10, 0), (1, 5, STR, 11, 1)],
-                "{order:?}: the first item of each fact"
-            );
-            // Within one member, beside a member without the predicate.
-            let other: Vec<Row> = vec![(9, 6, STR, 1, NO_LIST)];
-            let members = vec![member(order, &[&g1[..]]), member(order, &[&other[..]])];
-            let out = drain(&mut merge(order, members)).unwrap();
-            assert_is_the_union(order, &[g1.clone(), other.clone()], &out);
-            assert_eq!(out.len(), 3, "{order:?}");
+            let mut want: Vec<Row> = g1
+                .iter()
+                .chain(&g2)
+                .chain(&h1)
+                .chain(&h2)
+                .copied()
+                .collect();
+            want = sorted(order, want);
+            assert_eq!(out, want, "{order:?}");
+            assert_eq!(out.len(), 8, "{order:?}");
         }
-    }
-
-    #[test]
-    fn list_rows_decline_in_post_and_opst() {
-        // In OPST, (o, o_i 0, s1), (o, o_i 0, s2), (o, o_i 1, s1): the two
-        // items of (s1, p, o) are not adjacent. POST likewise.
-        let g1: Vec<Row> = vec![(1, 5, IRI, 3, 0), (2, 5, IRI, 3, 0), (1, 5, IRI, 3, 1)];
-        let g2: Vec<Row> = vec![(4, 5, IRI, 3, NO_LIST)];
-        for order in [RunSortOrder::Post, RunSortOrder::Opst] {
-            let members = vec![member(order, &[&g1[..]]), member(order, &[&g2[..]])];
-            assert_eq!(
-                drain(&mut merge(order, members)),
-                Err(MergeDecline::ListRows { order })
-            );
-        }
-        assert_eq!(
-            MergeDecline::ListRows {
-                order: RunSortOrder::Post
-            }
-            .reason(),
-            "ListRowsInPost"
-        );
-        assert_eq!(
-            MergeDecline::ListRows {
-                order: RunSortOrder::Opst
-            }
-            .reason(),
-            "ListRowsInOpst"
-        );
     }
 
     #[test]
@@ -1265,16 +1370,15 @@ mod tests {
     }
 
     /// k = 2, 3 and 5 (past the heap threshold), random members over a small
-    /// universe so they overlap, cut into leaflets of 1 to 7 rows. SPOT and
-    /// PSOT carry list rows, a value repeated within one member's list and
-    /// across members included; POST and OPST don't.
+    /// universe so they overlap, cut into leaflets of 1 to 7 rows, with list
+    /// rows in every order: a value repeated within one member's list, and
+    /// one list item held by several members.
     #[test]
     fn random_members_merge_to_the_set_union() {
         let objects = [(STR, 10), (STR, 11), (IRI, 3), (INT, 7)];
         for seed in 1..=40u64 {
             let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
             for order in ORDERS {
-                let lists = matches!(order, RunSortOrder::Spot | RunSortOrder::Psot);
                 for k in [2usize, 3, 5] {
                     let mut members = Vec::new();
                     for _ in 0..k {
@@ -1283,7 +1387,7 @@ mod tests {
                             for p in 1..=3u32 {
                                 for &(o_type, o_key) in &objects {
                                     if rng.below(10) < 4 {
-                                        let o_i = if lists && rng.below(4) == 0 {
+                                        let o_i = if rng.below(4) == 0 {
                                             rng.below(3) as u32
                                         } else {
                                             NO_LIST
@@ -1291,7 +1395,7 @@ mod tests {
                                         rows.push((s, p, o_type, o_key, o_i));
                                         // A list that repeats the value
                                         // within this member.
-                                        if lists && rng.below(6) == 0 {
+                                        if rng.below(6) == 0 {
                                             let again = 3 + rng.below(3) as u32;
                                             rows.push((s, p, o_type, o_key, again));
                                         }
@@ -1308,6 +1412,33 @@ mod tests {
                     let out = drain(&mut merge(order, batches))
                         .unwrap_or_else(|d| panic!("{order:?} k={k} seed={seed}: {d:?}"));
                     assert_is_the_union(order, &members, &out);
+                    // Counting alone (no output column) emits as many rows,
+                    // over leaflets cut differently.
+                    let batches = members
+                        .iter()
+                        .map(|rows| split_leaflets(&mut rng, rows))
+                        .collect();
+                    let (min, max) = full_range();
+                    let mut counting = MergedRangeCursor::from_batches(
+                        order,
+                        batches,
+                        &min,
+                        &max,
+                        ColumnProjection {
+                            output: ColumnSet::EMPTY,
+                            internal: ColumnSet::EMPTY,
+                        },
+                    );
+                    let mut counted = 0;
+                    while let Some(batch) = counting.next_batch().unwrap().unwrap() {
+                        assert!(batch.row_count > 0 && batch.s_id.is_absent());
+                        counted += batch.row_count;
+                    }
+                    assert_eq!(
+                        counted,
+                        out.len(),
+                        "{order:?} k={k} seed={seed}: count only"
+                    );
                 }
             }
         }
@@ -1332,12 +1463,16 @@ mod tests {
             vec![1, 2, 3, 4, 5]
         );
 
-        // One fact's two list items, split across g1's leaflets, with g2
-        // holding the same fact as a plain value.
+        // One value's two list items split across g1's leaflets, g2 holding
+        // the second item and the plain value: four facts, the shared item
+        // once.
         let g1 = member(order, &[&[r(1, 1, 0)], &[r(1, 1, 1), r(2, 1, NO_LIST)]]);
-        let g2 = member(order, &[&[r(1, 1, NO_LIST)]]);
+        let g2 = member(order, &[&[r(1, 1, 1), r(1, 1, NO_LIST)]]);
         let out = drain(&mut merge(order, vec![g1, g2])).unwrap();
-        assert_eq!(out, vec![r(1, 1, 0), r(2, 1, NO_LIST)]);
+        assert_eq!(
+            out,
+            vec![r(1, 1, 0), r(1, 1, 1), r(1, 1, NO_LIST), r(2, 1, NO_LIST)]
+        );
 
         // The same row closes one member's leaflet and the other's, in every
         // order, with a third member in between.
