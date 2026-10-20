@@ -155,9 +155,26 @@ WHERE { GRAPH <http://example.org/claims-review/decisions> {
 
 The server applies the update atomically. A run that lost the race matches
 nothing and commits nothing; it confirms its own publication by reading the
-generation record back and finding its generation and output hash there. The
-first publication guards with `FILTER NOT EXISTS` on any generation record
-instead.
+generation record back and finding its generation and output hash there.
+
+Unlike `publish()` in the worker, which stages the delete and the insert as
+two writes, this single update does not net to the difference: each commit
+asserts every unchanged result again. The graph holds the same facts either
+way; only the commits are larger.
+
+The first publication has no generation record to match, and on an empty
+graph `?s ?p ?o` matches nothing either, so it has no `DELETE` and guards on
+the record's absence:
+
+```sparql
+PREFIX w: <http://example.org/worker#>
+INSERT { GRAPH <http://example.org/claims-review/decisions> {
+  # … the new results …
+  <http://example.org/claims-review/decisions#generation> w:generation 1 .
+} }
+WHERE { FILTER NOT EXISTS { GRAPH <http://example.org/claims-review/decisions> {
+  ?gen w:generation ?any } } }
+```
 
 ## Limits
 
