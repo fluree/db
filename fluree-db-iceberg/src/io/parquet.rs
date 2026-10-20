@@ -1018,12 +1018,21 @@ fn decode_int96_column(
         )
         .map_err(|e| IcebergError::Storage(format!("Failed to read int96 column: {e}")))?;
 
-    // Convert INT96 to microseconds since epoch
-    let result = decode_with_nulls(records_read, values_read, &def_levels, &values, |int96| {
-        int96_to_nanos(int96) / 1000
-    });
+    let result = decode_with_nulls(
+        records_read,
+        values_read,
+        &def_levels,
+        &values,
+        int96_to_micros,
+    );
 
     Ok(Column::Timestamp(result))
+}
+
+/// Convert INT96 to microseconds since the Unix epoch, held to the
+/// microsecond at or before the instant, as a dateTime is.
+fn int96_to_micros(int96: &parquet::data_type::Int96) -> i64 {
+    fluree_db_core::temporal::micros_from_epoch_nanos(int96_to_nanos(int96))
 }
 
 /// Convert INT96 to nanoseconds since Unix epoch.
@@ -1686,6 +1695,20 @@ mod tests {
         let int96 = parquet::data_type::Int96::from(vec![0, 0, 2_440_588_u32]);
         let nanos = int96_to_nanos(&int96);
         assert_eq!(nanos, 0);
+    }
+
+    /// An INT96 timestamp is held to the microsecond at or before it, before
+    /// 1970 too: 500 ns before the epoch is the microsecond before it.
+    #[test]
+    fn int96_rounds_down_to_the_microsecond() {
+        let day_nanos: u64 = 86_400_000_000_000 - 500;
+        let int96 = parquet::data_type::Int96::from(vec![
+            day_nanos as u32,
+            (day_nanos >> 32) as u32,
+            2_440_587_u32,
+        ]);
+        assert_eq!(int96_to_nanos(&int96), -500);
+        assert_eq!(int96_to_micros(&int96), -1);
     }
 
     #[test]

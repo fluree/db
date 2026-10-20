@@ -513,7 +513,7 @@ fn cmp_values_inner(
     // Cross-type coercion: when one side is a temporal type and the other is a
     // string, try to parse the string as that temporal type (ordering only).
     if temporal_string_coerce {
-        if let Some(ordering) = try_coerce_temporal_string_cmp(&left_fv, &right_fv) {
+        if let Some(ordering) = fluree_db_core::temporal::cmp_with_lexical(&left_fv, &right_fv) {
             return ValueOrder::Ordered(ordering);
         }
     }
@@ -723,71 +723,6 @@ pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutc
         // Otherwise at least one operand has an unrecognized / ill-typed datatype
         // that might still denote the same value → type error.
         _ => EqOutcome::TypeError,
-    }
-}
-
-/// Try to compare a temporal FlakeValue against a String by parsing the
-/// string as the matching temporal type. Returns `None` if neither side is
-/// a string or parsing fails.
-///
-/// This handles values stored as LEX_ID (string dict entry) with a temporal
-/// datatype annotation — the index stores the raw string but the FILTER
-/// constant is a properly-typed temporal value.
-fn try_coerce_temporal_string_cmp(left: &FlakeValue, right: &FlakeValue) -> Option<Ordering> {
-    use fluree_db_core::temporal;
-
-    match (left, right) {
-        // String on left, temporal on right → parse left as temporal
-        (FlakeValue::String(s), FlakeValue::GYear(g)) => temporal::GYear::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GYearMonth(g)) => temporal::GYearMonth::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GMonth(g)) => temporal::GMonth::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GDay(g)) => temporal::GDay::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GMonthDay(g)) => temporal::GMonthDay::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::DateTime(dt)) => temporal::DateTime::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(dt.as_ref())),
-        (FlakeValue::String(s), FlakeValue::Date(d)) => temporal::Date::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(d.as_ref())),
-        (FlakeValue::String(s), FlakeValue::Time(t)) => temporal::Time::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(t.as_ref())),
-        // Temporal on left, string on right → parse right as temporal
-        (FlakeValue::GYear(g), FlakeValue::String(s)) => temporal::GYear::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GYearMonth(g), FlakeValue::String(s)) => temporal::GYearMonth::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GMonth(g), FlakeValue::String(s)) => temporal::GMonth::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GDay(g), FlakeValue::String(s)) => temporal::GDay::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GMonthDay(g), FlakeValue::String(s)) => temporal::GMonthDay::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::DateTime(dt), FlakeValue::String(s)) => temporal::DateTime::parse(s)
-            .ok()
-            .map(|parsed| dt.as_ref().cmp(&parsed)),
-        (FlakeValue::Date(d), FlakeValue::String(s)) => temporal::Date::parse(s)
-            .ok()
-            .map(|parsed| d.as_ref().cmp(&parsed)),
-        (FlakeValue::Time(t), FlakeValue::String(s)) => temporal::Time::parse(s)
-            .ok()
-            .map(|parsed| t.as_ref().cmp(&parsed)),
-        _ => None,
     }
 }
 

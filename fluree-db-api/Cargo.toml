@@ -694,6 +694,10 @@ name = "transact_filtered_delete"
 harness = false
 
 [[bench]]
+name = "transact_delete_wide_slot"
+harness = false
+
+[[bench]]
 name = "transact_upsert_replace"
 harness = false
 
