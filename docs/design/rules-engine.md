@@ -56,8 +56,9 @@ expressions, BIND, VALUES, UNION, property paths, and subqueries.
 Rule bodies run with reasoning disabled (no re-entrant materialization), as
 root (derived facts are policy-filtered after materialization, exactly as
 before), with eager materialization so every binding is a decoded `Sid` or
-literal, and without fuel or cancellation limits of their own (the reasoning
-budget bounds them).
+literal, and without fuel limits of their own. Each body runs under a
+cancellation handle that times out at the reasoning budget's deadline, so a
+long body stops at its next checkpoint instead of running to completion.
 
 ### Fixpoint
 
@@ -169,10 +170,10 @@ to stored rules too: a ledger whose rule set contains a broken rule fails its
 reasoning queries until the rule is fixed, rather than silently answering over
 an incomplete derivation.
 
-Rejected constructs are the non-monotonic ones, which a fixpoint cannot
-evaluate soundly without stratification: OPTIONAL, MINUS, NOT EXISTS
-(`["not-exists", …]`), aggregates and GROUP BY, and SERVICE. Everything else the
-executor accepts is allowed.
+Rejected constructs: OPTIONAL, MINUS (NOT EXISTS is the supported negation),
+GROUP BY at the top of a body (aggregate in a subquery instead), and SERVICE.
+Everything else the executor accepts is allowed, including stratified
+negation and aggregation (below).
 
 Range restriction is enforced per rule: every head variable must be bound by
 the body. A head that references an unbound variable now rejects the rule (it
@@ -198,6 +199,69 @@ The fixpoint's pass limit is reported like a budget cap: stopping at
 `max_iterations` passes in one stage while its last pass still derived facts
 sets `capped_reason: "iterations"` and logs a warning, so a truncated closure
 is never indistinguishable from a converged one (#1559).
+
+### Stratified negation and aggregation
+
+Reads under `NOT EXISTS` or `!` are recorded as `negated_reads` in the
+footprint, and reads inside a grouped or aggregating subquery as
+`aggregated_reads`, as well as ordinary reads, so they create dependency
+edges like any other read: a negating or aggregating rule's stage comes after
+every rule that can write what it reads. `RuleDependencies::unstratified`
+rejects a program in which such a read may observe a write of the reading
+rule's own recursive group, reporting a cycle found by a breadth-first search
+inside that group (`-not->` or `-agg->` on the first arrow) and the facts
+the offending read names, with IRIs spelled out. Double negation counts as negated, which keeps the check
+conservative. The validator requires every variable a negation shares with
+its group to be bound by a positive pattern of that group (or of the group the
+negation is nested in).
+
+Because a cap stops all later stages, a negating or aggregating rule never
+runs over incomplete inputs within datalog. A capped run that leaves such a
+rule unfinished fails with `ResourceLimit` instead of returning partial
+conclusions, and so does an OWL 2 RL cap or failure ahead of such a program,
+since the OWL closure is datalog's input (a positive program still runs over
+what OWL produced, or without it). `RuleSchedule::WholeProgram` refuses these
+programs: it runs every rule from the first round. A subquery's solutions are
+a bag, as in queries, and `owl:sameAs` aliases are counted as stated.
+
+### Named graphs
+
+`RuleHead::graph` holds a head's expanded graph IRI: from a CONSTRUCT
+template's `GRAPH <iri>` block, or a JSON-LD insert node's `"@graph": "<iri>"`
+(a named graph object `{"@id": <iri>, "@graph": [ … ]}` assigns its nodes).
+The footprint writes such a head into `GraphScope::Named`. At run start
+`HeadGraphs::resolve` maps each IRI to a graph id through the ledger's graph
+registry, refusing a graph the ledger lacks, a system graph, or the graph the
+rules run against. A derived flake carries its graph's SID in `g`, so the
+dedup key and routing both see it.
+
+`DerivedFactsOverlay` partitions facts by graph id (`new_routed` /
+`DerivedFactsBuilder::build_routed`); a flake with no `g` belongs to the
+graph the rules ran against, and OWL 2 RL facts stay in the default graph.
+The executor splices the reasoning overlay into every dataset graph of the
+ledger that holds derived facts, not only the primary view. A semi-naive
+seed holds only facts without `g`, since a seeded pattern is a top-level
+pattern of the graph the rules run against; named-graph reads sit inside
+`GRAPH` and re-run whole. A transitive closure head with a graph does not
+compile to a path.
+
+### Run contract
+
+- **Evaluation time.** `NOW()` and `TODAY()` read
+  `ExecutionContext::evaluation_time` when it is set, and rule bodies always
+  set it. A run's time is the query's `reasoningTime` /
+  `# PRAGMA reasoning-time:`, else the commit time (`db:time` in the
+  txn-meta graph) of the commit at the queried `t`. A snapshot with no commit
+  at that `t` fails a program whose footprint `reads_clock`, rather than
+  falling back to the wall clock. With one time per run, both functions are
+  repeatable for scheduling and semi-naive purposes. A requested time is part
+  of the cache key; a defaulted one is already pinned by `to_t`.
+- **Deadline.** The reasoning budget's deadline becomes the body's
+  `QueryCancellation::with_deadline`; a cancelled body caps the run on time.
+- **Attribution.** A capped run records `capped_rules` (the groups still
+  running when the cap fired) and `pending_rules` (the stages after it), and
+  both reach the tracked response. The Raft-recorded tally mirror does not
+  carry them, so its positional wire form is unchanged.
 
 ### IRI operands in JSON-LD filters
 
@@ -270,8 +334,9 @@ ids, which would make derived provenance durable and diffable across commits.
 Materialization happens while the query is *prepared*, before its execution
 context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
 materialization always has. A rule body is therefore bounded by the reasoning
-budget (facts, memory, time — checked as its rows arrive) but cannot be
-cancelled mid-body by the query's cancellation token, and its scans are not
+budget (facts, memory, and time — checked as its rows arrive, and time also
+at a running body's checkpoints) but cannot be cancelled by the query's own
+cancellation token, such as a client disconnect, and its scans are not
 charged as query fuel. Threading the tracker and cancellation into
 prepare-time materialization is the follow-up that closes this for both
 engines.
@@ -283,6 +348,6 @@ to annotations would have meant re-implementing the planner's annotation
 expansion (`expand_edge_annotation_patterns`), the three annotation read lanes,
 and join ordering, inside a second engine. Two real costs of the executor
 approach were weighed and accepted: per-rule planning overhead of a few
-milliseconds per round, and the loss of a cheap semi-naive delta restriction
-(the old engine did not have one either; it re-ran every rule against the full
-overlay each round).
+milliseconds per pass, and a delta restriction that seeds a body with a
+`VALUES` block (see Fixpoint) rather than living inside a dedicated join
+operator.

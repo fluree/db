@@ -10,6 +10,7 @@ use super::ast::{
     UnresolvedTriplePattern, UnresolvedVectorSearchPattern, UnresolvedVectorSearchTarget,
 };
 use super::error::{ParseError, Result};
+use super::graph_name::{classify_written_graph_name, WrittenGraphName};
 use super::policy::JsonLdParseCtx;
 use fluree_graph_json_ld::{expand_iri, ParsedContext, TypeValue};
 use fluree_vocab::search_iris;
@@ -512,6 +513,37 @@ fn parse_index_search_result(
     }
 }
 
+/// A node's own `@graph` selector, the GRAPH sugar both node parsers share:
+/// `parse` reads the node's other entries (in the written order), in the
+/// graph the selector names, or as they are when it names the `where`'s own
+/// default graph. `false` (nothing parsed) when the node has no selector.
+fn in_node_graph(
+    map: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+    parse: impl FnOnce(&serde_json::Map<String, JsonValue>, &mut UnresolvedQuery) -> Result<()>,
+) -> Result<bool> {
+    let Some((graph_key, raw)) = node_graph_selector(map, &ctx.context)? else {
+        return Ok(false);
+    };
+    let inner_map: serde_json::Map<String, JsonValue> = map
+        .iter()
+        .filter(|(k, _)| k.as_str() != graph_key)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    match resolve_where_graph(raw, ctx)? {
+        WhereGraph::Default => parse(&inner_map, query)?,
+        WhereGraph::Named(name) => {
+            let mut inner = UnresolvedQuery::new(ctx.context.clone());
+            ctx.in_graph_scope(|| parse(&inner_map, &mut inner))?;
+            query
+                .patterns
+                .push(UnresolvedPattern::graph(name, inner.patterns));
+        }
+    }
+    Ok(true)
+}
+
 /// Parse a node-map (single where clause object)
 ///
 /// Extracts triple patterns from JSON-LD node-map format.
@@ -525,6 +557,25 @@ pub fn parse_node_map(
     object_var_parsing: bool,
 ) -> Result<()> {
     let context = &ctx.context;
+
+    // A node-level `@graph` selector is GRAPH sugar: this node's patterns
+    // (and those of the nodes nested in it) match in the named graph, as
+    // `["graph", <iri>, {…this node…}]` does. The name resolves exactly as
+    // the same key does in an insert or delete (`resolve_where_graph`), so
+    // one document means one graph by it. (It used to be read as a predicate
+    // named `@graph`, so the pattern matched nothing.)
+    if in_node_graph(map, ctx, query, |inner_map, query| {
+        parse_node_map(
+            inner_map,
+            ctx,
+            query,
+            subject_counter,
+            nested_counter,
+            object_var_parsing,
+        )
+    })? {
+        return Ok(());
+    }
 
     // Check for vector search pattern first (has f:queryVector)
     if is_vector_search_pattern(map, context) {
@@ -612,6 +663,96 @@ pub fn parse_node_map(
     }
 
     Ok(())
+}
+
+/// The graph a where node-map selects with a node-level `@graph` (the keyword
+/// or a context alias of it; a bare `graph` key stays a property in a
+/// pattern), with the key it was found under.
+fn node_graph_selector<'m>(
+    map: &'m serde_json::Map<String, JsonValue>,
+    context: &ParsedContext,
+) -> Result<Option<(&'m str, &'m str)>> {
+    let Some((key, value)) = map.iter().find(|(k, _)| {
+        k.as_str() == "@graph" || context.get(k).and_then(|e| e.id.as_deref()) == Some("@graph")
+    }) else {
+        return Ok(None);
+    };
+    match fluree_graph_json_ld::classify_graph_value(value) {
+        fluree_graph_json_ld::GraphValue::Selector(name) => Ok(Some((key.as_str(), name))),
+        fluree_graph_json_ld::GraphValue::Content(_) => Err(ParseError::InvalidWhere(
+            "a node with `@graph` content (a JSON-LD named graph) is not a where pattern; \
+             use [\"graph\", <name>, <pattern>]"
+                .to_string(),
+        )),
+        fluree_graph_json_ld::GraphValue::Invalid(why) => {
+            Err(ParseError::InvalidWhere(why.to_string()))
+        }
+    }
+}
+
+/// A `where` pattern cannot leave the graph an enclosing selector chose, so
+/// `default` there (which in a template would escape it) is refused.
+fn default_cannot_leave_a_graph() -> ParseError {
+    ParseError::InvalidWhere(
+        "\"@graph\": \"default\" cannot leave the graph an enclosing \"@graph\" or \
+         [\"graph\", …] selects; write that pattern outside it"
+            .to_string(),
+    )
+}
+
+/// The graph a `where` node selects.
+enum WhereGraph {
+    /// The where's default graph.
+    Default,
+    /// A GRAPH pattern's name: a variable, an alias, or a graph IRI.
+    Named(String),
+}
+
+/// Resolve a `where` node's graph name by the order templates use
+/// ([`classify_written_graph_name`]): a variable; a `fromNamed` alias (kept
+/// as written, the pattern resolves it against the dataset to the IRI a
+/// template writes); the keywords `default`, `config` and `txn-meta` (the
+/// last two need the ledger, which an update's `where` knows; elsewhere they
+/// are names as written); else the name expanded against the `@context`, an
+/// absolute IRI. A name that expands to no absolute IRI is kept as written:
+/// in a query it can name a `fromNamed` alias the parser does not see.
+fn resolve_where_graph(raw: &str, ctx: &JsonLdParseCtx) -> Result<WhereGraph> {
+    use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+    use WrittenGraphName as W;
+
+    let env = &ctx.graph_names;
+    let ledger_graph = |iri: fn(&str) -> String| match env.ledger_id.as_deref() {
+        Some(ledger) => WhereGraph::Named(iri(ledger)),
+        None => WhereGraph::Named(raw.to_string()),
+    };
+    Ok(
+        match classify_written_graph_name(
+            raw,
+            &env.aliases,
+            &ctx.context,
+            ctx.policy.strict_compact_iri,
+        )? {
+            W::Var(var) => WhereGraph::Named(var.to_string()),
+            W::Alias { alias, .. } => WhereGraph::Named(alias.to_string()),
+            // `default` is the ledger's default graph, as in a template. It
+            // is the WHERE's own default graph unless the update reads
+            // another (`graph`, `from`); then the where reads it as
+            // `GRAPH <urn:default>`. Either way a where pattern cannot leave
+            // an enclosing graph for it.
+            W::Default if ctx.in_any_graph_scope() => return Err(default_cannot_leave_a_graph()),
+            W::Default if env.default_by_name => {
+                ctx.note_reads_ledger_default();
+                WhereGraph::Named(fluree_db_core::DEFAULT_GRAPH_IRI.to_string())
+            }
+            W::Default => WhereGraph::Default,
+            W::Config => ledger_graph(config_graph_iri),
+            W::TxnMeta => ledger_graph(txn_meta_graph_iri),
+            W::Expanded(iri) if fluree_db_core::dataset_ref::GraphIri::parse(&iri).is_ok() => {
+                WhereGraph::Named(iri)
+            }
+            W::Expanded(_) => WhereGraph::Named(raw.to_string()),
+        },
+    )
 }
 
 /// Parse the subject (@id value)
@@ -1614,6 +1755,22 @@ fn parse_nested_node_map(
     object_var_parsing: bool,
 ) -> Result<()> {
     let context = &ctx.context;
+
+    // A nested node's own `@graph` selects the graph its patterns match in,
+    // as a nested selector scopes a node in an insert or delete. The edge to
+    // it stays in the enclosing node's graph.
+    if in_node_graph(map, ctx, query, |inner_map, query| {
+        parse_nested_node_map(
+            inner_map,
+            subject,
+            ctx,
+            query,
+            nested_counter,
+            object_var_parsing,
+        )
+    })? {
+        return Ok(());
+    }
 
     // Check for explicit @id in nested object - it overrides the generated subject
     let actual_subject = if let Some(id_val) = map.get("@id") {

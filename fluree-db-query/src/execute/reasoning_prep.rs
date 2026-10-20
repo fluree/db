@@ -249,6 +249,31 @@ pub struct DerivedFactsOutcome {
     pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
+/// `rdfs` and `owl2ql` widen the query's own patterns, and rule bodies run
+/// without them, so a rule that negates or counts would read an entailment
+/// the query sees as absent and conclude what the query's answer contradicts.
+/// OWL 2 RL materializes those entailments where rules and query both read
+/// them, and the rewrite steps aside for it.
+fn refuse_non_monotone_rules_under_rewrites(
+    reasoning: &ReasoningModes,
+    rule_set: &crate::datalog_rules::DatalogRuleSet,
+) -> Result<()> {
+    if reasoning.owl2rl || !(reasoning.rdfs || reasoning.owl2ql) {
+        return Ok(());
+    }
+    let Some((rule, construct)) = rule_set.non_monotone_rules().first().copied() else {
+        return Ok(());
+    };
+    let mode = if reasoning.owl2ql { "owl2ql" } else { "rdfs" };
+    Err(crate::error::QueryError::InvalidQuery(format!(
+        "datalog rule {rule} uses {construct}, but {mode} reasoning is on without owl2rl. \
+         {mode} widens the query's patterns but not rule bodies, so the rule would read an \
+         entailed fact as absent and contradict the query's answer. Add \"owl2rl\" to the \
+         reasoning modes, which materializes those entailments for rules and query alike \
+         ({mode} may come from the ledger's f:reasoningDefaults)"
+    )))
+}
+
 /// Compute derived facts from OWL2-RL reasoning and/or user-defined datalog rules.
 ///
 /// - OWL2-RL materializes ontology entailments (cached by `reason_owl2rl`).
@@ -287,10 +312,15 @@ pub async fn compute_derived_facts(
     // Datalog: load the rule set first so its content can key the cache.
     let (rule_set, datalog_key) = if reasoning.datalog {
         let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
+        // Before the cache: its key leaves out rdfs and owl2ql.
+        refuse_non_monotone_rules_under_rewrites(reasoning, &rule_set)?;
         let key = overlay.content_version().map(|overlay_version| {
             let mut h = DefaultHasher::new();
-            "datalog-v2".hash(&mut h);
+            "datalog-v3".hash(&mut h);
             budget.config_hash().hash(&mut h);
+            // A defaulted evaluation time is the commit time at `to_t`, which
+            // the key already pins; a requested one is part of the key.
+            reasoning.evaluation_time.hash(&mut h);
             reasoning.owl2rl.hash(&mut h);
             g_id.hash(&mut h);
             rules_source_g_id.hash(&mut h);
@@ -363,6 +393,30 @@ pub async fn compute_derived_facts(
                 }
                 diagnostics = Some(result.diagnostics.clone());
 
+                // Datalog reads the OWL closure as a finished input. A rule
+                // that negates or counts over it would treat entailments the
+                // cap cut off as absent and derive conclusions that are
+                // false, not merely missing.
+                if result.diagnostics.capped {
+                    if let Some((rule, construct)) = rule_set
+                        .as_ref()
+                        .and_then(|rules| rules.non_monotone_rules().first().copied())
+                    {
+                        return Err(crate::error::QueryError::ResourceLimit(format!(
+                            "OWL 2 RL materialization hit its budget ({}) before datalog rule \
+                             {rule}, which uses {construct}, could read a complete closure. \
+                             Raise the budget via f:reasoningMaxFacts / f:reasoningMaxSeconds / \
+                             f:reasoningMaxMemoryMb (ledger config) or \"reasoningBudget\" \
+                             (query)",
+                            result
+                                .diagnostics
+                                .capped_reason
+                                .as_deref()
+                                .unwrap_or("budget")
+                        )));
+                    }
+                }
+
                 // Without datalog there is nothing to combine: hand the
                 // prebuilt (cached, pre-sorted) overlay straight to
                 // execution instead of re-collecting and re-sorting its
@@ -392,6 +446,18 @@ pub async fn compute_derived_facts(
                 owl_overlay = Some(result.overlay.clone());
             }
             Err(e) => {
+                // A positive program over a missing closure only derives
+                // less; one that negates or counts would read the missing
+                // entailments as absent.
+                if let Some((rule, construct)) = rule_set
+                    .as_ref()
+                    .and_then(|rules| rules.non_monotone_rules().first().copied())
+                {
+                    return Err(crate::error::QueryError::Internal(format!(
+                        "OWL 2 RL materialization failed ({e}), and datalog rule {rule} uses \
+                         {construct}, which needs a complete closure"
+                    )));
+                }
                 tracing::warn!(error = %e, "OWL2-RL reasoning failed, continuing without OWL derived facts");
                 // The combined entry is keyed as owl2rl+datalog. Caching a
                 // datalog-only overlay under it would serve every later
@@ -413,7 +479,10 @@ pub async fn compute_derived_facts(
             "executing user-defined datalog rules"
         );
         const MAX_DATALOG_ITERATIONS: usize = 100;
-        let env = RuleExecutionEnv { binary_store };
+        let env = RuleExecutionEnv {
+            binary_store,
+            evaluation_time: reasoning.evaluation_time.as_ref(),
+        };
 
         // If OWL2-RL produced derived facts, run the rules over base + OWL
         // entailments so datalog can chain off them.
@@ -470,6 +539,9 @@ pub async fn compute_derived_facts(
                     }
                     fired
                 },
+                capped_rules: dl_diag.capped_rules,
+                pending_rules: dl_diag.pending_rules,
+                evaluation_time: dl_diag.evaluation_time,
             },
         });
         all_flakes.extend(datalog_result.derived_flakes);
@@ -479,7 +551,13 @@ pub async fn compute_derived_facts(
     // cache it so the next identical query is served from the LRU.
     let mut builder = DerivedFactsBuilder::with_capacity(all_flakes.len());
     builder.extend(all_flakes);
-    let derived_overlay = Arc::new(builder.build(same_as, overlay.epoch()));
+    // A rule can derive into a named graph; everything else belongs to the
+    // graph the reasoning ran against.
+    let derived_overlay = Arc::new(builder.build_routed(
+        same_as,
+        overlay.epoch(),
+        crate::datalog_rules::derived_fact_graph(snapshot, g_id),
+    ));
     // A time cap depends on machine load — a GC pause, a noisy neighbour, a
     // cold cache — not on the inputs, so the same query could be served a
     // different closure depending on what else the box was doing when it first

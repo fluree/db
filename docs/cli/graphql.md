@@ -83,7 +83,7 @@ nothing GraphQL-specific to write:
 | SHACL | GraphQL |
 |-------|---------|
 | `sh:maxCount 1` | a single value instead of a list |
-| `sh:minCount ≥ 1` | `!` |
+| `sh:minCount ≥ 1` | `!`, where the ledger config enables SHACL (elsewhere nothing enforces it, so the field stays nullable) |
 | `sh:datatype` | the scalar |
 | `sh:class` / `sh:node` | the object type (`Node` if that class is not exposed) |
 | `sh:in` | an `enum`, when every member yields a usable name |
@@ -128,9 +128,9 @@ cannot justify, and guessing at them would put words in your mouth. It is also
 lossy in one direction: several XSD types map to `String`, so a `rdf:langString`
 property comes back as `xsd:string`.
 
-Nothing is written. **Shapes activate SHACL validation for their class**, so
-applying them is a decision to make deliberately, after reading what you are
-about to apply.
+Nothing is written. **Shapes drive SHACL validation for their class** once the
+ledger config enables SHACL, so applying them is a decision to make
+deliberately, after reading what you are about to apply.
 
 ### What the derived schema does and does not claim
 
@@ -296,10 +296,10 @@ mutation {
 - A reference is written as the target's `id`. Creating one as a side effect
   would write an object you never named.
 
-Every mutation is an ordinary Fluree transaction, so SHACL validation and policy
-apply unchanged; a rejected write comes back as a GraphQL error having written
-nothing. Mutations run serially, so a later field in the same document sees an
-earlier one's write.
+Every mutation is an ordinary Fluree transaction, so policy applies, and SHACL
+validation applies where the ledger config enables SHACL; a rejected write
+comes back as a GraphQL error having written nothing. Mutations run serially,
+so a later field in the same document sees an earlier one's write.
 
 ## Not yet supported
 

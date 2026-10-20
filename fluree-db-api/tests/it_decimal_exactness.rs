@@ -1580,6 +1580,109 @@ async fn jsonld_update_from_named_graph_copies_that_graphs_overflow_value() {
     );
 }
 
+/// The reverse of the two above: the update's base graph is `<g>`, and its
+/// WHERE reads the default graph through a graph pattern (named in the
+/// dataset by `USING NAMED`, as SPARQL requires once `USING` is given). A
+/// value leaving that pattern decodes through the default graph's arena, not
+/// `<g>`'s.
+#[tokio::test]
+async fn insert_where_reading_the_default_graph_under_using_copies_its_overflow_value() {
+    let (fluree, ledger) =
+        indexed_per_graph_overflow_values("decimal/bigint-using-default:main").await;
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        "PREFIX ex: <http://example.org/>
+         INSERT { ex:z ex:copy ?o ; ex:from ?s }
+         USING <http://example.org/g>
+         USING NAMED <urn:default>
+         WHERE { GRAPH <urn:default> { ?s ex:v ?o } }",
+    )
+    .await
+    .ledger;
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o WHERE { ex:z ex:copy ?o ; ex:from ?s }",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "s"), vec!["http://example.org/a"]);
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_INT],
+        "GRAPH <urn:default> must decode ?o through the default graph's arena: {json}"
+    );
+    assert_eq!(binding_datatypes(&json, "o"), vec![XSD_INTEGER]);
+}
+
+/// The JSON-LD twin: an update scoped to `<g>` whose where node reads the
+/// default graph (`"@graph": "default"`) writes the default graph's value.
+#[tokio::test]
+async fn jsonld_update_in_a_named_graph_reading_the_default_graph_copies_its_overflow_value() {
+    let (fluree, ledger) =
+        indexed_per_graph_overflow_values("decimal/bigint-jsonld-graph-default:main").await;
+    let update = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "graph": "http://example.org/g",
+        "where": {"@id": "?s", "@graph": "default", "ex:v": "?o"},
+        "insert": {"@id": "ex:z", "ex:copy": "?o", "ex:from": {"@id": "?s"}}
+    });
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("JSON-LD update")
+        .ledger;
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o WHERE { GRAPH <http://example.org/g> { ex:z ex:copy ?o ; ex:from ?s } }",
+    )
+    .await;
+    assert_eq!(binding_values(&json, "s"), vec!["http://example.org/a"]);
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_INT],
+        "a where node in the default graph must decode ?o through its arena: {json}"
+    );
+}
+
+/// An update whose `from` names the default graph and `<g>` reads both;
+/// each copied value decodes through the arena of the graph it came from.
+#[tokio::test]
+async fn jsonld_update_from_the_default_graph_and_a_named_graph_copies_each_overflow_value() {
+    let (fluree, ledger) =
+        indexed_per_graph_overflow_values("decimal/bigint-jsonld-from-both:main").await;
+    let update = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ["default", "http://example.org/g"],
+        "where": {"@id": "?s", "ex:v": "?o"},
+        "insert": {"@id": "?s", "ex:copy": "?o"}
+    });
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("JSON-LD update")
+        .ledger;
+    let json = sparql_results(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o WHERE { ?s ex:copy ?o } ORDER BY ?s",
+    )
+    .await;
+    assert_eq!(
+        binding_values(&json, "s"),
+        vec!["http://example.org/a", "http://example.org/b"]
+    );
+    assert_eq!(
+        binding_values(&json, "o"),
+        vec![OVERFLOW_INT, OVERFLOW_DEC],
+        "each value must decode through its own graph's arena: {json}"
+    );
+}
+
 #[tokio::test]
 async fn jsonld_indexed_overflow_integer_datatype_and_distinct() {
     let (fluree, ledger) = indexed_overflow_numerics("decimal/bigint-jsonld:main").await;

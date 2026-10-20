@@ -24,23 +24,31 @@ use fluree_db_core::clock::Instant;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::edge::id_datatype_sid;
 use fluree_db_core::flake::FlakeMeta;
+use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+use fluree_db_core::temporal::DateTime;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{
-    Flake, GraphDbRef, GraphId, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid,
+    range_with_overlay, Flake, GraphDbRef, GraphId, IndexType, LedgerSnapshot, QueryCancellation,
+    RangeMatch, RangeOptions, RangeTest, Sid, TXN_META_GRAPH_ID,
 };
 use fluree_db_reasoner::{
     approx_flake_bytes, DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, ReasoningBudget,
     ReasoningDiagnostics,
 };
-use std::collections::HashSet;
+use fluree_vocab::namespaces::FLUREE_DB;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 /// Execution resources rule bodies should use — the same binary index store
-/// the enclosing query plans against, so rule bodies take the indexed lanes.
+/// the enclosing query plans against, so rule bodies take the indexed lanes —
+/// and the evaluation time requested for the run.
 #[derive(Clone, Copy, Default)]
 pub struct RuleExecutionEnv<'a> {
     pub binary_store: Option<&'a Arc<BinaryIndexStore>>,
+    /// What `NOW()` and `TODAY()` return in rule bodies. `None` uses the
+    /// commit time of the snapshot the rules run against.
+    pub evaluation_time: Option<&'a DateTime>,
 }
 
 /// Execute the stored rules of a graph with an unlimited budget.
@@ -94,12 +102,14 @@ pub async fn execute_datalog_rules_with_query_rules(
     run_fixpoint(db, &rule_set, max_iterations, budget, env).await
 }
 
-/// Dedup key: RDF term identity plus datatype and metadata (language tag,
-/// list index), so `"chat"@fr` and `"chat"@en` stay distinct facts.
-type FactKey = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
+/// Dedup key: the graph, RDF term identity, and datatype and metadata
+/// (language tag, list index), so `"chat"@fr` and `"chat"@en` stay distinct
+/// facts, as do one triple in two graphs.
+type FactKey = (Option<Sid>, Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
 
 fn fact_key(flake: &Flake) -> FactKey {
     (
+        flake.g.clone(),
         flake.s.clone(),
         flake.p.clone(),
         flake.o.clone(),
@@ -174,12 +184,15 @@ pub async fn run_fixpoint(
 /// closure finishes in its first pass. `max_iterations` bounds
 /// the passes of each stage. A rule's heads are instantiated as its body's
 /// rows arrive. The fact and memory budgets are checked before every new
-/// fact is kept, so a pass cannot overshoot them; the deadline is checked
-/// before each rule and as the rows arrive. Either stops the body, apart
-/// from work an operator does before returning its first row (a sort, a
-/// grouping, a property path with both ends free). A rule that finishes
-/// deriving has derived everything it can, so a run whose last rule
-/// completes after the deadline still reports a completed fixpoint.
+/// fact is kept, so a pass cannot overshoot them, and stop the body; work an
+/// operator does before returning its first row (a sort, a grouping, a
+/// property path with both ends free) is not counted. The deadline is
+/// checked before each rule, at the running body's checkpoints, and as its
+/// rows arrive. A rule that finishes deriving has derived everything it can,
+/// so a run whose last rule completes after the deadline still reports a
+/// completed fixpoint. When a rule calls `NOW()` or `TODAY()`, every body
+/// evaluates them at one time: `env.evaluation_time`, else the commit time of
+/// the snapshot at `db.t`.
 pub async fn run_fixpoint_with_schedule(
     db: GraphDbRef<'_>,
     rule_set: &DatalogRuleSet,
@@ -198,6 +211,18 @@ pub async fn run_fixpoint_with_schedule(
     }
 
     let dependencies = rule_set.dependencies();
+    if let Some(cycle) = dependencies.unstratified(rule_set, |sid| db.snapshot.decode_sid(sid)) {
+        return Err(QueryError::InvalidQuery(cycle));
+    }
+    if schedule == RuleSchedule::WholeProgram {
+        if let Some((rule, construct)) = rule_set.non_monotone_rules().first() {
+            return Err(QueryError::InvalidQuery(format!(
+                "datalog rule {rule} uses {construct}, which the whole-program schedule \
+                 cannot evaluate: it runs every rule from the first round, before what the \
+                 rule reads is complete"
+            )));
+        }
+    }
     let whole_program = RuleComponent {
         rules: (0..rule_set.len()).collect(),
         recursive: true,
@@ -226,13 +251,24 @@ pub async fn run_fixpoint_with_schedule(
         ),
     };
 
+    let head_graphs = HeadGraphs::resolve(rule_set, db)?;
+    let evaluation_time = if rule_set.reads_clock() {
+        Some(resolve_evaluation_time(db, env.evaluation_time).await?)
+    } else {
+        None
+    };
+    let start = Instant::now();
+
     // Derived facts carry the query's `t` so the overlay's `t <= to_t` filter
     // keeps them visible (same convention as OWL2-RL).
     let mut state = Derivation {
         snapshot: db.snapshot,
         derived_t: db.t,
         budget,
-        start: Instant::now(),
+        start,
+        deadline: start.checked_add(budget.max_duration),
+        evaluation_time,
+        head_graphs: &head_graphs,
         derived: Vec::new(),
         seen: HashSet::new(),
         bytes: 0,
@@ -242,9 +278,19 @@ pub async fn run_fixpoint_with_schedule(
         body_rows: 0,
     };
     let dict_novelty = ExecutionContext::extract_dict_novelty(db.snapshot);
+    let plan = RunPlan {
+        rule_set,
+        reevaluations: &reevaluations,
+        closures: &closures,
+        env,
+        dict_novelty,
+    };
     let mut derived_overlay: Arc<DerivedFactsOverlay> = Arc::new(DerivedFactsOverlay::empty());
     let mut passes = 0usize;
     let mut capped: Option<&'static str> = None;
+    // Where a cap fired: the groups it cut short, and the stage they were in.
+    let mut cut_short: Vec<&RuleComponent> = Vec::new();
+    let mut capped_stage = 0usize;
 
     'stages: for (stage_index, stage) in stages.iter().enumerate() {
         let is_last_stage = stage_index + 1 == stages.len();
@@ -255,8 +301,10 @@ pub async fn run_fixpoint_with_schedule(
         let mut stage_passes = 0usize;
 
         while !active.is_empty() {
+            capped_stage = stage_index;
             if let Some(reason) = state.over_budget() {
                 capped = Some(reason);
+                cut_short = active.iter().map(|g| g.group).collect();
                 break 'stages;
             }
             if stage_passes >= max_iterations {
@@ -271,6 +319,7 @@ pub async fn run_fixpoint_with_schedule(
                      rule group converged; results may be missing derived facts"
                 );
                 capped = Some("iterations");
+                cut_short = active.iter().map(|g| g.group).collect();
                 break 'stages;
             }
             stage_passes += 1;
@@ -287,64 +336,22 @@ pub async fn run_fixpoint_with_schedule(
 
             let mut new_this_pass = 0usize;
             let mut still_deriving: Vec<ActiveGroup> = Vec::new();
-            for ActiveGroup { group, delta } in active {
+            let mut queue = active.into_iter();
+            while let Some(ActiveGroup { group, delta }) = queue.next() {
                 let first_new = state.derived.len();
-                let mut closed = false;
-                for &index in &group.rules {
-                    let rule = &rule_set.rules[index];
-                    if let (None, Some(closure)) = (&delta, &closures[index]) {
-                        if let Some(reason) = state.over_budget() {
-                            capped = Some(reason);
-                            break 'stages;
-                        }
-                        match state
-                            .apply_closure(pass_db, rule, closure, env, dict_novelty.clone())
-                            .await?
-                        {
-                            Some(RuleOutcome::Finished) => {
-                                closed = true;
-                                continue;
-                            }
-                            Some(RuleOutcome::Capped(reason)) => {
-                                capped = Some(reason);
-                                break 'stages;
-                            }
-                            None => {}
-                        }
+                let closed = match state.run_group(pass_db, &plan, group, delta).await? {
+                    GroupOutcome::Capped(reason) => {
+                        capped = Some(reason);
+                        cut_short = still_deriving
+                            .iter()
+                            .map(|g| g.group)
+                            .chain(std::iter::once(group))
+                            .chain(queue.map(|g| g.group))
+                            .collect();
+                        break 'stages;
                     }
-                    // A group's first pass runs every whole body; nothing it
-                    // reads has been seen before.
-                    let seeds: Vec<Option<(&DeltaAtom, Range<usize>)>> =
-                        match (&delta, &reevaluations[index]) {
-                            (Some(delta), Reevaluation::Delta(atoms)) => atoms
-                                .iter()
-                                .map(|atom| Some((atom, delta.clone())))
-                                .collect(),
-                            _ => vec![None],
-                        };
-                    for seed in seeds {
-                        if let Some(reason) = state.over_budget() {
-                            capped = Some(reason);
-                            break 'stages;
-                        }
-                        let body = match seed {
-                            None => rule.body.query.clone(),
-                            Some((atom, delta)) => {
-                                match atom.seeded(&rule.body.query, &state.derived[delta]) {
-                                    Some(body) => body,
-                                    None => continue,
-                                }
-                            }
-                        };
-                        if let RuleOutcome::Capped(reason) = state
-                            .apply(pass_db, rule, body, env, dict_novelty.clone())
-                            .await?
-                        {
-                            capped = Some(reason);
-                            break 'stages;
-                        }
-                    }
-                }
+                    GroupOutcome::Finished { closed } => closed,
+                };
                 let derived = first_new..state.derived.len();
                 new_this_pass += derived.len();
                 if group.recursive && !closed && !derived.is_empty() {
@@ -367,8 +374,11 @@ pub async fn run_fixpoint_with_schedule(
             if new_this_pass > 0 && more_passes_follow {
                 let mut builder = DerivedFactsBuilder::with_capacity(state.derived.len());
                 builder.extend(state.derived.iter().cloned());
-                derived_overlay =
-                    Arc::new(builder.build(FrozenSameAs::empty(), db.overlay.epoch()));
+                derived_overlay = Arc::new(builder.build_routed(
+                    FrozenSameAs::empty(),
+                    db.overlay.epoch(),
+                    |flake| head_graphs.route(flake, db.g_id),
+                ));
             }
             active = still_deriving;
         }
@@ -377,8 +387,43 @@ pub async fn run_fixpoint_with_schedule(
     let facts = state.derived.len();
     let elapsed = state.start.elapsed();
     let mut diagnostics = state.diagnostics;
+    diagnostics.evaluation_time = state.evaluation_time.as_ref().map(DateTime::canonical);
     match capped {
-        Some(reason) => diagnostics.mark_capped(reason, passes, facts, elapsed),
+        Some(reason) => {
+            let pending: Vec<&RuleComponent> = stages
+                .iter()
+                .skip(capped_stage + 1)
+                .flatten()
+                .copied()
+                .collect();
+            let unfinished = cut_short
+                .iter()
+                .chain(&pending)
+                .flat_map(|g| g.rules.iter().map(|&i| &rule_set.rules[i]));
+            if let Some((rule, construct)) = unfinished.into_iter().find_map(|r| {
+                r.footprint
+                    .non_monotone_construct()
+                    .map(|construct| (r, construct))
+            }) {
+                return Err(QueryError::ResourceLimit(format!(
+                    "the reasoning budget ({reason}) ran out before datalog rule {} could \
+                     finish. It uses {construct}, so its conclusions are only meaningful over \
+                     complete inputs, and the query fails rather than answer from a partial \
+                     run. Raise the budget via f:reasoningMaxFacts / f:reasoningMaxSeconds / \
+                     f:reasoningMaxMemoryMb (ledger config) or \"reasoningBudget\" (query)",
+                    rule.name
+                )));
+            }
+            diagnostics.mark_capped(reason, passes, facts, elapsed);
+            let names = |groups: &[&RuleComponent]| -> Vec<String> {
+                groups
+                    .iter()
+                    .flat_map(|g| g.rules.iter().map(|&i| rule_set.rules[i].name.clone()))
+                    .collect()
+            };
+            diagnostics.capped_rules = names(&cut_short);
+            diagnostics.pending_rules = names(&pending);
+        }
         None => diagnostics.mark_completed(passes, facts, elapsed),
     }
     tracing::debug!(
@@ -395,6 +440,146 @@ pub async fn run_fixpoint_with_schedule(
         rule_body_runs: state.rule_body_runs,
         body_rows: state.body_rows,
     })
+}
+
+/// The evaluation time for a run whose rules read the clock: the requested
+/// one, else the commit time of the snapshot at `db.t`. A snapshot with no
+/// commit at that `t` (an empty ledger, a staged view) has no time of its
+/// own, and the wall clock would make the result depend on when it ran.
+async fn resolve_evaluation_time(
+    db: GraphDbRef<'_>,
+    requested: Option<&DateTime>,
+) -> Result<DateTime> {
+    if let Some(time) = requested {
+        return Ok(time.clone());
+    }
+    let commit_times = range_with_overlay(
+        db.snapshot,
+        TXN_META_GRAPH_ID,
+        db.overlay,
+        IndexType::Psot,
+        RangeTest::Eq,
+        RangeMatch::predicate(Sid::new(FLUREE_DB, fluree_vocab::db::TIME)),
+        RangeOptions::new().with_to_t(db.t),
+    )
+    .await
+    .map_err(|e| QueryError::Internal(format!("failed to read commit times: {e}")))?;
+    commit_times
+        .iter()
+        .find_map(|f| match f.o {
+            FlakeValue::Long(millis) if f.op && f.t == db.t => millis
+                .checked_mul(1000)
+                .and_then(DateTime::from_epoch_micros),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            QueryError::InvalidQuery(format!(
+                "datalog rules call NOW() or TODAY(), but the snapshot at t={} has no commit \
+                 time to evaluate them at (an empty ledger or uncommitted changes). Set the \
+                 evaluation time with \"reasoningTime\" (or # PRAGMA reasoning-time:)",
+                db.t
+            ))
+        })
+}
+
+/// The named graphs rule heads derive into: the SID a derived fact carries
+/// for each (none for the graph the rules run against), and the graph its
+/// facts are routed to.
+#[derive(Default)]
+struct HeadGraphs {
+    sids: HashMap<Arc<str>, Option<Sid>>,
+    ids: HashMap<Sid, GraphId>,
+}
+
+impl HeadGraphs {
+    /// Resolve every head graph against the ledger. A head may derive only
+    /// into a user named graph that exists: the overlay can serve facts only
+    /// for a graph the ledger can address, and the system graphs hold
+    /// metadata rather than data. A head naming the graph the rules run
+    /// against derives into it as a head with no graph does, so a stored
+    /// rule serves queries over that graph and over the default graph alike.
+    fn resolve(rule_set: &DatalogRuleSet, db: GraphDbRef<'_>) -> Result<Self> {
+        let mut graphs = Self::default();
+        for rule in rule_set.iter_in_order() {
+            for iri in rule.heads.iter().filter_map(|h| h.graph.as_ref()) {
+                if graphs.sids.contains_key(iri) {
+                    continue;
+                }
+                let refuse = |why: &str| {
+                    QueryError::InvalidQuery(format!(
+                        "datalog rule {} derives into graph <{iri}>, {why}",
+                        rule.name
+                    ))
+                };
+                let g_id = db
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .ok_or_else(|| {
+                        refuse(
+                            "which this ledger does not have. A rule derives only into an \
+                         existing named graph; transact data into the graph to create it",
+                        )
+                    })?;
+                if g_id < FIRST_USER_GRAPH_ID {
+                    return Err(refuse("a system graph, which rules cannot write"));
+                }
+                if g_id == db.g_id {
+                    graphs.sids.insert(iri.clone(), None);
+                    continue;
+                }
+                let sid = IriEncoder::encode_iri(db.snapshot, iri)
+                    .ok_or_else(|| refuse("whose IRI cannot be encoded"))?;
+                graphs.ids.insert(sid.clone(), g_id);
+                graphs.sids.insert(iri.clone(), Some(sid));
+            }
+        }
+        Ok(graphs)
+    }
+
+    /// The graph a derived fact belongs to: its head's named graph, else
+    /// the graph the rules run against.
+    fn route(&self, flake: &Flake, default: GraphId) -> GraphId {
+        flake
+            .g
+            .as_ref()
+            .and_then(|g| self.ids.get(g).copied())
+            .unwrap_or(default)
+    }
+}
+
+/// The graph a fact derived over `snapshot` belongs to: the named graph its
+/// `g` names, else `default`, the graph the rules ran against.
+pub fn derived_fact_graph(
+    snapshot: &LedgerSnapshot,
+    default: GraphId,
+) -> impl Fn(&Flake) -> GraphId + '_ {
+    move |flake| {
+        flake
+            .g
+            .as_ref()
+            .and_then(|g| snapshot.decode_sid(g))
+            .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+            .unwrap_or(default)
+    }
+}
+
+/// What every group of a run shares.
+struct RunPlan<'r> {
+    rule_set: &'r DatalogRuleSet,
+    reevaluations: &'r [Reevaluation],
+    closures: &'r [Option<Closure>],
+    env: RuleExecutionEnv<'r>,
+    dict_novelty: Option<Arc<DictNovelty>>,
+}
+
+enum GroupOutcome {
+    /// Every rule ran. `closed` when the group's recursion was evaluated in
+    /// full, as a closure path, and needs no further pass.
+    Finished {
+        closed: bool,
+    },
+    Capped(&'static str),
 }
 
 /// A group still iterating in the current stage.
@@ -512,6 +697,10 @@ struct Derivation<'a> {
     derived_t: i64,
     budget: &'a ReasoningBudget,
     start: Instant,
+    /// `start` plus the time budget; `None` when the budget is unbounded.
+    deadline: Option<Instant>,
+    evaluation_time: Option<DateTime>,
+    head_graphs: &'a HeadGraphs,
     derived: Vec<Flake>,
     seen: HashSet<FactKey>,
     bytes: usize,
@@ -524,6 +713,64 @@ struct Derivation<'a> {
 }
 
 impl Derivation<'_> {
+    /// Run one pass of `group`: each rule's whole body on the group's first
+    /// pass (or its closure path), its seeded bodies after that.
+    async fn run_group(
+        &mut self,
+        db: GraphDbRef<'_>,
+        plan: &RunPlan<'_>,
+        group: &RuleComponent,
+        delta: Option<Range<usize>>,
+    ) -> Result<GroupOutcome> {
+        let mut closed = false;
+        for &index in &group.rules {
+            let rule = &plan.rule_set.rules[index];
+            if let (None, Some(closure)) = (&delta, &plan.closures[index]) {
+                if let Some(reason) = self.over_budget() {
+                    return Ok(GroupOutcome::Capped(reason));
+                }
+                match self
+                    .apply_closure(db, rule, closure, plan.env, plan.dict_novelty.clone())
+                    .await?
+                {
+                    Some(RuleOutcome::Finished) => {
+                        closed = true;
+                        continue;
+                    }
+                    Some(RuleOutcome::Capped(reason)) => return Ok(GroupOutcome::Capped(reason)),
+                    None => {}
+                }
+            }
+            // A group's first pass runs every whole body; nothing it reads
+            // has been seen before.
+            let seeds: Vec<Option<&DeltaAtom>> = match (&delta, &plan.reevaluations[index]) {
+                (Some(_), Reevaluation::Delta(atoms)) => atoms.iter().map(Some).collect(),
+                _ => vec![None],
+            };
+            for seed in seeds {
+                if let Some(reason) = self.over_budget() {
+                    return Ok(GroupOutcome::Capped(reason));
+                }
+                let body = match (seed, &delta) {
+                    (Some(atom), Some(delta)) => {
+                        match atom.seeded(&rule.body.query, &self.derived[delta.clone()]) {
+                            Some(body) => body,
+                            None => continue,
+                        }
+                    }
+                    _ => rule.body.query.clone(),
+                };
+                if let RuleOutcome::Capped(reason) = self
+                    .apply(db, rule, body, plan.env, plan.dict_novelty.clone())
+                    .await?
+                {
+                    return Ok(GroupOutcome::Capped(reason));
+                }
+            }
+        }
+        Ok(GroupOutcome::Finished { closed })
+    }
+
     fn over_budget(&self) -> Option<&'static str> {
         over_budget(self.budget, &self.start, self.derived.len(), self.bytes)
     }
@@ -611,6 +858,16 @@ impl Derivation<'_> {
         path_pair_limit: Option<usize>,
     ) -> Result<RuleOutcome> {
         self.rule_body_runs += 1;
+        let config = ContextConfig {
+            dict_novelty,
+            path_pair_limit,
+            cancellation: Some(self.deadline.map_or_else(
+                QueryCancellation::disabled,
+                QueryCancellation::with_deadline,
+            )),
+            evaluation_time: self.evaluation_time.clone(),
+            ..Default::default()
+        };
         let mut heads = HeadSink {
             state: self,
             rule,
@@ -618,16 +875,7 @@ impl Derivation<'_> {
             instantiated: 0,
             capped: None,
         };
-        let run = run_body(
-            db,
-            rule,
-            body,
-            env,
-            dict_novelty,
-            path_pair_limit,
-            &mut heads,
-        )
-        .await;
+        let run = run_body(db, rule, body, env, config, &mut heads).await;
         let HeadSink {
             matched_rows,
             instantiated,
@@ -637,9 +885,15 @@ impl Derivation<'_> {
         if let Some(reason) = capped {
             return Ok(RuleOutcome::Capped(reason));
         }
-        run?;
-        // A rule that ran past the deadline must not let a final pass report
-        // a completed fixpoint.
+        match run {
+            Ok(()) => {}
+            // The deadline passed while the body ran; it stopped at its next
+            // checkpoint instead of running to completion.
+            Err(QueryError::Cancelled { .. }) => return Ok(RuleOutcome::Capped("time")),
+            Err(e) => return Err(e),
+        }
+        // A body can finish between checkpoints after the deadline; it must
+        // not let a final pass report a completed fixpoint.
         if matched_rows == 0 && self.past_deadline() {
             return Ok(RuleOutcome::Capped("time"));
         }
@@ -691,10 +945,14 @@ impl HeadSink<'_, '_> {
                 return Some("time");
             }
             for head in &self.rule.heads {
-                let Some(flake) = instantiate(head, batch, row, state.snapshot, state.derived_t)
+                let Some(mut flake) =
+                    instantiate(head, batch, row, state.snapshot, state.derived_t)
                 else {
                     continue;
                 };
+                if let Some(graph) = &head.graph {
+                    flake.g = state.head_graphs.sids.get(graph).cloned().flatten();
+                }
                 self.instantiated += 1;
                 if !state.seen.insert(fact_key(&flake)) {
                     continue;
@@ -733,14 +991,14 @@ impl BatchSink for HeadSink<'_, '_> {
     }
 }
 
-/// Run one rule body through the executor, handing its rows to `sink`.
-async fn run_body(
-    db: GraphDbRef<'_>,
+/// Run one rule body through the executor under `config`, handing its rows
+/// to `sink`.
+async fn run_body<'a>(
+    db: GraphDbRef<'a>,
     rule: &DatalogRule,
     body: Query,
     env: RuleExecutionEnv<'_>,
-    dict_novelty: Option<Arc<DictNovelty>>,
-    path_pair_limit: Option<usize>,
+    config: ContextConfig<'a, '_>,
     sink: &mut impl BatchSink,
 ) -> Result<()> {
     // Reasoning is off for the body itself: derived facts arrive through the
@@ -759,9 +1017,7 @@ async fn run_body(
     let config = ContextConfig {
         binary_store: env.binary_store.cloned(),
         binary_g_id: db.g_id,
-        dict_novelty,
-        path_pair_limit,
-        ..Default::default()
+        ..config
     };
     execute_prepared_streaming(db, &rule.body.vars, prepared, config, sink).await
 }

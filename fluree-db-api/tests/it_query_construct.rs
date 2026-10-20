@@ -1735,6 +1735,98 @@ mod annotations_and_graphs {
         assert_eq!(nt.matches(REIFIES).count(), 2, "{nt}");
     }
 
+    /// A template node's own `@graph` names the graph its triples go to, as
+    /// `["graph", <name>, …]` does and as SPARQL's `GRAPH <g> { … }` in a
+    /// template does. The node used to be dropped from the template, so the
+    /// result was empty.
+    #[tokio::test]
+    async fn jsonld_node_level_graph_in_a_template_names_the_output_graph() {
+        let (fluree, ledger) = seed_people().await;
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                "@prefix ex: <http://example.org/> .\n\
+                 ex:a ex:p \"one\" .\n\
+                 ex:b ex:p \"two\" .\n",
+            )
+            .execute()
+            .await
+            .expect("seed")
+            .ledger;
+        let sparql_result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { GRAPH ex:g2 { ?s ex:label ?o } } WHERE { ?s ex:p ?o }",
+        )
+        .await;
+        let sparql_nq = render(&sparql_result, &ledger, FormatterConfig::nquads());
+        let expected = sorted_lines(&sparql_nq);
+        assert_eq!(expected.len(), 2, "{expected:?}");
+        for template in [
+            json!([{"@id": "?s", "@graph": "ex:g2", "ex:label": "?o"}]),
+            json!([["graph", "ex:g2", {"@id": "?s", "ex:label": "?o"}]]),
+        ] {
+            let jsonld_result = support::query_jsonld(
+                &fluree,
+                &ledger,
+                &json!({
+                    "@context": context_people(),
+                    "where": [{"@id": "?s", "ex:p": "?o"}],
+                    "construct": template
+                }),
+            )
+            .await
+            .expect("JSON-LD construct");
+            let nq = render(&jsonld_result, &ledger, FormatterConfig::nquads());
+            assert_eq!(sorted_lines(&nq), expected, "{template}");
+        }
+    }
+
+    /// `"construct": true` uses the `where` clause as the template, a node's
+    /// own `@graph` included: the node's triples come out in that graph, as
+    /// the explicit template writes them.
+    #[tokio::test]
+    async fn jsonld_construct_shorthand_keeps_a_where_nodes_graph() {
+        let (fluree, ledger) = seed_people().await;
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(
+                "@prefix ex: <http://example.org/> .\n\
+                 ex:a ex:p \"one\" .\n\
+                 GRAPH ex:g { ex:b ex:q \"two\" . }\n",
+            )
+            .execute()
+            .await
+            .expect("seed")
+            .ledger;
+        let sparql_result = sparql(
+            &fluree,
+            &ledger,
+            "CONSTRUCT { ?s ex:p ?o . GRAPH ex:g { ?t ex:q ?v } } \
+             WHERE { ?s ex:p ?o . GRAPH ex:g { ?t ex:q ?v } }",
+        )
+        .await;
+        let sparql_nq = render(&sparql_result, &ledger, FormatterConfig::nquads());
+        let expected = sorted_lines(&sparql_nq);
+        assert_eq!(expected.len(), 2, "{expected:?}");
+        let jsonld_result = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": context_people(),
+                "where": [
+                    {"@id": "?s", "ex:p": "?o"},
+                    {"@id": "?t", "@graph": "ex:g", "ex:q": "?v"}
+                ],
+                "construct": true
+            }),
+        )
+        .await
+        .expect("JSON-LD construct");
+        let nq = render(&jsonld_result, &ledger, FormatterConfig::nquads());
+        assert_eq!(sorted_lines(&nq), expected);
+    }
+
     /// The JSON-LD twin of `GRAPH ?g` in a template.
     #[tokio::test]
     async fn jsonld_graph_variable_copies_named_graphs() {

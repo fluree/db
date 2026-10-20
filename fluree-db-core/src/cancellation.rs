@@ -3,6 +3,7 @@
 //! This module is runtime-agnostic: it uses only atomics so embedders can wire
 //! cancellation from any HTTP framework, task runtime, or resource monitor.
 
+use crate::clock::Instant;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -77,6 +78,9 @@ struct QueryCancellationInner {
     /// engine reads it at a checkpoint and decides. Lets an embedder pin a budget onto
     /// the same handle that carries cancellation.
     memory_limit: AtomicUsize,
+    /// When set, the handle reports [`QueryCancellationReason::Timeout`] once
+    /// this instant passes, without anyone having to signal it.
+    deadline: Option<Instant>,
 }
 
 impl Default for QueryCancellationInner {
@@ -85,6 +89,7 @@ impl Default for QueryCancellationInner {
             reason: AtomicU8::new(NOT_CANCELLED),
             allocated: AtomicUsize::new(0),
             memory_limit: AtomicUsize::new(NO_MEMORY_LIMIT),
+            deadline: None,
         }
     }
 }
@@ -94,7 +99,8 @@ impl Default for QueryCancellationInner {
 ///
 /// A disabled value is a single `None` pointer, so callers that do not opt in pay
 /// only a cheap branch at checkpoints. Timeout and disconnect detection are external
-/// concerns: callers decide when to signal this handle. The memory counter is pure
+/// concerns: callers decide when to signal this handle, or give it a deadline at
+/// construction ([`with_deadline`](Self::with_deadline)) that checkpoints compare. The memory counter is pure
 /// mechanism — this crate accumulates and reports bytes but never enforces a budget;
 /// the query engine's checkpoint compares the count against the ceiling.
 #[derive(Debug, Clone, Default)]
@@ -113,6 +119,17 @@ impl QueryCancellation {
     pub fn new() -> Self {
         Self {
             inner: Some(Arc::new(QueryCancellationInner::default())),
+        }
+    }
+
+    /// A handle that times out by itself once `deadline` passes, and can also
+    /// be cancelled like one from [`new`](Self::new).
+    pub fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            inner: Some(Arc::new(QueryCancellationInner {
+                deadline: Some(deadline),
+                ..QueryCancellationInner::default()
+            })),
         }
     }
 
@@ -139,7 +156,8 @@ impl QueryCancellation {
         }
     }
 
-    /// Return the cancellation reason if cancellation was externally signalled.
+    /// Return the cancellation reason if cancellation was signalled or the
+    /// handle's deadline has passed.
     #[inline]
     pub fn reason(&self) -> Option<QueryCancellationReason> {
         if let Some(inner) = &self.inner {
@@ -147,6 +165,13 @@ impl QueryCancellation {
                 QueryCancellationReason::from_code(inner.reason.load(Ordering::Relaxed))
             {
                 return Some(reason);
+            }
+            if inner
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.cancel_with(QueryCancellationReason::Timeout);
+                return self.reason();
             }
         }
         None
@@ -223,6 +248,22 @@ impl QueryCancellation {
 #[cfg(test)]
 mod tests {
     use super::{QueryCancellation, QueryCancellationReason};
+    use crate::clock::Instant;
+    use std::time::Duration;
+
+    #[test]
+    fn a_deadline_reports_timeout_once_it_passes() {
+        let expired = QueryCancellation::with_deadline(Instant::now());
+        assert_eq!(expired.reason(), Some(QueryCancellationReason::Timeout));
+
+        let pending = QueryCancellation::with_deadline(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(pending.reason(), None);
+        pending.cancel_with(QueryCancellationReason::ClientDisconnected);
+        assert_eq!(
+            pending.reason(),
+            Some(QueryCancellationReason::ClientDisconnected)
+        );
+    }
 
     #[test]
     fn disabled_never_reports_cancellation() {

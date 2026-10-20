@@ -3,8 +3,8 @@
 //! The output is deliberately weak: paths and value types, no cardinalities, no
 //! `sh:closed`, no `sh:in`. Those are the claims statistics cannot justify, and
 //! they are exactly what a person adds by editing — emitting a guess at them
-//! would put words in the author's mouth and, since Fluree enforces SHACL once
-//! shapes exist, could start rejecting writes that were previously fine.
+//! would put words in the author's mouth and, on a ledger whose config enables
+//! SHACL, could start rejecting writes that were previously fine.
 //!
 //! Nothing here transacts. The shapes are printed for the author to read, edit,
 //! and apply deliberately.
