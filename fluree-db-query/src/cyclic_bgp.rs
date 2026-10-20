@@ -468,8 +468,8 @@ fn is_arena_o_type(o_type: u16) -> bool {
 }
 
 /// An edge's rows over a default graph of several graphs: its facts, each
-/// once. A fact is `(subject, object, list index)` (AJ-66, #2109's
-/// `FactIdentity`; the predicate is the edge's), which is what the
+/// once. A fact is `(subject, object, list index)` (storage's fact identity,
+/// #2109's `FactIdentity`; the predicate is the edge's), which is what the
 /// fallback's `BatchDeduper` keeps too: only a fact two members both hold
 /// collapses, so two list items with one value stay two rows, which the join
 /// takes twice. `list_index[i]` is row `i`'s. This is the one place the

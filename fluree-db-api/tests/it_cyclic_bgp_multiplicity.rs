@@ -12,8 +12,9 @@
 //! can't pass by falling back.
 //!
 //! Over a default graph of several graphs, the union variant keeps each
-//! edge's facts (AJ-66): a fact two members both hold once, two list items
-//! with one value twice, a plain fact and a list item with one value twice.
+//! edge's facts, as a union of graphs keeps them: a fact two members both
+//! hold once, two list items with one value twice, a plain fact and a list
+//! item with one value twice.
 //! There the oracle is the general plan under the fast-path kill switch, which
 //! the union variant sits behind, and every lane run must stamp
 //! `cyclic_bgp_union` `proceed`.
