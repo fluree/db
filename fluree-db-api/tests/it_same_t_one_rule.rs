@@ -413,7 +413,14 @@ async fn a_local_commit_holding_a_same_t_pair_is_refused() {
         )
         .await
         .expect("read");
-        assert_eq!(stored.batches.iter().map(|b| b.len()).sum::<usize>(), 1);
+        assert_eq!(
+            stored
+                .batches
+                .iter()
+                .map(fluree_db_api::Batch::len)
+                .sum::<usize>(),
+            1
+        );
         let held = ledger
             .novelty
             .iter_flakes(fluree_db_core::IndexType::Spot)

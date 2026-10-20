@@ -80,14 +80,12 @@ struct Case {
 impl Case {
     fn events(&self) -> Vec<(u32, u8)> {
         let mut events = Vec::new();
-        for i in 0..self.len {
-            let t = EVENT_TS[i];
+        for (i, (&t, &op)) in EVENT_TS.iter().zip(&self.ops).take(self.len).enumerate() {
             if self.pair_at == Some(i) {
-                let first = self.ops[i];
-                events.push((t, first));
-                events.push((t, 1 - first));
+                events.push((t, op));
+                events.push((t, 1 - op));
             } else {
-                events.push((t, self.ops[i]));
+                events.push((t, op));
             }
         }
         events
