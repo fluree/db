@@ -533,6 +533,11 @@ the default graph (`urn:default`; leave the graph out instead) or a system
 graph such as the transaction metadata graph. A rule naming any other graph
 fails the query with an error naming the graph.
 
+A graph a Python job publishes is input like any other: see
+[Custom stages in Python](../guides/custom-stages-python.md) for running
+model calls and versioned decisions outside the engine and publishing their
+results into a graph your rules read.
+
 ## Explaining a derived fact
 
 The Rust API's `Fluree::explain_derived` reports why the rules concluded a
@@ -893,5 +898,6 @@ When both OWL 2 RL and Datalog are enabled:
 | Enabling reasoning in queries | [Query-time reasoning](reasoning.md) |
 | Edge annotations (claims) in rule bodies | [Edge annotations](../concepts/edge-annotations.md) |
 | Engine design and the head-annotation decision | [Rules engine design](../design/rules-engine.md) |
+| Publishing results from Python into a graph rules read | [Custom stages in Python](../guides/custom-stages-python.md) |
 | OWL & RDFS constructs | [OWL & RDFS reference](../reference/owl-rdfs-support.md) |
 | Ledger-wide config | [Setting groups](../ledger-config/setting-groups.md) |
