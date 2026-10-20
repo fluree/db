@@ -11,8 +11,15 @@
 //! rows, and every lane run must stamp `cyclic_bgp` `proceed`, so a case
 //! can't pass by falling back.
 //!
-//! Env mutation lives in ONE test fn (and this file is its own test binary)
-//! so parallel test threads can't race on process-global state.
+//! Over a default graph of several graphs, the union variant keeps each
+//! edge's facts (AJ-66): a fact two members both hold once, two list items
+//! with one value twice, a plain fact and a list item with one value twice.
+//! There the oracle is the general plan under the fast-path kill switch, which
+//! the union variant sits behind, and every lane run must stamp
+//! `cyclic_bgp_union` `proceed`.
+//!
+//! Env and switch mutation live in ONE test fn (and this file is its own test
+//! binary) so parallel test threads can't race on process-global state.
 
 #![cfg(feature = "native")]
 
@@ -81,6 +88,52 @@ fn base_edges() -> JsonValue {
     })
 }
 
+/// `urn:g1` and `urn:g2`, whose union keeps facts by identity:
+/// - triangle m → n → o: `m → n` as list items 0 and 1 in both graphs, the
+///   same two facts, so each rotation twice;
+/// - triangle u → v → w: `u → v` plain in g1 and a list item in g2, two
+///   facts with one value, so each rotation twice;
+/// - triangle x → y → z: the same plain facts in both graphs, so once.
+fn union_graphs() -> [JsonValue; 2] {
+    let twice = |id: &str| json!({"@list": [{"@id": id}, {"@id": id}]});
+    let edge = |s: &str, o: &str| json!({"@id": s, "ex:knows": {"@id": o}});
+    let xyz = [
+        edge("ex:x", "ex:y"),
+        edge("ex:y", "ex:z"),
+        edge("ex:z", "ex:x"),
+    ];
+    let mut g1 = vec![
+        json!({"@id": "ex:m", "ex:knows": twice("ex:n")}),
+        edge("ex:n", "ex:o"),
+        edge("ex:o", "ex:m"),
+        edge("ex:u", "ex:v"),
+        edge("ex:v", "ex:w"),
+        edge("ex:w", "ex:u"),
+    ];
+    g1.extend(xyz.clone());
+    let mut g2 = vec![
+        json!({"@id": "ex:m", "ex:knows": twice("ex:n")}),
+        json!({"@id": "ex:u", "ex:knows": {"@list": [{"@id": "ex:v"}]}}),
+    ];
+    g2.extend(xyz);
+    [
+        json!({"@context": {"ex": EX}, "@id": "urn:g1", "@graph": g1}),
+        json!({"@context": {"ex": EX}, "@id": "urn:g2", "@graph": g2}),
+    ]
+}
+
+/// A knows edge that closes no cycle in each of the default graph, g1 and
+/// g2: the index the novelty state writes [`union_graphs`] over, so both
+/// graphs and the predicate are in it.
+fn union_base_edges() -> [JsonValue; 3] {
+    let edge = json!([{"@id": "ex:base", "ex:knows": {"@id": "ex:base2"}}]);
+    [
+        json!({"@context": {"ex": EX}, "@graph": edge.clone()}),
+        json!({"@context": {"ex": EX}, "@id": "urn:g1", "@graph": edge.clone()}),
+        json!({"@context": {"ex": EX}, "@id": "urn:g2", "@graph": edge}),
+    ]
+}
+
 #[derive(Clone, Copy, Debug)]
 enum State {
     /// [`cycles`] indexed, no novelty.
@@ -105,6 +158,29 @@ async fn index(fluree: &Fluree, ledger_id: &str) -> LedgerHandle {
         .expect("index");
     fluree.disconnect_ledger(ledger_id).await;
     fluree.ledger_cached(ledger_id).await.expect("reload")
+}
+
+async fn union_ledger(state: State) -> (Fluree, LedgerHandle) {
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let ledger_id = "it/cyclic-multiplicity-union:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let mut handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    if matches!(state, State::Novelty) {
+        for doc in union_base_edges() {
+            insert(&fluree, &handle, &doc).await;
+        }
+        handle = index(&fluree, ledger_id).await;
+    }
+    for doc in union_graphs() {
+        insert(&fluree, &handle, &doc).await;
+    }
+    if matches!(state, State::Indexed) {
+        handle = index(&fluree, ledger_id).await;
+    }
+    (fluree, handle)
 }
 
 async fn ledger(state: State) -> (Fluree, LedgerHandle) {
@@ -308,9 +384,57 @@ async fn answer(fluree: &Fluree, handle: &LedgerHandle, case: &Case) -> Result<R
     }
 }
 
+/// The union cases: the triangle over g1 and g2, by `FROM` and as the union
+/// default graph (whose default graph adds only the novelty state's base
+/// edge, which closes no cycle).
+fn union_cases() -> Vec<Case> {
+    let want = times(&[
+        (&["m", "n", "o"], 2),
+        (&["n", "o", "m"], 2),
+        (&["o", "m", "n"], 2),
+        (&["u", "v", "w"], 2),
+        (&["v", "w", "u"], 2),
+        (&["w", "u", "v"], 2),
+        (&["x", "y", "z"], 1),
+        (&["y", "z", "x"], 1),
+        (&["z", "x", "y"], 1),
+    ]);
+    let tri = |prologue: &str, ds: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        )
+    };
+    vec![
+        Case {
+            label: "union: FROM g1 FROM g2",
+            surface: Surface::Sparql,
+            query: tri("", "FROM <urn:g1> FROM <urn:g2>"),
+            vars: &["x", "y", "z"],
+            want: want.clone(),
+        },
+        Case {
+            label: "union: the union default graph",
+            surface: Surface::Sparql,
+            query: tri("# PRAGMA union-default-graph: true\n", ""),
+            vars: &["x", "y", "z"],
+            want,
+        },
+    ]
+}
+
+/// Turns the process-wide fast-path switch back off on every exit path.
+struct FastPathsBackOn;
+impl Drop for FastPathsBackOn {
+    fn drop(&mut self) {
+        fluree_db_api::set_fast_paths_disabled(false);
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_join_keeps_the_multiplicity_of_a_pair_stored_twice() {
     std::env::remove_var("FLUREE_CYCLIC_BGP");
+    let _back_on = FastPathsBackOn;
     let mut failures: Vec<String> = Vec::new();
     for state in [State::Indexed, State::Novelty] {
         let (fluree, handle) = ledger(state).await;
@@ -332,6 +456,36 @@ async fn cyclic_join_keeps_the_multiplicity_of_a_pair_stored_twice() {
             std::env::remove_var("FLUREE_CYCLIC_BGP");
 
             for (which, got) in [("the lane", lane), ("FLUREE_CYCLIC_BGP=0", generic)] {
+                match got {
+                    Ok(rows) if rows == case.want => {}
+                    Ok(rows) => failures.push(format!(
+                        "{label}: {which}:\n    got  {rows:?}\n    want {:?}",
+                        case.want
+                    )),
+                    Err(e) => failures.push(format!("{label}: {which}: failed: {e}")),
+                }
+            }
+        }
+
+        let (fluree, handle) = union_ledger(state).await;
+        for case in union_cases() {
+            let label = format!("{state:?} / {}", case.label);
+
+            let (store, guard) = init_test_tracing();
+            let lane = answer(&fluree, &handle, &case).await;
+            drop(guard);
+            let ran = stamps(&store, "cyclic_bgp_union");
+            if ran != ["proceed"] {
+                failures.push(format!(
+                    "{label}: `cyclic_bgp_union` stamps {ran:?}, want [proceed]"
+                ));
+            }
+
+            fluree_db_api::set_fast_paths_disabled(true);
+            let generic = answer(&fluree, &handle, &case).await;
+            fluree_db_api::set_fast_paths_disabled(false);
+
+            for (which, got) in [("the lane", lane), ("the general plan", generic)] {
                 match got {
                     Ok(rows) if rows == case.want => {}
                     Ok(rows) => failures.push(format!(

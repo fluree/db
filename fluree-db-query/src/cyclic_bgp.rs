@@ -22,8 +22,9 @@ use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::plan_node::PlanChild;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_binary_index::{BinaryGraphView, ColumnProjection};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{PropertyStatData, StatsView};
@@ -466,15 +467,38 @@ fn is_arena_o_type(o_type: u16) -> bool {
     )
 }
 
-/// Sort `rows` by `(subject, object)` and drop repeats: the set of an edge's
-/// rows over a default graph of several graphs, which the fallback's
-/// `BatchDeduper` also keeps once each, list index or not. Each member's rows
-/// arrive grouped by subject, and a full scan of a ref predicate arrives
-/// sorted, so the stable sort's run detection merges the members' runs
-/// rather than sorting from scratch.
-fn set_union<O: Ord>(rows: &mut Vec<(u64, O)>) {
-    rows.sort();
-    rows.dedup();
+/// An edge's rows over a default graph of several graphs: its facts, each
+/// once. A fact is `(subject, object, list index)` (AJ-66, #2109's
+/// `FactIdentity`; the predicate is the edge's), which is what the
+/// fallback's `BatchDeduper` keeps too: only a fact two members both hold
+/// collapses, so two list items with one value stay two rows, which the join
+/// takes twice. `list_index[i]` is row `i`'s. This is the one place the
+/// union's identity lives.
+///
+/// Each member's rows arrive grouped by subject, and a full scan of a ref
+/// predicate arrives sorted, so the stable sort's run detection merges the
+/// members' runs rather than sorting from scratch.
+fn set_union<O: Ord + Copy>(rows: &mut Vec<(u64, O)>, list_index: &[u32]) {
+    debug_assert_eq!(rows.len(), list_index.len());
+    let mut facts: Vec<(u64, O, u32)> = rows
+        .iter()
+        .zip(list_index)
+        .map(|(&(s, o), &i)| (s, o, i))
+        .collect();
+    facts.sort();
+    facts.dedup();
+    rows.clear();
+    rows.extend(facts.into_iter().map(|(s, o, _)| (s, o)));
+}
+
+/// The cursor columns a full scan reads: subject and object, and with
+/// `list_index` the list index too (a union's fact identity, [`set_union`]).
+fn scan_projection(list_index: bool) -> ColumnProjection {
+    let mut projection = cursor_projection_sid_otype_okey();
+    if list_index {
+        projection.output.insert(ColumnId::OI);
+    }
+    projection
 }
 
 /// One graph a relation load reads: the member, and the context its cursors
@@ -842,10 +866,13 @@ impl CyclicBgpOperator {
             && !overlay_carries_novelty(read.member.overlay())
     }
 
+    /// The edge's full relation in `read`'s graph. With `list_index`, each
+    /// row's list index is pushed there too (a union's fact identity).
     fn scan_ref_relation(
         &self,
         read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
+        mut list_index: Option<&mut Vec<u32>>,
     ) -> Result<Option<Vec<(u64, u64)>>> {
         let span = tracing::debug_span!(
             "cyclic_scan_relation",
@@ -866,7 +893,7 @@ impl CyclicBgpOperator {
             read.member.g_id(),
             pred_sid,
             p_id,
-            cursor_projection_sid_otype_okey(),
+            scan_projection(list_index.is_some()),
         )? {
             Some(cursor) => cursor,
             None if self.member_holds_nothing(read) => return Ok(Some(Vec::new())),
@@ -888,6 +915,9 @@ impl CyclicBgpOperator {
                     return Ok(None);
                 }
                 rows.push((batch.s_id.get(row), batch.o_key.get(row)));
+                if let Some(list_index) = list_index.as_mut() {
+                    list_index.push(batch.o_i.get_or(row, u32::MAX));
+                }
                 if rows.len() as u64 > row_cap {
                     self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
                     return Ok(None);
@@ -898,10 +928,12 @@ impl CyclicBgpOperator {
         Ok(Some(rows))
     }
 
+    /// [`Self::scan_ref_relation`] for encoded objects.
     fn scan_relation(
         &self,
         read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
+        mut list_index: Option<&mut Vec<u32>>,
     ) -> Result<Option<Vec<(u64, EncObj)>>> {
         let span = tracing::debug_span!(
             "cyclic_scan_relation",
@@ -922,7 +954,7 @@ impl CyclicBgpOperator {
             read.member.g_id(),
             pred_sid,
             p_id,
-            cursor_projection_sid_otype_okey(),
+            scan_projection(list_index.is_some()),
         )? {
             Some(cursor) => cursor,
             None if self.member_holds_nothing(read) => return Ok(Some(Vec::new())),
@@ -945,6 +977,9 @@ impl CyclicBgpOperator {
                     object: batch.o_key.get(row),
                     p_id,
                 });
+                if let Some(list_index) = list_index.as_mut() {
+                    list_index.push(batch.o_i.get_or(row, u32::MAX));
+                }
                 if raw_rows.len() as u64 > row_cap {
                     self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
                     return Ok(None);
@@ -994,6 +1029,7 @@ impl CyclicBgpOperator {
         edge: &CyclicEdge,
         subjects: &FxHashSet<u64>,
         overlay_ops: Option<&SharedOverlayOps>,
+        mut list_index: Option<&mut Vec<u32>>,
     ) -> Result<Option<Vec<(u64, EncObj)>>> {
         let span = tracing::debug_span!(
             "cyclic_scan_relation",
@@ -1044,6 +1080,9 @@ impl CyclicBgpOperator {
                     object: o_key,
                     p_id,
                 });
+                if let Some(list_index) = list_index.as_mut() {
+                    list_index.push(o_i);
+                }
             })?;
             if let Some(p) = probe.as_mut() {
                 p.drain_asserts_for_subject(subject, |op| {
@@ -1053,6 +1092,9 @@ impl CyclicBgpOperator {
                         object: op.o_key,
                         p_id,
                     });
+                    if let Some(list_index) = list_index.as_mut() {
+                        list_index.push(op.o_i);
+                    }
                     Ok(())
                 })?;
             }
@@ -1193,6 +1235,7 @@ impl CyclicBgpOperator {
         edge: &CyclicEdge,
         subjects: &FxHashSet<u64>,
         overlay_ops: Option<&SharedOverlayOps>,
+        mut list_index: Option<&mut Vec<u32>>,
     ) -> Result<Option<Vec<(u64, u64)>>> {
         let span = tracing::debug_span!(
             "cyclic_scan_relation",
@@ -1242,6 +1285,9 @@ impl CyclicBgpOperator {
                     non_ref_object = true;
                 } else {
                     rows.push((subject, o_key));
+                    if let Some(list_index) = list_index.as_mut() {
+                        list_index.push(o_i);
+                    }
                 }
             })?;
             if let Some(p) = probe.as_mut() {
@@ -1252,6 +1298,9 @@ impl CyclicBgpOperator {
                         non_ref_object = true;
                     } else {
                         rows.push((subject, op.o_key));
+                        if let Some(list_index) = list_index.as_mut() {
+                            list_index.push(op.o_i);
+                        }
                     }
                     Ok(())
                 })?;
@@ -1434,29 +1483,30 @@ impl CyclicBgpOperator {
     /// The relation of `edge` over `reads`, each read by `scan`: one graph's
     /// rows as its scan gives them, several graphs' as a set. `None` when a
     /// scan declines, or when the set passes the row cap.
-    fn load_relation<O: Ord>(
+    fn load_relation<O: Ord + Copy>(
         &self,
         reads: &[MemberRead<'_, '_>],
         edge: &CyclicEdge,
-        mut scan: impl FnMut(&MemberRead<'_, '_>) -> Result<Option<Vec<(u64, O)>>>,
+        mut scan: impl FnMut(
+            &MemberRead<'_, '_>,
+            Option<&mut Vec<u32>>,
+        ) -> Result<Option<Vec<(u64, O)>>>,
     ) -> Result<Option<Vec<(u64, O)>>> {
+        if let [read] = reads {
+            return scan(read, None);
+        }
         let mut rows: Vec<(u64, O)> = Vec::new();
+        let mut list_index: Vec<u32> = Vec::new();
         for read in reads {
-            let Some(part) = scan(read)? else {
+            let Some(part) = scan(read, Some(&mut list_index))? else {
                 return Ok(None);
             };
-            if rows.is_empty() {
-                rows = part;
-            } else {
-                rows.extend(part);
-            }
+            rows.extend(part);
         }
-        if reads.len() > 1 {
-            set_union(&mut rows);
-            if rows.len() as u64 > max_predicate_rows() {
-                self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
-                return Ok(None);
-            }
+        set_union(&mut rows, &list_index);
+        if rows.len() as u64 > max_predicate_rows() {
+            self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
+            return Ok(None);
         }
         Ok(Some(rows))
     }
@@ -1635,8 +1685,9 @@ impl CyclicBgpOperator {
         );
         let edges: Vec<CyclicEdge> = self.plan.edges.to_vec();
         let results = parallel_map_pooled(edges, |edge| {
-            let rows =
-                self.load_relation(reads, &edge, |read| self.scan_ref_relation(read, &edge))?;
+            let rows = self.load_relation(reads, &edge, |read, list_index| {
+                self.scan_ref_relation(read, &edge, list_index)
+            })?;
             Ok(rows.map(|rows| {
                 let span = tracing::debug_span!(
                     "cyclic_index_build",
@@ -1679,7 +1730,9 @@ impl CyclicBgpOperator {
         );
         let edges: Vec<CyclicEdge> = self.plan.edges.to_vec();
         let results = parallel_map_pooled(edges, |edge| {
-            let rows = self.load_relation(reads, &edge, |read| self.scan_relation(read, &edge))?;
+            let rows = self.load_relation(reads, &edge, |read, list_index| {
+                self.scan_relation(read, &edge, list_index)
+            })?;
             Ok(rows.map(|rows| {
                 let span = tracing::debug_span!(
                     "cyclic_index_build",
@@ -1767,12 +1820,13 @@ impl CyclicBgpOperator {
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
-                        match self.load_relation(reads, edge, |read| {
+                        match self.load_relation(reads, edge, |read, list_index| {
                             self.scan_ref_relation_for_subjects(
                                 read,
                                 edge,
                                 &frontier,
                                 read.probe_ops[edge_idx].as_ref(),
+                                list_index,
                             )
                         })? {
                             Some(rows) => rows,
@@ -1790,9 +1844,9 @@ impl CyclicBgpOperator {
                         estimate = edge.estimate.unwrap_or(0),
                         "cyclic cascade: full-scanning edge"
                     );
-                    let rows = match self
-                        .load_relation(reads, edge, |read| self.scan_ref_relation(read, edge))?
-                    {
+                    let rows = match self.load_relation(reads, edge, |read, list_index| {
+                        self.scan_ref_relation(read, edge, list_index)
+                    })? {
                         Some(rows) => rows,
                         None => return Ok(false),
                     };
@@ -1879,12 +1933,13 @@ impl CyclicBgpOperator {
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
-                        match self.load_relation(reads, edge, |read| {
+                        match self.load_relation(reads, edge, |read, list_index| {
                             self.scan_relation_for_subjects(
                                 read,
                                 edge,
                                 &frontier,
                                 read.probe_ops[edge_idx].as_ref(),
+                                list_index,
                             )
                         })? {
                             Some(rows) => rows,
@@ -1902,9 +1957,9 @@ impl CyclicBgpOperator {
                         estimate = edge.estimate.unwrap_or(0),
                         "cyclic cascade: full-scanning edge"
                     );
-                    let rows = match self
-                        .load_relation(reads, edge, |read| self.scan_relation(read, edge))?
-                    {
+                    let rows = match self.load_relation(reads, edge, |read, list_index| {
+                        self.scan_relation(read, edge, list_index)
+                    })? {
                         Some(rows) => rows,
                         None => return Ok(false),
                     };
@@ -3451,30 +3506,26 @@ mod tests {
         assert_eq!(remaining[pos], 2);
     }
 
-    /// Over several graphs an edge's rows are a set: a row two members hold,
-    /// or one member holds twice as list items, is kept once. Over one graph
-    /// they are a bag, and every index over the relation counts a repeated
-    /// row as often as it is stored: the pair count as the subject and object
-    /// scans do.
+    /// Over several graphs an edge's rows are its facts, each once: a fact
+    /// two members both hold collapses, while two list items with one value
+    /// (two facts) stay two rows, and so does a plain fact beside a list item
+    /// with the same value. Every index over the relation then counts a
+    /// repeated pair as often as it is stored, the pair count as the subject
+    /// and object scans do.
     #[test]
-    fn set_union_keeps_each_edge_once_across_and_within_members() {
+    fn set_union_keeps_each_fact_once() {
         let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
         let op = operator_for(&triples);
         let edge = &op.plan.edges[0];
-        // Member one holds (1, 2) as two list items and (1, 3); member two
-        // holds (1, 2) again and (4, 5).
-        let bag = [(1, 2), (1, 2), (1, 3), (1, 2), (4, 5)];
-        let mut rows = bag.to_vec();
-        set_union(&mut rows);
-        assert_eq!(rows, vec![(1, 2), (1, 3), (4, 5)]);
+        const PLAIN: u32 = u32::MAX;
+        // Member one: (1, 2) as list items 0 and 1, and (1, 3). Member two:
+        // the same two list items, (1, 2) as a plain fact, and (4, 5).
+        let mut rows = vec![(1, 2), (1, 2), (1, 3), (1, 2), (1, 2), (1, 2), (4, 5)];
+        let list_index = [0, 1, PLAIN, 0, 1, PLAIN, PLAIN];
+        set_union(&mut rows, &list_index);
+        assert_eq!(rows, vec![(1, 2), (1, 2), (1, 2), (1, 3), (4, 5)]);
 
         let rel = ref_rel(edge, &rows);
-        assert_eq!(rel.subject_rows(1).iter().filter(|r| r.1 == 2).count(), 1);
-        assert_eq!(rel.object_subjects(&2).filter(|&s| s == 1).count(), 1);
-        assert_eq!(rel.pair_count(1, &2), 1);
-
-        // Over the bag every index counts the repeat three times.
-        let rel = ref_rel(edge, &bag);
         assert_eq!(rel.subject_rows(1).iter().filter(|r| r.1 == 2).count(), 3);
         assert_eq!(rel.object_subjects(&2).filter(|&s| s == 1).count(), 3);
         assert_eq!(rel.pair_count(1, &2), 3);
@@ -3483,8 +3534,9 @@ mod tests {
         assert_eq!(rel.pair_count(1, &9), 0);
     }
 
-    /// Encoded objects are kept once per term: equal identity collapses,
-    /// while a string and a ref that share an `o_key` stay two terms.
+    /// Encoded objects are kept once per fact: equal identity at one list
+    /// index collapses, while a string and a ref that share an `o_key` stay
+    /// two terms.
     #[test]
     fn set_union_of_encoded_objects_keys_on_term_identity() {
         let string = |o_key| {
@@ -3496,7 +3548,7 @@ mod tests {
             (1, string(10)),
             (1, EncObj::from_ref(10)),
         ];
-        set_union(&mut rows);
+        set_union(&mut rows, &[u32::MAX; 4]);
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows.iter()
