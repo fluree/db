@@ -23,14 +23,17 @@
 //! In single-db mode (no dataset) every graph of the ledger lives in one
 //! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
 //! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
-//! explicit `FROM NAMED` (issue #1279); the ledger alias EXPLICITLY addresses
-//! the default graph, and reserved system graphs (txn-meta, config) stay private.
+//! explicit `FROM NAMED` (issue #1279), through the table every graph position
+//! of a ledger shares (`TargetLedger::graph_position`): the ledger's own
+//! address, in any spelling, EXPLICITLY addresses the default graph, `L#<g>`
+//! the graph `<g>`, and reserved system graphs (txn-meta, config) stay private.
 //! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
-//!   the ledger alias, or an R2RML graph source; otherwise empty
-//! - unbound `GRAPH ?g`: binds ?g to each registered user graph. The ledger
-//!   alias (default graph) is NOT enumerated — W3C-conformant since issue
-//!   #1442 (decision D-2); the #1279 implicit default-graph enumeration was
-//!   dropped, while explicit alias addressing above is retained
+//!   the ledger's own address, or an R2RML graph source; otherwise empty
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph, under a name
+//!   that reads it back (`L#<iri>` for a graph registered under the ledger's
+//!   own address). The default graph is NOT enumerated — W3C-conformant since
+//!   issue #1442; the #1279 implicit default-graph enumeration
+//!   was dropped, while explicit addressing above is retained
 //!
 //! # Architecture
 //!
@@ -55,69 +58,34 @@ use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::FlakeValue;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 // Note: tracing::debug removed to fix compilation - add tracing dependency if needed
 
-/// Best-effort load of the compiled R2RML mapping for `graph_iri`, used only to
-/// let [`rewrite_patterns_for_r2rml`] decide whether a same-subject `rdf:type`
-/// may be safely fused into a star scan. Returns `None` (which disables class
-/// fusion but stays correct) when there is no provider or the load fails; the
-/// R2RML operator loads the mapping again at setup, so within a query this is a
-/// cache hit under the query-scoped catalog session.
+/// Load the compiled R2RML mapping for `graph_iri`, which the caller has just
+/// found to be an R2RML graph source, so [`rewrite_patterns_for_r2rml`] can
+/// decide whether a same-subject `rdf:type` may be safely fused into a star
+/// scan. `None` only when there is no provider. A failed load fails the query
+/// rather than silently disabling the rewrite; the R2RML operator loads the
+/// mapping again at setup, so within a query this is a cache hit under the
+/// query-scoped catalog session.
 async fn r2rml_mapping_for_rewrite(
     ctx: &ExecutionContext<'_>,
     graph_iri: &str,
-) -> Option<Arc<CompiledR2rmlMapping>> {
-    let provider = ctx.r2rml_provider?;
+) -> Result<Option<Arc<CompiledR2rmlMapping>>> {
+    let Some(provider) = ctx.r2rml_provider else {
+        return Ok(None);
+    };
     let as_of_t = if ctx.explicit_dataset().is_some() {
         None
     } else {
         Some(ctx.to_t)
     };
-    provider.compiled_mapping(graph_iri, as_of_t).await.ok()
-}
-
-/// The encoded bindings a `GRAPH` scope must decode as they leave it, and the
-/// scope's own view to decode them against.
-struct ScopeExit {
-    view: Option<BinaryGraphView>,
-    /// Decode every encoded binding, not only NUM_BIG handles.
-    all: bool,
-}
-
-impl ScopeExit {
-    fn new(ctx: &ExecutionContext<'_>, graph_ctx: &ExecutionContext<'_>) -> Self {
-        // NumBig arena handles are scoped per (graph, predicate), so one that
-        // leaves for a scope on another g_id would be decoded against the
-        // OUTER graph's arena, silently producing wrong values. The other
-        // encoded kinds decode against store-global dictionaries and are safe
-        // to carry out, unless the surrounding scope spans several graphs (a
-        // union default graph, or `FROM` naming several): it has no graph view
-        // to decode anything against.
-        let all = !ctx.has_binary_store();
-        let view = if all || graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
-        Self { view, all }
-    }
-
-    fn decode(&self, binding: Binding) -> Binding {
-        let leaves_encoded = if self.all {
-            binding.is_encoded()
-        } else {
-            crate::object_binding::is_numbig_encoded(&binding)
-        };
-        if leaves_encoded && self.view.is_some() {
-            crate::group_aggregate::materialize_encoded(&binding, self.view.as_ref())
-        } else {
-            binding
-        }
-    }
+    provider
+        .compiled_mapping(graph_iri, as_of_t)
+        .await
+        .map(Some)
 }
 
 /// GRAPH pattern operator - scopes inner patterns to a specific graph
@@ -263,6 +231,13 @@ impl GraphOperator {
             // (Subject/string dictionaries are store-global, so decoding
             // against the outer view is sound; when extraction DOES run in
             // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
+            // A predicate IRI bound in predicate position (`ex:s1 ?g ?o .
+            // GRAPH ?g { … }`).
+            Binding::EncodedPid { p_id } => ctx
+                .binary_store
+                .as_ref()?
+                .resolve_predicate_iri(*p_id)
+                .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
                 let gv = ctx.graph_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
@@ -323,16 +298,20 @@ impl GraphOperator {
         }
 
         // Check if this graph is backed by an R2RML mapping.
-        // Prefer the precomputed set (populated in runner.rs for dataset queries),
-        // but fall back to asking the provider dynamically for the no-dataset
-        // single-source path where the GRAPH IRI may differ from the ledger_id.
+        // Prefer the precomputed set (populated in runner.rs from the query's
+        // graphs), but fall back to asking the provider dynamically for the
+        // no-dataset single-source path where the GRAPH IRI may differ from the
+        // ledger_id.
         let is_r2rml_gs = if ctx.r2rml_graph_ids.contains(graph_iri.as_ref()) {
             true
-        } else if ctx.single_db_user_graph_id(&graph_iri).is_some() {
-            // Registered native graph — never R2RML; skip the per-graph probe.
+        } else if ctx.single_db_user_graph_id(&graph_iri).is_some()
+            || ctx.graph_is_native(&graph_iri)
+        {
+            // A registered graph, or a graph loaded as a ledger graph: never
+            // R2RML, so skip the per-graph probe.
             false
         } else if let Some(provider) = ctx.r2rml_provider {
-            provider.has_r2rml_mapping(&graph_iri).await
+            provider.has_r2rml_mapping(&graph_iri).await?
         } else {
             false
         };
@@ -340,7 +319,7 @@ impl GraphOperator {
         // Determine which patterns to use (rewritten for R2RML or original)
         let patterns_to_execute: std::borrow::Cow<'_, [Pattern]> = if is_r2rml_gs {
             // Rewrite triple patterns to R2RML patterns
-            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
             let rewrite_result = rewrite_patterns_for_r2rml(
                 &self.inner_patterns,
                 &graph_iri,
@@ -385,14 +364,20 @@ impl GraphOperator {
         // away at merge time. Join-equivalent by construction; strictly
         // narrows the inner scan. All other shapes rely on the merge-time
         // `{?g → graph}` join below.
+        //
+        // The seeding row's arena handles (big numbers, vectors) name values
+        // in the outer graph, and the rows leaving carry handles into this
+        // graph's arenas: each is decoded through its own graph on the way.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        let mut row: Vec<Binding> = parent_batch
+            .row_view(row_idx)
+            .expect("row_idx must be valid for batch")
+            .to_vec();
+        crossing.enter(&mut row);
         let seed = match bind_graph_var {
             Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
                 let mut schema_vec = parent_batch.schema().to_vec();
                 schema_vec.push(var);
-                let mut row: Vec<Binding> = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for batch")
-                    .to_vec();
                 row.push(Binding::iri(graph_iri.clone()));
                 if stamp_ledger_id.is_some() {
                     row = crate::dataset_operator::stamp_seed_row(row, ctx);
@@ -401,17 +386,14 @@ impl GraphOperator {
             }
             // Across a ledger boundary the parent's raw `Sid`s are stamped in
             // the requester's ledger before seeding (see `stamp_seed_row`).
-            _ if stamp_ledger_id.is_some() => {
-                let row = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for batch")
-                    .to_vec();
-                SeedOperator::from_row(
-                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
-                    crate::dataset_operator::stamp_seed_row(row, ctx),
-                )
-            }
-            _ => SeedOperator::from_batch_row(parent_batch, row_idx),
+            _ if stamp_ledger_id.is_some() => SeedOperator::from_row(
+                Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                crate::dataset_operator::stamp_seed_row(row, ctx),
+            ),
+            _ => SeedOperator::from_row(
+                Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                row,
+            ),
         };
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -439,8 +421,6 @@ impl GraphOperator {
         // a legitimate correlated query with a typed 507.
         let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
-
-        let scope_exit = ScopeExit::new(ctx, &graph_ctx);
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
@@ -512,7 +492,7 @@ impl GraphOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        merged_row.push(scope_exit.decode(binding));
+                        merged_row.push(crossing.leave(binding));
                     }
                 }
 
@@ -556,7 +536,7 @@ impl GraphOperator {
             graph_ctx.eager_materialization = true;
         }
 
-        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
         let rewrite_result = rewrite_patterns_for_r2rml(
             &self.inner_patterns,
             &graph_iri,
@@ -581,6 +561,17 @@ impl GraphOperator {
             ));
         }
 
+        // The whole parent batch seeds the source undecoded: sound only
+        // because nothing crosses graphs here. This path runs without an
+        // explicit dataset: with none, the source scope inherits the outer
+        // graph id; under an implicit union default graph, the outer context
+        // has no graph view and the source is no member graph, so neither side
+        // has one. Either way the arena crossing is a no-op both ways.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        debug_assert!(
+            crossing.is_noop(),
+            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
+        );
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -612,7 +603,10 @@ impl GraphOperator {
         let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
 
-        let scope_exit = ScopeExit::new(ctx, &graph_ctx);
+        // As at the per-row exit, only the columns this scope binds leave
+        // through the crossing; the parent columns threaded through keep the
+        // outer graph's handles.
+        let parent_len = self.child.schema().len();
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
@@ -628,12 +622,16 @@ impl GraphOperator {
             // output variable of `self.schema` directly from it.
             for inner_row_idx in 0..batch.len() {
                 let mut merged_row = Vec::with_capacity(self.schema.len());
-                for var in self.schema.iter() {
+                for (i, var) in self.schema.iter().enumerate() {
                     let binding = batch
                         .get(inner_row_idx, *var)
                         .cloned()
                         .unwrap_or(Binding::Unbound);
-                    merged_row.push(scope_exit.decode(binding));
+                    merged_row.push(if i < parent_len {
+                        binding
+                    } else {
+                        crossing.leave(binding)
+                    });
                 }
                 self.result_buffer.push(merged_row);
             }
@@ -756,13 +754,13 @@ impl Operator for GraphOperator {
             if ctx.explicit_dataset().is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = ctx.names_default_graph(iri);
+                    let is_alias = ctx.single_db_names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                             true
                         } else if let Some(provider) = ctx.r2rml_provider {
-                            provider.has_r2rml_mapping(iri).await
+                            provider.has_r2rml_mapping(iri).await?
                         } else {
                             false
                         };
@@ -797,16 +795,16 @@ impl Operator for GraphOperator {
                             // else: graph not found → no output for this row
                         } else {
                             // Single-db: a registered user graph, a name of
-                            // the default graph (`names_default_graph`), or an
-                            // R2RML graph source.
+                            // the default graph (`single_db_names_default_graph`),
+                            // or an R2RML graph source.
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = ctx.names_default_graph(iri);
+                            let is_alias = ctx.single_db_names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                                     true
                                 } else if let Some(provider) = ctx.r2rml_provider {
-                                    provider.has_r2rml_mapping(iri).await
+                                    provider.has_r2rml_mapping(iri).await?
                                 } else {
                                     false
                                 };
@@ -846,13 +844,13 @@ impl Operator for GraphOperator {
                                     // Single-db: same resolution as the concrete arm.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias = ctx.names_default_graph(&bound_iri);
+                                    let is_alias = ctx.single_db_names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
-                                            provider.has_r2rml_mapping(&bound_iri).await
+                                            provider.has_r2rml_mapping(&bound_iri).await?
                                         } else {
                                             false
                                         };
@@ -885,13 +883,14 @@ impl Operator for GraphOperator {
                                 }
                             } else {
                                 // Single-db: bind ?g to each registered user
-                                // graph (empty graphs emit no rows). The ledger
-                                // alias (default graph) is NOT enumerated: per
-                                // SPARQL 1.1, `GRAPH ?g` ranges over named
-                                // graphs only (D-2 / issue #1442 dropped the
-                                // #1279 implicit enumeration). The default
-                                // graph remains explicitly addressable via
-                                // `GRAPH <alias>` in the arms above.
+                                // graph (empty graphs emit no rows), under a
+                                // name that reads it back. The default graph is
+                                // NOT enumerated: per SPARQL 1.1, `GRAPH ?g`
+                                // ranges over named graphs only (issue
+                                // #1442 dropped the #1279 implicit
+                                // enumeration). It remains explicitly
+                                // addressable by the ledger's own address in
+                                // the arms above.
                                 for iri in ctx.single_db_user_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,

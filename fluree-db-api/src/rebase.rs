@@ -7,9 +7,7 @@
 use crate::commit_data::{key_of, OwnChanges};
 use crate::error::{ApiError, Result};
 use fluree_db_core::LedgerId;
-use fluree_db_core::{
-    BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake, DEFAULT_GRAPH_ID,
-};
+use fluree_db_core::{BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::{delta_keys_of, FactKey};
@@ -682,7 +680,7 @@ impl crate::Fluree {
             .await?;
         outcome.into_result_with(|report| {
             format!(
-                "replaying commit t={} would violate the source branch's shapes:\n{report}",
+                "replaying commit t={} was refused:\n{report}",
                 original_commit.t
             )
         })?;
@@ -941,22 +939,8 @@ pub(crate) async fn current_asserted_for_key(
     state: &LedgerState,
     key: &ConflictKey,
 ) -> Result<Vec<StoredFact>> {
-    let g_id = match &key.g {
-        None => DEFAULT_GRAPH_ID,
-        Some(g_sid) => match state
-            .snapshot
-            .decode_sid(g_sid)
-            .and_then(|iri| state.snapshot.graph_registry.graph_id_for_iri(&iri))
-        {
-            Some(g_id) => g_id,
-            None => return Ok(Vec::new()),
-        },
-    };
-    let slot = Slot {
-        g_id,
-        g_sid: key.g.clone(),
-        s: key.s.clone(),
-        p: key.p.clone(),
+    let Some(slot) = Slot::in_ledger(state, &key.g, &key.s, &key.p) else {
+        return Ok(Vec::new());
     };
     Ok(CurrentFacts::new(state)
         .of_slots(std::slice::from_ref(&slot))

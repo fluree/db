@@ -245,6 +245,7 @@ impl Fluree {
                 Some(&index_config),
                 policy.as_ref(),
                 Some(&tracker),
+                None,
             )
             .await?
         } else {
@@ -305,6 +306,7 @@ impl Fluree {
                 Some(&index_config),
                 policy.as_ref(),
                 Some(&tracker),
+                None,
                 None,
             )
             .await?;

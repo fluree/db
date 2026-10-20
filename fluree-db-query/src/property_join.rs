@@ -1135,19 +1135,11 @@ impl PropertyJoinOperator {
         let normalizable = !ctx.eager_materialization;
         Ok(Self::subject_key_single(subject).map(|key| match key {
             SubjectKey::Sid(sid) if normalizable => {
-                let resolved = ctx.binary_store.as_deref().and_then(|store| {
-                    store
-                        .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                let resolved = crate::object_binding::TermDicts::of(ctx).and_then(|dicts| {
+                    dicts
+                        .subject_id(sid.namespace_code, &sid.name)
                         .ok()
                         .flatten()
-                        .or_else(|| {
-                            ctx.dict_novelty
-                                .as_ref()
-                                .filter(|dn| dn.is_initialized())
-                                .and_then(|dn| {
-                                    dn.subjects.find_subject(sid.namespace_code, &sid.name)
-                                })
-                        })
                 });
                 resolved.map_or(SubjectKey::Sid(sid), SubjectKey::Id)
             }

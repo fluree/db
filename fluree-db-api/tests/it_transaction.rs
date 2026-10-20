@@ -535,6 +535,70 @@ async fn a_policy_configured_while_open_applies_to_the_commit() {
     assert!(people(&fluree, &head(&fluree).await).await.is_empty());
 }
 
+/// Every kind of operation a transaction stages is checked against the
+/// policy the transaction is under, whichever staging lane it takes.
+#[tokio::test]
+async fn every_kind_of_operation_is_checked_against_the_policy() {
+    let fluree = fluree().await;
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <urn:fluree:{LEDGER}#config> {{
+                 <urn:config:main> a f:LedgerConfig ;
+                     f:policyDefaults <urn:config:policy> .
+                 <urn:config:policy> f:defaultAllow false .
+             }}"
+        ))
+        .commit()
+        .await
+        .unwrap();
+    let t = head(&fluree).await.t;
+
+    let turtle = "@prefix ex: <http://example.org/> . ex:bob ex:name \"Bob\" .";
+    let bob = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:bob", "ex:name": "Bob",
+    });
+    let operations = [
+        ("insert", TxnOperation::Insert(bob.clone())),
+        ("upsert", TxnOperation::Upsert(bob.clone())),
+        ("update", TxnOperation::Update(json!({ "insert": bob }))),
+        (
+            "insert turtle",
+            TxnOperation::InsertTurtle(turtle.to_string()),
+        ),
+        (
+            "upsert turtle",
+            TxnOperation::UpsertTurtle(turtle.to_string()),
+        ),
+        (
+            "sparql update",
+            TxnOperation::SparqlUpdate(
+                format!("{PREFIX}INSERT DATA {{ ex:bob ex:name \"Bob\" }}"),
+                None,
+            ),
+        ),
+    ];
+    for (kind, operation) in operations {
+        let mut txn = begin(&fluree).await;
+        let err = match txn.stage(operation).await {
+            Err(err) => err,
+            Ok(()) => txn
+                .commit(CommitOpts::default())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{kind}: committed under a deny-all policy")),
+        };
+        assert!(
+            err.to_string().contains("Policy enforcement"),
+            "{kind}: {err}"
+        );
+        assert_eq!(head(&fluree).await.t, t, "{kind}");
+    }
+}
+
 /// A rollback stages the operations before the savepoint again, and their
 /// blank nodes keep the identities the caller already read.
 #[tokio::test]
@@ -553,6 +617,29 @@ async fn a_rollback_keeps_the_blank_nodes_staged_before_it() {
     txn.stage(insert("bob", "Bob", 40)).await.unwrap();
     txn.rollback_to(savepoint).await.unwrap();
     assert_eq!(select(&fluree, &txn.db().await.unwrap(), ITEM).await, item);
+}
+
+/// A Turtle upsert names its blank nodes from the document, so staging it
+/// again on a rollback, and committing it, keeps the identities the caller
+/// already read.
+#[tokio::test]
+async fn a_rollback_keeps_a_turtle_upserts_blank_nodes() {
+    const ITEM: &str = "SELECT ?item WHERE { ex:order ex:item ?item }";
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage(TxnOperation::UpsertTurtle(
+        "@prefix ex: <http://example.org/> .\nex:order ex:item [ ex:sku \"A1\" ] .\n".into(),
+    ))
+    .await
+    .unwrap();
+    let item = select(&fluree, &txn.db().await.unwrap(), ITEM).await;
+    assert_eq!(item.len(), 1, "{item:?}");
+    let savepoint = txn.savepoint();
+    txn.stage(insert("bob", "Bob", 40)).await.unwrap();
+    txn.rollback_to(savepoint).await.unwrap();
+    assert_eq!(select(&fluree, &txn.db().await.unwrap(), ITEM).await, item);
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(select(&fluree, &head(&fluree).await, ITEM).await, item);
 }
 
 fn tracked(max_fuel: Option<u64>) -> TransactionOptions {

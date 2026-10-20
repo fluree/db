@@ -188,3 +188,95 @@ async fn cross_ledger_constraints_missing_model_fails_tx_closed() {
         "error must name the missing model ledger, got: {msg}"
     );
 }
+
+/// Uniqueness governs data writes only. With it enabled and its constraints
+/// source in a model ledger that is gone, a data write fails closed, while a
+/// config-only write commits (the system graphs never participate in
+/// uniqueness, so none resolves the source): that is how the owner turns the
+/// broken constraint off, after which data writes commit.
+#[tokio::test]
+async fn dropped_constraints_model_fails_data_writes_closed_and_config_writes_commit() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_name = "test/cross-ledger-constraints/dropped-model";
+    let model_id = format!("{model_name}:main");
+    let constraints_graph_iri = "http://example.org/governance/constraints";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, &model_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:  <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/ns/> .
+
+            GRAPH <{constraints_graph_iri}> {{ ex:email f:enforceUnique true . }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M constraints graph");
+
+    let data_id = "test/cross-ledger-constraints/dropped-data:main";
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(genesis_ledger(&fluree, data_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:transactDefaults <urn:cfg:transact> .
+                <urn:cfg:transact> f:uniqueEnabled true .
+                <urn:cfg:transact> f:constraintsSource <urn:cfg:constraints-ref> .
+                <urn:cfg:constraints-ref> rdf:type f:GraphRef ;
+                                          f:graphSource <urn:cfg:constraints-src> .
+                <urn:cfg:constraints-src> f:ledger <{model_id}> ;
+                                          f:graphSelector <{constraints_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger constraints config");
+    fluree
+        .drop_ledger(model_name, fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop M");
+
+    let record = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:alice",
+        "ex:email": "alice@example.com"
+    });
+    let err = fluree
+        .graph(data_id)
+        .transact()
+        .insert(&record)
+        .commit()
+        .await
+        .expect_err("uniqueness is on and its constraints source is gone: fail closed");
+    assert!(
+        err.to_string().contains(model_name),
+        "the refusal names the missing model ledger: {err}"
+    );
+
+    fluree
+        .graph(data_id)
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             DELETE {{ GRAPH <{config_iri}> {{ <urn:cfg:transact> f:uniqueEnabled ?on }} }} \
+             INSERT {{ GRAPH <{config_iri}> {{ <urn:cfg:transact> f:uniqueEnabled false }} }} \
+             WHERE {{ GRAPH <{config_iri}> {{ <urn:cfg:transact> f:uniqueEnabled ?on }} }}"
+        ))
+        .commit()
+        .await
+        .expect("a config-only write resolves no constraints source");
+    fluree
+        .graph(data_id)
+        .transact()
+        .insert(&record)
+        .commit()
+        .await
+        .expect("with uniqueness turned off, the data write commits");
+}

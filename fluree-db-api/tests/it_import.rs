@@ -3845,3 +3845,157 @@ GRAPH <#txn-meta> {
         "envelope-supplied commit metadata must survive the load-side drop; got {rows}"
     );
 }
+
+/// Bulk JSON-LD import cannot write graph-scoped statements yet: a node's
+/// graph selector, or a JSON-LD named graph's content, refuses the import
+/// instead of folding the statements into the default graph (the selector
+/// used to be dropped) or dropping them (named-graph content was). The same
+/// data as TriG imports into its graph.
+#[tokio::test]
+async fn import_jsonld_graph_scoping_is_refused_not_folded() {
+    for (i, doc) in [
+        r#"{"@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": "ex:a", "@graph": "ex:g", "ex:p": 1}]}"#,
+        r#"{"@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:p": 1}]}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let db_dir = tempfile::tempdir().expect("db tmpdir");
+        let data_dir = tempfile::tempdir().expect("data tmpdir");
+        let file_path = data_dir.path().join("scoped.jsonld");
+        std::fs::write(&file_path, doc).unwrap();
+        let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build file-backed Fluree");
+        let err = fluree
+            .create(&format!("test/import-jsonld-scoped-{i}:main"))
+            .import(&file_path)
+            .cleanup(false)
+            .execute()
+            .await
+            .expect_err("graph-scoped JSON-LD is refused by bulk import");
+        assert!(
+            err.to_string()
+                .contains("graph scoping is not supported by bulk import"),
+            "{err}"
+        );
+    }
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig_path = data_dir.path().join("scoped.trig");
+    std::fs::write(
+        &trig_path,
+        "GRAPH <http://example.org/ns/g> { <http://example.org/ns/a> <http://example.org/ns/p> 1 . }\n",
+    )
+    .unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/import-trig-scoped:main")
+        .import(&trig_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("the TriG spelling imports");
+    let ledger = fluree
+        .ledger("test/import-trig-scoped:main")
+        .await
+        .expect("load");
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "SELECT ?o WHERE { GRAPH <http://example.org/ns/g> { ?s <http://example.org/ns/p> ?o } }",
+    )
+    .await
+    .expect("query");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+}
+
+/// A bulk-import TriG block named by the ledger's own address, in any
+/// spelling, loads into the default graph, and one named `<ledger>#<g>` into
+/// the graph `<g>`: the table every graph position of a ledger shares. The
+/// import registers no graph under the address.
+#[tokio::test]
+async fn import_trig_blocks_named_by_the_ledger_address() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = "@prefix ex: <http://a.org/> .\n\
+                ex:x ex:p \"default\" .\n\
+                GRAPH <trigown:main> { ex:y ex:p \"address block\" . }\n\
+                GRAPH <urn:fluree:trigown:main> { ex:v ex:p \"urn block\" . }\n\
+                GRAPH <trigown:main#http://example.org/g1> { ex:w ex:p \"g1\" . }\n";
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("trigown:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+    let ledger = fluree.ledger("trigown:main").await.expect("load ledger");
+
+    let rows = |sparql: &'static str| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let result = support::query_sparql(fluree, ledger, sparql)
+                .await
+                .expect("query");
+            let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let cell = |c: &serde_json::Value| {
+                c.as_str()
+                    .or_else(|| c.get("@id").and_then(|v| v.as_str()))
+                    .or_else(|| c.get("@value").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| c.to_string())
+            };
+            let mut rows: Vec<String> = json
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| {
+                    r.as_array()
+                        .expect("row")
+                        .iter()
+                        .map(cell)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+    };
+    assert_eq!(
+        rows("SELECT ?s ?o WHERE { ?s <http://a.org/p> ?o }").await,
+        [
+            "http://a.org/v urn block",
+            "http://a.org/x default",
+            "http://a.org/y address block",
+        ],
+        "the address blocks are the default graph"
+    );
+    assert_eq!(
+        rows("SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s <http://a.org/p> ?o } }").await,
+        ["http://example.org/g1 http://a.org/w g1"],
+        "the `<ledger>#<g>` block is the graph <g>"
+    );
+    let registered: Vec<String> = ledger
+        .snapshot
+        .graph_registry
+        .iter_entries()
+        .filter(|(g_id, _)| *g_id >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+        .map(|(_, iri)| iri.to_string())
+        .collect();
+    assert_eq!(registered, ["http://example.org/g1"]);
+}

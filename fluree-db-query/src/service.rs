@@ -32,7 +32,7 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{format_ledger_id, split_ledger_id, FlakeValue};
+use fluree_db_core::{FlakeValue, LedgerRef};
 use std::sync::Arc;
 
 /// Fluree ledger SERVICE endpoint prefix
@@ -111,20 +111,20 @@ impl ServiceOperator {
 
     /// Parse a Fluree ledger reference from an endpoint IRI
     ///
-    /// Format: `fluree:ledger:<name>` or `fluree:ledger:<name>:<branch>`
+    /// Format: `fluree:ledger:<address>`, where the address is a ledger's
+    /// `name[:branch]`, optionally `urn:fluree:`-prefixed. A SERVICE endpoint
+    /// names a whole ledger, whose time and graphs come from the dataset, so an
+    /// address that pins a time or names a graph is malformed here.
     ///
-    /// Returns the full ledger ID string that matches dataset storage format.
+    /// Returns the canonical ledger ID that matches dataset storage format.
     /// - `fluree:ledger:orders` → `"orders:main"` (defaults to :main branch)
     /// - `fluree:ledger:orders:main` → `"orders:main"`
     /// - `fluree:ledger:orders:dev` → `"orders:dev"`
+    /// - `fluree:ledger:urn:fluree:orders:dev` → `"orders:dev"`
     fn parse_fluree_ledger_ref(endpoint: &str) -> Option<String> {
         let rest = endpoint.strip_prefix(FLUREE_LEDGER_PREFIX)?;
-        if rest.is_empty() {
-            return None;
-        }
-
-        let (name, branch) = split_ledger_id(rest).ok()?;
-        Some(format_ledger_id(&name, &branch))
+        let address = LedgerRef::parse(rest).ok()?;
+        address.is_bare().then(|| address.into_id().to_string())
     }
 
     /// Check if an endpoint is a local Fluree ledger reference
@@ -156,9 +156,29 @@ impl ServiceOperator {
         bind_endpoint_var: Option<VarId>,
         endpoint_iri: &str,
     ) -> Result<()> {
-        // Look up the ledger in the dataset
+        // Look up the ledger in the dataset. An endpoint that is not a member is
+        // not the current dataset (which would answer for another ledger with
+        // this dataset's data) and is never loaded here (a SERVICE endpoint is
+        // not authorized the way a dataset member is): it is a caller error, or
+        // no rows under SILENT.
         let graph_ref = if let Some(ds) = ctx.explicit_dataset() {
-            ds.find_by_ledger_id(full_ledger_ref)
+            match ds.service_member(full_ledger_ref) {
+                Ok(Some(graph_ref)) => Some(graph_ref),
+                Ok(None) | Err(_) if self.service.silent => return Ok(()),
+                Ok(None) => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "SERVICE endpoint names ledger '{full_ledger_ref}', which is not in this \
+                         query's dataset; add it with FROM NAMED to query it"
+                    )))
+                }
+                Err((a, b)) => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "SERVICE endpoint names ledger '{full_ledger_ref}', which this query's \
+                         dataset holds at more than one time (t={a} and t={b}), so the endpoint \
+                         does not say which to read; keep one of them in the dataset"
+                    )))
+                }
+            }
         } else {
             // No dataset - check if alias matches the current db
             if ctx.active_snapshot.ledger_id != full_ledger_ref {
@@ -180,31 +200,6 @@ impl ServiceOperator {
             (gref.ledger_id.as_ref() != ctx.active_snapshot.ledger_id.as_str())
                 .then(|| Arc::clone(&gref.ledger_id))
         });
-
-        // Build seed operator from parent row (like EXISTS/Subquery). Across a
-        // ledger boundary the parent's raw `Sid`s are stamped in the
-        // REQUESTER's ledger first: a body `BIND(?parent AS ?x)` would
-        // otherwise copy a requester-encoded `Sid` into a column the boundary
-        // stamp then decodes through the target's table.
-        let seed = match &cross_ledger {
-            Some(_) => {
-                let schema: Arc<[VarId]> =
-                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
-                let row = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for parent batch")
-                    .to_vec();
-                SeedOperator::from_row(schema, crate::dataset_operator::stamp_seed_row(row, ctx))
-            }
-            None => SeedOperator::from_batch_row(parent_batch, row_idx),
-        };
-        let mut inner = build_where_operators_seeded(
-            Some(Box::new(seed)),
-            &self.service.patterns,
-            None,
-            None,
-            &self.planning,
-        )?;
 
         // Create execution context for the target ledger
         // If graph_ref is Some, create a new context; otherwise use the current context (self-reference)
@@ -239,6 +234,37 @@ impl ServiceOperator {
         } else {
             ctx
         };
+
+        // Build seed operator from parent row (like EXISTS/Subquery). Across a
+        // ledger boundary the parent's raw `Sid`s are stamped in the
+        // REQUESTER's ledger first: a body `BIND(?parent AS ?x)` would
+        // otherwise copy a requester-encoded `Sid` into a column the boundary
+        // stamp then decodes through the target's table.
+        //
+        // A target graph other than the parent's also reads other arenas: the
+        // parent row's arena handles (big numbers, vectors) are decoded
+        // through the parent's graph on the way in, and the body's through
+        // the target's on the way out.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, ctx_to_use);
+        let mut row: Vec<Binding> = parent_batch
+            .row_view(row_idx)
+            .expect("row_idx must be valid for parent batch")
+            .to_vec();
+        crossing.enter(&mut row);
+        let schema: Arc<[VarId]> = Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
+        let seed = match &cross_ledger {
+            Some(_) => {
+                SeedOperator::from_row(schema, crate::dataset_operator::stamp_seed_row(row, ctx))
+            }
+            None => SeedOperator::from_row(schema, row),
+        };
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &self.service.patterns,
+            None,
+            None,
+            &self.planning,
+        )?;
 
         match inner.open(ctx_to_use).await {
             Ok(()) => {}
@@ -324,7 +350,7 @@ impl ServiceOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        merged_row.push(binding);
+                        merged_row.push(crossing.leave(binding));
                     }
                 }
 
@@ -518,7 +544,7 @@ impl Operator for ServiceOperator {
                                 );
                             } else {
                                 return Err(QueryError::InvalidQuery(format!(
-                                    "Invalid fluree:ledger endpoint format: '{iri}'. Expected 'fluree:ledger:<alias>' or 'fluree:ledger:<alias>:<branch>'"
+                                    "Invalid fluree:ledger endpoint format: '{iri}'. Expected 'fluree:ledger:<alias>' or 'fluree:ledger:<alias>:<branch>', with no time or graph"
                                 )));
                             }
                         } else if is_fluree_remote_endpoint(iri) {
@@ -746,6 +772,30 @@ mod tests {
             ServiceOperator::parse_fluree_ledger_ref("fluree:ledger::main"),
             None
         );
+
+        // Valid: the `urn:fluree:` spelling of the same address
+        assert_eq!(
+            ServiceOperator::parse_fluree_ledger_ref("fluree:ledger:urn:fluree:orders:dev"),
+            Some("orders:dev".to_string())
+        );
+        assert_eq!(
+            ServiceOperator::parse_fluree_ledger_ref("fluree:ledger:urn:fluree:orders"),
+            Some("orders:main".to_string())
+        );
+
+        // Invalid: an endpoint names a whole ledger; its time and graphs come
+        // from the dataset
+        for endpoint in [
+            "fluree:ledger:orders@t:3",
+            "fluree:ledger:orders:main#txn-meta",
+            "fluree:ledger:orders#http://example.org/g",
+        ] {
+            assert_eq!(
+                ServiceOperator::parse_fluree_ledger_ref(endpoint),
+                None,
+                "{endpoint}"
+            );
+        }
     }
 
     #[test]

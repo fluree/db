@@ -27,11 +27,8 @@ use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
 use fluree_db_core::LedgerId;
-use fluree_db_core::{
-    range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
-    TXN_META_GRAPH_ID,
-};
-use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
+use fluree_db_core::Storage;
+use fluree_db_core::{ContentAddressedWrite, ContentKind, Flake, GraphId, Sid, TXN_META_GRAPH_ID};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
@@ -397,13 +394,10 @@ impl Fluree {
         // Track per-commit "all flakes" so we can update state after CAS.
         let mut accepted_all_flakes: Vec<(i64, Vec<Flake>)> = Vec::with_capacity(decoded.len());
 
-        // 4.0 Build ONE cumulative graph routing from ALL commits' flakes.
-        //
-        // This ensures consistent GraphId assignments across the entire push batch.
-        // Per-commit routing would assign different GraphIds for the same graph
-        // when processing separate commits independently (each starts max_g_id=1).
-        let all_push_flakes: Vec<&Flake> = decoded.iter().flat_map(|c| &c.commit.flakes).collect();
-        let routing = derive_graph_routing(&base_state, &all_push_flakes);
+        // 4.0 Build ONE graph routing for the whole push: every graph the
+        // commits write, with the id the ledger gives it once they apply.
+        let routing =
+            derive_graph_routing(&base_state, &decoded).map_err(PushError::into_api_error)?;
         let mut reverse_graph = reverse_graph_lookup(&routing.graph_sids);
         // Ensure txn-meta graph is always routable — commit metadata flakes
         // are stamped with this graph SID after routing is derived.
@@ -517,16 +511,12 @@ impl Fluree {
             )
             .map_err(ApiError::Transact)?;
 
-            // 4.1 Retraction invariant (strict).
-            assert_retractions_exist(
-                &base_state.snapshot,
-                &evolving_novelty,
-                current_t,
-                &c.commit.flakes,
-                &reverse_graph,
-            )
-            .await
-            .map_err(PushError::into_api_error)?;
+            // 4.1 Retraction invariant (strict), read as of `current_t`: the
+            // state's `t` is the greater of the index's and novelty's.
+            let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
+            assert_retractions_exist(&evolving_state, &c.commit.flakes, &reverse_graph)
+                .await
+                .map_err(PushError::into_api_error)?;
 
             // 4.2 Policy enforcement: build policy context from opts against current state.
             let policy_ctx =
@@ -534,7 +524,6 @@ impl Fluree {
                     .await?;
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
-            let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
             let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
@@ -569,27 +558,23 @@ impl Fluree {
             // the leader (ledger-wide or per-graph) must not reject replication
             // on the follower.
             //
-            // `graph_delta` is built from `routing.graph_iris` — IRIs already
-            // resolved during graph routing. Overlay-only graphs (not yet in
-            // the binary store) are intentionally absent from `graph_iris` and
-            // therefore fall back to the ledger-wide baseline, which is the
-            // correct behavior: config cannot exist for a graph not yet known.
+            // `graph_delta` is `routing.graph_iris`, which names every graph
+            // the push writes, so each is validated under its own config.
             // The SHACL pass attaches the staged dictionaries to the view.
             #[cfg(feature = "shacl")]
             let mut staged_view = staged_view;
             #[cfg(feature = "shacl")]
             {
+                // An unreadable config is a server-side read failure (500),
+                // not a property of the pushed commits.
+                let config = crate::tx::enforcement_config(&staged_view)
+                    .await
+                    .map_err(ApiError::from)?;
                 crate::tx::apply_shacl_policy_to_staged_view(
                     &mut staged_view,
                     crate::tx::StagedShaclContext {
                         graph_delta: Some(&routing.graph_iris),
                         tracker: None,
-                        // Commit replay doesn't engage the
-                        // cross-ledger dispatch (the leader
-                        // already validated against M when the
-                        // commit was authored); followers
-                        // re-validate same-ledger only.
-                        cross_ledger_shapes: None,
                         staged_ns: None,
                         // These commits' own namespaces do not reach the
                         // snapshot until after validation, so a violation on a
@@ -600,12 +585,10 @@ impl Fluree {
                         // authoring context to compact against — violations
                         // here name full IRIs.
                         txn_context: None,
-                        cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no
                         // `opts` payload.
                         inline_shape_bundle: None,
-                        cross_ledger_membership: None,
                         // Replay re-validates under the configured posture:
                         // any authoring-time softening was already applied
                         // (or denied) when the commit was first staged.
@@ -613,7 +596,14 @@ impl Fluree {
                         request_identity: None,
                         origin_validated_replay: true,
                     },
-                    // Commit replay resolves config internally.
+                    config.as_deref(),
+                    // Commit replay doesn't engage the cross-ledger dispatch
+                    // (the leader already validated against M when the
+                    // commit was authored); followers re-validate
+                    // same-ledger only.
+                    None,
+                    // Each pushed commit is governed by the state it applies
+                    // to, as when it was authored.
                     None,
                 )
                 .await
@@ -824,103 +814,84 @@ impl PushError {
     }
 }
 
-/// Result of graph routing derivation.
-///
-/// Maps each unique graph Sid to a GraphId. Resolved graphs (known to the
-/// binary store) use the store's existing GraphId; unresolved graphs get
-/// fresh sequential IDs. Used by `stage_flakes` and `is_currently_asserted`.
+/// The graph routing of a push: every graph the pushed commits' flakes
+/// write, with its ledger graph id.
 struct GraphRoutingResult {
-    /// All graph ID → Sid mappings (resolved + fabricated).
+    /// Graph id → graph Sid, for staging.
     graph_sids: HashMap<GraphId, Sid>,
 
-    /// `GraphId → graph IRI` for graphs resolved against the binary store.
-    ///
-    /// Used for per-graph SHACL config lookup during replay. Overlay-only
-    /// (unresolved) graphs are intentionally omitted — no per-graph config can
-    /// exist for a graph that isn't yet known to the store, so those fall back
-    /// to the ledger-wide SHACL baseline.
+    /// Graph id → graph IRI, for per-graph SHACL config during replay.
     #[cfg(feature = "shacl")]
     graph_iris: rustc_hash::FxHashMap<GraphId, String>,
 }
 
-/// Derive a `GraphId → Sid` routing map from flakes + binary store.
+/// Route every graph the pushed commits write to the id the ledger gives it.
 ///
-/// For each unique `Flake.g = Some(sid)`, resolves the graph IRI via the
-/// binary store's namespace dictionary, then looks up the `GraphId` in the
-/// binary store's graph dictionary.
+/// The ledger's graph registry owns graph ids: a graph it has registered
+/// keeps its id, and a graph the commits register (their `graph_delta`)
+/// gets the id applying them assigns
+/// ([`GraphRegistry::provisional_ids`](fluree_db_core::GraphRegistry::provisional_ids),
+/// over the same set `apply_pushed_commits_to_state` registers). Ids do not
+/// depend on whether the ledger is indexed.
 ///
-/// Graphs not found in the binary store are "overlay-only" — they exist in
-/// novelty but haven't been indexed yet. They still get fabricated sequential
-/// `GraphId`s (needed by `stage_flakes`), but range queries for them must use
-/// g_id=0 and post-filter by `flake.g` to avoid scanning non-existent binary
-/// index partitions.
-///
-/// Returns an empty routing when no named-graph flakes are present.
-fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingResult {
-    // Collect unique graph Sids from flakes.
-    let graph_sids_set: HashSet<Sid> = flakes.iter().filter_map(|f| f.g.clone()).collect();
-
-    if graph_sids_set.is_empty() {
-        return GraphRoutingResult {
-            graph_sids: HashMap::new(),
-            #[cfg(feature = "shacl")]
-            graph_iris: rustc_hash::FxHashMap::default(),
-        };
-    }
-
-    let binary_store: Option<Arc<BinaryIndexStore>> = state
-        .binary_store
-        .as_ref()
-        .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok());
-
-    let mut result: HashMap<GraphId, Sid> = HashMap::new();
-    #[cfg(feature = "shacl")]
-    let mut graph_iris: rustc_hash::FxHashMap<GraphId, String> = rustc_hash::FxHashMap::default();
-    let mut max_g_id: GraphId = 1; // 0=default, 1=txn-meta
-    let mut unresolved: Vec<Sid> = Vec::new();
-
-    for g_sid in &graph_sids_set {
-        let resolved = if let Some(store) = &binary_store {
-            let iri = match store.sid_to_iri(g_sid) {
-                Some(iri) => iri,
-                None => {
-                    tracing::error!(
-                        ns_code = g_sid.namespace_code,
-                        suffix = %g_sid.name,
-                        "sid_to_iri failed for graph SID — namespace code not in binary store"
-                    );
-                    continue; // skip unresolvable graph SID
-                }
-            };
-            store.graph_id_for_iri(&iri).map(|g_id| (g_id, iri))
-        } else {
-            None
-        };
-
-        if let Some((g_id, iri)) = resolved {
-            max_g_id = max_g_id.max(g_id);
-            result.insert(g_id, g_sid.clone());
-            #[cfg(feature = "shacl")]
-            graph_iris.insert(g_id, iri);
-            #[cfg(not(feature = "shacl"))]
-            drop(iri);
-        } else {
-            unresolved.push(g_sid.clone());
-        }
-    }
-
-    // Assign fabricated sequential GraphIds for unresolved graphs.
-    // Sort to ensure deterministic assignment across calls.
-    unresolved.sort();
-    for (next_id, g_sid) in (max_g_id + 1..).zip(unresolved) {
-        result.insert(next_id, g_sid);
-    }
-
-    GraphRoutingResult {
-        graph_sids: result,
+/// A flake in a graph that is neither registered nor registered by the
+/// commits is refused: no id is ever given to it, so the ledger could not
+/// load it.
+fn derive_graph_routing(
+    state: &LedgerState,
+    decoded: &[PushCommitDecoded],
+) -> std::result::Result<GraphRoutingResult, PushError> {
+    let mut routing = GraphRoutingResult {
+        graph_sids: HashMap::new(),
         #[cfg(feature = "shacl")]
-        graph_iris,
+        graph_iris: rustc_hash::FxHashMap::default(),
+    };
+    let graph_sids: HashSet<&Sid> = decoded
+        .iter()
+        .flat_map(|c| &c.commit.flakes)
+        .filter_map(|f| f.g.as_ref())
+        .collect();
+    if graph_sids.is_empty() {
+        return Ok(routing);
     }
+
+    let registered_by_push: Vec<String> = decoded
+        .iter()
+        .flat_map(|c| c.commit.graph_delta.values().cloned())
+        .collect();
+    let ids = state
+        .snapshot
+        .graph_registry
+        .provisional_ids(&registered_by_push);
+    // The commits' graph Sids may use namespace codes they introduce.
+    let pushed_prefix = |code: u16| {
+        decoded
+            .iter()
+            .find_map(|c| c.commit.namespace_delta.get(&code))
+    };
+
+    for g_sid in graph_sids {
+        let iri = state
+            .snapshot
+            .decode_sid(g_sid)
+            .or_else(|| pushed_prefix(g_sid.namespace_code).map(|p| format!("{p}{}", g_sid.name)))
+            .ok_or_else(|| {
+                PushError::Invalid(format!(
+                    "a pushed flake names a graph in unknown namespace {}",
+                    g_sid.namespace_code
+                ))
+            })?;
+        let g_id = *ids.get(iri.as_str()).ok_or_else(|| {
+            PushError::Invalid(format!(
+                "pushed flakes write graph <{iri}>, which neither this ledger nor the \
+                 pushed commits register"
+            ))
+        })?;
+        routing.graph_sids.insert(g_id, g_sid.clone());
+        #[cfg(feature = "shacl")]
+        routing.graph_iris.insert(g_id, iri);
+    }
+    Ok(routing)
 }
 
 /// Build a reverse lookup from graph Sid → GraphId.
@@ -1259,82 +1230,62 @@ async fn stage_commit_flakes(
 }
 
 async fn assert_retractions_exist(
-    snapshot: &fluree_db_core::LedgerSnapshot,
-    overlay: &dyn fluree_db_core::OverlayProvider,
-    to_t: i64,
+    state: &LedgerState,
     flakes: &[Flake],
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<(), PushError> {
+    let mut at = Vec::new();
+    let mut items = Vec::new();
     for (idx, f) in flakes.iter().enumerate() {
         if f.op {
             continue;
         }
-
-        if !is_currently_asserted(snapshot, overlay, to_t, f, reverse_graph).await? {
-            return Err(PushError::Invalid(format!(
-                "retraction invariant violated at flake[{idx}]: retract targets non-existent assertion"
-            )));
-        }
+        at.push(idx);
+        items.push((retraction_slot(f, reverse_graph)?, f));
     }
-    Ok(())
+    if items.is_empty() {
+        return Ok(());
+    }
+    // Read through `CurrentFacts`, which stamps the graph on index rows (a
+    // range read returns them with `g: None` whatever graph they live in),
+    // reads each slot once, and names a fact by the identity storage gives
+    // it, so a retraction carrying a term the index keeps less of (a big
+    // integer's XSD subtype) names the stored fact.
+    let named = fluree_db_transact::CurrentFacts::new(state)
+        .named_by(&items)
+        .await
+        .map_err(|e| PushError::Internal(e.to_string()))?;
+    match at.iter().zip(&named).find(|(_, fact)| fact.is_none()) {
+        Some((idx, _)) => Err(PushError::Invalid(format!(
+            "retraction invariant violated at flake[{idx}]: retract targets non-existent assertion"
+        ))),
+        None => Ok(()),
+    }
 }
 
-async fn is_currently_asserted(
-    snapshot: &fluree_db_core::LedgerSnapshot,
-    overlay: &dyn fluree_db_core::OverlayProvider,
-    to_t: i64,
+/// The slot whose stored fact `target` retracts, in the graph the push's
+/// routing gives it.
+fn retraction_slot(
     target: &Flake,
     reverse_graph: &HashMap<Sid, GraphId>,
-) -> std::result::Result<bool, PushError> {
-    // Resolve the correct graph for this flake's range query.
-    //
+) -> std::result::Result<fluree_db_transact::Slot, PushError> {
     // With per-graph novelty, ALL graphs (including overlay-only ones) have proper
-    // GraphIds assigned by the cumulative routing. The overlay returns only that
-    // graph's flakes, so no post-filtering by flake.g is needed for graph isolation.
+    // GraphIds assigned by the cumulative routing.
     let g_id = match &target.g {
         None => 0,
         Some(g_sid) => *reverse_graph.get(g_sid).ok_or_else(|| {
             PushError::Internal(format!(
-                "is_currently_asserted: graph Sid {g_sid:?} not found in reverse_graph map \
+                "retraction_slot: graph Sid {g_sid:?} not found in reverse_graph map \
                  — derive_graph_routing should have included it",
             ))
         })?,
     };
-
-    let rm = RangeMatch::new()
-        .with_subject(target.s.clone())
-        .with_predicate(target.p.clone())
-        .with_object(target.o.clone())
-        .with_datatype(target.dt.clone());
-
-    let found = range_with_overlay(
-        snapshot,
+    Ok(fluree_db_transact::Slot {
         g_id,
-        overlay,
-        IndexType::Spot,
-        RangeTest::Eq,
-        rm,
-        RangeOptions::new().with_to_t(to_t),
-    )
-    .await
-    .map_err(|e| PushError::Internal(e.to_string()))?;
-
-    let mut last_t: Option<i64> = None;
-    let mut last_op: bool = false;
-
-    for f in found {
-        // Exact match on graph + metadata. (RangeMatch does not include these fields.)
-        if f.g != target.g || f.m != target.m {
-            continue;
-        }
-        // Current truth is the op of the latest t <= to_t.
-        if last_t.map(|t| f.t > t).unwrap_or(true) {
-            last_t = Some(f.t);
-            last_op = f.op;
-        }
-    }
-
-    Ok(last_t.is_some() && last_op)
+        g_sid: target.g.clone(),
+        s: target.s.clone(),
+        p: target.p.clone(),
+    })
 }
 
 async fn write_required_blobs<S>(

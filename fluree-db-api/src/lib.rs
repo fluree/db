@@ -37,13 +37,16 @@
 pub mod admin;
 pub mod authorization;
 pub use authorization::PolicyAuthorization;
+pub mod advisory;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
 mod branch_validation;
 mod commit_data;
 pub mod commit_transfer;
+mod config_guard;
 pub mod config_resolver;
+mod config_vocab;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
@@ -102,7 +105,10 @@ mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
+#[cfg(feature = "native")]
+pub mod shared;
 pub(crate) mod sparql_lang;
+pub mod target_dataset;
 mod time_resolve;
 mod transaction;
 pub mod tx;
@@ -152,8 +158,9 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
-    TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
+    sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
+    DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
@@ -193,7 +200,7 @@ pub use ledger_manager::{
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
     UpdatePlan, WritePathStats,
 };
-pub use ledger_view::{CommitRef, LedgerView, COMMIT_PREFIX_MIN_LEN};
+pub use ledger_view::{CommitRef, GraphNames, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
@@ -220,6 +227,13 @@ pub use rebase::{
 };
 pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
+#[cfg(feature = "native")]
+pub use shared::{SharedFluree, SharedOptions};
+pub use target_dataset::{
+    jsonld_dataset_ledger, jsonld_lane, jsonld_names_dataset, jsonld_view_ledger,
+    resolve_in_target, resolve_jsonld_dataset_in_target, GraphLookup, InTarget, JsonLdInTarget,
+    JsonLdLane, SingleFrom,
+};
 pub use transaction::{CypherReturn, Savepoint, Transaction, TransactionOptions, TxnOperation};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
@@ -354,6 +368,9 @@ pub use fluree_db_query::{fast_paths_disabled, set_fast_paths_disabled};
 // Re-export for lower-level pattern-based queries (internal/advanced use)
 pub use fluree_db_query::{Term, TriplePattern};
 // Re-export parse types for query results
+pub use fluree_db_query::datalog_rules::{
+    Absence, Derivation, ExplainedFact, Explanation, GroupInputs, Premise,
+};
 pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
@@ -363,10 +380,12 @@ pub use fluree_db_transact::{
 };
 
 // Re-export SPARQL types (product feature; always enabled)
+pub use advisory::QueryAdvisory;
 pub use fluree_db_sparql::{
-    lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError, ParamMap as SparqlParamMap,
-    ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
+    lower_sparql, parse_sparql, resolve_dataset_clause, validate as validate_sparql,
+    Capabilities as SparqlCapabilities, Diagnostic as SparqlDiagnostic,
+    LowerError as SparqlLowerError, ParamMap as SparqlParamMap, ParseOutput as SparqlParseOutput,
+    Prologue as SparqlPrologue, QueryBody as SparqlQueryBody, ResolvedDatasetClause,
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,
 };
@@ -1497,6 +1516,10 @@ pub struct FlureeBuilder {
     /// several processes. See `FileStorage::with_wal_owner`.
     #[cfg(feature = "native")]
     storage_wal_owner: Option<String>,
+    /// Hold the file storage root's lock for the instance's lifetime.
+    /// See [`FlureeBuilder::with_storage_lock`].
+    #[cfg(feature = "native")]
+    storage_lock: bool,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
     encryption_key: Option<ConfiguredKey>,
     /// Optional ledger cache configuration (enables LedgerManager)
@@ -1767,6 +1790,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1790,6 +1815,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1869,6 +1896,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2100,6 +2129,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2206,6 +2237,61 @@ impl FlureeBuilder {
     pub fn with_storage_wal_owner(mut self, owner: impl Into<String>) -> Self {
         self.storage_wal_owner = Some(owner.into());
         self
+    }
+
+    /// Hold an exclusive lock on the file storage root for as long as the
+    /// built instance is open, so nothing else opens the root meanwhile.
+    ///
+    /// One instance owns a root: a second instance on it, in another
+    /// process or this one, does not see the first's commits, and both run
+    /// indexing and sweeps over the same files. With the lock, building that
+    /// second instance fails with [`ApiError::StorageInUse`]. Share the
+    /// built `Fluree` by cloning it within a process, and run a server to
+    /// share the root across processes.
+    ///
+    /// The lock lasts as long as the instance: it is released once the
+    /// instance and every clone of it are dropped, or its process exits,
+    /// however it exits. Any error taking it fails the build, including a
+    /// filesystem that cannot lock, unless
+    /// [`fluree_db_core::ALLOW_UNLOCKED_ENV_VAR`] allows opening such a root
+    /// unprotected. Only file storage is locked. A root shared on purpose
+    /// under per-process WALs ([`Self::with_storage_wal_owner`]) cannot take
+    /// it.
+    #[cfg(feature = "native")]
+    pub fn with_storage_lock(mut self) -> Self {
+        self.storage_lock = true;
+        self
+    }
+
+    /// The root lock [`Self::with_storage_lock`] asked for, taken before the
+    /// root is swept or its WAL replayed.
+    #[cfg(feature = "native")]
+    fn lock_storage_root(&self, path: &str) -> Result<Option<Arc<fluree_db_core::RootLock>>> {
+        if !self.storage_lock {
+            return Ok(None);
+        }
+        if self.storage_wal_owner.is_some() {
+            return Err(ApiError::config(
+                "a storage lock cannot be combined with a shared WAL owner: \
+                 the owner exists for roots that several processes open",
+            ));
+        }
+        use fluree_db_core::RootLockError;
+        match fluree_db_core::RootLock::acquire(std::path::Path::new(path)) {
+            Ok(lock) => Ok(Some(Arc::new(lock))),
+            Err(RootLockError::Held { holder }) => Err(ApiError::StorageInUse {
+                root: path.to_string(),
+                holder,
+            }),
+            Err(RootLockError::Unsupported(error)) => Err(ApiError::config(format!(
+                "storage '{path}' is on a filesystem that cannot lock it ({error}); set \
+                 {}=true to open it without protection from a second process",
+                fluree_db_core::ALLOW_UNLOCKED_ENV_VAR
+            ))),
+            Err(RootLockError::Io(error)) => Err(ApiError::Core(fluree_db_core::Error::io(
+                format!("cannot lock storage '{path}': {error}"),
+            ))),
+        }
     }
 
     /// Apply the builder's durability and log owner, if chosen, to a storage
@@ -2500,9 +2586,9 @@ impl FlureeBuilder {
     /// From async code, use [`Self::build_async`].
     #[cfg(feature = "native")]
     pub fn build(mut self) -> Result<Fluree> {
-        let storage = self.open_file_storage()?;
+        let (storage, root_lock) = self.open_file_storage()?;
         storage.recover_wal()?;
-        Ok(self.build_file(storage))
+        Ok(self.build_file(storage).holding(root_lock))
     }
 
     /// Build a file-backed Fluree instance, recovering the storage root's WAL
@@ -2511,25 +2597,44 @@ impl FlureeBuilder {
     /// It builds the same instance as [`Self::build`].
     #[cfg(feature = "native")]
     pub async fn build_async(mut self) -> Result<Fluree> {
-        let storage = self.open_file_storage()?;
-        storage.recover_wal_async().await?;
-        Ok(self.build_file(storage))
+        let (storage, root_lock) = self.open_file_storage()?;
+        let root_lock = Self::recover_holding(&storage, root_lock).await?;
+        Ok(self.build_file(storage).holding(root_lock))
     }
 
-    /// Takes the builder's storage path and opens its file storage.
+    /// Replay `storage`'s WAL in a task that holds `root_lock` until the
+    /// replay ends. The replay runs on the blocking pool and goes on when the
+    /// caller stops waiting, so the lock must not go with the caller's future.
+    #[cfg(feature = "native")]
+    async fn recover_holding(
+        storage: &FileStorage,
+        root_lock: Option<Arc<fluree_db_core::RootLock>>,
+    ) -> Result<Option<Arc<fluree_db_core::RootLock>>> {
+        let storage = storage.clone();
+        tokio::spawn(async move { storage.recover_wal_async().await.map(|()| root_lock) })
+            .await
+            .map_err(|e| ApiError::internal(format!("WAL recovery task failed: {e}")))?
+            .map_err(Into::into)
+    }
+
+    /// Takes the builder's storage path and opens its file storage, with
+    /// the root's lock when one was asked for.
     ///
     /// Building an instance is startup, so this starts the sweep of staging
     /// files a crash left behind. The sweep runs once per base path per
     /// process. The file nameservice shares the tree and needs no sweep of its own.
     #[cfg(feature = "native")]
-    fn open_file_storage(&mut self) -> Result<FileStorage> {
+    fn open_file_storage(
+        &mut self,
+    ) -> Result<(FileStorage, Option<Arc<fluree_db_core::RootLock>>)> {
         let path = self
             .storage_path
             .take()
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
+        let root_lock = self.lock_storage_root(&path)?;
         let storage = self.file_storage(&path);
         storage.sweep_orphaned_staging();
-        Ok(storage)
+        Ok((storage, root_lock))
     }
 
     /// Assembles a file-backed instance over `storage`, whose WAL is already recovered.
@@ -3204,6 +3309,8 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             secret_resolver,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(feature = "native")]
+            root: RootHold::default(),
         }
     }
 
@@ -3343,6 +3450,7 @@ impl FlureeBuilder {
                 .ok_or_else(|| ApiError::config("File storage requires filePath"))?
                 .clone();
 
+            let root_lock = self.lock_storage_root(path.as_ref())?;
             let mut file_storage = self.file_storage(path.as_ref());
             // A query peer must recover the preceding writer's tail without
             // retaining its WAL lock. Any incidental storage writes remain
@@ -3355,7 +3463,7 @@ impl FlureeBuilder {
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
-            file_storage.recover_wal_async().await?;
+            let root_lock = Self::recover_holding(&file_storage, root_lock).await?;
             let ns_storage = file_storage.clone();
             let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
 
@@ -3400,7 +3508,8 @@ impl FlureeBuilder {
                 self.remote_mounts,
                 #[cfg(feature = "iceberg")]
                 self.secret_resolver,
-            ))
+            )
+            .holding(root_lock))
         }
     }
 
@@ -3556,6 +3665,21 @@ pub struct Fluree {
     secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
+    /// What this instance holds of its file storage root.
+    #[cfg(feature = "native")]
+    root: RootHold,
+}
+
+/// What an instance holds of its file storage root.
+#[cfg(feature = "native")]
+#[derive(Clone, Default)]
+struct RootHold {
+    /// The root's lock, when the builder took one. Every clone shares it,
+    /// so it is released only when the last clone is dropped.
+    lock: Option<Arc<fluree_db_core::RootLock>>,
+    /// Set for an instance [`SharedFluree`] handles own. Its lifecycle is
+    /// theirs, so [`Fluree::disconnect`] leaves it alone.
+    owned_by_shared_handles: bool,
 }
 
 impl Fluree {
@@ -3596,6 +3720,8 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(feature = "native")]
+            root: RootHold::default(),
         }
     }
 
@@ -3622,7 +3748,21 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(feature = "native")]
+            root: RootHold::default(),
         }
+    }
+
+    #[cfg(feature = "native")]
+    fn holding(mut self, root_lock: Option<Arc<fluree_db_core::RootLock>>) -> Self {
+        self.root.lock = root_lock;
+        self
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn owned_by_shared_handles(mut self) -> Self {
+        self.root.owned_by_shared_handles = true;
+        self
     }
 
     /// Set the indexing mode
@@ -4197,6 +4337,7 @@ impl Fluree {
                         &ledger_id,
                         None,
                         Some(&index_config),
+                        None,
                         None,
                         None,
                         None,
@@ -4776,23 +4917,43 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        // Not a call to `ledger_handle`: awaiting it would nest one more future
+        // in every caller's, and some test futures sit at the type-layout
+        // depth limit.
         let ledger_id = LedgerId::parse(ledger_id)?;
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(&ledger_id).await,
-            None => {
-                // Caching disabled: load fresh, wrap in ephemeral handle.
-                // Note: This handle is NOT cached; each call loads fresh.
-                // Extract the concrete BinaryIndexStore from the state's TypeErasedStore
-                // so the handle's binary_store stays coherent with db.range_provider.
-                let state = self.ledger(&ledger_id).await?;
-                let binary_store = state.binary_store.as_ref().and_then(|te| {
-                    te.0.clone()
-                        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                        .ok()
-                });
-                Ok(LedgerHandle::new(ledger_id, state, binary_store))
-            }
+            None => Ok(Self::ephemeral_handle(
+                &ledger_id,
+                self.ledger(&ledger_id).await?,
+            )),
         }
+    }
+
+    /// [`ledger_cached`](Self::ledger_cached) for an id the caller has
+    /// already parsed (a route's path ledger): the handle is found by the id
+    /// as it stands, with no second parse.
+    pub async fn ledger_handle(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
+        match &self.ledger_manager {
+            Some(mgr) => mgr.get_or_load(ledger_id).await,
+            None => Ok(Self::ephemeral_handle(
+                ledger_id,
+                self.ledger(ledger_id).await?,
+            )),
+        }
+    }
+
+    /// Caching disabled: a fresh load wrapped in an ephemeral handle, which is
+    /// NOT cached (each call loads fresh). The concrete `BinaryIndexStore` is
+    /// taken from the state's type-erased store, so the handle's binary store
+    /// stays coherent with the snapshot's range provider.
+    fn ephemeral_handle(ledger_id: &LedgerId, state: LedgerState) -> LedgerHandle {
+        let binary_store = state.binary_store.as_ref().and_then(|te| {
+            te.0.clone()
+                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+                .ok()
+        });
+        LedgerHandle::new(ledger_id.clone(), state, binary_store)
     }
 
     /// Disconnect a ledger from the connection cache
@@ -4842,11 +5003,30 @@ impl Fluree {
     /// 2. Evicts all cached ledgers from the ledger manager (with a shutdown flag
     ///    that prevents in-flight loaders from re-inserting)
     /// 3. Clears the R2RML mapping cache
+    /// 4. Retires a file storage root's WAL
+    ///
+    /// It does not release a lock `FlureeBuilder::with_storage_lock` took:
+    /// that lasts until the instance's last clone is dropped. An instance
+    /// that `SharedFluree` handles own is theirs to shut down, so this
+    /// does nothing to it; close the handles instead.
     ///
     /// For full termination, the caller should also:
     /// - Abort the maintenance task JoinHandle (if spawned via `spawn_maintenance`)
     /// - Drop the Fluree instance (stops the indexer worker)
     pub async fn disconnect(&self) {
+        #[cfg(feature = "native")]
+        if self.root.owned_by_shared_handles {
+            tracing::warn!(
+                "disconnect() on an instance that SharedFluree handles own does nothing; \
+                 close the handles instead"
+            );
+            return;
+        }
+        self.shut_down().await;
+    }
+
+    /// [`Self::disconnect`]'s work, for the owner of the instance's lifecycle.
+    pub(crate) async fn shut_down(&self) {
         // 1. Cancel background indexing and wait for idle
         if let tx::IndexingMode::Background(handle) = &self.indexing_mode {
             handle.cancel_all().await;
@@ -6115,3 +6295,44 @@ mod tests {
 
 #[cfg(all(test, feature = "shacl"))]
 mod shacl_tests;
+
+#[cfg(all(test, feature = "native"))]
+mod storage_lock_tests {
+    use super::*;
+
+    /// One blocking thread, held busy, queues the build's WAL replay behind
+    /// it; the build is then dropped mid-replay.
+    #[test]
+    fn a_cancelled_build_keeps_the_root_locked_until_its_replay_ends() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+            });
+            let build = FlureeBuilder::file(dir.path().to_str().unwrap())
+                .without_indexing()
+                .with_storage_lock()
+                .build_async();
+
+            let cancelled = tokio::time::timeout(std::time::Duration::ZERO, build).await;
+
+            assert!(cancelled.is_err(), "the replay was meant to be queued");
+            assert!(
+                matches!(
+                    fluree_db_core::RootLock::acquire(dir.path()),
+                    Err(fluree_db_core::RootLockError::Held { .. })
+                ),
+                "the root was released while its replay was still queued"
+            );
+            release.send(()).unwrap();
+            busy.await.unwrap();
+        });
+    }
+}

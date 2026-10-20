@@ -191,13 +191,17 @@ fluree branch diff my-branch --target main
 fluree branch diff my-branch --target main --conflict-details
 ```
 
-The preview stages the merge's resolved change set on the target and validates it against the target's SHACL shapes, through the same code path the merge uses. `mergeable: yes` means neither the strategy nor the target's shapes will reject the merge; otherwise the `validation:` line carries the report the merge would fail with. Other conditions still apply at commit time, such as novelty backpressure on a ledger due for indexing. Pass `--no-validate` for a cheaper count-only preview.
+The preview stages the merge's resolved change set on the target and validates it against the target's SHACL shapes and uniqueness constraints and re-checks its config groups, through the same code path the merge uses (a fast-forward only when the target's config enables SHACL or uniqueness, or the adopted commits carry config settings, as the merge does). `mergeable: yes` means neither the strategy nor the target's shapes will reject the merge; otherwise the `validation:` line carries the report the merge would fail with. Other conditions still apply at commit time, such as novelty backpressure on a ledger due for indexing. Pass `--no-validate` for a cheaper count-only preview.
 
 See what's different between two branches:
 
 ```bash
-# Query branch for entities not in main
-fluree query --ledger mydb:my-branch 'SELECT ?s ?p ?o WHERE {
+# Query branch for entities not in main. The SERVICE endpoint must be in the
+# query's dataset, so name both branches.
+fluree query --ledger mydb:my-branch 'SELECT ?s ?p ?o
+FROM <mydb:my-branch>
+FROM NAMED <mydb:main>
+WHERE {
   ?s ?p ?o .
   FILTER NOT EXISTS {
     SERVICE <fluree:ledger:mydb:main> { ?s ?p ?o }

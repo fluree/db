@@ -35,6 +35,8 @@ mod it_query_fulltext;
 mod it_query_geo;
 #[path = "it_query_geo_search.rs"]
 mod it_query_geo_search;
+#[path = "it_query_graph_names.rs"]
+mod it_query_graph_names;
 #[path = "it_query_grouping.rs"]
 mod it_query_grouping;
 #[path = "it_query_jsonld.rs"]
@@ -49,6 +51,8 @@ mod it_query_jsonld_grouped_projection;
 mod it_query_list_functions;
 #[path = "it_query_misc.rs"]
 mod it_query_misc;
+#[path = "it_query_optional_encoded_bindings.rs"]
+mod it_query_optional_encoded_bindings;
 #[path = "it_query_optional_hashjoin.rs"]
 mod it_query_optional_hashjoin;
 #[path = "it_query_post_order_limit.rs"]

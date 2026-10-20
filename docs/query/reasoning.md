@@ -57,6 +57,24 @@ Each mode has exactly one accepted string (case-insensitive):
 | `"datalog"` | Datalog rule execution |
 | `"none"` | Disable all reasoning |
 
+### Inside `opts`
+
+The reasoning keys (`reasoning`, `rules`, `ontology`, `reasoningBudget` and
+`reasoningTime`) can also go inside the query's `opts` object. Each key is
+read from the top level when it is there and from `opts` otherwise, so
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "ex:p": "?o"},
+  "reasoningBudget": {"maxFacts": 20000000},
+  "opts": {"reasoning": "datalog"}
+}
+```
+
+runs datalog under that budget. When both carry the same key, the top
+level's value is used.
+
 ## Default behavior
 
 Reasoning is **opt-in**. When the `reasoning` key is absent from a query, no
@@ -212,7 +230,13 @@ Enable RDFS + OWL 2 RL + Datalog together:
 ```
 
 OWL 2 RL facts are materialized first, then Datalog rules run over the
-combined base + OWL data, and finally RDFS query rewriting is applied.
+combined base + OWL data. OWL 2 RL materializes everything RDFS and OWL 2 QL
+query rewriting would add, so with `owl2rl` on the rewrite is skipped.
+
+Rule bodies don't use the `rdfs` and `owl2ql` rewrites. Under either mode
+without `owl2rl`, a program with a rule that negates or aggregates is
+refused: the rule would read an entailment the query sees as absent. Add
+`owl2rl`. See [Datalog rules](datalog-rules.md#negation).
 
 A rule that fails to parse or validate — a stored `f:rule` as much as a
 query-time one — fails the query with an error naming the rule and the
@@ -277,11 +301,14 @@ analytics with hypothetical sub-class chains.
 ## Interaction with ledger configuration
 
 If `f:reasoningDefaults` is set in the ledger configuration graph (see
-[Setting groups](../ledger-config/setting-groups.md)), those modes are the
-baseline for every query. The per-query `reasoning` parameter can:
+[Setting groups](../ledger-config/setting-groups.md)), those modes apply to
+every query that does not set `reasoning` itself. The per-query `reasoning`
+parameter can:
 
-- **Add modes** — the query modes are merged with the defaults.
-- **Disable all** — `"reasoning": "none"` overrides the defaults entirely.
+- **Replace them** — a query that sets `reasoning` runs its own modes
+  instead. The two are not merged, so a query that wants a default mode and
+  another lists both.
+- **Disable all** — `"reasoning": "none"` runs with no reasoning.
 
 The `f:overrideControl` setting on the ledger config determines whether
 query-time overrides are allowed. See
@@ -330,6 +357,10 @@ just logged:
 - `rules_fired` breaks the tally down per rule. It counts derived **facts**
   per rule, not rule applications: a rule that matches a thousand rows and
   derives one new fact from them counts once.
+- When datalog rules are capped, `capped_rules` names the rules that were
+  running when the cap fired and `pending_rules` the rules it kept from
+  running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
+  time they returned (see [Datalog rules](datalog-rules.md)).
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):
@@ -346,6 +377,17 @@ The budget is configurable at three levels (highest precedence first):
 3. **Server-wide** — `FLUREE_REASONING_MAX_FACTS` /
    `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB`
    environment variables.
+
+**The query's own limits apply too.** Materialization runs on the query's
+behalf, so cancelling the query — a client disconnect, or a query timeout —
+stops OWL 2 RL and datalog rule bodies mid-run, and the query fails with the
+cancellation rather than answering over a partial closure. The work counts
+toward the query's fuel: OWL 2 RL charges 0.001 fuel for each fact a round
+processes, and rule bodies are charged like any query, including the
+property paths a transitive-closure rule runs as. Only the
+query that computes a materialization pays for it; queries answered from the
+cached result do not, and a run that was cancelled or ran out of fuel caches
+nothing.
 
 ## Performance considerations
 
@@ -373,6 +415,8 @@ Reasoning composes with view policy, but mind the contract when both are on:
 - **OWL 2 QL** and **RDFS** rewrite the query and execute under your identity, so they are filtered like any normal query.
 - **OWL 2 RL** and **datalog** materialize derived facts into the query overlay; those facts are filtered by the **same per-flake view policy as base data**. A derived flake you may not view is dropped.
 - The engine filters a derived fact by its own `(subject, predicate, object)` — **not** by the base facts it was derived from. A rule or ontology axiom can therefore re-express hidden data under a viewable predicate (e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule deriving `ex:isHighEarner` from a hidden `ex:salary`) and the derived value will surface.
+- Materialized facts are computed once over all of the ledger's data and shared by every caller; the policy applies when rows are read, not while facts are derived.
+- The two approaches can therefore answer the same query differently under the same policy. With `ex:ssn rdfs:subPropertyOf ex:identifier` and `ex:ssn` hidden, a query for `ex:identifier` returns nothing under `"rdfs"`, because the rewritten query scans the hidden `ex:ssn`. Under `"owl2rl"` it returns the value, because the derived `ex:identifier` fact is itself viewable.
 
 **If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden.
 

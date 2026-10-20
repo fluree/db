@@ -578,6 +578,124 @@ async fn indexed_repeated_vars_in_triple_pattern_do_not_duplicate_schema() {
         .await;
 }
 
+/// A repeated variable that puts a subject or object beside a predicate
+/// (`?x ?x ?o`, `?s ?p ?p`) compares them as Sids. A subject first written
+/// after the index has an id above the persisted watermark, so it must
+/// resolve from novelty, not the persisted dictionaries.
+#[tokio::test]
+async fn indexed_repeated_vars_match_subjects_first_written_in_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-repeated-vars-novelty:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let indexed = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:a": {"@id": "ex:b"}},
+                    {"@id": "ex:s", "ex:q": {"@id": "ex:q"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &indexed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let novel = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:c", "ex:c": {"@id": "ex:d"}},
+                    {"@id": "ex:t", "ex:r": {"@id": "ex:r"}}
+                ]
+            });
+            fluree
+                .insert(ledger1, &novel)
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("load view");
+            let subject_is_predicate = json!([["ex:a", "ex:b"], ["ex:c", "ex:d"]]);
+            let object_is_predicate = json!([["ex:s", "ex:q"], ["ex:t", "ex:r"]]);
+
+            let sparql = [
+                (
+                    "PREFIX ex: <http://example.org/ns/> SELECT ?x ?o WHERE { ?x ?x ?o }",
+                    &subject_is_predicate,
+                ),
+                (
+                    "PREFIX ex: <http://example.org/ns/> SELECT ?s ?p WHERE { ?s ?p ?p }",
+                    &object_is_predicate,
+                ),
+            ];
+            for (query, expected) in sparql {
+                let result = fluree
+                    .query(&view, QueryInput::Sparql(query))
+                    .await
+                    .unwrap_or_else(|e| panic!("{query}: {e}"));
+                let rows = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+                assert_eq!(normalize_rows(&rows), normalize_rows(expected), "{query}");
+            }
+
+            let jsonld = [
+                (
+                    json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "select": ["?x", "?o"],
+                        "where": {"@id": "?x", "?x": {"@id": "?o"}}
+                    }),
+                    &subject_is_predicate,
+                ),
+                (
+                    json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "select": ["?s", "?p"],
+                        "where": {"@id": "?s", "?p": {"@id": "?p"}}
+                    }),
+                    &object_is_predicate,
+                ),
+            ];
+            for (query, expected) in jsonld {
+                let result = fluree
+                    .query(&view, QueryInput::JsonLd(&query))
+                    .await
+                    .unwrap_or_else(|e| panic!("{query}: {e}"));
+                let rows = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+                assert_eq!(normalize_rows(&rows), normalize_rows(expected), "{query}");
+            }
+        })
+        .await;
+}
+
 /// Regression: a two-pattern join that shares both subject and object variables
 /// (e.g. `?s p1 ?o . ?s p2 ?o`) must not be planned as a PropertyJoinOperator
 /// (which assumes distinct object vars) and must execute without duplicate schema.

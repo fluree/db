@@ -277,16 +277,22 @@ CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
 
 **Remote time travel (`--at`)** routes through the **ledger-scoped** endpoints
-(`POST /query/{ledger}`, etc.): the URL path drives the bearer's
-`can_read` check (so a token scoped to `mydb:main` matches), and the
-time-travel suffix rides in the body's `from` (`mydb:main@t:N` for JSON-LD)
-or in an injected `FROM <mydb:main@t:N>` clause (for SPARQL). Posting to
-the connection-level endpoint instead would force auth to derive the
-ledger ID from `from` and reject scoped tokens.
+with the time in the path (`POST /query/{ledger}@t:N`,
+`POST /explain/{ledger}@t:N`): the URL path drives the bearer's `can_read`
+check (so a token scoped to `mydb:main` matches), and the query is sent as
+written, so its own `FROM` / `from` keeps what it names and is read at that
+time, and a query with no dataset clause reads the ledger's named graphs too.
+A server that predates path pins (before v4.2.2) refuses the pinned path as an
+invalid ledger id (v4.1 and v4.2.1 answer with a 500 that names it); the CLI
+then falls back to the older form, which rides the time in
+the body's `from` (`mydb:main@t:N` for JSON-LD) or in an injected
+`FROM <mydb:main@t:N>` clause (for SPARQL). NDJSON (`--format ndjson`) and
+TSV/CSV still use that older form. Posting to the connection-level endpoint
+instead would force auth to derive the ledger ID from `from` and reject scoped
+tokens.
 
-**Remote `--at --explain` flows through the same ledger-scoped path.** The
-CLI injects the time-travel suffix into `from` (JSON-LD) or as a `FROM
-<ledger@t:N>` clause (SPARQL), then POSTs to `POST /explain/{ledger}`.
+**Remote `--at --explain` flows through the same ledger-scoped path**, as
+`POST /explain/{ledger}@t:N`.
 The server's explain handlers route those requests through a
 dataset-aware path so the request is processed against a view at the
 requested `t`. Note that Fluree maintains one set of index stats
@@ -983,14 +989,16 @@ These rules are not negotiable; the CLI and other clients depend on them:
 11. **Validation.** When `include_validation == true` (the default) and
    `!fast_forward`, stage the change set from rule 10, resolved under
    `strategy` against the **uncapped** conflict set, onto the target's
-   current state and run the same SHACL validation `POST /merge` runs for
-   that strategy. Report `validation: { conforms, report? }`, where
+   current state and run the same validation (SHACL, uniqueness and the
+   config-group checks) `POST /merge` runs for that strategy. Report `validation: { conforms, report? }`, where
    `report` is present only when `conforms == false` and is the message
    the merge would fail with. `mergeable` is then
    `strategy-applies && validation.conforms`; with
    `include_validation=false` it is the strategy signal alone and
-   `validation` is absent. Fast-forward previews carry no `validation`:
-   the adopted commits were validated when authored. Under
+   `validation` is absent. A fast-forward preview carries `validation`
+   only when the target's config enables SHACL or uniqueness, or the
+   commits it adopts carry config settings (a field the config reader reads, or a write to a config or txn-meta graph of this ledger), as only
+   then does the merge check them. Under
    `strategy=abort` with conflicts the merge never reaches validation, so
    `validation` is absent there too. This rule is what makes
    `mergeable=true` mean "neither the strategy nor the shapes reject it"
@@ -1519,7 +1527,7 @@ Content-Type: application/json
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address any other graph itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
 | `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
 | `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |

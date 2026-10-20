@@ -110,7 +110,7 @@ impl TopKBound {
         Self {
             k,
             ascending,
-            heap: BinaryHeap::with_capacity(k.saturating_add(1)),
+            heap: BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(k)),
         }
     }
 
@@ -329,6 +329,22 @@ mod tests {
         assert!(!b.can_stop(Some(&f(11.0))));
         // no bound (all-null column) → never stop (must read).
         assert!(!b.can_stop(None));
+    }
+
+    /// `k` is the query's `LIMIT + OFFSET`, which may be far larger than any
+    /// table: the heap starts at the shared cap and grows as values arrive.
+    #[test]
+    fn large_k_starts_at_the_capped_capacity() {
+        for k in [i64::MAX as usize, usize::MAX] {
+            let mut b = TopKBound::new(k, false);
+            assert_eq!(
+                b.heap.capacity(),
+                fluree_db_core::topk::MAX_INITIAL_CAPACITY
+            );
+            b.observe_all([f(10.0), f(30.0), f(20.0)]);
+            assert!(!b.is_full(), "3 values never fill k={k}");
+            assert!(!b.can_stop(Some(&f(1.0))));
+        }
     }
 
     #[test]

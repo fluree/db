@@ -26,6 +26,7 @@ pub use read::binary_index_store::{
     BinaryGraphView, BinaryIndexStore, RemoteLeafFetch, SharedLeafBytes,
 };
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
+pub use read::graph_names::HeadGraphNames;
 pub use read::leaflet_cache::{
     CachedOverlaySegment, LeafletCache, LeafletCacheKey, V3BatchCacheKey,
 };

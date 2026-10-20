@@ -1,18 +1,44 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_datalog_aggregates.rs"]
+mod it_datalog_aggregates;
+#[path = "it_datalog_closure_paths.rs"]
+mod it_datalog_closure_paths;
+#[path = "it_datalog_explain.rs"]
+mod it_datalog_explain;
+#[path = "it_datalog_named_graphs.rs"]
+mod it_datalog_named_graphs;
+#[path = "it_datalog_negation.rs"]
+mod it_datalog_negation;
+#[path = "it_datalog_program_assessment.rs"]
+mod it_datalog_program_assessment;
+#[path = "it_datalog_program_reachability.rs"]
+mod it_datalog_program_reachability;
+#[path = "it_datalog_rule_dependencies.rs"]
+mod it_datalog_rule_dependencies;
+#[path = "it_datalog_rule_schedule.rs"]
+mod it_datalog_rule_schedule;
 #[path = "it_datalog_rules.rs"]
 mod it_datalog_rules;
 #[path = "it_datalog_rules_annotations.rs"]
 mod it_datalog_rules_annotations;
 #[path = "it_datalog_rules_sparql.rs"]
 mod it_datalog_rules_sparql;
+#[path = "it_datalog_run_contract.rs"]
+mod it_datalog_run_contract;
+#[path = "it_datalog_semi_naive.rs"]
+mod it_datalog_semi_naive;
 #[path = "it_reasoning_budget.rs"]
 mod it_reasoning_budget;
 #[path = "it_reasoning_imports.rs"]
 mod it_reasoning_imports;
 #[path = "it_reasoning_join_repro.rs"]
 mod it_reasoning_join_repro;
+#[path = "it_reasoning_policy_contract.rs"]
+mod it_reasoning_policy_contract;
+#[path = "it_reasoning_request_limits.rs"]
+mod it_reasoning_request_limits;
 #[path = "it_rules_cross_ledger.rs"]
 mod it_rules_cross_ledger;
 #[path = "it_rules_source.rs"]

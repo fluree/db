@@ -156,6 +156,13 @@ pub struct Txn {
     /// added as additional named-graph keys, allowing `["graph", "<alias>", ...]` patterns.
     pub update_where_named_graphs: Option<Vec<UpdateNamedGraph>>,
 
+    /// The JSON-LD update's where reads the ledger's default graph by name, as
+    /// `GRAPH <urn:default>` (a `"@graph": "default"` while the WHERE reads
+    /// another default graph, a top-level `graph` or `from`). Staging keeps
+    /// `urn:default` in the WHERE dataset when `fromNamed` restricts its
+    /// named graphs.
+    pub update_where_names_ledger_default: bool,
+
     /// Transaction options
     pub opts: TxnOpts,
 
@@ -174,18 +181,11 @@ pub struct Txn {
     /// GRAPH` or transfer destination. Graphs a `GRAPH ?g` template resolves
     /// to are only known once the WHERE runs; staging adds them.
     ///
-    /// Staging reports the full set keyed by ledger graph id, and the commit
-    /// registers any that are new.
+    /// Staging resolves each in the ledger it writes, as it does the
+    /// templates' graphs (the ledger's own address is its default graph, and
+    /// `L#<g>` the graph `<g>`), reports the full set keyed by ledger graph
+    /// id, and the commit registers any that are new.
     pub write_graphs: BTreeSet<String>,
-
-    /// The update's template default graph: the IRI of SPARQL `WITH <iri>` or
-    /// of a JSON-LD update's top-level `graph`. Lowering writes every template
-    /// that names no graph itself to it (marking the template
-    /// [`TripleTemplate::graph_from_template_default`]) and lists it in
-    /// [`Txn::write_graphs`]. When it names this ledger's default graph (see
-    /// `names_default_graph`), staging writes those templates to the ledger's
-    /// default graph instead, the graph the WHERE reads for that IRI.
-    pub template_default_graph: Option<String>,
 
     /// Namespace allocations made during lowering that the staging path must
     /// merge into its own registry before flake generation.
@@ -306,11 +306,11 @@ impl Txn {
             unmatched_optional: UnmatchedOptional::Unbound,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
+            update_where_names_ledger_default: false,
             opts: TxnOpts::default(),
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
             write_graphs: BTreeSet::new(),
-            template_default_graph: None,
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
@@ -521,12 +521,6 @@ pub struct TripleTemplate {
 
     /// The graph this template writes to.
     pub graph: TemplateGraph,
-
-    /// Whether [`graph`](Self::graph) is the update's template default graph
-    /// ([`Txn::template_default_graph`]) rather than a graph the template
-    /// names itself (`GRAPH <iri>`, `@graph`, `["graph", …]`, a data quad, a
-    /// TriG block).
-    pub graph_from_template_default: bool,
 }
 
 impl TripleTemplate {
@@ -539,7 +533,6 @@ impl TripleTemplate {
             dtc: None,
             list_index: None,
             graph: TemplateGraph::Default,
-            graph_from_template_default: false,
         }
     }
 
@@ -556,25 +549,16 @@ impl TripleTemplate {
     }
 
     /// Write to the named graph `iri`. The transaction must also list it in
-    /// [`Txn::write_graphs`].
+    /// [`Txn::write_graphs`]. Staging resolves `iri` in the ledger it writes
+    /// (the ledger's own address is its default graph).
     pub fn in_graph(mut self, iri: impl Into<Arc<str>>) -> Self {
         self.graph = TemplateGraph::Iri(iri.into());
-        self.graph_from_template_default = false;
-        self
-    }
-
-    /// Write to the update's template default graph `iri` (SPARQL `WITH`,
-    /// JSON-LD top-level `graph`; see [`Txn::template_default_graph`]).
-    pub fn in_template_default_graph(mut self, iri: impl Into<Arc<str>>) -> Self {
-        self.graph = TemplateGraph::Iri(iri.into());
-        self.graph_from_template_default = true;
         self
     }
 
     /// Write to the graph named by `var`'s binding in each WHERE solution.
     pub fn with_graph_var(mut self, var: VarId) -> Self {
         self.graph = TemplateGraph::Var(var);
-        self.graph_from_template_default = false;
         self
     }
 }
@@ -592,33 +576,182 @@ pub enum TemplateGraph {
     Var(VarId),
 }
 
-/// Whether the graph IRI `iri` names the default graph of the ledger
-/// `ledger_id` in an update's default-graph positions: `urn:default`
-/// ([`DEFAULT_GRAPH_IRI`](fluree_db_core::DEFAULT_GRAPH_IRI)), or the ledger's
-/// own address in any spelling [`LedgerRef::parse`](fluree_db_core::LedgerRef::parse)
-/// accepts (`name`, `name:branch`, `urn:fluree:…`) with no time pin and no
-/// graph fragment.
-///
-/// Only an update's default-graph positions consult it, and they read such an
-/// IRI as the ledger's default graph (the within-ledger convention, D-3): the
-/// WHERE's default graph (`USING`, `WITH`, JSON-LD `from` and top-level
-/// `graph`) and the template default graph (`WITH`, JSON-LD top-level
-/// `graph`). Every other graph position resolves the IRI through the graph
-/// registry like any other IRI: `GRAPH <iri>` in a template or in the WHERE,
-/// `GRAPH ?g`, `USING NAMED`, JSON-LD `fromNamed`, `@graph` and
-/// `["graph", …]`, data quads and TriG blocks.
-pub(crate) fn names_default_graph(ledger_id: &fluree_db_core::LedgerId, iri: &str) -> bool {
-    if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
-        return true;
+/// A write-side graph name after resolution: the default graph, a named
+/// graph by absolute IRI (the ledger's config graph included), a ledger
+/// address, or a WHERE variable (`GRAPH ?g`, update templates only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphName {
+    /// The default graph.
+    Default,
+    /// A named graph.
+    Iri(fluree_db_core::dataset_ref::GraphIri),
+    /// An address of the ledger being written that expands to no absolute IRI.
+    Address(AddressName),
+    /// The graph a WHERE variable binds.
+    Var(VarId),
+}
+
+/// A graph name written as an address of the ledger being written that
+/// expands to no absolute IRI: `mydb#config` or a bare `mydb` (no scheme), or
+/// `mydb:main` under strict compact-IRI checking with no `mydb` prefix in the
+/// `@context`. It is kept as written, as a `from` source is, and staging reads
+/// it through the ledger's graph-position table like any graph IRI (the
+/// ledger's own address writes its default graph, `L#config` the config
+/// graph, `L#<g>` the graph `<g>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressName(Arc<str>);
+
+impl AddressName {
+    /// `written`, if it is an address of the ledger `ledger_id`, in any
+    /// spelling. Another ledger's address is not one: it stays the name it
+    /// is, which expands to no absolute IRI.
+    pub fn parse(written: &str, ledger_id: &str) -> Option<Self> {
+        let ledger = fluree_db_core::LedgerId::parse(ledger_id).ok()?;
+        let no_graphs = |_: &str| None;
+        fluree_db_core::TargetLedger::new(&ledger, &no_graphs)
+            .names_this_ledger(written)
+            .then(|| Self(written.into()))
     }
-    // Every spelling starts with the ledger name, so most IRIs are rejected
-    // without parsing (a parse allocates the canonical id).
-    let body = iri
-        .strip_prefix(fluree_db_core::ledger_id::LEDGER_URN_PREFIX)
-        .unwrap_or(iri);
-    body.starts_with(ledger_id.name())
-        && fluree_db_core::LedgerRef::parse(iri)
-            .is_ok_and(|r| r.at.is_none() && r.fragment.is_none() && r.id == *ledger_id)
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The graph every template of one lexical scope is written to.
+///
+/// A JSON-LD node's statements, and those of every node nested in it, are
+/// written to the node's scope: its own graph selector if it has one, else
+/// its parent's. The parser passes the scope down the recursion by
+/// reference, so a nested node cannot be emitted without one.
+///
+/// Built only by [`WriteGraphs::scope`] or [`GraphScope::default_graph`], so
+/// a named graph a scope can carry is always registered in
+/// [`Txn::write_graphs`]. Every scope's IRI, the update `graph` key's
+/// included, is read by staging through the ledger's graph-position table
+/// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)),
+/// so the ledger's own address writes its default graph in every scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphScope {
+    graph: TemplateGraph,
+}
+
+impl GraphScope {
+    /// The default graph.
+    pub fn default_graph() -> Self {
+        GraphScope {
+            graph: TemplateGraph::Default,
+        }
+    }
+
+    /// The graph this scope writes to.
+    pub fn graph(&self) -> &TemplateGraph {
+        &self.graph
+    }
+
+    /// Emit one template in this scope.
+    ///
+    /// This is the one template-level emitter of `f:reifiesGraph`: a
+    /// reifier's `f:reifiesSubject` statement emitted in a named scope is
+    /// accompanied by `(reifier, f:reifiesGraph, <the scope's graph>)` in the
+    /// same scope, so a reifier bundle always names the graph of the edge it
+    /// reifies, which is the graph the bundle itself is written to. Nothing
+    /// else writes the anchor into templates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit(
+        &self,
+        out: &mut Vec<TripleTemplate>,
+        ns: &mut crate::namespace::NamespaceRegistry,
+        subject: TemplateTerm,
+        predicate: TemplateTerm,
+        object: TemplateTerm,
+        dtc: Option<DatatypeConstraint>,
+        list_index: Option<i32>,
+    ) {
+        let anchor = match (&self.graph, &predicate) {
+            (TemplateGraph::Default, _) => None,
+            (graph, TemplateTerm::Sid(p)) if is_reifies_subject(p) => Some(match graph {
+                TemplateGraph::Iri(iri) => TemplateTerm::Sid(ns.sid_for_iri(iri)),
+                TemplateGraph::Var(var) => TemplateTerm::Var(*var),
+                TemplateGraph::Default => unreachable!("matched above"),
+            }),
+            _ => None,
+        };
+        let anchor_subject = anchor.as_ref().map(|_| subject.clone());
+        out.push(TripleTemplate {
+            subject,
+            predicate,
+            object,
+            dtc,
+            list_index,
+            graph: self.graph.clone(),
+        });
+        if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
+            out.push(TripleTemplate {
+                subject: reifier,
+                predicate: TemplateTerm::Sid(Sid::new(
+                    fluree_vocab::namespaces::FLUREE_DB,
+                    fluree_vocab::db::REIFIES_GRAPH,
+                )),
+                object: graph,
+                dtc: None,
+                list_index: None,
+                graph: self.graph.clone(),
+            });
+        }
+    }
+}
+
+/// Whether `p` is `f:reifiesSubject`, compared without allocating.
+pub(crate) fn is_reifies_subject(p: &Sid) -> bool {
+    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+        && &*p.name == fluree_vocab::db::REIFIES_SUBJECT
+}
+
+/// The named graphs one transaction writes to, interned so every template of
+/// a graph shares its IRI. The only way to obtain a named [`GraphScope`].
+#[derive(Debug, Default)]
+pub struct WriteGraphs {
+    interned: std::collections::HashMap<String, Arc<str>>,
+}
+
+impl WriteGraphs {
+    /// No graphs yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scope for `name`, registering a named graph as a write target.
+    pub fn scope(&mut self, name: GraphName) -> GraphScope {
+        match name {
+            GraphName::Default => GraphScope::default_graph(),
+            GraphName::Var(var) => GraphScope {
+                graph: TemplateGraph::Var(var),
+            },
+            GraphName::Iri(iri) => GraphScope {
+                graph: TemplateGraph::Iri(self.intern(iri.as_arc())),
+            },
+            GraphName::Address(address) => GraphScope {
+                graph: TemplateGraph::Iri(self.intern(&address.0)),
+            },
+        }
+    }
+
+    /// `name`, registered as a write target, shared with every scope of it.
+    fn intern(&mut self, name: &Arc<str>) -> Arc<str> {
+        match self.interned.get(&**name) {
+            Some(interned) => Arc::clone(interned),
+            None => {
+                self.interned.insert(name.to_string(), Arc::clone(name));
+                Arc::clone(name)
+            }
+        }
+    }
+
+    /// The registered named-graph IRIs, for [`Txn::write_graphs`].
+    pub fn into_iris(self) -> BTreeSet<String> {
+        self.interned.into_keys().collect()
+    }
 }
 
 /// A term in a triple template

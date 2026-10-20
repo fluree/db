@@ -239,7 +239,7 @@ The triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifi
 
 ## Annotate an edge inside a named graph
 
-Edge annotations live in the same graph as the edge they reify. On the JSON-LD surface, name the target graph with a node-level `@graph` selector — the annotation is written into that same graph and carries the graph identity automatically:
+Edge annotations live in the same graph as the edge they reify. On the JSON-LD surface, name the target graph with a node-level `@graph` selector — the annotation is written into that same graph and carries the graph identity automatically. The selector covers the nodes nested under it too, so an annotated edge on a nested node lands in the same graph; an update's top-level `graph` key (or a `["graph", <iri>, ...]` template) scopes annotations the same way:
 
 ```json
 {

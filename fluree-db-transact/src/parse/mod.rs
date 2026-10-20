@@ -24,7 +24,7 @@ pub mod txn_meta;
 ///   It also rejects (rather than silently strips) a single-object document
 ///   whose own `@context` defines one of these names as a term — that name is
 ///   reserved, so the collision is an error, not a guess.
-/// - [`edge_annotations::is_envelope`] / [`edge_annotations::is_transaction_wrapper`]
+/// - `fluree_graph_json_ld::doc_shape` / [`edge_annotations::is_transaction_wrapper`]
 ///   tolerate them when classifying a document as an envelope / wrapper
 ///   rather than a data node-map, so annotation lowering still recurses into
 ///   `@graph` / clause values.
@@ -51,8 +51,8 @@ pub(crate) const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert",
 pub use jsonld::{parse_graph_insert, parse_sync_transaction, parse_transaction};
 pub use nquads::nquads_to_trig;
 pub use rdf_text::{
-    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, Placement, RdfText,
-    RdfTextSummary,
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, ContentIdentity,
+    Placement, RdfText, RdfTextSummary,
 };
 pub use trig_meta::{
     might_contain_graph_block, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject,

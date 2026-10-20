@@ -231,7 +231,8 @@ fn detect_post_order_desc_limit(
     // runtime scan budget. (Patterns beyond `?s <p> ?o [; ?s a <Class>]` were
     // already rejected above, so no other selective clause reaches here.)
     if let (Some(class), Some(stats)) = (&class_term, stats) {
-        if !post_order_class_is_profitable(stats, &anchor_pred, class, offset + limit) {
+        if !post_order_class_is_profitable(stats, &anchor_pred, class, offset.saturating_add(limit))
+        {
             return None;
         }
     }
@@ -3081,14 +3082,21 @@ fn build_operator_tree_inner(
             detect_predicate_group_by_object_count_topk(query)
         {
             stamp_fast_path("group_by_object_count_topk", FastPathOutcome::Proceed);
-            return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
+            // Keep the best `LIMIT + OFFSET` groups, then skip `OFFSET` of them.
+            let offset = query.offset.unwrap_or(0);
+            let topk: BoxedOperator = Box::new(PredicateGroupCountFirstsOperator::new(
                 s_var,
                 o_var,
                 count_var,
                 pred,
-                limit,
+                limit.saturating_add(offset),
                 planning.mode(),
-            )));
+            ));
+            return Ok(if offset > 0 {
+                Box::new(OffsetOperator::new(topk, offset))
+            } else {
+                topk
+            });
         }
     }
 

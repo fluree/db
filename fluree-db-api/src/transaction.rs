@@ -2,7 +2,10 @@
 //!
 //! Each [`Transaction::stage`] (or [`Transaction::stage_cypher`]) applies its
 //! operation over the ones before it — validated by the full staging pipeline
-//! (policy, SHACL, uniqueness) as it is added — and [`Transaction::db`] reads
+//! (policy, SHACL, uniqueness) as it is added, under the shapes, constraints
+//! and config of the state the transaction began on, as a multi-operation
+//! SPARQL UPDATE is; the config guard runs once, on the committed result —
+//! and [`Transaction::db`] reads
 //! the result without committing. [`Transaction::commit`] writes every staged
 //! operation as a single commit, the operations netted in order exactly as a
 //! `;`-separated SPARQL UPDATE nets its parts. Operations in different
@@ -32,12 +35,15 @@
 //!
 //! [`Transaction::commit`] commits on this process's own write path, as
 //! Bolt's explicit transactions do: local-commit deployments only. A Raft or
-//! peer host must not offer transactions to its clients.
+//! peer host must not offer transactions to its clients. (Bolt's explicit
+//! transactions commit each statement as it runs, so each statement is
+//! governed by the state before it, as separate transactions are; here every
+//! operation is governed by the state the transaction began on.)
 
 use crate::cypher_write::{self, ResolvedConditional, WritePlan};
 use crate::format::cypher_typed::CypherCell;
 use crate::ledger_manager::{RefreshOpts, WritePath};
-use crate::tx::{SequentialStager, TransactResultRef};
+use crate::tx::{RequestGovernance, SequentialStager, TransactResultRef};
 use crate::tx_builder::{is_retryable_commit_conflict, OpPlan, TransactOperation};
 use crate::{
     ApiError, CypherParamMap, Fluree, GovernanceOptions, GraphDb, PolicyContext, Result, Tracker,
@@ -304,6 +310,7 @@ impl Transaction {
             self.base.clone(),
             &self.operations[..len],
             &self.context,
+            Some(self.stager.governance().clone()),
         )
         .await?;
         self.operations.truncate(len);
@@ -352,6 +359,7 @@ impl Transaction {
                 self.base.clone(),
                 &self.operations,
                 &self.context,
+                Some(self.stager.governance().clone()),
             )
             .await?;
             self.stale = false;
@@ -372,6 +380,7 @@ impl Transaction {
                 self.base.clone(),
                 &self.operations,
                 &self.context,
+                Some(self.stager.governance().clone()),
             )
             .await?;
             GraphDb::from_ledger_state(stager.state())
@@ -440,7 +449,7 @@ impl Transaction {
                             // transaction began may have changed it.
                             context.policy =
                                 transact_policy(&fluree, &state, &context.governance).await?;
-                            stage_all(&fluree, state, &operations, &context)
+                            stage_all(&fluree, state, &operations, &context, None)
                                 .await?
                                 .finish()
                                 .await?
@@ -522,7 +531,7 @@ async fn stage_one(
                 ..TxnOpts::default()
             };
             stager
-                .stage_with(true, |state| async move {
+                .stage_with(true, |state, request| async move {
                     let (stage, _, _) = fluree
                         .stage_plan(
                             &plan,
@@ -532,6 +541,7 @@ async fn stage_one(
                             Some(&context.tracker),
                             &context.index_config,
                             context.policy.as_ref(),
+                            Some(&request),
                         )
                         .await?;
                     Ok(stage)
@@ -580,7 +590,7 @@ async fn stage_cypher(
     let mut pending = None;
     let pending_ref = &mut pending;
     stager
-        .stage_with(true, |state| async move {
+        .stage_with(true, |state, request| async move {
             // Multi-clause statements run through the sequential driver, which
             // answers a trailing RETURN from its final row table.
             if let Ok(ast) = crate::query::helpers::substituted_cypher_ast(query, params) {
@@ -595,6 +605,7 @@ async fn stage_cypher(
                             context.policy.as_ref(),
                             Some(&context.tracker),
                             Some(skolem_txn_id.to_string()),
+                            Some(&request),
                         )
                         .await?;
                     if let Some(result) = outcome.return_result {
@@ -658,17 +669,19 @@ async fn stage_cypher(
                             Some(&context.index_config),
                             context.policy.as_ref(),
                             Some(&context.tracker),
+                            Some(&request),
                         )
                         .await
                 }
                 None => {
                     fluree
-                        .stage_transaction_from_txn(
+                        .stage_txn_governed(
                             state,
                             resolved.primary,
                             Some(&context.index_config),
                             context.policy.as_ref(),
                             Some(&context.tracker),
+                            Some(&request),
                         )
                         .await
                 }
@@ -678,13 +691,20 @@ async fn stage_cypher(
     Ok(pending)
 }
 
+/// Stage `operations` over `base`. Staged again from the transaction's own
+/// base, the operations keep the request's `governance`; over a newer head
+/// (`None`) they are governed as that head is.
 async fn stage_all(
     fluree: &Fluree,
     base: LedgerState,
     operations: &[Op],
     context: &StageContext,
+    governance: Option<RequestGovernance>,
 ) -> Result<SequentialStager> {
-    let mut stager = SequentialStager::new(base);
+    let mut stager = match governance {
+        Some(governance) => SequentialStager::resume(base, governance),
+        None => SequentialStager::new(base),
+    };
     for op in operations {
         stage_one(fluree, &mut stager, &op.staged, context).await?;
     }

@@ -62,7 +62,7 @@ pub use rdf_list::{
 };
 pub use same_as::{FrozenSameAs, SameAsTracker};
 
-use fluree_db_core::GraphDbRef;
+use fluree_db_core::{GraphDbRef, QueryCancellation, Tracker};
 use std::sync::Arc;
 pub use types::{ChainElement, PropertyChain, PropertyExpression};
 
@@ -87,6 +87,12 @@ pub struct ReasoningOptions {
     /// `owl:sameAs` equality processing (`eq-*`) is canonicalization
     /// infrastructure and always runs.
     pub enabled_rules: Vec<String>,
+    /// The cancellation handle of the request the closure is computed for.
+    /// Once it reports cancellation, the run stops and fails.
+    pub cancellation: QueryCancellation,
+    /// The request's tracker: each fact a round processes is charged as its
+    /// fuel.
+    pub tracker: Tracker,
 }
 
 /// All rule identifiers accepted in [`ReasoningOptions::enabled_rules`]: the
@@ -145,7 +151,7 @@ impl ReasoningOptions {
     pub fn with_budget(budget: ReasoningBudget) -> Self {
         Self {
             budget,
-            enabled_rules: Vec::new(),
+            ..Self::default()
         }
     }
 

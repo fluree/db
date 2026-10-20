@@ -74,6 +74,17 @@ pub fn path_max_visited() -> usize {
     })
 }
 
+/// Fails once a path has computed more pairs than the context allows before
+/// returning its first row (see [`ExecutionContext::path_pair_limit`]).
+fn check_pair_limit(ctx: &ExecutionContext<'_>, pairs: usize) -> Result<()> {
+    match ctx.path_pair_limit {
+        Some(limit) if pairs > limit => Err(QueryError::ResourceLimit(format!(
+            "Property path exceeded max result pairs ({limit})"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Predicates a wildcard (untyped) path must never traverse: `rdf:type` (its
 /// object is a class, not a node) and the `f:reifies*` reifier bundle (the
 /// edge-annotation sidecar, hidden from variable-predicate reads). Data
@@ -91,6 +102,30 @@ pub(crate) fn is_reserved_edge_predicate(p: &Sid) -> bool {
 #[inline]
 fn reencode_pred(ctx: &ExecutionContext<'_>, db: &fluree_db_core::LedgerSnapshot, p: &Sid) -> Sid {
     crate::context::reencode_sid(ctx, db, p).unwrap_or_else(|| p.clone())
+}
+
+/// One endpoint of a correlated path row, resolved from its constant or the
+/// row's binding.
+enum Endpoint {
+    /// Unbound: the path ranges over it.
+    Free,
+    /// A node the path traverses from.
+    Node(Sid),
+    /// A bound term no edge of the path touches: a literal, or any other
+    /// value that is no node. Only a zero-length match reaches it.
+    Term(Binding),
+    /// A value that matches nothing (a poisoned correlation).
+    Nothing,
+}
+
+impl Endpoint {
+    /// The node of a free or node endpoint.
+    fn into_node(self) -> Option<Sid> {
+        match self {
+            Endpoint::Node(sid) => Some(sid),
+            Endpoint::Free | Endpoint::Term(_) | Endpoint::Nothing => None,
+        }
+    }
 }
 
 /// Property path operator - transitive graph traversal
@@ -388,6 +423,10 @@ impl PropertyPathOperator {
     /// edges are removed here so the path neither traverses them nor reaches the
     /// nodes behind them, matching the per-flake semantics of the scan path.
     /// No-op for root / no policy (the filter short-circuits).
+    ///
+    /// Every edge read is charged to the query's fuel, as a row a range read
+    /// returns: traversal reads each reached node's edges, so this prices
+    /// the walk itself.
     async fn read_graph_edges(
         ctx: &ExecutionContext<'_>,
         graph: &PathGraph<'_>,
@@ -404,6 +443,9 @@ impl PropertyPathOperator {
             RangeOptions::new().with_to_t(graph.to_t),
         )
         .await?;
+        ctx.tracker.consume_fuel(
+            flakes.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+        )?;
         BinaryScanOperator::filter_flakes_by_enforcer(
             ctx,
             graph.policy_enforcer.as_ref(),
@@ -753,6 +795,7 @@ impl PropertyPathOperator {
                 for reachable in self.traverse_forward(ctx, start).await? {
                     out.push((Binding::sid(start.clone()), Binding::sid(reachable)));
                 }
+                check_pair_limit(ctx, out.len())?;
             }
             // For `*`/`?` the zero-length path pairs each term of the
             // zero-length universe with itself. `traverse_forward` already
@@ -841,6 +884,7 @@ impl PropertyPathOperator {
         // hop) — no closure.
         if self.pattern.modifier == PathModifier::ZeroOrOne {
             for n in &nodes {
+                check_pair_limit(ctx, out.len())?;
                 let mut seen: HashSet<Sid> = HashSet::from([n.clone()]);
                 if !spans_all_terms {
                     out.push((Binding::sid(n.clone()), Binding::sid(n.clone())));
@@ -862,6 +906,7 @@ impl PropertyPathOperator {
             // branch below would otherwise be uninterruptible (only the unbounded
             // branch polls per dequeue).
             crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            check_pair_limit(ctx, out.len())?;
             // Bounded path: layered (node, depth) BFS over the adjacency map, so
             // a node first reached below `min_hops` can still be reached on a
             // longer in-range path (matches `traverse_bounded`).
@@ -926,6 +971,7 @@ impl PropertyPathOperator {
             let mut added_self_via_cycle = false;
             while let Some((cur, depth)) = queue.pop_front() {
                 crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+                check_pair_limit(ctx, out.len())?;
                 if visited.len() >= self.max_visited {
                     return Err(QueryError::ResourceLimit(format!(
                         "Property path exceeded max visited nodes ({})",
@@ -1437,9 +1483,93 @@ impl PropertyPathOperator {
             }
         };
 
+        check_pair_limit(ctx, results.len())?;
         self.results_buffer = Some(results);
         self.results_idx = 0;
         Ok(())
+    }
+
+    /// Rows for a correlated row one of whose endpoints is a bound term no
+    /// edge touches (a literal, say). Only a zero-length match reaches it,
+    /// pairing the term with itself, and only where zero-length matches range
+    /// over the graph's terms (SPARQL `*` and `?`): `+` has none, and Cypher
+    /// paths range over nodes. A term no triple holds is not among the graph's
+    /// terms, so it has no zero-length match either (the W3C
+    /// `values_and_path` case). `other` is the other endpoint, bound to `term`
+    /// when free.
+    async fn term_endpoint_rows(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        child_batch: &Batch,
+        row_idx: usize,
+        term: &Binding,
+        other: &Endpoint,
+        other_var: Option<VarId>,
+    ) -> Result<Vec<Vec<Binding>>> {
+        if !self.zero_length_spans_all_terms() {
+            return Ok(Vec::new());
+        }
+        let bind_other = match other {
+            Endpoint::Free => true,
+            Endpoint::Term(other) => {
+                if !crate::object_binding::same_term_in(term, other, Some(ctx))? {
+                    return Ok(Vec::new());
+                }
+                false
+            }
+            Endpoint::Node(_) | Endpoint::Nothing => return Ok(Vec::new()),
+        };
+        if !self.literal_in_graph(ctx, term).await? {
+            return Ok(Vec::new());
+        }
+        let row = self
+            .in_schema
+            .iter()
+            .map(|var| {
+                if bind_other && Some(*var) == other_var {
+                    return term.clone();
+                }
+                child_batch
+                    .column(*var)
+                    .map_or(Binding::Unbound, |col| col[row_idx].clone())
+            })
+            .collect();
+        Ok(vec![row])
+    }
+
+    /// Whether a literal is a term of the path's graphs: the object of a
+    /// triple the query can see. One read of the triples holding its value.
+    /// An encoded literal decodes through the graph view; with several graphs
+    /// active there is none, and the member scans have decoded it already.
+    async fn literal_in_graph(&self, ctx: &ExecutionContext<'_>, term: &Binding) -> Result<bool> {
+        let decoded;
+        let term = match term {
+            Binding::EncodedLit { .. } => {
+                decoded =
+                    crate::group_aggregate::materialize_encoded(term, ctx.graph_view().as_ref());
+                &decoded
+            }
+            other => other,
+        };
+        let Binding::Lit { val, dtc, .. } = term else {
+            return Ok(false);
+        };
+        let graphs = ctx.path_graphs()?;
+        let flakes = self
+            .read_edges(ctx, &graphs, IndexType::Opst, |_| {
+                RangeMatch::new().with_object(val.clone())
+            })
+            .await?;
+        Ok(flakes.iter().any(|flake| {
+            if flake.o != *val || fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
+                return false;
+            }
+            match (dtc, flake.m.as_ref().and_then(|meta| meta.lang.as_deref())) {
+                (DatatypeConstraint::LangTag(want), Some(lang)) => want.as_ref() == lang,
+                (DatatypeConstraint::Explicit(dt), None) => *dt == flake.dt,
+                _ => false,
+            }
+        }))
     }
 
     /// Process a single child row in correlated mode
@@ -1466,43 +1596,107 @@ impl PropertyPathOperator {
         // The snapshot the path's graphs share a namespace table with.
         let db_for_encode = ctx.path_snapshot()?;
 
-        // Extract SIDs from constants or child bindings (if bound).
+        // Resolve each endpoint from its constant or the child's binding.
         //
         // Note: lowering may produce `Ref::Iri` constants to support cross-ledger joins.
         // For property paths we must traverse SIDs, so we opportunistically encode IRIs
         // against the selected active graph's namespace table.
         let binary_store = ctx.binary_store.as_ref();
-        let resolve_sid = |term: &Ref, binding: Option<&Binding>| -> Option<Sid> {
-            match term {
+        let resolve = |term: &Ref, binding: Option<&Binding>| -> Result<Endpoint> {
+            // An IRI is a node, one the ledger has never seen included (it
+            // encodes under the empty namespace, and no edge touches it).
+            let iri_endpoint = |iri: &str, as_term: Binding| match db_for_encode.encode_iri(iri) {
+                Some(sid) => Endpoint::Node(sid),
+                None => Endpoint::Term(as_term),
+            };
+            Ok(match term {
                 // Re-encode a pattern-constant endpoint into the active graph
                 // (like the `Ref::Iri` arm) so a divergent-namespace endpoint
                 // matches; falls back to the raw SID when undecodable.
-                Ref::Sid(s) => {
-                    crate::context::reencode_sid(ctx, db_for_encode, s).or_else(|| Some(s.clone()))
-                }
-                Ref::Iri(iri) => db_for_encode.encode_iri(iri),
-                Ref::Var(_) => binding.and_then(|b| match b {
-                    Binding::Sid { sid: s, .. } => Some(s.clone()),
-                    Binding::IriMatch { iri, .. } => db_for_encode.encode_iri(iri),
-                    Binding::Iri(iri) => db_for_encode.encode_iri(iri),
+                Ref::Sid(s) => Endpoint::Node(
+                    crate::context::reencode_sid(ctx, db_for_encode, s)
+                        .unwrap_or_else(|| s.clone()),
+                ),
+                Ref::Iri(iri) => iri_endpoint(iri, Binding::Iri(iri.clone())),
+                Ref::Var(_) => match binding {
+                    None | Some(Binding::Unbound) => Endpoint::Free,
+                    // A poisoned correlation value matches nothing.
+                    Some(Binding::Poisoned) => Endpoint::Nothing,
+                    Some(Binding::Sid { sid: s, .. }) => Endpoint::Node(s.clone()),
+                    Some(b @ (Binding::IriMatch { iri, .. } | Binding::Iri(iri))) => {
+                        iri_endpoint(iri, b.clone())
+                    }
                     // Indexed BinaryScan emits late-materialized EncodedSid for a
                     // correlated path endpoint (e.g. the ?mid of `?s p1 ?mid . ?mid p2+ ?o`
-                    // with a bound subject). Resolve its raw s_id (only meaningful within
-                    // this single ledger, which property paths already require) to its IRI
-                    // via the active graph's store, then re-encode against the same graph —
-                    // matching the `IriMatch`/`Iri` arms above. Without this arm the binding
-                    // resolved to None and fell into the full-closure branch, pairing the
-                    // row with the entire p2 closure.
-                    Binding::EncodedSid { s_id, .. } => binary_store
-                        .and_then(|st| st.resolve_subject_iri(*s_id).ok())
-                        .and_then(|iri| db_for_encode.encode_iri(&iri)),
-                    _ => None,
-                }),
-            }
+                    // with a bound subject), and a batched join lane binds a subject
+                    // minted since the last index by its novelty id. Resolve the id
+                    // (only meaningful within this single ledger, which property paths
+                    // already require) to its IRI through the novelty-aware graph view,
+                    // then re-encode against the same graph — matching the
+                    // `IriMatch`/`Iri` arms above. Subject ids are the ledger's, so with
+                    // several graphs active (no graph view) the store's view across them
+                    // resolves it. An id that cannot be resolved is an error, not an
+                    // unbound endpoint.
+                    Some(b @ Binding::EncodedSid { s_id, .. }) => {
+                        let view = ctx
+                            .graph_view()
+                            .or_else(|| {
+                                binary_store.map(|store| {
+                                    store
+                                        .graph_with_novelty(
+                                            ctx.binary_g_id,
+                                            ctx.dict_novelty.clone(),
+                                        )
+                                        .with_namespace_codes_fallback(
+                                            ctx.namespace_codes_fallback.clone(),
+                                        )
+                                        .with_tracker(ctx.tracker.clone())
+                                })
+                            })
+                            .ok_or_else(|| {
+                                QueryError::Internal(format!(
+                                    "property path endpoint {b:?} has no store to decode it"
+                                ))
+                            })?;
+                        let iri = view
+                            .resolve_subject_iri(*s_id)
+                            .map_err(|e| QueryError::from_io("property path endpoint", e))?;
+                        iri_endpoint(&iri, b.clone())
+                    }
+                    // A predicate the scan reached in predicate position (`ex:s1 ?p ?o .
+                    // ?p ex:parentProp+ ?super`).
+                    Some(b @ Binding::EncodedPid { p_id }) => {
+                        let iri = binary_store
+                            .and_then(|st| st.resolve_predicate_iri(*p_id))
+                            .ok_or_else(|| {
+                                QueryError::Internal(format!(
+                                    "property path endpoint {b:?} names no predicate"
+                                ))
+                            })?;
+                        iri_endpoint(iri, b.clone())
+                    }
+                    // A literal, or any other value that is no node.
+                    Some(other) => Endpoint::Term(other.clone()),
+                },
+            })
         };
 
-        let subj_sid = resolve_sid(&self.pattern.subject, subj_binding);
-        let obj_sid = resolve_sid(&self.pattern.object, obj_binding);
+        let subj = resolve(&self.pattern.subject, subj_binding)?;
+        let obj = resolve(&self.pattern.object, obj_binding)?;
+        let (subj_sid, obj_sid) = match (subj, obj) {
+            (Endpoint::Nothing, _) | (_, Endpoint::Nothing) => return Ok(Vec::new()),
+            (Endpoint::Term(term), other) => {
+                return self
+                    .term_endpoint_rows(ctx, child_batch, row_idx, &term, &other, obj_var)
+                    .await;
+            }
+            (other, Endpoint::Term(term)) => {
+                return self
+                    .term_endpoint_rows(ctx, child_batch, row_idx, &term, &other, subj_var)
+                    .await;
+            }
+            (subj, obj) => (subj.into_node(), obj.into_node()),
+        };
 
         // Determine execution mode based on what's bound
         match (subj_sid, obj_sid) {
@@ -1648,6 +1842,10 @@ impl Operator for PropertyPathOperator {
                 self.state = OperatorState::Exhausted;
                 return Ok(None);
             }
+            // Each emitted row is charged, as a scan charges its rows.
+            ctx.tracker.consume_fuel(
+                batch_results.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+            )?;
 
             // A both-constant path (e.g. `:a0 (:p)* :a1`, pp36) binds no
             // variables, so `in_schema` is empty and `Batch::new` would infer
@@ -1737,6 +1935,9 @@ impl Operator for PropertyPathOperator {
             }
 
             if !all_rows.is_empty() {
+                ctx.tracker.consume_fuel(
+                    all_rows.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+                )?;
                 // Same empty-schema guard as unseeded mode (pp36): a
                 // both-constant path over a variable-free child produces rows
                 // with no columns; preserve the row count instead of letting
@@ -1918,6 +2119,120 @@ mod tests {
 
     fn make_pattern(subj: Ref, pred: Sid, modifier: PathModifier, obj: Ref) -> PropertyPathPattern {
         PropertyPathPattern::new(subj, pred, modifier, obj)
+    }
+
+    /// An encoded endpoint the context cannot decode is an error, not an
+    /// unbound endpoint that would pair the row with the whole closure.
+    #[test]
+    fn undecodable_encoded_endpoint_is_an_error() {
+        let pattern = make_pattern(
+            Ref::Var(VarId(0)),
+            Sid::new(2, "next"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        );
+        let op = PropertyPathOperator::with_defaults(None, pattern);
+        let child = Batch::new(
+            Arc::from(vec![VarId(0)].into_boxed_slice()),
+            vec![vec![Binding::encoded_sid(7)]],
+        )
+        .expect("batch");
+        // A context with no index has no view to decode an id through.
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let result = futures::executor::block_on(op.process_correlated_row(&ctx, &child, 0));
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("property path endpoint")),
+            "{result:?}"
+        );
+    }
+
+    /// A literal endpoint is a term no edge touches. One no triple holds is not
+    /// among the graph's terms either, so not even a zero-length match reaches
+    /// it (the W3C `values_and_path` case), and it is not an unbound endpoint
+    /// ranging over the closure.
+    #[test]
+    fn literal_no_triple_holds_has_no_match() {
+        let lit = Binding::lit(FlakeValue::Long(30), Sid::new(2, "integer"));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let child = Batch::new(
+            Arc::from(vec![VarId(0)].into_boxed_slice()),
+            vec![vec![lit]],
+        )
+        .expect("batch");
+        for modifier in [
+            PathModifier::ZeroOrMore,
+            PathModifier::ZeroOrOne,
+            PathModifier::OneOrMore,
+        ] {
+            let pattern = make_pattern(
+                Ref::Var(VarId(0)),
+                Sid::new(2, "next"),
+                modifier,
+                Ref::Var(VarId(1)),
+            );
+            let op = PropertyPathOperator::with_defaults(None, pattern);
+            let rows = futures::executor::block_on(op.process_correlated_row(&ctx, &child, 0))
+                .expect("rows");
+            assert!(rows.is_empty(), "{modifier:?}: {rows:?}");
+        }
+    }
+
+    /// A path with both ends free computes all its pairs before it returns
+    /// a row. Past the context's pair limit it fails instead of holding them.
+    #[test]
+    fn an_unseeded_path_stops_at_the_pair_limit() {
+        use fluree_db_reasoner::{DerivedFactsBuilder, FrozenSameAs};
+        const NODES: usize = 10;
+        let next = Sid::new(100, "next");
+        let node = |i: usize| Sid::new(100, format!("n{i}"));
+        let mut builder = DerivedFactsBuilder::with_capacity(NODES);
+        builder.extend((0..NODES - 1).map(|i| {
+            fluree_db_core::Flake::new(
+                node(i),
+                next.clone(),
+                FlakeValue::Ref(node(i + 1)),
+                fluree_db_core::edge::id_datatype_sid(),
+                1,
+                true,
+                None,
+            )
+        }));
+        let overlay = builder.build(FrozenSameAs::empty(), 1);
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let pairs = |limit: Option<usize>| -> Result<usize> {
+            let mut ctx =
+                ExecutionContext::with_time_and_overlay(&snapshot, &vars, 1, None, &overlay);
+            if let Some(limit) = limit {
+                ctx = ctx.with_path_pair_limit(limit);
+            }
+            let pattern = make_pattern(
+                Ref::Var(VarId(0)),
+                next.clone(),
+                PathModifier::OneOrMore,
+                Ref::Var(VarId(1)),
+            );
+            let mut op = PropertyPathOperator::with_defaults(None, pattern);
+            futures::executor::block_on(async {
+                op.open(&ctx).await?;
+                let mut rows = 0;
+                while let Some(batch) = op.next_batch(&ctx).await? {
+                    rows += batch.len();
+                }
+                Ok(rows)
+            })
+        };
+        let closure = NODES * (NODES - 1) / 2;
+        assert_eq!(pairs(None).expect("no limit"), closure);
+        assert_eq!(pairs(Some(closure)).expect("at the limit"), closure);
+        assert!(
+            matches!(pairs(Some(closure - 1)), Err(QueryError::ResourceLimit(_))),
+            "a closure one pair over the limit must fail"
+        );
     }
 
     #[test]

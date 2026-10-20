@@ -594,9 +594,14 @@ SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
 
 An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
 binds `?g` to each user-registered named graph and never to the default
-graph. The default graph remains explicitly addressable by the ledger alias
-(`GRAPH <mydb:main> { ... }`) when named directly or bound from another
-pattern — it just isn't enumerated.
+graph. The default graph remains explicitly addressable by the ledger's own
+address in any spelling (`GRAPH <mydb:main> { ... }`, `GRAPH <mydb> { ... }`)
+when named directly or bound from another pattern — it just isn't
+enumerated. `GRAPH <mydb:main#http://example.org/g>` addresses the graph
+`http://example.org/g`, and a graph an earlier version registered under the
+address is listed, and read, as
+`<mydb:main#mydb:main>` (see [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)).
 
 Only user-registered named graphs are exposed this way; the reserved system
 graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
@@ -865,20 +870,28 @@ For local Fluree ledger queries, use the `fluree:ledger:` scheme:
 |--------|-------------|----------------------|
 | `fluree:ledger:<name>` | Query ledger with default branch (main) | `<name>:main` |
 | `fluree:ledger:<name>:<branch>` | Query specific branch | `<name>:<branch>` |
+| `fluree:ledger:urn:fluree:<name>:<branch>` | The same, in the URN spelling | `<name>:<branch>` |
 
 Where:
 - `<name>` is the ledger name **without** the branch (e.g., `orders`, `acme/people`)
 - `<branch>` is the branch name (e.g., `main`, `dev`)
 - The full dataset ledger ID is always `<name>:<branch>` (e.g., `orders:main`, `acme/people:dev`)
 
-The endpoint is resolved by matching against the full `ledger_id` in the dataset.
+The endpoint must name a ledger that is **in the query's dataset** (a `FROM` or
+`FROM NAMED` member), or, for a query with no dataset clause, the ledger the
+query runs on. An endpoint naming any other ledger is refused with a 400
+("… not in this query's dataset; add it with FROM NAMED to query it"), and under
+`SERVICE SILENT` it contributes no rows. A SERVICE endpoint never loads a ledger
+on its own. The endpoint names a whole ledger, so it takes no time pin
+(`@t:…`) and no graph (`#…`): the member's time and graphs come from the
+dataset.
 
 **Examples:**
 
 ```sparql
-SERVICE <fluree:ledger:orders> { ... }         -- matches orders:main
-SERVICE <fluree:ledger:orders:main> { ... }    -- matches orders:main (explicit)
-SERVICE <fluree:ledger:orders:dev> { ... }     -- matches orders:dev
+SERVICE <fluree:ledger:orders> { ... }         # matches orders:main
+SERVICE <fluree:ledger:orders:main> { ... }    # matches orders:main (explicit)
+SERVICE <fluree:ledger:orders:dev> { ... }     # matches orders:dev
 ```
 
 ### SERVICE SILENT
@@ -897,7 +910,7 @@ WHERE {
 }
 ```
 
-If the `orders` ledger is not in the dataset or encounters an error, the query returns results with unbound `?order` values instead of failing.
+If the `orders` ledger is not in the dataset or encounters an error, the SERVICE block contributes no rows instead of failing the query.
 
 ### Variable Endpoints
 
@@ -1263,7 +1276,27 @@ SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
 - **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**. A graph that doesn’t exist contributes nothing, so a lone `USING` of an unknown graph gives the `WHERE` an empty default graph.
 - **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
 
-The ledger’s own address (`mydb`, `mydb:main` or `urn:fluree:mydb:main`, with no `#fragment` and no time pin) names the ledger’s default graph in `USING` and `WITH`. `WITH <mydb:main>` therefore reads and writes the default graph and never creates a named graph called `mydb:main`. Only these two clauses treat the address this way: a `GRAPH <iri>` block in a template or in the `WHERE`, `USING NAMED`, and an `INSERT DATA`/`DELETE DATA` quad resolve it like any other graph IRI. The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`.
+Each `USING`, `USING NAMED` or `WITH` IRI resolves in the ledger being updated,
+the same way a query's `FROM` does: the ledger's own address (`mydb`,
+`mydb:main`, `urn:fluree:mydb:main`) names its default graph, `mydb:main#config`
+or its URN names the config graph, and a registered graph IRI names that graph.
+A graph the ledger does not have contributes nothing, so `WHERE` over it binds
+nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). That
+includes an IRI that also reads as another ledger's address (`urn:g1`,
+`other:main`). An address that can only name another ledger (`other`,
+`other@t:1`), or an address with a time pin, is refused with a 400.
+
+A `GRAPH <iri>` block in the `WHERE` or in a template, and an `INSERT DATA` /
+`DELETE DATA` quad, read the address the same way: `mydb:main` is the default
+graph, so `WITH <mydb:main>` and `GRAPH <mydb:main> { … }` read and write it and
+never create a named graph called `mydb:main`, and `mydb:main#<graph IRI>` is
+that graph. See [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)
+for the full table, and for a graph an earlier version registered under the
+address. The reserved graphs keep their own IRIs, such as
+`urn:fluree:mydb:main#config`, and `mydb:main#config` names the config graph
+in these positions too: it writes the config graph, and `mydb:main#txn-meta`
+is refused as a write target like any name of `#txn-meta`.
 
 `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, names the default graph in every clause that reads a graph: `USING`, `USING NAMED`, `WITH`, and `GRAPH <urn:default>` in the `WHERE`. `WITH <urn:default>` also writes the default graph. The default graph is not a named graph, so a write that names one by it (a `GRAPH <urn:default>` template or `INSERT DATA` quad, `CREATE GRAPH`, or a `CLEAR`/`DROP`/`ADD`/`COPY`/`MOVE` operand) is refused with a `400`; leave out `GRAPH`, or write `DEFAULT` in graph management.
 
@@ -1281,7 +1314,8 @@ WHERE  { GRAPH ?g { ?s ex:status "old" } }
 
 `DELETE WHERE { GRAPH ?g { ... } }` works the same way.
 
-- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>`.
+- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>` or `GRAPH <<ledger>#config>`.
+- The template writes the graph `?g` names in the ledger (see [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)), which is the graph the `WHERE` read: a `?g` bound to the ledger's own address writes the default graph.
 - `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
 - A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.
 
@@ -1350,11 +1384,21 @@ offending operation. Ordered uniqueness checking requires this; for SHACL it
 is a deliberate choice (every intermediate state must satisfy the shapes,
 like a database without deferred constraints).
 
+What is enforced is read once, from the state before the request: the ledger
+config, the shapes and the uniqueness constraints. Shapes from another ledger
+(a cross-ledger `f:shapesSource`) are read at the head the request first reads
+that ledger at. An operation that turns
+SHACL or uniqueness off, or removes a shape or a constraint, does not relax
+the checks on a later operation in the same request, and one that turns them
+on does not apply them to the request, as in a single transaction. The config
+checks (a setting group split across graphs, a second value for a
+single-valued setting) run once, on the request's result.
+
 ### SPARQL UPDATE Restrictions
 
 Current restrictions / boundaries:
 
-- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
+- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. `DROP` behaves like `CLEAR`: the graph registry is additive, so a dropped graph stays registered but empty. These operations refuse the reserved `#config` and `#txn-meta` graphs, and read a graph named through the ledger's address, `<ledger>#<g>`, as the graph `<g>`. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
 - **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
@@ -1402,6 +1446,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 |--------|-------|------------|----------------|--------|
 | `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
 | `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `reasoning-time` | ISO 8601 datetime | queries | `reasoningTime` | — |
 | `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
 | `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
 | `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |

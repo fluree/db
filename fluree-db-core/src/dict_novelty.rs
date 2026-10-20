@@ -40,7 +40,7 @@
 
 use std::sync::Arc;
 
-use crate::ns_vec_bi_dict::{lookup_key, NsVecBiDict};
+use crate::ns_vec_bi_dict::{lookup_key, with_lookup_key, NsVecBiDict};
 use crate::vec_bi_dict::VecBiDict;
 use crate::{Flake, FlakeValue};
 
@@ -304,7 +304,7 @@ impl SubjectDictNovelty {
 
     /// Reverse lookup: find sid64 by `(ns_code, suffix)`.
     pub fn find_subject(&self, ns_code: u16, suffix: &str) -> Option<u64> {
-        self.find_by_key(&lookup_key(ns_code, suffix))
+        with_lookup_key(ns_code, suffix, |key| self.find_by_key(key))
     }
 
     /// Reverse lookup through the layer chain with the key encoded once.

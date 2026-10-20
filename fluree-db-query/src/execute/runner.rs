@@ -4,7 +4,7 @@
 
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
-use crate::dataset::DataSet;
+use crate::dataset::{DataSet, MemberKind};
 use crate::error::Result;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -145,6 +145,22 @@ pub struct PreparedExecution {
     pub reasoning_active: bool,
 }
 
+/// The request a query is prepared for. Preparing a query that reasons
+/// materializes derived facts; with these, that work is charged to the
+/// request's fuel and stops when the request is cancelled.
+#[derive(Clone, Copy, Default)]
+pub struct QueryRequest<'a> {
+    pub tracker: Option<&'a Tracker>,
+    pub cancellation: Option<&'a QueryCancellation>,
+}
+
+impl QueryRequest<'_> {
+    /// Why the request was cancelled, if it was.
+    pub fn cancelled(&self) -> Option<fluree_db_core::QueryCancellationReason> {
+        self.cancellation.and_then(QueryCancellation::reason)
+    }
+}
+
 /// Inputs that the preparation phase needs to know up front.
 ///
 /// Lives here rather than as loose parameters so that future planner inputs
@@ -161,6 +177,8 @@ pub struct PrepareConfig<'a> {
     /// spans several ledgers runs without one, so nothing may be rewritten
     /// into an operator that reads it.
     pub binary_scans: bool,
+    /// The request being prepared for (see [`QueryRequest`]).
+    pub request: QueryRequest<'a>,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -175,6 +193,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current(),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -191,6 +210,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -205,6 +225,7 @@ impl<'a> PrepareConfig<'a> {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::history(),
             binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -212,6 +233,19 @@ impl<'a> PrepareConfig<'a> {
     /// [`Self::binary_scans`]).
     pub fn without_binary_scans(mut self) -> Self {
         self.binary_scans = false;
+        self
+    }
+
+    /// Prepare for a request with this tracker and cancellation handle.
+    pub fn for_request(
+        mut self,
+        tracker: Option<&'a Tracker>,
+        cancellation: Option<&'a QueryCancellation>,
+    ) -> Self {
+        self.request = QueryRequest {
+            tracker,
+            cancellation,
+        };
         self
     }
 }
@@ -321,13 +355,11 @@ pub async fn prepare_execution_with_config(
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
             let derived_outcome = compute_derived_facts(
-                db.snapshot,
-                db.g_id,
-                effective_overlay,
-                db.t,
+                GraphDbRef::new(db.snapshot, db.g_id, effective_overlay, db.t),
                 &reasoning,
                 query.reasoning.rules_source_g_id,
                 binary_store,
+                config.request,
             )
             .await?;
 
@@ -709,12 +741,17 @@ pub struct ContextConfig<'a, 'b> {
     /// `@vocab` prefix a Cypher query was lowered against (from
     /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return (see
+    /// [`ExecutionContext::evaluation_time`]).
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, the injected true-wildcard crawl scan renders R2RML
     /// `RefObjectMap` objects by templating the parent IRI from the child row's
     /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
     /// set only by the graph-source browse-crawl path. See
     /// [`ExecutionContext::trust_fk_refs`].
     pub trust_fk_refs: bool,
+    /// See [`ExecutionContext::path_pair_limit`].
+    pub path_pair_limit: Option<usize>,
     /// Binary columnar index store for `BinaryScanOperator`.
     ///
     /// This is the explicit path — separate from `LedgerSnapshot.range_provider` which
@@ -737,6 +774,10 @@ pub struct ContextConfig<'a, 'b> {
     pub english_lang_id: Option<u16>,
     /// Remote SERVICE executor for `fluree:remote:` endpoints.
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
+    /// What `db` reads when there is no dataset, if the caller knows (see
+    /// [`MemberKind`]); dataset members carry their own
+    /// [`GraphRef::kind`](crate::dataset::GraphRef::kind).
+    pub primary_kind: MemberKind,
 }
 
 /// Execute a prepared query with configurable context options
@@ -786,6 +827,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             derived_facts: diag.facts_derived as u64,
             iterations: diag.iterations as u64,
             duration_ms: diag.duration.as_millis() as u64,
+            capped_rules: diag.capped_rules.clone(),
+            pending_rules: diag.pending_rules.clone(),
+            evaluation_time: diag.evaluation_time.clone(),
         });
     }
 
@@ -801,15 +845,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
 
     // Dataset execution scans through per-graph `GraphRef`s, not the
     // top-level context overlay — splice the derived-facts overlay into
-    // every ref matching the primary execution view, or datalog / OWL2-RL
-    // derived facts are invisible to dataset queries.
+    // every ref matching the primary execution view, and every named graph
+    // of the same ledger a rule derived into, or datalog / OWL2-RL derived
+    // facts are invisible to dataset queries.
     let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
-        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
-            db.snapshot.ledger_id.as_str(),
-            db.g_id,
-            db.t,
-            effective_overlay,
-        )),
+        (Some(ds), Some(reasoning)) => {
+            let mut graphs = vec![db.g_id];
+            graphs.extend(reasoning.derived().graph_ids().filter(|g| *g != db.g_id));
+            Some(ds.with_overlay_for_graphs(
+                db.snapshot.ledger_id.as_str(),
+                &graphs,
+                db.t,
+                effective_overlay,
+            ))
+        }
         _ => None,
     };
 
@@ -892,11 +941,15 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(vocab) = config.cypher_vocab.clone() {
         ctx.cypher_vocab = Some(vocab);
     }
+    ctx.evaluation_time = config.evaluation_time.clone();
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);
     }
     if config.trust_fk_refs {
         ctx = ctx.with_trust_fk_refs(true);
+    }
+    if let Some(limit) = config.path_pair_limit {
+        ctx = ctx.with_path_pair_limit(limit);
     }
     if let Some(store) = config.binary_store {
         ctx = ctx.with_binary_store(store, config.binary_g_id);
@@ -915,34 +968,39 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx = ctx.with_remote_service(executor);
     }
 
-    // Precompute which graphs in the dataset are R2RML-backed.
-    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.explicit_dataset()) {
+    // Precompute which of the query's graphs are R2RML-backed: the members of
+    // a dataset the query named, or otherwise the primary snapshot (a
+    // single-source graph source query; a union default graph's members are
+    // the primary ledger's own graphs). The provider is asked only about
+    // graphs whose kind leaves it open; a native graph is never looked up, and
+    // a lookup that fails fails the query rather than reading a graph source
+    // as an empty graph.
+    ctx.primary_kind = config.primary_kind;
+    if let Some(provider) = ctx.r2rml_provider {
         let mut r2rml_ids = std::collections::HashSet::new();
-        for graph_ref in dataset.default_graphs() {
-            let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
-            if is_r2rml {
-                r2rml_ids.insert(Arc::clone(&graph_ref.ledger_id));
+        if let Some(dataset) = ctx.explicit_dataset() {
+            for graph_ref in dataset.default_graphs() {
+                if graph_ref.kind != MemberKind::Native
+                    && provider.has_r2rml_mapping(&graph_ref.ledger_id).await?
+                {
+                    r2rml_ids.insert(Arc::clone(&graph_ref.ledger_id));
+                }
             }
-        }
-        for (iri, graph_ref) in dataset.named_graphs_iter() {
-            let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
-            if is_r2rml {
-                // Insert the graph IRI (not ledger_id) since graph.rs
-                // checks r2rml_graph_ids against the GRAPH pattern IRI.
-                r2rml_ids.insert(Arc::clone(iri));
+            for (iri, graph_ref) in dataset.named_graphs_iter() {
+                if graph_ref.kind != MemberKind::Native
+                    && provider.has_r2rml_mapping(&graph_ref.ledger_id).await?
+                {
+                    // Insert the graph IRI (not ledger_id) since graph.rs
+                    // checks r2rml_graph_ids against the GRAPH pattern IRI.
+                    r2rml_ids.insert(Arc::clone(iri));
+                }
             }
+        } else if config.primary_kind != MemberKind::Native
+            && provider.has_r2rml_mapping(&db.snapshot.ledger_id).await?
+        {
+            r2rml_ids.insert(Arc::from(db.snapshot.ledger_id.as_str()));
         }
         ctx.r2rml_graph_ids = r2rml_ids;
-    }
-    // Also check the primary snapshot's ledger_id (for single-source graph source queries)
-    if let Some(provider) = ctx.r2rml_provider {
-        if ctx.explicit_dataset().is_none() {
-            let is_r2rml = provider.has_r2rml_mapping(&db.snapshot.ledger_id).await;
-            if is_r2rml {
-                ctx.r2rml_graph_ids
-                    .insert(Arc::from(db.snapshot.ledger_id.as_str()));
-            }
-        }
     }
 
     // A sub-query plans at run time; name the variables in its plan errors.
@@ -966,7 +1024,8 @@ pub async fn execute<'a>(
 ) -> Result<Vec<Batch>> {
     // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
     // the dataset paths do, so the members' scans deduplicate on full rows.
-    let mut prepare_config = PrepareConfig::default();
+    let mut prepare_config =
+        PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
     prepare_config.planning = prepare_config.planning.with_multi_default_graph(
         config
             .dataset

@@ -2851,6 +2851,82 @@ async fn cypher_call_subquery_import_all() {
     );
 }
 
+/// `x AS x` projects `x` unchanged, on novelty and on an indexed ledger, at
+/// the top level and inside `CALL (a) { … }`. The five CALL shapes are
+/// #1894's: each person gets its own name, once.
+#[tokio::test]
+async fn cypher_with_aliasing_a_variable_to_itself_keeps_every_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:self-alias";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "a1", "@type": "Person", "name": "Ann"},
+                    {"@id": "a2", "@type": "Person", "name": "Ben"},
+                    {"@id": "a3", "@type": "Person", "name": "Cy"},
+                    {"@id": "a4", "@type": "Person", "name": "Di"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let names = json!([["Ann"], ["Ben"], ["Cy"], ["Di"]]);
+    let pairs = json!([["Ann", "Ann"], ["Ben", "Ben"], ["Cy", "Cy"], ["Di", "Di"]]);
+    const CALL: &str = "MATCH (a:Person) CALL (a) { ";
+    let mut cases: Vec<(String, &JsonValue)> = Vec::new();
+    for body in [
+        "WITH a.name AS n RETURN n AS z",
+        "WITH a.name AS n, 1 AS k RETURN n AS z",
+        "WITH a AS a RETURN a.name AS z",
+        "WITH a, a.name AS n RETURN n AS z",
+        "RETURN a.name AS z",
+        "WITH a AS a, a.name AS n RETURN n AS z",
+        "WITH a AS b RETURN b.name AS z",
+    ] {
+        cases.push((format!("{CALL}{body} }} RETURN z"), &names));
+        cases.push((format!("{CALL}{body} }} RETURN a.name AS an, z"), &pairs));
+    }
+    for query in [
+        "MATCH (a:Person) WITH a AS a RETURN a.name AS z",
+        "MATCH (a:Person) WITH a AS a, a.name AS n RETURN n AS z",
+        "MATCH (a:Person) WITH a AS b RETURN b.name AS z",
+    ] {
+        cases.push((query.to_string(), &names));
+    }
+
+    let mut wrong = Vec::new();
+    for (label, db) in [("novelty", &novelty_db), ("indexed", &indexed_db)] {
+        for (query, expected) in &cases {
+            let cj = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .expect("cypher json");
+            let mut rows: Vec<JsonValue> = cj["results"][0]["data"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| r["row"].clone())
+                .collect();
+            rows.sort_by_key(std::string::ToString::to_string);
+            if &JsonValue::Array(rows.clone()) != *expected {
+                wrong.push(format!("{label}: {query}\n  got {rows:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
 #[tokio::test]
 async fn cypher_call_subquery_nested() {
     // A nested CALL sees the variables imported by its enclosing CALL.

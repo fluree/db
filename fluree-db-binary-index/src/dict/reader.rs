@@ -21,6 +21,38 @@ use super::reverse_leaf::ReverseLeaf;
 use crate::read::leaflet_cache::LeafletCache;
 use fluree_db_core::{ContentId, ContentStore};
 
+/// A clock for the slow-lookup debug logs below, read only when this module
+/// logs at debug level. Nothing else reads these timings, and a clock read is
+/// a large share of a lookup that hits a cached leaf. Its cost depends on the
+/// platform and clock source: on arm64, macOS and Linux alike, a read and its
+/// `elapsed()` take about 35 ns.
+struct DebugClock(Option<Instant>);
+
+impl DebugClock {
+    fn start() -> Self {
+        Self(tracing::enabled!(tracing::Level::DEBUG).then(Instant::now))
+    }
+
+    /// Time since the start or the previous lap, and restart the lap; zero
+    /// when not timing.
+    fn lap(&mut self) -> std::time::Duration {
+        match &mut self.0 {
+            Some(started) => {
+                let now = Instant::now();
+                let lap = now.duration_since(*started);
+                *started = now;
+                lap
+            }
+            None => std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Whole milliseconds, for log fields.
+fn millis(d: std::time::Duration) -> u64 {
+    d.as_millis() as u64
+}
+
 /// Leaf data source for demand-loading.
 #[derive(Debug)]
 pub enum LeafSource {
@@ -282,25 +314,23 @@ impl DictTreeReader {
     pub fn reverse_lookup(&self, key: &[u8]) -> io::Result<Option<u64>> {
         const SLOW_LOOKUP_WARN_MS: u64 = 250;
 
-        let lookup_started = Instant::now();
-        let find_leaf_started = Instant::now();
+        let mut clock = DebugClock::start();
         let leaf_idx = match self.branch.find_leaf(key) {
             Some(idx) => idx,
             None => return Ok(None),
         };
-        let find_leaf_ms = find_leaf_started.elapsed().as_millis() as u64;
+        let find_leaf = clock.lap();
 
         let address = &self.branch.leaves[leaf_idx].address;
-        let load_leaf_started = Instant::now();
         let leaf_data = self.load_leaf(address)?;
-        let load_leaf_ms = load_leaf_started.elapsed().as_millis() as u64;
-        let decode_started = Instant::now();
+        let load_leaf = clock.lap();
         let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
-        let decode_leaf_ms = decode_started.elapsed().as_millis() as u64;
-        let leaf_lookup_started = Instant::now();
+        let decode_leaf = clock.lap();
         let result = leaf.lookup(key);
-        let lookup_leaf_ms = leaf_lookup_started.elapsed().as_millis() as u64;
-        let total_ms = lookup_started.elapsed().as_millis() as u64;
+        let lookup_leaf = clock.lap();
+        let total_ms = millis(find_leaf + load_leaf + decode_leaf + lookup_leaf);
+        let (find_leaf_ms, load_leaf_ms) = (millis(find_leaf), millis(load_leaf));
+        let (decode_leaf_ms, lookup_leaf_ms) = (millis(decode_leaf), millis(lookup_leaf));
 
         if total_ms >= SLOW_LOOKUP_WARN_MS || load_leaf_ms >= SLOW_LOOKUP_WARN_MS {
             tracing::debug!(
@@ -372,13 +402,12 @@ impl DictTreeReader {
     {
         const SLOW_BATCH_WARN_MS: u64 = 250;
 
-        let lookup_started = Instant::now();
+        let mut clock = DebugClock::start();
         let key_refs: Vec<&[u8]> = keys.into_iter().collect();
         if key_refs.is_empty() {
             return Ok(Vec::new());
         }
 
-        let find_leaf_started = Instant::now();
         let mut results = vec![None; key_refs.len()];
         let mut key_indices_by_leaf = vec![Vec::<usize>::new(); self.branch.leaves.len()];
 
@@ -387,9 +416,8 @@ impl DictTreeReader {
                 key_indices_by_leaf[leaf_idx].push(idx);
             }
         }
-        let find_leaf_ms = find_leaf_started.elapsed().as_millis() as u64;
+        let find_leaf = clock.lap();
 
-        let load_and_decode_started = Instant::now();
         let mut touched_leaves = 0usize;
         for (leaf_idx, key_indices) in key_indices_by_leaf.iter().enumerate() {
             if key_indices.is_empty() {
@@ -404,8 +432,9 @@ impl DictTreeReader {
                 results[key_idx] = leaf.lookup(key_refs[key_idx]);
             }
         }
-        let load_and_decode_ms = load_and_decode_started.elapsed().as_millis() as u64;
-        let total_ms = lookup_started.elapsed().as_millis() as u64;
+        let load_and_decode = clock.lap();
+        let total_ms = millis(find_leaf + load_and_decode);
+        let (find_leaf_ms, load_and_decode_ms) = (millis(find_leaf), millis(load_and_decode));
 
         if total_ms >= SLOW_BATCH_WARN_MS {
             tracing::debug!(
@@ -599,7 +628,7 @@ impl DictTreeReader {
             })
         }
 
-        let load_started = Instant::now();
+        let mut clock = DebugClock::start();
         let result = match &self.leaf_source {
             LeafSource::LocalFiles(map) => {
                 let path = map.get(address).ok_or_else(|| {
@@ -757,7 +786,7 @@ impl DictTreeReader {
         };
 
         if let Ok(bytes) = &result {
-            let elapsed_ms = load_started.elapsed().as_millis() as u64;
+            let elapsed_ms = millis(clock.lap());
             if elapsed_ms >= 250 {
                 tracing::debug!(
                     address,
@@ -1281,5 +1310,55 @@ mod tests {
 
         assert_eq!(reader.reverse_lookup(b"key_0050").unwrap(), Some(50));
         assert_eq!(reader.reverse_lookup(b"nonexistent").unwrap(), None);
+    }
+
+    /// The target the slow-lookup logs, and the clock's `enabled!` check, use.
+    const DICT_READER_TARGET: &str = "fluree_db_binary_index::dict::reader";
+
+    /// Runs `f` under `subscriber` as this thread's default, with callsite
+    /// interest rebuilt so a cached interest from another test can't decide
+    /// whether the clock runs.
+    fn with_subscriber<S, R>(subscriber: S, f: impl FnOnce() -> R) -> R
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        })
+    }
+
+    fn reader_at(level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::Targets::new().with_target(DICT_READER_TARGET, level))
+    }
+
+    fn lap_after_sleep() -> (bool, std::time::Duration) {
+        let mut clock = DebugClock::start();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (clock.0.is_some(), clock.lap())
+    }
+
+    #[test]
+    fn debug_clock_does_not_read_without_debug() {
+        let none = with_subscriber(
+            tracing::subscriber::NoSubscriber::default(),
+            lap_after_sleep,
+        );
+        assert_eq!(none, (false, std::time::Duration::ZERO), "no subscriber");
+
+        let info = with_subscriber(reader_at(tracing::Level::INFO), lap_after_sleep);
+        assert_eq!(info, (false, std::time::Duration::ZERO), "reader at INFO");
+    }
+
+    #[test]
+    fn debug_clock_times_laps_with_debug() {
+        let (timing, lap) = with_subscriber(reader_at(tracing::Level::DEBUG), lap_after_sleep);
+        assert!(timing, "reader at DEBUG should read the clock");
+        assert!(
+            lap >= std::time::Duration::from_millis(5),
+            "lap {lap:?} should cover the 5ms sleep"
+        );
     }
 }

@@ -915,7 +915,8 @@ pub(crate) fn group_count_v6(
     // length of its run — a single counter that persists across leaflet/leaf
     // boundaries, no per-row hashing. Completed runs feed a bounded top-K heap, so
     // there is no full sort of all distinct objects either.
-    let mut heap: BinaryHeap<GroupTopK> = BinaryHeap::with_capacity(limit + 1);
+    let mut heap: BinaryHeap<GroupTopK> =
+        BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(limit));
     let mut cur: Option<(u16, u64)> = None;
     let mut run: i64 = 0;
     let cache = store.leaflet_cache();

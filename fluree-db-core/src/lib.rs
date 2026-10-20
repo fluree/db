@@ -35,6 +35,7 @@ pub mod comparator;
 pub mod conflict_key;
 pub mod content_id;
 pub mod content_kind;
+pub mod dataset_ref;
 pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
@@ -82,6 +83,7 @@ pub mod sysmem;
 #[cfg(feature = "native")]
 pub mod task;
 pub mod temporal;
+pub mod topk;
 pub mod tracking;
 pub mod value;
 pub mod value_id;
@@ -119,6 +121,11 @@ pub use content_kind::{
     CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_SPATIAL_INDEX,
     CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
+pub use dataset_ref::{
+    AddressText, DatasetRef, GraphIri, GraphNameTable, GraphPosition, GraphSel, LedgerRef,
+    MemberRef, RefError, TargetError, TargetGraph, TargetLedger, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
+};
 pub use datatype_constraint::DatatypeConstraint;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
@@ -142,8 +149,8 @@ pub use index_stats::{
 pub use ledger_id::{
     format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,
     split_ledger_id, split_time_travel_suffix, validate_branch_name, validate_ledger_name,
-    IntoLedgerId, LedgerId, LedgerIdParseError, LedgerIdTimeSpec, LedgerName, LedgerRef,
-    ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
+    IntoLedgerId, LedgerId, LedgerIdParseError, LedgerIdTimeSpec, LedgerName, ParsedLedgerId,
+    COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
 };
 pub use namespaces::{
     default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,
@@ -213,7 +220,10 @@ pub use storage::{
     STORAGE_METHOD_S3,
 };
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use storage::{FileStorage, STORAGE_METHOD_FILE};
+pub use storage::{
+    FileStorage, RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE,
+    STORAGE_METHOD_FILE,
+};
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
 pub use tracking::{

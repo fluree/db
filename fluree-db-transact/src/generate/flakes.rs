@@ -11,6 +11,7 @@ use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_query::{Batch, Binding, VarId};
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use once_cell::sync::Lazy;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -39,6 +40,40 @@ pub(crate) static DT_YEAR_MONTH_DURATION: Lazy<Sid> =
 pub(crate) static DT_DAY_TIME_DURATION: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "dayTimeDuration"));
 pub(crate) static DT_DURATION: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "duration"));
 pub(crate) static DT_WKT_LITERAL: Lazy<Sid> = Lazy::new(|| Sid::new(OGC_GEO, "wktLiteral"));
+
+/// The graph a write goes to in the ledger being updated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteGraph {
+    /// The ledger's default graph.
+    Default,
+    /// A named graph, by the IRI it is registered under (or will be, when the
+    /// commit registers it).
+    Named(Arc<str>),
+}
+
+/// Resolves a graph IRI written in a graph position to the graph a write
+/// goes to (see [`FlakeGenerator::set_graph_table`]).
+pub type GraphTable<'a> = &'a (dyn Fn(&str) -> Result<WriteGraph> + Sync);
+
+/// What a template's graph term resolved to for one solution.
+enum SolutionGraph {
+    /// Unbound (or poisoned by OPTIONAL): the template writes nothing.
+    Unbound,
+    /// The default graph.
+    Default,
+    /// A named graph, by its Sid.
+    Named(Sid),
+}
+
+impl SolutionGraph {
+    /// A resolved graph: `None` is the default graph.
+    fn of(graph: Option<Sid>) -> Self {
+        match graph {
+            Some(sid) => Self::Named(sid),
+            None => Self::Default,
+        }
+    }
+}
 
 /// Generates flakes from triple templates
 ///
@@ -77,9 +112,22 @@ pub struct FlakeGenerator<'a> {
     /// a template `?g` bound to an alias writes to the graph the WHERE read.
     graph_aliases: HashMap<Arc<str>, Arc<str>>,
 
+    /// The ledger's graph-position table, which a `GRAPH ?g` binding resolves
+    /// through ([`FlakeGenerator::set_graph_table`]).
+    graph_table: Option<GraphTable<'a>>,
+
+    /// Graph-variable resolutions keyed by the bound IRI, so each distinct
+    /// binding resolves once, not once per row. `None` is the default graph.
+    bound_graphs: HashMap<Box<str>, Option<Sid>>,
+
     /// Graph-variable resolutions keyed by the bound Sid, so a Sid-bound `?g`
-    /// rebuilds and validates its IRI once per graph, not once per row.
-    sid_graphs: HashMap<Sid, Sid>,
+    /// rebuilds and resolves its IRI once per graph, not once per row.
+    sid_graphs: HashMap<Sid, Option<Sid>>,
+
+    /// Canonical Sids of the fallback-encoded IRIs written so far, keyed by
+    /// the IRI (the fallback Sid's name), so each is re-encoded once per
+    /// transaction, not once per flake.
+    canonical_sids: FxHashMap<Arc<str>, Sid>,
 }
 
 impl<'a> FlakeGenerator<'a> {
@@ -97,14 +145,33 @@ impl<'a> FlakeGenerator<'a> {
             solution_base: 0,
             written_graphs: HashMap::new(),
             graph_aliases: HashMap::new(),
+            graph_table: None,
+            bound_graphs: HashMap::new(),
             sid_graphs: HashMap::new(),
+            canonical_sids: FxHashMap::default(),
         }
+    }
+
+    /// `sid`'s IRI, decoded with the transaction's namespace codes: the
+    /// ledger's and the ones the transaction has allocated.
+    pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
+        let prefix = self.ns_registry.get_prefix(sid.namespace_code)?;
+        Some(format!("{prefix}{}", sid.name))
     }
 
     /// Set the WHERE dataset's alias names and the canonical IRI each resolves
     /// to (see [`DataSet::with_named_graph_alias`](fluree_db_query::DataSet)).
     pub fn set_graph_aliases(&mut self, aliases: HashMap<Arc<str>, Arc<str>>) {
         self.graph_aliases = aliases;
+    }
+
+    /// Resolve every `GRAPH ?g` binding through `table`, the ledger's
+    /// graph-position table, so a template writes the graph its binding names
+    /// in that ledger (the ledger's own address writes its default graph, and
+    /// `L#<g>` the graph `<g>`). Without a table a binding names the graph of
+    /// that IRI.
+    pub fn set_graph_table(&mut self, table: GraphTable<'a>) {
+        self.graph_table = Some(table);
     }
 
     /// Named graphs written so far, as (IRI, Sid).
@@ -119,6 +186,32 @@ impl<'a> FlakeGenerator<'a> {
         let sid = self.ns_registry.sid_for_iri(iri);
         self.written_graphs.insert(iri.to_string(), sid.clone());
         sid
+    }
+
+    /// Put `sid` under its canonical namespace code. A WHERE constant whose
+    /// namespace the ledger has not registered lowers to the encoder's
+    /// fallback, `Sid(EMPTY, iri)`; it is re-encoded through the
+    /// transaction's registry, which gives the namespace its code, as a
+    /// template naming the IRI would. Every other Sid is already canonical.
+    #[inline]
+    fn canonicalize(&mut self, sid: &mut Sid) {
+        if sid.namespace_code == fluree_vocab::namespaces::EMPTY {
+            *sid = self.canonical_sid(sid);
+        }
+    }
+
+    /// The canonical Sid for the fallback-encoded `sid`, re-encoded on its
+    /// IRI's first write in the transaction and cached: a hit clones the
+    /// cached Sid, a refcount bump.
+    #[cold]
+    fn canonical_sid(&mut self, sid: &Sid) -> Sid {
+        if let Some(canonical) = self.canonical_sids.get(&*sid.name) {
+            return canonical.clone();
+        }
+        let canonical = self.ns_registry.sid_for_iri(&sid.name);
+        self.canonical_sids
+            .insert(Arc::clone(&sid.name), canonical.clone());
+        canonical
     }
 
     /// Set the global solution index of the next batch's first row, so blank
@@ -206,8 +299,9 @@ impl<'a> FlakeGenerator<'a> {
             TemplateGraph::Default => None,
             TemplateGraph::Iri(iri) => Some(self.graph_sid(iri)),
             TemplateGraph::Var(var) => match self.resolve_graph_var(*var, bindings, row_idx)? {
-                Some(g_sid) => Some(g_sid),
-                None => return Ok(None),
+                SolutionGraph::Unbound => return Ok(None),
+                SolutionGraph::Default => None,
+                SolutionGraph::Named(g_sid) => Some(g_sid),
             },
         };
 
@@ -244,10 +338,23 @@ impl<'a> FlakeGenerator<'a> {
         };
 
         // If any component is None (unbound variable), skip this flake
-        let (s, p, o, dt) = match (s, p, o, dt) {
+        let (mut s, mut p, mut o, mut dt) = match (s, p, o, dt) {
             (Some(s), Some(p), Some(o), Some(dt)) => (s, p, o, dt),
             _ => return Ok(None),
         };
+
+        // An assertion stores every IRI under its canonical namespace code,
+        // whichever path bound it, so one IRI is never stored under two Sids.
+        // A retraction keeps the Sid it was bound to: it must match the flake
+        // as stored.
+        if op {
+            self.canonicalize(&mut s);
+            self.canonicalize(&mut p);
+            if let FlakeValue::Ref(sid) = &mut o {
+                self.canonicalize(sid);
+            }
+            self.canonicalize(&mut dt);
+        }
 
         // Late hard guard for storage invariants: catches (FlakeValue, dt)
         // mis-pairings (e.g. scalar object key with VECTOR_ID datatype) before
@@ -266,24 +373,26 @@ impl<'a> FlakeGenerator<'a> {
         Ok(Some(flake))
     }
 
-    /// Resolve a template graph variable to the graph's Sid.
+    /// Resolve a template graph variable to the graph it writes.
     ///
-    /// `None` (unbound, or poisoned by OPTIONAL) skips the triple, as for any
-    /// other template variable. A binding that cannot name a graph is an error
-    /// rather than a skip, matching how a literal subject is treated.
+    /// Unbound (or poisoned by OPTIONAL) skips the triple, as for any other
+    /// template variable. A binding that cannot name a graph is an error
+    /// rather than a skip, matching how a literal subject is treated. A
+    /// binding resolves through the ledger's graph-position table, so the
+    /// graph a WHERE read under a name is the graph the name writes.
     fn resolve_graph_var(
         &mut self,
         var: VarId,
         bindings: &Batch,
         row: usize,
-    ) -> Result<Option<Sid>> {
+    ) -> Result<SolutionGraph> {
         if bindings.is_empty() {
             return Err(TransactError::UnboundVariable(format!("var_{var:?}")));
         }
         let sid_iri;
         let mut bound_sid = None;
         let iri: &str = match bindings.get(row, var) {
-            None | Some(Binding::Unbound | Binding::Poisoned) => return Ok(None),
+            None | Some(Binding::Unbound | Binding::Poisoned) => return Ok(SolutionGraph::Unbound),
             Some(Binding::Iri(iri)) => iri,
             Some(
                 Binding::Sid { sid, .. }
@@ -292,7 +401,7 @@ impl<'a> FlakeGenerator<'a> {
                 },
             ) => {
                 if let Some(graph) = self.sid_graphs.get(sid) {
-                    return Ok(Some(graph.clone()));
+                    return Ok(SolutionGraph::of(graph.clone()));
                 }
                 bound_sid = Some(sid);
                 if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
@@ -323,18 +432,30 @@ impl<'a> FlakeGenerator<'a> {
             }
         };
         let iri = self.graph_aliases.get(iri).map_or(iri, AsRef::as_ref);
-        let graph = if let Some(sid) = self.written_graphs.get(iri) {
-            sid.clone()
-        } else {
-            fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
-                .map_err(TransactError::InvalidTerm)?;
-            let iri = iri.to_string();
-            self.graph_sid(&iri)
+        let graph = match self.bound_graphs.get(iri) {
+            Some(graph) => graph.clone(),
+            None => {
+                let bound: Box<str> = iri.into();
+                let target = match self.graph_table {
+                    Some(table) => table(&bound)?,
+                    None => WriteGraph::Named(Arc::from(&*bound)),
+                };
+                let graph = match target {
+                    WriteGraph::Default => None,
+                    WriteGraph::Named(iri) => {
+                        fluree_db_core::graph_registry::validate_absolute_graph_iri(&iri)
+                            .map_err(TransactError::InvalidTerm)?;
+                        Some(self.graph_sid(&iri))
+                    }
+                };
+                self.bound_graphs.insert(bound, graph.clone());
+                graph
+            }
         };
         if let Some(sid) = bound_sid {
             self.sid_graphs.insert(sid.clone(), graph.clone());
         }
-        Ok(Some(graph))
+        Ok(SolutionGraph::of(graph))
     }
 
     /// Resolve a subject term

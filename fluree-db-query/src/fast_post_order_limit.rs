@@ -409,7 +409,8 @@ fn collect_post_desc_topk(
     // SortOperator's multiset semantics), and DISTINCT collapses them by the
     // projected `(s?, o)` below — neither needs `o_i`.
     let projection = projection_sid_okey();
-    let mut results: Vec<TopKRow> = Vec::with_capacity(need);
+    let mut results: Vec<TopKRow> =
+        Vec::with_capacity(fluree_db_core::topk::initial_capacity(need));
     // DISTINCT dedup key: (subject-or-0, o_type, o_key). When DISTINCT is set the
     // detector guarantees the object var is projected, so the object component is
     // always meaningful; the subject component is included only when projected.
@@ -564,7 +565,8 @@ fn collect_post_desc_topk_overlay(
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let projection = projection_sid_okey_oi();
 
-    let mut results: Vec<TopKRow> = Vec::with_capacity(need);
+    let mut results: Vec<TopKRow> =
+        Vec::with_capacity(fluree_db_core::topk::initial_capacity(need));
     let mut emitted: FxHashSet<OvRow> = FxHashSet::default(); // full-fact dedup
     let mut distinct_seen: FxHashSet<(u64, u64)> = FxHashSet::default(); // (s_or0, o_key)
     let mut assert_idx = 0usize;

@@ -35,14 +35,19 @@ DatalogRule {
            with their VarRegistry,
     heads: Vec<RuleHead>  — (subject, predicate, object) terms that are either
            constants or VarIds bound by the body,
-    depends_on / generates — predicate Sids, for the ordering heuristic
+    footprint: graph-qualified predicates/classes the body may read and the
+           heads may write, plus whether re-running the body is repeatable
 }
 ```
 
 Rule bodies are executed by the planned query executor
-(`prepare_execution_with_config` + `execute_prepared`) against the same
-`GraphDbRef` the query runs on, with the base overlay wrapped in a
-`ReasoningOverlay` carrying the facts derived so far. Every construct the
+(`prepare_execution_with_config` + `execute_prepared_streaming`) against the
+same `GraphDbRef` the query runs on, with the base overlay wrapped in a
+`ReasoningOverlay` carrying the facts derived so far. Derived facts carry
+the query's `t`, and at equal `t` a retraction wins the tie, so the overlay
+drops a stored retraction at the query's `t` that a derived fact restates:
+when the latest commit retracted the stored copy of a fact the rules derive
+again, the fact still holds. Every construct the
 executor supports is therefore available in a rule body, subject to the
 monotonicity rule below: edge annotations (`@annotation`, `{| |}`, `~ ?r`),
 claim-first patterns (`@reifies`, `rdf:reifies <<( … )>>`), full FILTER
@@ -51,30 +56,97 @@ expressions, BIND, VALUES, UNION, property paths, and subqueries.
 Rule bodies run with reasoning disabled (no re-entrant materialization), as
 root (derived facts are policy-filtered after materialization, exactly as
 before), with eager materialization so every binding is a decoded `Sid` or
-literal, and without fuel or cancellation limits of their own (the reasoning
-budget bounds them).
+literal, and without fuel limits of their own. Each body runs under a
+cancellation handle that times out at the reasoning budget's deadline, so a
+long body stops at its next checkpoint instead of running to completion.
 
 ### Fixpoint
 
+Rules are scheduled by dependency (`datalog_rules/dependency.rs`). Rule B
+depends on rule A when one of B's reads may observe one of A's writes. Reads
+and writes are qualified by graph and by predicate, and `rdf:type` by class.
+Anything the walk cannot pin down reads or writes everything: a variable
+predicate, a wildcard or zero-length path (a zero-hop match pairs every term
+in the graph with itself), a variable-predicate head, an unmodelled construct.
+Strongly connected components of the dependency graph are the recursive
+groups; each group's stage is one past the latest stage of any group it reads
+from.
+
 ```text
-loop:
-    budget check (time, facts, memory)
-    overlay = base ⊕ derived-so-far           (rebuilt only when derived grew)
-    for rule in rules (ordered by dependency count):
-        rows = execute(rule.body over overlay)
-        for row in rows, head in rule.heads:
-            flake = instantiate(head, row)      (skip rows that cannot instantiate)
-            if seen.insert(key(flake)):         (HashSet, O(1))
-                derived.push(flake); new += 1
-                budget check (facts, memory)    (inside the round)
-    if new == 0: fixpoint
+for stage in stages (producers first):
+    active = stage's groups, each with delta = none
+    while active is non-empty:                   (≤ max_iterations passes)
+        budget check (time, facts, memory)
+        overlay = base ⊕ derived-so-far
+        for group in active, rule in group:
+            bodies = [rule.body]                      if group.delta is none
+                                                      or the rule re-runs whole
+                   = [rule.body with atom seeded      otherwise
+                      by group.delta, for each recursive atom]
+            for body in bodies:
+                for row in execute(body over overlay):   (streamed)
+                    budget check (time, every 1024 rows)
+                    for head in rule.heads:
+                        flake = instantiate(head, row)  (skip rows that cannot instantiate)
+                        if seen.insert(key(flake)):     (HashSet, O(1))
+                            derived.push(flake)
+                            budget check (facts, memory)
+        active = recursive groups that derived something this pass,
+                 each with delta = what it derived
+        rebuild the derived overlay if anything was derived and work remains
 ```
 
-Deduplication is a hash set keyed on `(s, p, o, dt, m)`. The derived overlay
-is rebuilt between rounds only when the round produced facts; most rule sets
-converge in two rounds. Semi-naive evaluation (restricting one body pattern to
-the previous round's delta) is a follow-up; it is straightforward to add as a
-VALUES seed on the delta once needed.
+A non-recursive group runs once, against the complete output of the stages
+before it. Groups in one stage never read each other's writes, so they share
+an overlay. Deduplication is a hash set keyed on `(s, p, o, dt, m)`.
+
+Inside a recursive group, evaluation is semi-naive (`datalog_rules/delta.rs`).
+A match a rule finds in pass k+1 but not in pass k uses at least one fact the
+group derived in pass k: nothing else changes while the group iterates, since
+no group in the same stage writes what it reads. A rule's *recursive atoms*
+are its top-level triple patterns whose read may observe one of the group's
+writes. After the group's first pass, the rule runs once per recursive atom,
+with a `VALUES` seed in front of the atom binding its variables to the
+distinct matches among the previous pass's facts. The seed replaces the
+pattern when it matches exactly as a scan would (variables and SID constants,
+a constant predicate, no datatype constraint); otherwise the pattern stays
+behind the seed to do the matching. The rule's other atoms read the full
+overlay, so a match using new facts in two positions is found twice and
+deduplicated; splitting old and new facts per position would need two
+overlays per pass. A rule that reads its group's writes anywhere else — a
+UNION branch, EXISTS, a subquery, a property path, the trailing VALUES block —
+re-runs its whole body every pass. So does a rule whose footprint is not
+repeatable: a volatile function gives new rows for old matches every pass,
+and a seed carries no transaction metadata for `t`/`op` to read.
+
+A recursive group of one rule shaped as a transitive closure skips
+iteration (`datalog_rules/closure.rs`). With `R₀` the `R` facts visible when
+the group starts and `T` a triple pattern with another constant predicate,
+in either direction, the rule's fixpoint derives exactly:
+
+| Rule | Derives | Run once as |
+|---|---|---|
+| `T(x,y) . R(y,z) → R(x,z)` | `T⁺ ∘ R₀` | `T+(x,y) . R(y,z)` |
+| `R(x,y) . T(y,z) → R(x,z)` | `R₀ ∘ T⁺` | `R(x,y) . T+(y,z)` |
+| `R(x,y) . R(y,z) → R(x,z)` | pairs ≥ 2 hops apart in `R₀` | `R+(x,y) . R(y,z)` |
+
+The nonlinear row keeps its last hop as a triple pattern: `R+(x,z)` would
+also emit the one-hop pairs, re-deriving asserted facts the rule never
+derives. The path operator follows only IRI-valued objects. In the first and
+third rows every node on the path is the subject of a fact; in the second the
+path ends at the head's object, so that shape compiles only after a scan
+finds no literal object of `T`'s predicate (which the group cannot write).
+A path with both ends free computes all its pairs before it returns a row,
+so the closure body runs with a pair limit of one more than the facts the
+budget still has room for (or the memory left, at `size_of::<Flake>()` a
+fact, if smaller). A path that exceeds it, or a traversal that hits the path
+operator's visited-node limit, falls back to iteration, which the budget
+bounds fact by fact. The wasted work is about one budget's worth of pairs.
+
+`RuleSchedule::WholeProgram` treats the whole program as one recursive group
+and runs every rule's whole body every round, the evaluation used before
+dependency scheduling. It is kept as the reference differential tests compare
+against.
 
 ### Parsing
 
@@ -98,10 +170,10 @@ to stored rules too: a ledger whose rule set contains a broken rule fails its
 reasoning queries until the rule is fixed, rather than silently answering over
 an incomplete derivation.
 
-Rejected constructs are the non-monotonic ones, which a fixpoint cannot
-evaluate soundly without stratification: OPTIONAL, MINUS, NOT EXISTS
-(`["not-exists", …]`), aggregates and GROUP BY, and SERVICE. Everything else the
-executor accepts is allowed.
+Rejected constructs: OPTIONAL, MINUS (NOT EXISTS is the supported negation),
+GROUP BY at the top of a body (aggregate in a subquery instead), and SERVICE.
+Everything else the executor accepts is allowed, including stratified
+negation and aggregation (below).
 
 Range restriction is enforced per rule: every head variable must be bound by
 the body. A head that references an unbound variable now rejects the rule (it
@@ -123,10 +195,73 @@ nothing, silently". And a stored `f:rule` value whose datatype is neither
 with the two accepted shapes spelled out, instead of being expanded as
 ordinary nodes.
 
-The fixpoint's round limit is reported like a budget cap: stopping at
-`max_iterations` while the last round still derived facts sets
-`capped_reason: "iterations"` and logs a warning, so a truncated closure is
-never indistinguishable from a converged one (#1559).
+The fixpoint's pass limit is reported like a budget cap: stopping at
+`max_iterations` passes in one stage while its last pass still derived facts
+sets `capped_reason: "iterations"` and logs a warning, so a truncated closure
+is never indistinguishable from a converged one (#1559).
+
+### Stratified negation and aggregation
+
+Reads under `NOT EXISTS` or `!` are recorded as `negated_reads` in the
+footprint, and reads inside a grouped or aggregating subquery as
+`aggregated_reads`, as well as ordinary reads, so they create dependency
+edges like any other read: a negating or aggregating rule's stage comes after
+every rule that can write what it reads. `RuleDependencies::unstratified`
+rejects a program in which such a read may observe a write of the reading
+rule's own recursive group, reporting a cycle found by a breadth-first search
+inside that group (`-not->` or `-agg->` on the first arrow) and the facts
+the offending read names, with IRIs spelled out. Double negation counts as negated, which keeps the check
+conservative. The validator requires every variable a negation shares with
+its group to be bound by a positive pattern of that group (or of the group the
+negation is nested in).
+
+Because a cap stops all later stages, a negating or aggregating rule never
+runs over incomplete inputs within datalog. A capped run that leaves such a
+rule unfinished fails with `ResourceLimit` instead of returning partial
+conclusions, and so does an OWL 2 RL cap or failure ahead of such a program,
+since the OWL closure is datalog's input (a positive program still runs over
+what OWL produced, or without it). `RuleSchedule::WholeProgram` refuses these
+programs: it runs every rule from the first round. A subquery's solutions are
+a bag, as in queries, and `owl:sameAs` aliases are counted as stated.
+
+### Named graphs
+
+`RuleHead::graph` holds a head's expanded graph IRI: from a CONSTRUCT
+template's `GRAPH <iri>` block, or a JSON-LD insert node's `"@graph": "<iri>"`
+(a named graph object `{"@id": <iri>, "@graph": [ … ]}` assigns its nodes).
+The footprint writes such a head into `GraphScope::Named`. At run start
+`HeadGraphs::resolve` maps each IRI to a graph id through the ledger's graph
+registry, refusing a graph the ledger lacks, a system graph, or the graph the
+rules run against. A derived flake carries its graph's SID in `g`, so the
+dedup key and routing both see it.
+
+`DerivedFactsOverlay` partitions facts by graph id (`new_routed` /
+`DerivedFactsBuilder::build_routed`); a flake with no `g` belongs to the
+graph the rules ran against, and OWL 2 RL facts stay in the default graph.
+The executor splices the reasoning overlay into every dataset graph of the
+ledger that holds derived facts, not only the primary view. A semi-naive
+seed holds only facts without `g`, since a seeded pattern is a top-level
+pattern of the graph the rules run against; named-graph reads sit inside
+`GRAPH` and re-run whole. A transitive closure head with a graph does not
+compile to a path.
+
+### Run contract
+
+- **Evaluation time.** `NOW()` and `TODAY()` read
+  `ExecutionContext::evaluation_time` when it is set, and rule bodies always
+  set it. A run's time is the query's `reasoningTime` /
+  `# PRAGMA reasoning-time:`, else the commit time (`db:time` in the
+  txn-meta graph) of the commit at the queried `t`. A snapshot with no commit
+  at that `t` fails a program whose footprint `reads_clock`, rather than
+  falling back to the wall clock. With one time per run, both functions are
+  repeatable for scheduling and semi-naive purposes. A requested time is part
+  of the cache key; a defaulted one is already pinned by `to_t`.
+- **Deadline.** The reasoning budget's deadline becomes the body's
+  `QueryCancellation::with_deadline`; a cancelled body caps the run on time.
+- **Attribution.** A capped run records `capped_rules` (the groups still
+  running when the cap fired) and `pending_rules` (the stages after it), and
+  both reach the tracked response. The Raft-recorded tally mirror does not
+  carry them, so its positional wire form is unchanged.
 
 ### IRI operands in JSON-LD filters
 
@@ -194,16 +329,52 @@ Two things need deciding before B ships: whether minted reifiers count against
 materialization sidecar (if built) persists them with the same deterministic
 ids, which would make derived provenance durable and diffable across commits.
 
-## Known limit: rule bodies run under the budget, not the query's tracker
+## Rule bodies run on the query's behalf
 
 Materialization happens while the query is *prepared*, before its execution
-context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
-materialization always has. A rule body is therefore bounded by the reasoning
-budget (facts, memory, time — checked between rules and rounds) but cannot be
-cancelled mid-body by the query's cancellation token, and its scans are not
-charged as query fuel. Threading the tracker and cancellation into
-prepare-time materialization is the follow-up that closes this for both
-engines.
+context exists, so preparation takes the request's tracker and cancellation
+handle (`PrepareConfig::for_request`, carried as `QueryRequest` into
+`compute_derived_facts` and `RuleExecutionEnv`). Each rule body runs under a
+handle from `QueryCancellation::with_deadline_inside`: it reports the query's
+cancellation (client disconnect, query timeout) and also times out at the
+reasoning budget's deadline without cancelling the query. A body stopped by
+the query's cancellation fails the run with `Cancelled`; one stopped by the
+deadline caps it, as before. Rule bodies' scans charge the query's tracker.
+OWL 2 RL takes the same handle and tracker in `ReasoningOptions`: it checks
+for cancellation at each round and every 1,024 facts within one, and charges
+one micro-fuel per fact a round processes. Its cancellation and fuel errors
+fail the query instead of letting it continue without OWL entailments.
+
+A materialization is cached and shared, so its cost lands on the query that
+computes it; queries that reuse it pay nothing for it. A run that is
+cancelled or runs out of fuel returns an error and caches nothing.
+
+## Explanations
+
+`explain_derived_facts` (behind `Fluree::explain_derived`) materializes as a
+query with the same reasoning modes would, from the reasoning cache when it
+can, and takes the facts matching the target from the derived facts. It then
+re-runs the body of every repeatable rule whose head can produce the target,
+over asserted plus derived facts, and keeps the rows whose head instantiates
+to one of those facts, compared by full term identity (value, datatype,
+language tag) (`datalog_rules::explain`). Rules that are not repeatable are
+reported, not replayed. Each row becomes a derivation: the body's triple
+patterns instantiated as premises (looked up in the asserted facts to mark
+them derived or not), its property paths as premises marked `path`, its
+`NOT EXISTS` patterns instantiated as absences with their graph scope, and,
+for a grouped
+subquery, the subquery's patterns re-run without grouping, inside the
+`GRAPH` block that encloses the subquery, and filtered to the row's group
+key. Patterns inside a `UNION` count for each choice of branches the row
+satisfies: every triple bound by the row and holding over asserted and
+derived facts, every path's ends bound (up to 64 choices; past that, only
+what lies outside the unions is reported). Replays run only when the run derived a matching fact, under the
+reasoning budget's deadline measured from the start of the explanation and
+under the request's cancellation and tracker: the deadline marks the
+explanation incomplete, a cancellation fails it. Explanations are one step
+and are not cached. They expose premises regardless of policy, so the API
+refuses a non-root view, checked after the ledger's default policy is
+applied.
 
 ## Why not keep the old matcher and extend it
 
@@ -212,6 +383,6 @@ to annotations would have meant re-implementing the planner's annotation
 expansion (`expand_edge_annotation_patterns`), the three annotation read lanes,
 and join ordering, inside a second engine. Two real costs of the executor
 approach were weighed and accepted: per-rule planning overhead of a few
-milliseconds per round, and the loss of a cheap semi-naive delta restriction
-(the old engine did not have one either; it re-ran every rule against the full
-overlay each round).
+milliseconds per pass, and a delta restriction that seeds a body with a
+`VALUES` block (see Fixpoint) rather than living inside a dedicated join
+operator.

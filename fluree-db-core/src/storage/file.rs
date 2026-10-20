@@ -1205,6 +1205,13 @@ impl FileStorage {
         &self.base_path
     }
 
+    /// The file `address` names under this storage's root, by the rule every
+    /// read and write applies: an address that is absolute, has a `..`
+    /// component, or names the write-ahead log's directory is an error.
+    pub fn path_of(&self, address: &str) -> Result<std::path::PathBuf> {
+        self.resolve_path(address)
+    }
+
     /// Extract the path portion from a Fluree address.
     ///
     /// Handles formats like:
@@ -1244,24 +1251,11 @@ impl FileStorage {
     }
 
     fn resolve_relative_path(&self, path: &str) -> Result<std::path::PathBuf> {
-        use std::path::Component;
-        let p = std::path::Path::new(path);
-
-        // Disallow absolute paths, path traversal, and the log's own directory.
-        if p.is_absolute()
-            || p.components().any(|c| {
-                matches!(
-                    c,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                ) || c.as_os_str() == WAL_DIR
-            })
-        {
-            return Err(crate::error::Error::storage(format!(
+        wal::key_path(&self.base_path, path).ok_or_else(|| {
+            crate::error::Error::storage(format!(
                 "Invalid storage path '{path}': must be a relative path without '..' or '{WAL_DIR}'"
-            )));
-        }
-
-        Ok(self.base_path.join(p))
+            ))
+        })
     }
 }
 
@@ -1522,7 +1516,7 @@ impl StorageRead for FileStorage {
         let path_prefix = Self::extract_path_from_address(prefix).unwrap_or(prefix);
 
         // Get the directory to list from and the file prefix to match
-        let full_path = self.base_path.join(path_prefix);
+        let full_path = self.resolve_relative_path(path_prefix)?;
         let (list_dir, file_prefix) = if full_path.is_dir() {
             (full_path, String::new())
         } else {
@@ -1575,9 +1569,12 @@ impl StorageRead for FileStorage {
                         dirs_to_visit.push(path);
                     }
                 } else if file_type.is_file() {
-                    // A staging file left by an interrupted write is not
-                    // content and must not be handed out as an address.
-                    if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
+                    // A staging file left by an interrupted write, and the
+                    // root's lock file, are not content and must not be
+                    // handed out as addresses.
+                    if is_tmp_artifact(&entry.file_name().to_string_lossy())
+                        || entry.file_name() == super::ROOT_LOCK_FILE
+                    {
                         continue;
                     }
                     // Convert back to relative path from base, as an address
@@ -2522,6 +2519,37 @@ mod tests {
             .filter(|n| is_tmp_artifact(n))
             .collect();
         assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    }
+
+    /// An address names a file under the root or none: `path_of` and
+    /// `list_prefix` refuse an absolute address or one with a `..` component.
+    #[tokio::test]
+    async fn addresses_name_files_under_the_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("beside")).unwrap();
+        let storage = FileStorage::new(&root);
+
+        assert_eq!(
+            storage.path_of("fluree:file://a/b.json").unwrap(),
+            root.join("a/b.json")
+        );
+        for address in [
+            "fluree:file://../beside/x.json",
+            "fluree:file:///beside/x.json",
+        ] {
+            assert!(storage.path_of(address).is_err(), "{address}");
+        }
+        assert!(storage
+            .list_prefix("fluree:file://../beside/")
+            .await
+            .is_err());
+        assert!(storage.list_prefix("../beside/").await.is_err());
+        assert_eq!(
+            storage.list_prefix("a/").await.unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     /// A staging file left by an interrupted write is not content; handing it
@@ -3738,6 +3766,22 @@ mod wal_tests {
             .write_bytes(&format!("fluree:file://{WAL_DIR}/x.bin"), b"x")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn listing_keeps_out_the_root_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = crate::storage::RootLock::acquire(dir.path()).unwrap();
+        let storage = with_wal(dir.path());
+        commit(&storage, 1).await;
+        let listed = storage.list_prefix("").await.unwrap();
+        assert!(!listed.is_empty());
+        assert!(
+            listed
+                .iter()
+                .all(|a| !a.contains(crate::storage::ROOT_LOCK_FILE)),
+            "{listed:?}"
+        );
     }
 
     fn contested_root(dir: &Path) -> (FileStorage, std::fs::File) {

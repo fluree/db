@@ -195,6 +195,13 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
+    /// The ledger config, which decides what checks a write gets, could not
+    /// be read (a storage or read failure, not anything in the request). The
+    /// write is refused rather than admitted unchecked; it can succeed on
+    /// retry.
+    #[error("Ledger config unavailable: {0}")]
+    ConfigUnavailable(String),
+
     /// A transaction named a reserved system graph as a write target:
     /// `urn:fluree:{ledger}#config` (g_id 2) or `#txn-meta` (g_id 1). These
     /// graphs are Fluree-internal — `#config` seeds SHACL/uniqueness governance
@@ -264,6 +271,24 @@ pub enum TransactError {
     SourceGraphNotFound {
         /// The missing source graph IRI the transfer attempted to read.
         graph_iri: String,
+    },
+
+    /// A request-time setting that the ledger config's `f:overrideControl`
+    /// does not permit for this request, where applying less than the caller
+    /// asked for would be unsafe: inline SHACL shapes (`opts.shapes`) the
+    /// caller expects its data to be checked against. Refused rather than
+    /// dropped, so nothing commits unvalidated.
+    #[error(
+        "{setting} refused by this ledger's override control (f:overrideControl {control}) \
+         for {graph}"
+    )]
+    RequestOverrideRefused {
+        /// The request setting, as the caller wrote it.
+        setting: String,
+        /// The graph whose effective control refused it.
+        graph: String,
+        /// The effective `f:overrideControl` value.
+        control: String,
     },
 
     /// Unique constraint violation (`f:enforceUnique`).
