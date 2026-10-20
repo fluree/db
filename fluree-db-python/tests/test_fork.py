@@ -36,6 +36,15 @@ def in_child(fn):
 def work(path):
     return fluree.connect(path).ledger("people").query(Q).values()
 
+def work_elsewhere(path):
+    try:
+        work(path)
+    except fluree.DatabaseInUseError:
+        pass
+    else:
+        raise AssertionError("opened a directory the parent holds")
+    return fluree.connect(tempfile.mkdtemp()).create("people").query(Q).values()
+
 def started(path):
     conn = fluree.connect(path)
     people = conn.create("people")
@@ -92,13 +101,47 @@ def test_a_child_exits_cleanly_holding_inherited_objects(tmp_path):
 
 def test_a_child_forked_after_the_engine_started_refuses_it(tmp_path):
     # Its lock state names the parent's threads, which the child lacks; a
-    # spawned process starts clean.
+    # spawned process starts clean, though not on the directory the parent
+    # holds.
     lines = run(tmp_path, """
         conn, people = started(path)
         in_child(lambda: work(path))
         with multiprocessing.get_context("spawn").Pool(1) as pool:
-            print("SPAWN", pool.map(work, [path]))
+            print("SPAWN", pool.map(work_elsewhere, [path]))
         print("PARENT", people.query(Q).values())
     """)
     assert lines[0].startswith("ERR") and "forked after Fluree started" in lines[0] and "'spawn'" in lines[0]
-    assert lines[1:] == ["STATUS 0", "SPAWN [[['A']]]", "PARENT [['A']]"]
+    assert lines[1:] == ["STATUS 0", "SPAWN [[]]", "PARENT [['A']]"]
+
+
+def test_a_forked_child_does_not_keep_the_directory_locked(tmp_path):
+    # A child forked while the directory is open shares the lock's open file,
+    # yet the directory is free once its parent exits without closing it, or
+    # closes it.
+    lines = run(tmp_path, """
+        started_r, started_w = os.pipe()
+        release_r, release_w = os.pipe()
+
+        def fork_idle_child():
+            if os.fork() == 0:
+                os.close(release_w)
+                os.write(started_w, b"s")
+                os.read(release_r, 1)
+                os._exit(0)
+            os.read(started_r, 1)
+
+        holder = os.fork()
+        if holder == 0:
+            conn, people = started(path)
+            fork_idle_child()
+            os._exit(0)  # holding the directory, without closing it
+        os.waitpid(holder, 0)
+        report(lambda: fluree.connect(path).ledgers())
+
+        conn = fluree.connect(path)
+        fork_idle_child()
+        conn.close()
+        report(lambda: fluree.connect(path).ledgers())
+        os.close(release_w)
+    """)
+    assert lines == ["OK ['people:main']", "OK ['people:main']"]
