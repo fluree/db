@@ -4547,7 +4547,7 @@ where
         doc: DocChunk,
     ) -> std::result::Result<ParsedChunk, fluree_db_transact::TransactError> {
         let base = doc.skolem_base();
-        let parsed = if let Some(prelude) = ctx.prelude {
+        if let Some(prelude) = ctx.prelude {
             parse_chunk_with_prelude(
                 ttl,
                 ctx.shared_alloc,
@@ -4572,8 +4572,7 @@ where
                 Some(ctx.spool_config),
                 idx,
             )
-        };
-        parsed
+        }
     }
 
     // ---- Parse all chunks in parallel, commit serially in order ----
