@@ -418,6 +418,19 @@ path = "tests/it_count_star_row_multiplicity.rs"
 name = "it_topk_large_limit_offset"
 path = "tests/it_topk_large_limit_offset.rs"
 
+# Own binary: fixture A and the scope matrix of the multigraph lanes. It
+# toggles the process-global fast-path kill switch and asserts fast-path
+# routing, so it must not share a process with either.
+[[test]]
+name = "it_multigraph_lanes"
+path = "tests/it_multigraph_lanes.rs"
+
+# Own binary: asserts the index-scope stamp through thread-scoped tracing
+# capture, which misses events while other tests set and drop their own.
+[[test]]
+name = "it_index_scope"
+path = "tests/it_index_scope.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -663,6 +676,10 @@ harness = false
 
 [[bench]]
 name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
+name = "transact_delete_wide_slot"
 harness = false
 
 [[bench]]

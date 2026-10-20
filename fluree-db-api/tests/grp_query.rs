@@ -5,8 +5,6 @@ mod support;
 mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]
 mod it_differential_fastpath;
-#[path = "it_index_scope.rs"]
-mod it_index_scope;
 #[path = "it_jsonld_join_batched_lane.rs"]
 mod it_jsonld_join_batched_lane;
 #[path = "it_materializer_decode_errors.rs"]
@@ -37,6 +35,8 @@ mod it_query_fulltext;
 mod it_query_geo;
 #[path = "it_query_geo_search.rs"]
 mod it_query_geo_search;
+#[path = "it_query_graph_names.rs"]
+mod it_query_graph_names;
 #[path = "it_query_grouping.rs"]
 mod it_query_grouping;
 #[path = "it_query_jsonld.rs"]

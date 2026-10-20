@@ -549,6 +549,14 @@ pub struct Novelty {
     /// both the index root and novelty report no list rows. Never cleared —
     /// a trimmed overlay keeps the bit; the indexed root takes over.
     pub has_list_meta: bool,
+    /// Sticky: some assertion in this overlay holds a term whose persisted
+    /// index key keeps less than the term
+    /// ([`FlakeValue::index_key_loses_detail`](fluree_db_core::FlakeValue::index_key_loses_detail)).
+    /// A query reads such a term through its key as another term, so a DELETE
+    /// that matched it through a WHERE row cannot retract the row as decoded:
+    /// staging reads the stored fact instead. Never cleared — a trimmed
+    /// overlay keeps the bit; an index holds no such term.
+    pub has_lossy_index_terms: bool,
 
     /// Highest `commit_t` at which the ledger config graph (`CONFIG_GRAPH_ID`)
     /// received a write. Monotonic within a novelty window; resets to 0 when
@@ -576,6 +584,13 @@ fn flake_has_list_meta(flake: &Flake) -> bool {
     flake.m.as_ref().is_some_and(|m| m.i.is_some())
 }
 
+/// An assertion of a term its index key keeps less of (see
+/// [`Novelty::has_lossy_index_terms`]).
+#[inline]
+fn flake_has_lossy_index_term(flake: &Flake) -> bool {
+    flake.op && flake.o.index_key_loses_detail(&flake.dt)
+}
+
 impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
@@ -589,6 +604,7 @@ impl Novelty {
             schema_epoch: 0,
             shacl_epoch: 0,
             has_list_meta: false,
+            has_lossy_index_terms: false,
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
@@ -941,6 +957,7 @@ impl Novelty {
             schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
             shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
             self.has_list_meta |= flake_has_list_meta(&flake);
+            self.has_lossy_index_terms |= flake_has_lossy_index_term(&flake);
             per_graph.entry(g_id).or_default().push(flake);
         }
         if schema_touched {
@@ -1042,6 +1059,7 @@ impl Novelty {
                     self.shacl_epoch += 1;
                 }
                 self.has_list_meta |= flake_has_list_meta(&flake);
+                self.has_lossy_index_terms |= flake_has_lossy_index_term(&flake);
                 per_graph.entry(g_id).or_default().push(flake);
             }
         }
@@ -1709,6 +1727,63 @@ mod tests {
         assert_eq!(novelty.epoch, 0);
         assert_eq!(novelty.size, 0);
         assert!(novelty.is_empty());
+    }
+
+    /// Novelty records an assertion of a term its index key keeps less of (a
+    /// big integer written with an XSD subtype), and only an assertion: a
+    /// retraction, or a term the key holds whole (a double, `±INF` and NaN
+    /// included), leaves the flag clear. Both apply paths set it.
+    #[test]
+    fn a_lossy_term_assertion_sets_the_flag() {
+        let big = |dt: &str, t: i64, op: bool| {
+            Flake::new(
+                Sid::new(100, "s"),
+                Sid::new(100, "p"),
+                FlakeValue::BigInt(Box::new("123456789012345678901234567890".parse().unwrap())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                t,
+                op,
+                None,
+            )
+        };
+        let exact = "integer";
+        let lossy = "nonNegativeInteger";
+        let double = |d: f64| {
+            Flake::new(
+                Sid::new(100, "s"),
+                Sid::new(100, "d"),
+                FlakeValue::Double(d),
+                Sid::new(fluree_vocab::namespaces::XSD, "double"),
+                1,
+                true,
+                None,
+            )
+        };
+
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(
+                vec![
+                    big(exact, 1, true),
+                    big(lossy, 1, false),
+                    double(f64::INFINITY),
+                    double(f64::NEG_INFINITY),
+                    double(f64::NAN),
+                ],
+                1,
+                &no_graphs(),
+            )
+            .unwrap();
+        assert!(!novelty.has_lossy_index_terms);
+        novelty
+            .apply_commit(vec![big(lossy, 2, true)], 2, &no_graphs())
+            .unwrap();
+        assert!(novelty.has_lossy_index_terms);
+
+        let mut bulk = Novelty::new(0);
+        bulk.bulk_apply_commits(vec![(vec![big(lossy, 1, true)], 1)], &no_graphs())
+            .unwrap();
+        assert!(bulk.has_lossy_index_terms);
     }
 
     /// apply_commit must be atomic: a graph-routing error part-way through a

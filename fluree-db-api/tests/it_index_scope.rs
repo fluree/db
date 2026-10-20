@@ -7,20 +7,35 @@
 //! graph it enters (`site = "graph"`). Each stamp reads
 //! `site=scope/members/current`, where `current` says the index alone answers
 //! for every member (no novelty, the index at the member's `t`).
+//!
+//! Its own `[[test]]` target, and its tests take turns (`take_turn`): run in
+//! parallel threads beside another test setting and dropping its own capture
+//! subscriber, a test here intermittently missed its first query's stamp.
 
-use crate::support::span_capture::{init_test_tracing, SpanStore};
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
 use fluree_db_api::dataset::GraphSelector;
 use fluree_db_api::{
     DatasetSpec, Fluree, FlureeBuilder, GraphDb, GraphSource, LedgerHandle, ReindexOptions,
     TimeSpec,
 };
 use serde_json::{json, Value as JsonValue};
+use span_capture::{init_test_tracing, SpanStore};
 
 const LEDGER: &str = "it/index-scope:main";
 const OTHER_LEDGER: &str = "it/index-scope-other:main";
 const CONFIGURED: &str = "it/index-scope-configured:main";
 const PREFIXES: &str = "PREFIX ex: <http://example.org/> ";
 const UNION_PRAGMA: &str = "# PRAGMA union-default-graph: true\n";
+
+/// One test's capture at a time; see the module comment.
+async fn take_turn() -> tokio::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    TURN.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 /// A default graph and two named graphs, each with one triple of `ex:p`.
 const TRIG: &str = r"
@@ -154,6 +169,7 @@ fn sparql(body: &str) -> String {
 /// Every scope of design §5's table, through the surface that reaches it.
 #[tokio::test(flavor = "current_thread")]
 async fn index_scope_of_every_dataset_scope() {
+    let _turn = take_turn().await;
     let fluree = FlureeBuilder::memory().build_memory();
     indexed(&fluree, LEDGER, TRIG).await;
     indexed(
@@ -358,6 +374,7 @@ async fn scope_of(fluree: &Fluree, spec: &DatasetSpec) -> Vec<String> {
 /// its own and the scope was `none`.
 #[tokio::test(flavor = "current_thread")]
 async fn from_several_graphs_shares_one_load_of_the_ledger() {
+    let _turn = take_turn().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().to_string();
     // No background indexing: it would index the write below before the

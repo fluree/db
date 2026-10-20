@@ -1,17 +1,21 @@
-//! `fluree doc` — a folder of documents into a graph-RAG ledger, and search
-//! over what it built.
+//! `fluree doc` — a folder of documents into a graph-RAG ledger, search
+//! over what it built, and one document's graph without a ledger.
 //!
 //! `ingest` runs in-process against local storage: parse (cached), chunk,
 //! embed, retract the document's previous extraction, insert structure plus
-//! chunks as one commit, then create or sync the vector and full-text graph
-//! sources over the ledger. The HNSW index has no HTTP creation endpoint,
-//! so there is no server route for this command yet.
+//! chunks as one commit, then index the ledger and create or sync the
+//! full-text graph source over it. There is no server route for it yet.
 //!
-//! `search` embeds the query with the same endpoint and joins the index hit
-//! back to the chunk's text, section path and source document, so a result
-//! is a citation and not just a score.
+//! `search` scores chunk embeddings exactly and runs BM25 over chunk text,
+//! and joins each hit back to the chunk's text, section path and source
+//! document, so a result is a citation and not just a score.
+//!
+//! `parse` prints the structure graph `ingest` would write for one file.
 
-use crate::cli::{DocAction, DocIngestArgs, DocRelationMode, DocSearchArgs, DocSearchMode};
+use crate::cli::{
+    DocAction, DocIngestArgs, DocParseArgs, DocParseFormat, DocRelationMode, DocSearchArgs,
+    DocSearchMode,
+};
 use crate::commands::doc_sources::{self, Source};
 use crate::context::{self, build_fluree};
 use crate::error::{CliError, CliResult};
@@ -34,6 +38,7 @@ pub async fn run(action: DocAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         DocAction::Ingest(args) => run_ingest(args, dirs).await,
         DocAction::Search(args) => run_search(args, dirs).await,
+        DocAction::Parse(args) => run_parse(args, Some(dirs)).await,
     }
 }
 
@@ -500,9 +505,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
 
     let inputs = collect_inputs(&args.paths)?;
     if inputs.is_empty() {
-        return Err(CliError::Usage(
-            "no supported documents found (pdf, md, html, docx, pptx, png, jpg)".into(),
-        ));
+        return Err(CliError::Usage(format!(
+            "no supported documents found ({})",
+            fluree_db_doc::parse::SUPPORTED_EXTENSIONS
+        )));
     }
 
     let cache = (!args.no_cache).then(|| DocCache::new(cache_root(dirs)));
@@ -799,6 +805,9 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 "!".yellow()
             );
             totals.unescalated += 1;
+        }
+        for note in &doc.parsed.notes {
+            println!("    {} {note}", "!".yellow());
         }
         totals.ingested += 1;
         totals.chunks += doc.chunks.len();
@@ -1098,6 +1107,98 @@ async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {
         .lookup_graph_source(id)
         .await?
         .is_some_and(|r| !r.retracted))
+}
+
+// ---------------------------------------------------------------------------
+// parse
+// ---------------------------------------------------------------------------
+
+/// One file's structure graph (or text projection) to stdout. Writes no
+/// ledger, so it needs no project: `dirs` only supplies `[doc]` config and
+/// the cache when there is one.
+pub async fn run_parse(args: DocParseArgs, dirs: Option<&FlureeDir>) -> CliResult<()> {
+    let path = &args.file;
+    if !path.is_file() {
+        return Err(CliError::Input(format!("{}: no such file", path.display())));
+    }
+    if fluree_db_doc::SourceKind::from_path(path).is_none() {
+        return Err(CliError::Usage(format!(
+            "{}: not a document `fluree doc` reads ({})",
+            path.display(),
+            fluree_db_doc::parse::SUPPORTED_EXTENSIONS
+        )));
+    }
+    let config = match dirs {
+        Some(dirs) => resolve_config(dirs).await?,
+        None => DocConfig::default().with_env(),
+    };
+    let cache = dirs
+        .filter(|_| !args.no_cache)
+        .map(|d| DocCache::new(cache_root(d)));
+    let vlm = match (args.no_escalate, config.crop_reader()) {
+        (false, Some(endpoint)) => Some(Arc::new(VlmReader::new(
+            endpoint.clone(),
+            cache.clone(),
+            args.max_crops,
+        )?)),
+        _ => None,
+    };
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // The IRI `ingest` gives a file named on its own command line.
+    let doc_iri = args
+        .doc_iri
+        .clone()
+        .unwrap_or_else(|| fluree_db_doc::ingest::document_iri(&args.base_iri, &file_name));
+    if let Some(vlm) = &vlm {
+        eprintln!(
+            "{} vision model {} reads what the parser cannot (--no-escalate to skip)",
+            "→".dimmed(),
+            vlm.model()
+        );
+    }
+
+    let (p, iri) = (path.clone(), doc_iri.clone());
+    let (_, parsed) = tokio::task::spawn_blocking(move || {
+        fluree_db_doc::parse_file(&p, &file_name, &iri, cache.as_ref(), vlm.as_ref())
+    })
+    .await
+    .map_err(|e| CliError::Input(format!("parse task failed: {e}")))??;
+
+    if let Some(why) = &parsed.escalation_skipped {
+        eprintln!(
+            "{} deterministic tier only: {why}; raise --max-crops to read them",
+            "!".yellow()
+        );
+    }
+    for note in &parsed.notes {
+        eprintln!("{} {note}", "!".yellow());
+    }
+    let mut out = match args.format {
+        DocParseFormat::Doco => parsed.doco,
+        DocParseFormat::Text => parsed.text,
+    };
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    match &args.output {
+        Some(target) => std::fs::write(target, out)?,
+        None => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            // A reader that stopped early (`| head`) is not an error.
+            match stdout
+                .write_all(out.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                r => r?,
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
