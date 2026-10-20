@@ -527,6 +527,12 @@ fn shared_stretch<O: MergeOrder>(
     out: &mut Emitted<'_>,
 ) -> Option<(Key, Key)> {
     let from = a.pos;
+    if let Some(shared) = constant_shared_prefix::<O>(a, b, bound) {
+        a.pos += shared;
+        b.pos += shared;
+        out.run(a, from, a.pos, head);
+        return (a.pos < a.end && b.pos < b.end).then(|| (a.head(), b.head()));
+    }
     let next = loop {
         a.pos += 1;
         b.pos += 1;
@@ -540,6 +546,55 @@ fn shared_stretch<O: MergeOrder>(
     };
     out.run(a, from, a.pos, head);
     next
+}
+
+/// [`shared_stretch`]'s walk on slices: how many rows from both heads (equal)
+/// are equal and, after the first, sort before `bound`, when both batches
+/// carry `p_id`, `o_type` and `o_i` as one constant they agree on (one
+/// predicate's leaflets of one type, without list rows, the common case).
+/// Two rows then differ only in `s_id` and `o_key`, compared as slices.
+/// `None` when the columns are not of that shape.
+#[inline]
+fn constant_shared_prefix<O: MergeOrder>(
+    a: &Lane<'_>,
+    b: &Lane<'_>,
+    bound: Option<&Key>,
+) -> Option<usize> {
+    let (ab, bb) = (a.batch, b.batch);
+    let same_const = matches!((&ab.p_id, &bb.p_id), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
+        && matches!((&ab.o_type, &bb.o_type), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
+        && matches!((&ab.o_i, &bb.o_i), (ColumnData::Const(x), ColumnData::Const(y)) if x == y);
+    if !same_const {
+        return None;
+    }
+    let (
+        ColumnData::Block(a_s),
+        ColumnData::Block(b_s),
+        ColumnData::Block(a_o),
+        ColumnData::Block(b_o),
+    ) = (&ab.s_id, &bb.s_id, &ab.o_key, &bb.o_key)
+    else {
+        return None;
+    };
+    let mut span = (a.end - a.pos).min(b.end - b.pos);
+    if let Some(bound) = bound {
+        // The head always goes; the rows after it only while below `bound`.
+        let below = partition_point(a.pos + 1, a.end, |row| {
+            O::cmp(&Key::at(ab, row), bound) == Ordering::Less
+        });
+        span = span.min(below - a.pos);
+    }
+    let shared = a_s[a.pos..a.pos + span]
+        .iter()
+        .zip(&b_s[b.pos..b.pos + span])
+        .zip(
+            a_o[a.pos..a.pos + span]
+                .iter()
+                .zip(&b_o[b.pos..b.pos + span]),
+        )
+        .take_while(|((sa, sb), (oa, ob))| sa == sb && oa == ob)
+        .count();
+    Some(shared.max(1))
 }
 
 /// Two distinct elements of `slice`, mutably.
