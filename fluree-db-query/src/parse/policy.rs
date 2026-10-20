@@ -11,6 +11,7 @@ use fluree_graph_json_ld::{
     ParsedContext,
 };
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Parse-time policy flags for JSON-LD parsing.
@@ -38,6 +39,9 @@ pub struct JsonLdParseCtx {
     pub context: ParsedContext,
     pub path_aliases: PathAliasMap,
     pub policy: JsonLdParsePolicy,
+    /// Names the query's own dataset (`fromNamed`) spells; see
+    /// [`Self::graph_name`].
+    pub dataset_names: HashSet<String>,
     /// What resolves a graph name beyond the `@context`
     /// ([`super::graph_name`]): an update's ledger and `fromNamed` aliases.
     pub graph_names: GraphNameEnv,
@@ -60,10 +64,40 @@ impl JsonLdParseCtx {
             context,
             path_aliases,
             policy,
+            dataset_names: HashSet::new(),
             graph_names: GraphNameEnv::default(),
             enclosing_graphs: AtomicU32::new(0),
             reads_ledger_default: AtomicBool::new(false),
         }
+    }
+
+    /// The names the query's dataset spells, which a `graph` clause may
+    /// name as written.
+    pub fn with_dataset_names(mut self, names: HashSet<String>) -> Self {
+        self.dataset_names = names;
+        self
+    }
+
+    /// A `where` clause's graph name as the query means it. A compact IRI
+    /// whose prefix the context defines is expanded. Anything else — a
+    /// variable, an absolute IRI, a dataset alias, a ledger or graph source
+    /// name — is kept as written, as is a name the query's own dataset
+    /// spells exactly that way. Unlike a node `@id`, a graph name is not
+    /// resolved against `@base`: a name that is not an IRI is an alias.
+    pub fn graph_name(&self, raw: &str) -> String {
+        let defined_prefix = raw
+            .split_once(':')
+            .filter(|(_, local)| !local.starts_with("//"))
+            .is_some_and(|(prefix, _)| {
+                self.context
+                    .get(prefix)
+                    .is_some_and(|entry| entry.id.is_some())
+            });
+        if !defined_prefix || self.dataset_names.contains(raw) {
+            return raw.to_string();
+        }
+        self.expand_id(raw)
+            .map_or_else(|_| raw.to_string(), |(iri, _)| iri)
     }
 
     /// The same context, resolving graph names with `env` (an update's

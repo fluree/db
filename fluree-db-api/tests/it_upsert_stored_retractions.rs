@@ -18,7 +18,9 @@
 use crate::support;
 use fluree_db_api::{Fluree, FlureeBuilder, LedgerState};
 use fluree_db_core::comparator::IndexType;
-use fluree_db_core::{range_with_overlay, FlakeValue, RangeMatch, RangeOptions, RangeTest};
+use fluree_db_core::{
+    range_with_overlay, FlakeValue, OverlayProvider, RangeMatch, RangeOptions, RangeTest,
+};
 use serde_json::{json, Value as JsonValue};
 
 const EX: &str = "http://example.org/ns/";
@@ -538,15 +540,13 @@ async fn upsert_over_an_annotated_lang_value_cascades_the_annotation() {
     }
 }
 
-/// U5: a big integer typed with an XSD subtype loses its declared datatype
-/// in the index (`NUM_BIG` stores no datatype), so after an index build an
-/// identical re-upsert stages a retraction of the decoded `xsd:integer`
-/// value that shares one storage key with the assertion of the declared
-/// one, and the retraction wins: the value is deleted. The retraction
-/// resolver reads what the index can tell it, which does not include the
-/// declared subtype; the fix belongs to the index encoding.
+/// An identical re-upsert keeps an indexed big integer typed with an XSD
+/// subtype. The index stores it with no datatype (`NUM_BIG`), so the upsert
+/// retracts the stored `xsd:integer` value and asserts the declared one: two
+/// terms under one storage key, which storage resolves at one `t` as the
+/// retraction. The operation tells facts apart the way storage does
+/// (`FactIdentity`), so the two are one fact and cancel.
 #[tokio::test]
-#[ignore = "U5: the index drops the declared subtype of NUM_BIG values (filing held, AJ-4)"]
 async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     let mut h = Harness::new("u5").await;
     let doc = jsonld(json!({
@@ -560,12 +560,9 @@ async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
 }
 
-/// The same class for temporals: storage keeps a `dateTime` to the
-/// microsecond, so a value written with more digits decodes differently from
-/// the term that is re-upserted, and the retraction of the decode and the
-/// assertion of the written term share one storage key.
+/// The same for a `dateTime` written past the microsecond, which is read to
+/// the microsecond storage keeps, so the re-upserted term is the stored one.
 #[tokio::test]
-#[ignore = "U5: storage keeps temporals to the microsecond (filing held, AJ-4)"]
 async fn an_identical_reupsert_keeps_a_sub_microsecond_datetime() {
     let mut h = Harness::new("u5-datetime").await;
     let doc = jsonld(json!({
@@ -577,4 +574,317 @@ async fn an_identical_reupsert_keeps_a_sub_microsecond_datetime() {
     h.reindex().await;
     h.upsert(&doc).await;
     assert_eq!(h.facts(None, "s").await.len(), 1, "the value survives");
+}
+
+// =============================================================================
+// Ops on one index key are one stored fact
+// =============================================================================
+
+/// An integer past 64 bits: the index keys it by value, with no datatype.
+const BIG: &str = "123456789012345678901234567890";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+fn big(dt: &str) -> Payload {
+    jsonld(json!({"@id": "ex:s", "ex:n": {"@value": BIG, "@type": dt}}))
+}
+
+/// A delete of every `ex:s <p>` value, witnessed by its WHERE triple.
+fn delete_where(p: &str) -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "where": {"@id": "ex:s", p: "?o"},
+        "delete": {"@id": "ex:s", p: "?o"}
+    })
+}
+
+impl Harness {
+    async fn update(&mut self, txn: &JsonValue) -> fluree_db_api::CommitReceipt {
+        let ledger = self.ledger.take().expect("ledger");
+        let result = self.fluree.update(ledger, txn).await.expect("update");
+        self.ledger = Some(result.ledger);
+        result.receipt
+    }
+
+    /// The retractions in the default graph's novelty, as `(predicate local
+    /// name, datatype IRI)`.
+    fn novelty_retractions(&self) -> Vec<(String, String)> {
+        let ledger = self.ledger();
+        let mut out = Vec::new();
+        ledger.novelty.for_each_overlay_flake(
+            0,
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            ledger.t(),
+            &mut |f| {
+                if !f.op {
+                    let dt = ledger.snapshot.decode_sid(&f.dt).unwrap_or_default();
+                    out.push((f.p.name.to_string(), dt));
+                }
+            },
+        );
+        out
+    }
+
+    /// Upsert `payload`, which `ex:s` no longer holds, and check that it
+    /// writes the one value again, before and after the next index build.
+    async fn upsert_writes_it_again(&mut self, payload: &Payload, what: &str) {
+        assert!(self.facts(None, "s").await.is_empty(), "{what}: removed");
+        let t = self.ledger().t();
+        let receipt = self.upsert(payload).await;
+        assert!(
+            receipt.t > t && receipt.assert_count == 1,
+            "{what}: the upsert writes the value again: {receipt:?}"
+        );
+        assert_eq!(self.facts(None, "s").await.len(), 1, "{what}");
+        self.reindex().await;
+        assert_eq!(
+            self.facts(None, "s").await.len(),
+            1,
+            "{what}: after the next index build"
+        );
+    }
+}
+
+/// After a `DELETE WHERE` removes an indexed big integer, upserting the
+/// value writes it again: the delete retracts the fact the index holds.
+#[tokio::test]
+async fn an_upsert_after_a_delete_where_of_an_indexed_big_integer_writes_it() {
+    let mut h = Harness::new("key-delete-where").await;
+    h.insert(&big(XSD_INTEGER)).await;
+    h.reindex().await;
+    h.update(&delete_where("ex:n")).await;
+    h.upsert_writes_it_again(&big(XSD_INTEGER), "DELETE WHERE")
+        .await;
+}
+
+/// The retraction a `DELETE WHERE` stages for an indexed big integer
+/// carries the datatype it is stored with, `xsd:integer`, not the
+/// `xsd:decimal` the index reports for every big number.
+#[tokio::test]
+async fn a_delete_where_retracts_an_indexed_big_integer_as_xsd_integer() {
+    let mut h = Harness::new("key-delete-where-dt").await;
+    h.insert(&big(XSD_INTEGER)).await;
+    h.reindex().await;
+    h.update(&delete_where("ex:n")).await;
+    assert_eq!(
+        h.novelty_retractions(),
+        vec![("n".to_string(), XSD_INTEGER.to_string())]
+    );
+}
+
+const XSD_NON_NEGATIVE: &str = "http://www.w3.org/2001/XMLSchema#nonNegativeInteger";
+
+/// A revert retracts a big integer under the XSD subtype it was written
+/// with, which the index does not keep: once the insert is indexed, the
+/// retraction and the stored fact differ by datatype and share an index
+/// key, so storage removes the value. The resolver merges them the same
+/// way, and upserting the value afterwards writes it again.
+#[tokio::test]
+async fn an_upsert_after_reverting_an_indexed_subtyped_big_integer_writes_it() {
+    let mut h = Harness::new("key-revert").await;
+    // A first commit, so the reverted one is not the genesis commit.
+    h.insert(&jsonld(json!({"@id": "ex:unrelated", "ex:u": "u"})))
+        .await;
+    let Payload::JsonLd(doc) = big(XSD_NON_NEGATIVE) else {
+        unreachable!("a JSON-LD payload")
+    };
+    let ledger = h.ledger.take().expect("ledger");
+    let written = h.fluree.insert(ledger, &doc).await.expect("insert");
+    let commit = written.receipt.commit_id.clone();
+    h.ledger = Some(written.ledger);
+    h.reindex().await;
+    drop(h.ledger.take());
+    let (name, branch) = h.id.split_once(':').expect("ledger id");
+    h.fluree
+        .revert_commit(
+            name,
+            branch,
+            fluree_db_api::CommitRef::Exact(commit),
+            fluree_db_api::ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("revert");
+    h.ledger = Some(h.fluree.ledger(&h.id).await.expect("reload"));
+    h.upsert_writes_it_again(&big(XSD_NON_NEGATIVE), "revert")
+        .await;
+}
+
+/// A value in novelty whose index key keeps less than its term: queries over
+/// novelty read it through the key, so the row a `DELETE WHERE` matches is
+/// the key's decode, not the stored term. Retracted as decoded, the row
+/// shares the term's key and storage drops the value, while novelty's
+/// set-semantics dedup, which compares terms, still held the stored term as
+/// asserted and dropped its re-assertion: the value read as gone. Such rows
+/// now read their slot and retract the stored term.
+///
+/// `seed` is indexed first, so the predicate (and for a big integer, the
+/// value's key) is in the index; `doc` is written in novelty on top, deleted
+/// through its WHERE row, and upserted again.
+async fn a_lossy_value_survives_its_delete_and_upsert(name: &str, seed: Payload, doc: Payload) {
+    a_lossy_value_survives(name, seed, doc, delete_where("ex:v")).await;
+}
+
+async fn a_lossy_value_survives(name: &str, seed: Payload, doc: Payload, delete: JsonValue) {
+    let mut h = Harness::new(name).await;
+    h.insert(&seed).await;
+    h.reindex().await;
+    h.insert(&doc).await;
+    h.update(&delete).await;
+    h.upsert_writes_it_again(&doc, name).await;
+}
+
+fn typed(id: &str, value: &str, dt: &str) -> Payload {
+    jsonld(json!({"@id": id, "ex:v": {"@value": value, "@type": dt}}))
+}
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+#[tokio::test]
+async fn a_sub_microsecond_datetime_survives_its_delete_and_upsert() {
+    let dt = format!("{XSD}dateTime");
+    a_lossy_value_survives_its_delete_and_upsert(
+        "lossy-datetime",
+        typed("ex:other", "2020-01-01T00:00:00Z", &dt),
+        typed("ex:s", "2020-01-01T00:00:00.123456789Z", &dt),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_sub_microsecond_time_survives_its_delete_and_upsert() {
+    let dt = format!("{XSD}time");
+    a_lossy_value_survives_its_delete_and_upsert(
+        "lossy-time",
+        typed("ex:other", "12:00:00", &dt),
+        typed("ex:s", "12:00:00.123456789", &dt),
+    )
+    .await;
+}
+
+/// The value is in the index already, under another subject, so a query
+/// keys the novelty term by it and reads it back as `xsd:integer`.
+#[tokio::test]
+async fn a_subtyped_big_integer_survives_its_delete_and_upsert() {
+    a_lossy_value_survives_its_delete_and_upsert(
+        "lossy-big-integer",
+        typed("ex:other", BIG, XSD_INTEGER),
+        typed("ex:s", BIG, XSD_NON_NEGATIVE),
+    )
+    .await;
+}
+
+/// An indexed value and a novelty term of its index key, in one slot, are
+/// one stored fact, so an upsert of the slot retracts one fact. The slot read
+/// folds novelty ops into the index rows by key; the index row alone would
+/// be named as a second fact.
+#[tokio::test]
+async fn an_upsert_over_an_indexed_value_and_a_novelty_term_of_its_key_retracts_one_fact() {
+    let dt = format!("{XSD}dateTime");
+    let mut h = Harness::new("one-key-two-terms").await;
+    h.insert(&typed("ex:s", "2020-01-01T00:00:00.123456Z", &dt))
+        .await;
+    h.reindex().await;
+    h.insert(&typed("ex:s", "2020-01-01T00:00:00.123456789Z", &dt))
+        .await;
+    let receipt = h.upsert(&typed("ex:s", "2021-06-01T00:00:00Z", &dt)).await;
+    assert_eq!(receipt.retract_count, 1);
+    let facts = h.facts(None, "s").await;
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(facts[0].contains("2021"), "{facts:?}");
+}
+
+/// A predicate the index does not have yet, matched by a WHERE that binds
+/// the predicate: the subject scan keys novelty under a runtime predicate
+/// id, so its row is the key's decode, and the resolver keys the stored
+/// term the same way.
+#[tokio::test]
+async fn a_sub_microsecond_datetime_of_a_new_predicate_survives_its_delete_and_upsert() {
+    let dt = format!("{XSD}dateTime");
+    a_lossy_value_survives(
+        "lossy-datetime-new-predicate",
+        jsonld(json!({"@id": "ex:other", "ex:u": "u"})),
+        typed("ex:s", "2020-01-01T00:00:00.123456789Z", &dt),
+        json!({
+            "@context": ctx(),
+            "where": {"@id": "ex:s", "?p": "?o"},
+            "delete": {"@id": "ex:s", "?p": "?o"}
+        }),
+    )
+    .await;
+}
+
+// =============================================================================
+// upsert.md: replacing one language
+// =============================================================================
+
+/// `upsert.md`'s update that replaces one language of a predicate, read
+/// from the doc: the SPARQL block under "Replacing One Language".
+fn replace_one_language() -> &'static str {
+    const DOC: &str = include_str!("../../docs/transactions/upsert.md");
+    let section = DOC
+        .split_once("### Replacing One Language")
+        .expect("upsert.md has the section")
+        .1;
+    let block = section
+        .split_once("```sparql\n")
+        .expect("the section has a SPARQL block")
+        .1;
+    block.split_once("```").expect("the block closes").0
+}
+
+impl Harness {
+    async fn sparql_update(&mut self, text: &str) {
+        let ledger = self.ledger.take().expect("ledger");
+        let parsed = fluree_db_sparql::parse_sparql(text);
+        assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
+        let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+        let txn = fluree_db_transact::lower_sparql_update_ast(
+            &parsed.ast.expect("SPARQL AST"),
+            &mut ns,
+            fluree_db_transact::TxnOpts::default(),
+        )
+        .expect("lower");
+        let result = self
+            .fluree
+            .stage_owned(ledger)
+            .txn(txn)
+            .execute()
+            .await
+            .expect("update");
+        self.ledger = Some(result.ledger);
+    }
+}
+
+/// The recipe replaces the French name and keeps the English one, whether
+/// or not a French name is stored, where an upsert of the French name
+/// replaces every language.
+#[tokio::test]
+async fn upsert_md_replaces_one_language_and_keeps_the_others() {
+    let name = |v: &str, tag: &str| json!({"@value": v, "@language": tag});
+    for lane in [Lane::Novelty, Lane::Indexed] {
+        for (what, seed) in [
+            (
+                "french-stored",
+                json!([name("Alice", "en"), name("Alice", "fr")]),
+            ),
+            ("no-french", name("Alice", "en")),
+        ] {
+            let mut h = Harness::new(&format!("one-language-{what}-{lane:?}").to_lowercase()).await;
+            h.insert(&jsonld(
+                json!({"@id": "ex:alice", "http://schema.org/name": seed}),
+            ))
+            .await;
+            if matches!(lane, Lane::Indexed) {
+                h.reindex().await;
+            }
+            h.sparql_update(replace_one_language()).await;
+            assert_eq!(
+                h.facts(None, "alice").await,
+                vec!["name=Alice@en", "name=Alicia@fr"],
+                "{what} [{lane:?}]"
+            );
+        }
+    }
 }

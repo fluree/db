@@ -917,3 +917,159 @@ async fn history_range_respects_to_bound() {
         }
     }
 }
+
+/// A history range bound to an object — a literal, a reference, or a
+/// filter the planner folds into the scan — returns only that object's
+/// events, on an indexed ledger too, whose persisted events the scan reads
+/// by subject and predicate alone, through JSON-LD and SPARQL.
+#[tokio::test]
+async fn history_range_bound_object_matches_only_that_object() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-bound-object:main";
+
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:name": "A", "ex:age": 25, "ex:knows": {"@id": "ex:bob"}},
+                {"@id": "ex:bob", "ex:name": "B", "ex:age": 40},
+            ]}),
+        )
+        .await
+        .expect("t=1");
+    let r2 = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "B", "ex:age": 35,
+                    "ex:knows": {"@id": "ex:carol"}}),
+        )
+        .await
+        .expect("t=2");
+    fluree
+        .upsert(
+            r2.ledger,
+            &json!({"@context": ctx(), "@id": "ex:bob", "ex:name": "C"}),
+        )
+        .await
+        .expect("t=3");
+
+    let range = format!(r#""from": "{ledger_id}@t:1", "to": "{ledger_id}@t:latest""#);
+    let jsonld = |select: &str, where_: &str| -> serde_json::Value {
+        serde_json::from_str(&format!(
+            r#"{{"@context": {{"ex": "http://example.org/"}}, {range},
+                "select": {select}, "where": {where_}, "orderBy": {select}}}"#
+        ))
+        .unwrap()
+    };
+    let named_b = jsonld(r#"["?s"]"#, r#"[{"@id": "?s", "ex:name": "B"}]"#);
+    let knows_bob = jsonld(
+        r#"["?s"]"#,
+        r#"[{"@id": "?s", "ex:knows": {"@id": "ex:bob"}}]"#,
+    );
+    let equal_b = jsonld(
+        r#"["?t", "?op", "?s"]"#,
+        r#"[{"@id": "?s", "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}},
+            ["filter", "(= ?v \"B\")"]]"#,
+    );
+    let older_than_30 = jsonld(
+        r#"["?t", "?op", "?s"]"#,
+        r#"[{"@id": "?s", "ex:age": {"@value": "?v", "@t": "?t", "@op": "?op"}},
+            ["filter", "(> ?v 30)"]]"#,
+    );
+    let sparql_named_b = format!(
+        r#"PREFIX ex: <http://example.org/>
+           SELECT ?s FROM <{ledger_id}@t:1> TO <{ledger_id}@t:latest>
+           WHERE {{ ?s ex:name "B" }} ORDER BY ?s"#
+    );
+    let local = |v: &serde_json::Value| {
+        let s = v
+            .as_str()
+            .or_else(|| v["@id"].as_str())
+            .or_else(|| v["@value"].as_str())
+            .expect("IRI binding");
+        s.rsplit([':', '/']).next().unwrap().to_string()
+    };
+    let events = |rows: serde_json::Value| -> Vec<(String, i64, bool)> {
+        rows.as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                let op = &row["?op"];
+                (
+                    local(&row["?s"]),
+                    row["?t"]["@value"].as_i64().expect("?t"),
+                    op.get("@value").unwrap_or(op).as_bool().expect("?op"),
+                )
+            })
+            .collect()
+    };
+    let subjects = |rows: serde_json::Value| -> Vec<String> {
+        rows.as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| local(row.get("?s").unwrap_or(row)))
+            .collect()
+    };
+    let ev = |s: &str, t: i64, op: bool| (s.to_string(), t, op);
+    let b_events = vec![
+        ev("bob", 1, true),
+        ev("alice", 2, true),
+        ev("bob", 3, false),
+    ];
+    let over_30 = vec![ev("bob", 1, true), ev("alice", 2, true)];
+    let run = |query: serde_json::Value| {
+        let fluree = &fluree;
+        async move {
+            let result = fluree
+                .query_from()
+                .jsonld(&query)
+                .format(FormatterConfig::typed_json().with_normalize_arrays())
+                .execute_tracked()
+                .await
+                .expect("jsonld history");
+            serde_json::to_value(&result.result).unwrap()
+        }
+    };
+
+    for lane in ["novelty", "indexed"] {
+        if lane == "indexed" {
+            reindex_to_current(&fluree, ledger_id).await;
+        }
+        assert_eq!(
+            subjects(run(named_b.clone()).await),
+            ["alice", "bob", "bob"],
+            "{lane}: JSON-LD bound object"
+        );
+        assert_eq!(
+            subjects(run(knows_bob.clone()).await),
+            ["alice", "alice"],
+            "{lane}: JSON-LD bound reference"
+        );
+        assert_eq!(
+            events(run(equal_b.clone()).await),
+            b_events,
+            "{lane}: JSON-LD object equality"
+        );
+        assert_eq!(
+            events(run(older_than_30.clone()).await),
+            over_30,
+            "{lane}: JSON-LD object range"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql_named_b)
+            .format(FormatterConfig::typed_json().with_normalize_arrays())
+            .execute_tracked()
+            .await
+            .expect("sparql history");
+        assert_eq!(
+            subjects(serde_json::to_value(&result.result).unwrap()),
+            ["alice", "bob", "bob"],
+            "{lane}: SPARQL bound object"
+        );
+    }
+}

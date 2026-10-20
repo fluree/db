@@ -20,6 +20,7 @@
 
 use crate::span_capture::{init_test_tracing, SpanStore};
 use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
+use fluree_db_binary_index::RunSortOrder;
 use serde_json::{json, Value as JsonValue};
 use std::sync::OnceLock;
 
@@ -30,34 +31,24 @@ pub const LEDGER: &str = "it/mg-lanes:main";
 pub const UNION_LEDGER: &str = "it/mg-lanes-union:main";
 /// A second ledger, for a default graph that spans ledgers.
 pub const OTHER_LEDGER: &str = "it/mg-lanes-other:main";
+/// [`FIXTURE_A_EMPTY_G0`]: fixture A with an empty default graph.
+pub const EMPTY_G0_LEDGER: &str = "it/mg-lanes-empty-g0:main";
+/// [`FIXTURE_A_EMPTY_G0`] again, with `f:unionDefaultGraph` set.
+pub const EMPTY_G0_UNION_LEDGER: &str = "it/mg-lanes-empty-g0-union:main";
 pub const G1: &str = "urn:g1";
 pub const G2: &str = "urn:g2";
 
-/// Fixture A, written at t 1.
-///
-/// - an identical triple in g1 and g2: `s2 n 2`, `k1 kind T1`, `b big 2.5`
-///   and triangle t3;
-/// - subjects shared by g1 and g2 with different objects: `s1 n 1` / `s1 n 2`,
-///   and `s3` (`n 3` in g1, its label in g2);
-/// - a predicate only g2 has: `ex:only`;
-/// - a `@list` value repeated in one member: `L items ("v" "v")` in g2, two
-///   rows that differ only in their list index;
-/// - one NumBig per graph on one predicate: `b big` is `1.5` in g0 and `2.5`
-///   in g1 and g2 (every `xsd:decimal` is a NumBig arena handle, numbered per
-///   graph, so all three are handle 0 of their graph's arena);
-/// - triangles over `ex:knows`: t1 inside g1, t2 spanning g1 and g2 (its
-///   closing edge `t2c → t2a` is in g2), t3 in g1 and again in g2;
-/// - a constant that matches facts of three datatypes: `?s ex:m 2` matches
-///   `2` (`xsd:integer`), `2.0e0` (`xsd:double`) and `"2"^^xsd:short`. `q1`
-///   holds `2` in g1 and `2.0e0` in g2 (two facts), `q2` holds `2` in both
-///   (one fact).
-pub const FIXTURE_A: &str = r#"
+/// The parts of fixture A that [`FIXTURE_A`] and [`FIXTURE_A_EMPTY_G0`] share:
+/// its prefixes and its named graphs (what they hold is under [`FIXTURE_A`]).
+macro_rules! fixture_a {
+    (prefixes) => {
+        "
 @prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
-ex:a1 ex:n 1 ; ex:label "a1" .
-ex:a2 ex:n 0 ; ex:label "a2" .
-ex:k0 ex:kind ex:T1 .
-ex:b ex:big 1.5 .
+"
+    };
+    (named) => {
+        r#"
 GRAPH <urn:g1> {
   ex:s1 ex:n 1 .
   ex:s2 ex:n 2 ; ex:label "s2" .
@@ -83,7 +74,44 @@ GRAPH <urn:g2> {
   ex:t3a ex:knows ex:t3b . ex:t3b ex:knows ex:t3c . ex:t3c ex:knows ex:t3a .
   ex:q1 ex:m 2.0e0 . ex:q2 ex:m 2 . ex:q3 ex:m 2.0e0 . ex:q4 ex:m "2"^^xsd:short .
 }
-"#;
+"#
+    };
+}
+
+/// Fixture A, written at t 1.
+///
+/// - an identical triple in g1 and g2: `s2 n 2`, `k1 kind T1`, `b big 2.5`
+///   and triangle t3;
+/// - subjects shared by g1 and g2 with different objects: `s1 n 1` / `s1 n 2`,
+///   and `s3` (`n 3` in g1, its label in g2);
+/// - a predicate only g2 has: `ex:only`;
+/// - a `@list` value repeated in one member: `L items ("v" "v")` in g2, two
+///   rows that differ only in their list index;
+/// - one NumBig per graph on one predicate: `b big` is `1.5` in g0 and `2.5`
+///   in g1 and g2 (every `xsd:decimal` is a NumBig arena handle, numbered per
+///   graph, so all three are handle 0 of their graph's arena);
+/// - triangles over `ex:knows`: t1 inside g1, t2 spanning g1 and g2 (its
+///   closing edge `t2c → t2a` is in g2), t3 in g1 and again in g2;
+/// - a constant that matches facts of three datatypes: `?s ex:m 2` matches
+///   `2` (`xsd:integer`), `2.0e0` (`xsd:double`) and `"2"^^xsd:short`. `q1`
+///   holds `2` in g1 and `2.0e0` in g2 (two facts), `q2` holds `2` in both
+///   (one fact).
+pub const FIXTURE_A: &str = concat!(
+    fixture_a!(prefixes),
+    r#"
+ex:a1 ex:n 1 ; ex:label "a1" .
+ex:a2 ex:n 0 ; ex:label "a2" .
+ex:k0 ex:kind ex:T1 .
+ex:b ex:big 1.5 .
+"#,
+    fixture_a!(named)
+);
+
+/// Fixture A's named graphs g1 and g2 alone: a ledger whose default graph
+/// holds no facts, so its index has no leaf for it in any order. Every
+/// union over it answers as g1 and g2 do; the empty member contributes
+/// nothing, and is no reason for a lane to decline.
+pub const FIXTURE_A_EMPTY_G0: &str = concat!(fixture_a!(prefixes), fixture_a!(named));
 
 /// The second ledger's default graph.
 pub const FIXTURE_OTHER: &str = r#"
@@ -128,9 +156,10 @@ pub enum State {
     Indexed2,
 }
 
-/// Fixture A (twice: plain and with `f:unionDefaultGraph`) and the second
-/// ledger, on one in-memory connection with background indexing off, so only
-/// explicit index builds change what is indexed.
+/// Fixture A (twice: plain and with `f:unionDefaultGraph`), the same pair
+/// with an empty default graph, and the second ledger, on one in-memory
+/// connection with background indexing off, so only explicit index builds
+/// change what is indexed.
 pub struct Fixture {
     pub fluree: Fluree,
     pub state: State,
@@ -143,8 +172,16 @@ impl Fixture {
         seed(&fluree, LEDGER, FIXTURE_A).await;
         seed(&fluree, UNION_LEDGER, &format!("{FIXTURE_A}\n{config}")).await;
         seed(&fluree, OTHER_LEDGER, FIXTURE_OTHER).await;
+        let config = union_config(EMPTY_G0_UNION_LEDGER);
+        seed(&fluree, EMPTY_G0_LEDGER, FIXTURE_A_EMPTY_G0).await;
+        seed(
+            &fluree,
+            EMPTY_G0_UNION_LEDGER,
+            &format!("{FIXTURE_A_EMPTY_G0}\n{config}"),
+        )
+        .await;
         if state != State::Indexed {
-            for ledger in [LEDGER, UNION_LEDGER] {
+            for ledger in [LEDGER, UNION_LEDGER, EMPTY_G0_LEDGER, EMPTY_G0_UNION_LEDGER] {
                 let handle = fluree.ledger_cached(ledger).await.expect("ledger");
                 fluree
                     .stage(&handle)
@@ -156,6 +193,9 @@ impl Fixture {
                     index(&fluree, ledger).await;
                 }
             }
+        }
+        for ledger in [EMPTY_G0_LEDGER, EMPTY_G0_UNION_LEDGER] {
+            assert_no_default_graph_leaf(&fluree, ledger).await;
         }
         Self { fluree, state }
     }
@@ -177,6 +217,32 @@ async fn seed(fluree: &Fluree, ledger: &str, trig: &str) {
         .await
         .expect("seed");
     index(fluree, ledger).await;
+}
+
+/// The empty default graph is what the scopes over [`EMPTY_G0_LEDGER`] are
+/// for: its index must hold no leaf for g0 in any order, and one for g1. The
+/// build here leaves g0 out of the root; a root an older bulk import wrote can
+/// instead give it a SPOT with no leaves (#2118). A lane must take either as a
+/// member with no facts.
+async fn assert_no_default_graph_leaf(fluree: &Fluree, ledger: &str) {
+    let handle = fluree.ledger_cached(ledger).await.expect("ledger");
+    let view = handle.snapshot().await;
+    let store = view.binary_store.as_ref().expect("indexed");
+    let g1 = store.graph_id_for_iri(G1).expect("g1 is indexed");
+    for &order in RunSortOrder::all_build_orders() {
+        assert!(
+            store
+                .branch_for_order(0, order)
+                .is_none_or(|branch| branch.leaves.is_empty()),
+            "{ledger}: no {order:?} leaf for the default graph"
+        );
+        assert!(
+            store
+                .branch_for_order(g1, order)
+                .is_some_and(|branch| !branch.leaves.is_empty()),
+            "{ledger}: {order:?} leaves for g1"
+        );
+    }
 }
 
 /// Build `ledger`'s index and reload it, so the cached handle carries no
@@ -207,8 +273,9 @@ pub enum Surface {
     JsonLd,
 }
 
-/// Every scope of design §5's table. A scope says what the query's default
-/// graph is, the `index scope` stamp it must get, and which answer it reads.
+/// Every scope of design §5's table, and the union scopes over a default graph
+/// the index holds no leaf for. A scope says what the query's default graph
+/// is, the `index scope` stamp it must get, and which answer it reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// The ledger's default graph, no dataset.
@@ -240,9 +307,20 @@ pub enum Scope {
     /// `FROM <L@t:1#urn:g1> FROM <L@t:1#urn:g2>`, for [`State::Indexed2`]:
     /// both members at t 1, below the index.
     TimeTravel,
+    /// [`Scope::UnionPragma`] on [`EMPTY_G0_LEDGER`]: a union of three
+    /// members, one of them a default graph the index holds no leaf for.
+    UnionPragmaEmptyG0,
+    /// [`Scope::UnionOpts`] on [`EMPTY_G0_LEDGER`].
+    UnionOptsEmptyG0,
+    /// [`Scope::UnionConfig`] on [`EMPTY_G0_UNION_LEDGER`].
+    UnionConfigEmptyG0,
+    /// `FROM <E> FROM <urn:g1>` on [`EMPTY_G0_LEDGER`]: a union of the empty
+    /// default graph and g1.
+    FromEmptyG0G1,
 }
 
-/// The scopes every lane runs, in design §5's order.
+/// The scopes every lane runs: design §5's order, then the empty default
+/// graph's.
 pub const SCOPES: &[Scope] = &[
     Scope::FromG1G2,
     Scope::FromG1G2Connection,
@@ -257,6 +335,10 @@ pub const SCOPES: &[Scope] = &[
     Scope::GraphVar,
     Scope::TwoLedgers,
     Scope::TimeTravel,
+    Scope::UnionPragmaEmptyG0,
+    Scope::UnionOptsEmptyG0,
+    Scope::UnionConfigEmptyG0,
+    Scope::FromEmptyG0G1,
 ];
 
 /// Which graphs a scope's answer reads.
@@ -273,6 +355,24 @@ pub enum Graphs {
     Empty,
     /// One row set per named graph (g1, g2), each row led by its graph.
     PerNamedGraph,
+    /// g1 and g2 with an empty default graph: g1 and g2's answer.
+    G1G2WithEmptyG0,
+    /// g1 with an empty default graph: g1's answer.
+    G1WithEmptyG0,
+}
+
+/// What `ExecutionContext::index_scope` makes of a scope's default graph, for
+/// a lane to route on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// One graph's index.
+    One,
+    /// Two or more graphs of one ledger, on one index.
+    Union,
+    /// A default graph of none.
+    Empty,
+    /// No index scope: the default graph spans ledgers.
+    None,
 }
 
 impl Scope {
@@ -291,14 +391,18 @@ impl Scope {
             Scope::GraphVar => "GRAPH ?g",
             Scope::TwoLedgers => "two ledgers",
             Scope::TimeTravel => "FROM L@t:1#g1 FROM L@t:1#g2",
+            Scope::UnionPragmaEmptyG0 => "union default graph, PRAGMA, empty g0",
+            Scope::UnionOptsEmptyG0 => "union default graph, opts, empty g0",
+            Scope::UnionConfigEmptyG0 => "union default graph, f:unionDefaultGraph, empty g0",
+            Scope::FromEmptyG0G1 => "FROM empty g0 FROM g1",
         }
     }
 
     /// Whether `surface` can spell this scope.
     pub fn supports(self, surface: Surface) -> bool {
         match self {
-            Scope::UnionPragma => surface == Surface::Sparql,
-            Scope::UnionOpts => surface == Surface::JsonLd,
+            Scope::UnionPragma | Scope::UnionPragmaEmptyG0 => surface == Surface::Sparql,
+            Scope::UnionOpts | Scope::UnionOptsEmptyG0 => surface == Surface::JsonLd,
             _ => true,
         }
     }
@@ -320,6 +424,29 @@ impl Scope {
             Scope::GraphG2 => Graphs::G2,
             Scope::GraphVar => Graphs::PerNamedGraph,
             Scope::TwoLedgers => Graphs::G0Other,
+            Scope::UnionPragmaEmptyG0 | Scope::UnionOptsEmptyG0 | Scope::UnionConfigEmptyG0 => {
+                Graphs::G1G2WithEmptyG0
+            }
+            Scope::FromEmptyG0G1 => Graphs::G1WithEmptyG0,
+        }
+    }
+
+    pub fn kind(self) -> Kind {
+        match self {
+            Scope::DefaultGraph | Scope::FromG1 | Scope::GraphG2 | Scope::GraphVar => Kind::One,
+            Scope::FromG1G2
+            | Scope::FromG1G2Connection
+            | Scope::FromG0G1G2
+            | Scope::UnionPragma
+            | Scope::UnionOpts
+            | Scope::UnionConfig
+            | Scope::TimeTravel
+            | Scope::UnionPragmaEmptyG0
+            | Scope::UnionOptsEmptyG0
+            | Scope::UnionConfigEmptyG0
+            | Scope::FromEmptyG0G1 => Kind::Union,
+            Scope::FromNamedOnly => Kind::Empty,
+            Scope::TwoLedgers => Kind::None,
         }
     }
 
@@ -346,10 +473,16 @@ impl Scope {
         let g = || format!("graph=one/1/{current}");
         match self {
             Scope::DefaultGraph | Scope::FromG1 => vec![q("one/1")],
-            Scope::FromG1G2 | Scope::FromG1G2Connection => vec![q("union/2")],
-            Scope::FromG0G1G2 | Scope::UnionPragma | Scope::UnionOpts | Scope::UnionConfig => {
-                vec![q("union/3")]
+            Scope::FromG1G2 | Scope::FromG1G2Connection | Scope::FromEmptyG0G1 => {
+                vec![q("union/2")]
             }
+            Scope::FromG0G1G2
+            | Scope::UnionPragma
+            | Scope::UnionOpts
+            | Scope::UnionConfig
+            | Scope::UnionPragmaEmptyG0
+            | Scope::UnionOptsEmptyG0
+            | Scope::UnionConfigEmptyG0 => vec![q("union/3")],
             // No member to be stale: an empty scope reads no index.
             Scope::FromNamedOnly => vec!["query=empty/0/current".to_string()],
             Scope::GraphG2 | Scope::GraphVar => vec![q("one/1"), g()],
@@ -361,10 +494,13 @@ impl Scope {
 
     /// The ledger whose view or `from` the scope reads.
     fn ledger(self) -> &'static str {
-        if self == Scope::UnionConfig {
-            UNION_LEDGER
-        } else {
-            LEDGER
+        match self {
+            Scope::UnionConfig => UNION_LEDGER,
+            Scope::UnionPragmaEmptyG0 | Scope::UnionOptsEmptyG0 | Scope::FromEmptyG0G1 => {
+                EMPTY_G0_LEDGER
+            }
+            Scope::UnionConfigEmptyG0 => EMPTY_G0_UNION_LEDGER,
+            _ => LEDGER,
         }
     }
 
@@ -511,9 +647,11 @@ impl Shape {
         let prefixes = format!("PREFIX ex: <{EX}>\n");
         let at_t1 = |g: &str| format!("<{LEDGER}@t:1#{g}>");
         let (prologue, dataset) = match scope {
-            Scope::DefaultGraph | Scope::UnionConfig | Scope::GraphG2 | Scope::GraphVar => {
-                (String::new(), String::new())
-            }
+            Scope::DefaultGraph
+            | Scope::UnionConfig
+            | Scope::UnionConfigEmptyG0
+            | Scope::GraphG2
+            | Scope::GraphVar => (String::new(), String::new()),
             Scope::FromG1 => (String::new(), format!("FROM <{G1}>")),
             Scope::FromG1G2 => (String::new(), format!("FROM <{G1}> FROM <{G2}>")),
             Scope::FromG1G2Connection => (
@@ -524,11 +662,13 @@ impl Shape {
                 String::new(),
                 format!("FROM <{LEDGER}> FROM <{G1}> FROM <{G2}>"),
             ),
-            Scope::UnionPragma => (
+            Scope::UnionPragma | Scope::UnionPragmaEmptyG0 => (
                 "# PRAGMA union-default-graph: true\n".to_string(),
                 String::new(),
             ),
-            Scope::UnionOpts => panic!("opts.unionDefaultGraph has no SPARQL spelling"),
+            Scope::UnionOpts | Scope::UnionOptsEmptyG0 => {
+                panic!("opts.unionDefaultGraph has no SPARQL spelling")
+            }
             Scope::FromNamedOnly => (String::new(), format!("FROM NAMED <{G2}>")),
             Scope::TwoLedgers => (
                 String::new(),
@@ -537,6 +677,10 @@ impl Shape {
             Scope::TimeTravel => (
                 String::new(),
                 format!("FROM {} FROM {}", at_t1(G1), at_t1(G2)),
+            ),
+            Scope::FromEmptyG0G1 => (
+                String::new(),
+                format!("FROM <{EMPTY_G0_LEDGER}> FROM <{G1}>"),
             ),
         };
         let (select, body, group_by) = match scope {
@@ -584,12 +728,22 @@ impl Shape {
             Scope::FromG1 => q["from"] = json!(g(G1)),
             Scope::FromG1G2 | Scope::FromG1G2Connection => q["from"] = json!([g(G1), g(G2)]),
             Scope::FromG0G1G2 => q["from"] = json!([LEDGER, g(G1), g(G2)]),
-            Scope::UnionPragma => panic!("the PRAGMA has no JSON-LD spelling"),
+            Scope::UnionPragma | Scope::UnionPragmaEmptyG0 => {
+                panic!("the PRAGMA has no JSON-LD spelling")
+            }
             Scope::UnionOpts => {
                 q["from"] = json!(LEDGER);
                 q["opts"] = json!({"unionDefaultGraph": true});
             }
+            Scope::UnionOptsEmptyG0 => {
+                q["from"] = json!(EMPTY_G0_LEDGER);
+                q["opts"] = json!({"unionDefaultGraph": true});
+            }
             Scope::UnionConfig => q["from"] = json!(UNION_LEDGER),
+            Scope::UnionConfigEmptyG0 => q["from"] = json!(EMPTY_G0_UNION_LEDGER),
+            Scope::FromEmptyG0G1 => {
+                q["from"] = json!([EMPTY_G0_LEDGER, format!("{EMPTY_G0_LEDGER}#{G1}")]);
+            }
             Scope::FromNamedOnly => q["fromNamed"] = json!([g(G2)]),
             Scope::TwoLedgers => q["from"] = json!([LEDGER, OTHER_LEDGER]),
             Scope::TimeTravel => {
@@ -680,6 +834,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
     // of t2.
     let w = state != State::Indexed;
     match graphs {
+        // The empty default graph holds no fact, so it adds no solution.
+        Graphs::G1G2WithEmptyG0 => expected(shape, Graphs::G1G2, state),
+        Graphs::G1WithEmptyG0 => expected(shape, Graphs::G1, state),
         Graphs::PerNamedGraph => {
             let mut out = Rows::new();
             for (iri, g) in [(G1, Graphs::G1), (G2, Graphs::G2)] {
@@ -707,7 +864,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                 Graphs::G0G1G2 => rows(&[&["a1"], &["s2"], &["s3"]]),
                 Graphs::G0Other => rows(&[&["a1"], &["x1"]]),
                 Graphs::Empty => rows(&[]),
-                Graphs::PerNamedGraph => unreachable!(),
+                Graphs::PerNamedGraph | Graphs::G1G2WithEmptyG0 | Graphs::G1WithEmptyG0 => {
+                    unreachable!()
+                }
             },
             // Distinct subjects with `kind T1`.
             Shape::BoundObjectCount => {
@@ -722,7 +881,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                     Graphs::G0G1G2 => 4,
                     Graphs::G0Other => 2, // k0, x1
                     Graphs::Empty => 0,
-                    Graphs::PerNamedGraph => unreachable!(),
+                    Graphs::PerNamedGraph | Graphs::G1G2WithEmptyG0 | Graphs::G1WithEmptyG0 => {
+                        unreachable!()
+                    }
                 };
                 rows(&[&[&n.to_string()]])
             }
@@ -735,7 +896,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                     Graphs::G1 => 2,                    // q1 int, q2 int
                     Graphs::G2 => 4,                    // q1 dbl, q2 int, q3 dbl, q4 short
                     Graphs::G1G2 | Graphs::G0G1G2 => 5, // q1 int, q1 dbl, q2 int (both), q3 dbl, q4 short
-                    Graphs::PerNamedGraph => unreachable!(),
+                    Graphs::PerNamedGraph | Graphs::G1G2WithEmptyG0 | Graphs::G1WithEmptyG0 => {
+                        unreachable!()
+                    }
                 };
                 rows(&[&[&n.to_string()]])
             }
@@ -821,7 +984,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                     ],
                     Graphs::G0Other => &[("n", 3), ("label", 3), ("kind", 2), ("big", 1)],
                     Graphs::Empty => &[],
-                    Graphs::PerNamedGraph => unreachable!(),
+                    Graphs::PerNamedGraph | Graphs::G1G2WithEmptyG0 | Graphs::G1WithEmptyG0 => {
+                        unreachable!()
+                    }
                 };
                 let mut out: Rows = counts
                     .iter()
@@ -837,7 +1002,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                 Graphs::G2 if w => triangles(&[2, 3]),
                 Graphs::G2 => triangles(&[3]),
                 Graphs::G1G2 | Graphs::G0G1G2 => triangles(&[1, 2, 3]),
-                Graphs::PerNamedGraph => unreachable!(),
+                Graphs::PerNamedGraph | Graphs::G1G2WithEmptyG0 | Graphs::G1WithEmptyG0 => {
+                    unreachable!()
+                }
             },
             // (v, solutions of `?s ex:n v`).
             Shape::GroupByObject => match graphs {
@@ -857,7 +1024,9 @@ pub fn expected(shape: Shape, graphs: Graphs, state: State) -> Rows {
                 Graphs::G0G1G2 => rows(&[&["0", "1"], &["1", "2"], &["2", "2"], &["3", "1"]]),
                 Graphs::G0Other => rows(&[&["0", "1"], &["1", "1"], &["5", "1"]]),
                 Graphs::Empty => Rows::new(),
-                Graphs::PerNamedGraph => unreachable!(),
+                Graphs::PerNamedGraph | Graphs::G1G2WithEmptyG0 | Graphs::G1WithEmptyG0 => {
+                    unreachable!()
+                }
             },
         },
     }

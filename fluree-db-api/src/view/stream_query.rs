@@ -262,6 +262,8 @@ impl Fluree {
         let union = super::union_default_dataset(db, executable);
         let mut prepare_config = PrepareConfig::current(db.binary_store.as_ref());
         prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
+        let prepare_config =
+            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
             db_ref,
             executable,
@@ -382,11 +384,12 @@ impl Fluree {
         let params = options.sparql_params(&input)?;
 
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
+            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query_for_dataset(
                 json,
                 &primary.snapshot,
                 primary.default_context.as_ref(),
                 None,
+                dataset,
             )?,
             QueryInput::Sparql(sparql) => crate::query::helpers::parse_sparql_to_ir(
                 sparql,
