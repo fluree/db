@@ -1,13 +1,12 @@
-//! A default graph of several graphs deduplicates on fact identity (AJ-66):
+//! A default graph of several graphs deduplicates on fact identity:
 //! storage's identity, one fact per value and list position (#2109's
 //! `FactIdentity`). Only a fact two members both hold collapses, so a union
 //! with a graph that adds nothing answers as the graph alone.
 //!
-//! The cases are the probe table of round 6's lane C report ("Union dedup
-//! identity"), where the dedup keyed on the emitted row and lost the term a
-//! constant object matched and the list position. Each runs before the
-//! ledger is indexed (the scan reads decoded flakes) and after (it reads
-//! index rows), through SPARQL, with a JSON-LD twin.
+//! The cases are the ones where a dedup keyed on the emitted row loses the
+//! fact: the term a constant object matched, and the list position. Each runs
+//! before the ledger is indexed (the scan reads decoded flakes) and after (it
+//! reads index rows), through SPARQL, with a JSON-LD twin.
 
 use fluree_db_api::{Fluree, FlureeBuilder, GraphDb, ReindexOptions};
 use serde_json::{json, Value as JsonValue};
