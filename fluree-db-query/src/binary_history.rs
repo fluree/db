@@ -360,9 +360,8 @@ impl BinaryHistoryScanOperator {
             } // end `if from_t <= persisted_to_t`
         } // end `if let Some(store)`
 
-        // The persisted walk narrows by subject and predicate only; a bound
-        // object, its datatype and its bounds are matched on the decoded
-        // events, as the novelty walk below does.
+        // The persisted walk narrows by subject and predicate only. Both
+        // lanes match the bound object, its datatype and its bounds here.
         let object_match = RangeMatch {
             s: None,
             p: None,
@@ -370,19 +369,19 @@ impl BinaryHistoryScanOperator {
             dt: self.pattern.dtc.as_ref().map(|d| d.datatype().clone()),
             t: None,
         };
-        flakes.retain(|f| {
+        let object_matches = |f: &Flake| {
             flake_matches_range_eq(f, &object_match)
                 && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
-        });
+        };
+        flakes.retain(|f| object_matches(f));
 
         // ---- Novelty events in (index_t, to_t] ----
         if to_t > index_t {
-            // Build a RangeMatch for pattern-level filtering.
-            let match_val = RangeMatch {
+            let subject_predicate = RangeMatch {
                 s: s_sid.clone(),
                 p: p_sid.clone(),
-                o: o_val_opt.clone(),
-                dt: self.pattern.dtc.as_ref().map(|d| d.datatype().clone()),
+                o: None,
+                dt: None,
                 t: None,
             };
 
@@ -397,7 +396,6 @@ impl BinaryHistoryScanOperator {
             // even when our pattern only matches a sliver. `for_each_overlay_flake`'s
             // callback cannot return a Result, so we capture any
             // `FuelExceededError` and surface it after the walk.
-            let object_bounds = self.object_bounds.as_ref();
             let mut novelty: Vec<Flake> = Vec::new();
             let mut fuel_err: Option<fluree_db_core::FuelExceededError> = None;
             overlay.for_each_overlay_flake(
@@ -414,13 +412,8 @@ impl BinaryHistoryScanOperator {
                     if f.t <= index_t || f.t > to_t || f.t < from_t {
                         return;
                     }
-                    if !flake_matches_range_eq(f, &match_val) {
+                    if !flake_matches_range_eq(f, &subject_predicate) || !object_matches(f) {
                         return;
-                    }
-                    if let Some(bounds) = object_bounds {
-                        if !bounds.matches(&f.o) {
-                            return;
-                        }
                     }
                     if let Err(e) = ctx
                         .tracker
