@@ -653,7 +653,7 @@ async fn reads_during_a_rotation_see_the_same_data() {
         .active_here
     {
         assert_eq!(count_things(&fluree, "live").await, 300);
-        let fresh = client(data.path(), &keys, 2).await;
+        let fresh = reader(data.path(), &keys, 2).await;
         assert_eq!(count_things(&fresh, "live").await, 300);
         during += 1;
     }

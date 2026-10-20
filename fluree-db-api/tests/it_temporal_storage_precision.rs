@@ -232,7 +232,10 @@ async fn every_write_lane_holds_a_temporal_to_the_microsecond() {
         let (writer, named) = write(lane, &path).await;
         let before = holds_microsecond_values(&writer, named).await;
         drop(writer);
-        let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+        let fluree = FlureeBuilder::file(path.clone())
+            .without_storage_lock()
+            .build()
+            .expect("reload");
         let after = holds_microsecond_values(&fluree, named).await;
         let delete = format!(
             "{PFX}DELETE DATA {{ {} }}",
@@ -320,7 +323,10 @@ async fn a_cypher_write_holds_a_temporal_to_the_microsecond() {
             "before a reload"
         );
     }
-    let fluree = FlureeBuilder::file(path).build().expect("reload");
+    let fluree = FlureeBuilder::file(path)
+        .without_storage_lock()
+        .build()
+        .expect("reload");
     let ledger = fluree.ledger(LEDGER).await.expect("ledger");
     assert_eq!(count(fluree, ledger).await, json!([[1]]), "after a reload");
 }
@@ -356,9 +362,21 @@ async fn a_query_constant_past_the_microsecond_matches_the_stored_value() {
         .await
         .expect("insert");
     let in_process = asks(fluree.clone()).await;
-    let reloaded = asks(FlureeBuilder::file(path.clone()).build().expect("reload")).await;
+    let reloaded = asks(
+        FlureeBuilder::file(path.clone())
+            .without_storage_lock()
+            .build()
+            .expect("reload"),
+    )
+    .await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
-    let indexed = asks(FlureeBuilder::file(path).build().expect("reload")).await;
+    let indexed = asks(
+        FlureeBuilder::file(path)
+            .without_storage_lock()
+            .build()
+            .expect("reload"),
+    )
+    .await;
     assert_eq!(
         (in_process, reloaded, indexed),
         (vec![true, true], vec![true, true], vec![true, true]),
@@ -385,7 +403,10 @@ async fn an_identical_reupsert_after_a_reload_keeps_the_temporal() {
             .await
             .expect("upsert");
     }
-    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+    let fluree = FlureeBuilder::file(path.clone())
+        .without_storage_lock()
+        .build()
+        .expect("reload");
     let receipt = fluree
         .graph(LEDGER)
         .transact()
@@ -396,8 +417,14 @@ async fn an_identical_reupsert_after_a_reload_keeps_the_temporal() {
         .receipt;
     let after = holds_microsecond_values(&fluree, false).await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
-    let indexed =
-        holds_microsecond_values(&FlureeBuilder::file(path).build().expect("reload"), false).await;
+    let indexed = holds_microsecond_values(
+        &FlureeBuilder::file(path)
+            .without_storage_lock()
+            .build()
+            .expect("reload"),
+        false,
+    )
+    .await;
     assert_eq!(
         (receipt.flake_count, after, indexed),
         (0, (true, true), (true, true)),
@@ -582,12 +609,14 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
     let in_process = run(fluree.clone()).await;
     let reloaded = run(FlureeBuilder::file(path.clone())
         .without_indexing()
+        .without_storage_lock()
         .build()
         .expect("reload"))
     .await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
     let indexed = run(FlureeBuilder::file(path)
         .without_indexing()
+        .without_storage_lock()
         .build()
         .expect("reload"))
     .await;
@@ -654,12 +683,14 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     let in_process = run(fluree.clone()).await;
     let reloaded = run(FlureeBuilder::file(path.clone())
         .without_indexing()
+        .without_storage_lock()
         .build()
         .expect("reload"))
     .await;
     support::rebuild_and_publish_index(&fluree, LEDGER).await;
     let indexed = run(FlureeBuilder::file(path)
         .without_indexing()
+        .without_storage_lock()
         .build()
         .expect("reload"))
     .await;
@@ -736,6 +767,7 @@ async fn a_cypher_constant_is_held_to_the_microsecond_for_ordering_too() {
     }
     let fluree = FlureeBuilder::file(path)
         .without_indexing()
+        .without_storage_lock()
         .build()
         .expect("reload");
     let ledger = fluree.ledger(LEDGER).await.expect("ledger");

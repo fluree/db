@@ -1118,9 +1118,11 @@ async fn a_full_removal_is_a_delete_whichever_term_names_a_fact() {
             for (verb, permitted) in [("f:update", false), ("f:delete", true)] {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let path = dir.path().to_string_lossy().to_string();
+                // Each read is cold, beside the instances opened before it.
                 let open = || {
                     FlureeBuilder::file(path.clone())
                         .without_indexing()
+                        .without_storage_lock()
                         .build()
                         .expect("file fluree")
                 };
@@ -1847,7 +1849,10 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
                         wrap("ex:s ex:p ?o .")
                     );
                     async move {
-                        let fluree = FlureeBuilder::file(path).build().expect("reload");
+                        let fluree = FlureeBuilder::file(path)
+                            .without_storage_lock()
+                            .build()
+                            .expect("reload");
                         let ledger = fluree.ledger(id).await.expect("ledger");
                         let json = support::query_sparql(&fluree, &ledger, &q)
                             .await
@@ -1873,7 +1878,10 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
                 let before = read(path.clone()).await;
                 let restates = !lane.ends_with("upsert") && lane != "graph sync";
                 let flakes = {
-                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_storage_lock()
+                        .build()
+                        .expect("reload");
                     let graph = fluree.graph(id);
                     let tx = graph.transact();
                     let x = wrap(&format!("ex:s ex:p {lit} ."));
@@ -1908,7 +1916,10 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
                 };
                 let after = read(path.clone()).await;
                 {
-                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_storage_lock()
+                        .build()
+                        .expect("reload");
                     support::rebuild_and_publish_index(&fluree, id).await;
                 }
                 let reindexed = read(path.clone()).await;
@@ -1944,6 +1955,7 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
 async fn values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
     let fluree = FlureeBuilder::file(path.to_string())
         .without_indexing()
+        .without_storage_lock()
         .build()
         .expect("reload");
     let ledger = fluree.ledger(id).await.expect("ledger");
@@ -2033,7 +2045,10 @@ async fn changing_a_big_integers_subtype_keeps_it() {
                 }
             }
             let flakes = {
-                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let fluree = FlureeBuilder::file(path.clone())
+                    .without_storage_lock()
+                    .build()
+                    .expect("reload");
                 let graph = fluree.graph(id);
                 let tx = graph.transact();
                 let update = match lane {
@@ -2059,7 +2074,10 @@ async fn changing_a_big_integers_subtype_keeps_it() {
             };
             let after = values_of(&path, id, "ex:p").await;
             {
-                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let fluree = FlureeBuilder::file(path.clone())
+                    .without_storage_lock()
+                    .build()
+                    .expect("reload");
                 support::rebuild_and_publish_index(&fluree, id).await;
             }
             let reindexed = values_of(&path, id, "ex:p").await;
@@ -2110,7 +2128,10 @@ async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
             }
             let before = values_of(&path, id, "ex:l").await;
             let receipt = {
-                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let fluree = FlureeBuilder::file(path.clone())
+                    .without_storage_lock()
+                    .build()
+                    .expect("reload");
                 let update = format!(
                     "{PFX}DELETE {{ ex:s ex:l ?o }} INSERT {{ ex:s ex:q \"done\" }} \
                      WHERE {{ ex:s ex:l ?o FILTER(?o = {v}) }}"
@@ -2126,7 +2147,10 @@ async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
             };
             let after = values_of(&path, id, "ex:l").await;
             {
-                let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                let fluree = FlureeBuilder::file(path.clone())
+                    .without_storage_lock()
+                    .build()
+                    .expect("reload");
                 support::rebuild_and_publish_index(&fluree, id).await;
             }
             let reindexed = values_of(&path, id, "ex:l").await;
@@ -2235,6 +2259,7 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
                     }
                     let fluree = FlureeBuilder::file(path.clone())
                         .without_indexing()
+                        .without_storage_lock()
                         .build()
                         .expect("reload");
                     let transfer = format!("{verb} {src} TO {}", dest.unwrap_or("DEFAULT"));
@@ -2248,6 +2273,7 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
                     let reload = || {
                         FlureeBuilder::file(path.clone())
                             .without_indexing()
+                            .without_storage_lock()
                             .build()
                             .expect("reload")
                     };
@@ -2363,6 +2389,7 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             .await;
             let fluree = FlureeBuilder::file(path.clone())
                 .without_indexing()
+                .without_storage_lock()
                 .build()
                 .expect("reload");
             fluree
@@ -2381,6 +2408,7 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             support::build_and_publish_index(
                 &FlureeBuilder::file(path.clone())
                     .without_indexing()
+                    .without_storage_lock()
                     .build()
                     .expect("reload"),
                 &id,
@@ -2426,6 +2454,7 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             .await;
             let fluree = FlureeBuilder::file(path.clone())
                 .without_indexing()
+                .without_storage_lock()
                 .build()
                 .expect("reload");
             fluree
@@ -2444,6 +2473,7 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             support::rebuild_and_publish_index(
                 &FlureeBuilder::file(path.clone())
                     .without_indexing()
+                    .without_storage_lock()
                     .build()
                     .expect("reload"),
                 &id,
@@ -2509,6 +2539,7 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             .await;
             let fluree = FlureeBuilder::file(path.clone())
                 .without_indexing()
+                .without_storage_lock()
                 .build()
                 .expect("reload");
             let report = fluree
@@ -2520,6 +2551,7 @@ async fn merge_and_revert_keep_a_big_integer_written_under_another_subtype() {
             support::build_and_publish_index(
                 &FlureeBuilder::file(path.clone())
                     .without_indexing()
+                    .without_storage_lock()
                     .build()
                     .expect("reload"),
                 &id,

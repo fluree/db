@@ -330,7 +330,10 @@ async fn multi_op_reversal_nets_against_an_indexed_named_graph() {
             .expect("seed");
         crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
     }
-    let fluree = FlureeBuilder::file(path).build().expect("cold reload");
+    let fluree = FlureeBuilder::file(path)
+        .without_storage_lock()
+        .build()
+        .expect("cold reload");
     let update = |sparql: &'static str| {
         let fluree = fluree.clone();
         async move {
@@ -443,7 +446,10 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
                         wrap("ex:s ex:p ?o .".to_string())
                     );
                     async move {
-                        let fluree = FlureeBuilder::file(path).build().expect("reload");
+                        let fluree = FlureeBuilder::file(path)
+                            .without_storage_lock()
+                            .build()
+                            .expect("reload");
                         let ledger = fluree.ledger(ledger_id).await.expect("ledger");
                         let json = query_sparql(&fluree, &ledger, &q)
                             .await
@@ -459,6 +465,7 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
                 let graph_iri = graph.map(|_| "http://example.org/ns/g");
                 let (receipt, stored, retracted) = {
                     let fluree = FlureeBuilder::file(path.clone())
+                        .without_storage_lock()
                         .build()
                         .expect("cold reload");
                     let ledger = fluree.ledger(ledger_id).await.expect("ledger");
@@ -471,7 +478,10 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
                         .await
                         .expect("commit")
                         .receipt;
-                    let reloaded = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let reloaded = FlureeBuilder::file(path.clone())
+                        .without_storage_lock()
+                        .build()
+                        .expect("reload");
                     let ledger = reloaded.ledger(ledger_id).await.expect("ledger");
                     (receipt, stored, retracted_terms(&ledger))
                 };
@@ -489,7 +499,10 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
                 }
                 let after = read(path.clone()).await;
                 {
-                    let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
+                    let fluree = FlureeBuilder::file(path.clone())
+                        .without_storage_lock()
+                        .build()
+                        .expect("reload");
                     crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
                 }
                 let reindexed = read(path.clone()).await;
@@ -660,6 +673,7 @@ async fn multi_op_last_op_matrix(base: Base, kind: Kind) {
             crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
             FlureeBuilder::file(path.clone())
                 .without_indexing()
+                .without_storage_lock()
                 .build()
                 .expect("cold reload")
         } else {
@@ -710,6 +724,7 @@ async fn multi_op_last_op_matrix(base: Base, kind: Kind) {
         let reload = || {
             FlureeBuilder::file(path.clone())
                 .without_indexing()
+                .without_storage_lock()
                 .build()
                 .expect("reload")
         };
