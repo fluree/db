@@ -2,7 +2,7 @@
 
 Unstructured documents in, a knowledge graph out — from the command line, with nothing to run but the Fluree CLI.
 
-`fluree doc ingest ./contracts` reads PDFs, Word and PowerPoint files, Markdown, HTML and scans, and writes each one into a Fluree ledger as three connected layers: the document's **structure** (sections, paragraphs, lists, tables cell by cell, each with character offsets and, for PDFs, page and bounding box), **retrieval chunks** cut along that structure, and an **embedding** per chunk. `fluree doc search` then answers a question with chunks that carry their section path, their source file and the exact elements they came from.
+`fluree doc ingest ./contracts` reads PDFs, Word, PowerPoint and Excel files, Markdown, HTML, meeting transcripts, email and scans, and writes each one into a Fluree ledger as three connected layers: the document's **structure** (sections, paragraphs, lists, tables cell by cell, each with character offsets and, for PDFs, page and bounding box), **retrieval chunks** cut along that structure, and an **embedding** per chunk. `fluree doc search` then answers a question with chunks that carry their section path, their source file and the exact elements they came from.
 
 Give it an ontology and the entities you already have — `--model ./ontology.ttl --entities people` — and it adds a fourth layer: every **mention** of a known entity, under the IRI it already has, and the **relations** the text states, each checked against the ontology and kept with its evidence. A ledger of documents and a ledger of people then join on the same nodes.
 
@@ -20,27 +20,27 @@ A fourth, Fluree AI's hosted extraction pipeline — trained entity rankers, rel
 
 ## How well does it read?
 
-The parsing engine is scored on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench): 200 public PDFs with hand-checked ground truth, three metrics (NID for reading order and text, TEDS for table structure, MHS for heading structure), and a harness neither written nor tuned by Fluree. Measured 2026-08-01, the top 8 of the 17 engines scored:
+The parsing engine is scored on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench): 200 public PDFs with hand-checked ground truth, three metrics (NID for reading order and text, TEDS for table structure, MHS for heading structure), and a harness neither written nor tuned by Fluree. fluree-doc-parse is not on that benchmark's public leaderboard: its rows below come from running the public harness on the engine revision this CLI ships, measured 2026-10-07, and the other engines' rows match the leaderboard. The top 8 of the 17 engines:
 
 | # | engine | overall | NID | TEDS | MHS | s/doc |
 |---|---|---|---|---|---|---|
-| 1 | **fluree-doc-parse** (cascade) | **0.933** | 0.948 | 0.944 | 0.876 | ~1.5 |
+| 1 | **fluree-doc-parse** (cascade) | **0.934** | 0.948 | 0.942 | 0.881 | ~1.5 |
 | 2 | opendataloader-hybrid | 0.907 | 0.934 | 0.928 | 0.821 | 0.463 |
-| 3 | **fluree-doc-parse** (deterministic) | **0.892** | 0.923 | 0.847 | 0.813 | **~0.009** |
+| 3 | **fluree-doc-parse** (deterministic) | **0.895** | 0.924 | 0.862 | 0.817 | **~0.009** |
 | 4 | nutrient | 0.885 | 0.925 | 0.708 | 0.819 | 0.008 |
 | 5 | docling | 0.882 | 0.898 | 0.887 | 0.824 | 0.762 |
 | 6 | opendataloader-hybrid-hydrogen | 0.877 | 0.926 | 0.796 | 0.769 | 5.068 |
 | 7 | pdf-inspector | 0.875 | 0.915 | 0.814 | 0.788 | 0.006 |
 | 8 | marker | 0.861 | 0.890 | 0.808 | 0.796 | 53.932 |
 
-Two rows matter for the tiers above.
+The two fluree-doc-parse rows are not the same distance from what `fluree doc` runs.
 
-- The **deterministic** engine — no model, no GPU, no API key, about 8 ms per document on a CPU — is what the local tier runs. It is the best model-free engine on the board: ahead of every other engine that runs without a model (nutrient and pdf-inspector, the other two under 10 ms per document), and ahead of most of the model-assisted ones too, including docling and marker. Only one model-assisted engine scores above it.
-- The **cascade**, which adds a vision model for just the pages and regions the deterministic pass could not read, is what a `vlm` slot or a Fluree AI account gives you. It places first, ahead of every engine scored, model-assisted or not, on every one of the three metrics.
+- The **deterministic** engine — no model, no GPU, no API key, about 8 ms per document on a CPU — is exactly what every install runs, and what the local tier gets. It is the best model-free engine on the board: ahead of every other engine that runs without a model (nutrient and pdf-inspector, the other two under 10 ms per document), and ahead of most of the model-assisted ones too, including docling and marker. Only one model-assisted engine scores above it.
+- The **cascade** is the engine's full configuration: a layout detector arbitrating headings and table regions, then Gemini reading the pages and regions the deterministic pass could not. `fluree doc` runs no layout detector, and with a vision model configured it sends those pages and regions to that model. So the cascade's first place is the engine's ceiling, not a score for `fluree doc` with a model configured, which has not been measured on its own.
 
-In vendor terms: the deterministic engine outscores Nutrient, Docling, Marker and pdf-inspector, and the cascade outscores those and OpenDataLoader's hybrid as well. Further down the same benchmark's [public leaderboard](https://github.com/opendataloader-project/opendataloader-bench) sit Unstructured (both its `hi_res` and fast modes), EdgeParse, MinerU, PyMuPDF4LLM, MarkItDown and LiteParse, all below 0.85 overall — the tools most document-to-text and RAG pipelines are built on today.
+In vendor terms: the deterministic engine every install runs outscores Nutrient, Docling, Marker and pdf-inspector. Further down the same benchmark's [public leaderboard](https://github.com/opendataloader-project/opendataloader-bench) sit Unstructured (both its `hi_res` and fast modes), EdgeParse, MinerU, PyMuPDF4LLM, MarkItDown and LiteParse, all below 0.85 overall — the tools most document-to-text and RAG pipelines are built on today.
 
-Across that corpus 113 of the 200 documents never needed the model at all; of the 87 that did, the median cost 1.7 s and the worst 18.9 s.
+Across that corpus 113 of the 200 documents never needed a model at all; of the 87 that did, the cascade's median cost was 1.7 s and the worst 18.9 s.
 
 Every score reproduces from committed model-output caches without a GPU or a key, and the engine's own accounting of [where its output is better than the reference and scores lower for it](https://github.com/fluree/fluree-doc-parse/blob/main/docs/benchmarks/where-we-differ.md) is published alongside. Full detail: [the benchmarks page](https://github.com/fluree/fluree-doc-parse/blob/main/docs/benchmarks/README.md).
 
@@ -60,4 +60,4 @@ Every score reproduces from committed model-output caches without a GPU or a key
 - [Entities and relations](concepts/entities-and-relations.md) — `--model` and `--entities`, and why a known entity keeps its IRI.
 - [Models and calls](concepts/models-and-calls.md) — the three slots, which calls are made, and where data goes.
 - [Publish to Fluree AI](guides/publish-to-fluree-ai.md) — move a built ledger to your account.
-- [CLI reference](cli/README.md) — `ingest` and `search`, flag by flag.
+- [CLI reference](cli/README.md) — `ingest`, `search` and `parse`, flag by flag.

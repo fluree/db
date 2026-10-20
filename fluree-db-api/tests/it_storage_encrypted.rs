@@ -277,12 +277,7 @@ async fn seed_index_and_query(
     )
     .await
     .expect("index build");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index(&ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish index");
+    crate::support::publish_built_index(fluree, &ledger_id, result.index_t, &result.root_id).await;
 
     let indexed = fluree.ledger(&ledger_id).await.expect("reload");
     let query = json!({
