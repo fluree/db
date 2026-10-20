@@ -312,6 +312,18 @@ impl MergedRangeCursor {
                 end: input.end,
             })
             .collect();
+        // The round ends when the lane whose batch ends lowest runs out, so
+        // it emits nothing past that end (the horizon). A lane whose head is
+        // past it can be neither the smallest head nor a bound this round:
+        // leave it out, so lanes that only wait cost nothing per step.
+        if lanes.len() > 2 {
+            let horizon = lanes
+                .iter()
+                .map(|lane| Key::at(lane.batch, lane.end - 1))
+                .min_by(|x, y| O::cmp(x, y))
+                .expect("two or more lanes");
+            lanes.retain(|lane| O::cmp(&lane.head(), &horizon) != Ordering::Greater);
+        }
         let mut out = Emitted {
             runs,
             last,
@@ -491,22 +503,109 @@ fn merge_two<O: MergeOrder>(a: &mut Lane<'_>, b: &mut Lane<'_>, out: &mut Emitte
                 Some(next) => head_a = next,
                 None => return,
             },
-            // One row both members hold, the commonest where they overlap:
-            // `a` emits it and `b` steps past its copy, which would be
-            // dropped as a repeat.
-            Ordering::Equal => {
-                let next_a = advance::<O>(a, head_a, Some(&head_b), out);
-                b.pos += 1;
-                if b.pos == b.end {
-                    return;
-                }
-                head_b = b.head();
-                match next_a {
-                    Some(next) => head_a = next,
-                    None => return,
-                }
-            }
+            // Rows both members hold, the commonest where they overlap.
+            Ordering::Equal => match shared_stretch::<O>(a, b, head_a, None, out) {
+                Some((next_a, next_b)) => (head_a, head_b) = (next_a, next_b),
+                None => return,
+            },
         }
+    }
+}
+
+/// `a` and `b` both hold the row at their heads, whose key is `head`: walk the
+/// rows they both hold in lockstep, while the two stay equal and sort before
+/// `bound` (the smallest of any other heads), `a` emitting each and `b`
+/// stepping past its copy, which would be dropped as a repeat. One key read
+/// per lane and one comparison per row pair. Returns the two new heads, or
+/// `None` when either batch is used up.
+#[inline]
+fn shared_stretch<O: MergeOrder>(
+    a: &mut Lane<'_>,
+    b: &mut Lane<'_>,
+    head: Key,
+    bound: Option<&Key>,
+    out: &mut Emitted<'_>,
+) -> Option<(Key, Key)> {
+    let from = a.pos;
+    if let Some(shared) = constant_shared_prefix::<O>(a, b, bound) {
+        a.pos += shared;
+        b.pos += shared;
+        out.run(a, from, a.pos, head);
+        return (a.pos < a.end && b.pos < b.end).then(|| (a.head(), b.head()));
+    }
+    let next = loop {
+        a.pos += 1;
+        b.pos += 1;
+        if a.pos == a.end || b.pos == b.end {
+            break None;
+        }
+        let (next_a, next_b) = (a.head(), b.head());
+        if next_a != next_b || bound.is_some_and(|t| O::cmp(&next_a, t) != Ordering::Less) {
+            break Some((next_a, next_b));
+        }
+    };
+    out.run(a, from, a.pos, head);
+    next
+}
+
+/// [`shared_stretch`]'s walk on slices: how many rows from both heads (equal)
+/// are equal and, after the first, sort before `bound`, when both batches
+/// carry `p_id`, `o_type` and `o_i` as one constant they agree on (one
+/// predicate's leaflets of one type, without list rows, the common case).
+/// Two rows then differ only in `s_id` and `o_key`, compared as slices.
+/// `None` when the columns are not of that shape.
+#[inline]
+fn constant_shared_prefix<O: MergeOrder>(
+    a: &Lane<'_>,
+    b: &Lane<'_>,
+    bound: Option<&Key>,
+) -> Option<usize> {
+    let (ab, bb) = (a.batch, b.batch);
+    let same_const = matches!((&ab.p_id, &bb.p_id), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
+        && matches!((&ab.o_type, &bb.o_type), (ColumnData::Const(x), ColumnData::Const(y)) if x == y)
+        && matches!((&ab.o_i, &bb.o_i), (ColumnData::Const(x), ColumnData::Const(y)) if x == y);
+    if !same_const {
+        return None;
+    }
+    let (
+        ColumnData::Block(a_s),
+        ColumnData::Block(b_s),
+        ColumnData::Block(a_o),
+        ColumnData::Block(b_o),
+    ) = (&ab.s_id, &bb.s_id, &ab.o_key, &bb.o_key)
+    else {
+        return None;
+    };
+    let mut span = (a.end - a.pos).min(b.end - b.pos);
+    if let Some(bound) = bound {
+        // The head always goes; the rows after it only while below `bound`.
+        let below = partition_point(a.pos + 1, a.end, |row| {
+            O::cmp(&Key::at(ab, row), bound) == Ordering::Less
+        });
+        span = span.min(below - a.pos);
+    }
+    let shared = a_s[a.pos..a.pos + span]
+        .iter()
+        .zip(&b_s[b.pos..b.pos + span])
+        .zip(
+            a_o[a.pos..a.pos + span]
+                .iter()
+                .zip(&b_o[b.pos..b.pos + span]),
+        )
+        .take_while(|((sa, sb), (oa, ob))| sa == sb && oa == ob)
+        .count();
+    Some(shared.max(1))
+}
+
+/// Two distinct elements of `slice`, mutably.
+fn two_mut<T>(slice: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
+    debug_assert_ne!(i, j);
+    if i < j {
+        let (left, right) = slice.split_at_mut(j);
+        (&mut left[i], &mut right[0])
+    } else {
+        let (left, right) = slice.split_at_mut(i);
+        (&mut right[0], &mut left[j])
     }
 }
 
@@ -516,21 +615,37 @@ fn merge_linear<O: MergeOrder>(lanes: &mut [Lane<'_>], out: &mut Emitted<'_>) {
     let mut heads: SmallVec<[Key; LINEAR_MERGE_MAX_INPUTS]> =
         lanes.iter().map(Lane::head).collect();
     loop {
-        // The smallest head (the earlier input on a tie) and the smallest of
-        // the others.
+        // The smallest head and the smallest of the others (the earlier lane
+        // on a tie).
         let mut min_at = 0;
-        let mut runner_up: Option<Key> = None;
+        let mut second_at: Option<usize> = None;
         for at in 1..heads.len() {
             if O::cmp(&heads[at], &heads[min_at]) == Ordering::Less {
-                runner_up = Some(heads[min_at]);
+                second_at = Some(min_at);
                 min_at = at;
-            } else if runner_up.is_none_or(|r| O::cmp(&heads[at], &r) == Ordering::Less) {
-                runner_up = Some(heads[at]);
+            } else if second_at.is_none_or(|s| O::cmp(&heads[at], &heads[s]) == Ordering::Less) {
+                second_at = Some(at);
             }
         }
-        match advance::<O>(&mut lanes[min_at], heads[min_at], runner_up.as_ref(), out) {
-            Some(next) => heads[min_at] = next,
-            None => return,
+        let second_at = second_at.expect("two or more lanes");
+        if heads[min_at] == heads[second_at] {
+            // Rows two members hold: walk them in lockstep below the third
+            // head.
+            let third = (0..heads.len())
+                .filter(|&at| at != min_at && at != second_at)
+                .map(|at| heads[at])
+                .min_by(|x, y| O::cmp(x, y));
+            let (a, b) = two_mut(lanes, min_at, second_at);
+            match shared_stretch::<O>(a, b, heads[min_at], third.as_ref(), out) {
+                Some((next_a, next_b)) => (heads[min_at], heads[second_at]) = (next_a, next_b),
+                None => return,
+            }
+        } else {
+            let bound = heads[second_at];
+            match advance::<O>(&mut lanes[min_at], heads[min_at], Some(&bound), out) {
+                Some(next) => heads[min_at] = next,
+                None => return,
+            }
         }
     }
 }
