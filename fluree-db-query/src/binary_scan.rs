@@ -812,6 +812,9 @@ impl BinaryScanOperator {
         let base_len = self.base_schema_len();
         let num_vars = columns.len();
         let mut produced = 0;
+        // Read once: see `batch_to_bindings`.
+        let record_facts = self.row_facts.is_some();
+        let record_object = record_facts && self.object_is_constant_literal();
 
         while produced < batch_size {
             let Some(flake) = self.range_iter.as_mut().and_then(std::iter::Iterator::next) else {
@@ -938,14 +941,8 @@ impl BinaryScanOperator {
             for (col, binding) in columns.iter_mut().zip(bindings) {
                 col.push(binding);
             }
-            if self.row_facts.is_some() {
-                let object = self
-                    .object_is_constant_literal()
-                    .then(|| flake_object_binding(&flake));
-                let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
-                if let Some(facts) = self.row_facts.as_mut() {
-                    facts.push(RowFact { object, list_index });
-                }
+            if record_facts {
+                self.record_flake_fact(record_object, &flake);
             }
             produced += 1;
         }
@@ -1424,6 +1421,10 @@ impl BinaryScanOperator {
             // In particular, `?x ?x ?o` would otherwise compare EncodedSid vs EncodedPid.
             && !self.check_s_eq_p
             && !self.check_p_eq_o;
+        // Whether a union's dedup armed fact recording, read once per batch:
+        // a scan that is not a union member pays nothing per row.
+        let record_facts = self.row_facts.is_some();
+        let record_object = record_facts && self.object_is_constant_literal();
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
@@ -1521,17 +1522,6 @@ impl BinaryScanOperator {
                 }
             }
 
-            // The matched object a recorded fact names: a constant literal
-            // can match terms of several datatypes.
-            let fact_object = if self.row_facts.is_some() && self.object_is_constant_literal() {
-                Some(match &decoded_o {
-                    Some(val) => val.clone(),
-                    None => decode_value(o_type, o_key, p_id)?,
-                })
-            } else {
-                None
-            };
-
             bindings.clear();
             bindings.resize(base_len, Binding::Unbound);
 
@@ -1613,19 +1603,61 @@ impl BinaryScanOperator {
             for (i, binding) in bindings.drain(..).enumerate() {
                 columns[i].push(binding);
             }
-            if self.row_facts.is_some() {
-                let object = fact_object.map(|val| {
-                    materialized_object_binding(self.store(), o_type, p_id, val, None, None)
-                });
-                let list_index = (o_i != u32::MAX).then_some(o_i);
-                if let Some(facts) = self.row_facts.as_mut() {
-                    facts.push(RowFact { object, list_index });
-                }
+            if record_facts {
+                self.record_index_row_fact(&view, record_object, o_type, o_key, p_id, o_i)?;
             }
             produced += 1;
         }
 
         Ok(produced)
+    }
+}
+
+impl BinaryScanOperator {
+    /// Record the fact an index row matched: its list position, and the term
+    /// it matched when the pattern's object is a constant literal (a constant
+    /// can match terms of several datatypes). Out of line, so a scan that
+    /// records nothing carries none of it in its row loop.
+    #[inline(never)]
+    fn record_index_row_fact(
+        &mut self,
+        view: &BinaryGraphView,
+        record_object: bool,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        o_i: u32,
+    ) -> Result<()> {
+        let object = if record_object {
+            let val = view
+                .decode_value(o_type, o_key, p_id)
+                .map_err(|e| QueryError::from_io("decode_value", e))?;
+            Some(materialized_object_binding(
+                self.store(),
+                o_type,
+                p_id,
+                val,
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
+        let list_index = (o_i != u32::MAX).then_some(o_i);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
+        Ok(())
+    }
+
+    /// [`Self::record_index_row_fact`] for a decoded flake.
+    #[inline(never)]
+    fn record_flake_fact(&mut self, record_object: bool, flake: &Flake) {
+        let object = record_object.then(|| flake_object_binding(flake));
+        let list_index = flake.m.as_ref().and_then(|m| m.i).map(|i| i as u32);
+        if let Some(facts) = self.row_facts.as_mut() {
+            facts.push(RowFact { object, list_index });
+        }
     }
 }
 
