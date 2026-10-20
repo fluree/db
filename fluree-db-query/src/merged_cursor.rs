@@ -312,6 +312,18 @@ impl MergedRangeCursor {
                 end: input.end,
             })
             .collect();
+        // The round ends when the lane whose batch ends lowest runs out, so
+        // it emits nothing past that end (the horizon). A lane whose head is
+        // past it can be neither the smallest head nor a bound this round:
+        // leave it out, so lanes that only wait cost nothing per step.
+        if lanes.len() > 2 {
+            let horizon = lanes
+                .iter()
+                .map(|lane| Key::at(lane.batch, lane.end - 1))
+                .min_by(|x, y| O::cmp(x, y))
+                .expect("two or more lanes");
+            lanes.retain(|lane| O::cmp(&lane.head(), &horizon) != Ordering::Greater);
+        }
         let mut out = Emitted {
             runs,
             last,
