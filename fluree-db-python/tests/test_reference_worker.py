@@ -267,23 +267,32 @@ def test_a_stale_run_does_not_publish_over_a_newer_generation(ledger):
 
 
 def test_a_run_that_loses_the_race_to_publish_refuses(ledger, monkeypatch):
-    """Another run publishes while this one is staging its publication: the
-    commit conflicts, the transaction runs again, and the re-read generation
-    no longer matches."""
+    """Another run publishes between this one's generation read and its
+    commit. The read was made on the transaction, so the commit conflicts,
+    the transaction runs again, and the re-read generation no longer
+    matches. A transaction that was only written to would be staged again on
+    top of the other run's commit and publish over it."""
     worker.run_extract(ledger, MANIFEST, Model())
     transact = fluree.Ledger.transact
-    raced = []
+    read = worker.current_generation
+    publishing, raced = [], []
 
-    def racing(self, fn, *args, **kwargs):
-        def first_attempt_races(txn, *a, **kw):
-            if not raced:
-                raced.append(True)
-                worker.run_gate(ledger, with_(gate_version="v2"))
-            return fn(txn, *a, **kw)
+    def transacting(self, fn, *args, **kwargs):
+        publishing.append(True)
+        try:
+            return transact(self, fn, *args, **kwargs)
+        finally:
+            publishing.pop()
 
-        return transact(self, first_attempt_races, *args, **kwargs)
+    def read_then_race(view, graph):
+        found = read(view, graph)
+        if publishing and not raced:
+            raced.append(True)
+            worker.run_gate(ledger, with_(gate_version="v2"))
+        return found
 
-    monkeypatch.setattr(fluree.Ledger, "transact", racing)
+    monkeypatch.setattr(fluree.Ledger, "transact", transacting)
+    monkeypatch.setattr(worker, "current_generation", read_then_race)
     with pytest.raises(worker.StaleRun, match="generation 1; this run started from 0"):
         worker.run_gate(ledger, MANIFEST)
     record = generation(ledger, DECISIONS)
