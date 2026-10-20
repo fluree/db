@@ -9,9 +9,11 @@
 //!
 //! Every consumer that asks which one a value is (the expander, the
 //! transaction parser, the edge-annotation lowering, the txn-meta extractor,
-//! the bulk-import adapter) asks [`classify_graph_value`], and every consumer
-//! that asks what a whole document is asks [`doc_shape`], so they cannot
-//! disagree about the same bytes.
+//! the bulk-import adapter) asks [`classify_graph_value`], every writer that
+//! asks which graph a node object places itself and its content in (the
+//! transaction parser and the bulk-import adapter) asks [`node_graph`], and
+//! every consumer that asks what a whole document is asks [`doc_shape`], so
+//! they cannot disagree about the same bytes.
 
 use crate::context::ParsedContext;
 use crate::error::{JsonLdError, Result};
@@ -164,25 +166,48 @@ pub fn envelope_graph_key(map: &Map<String, Value>) -> Result<Option<&'static st
     Ok((map.contains_key("graph") && !has_id).then_some("graph"))
 }
 
-/// The name of a JSON-LD named graph: the `@id` of the node object that
-/// holds the `@graph` content. Fluree has no blank-node graph names, a
-/// variable cannot name one, and a graph object without an `@id` is only
-/// meaningful as the top-level envelope. The caller still checks that the
-/// name is an absolute IRI.
-pub fn named_graph_name(id: Option<&Value>) -> std::result::Result<&str, String> {
-    let Some(Value::String(iri)) = id else {
-        return Err(
-            "a node object with `@graph` content is a JSON-LD named graph and needs an `@id` \
-             naming the graph; only the top-level envelope may omit it"
-                .to_string(),
-        );
-    };
-    if iri.starts_with("_:") || iri.starts_with('?') {
-        return Err(format!(
-            "a JSON-LD named graph must be named by an IRI, not {iri:?}"
-        ));
+/// Where a node object's `@graph` places it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NodeGraph<'a> {
+    /// No `@graph`: the node, and every node nested in it, are in the
+    /// enclosing node's graph.
+    Enclosing,
+    /// A graph selector (Fluree's extension): the node, and every node nested
+    /// in it, are in the graph this name (as written) names.
+    Selector(&'a str),
+    /// A JSON-LD named graph: the node's own properties stay in the
+    /// enclosing graph, and `content` is in the graph `name` (the node's
+    /// expanded `@id`) names.
+    NamedGraph { name: &'a str, content: &'a [Value] },
+}
+
+/// Where a node object's `@graph` places it, read the one way every writer
+/// reads it. A named graph must be named by its `@id`: Fluree has no
+/// blank-node graph names, a variable cannot name one, and a graph object
+/// without an `@id` is only meaningful as the top-level envelope (which
+/// expansion unwraps). The caller still resolves the name, and checks that
+/// it is an absolute IRI. The error is suitable for a message.
+pub fn node_graph(node: &Map<String, Value>) -> std::result::Result<NodeGraph<'_>, String> {
+    match node.get("@graph").map(classify_graph_value) {
+        None => Ok(NodeGraph::Enclosing),
+        Some(GraphValue::Selector(raw)) => Ok(NodeGraph::Selector(raw)),
+        Some(GraphValue::Content(content)) => {
+            let Some(Value::String(name)) = node.get("@id") else {
+                return Err(
+                    "a node object with `@graph` content is a JSON-LD named graph and needs an \
+                     `@id` naming the graph; only the top-level envelope may omit it"
+                        .to_string(),
+                );
+            };
+            if name.starts_with("_:") || name.starts_with('?') {
+                return Err(format!(
+                    "a JSON-LD named graph must be named by an IRI, not {name:?}"
+                ));
+            }
+            Ok(NodeGraph::NamedGraph { name, content })
+        }
+        Some(GraphValue::Invalid(why)) => Err(why.to_string()),
     }
-    Ok(iri)
 }
 
 /// True when `key` means `@graph` under `ctx`: the keyword itself, a context

@@ -177,6 +177,23 @@ fn graph_scoped_forms() -> Vec<(&'static str, Value, Vec<&'static str>)> {
     let c = ctx();
     vec![
         (
+            "an envelope",
+            json!({"@context": c, "@graph": [{"@id": "ex:a", "ex:q": "v"}]}),
+            vec!["default: ex:a ex:q v"],
+        ),
+        (
+            "@included without a selector",
+            json!({"@context": c, "@id": "ex:a", "ex:q": "v",
+                "@included": [{"@id": "ex:b", "ex:q": "w"}]}),
+            vec!["default: ex:a ex:q v", "default: ex:b ex:q w"],
+        ),
+        (
+            // A transaction's routing key, not a selector: dropped on both.
+            "a top-level bare `graph` key on a node",
+            json!({"@context": c, "@id": "ex:a", "graph": "ex:g", "ex:q": "v"}),
+            vec!["default: ex:a ex:q v"],
+        ),
+        (
             "a named-graph document",
             json!({"@context": c, "@id": "ex:g", "@graph": [{"@id": "ex:a", "ex:q": "v"}]}),
             vec!["g: ex:a ex:q v"],
@@ -194,6 +211,11 @@ fn graph_scoped_forms() -> Vec<(&'static str, Value, Vec<&'static str>)> {
                 {"@id": "ex:b", "ex:q": "w"}
             ]}),
             vec!["default: ex:b ex:q w", "g: ex:a ex:q v"],
+        ),
+        (
+            "a named graph with no content",
+            json!({"@context": c, "@id": "ex:g", "ex:label": "G", "@graph": []}),
+            vec!["default: ex:g ex:label G"],
         ),
         (
             "a named graph as a property value",
@@ -262,6 +284,12 @@ fn graph_scoped_forms() -> Vec<(&'static str, Value, Vec<&'static str>)> {
             json!({"@context": c, "@id": "ex:a", "@graph": "ex:g",
                 "@reverse": {"ex:knows": {"@id": "ex:b"}}}),
             vec!["g: ex:b ex:knows ex:a"],
+        ),
+        (
+            "a selector over an annotated edge",
+            json!({"@context": c, "@id": "ex:a", "@graph": "ex:g",
+                "ex:knows": {"@id": "ex:b", "@annotation": {"ex:since": 2020}}}),
+            vec!["g: _: ex:since 2020", "g: ex:a ex:knows ex:b"],
         ),
         (
             "a list of nodes in the default graph",
@@ -373,55 +401,69 @@ async fn bulk_import_across_files_shares_each_named_graph() {
     );
 }
 
+/// What `insert` does with a document a bulk import refuses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Insert {
+    Refuses,
+    Writes,
+    /// The document names the import ledger's own graph, which is just
+    /// another graph to the transaction's ledger.
+    NotComparable,
+}
+
 /// What a bulk import cannot place, it refuses rather than skips, and
 /// nothing of the document is written. A transaction refuses the same
-/// documents, except where noted.
+/// documents, but for the ledger's config graph, which a transaction may
+/// write and a bulk import may not (as a TriG import may not).
 #[tokio::test]
 async fn bulk_import_refuses_what_it_cannot_place() {
     let c = ctx();
     let node = |graph: Value| json!({"@context": c, "@id": "ex:a", "@graph": graph, "ex:q": "v"});
-    let cases: Vec<(&str, Value, &str, bool)> = vec![
-        // A transaction may write the ledger's config graph; a bulk import
-        // may not, as a TriG import may not.
+    let cases: Vec<(&str, Value, &str, Insert)> = vec![
         (
             "the config graph",
             node(json!("config")),
             "config graph",
-            false,
+            Insert::Writes,
         ),
         (
             "the txn-meta graph",
             node(json!("txn-meta")),
             "reserved",
-            true,
+            Insert::Refuses,
         ),
         (
             "the txn-meta graph by IRI",
             node(json!(format!("urn:fluree:{IMPORT}#txn-meta"))),
             "reserved",
-            false, // names another ledger's graph in the transaction
+            Insert::NotComparable,
         ),
-        ("a variable", node(json!("?g")), "variable", true),
+        ("a variable", node(json!("?g")), "variable", Insert::Refuses),
         (
             "the default graph's name",
             node(json!("urn:default")),
             "default graph",
-            true,
+            Insert::Refuses,
         ),
-        ("a relative name", node(json!("g")), "absolute IRI", true),
+        (
+            "a relative name",
+            node(json!("g")),
+            "absolute IRI",
+            Insert::Refuses,
+        ),
         // A selector resolves against the document's context, not a node's.
         (
             "a prefix only a node's own context defines",
             json!({"@context": c, "@graph": [{"@context": {"y": "http://y.example/"},
                 "@id": "ex:a", "@graph": "y:g", "ex:q": "v"}]}),
             "'y:g'",
-            true,
+            Insert::Refuses,
         ),
         (
             "a named graph named by a blank node",
             json!({"@context": c, "@id": "_:g", "@graph": [{"@id": "ex:a", "ex:q": "v"}]}),
             "named by an IRI",
-            true,
+            Insert::Refuses,
         ),
         (
             "a nested named graph without an @id",
@@ -429,24 +471,17 @@ async fn bulk_import_refuses_what_it_cannot_place() {
                 {"ex:q": "v", "@graph": [{"@id": "ex:a", "ex:q": "v"}]}
             ]}),
             "needs an `@id`",
-            true,
+            Insert::Refuses,
         ),
         (
             "an unknown keyword",
             json!({"@context": c, "@id": "ex:a", "ex:q": "v", "@foo": "x"}),
             "\"@foo\"",
-            true,
-        ),
-        // A transaction reads it as its routing key and drops it.
-        (
-            "a top-level bare `graph` key",
-            json!({"@context": c, "@id": "ex:a", "graph": "ex:g", "ex:q": "v"}),
-            "routes a transaction",
-            false,
+            Insert::Refuses,
         ),
     ];
     let mut failures = Vec::new();
-    for (case, doc, needle, insert_refuses) in cases {
+    for (case, doc, needle, insert) in cases {
         let (refusal, written) = import_refused(&doc).await;
         match refusal {
             Some(e) if e.contains(needle) => {}
@@ -455,10 +490,12 @@ async fn bulk_import_refuses_what_it_cannot_place() {
         if !written.is_empty() {
             failures.push(format!("{case}: the refused import wrote {written:?}"));
         }
-        if insert_refuses {
-            if let Ok(rows) = transact(&doc).await {
+        match (insert, transact(&doc).await) {
+            (Insert::Refuses, Ok(rows)) => {
                 failures.push(format!("{case}: insert wrote {rows:?}"));
             }
+            (Insert::Writes, Err(e)) => failures.push(format!("{case}: insert refused: {e}")),
+            _ => {}
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

@@ -26,8 +26,8 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, is_keyword_form, named_graph_name,
-    parse_context, GraphValue, ParsedContext,
+    classify_graph_value, expand_with_context_policy, is_keyword_form, node_graph, parse_context,
+    GraphValue, NodeGraph, ParsedContext,
 };
 use fluree_vocab::{
     rdf::{self, TYPE},
@@ -1050,7 +1050,7 @@ impl BlankIssuer {
 
 /// Which graph names a selector may use, by where it was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GraphRole {
+pub(crate) enum GraphRole {
     /// Insert / upsert / graph-insert data: there is no WHERE, so a graph
     /// cannot be a variable.
     Data,
@@ -1118,67 +1118,33 @@ impl<'a> TemplateParseCtx<'a> {
         )?)
     }
 
-    /// Resolve a graph name written in this document. Every position (a node
-    /// selector, a `["graph", g, …]` item, the update `graph` key, and a
-    /// node-level `@graph` in `where`) classifies the name by the one order
-    /// in [`classify_written_graph_name`]; here that means:
-    ///
-    /// 1. `?name` is a WHERE variable, in update templates only.
-    /// 2. A `fromNamed` alias names its IRI (checked before the keywords, so
-    ///    an alias named `config` keeps meaning its IRI).
-    /// 3. A keyword: `default` is the default graph, `config` this ledger's
-    ///    config graph; `txn-meta` is not a write target.
-    /// 4. Anything else expands as a node identifier (`@id`-style,
-    ///    `@base`-relative) and must be an absolute IRI.
+    /// Resolve a graph name written in this document, by
+    /// [`resolve_written_graph`].
     fn resolve_graph_name(&mut self, raw: &str, role: GraphRole) -> Result<GraphName> {
-        use fluree_db_query::parse::WrittenGraphName as W;
-        match fluree_db_query::parse::classify_written_graph_name(
+        resolve_written_graph(
             raw,
             self.from_named_aliases,
             self.context,
             self.strict_compact_iri,
-        )? {
-            W::Var(var) => match role {
-                GraphRole::UpdateTemplate => Ok(GraphName::Var(self.vars.get_or_insert(var))),
-                GraphRole::Data => Err(TransactError::Parse(format!(
-                    "graph {raw:?} is a variable; a variable graph names the graph a \"where\" \
-                     binds, so it is only valid in an update's insert or delete"
-                ))),
-                GraphRole::UpdateDefault => Err(TransactError::Parse(format!(
-                    "the update \"graph\" key names the transaction's default graph and takes \
-                     a graph IRI, not the variable {raw:?}"
-                ))),
-            },
-            W::Alias { iri, .. } => named_graph(raw, iri),
-            W::Default => Ok(GraphName::Default),
-            W::Config => named_graph(
-                raw,
-                &fluree_db_core::graph_registry::config_graph_iri(self.ledger_id),
-            ),
-            W::TxnMeta => Err(TransactError::Parse(format!(
-                "graph \"txn-meta\" names the reserved system graph <{}>, which is not a write \
-                 target; transaction metadata goes in the \"txn-meta\" sidecar",
-                fluree_db_core::graph_registry::txn_meta_graph_iri(self.ledger_id)
-            ))),
-            W::Expanded(iri) => named_graph(raw, &iri),
-        }
+            self.ledger_id,
+            role,
+            self.vars,
+        )
     }
 
-    /// The scope of a JSON-LD named graph's content: the graph the owning
-    /// node's (expanded) `@id` names. The name must be an IRI: Fluree has no
-    /// blank-node graph names, a variable cannot name one, and a graph object
-    /// without an `@id` is only meaningful as the top-level envelope. The
+    /// The scope of a JSON-LD named graph's content: the graph `name`, the
+    /// owning node's (expanded) `@id` ([`node_graph`] has checked it is not
+    /// a blank node or a variable), names. It must be an absolute IRI. The
     /// name is checked even for empty content; `None` then, so an empty graph
     /// is not registered as a write target.
-    fn named_graph_scope(&mut self, id: Option<&Value>, empty: bool) -> Result<Option<GraphScope>> {
-        let iri = named_graph_name(id).map_err(TransactError::Parse)?;
+    fn named_graph_scope(&mut self, name: &str, empty: bool) -> Result<Option<GraphScope>> {
         if self.fixed_root.is_some() {
             return Err(TransactError::Parse(
                 "payload must not address named graphs; the target graph is given by the request"
                     .to_string(),
             ));
         }
-        let name = named_graph(iri, iri)?;
+        let name = named_graph(name, name)?;
         Ok((!empty).then(|| self.write_graphs.scope(name)))
     }
 
@@ -1197,8 +1163,65 @@ impl<'a> TemplateParseCtx<'a> {
     }
 }
 
+/// Resolve a graph name written in a JSON-LD document, for writing. Every
+/// position (a node selector, a `["graph", g, …]` item, the update `graph`
+/// key, a node-level `@graph` in `where`, and a bulk import's selectors)
+/// classifies the name by the one order in [`classify_written_graph_name`];
+/// for writing that means:
+///
+/// 1. `?name` is a WHERE variable, in update templates only.
+/// 2. A `fromNamed` alias names its IRI (checked before the keywords, so
+///    an alias named `config` keeps meaning its IRI).
+/// 3. A keyword: `default` is the default graph, `config` this ledger's
+///    config graph; `txn-meta` is not a write target.
+/// 4. Anything else expands as a node identifier (`@id`-style,
+///    `@base`-relative) and must be an absolute IRI.
+///
+/// [`classify_written_graph_name`]: fluree_db_query::parse::classify_written_graph_name
+pub(crate) fn resolve_written_graph(
+    raw: &str,
+    aliases: &HashMap<String, String>,
+    context: &ParsedContext,
+    strict_compact_iri: bool,
+    ledger_id: &str,
+    role: GraphRole,
+    vars: &mut VarRegistry,
+) -> Result<GraphName> {
+    use fluree_db_query::parse::WrittenGraphName as W;
+    match fluree_db_query::parse::classify_written_graph_name(
+        raw,
+        aliases,
+        context,
+        strict_compact_iri,
+    )? {
+        W::Var(var) => match role {
+            GraphRole::UpdateTemplate => Ok(GraphName::Var(vars.get_or_insert(var))),
+            GraphRole::Data => Err(TransactError::Parse(format!(
+                "graph {raw:?} is a variable; a variable graph names the graph a \"where\" \
+                 binds, so it is only valid in an update's insert or delete"
+            ))),
+            GraphRole::UpdateDefault => Err(TransactError::Parse(format!(
+                "the update \"graph\" key names the transaction's default graph and takes \
+                 a graph IRI, not the variable {raw:?}"
+            ))),
+        },
+        W::Alias { iri, .. } => named_graph(raw, iri),
+        W::Default => Ok(GraphName::Default),
+        W::Config => named_graph(
+            raw,
+            &fluree_db_core::graph_registry::config_graph_iri(ledger_id),
+        ),
+        W::TxnMeta => Err(TransactError::Parse(format!(
+            "graph \"txn-meta\" names the reserved system graph <{}>, which is not a write \
+             target; transaction metadata goes in the \"txn-meta\" sidecar",
+            fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id)
+        ))),
+        W::Expanded(iri) => named_graph(raw, &iri),
+    }
+}
+
 /// A graph named by `raw`, resolved to `iri`, which must be absolute.
-fn named_graph(raw: &str, iri: &str) -> Result<GraphName> {
+pub(crate) fn named_graph(raw: &str, iri: &str) -> Result<GraphName> {
     GraphIri::parse(iri).map(GraphName::Iri).map_err(|e| {
         TransactError::Parse(format!(
             "graph {raw:?} does not name an absolute IRI ({e}); use a full IRI, a compact IRI \
@@ -1672,19 +1695,18 @@ fn parse_expanded_object_with_ctx(
     // A JSON-LD 1.1 named graph (`{"@id": G, "@graph": [nodes]}`): the node's
     // own properties stay in the enclosing scope, and the content nodes are
     // written to the graph its `@id` names (after the properties, below).
-    let mut named_graph_content: Option<&[Value]> = None;
+    let mut named_graph_content: Option<(&str, &[Value])> = None;
     let own_scope: GraphScope;
-    let scope: &GraphScope = match obj.get("@graph").map(classify_graph_value) {
-        None => scope,
-        Some(GraphValue::Selector(raw)) => {
+    let scope: &GraphScope = match node_graph(obj).map_err(TransactError::Parse)? {
+        NodeGraph::Enclosing => scope,
+        NodeGraph::Selector(raw) => {
             own_scope = ctx.selector_scope(raw)?;
             &own_scope
         }
-        Some(GraphValue::Content(nodes)) => {
-            named_graph_content = Some(nodes);
+        NodeGraph::NamedGraph { name, content } => {
+            named_graph_content = Some((name, content));
             scope
         }
-        Some(GraphValue::Invalid(why)) => return Err(TransactError::Parse(why.to_string())),
     };
 
     // Get subject from @id (already expanded IRI or variable); a node
@@ -1783,8 +1805,8 @@ fn parse_expanded_object_with_ctx(
         }
     }
 
-    if let Some(nodes) = named_graph_content {
-        if let Some(graph) = ctx.named_graph_scope(obj.get("@id"), nodes.is_empty())? {
+    if let Some((name, nodes)) = named_graph_content {
+        if let Some(graph) = ctx.named_graph_scope(name, nodes.is_empty())? {
             for node in nodes {
                 parse_expanded_object_with_ctx(node, &graph, ctx, out)?;
             }

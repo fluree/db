@@ -85,17 +85,16 @@ mod inner {
         Ok(())
     }
 
-    /// Refuse a bare `graph` key at the top level of a JSON-LD document that
-    /// is not an envelope.
+    /// Drop a bare `graph` key from the top level of a JSON-LD document that
+    /// is not an envelope, as the transaction parser drops it.
     ///
-    /// There the key is a transaction's routing key: the transaction parser
-    /// strips it (`RESERVED_TXN_KEYS`) and writes the node where it would
-    /// without it, while the expander reads the same key as a graph selector.
-    /// A bulk import has no routing to give it, and reading it as a selector
-    /// would write the node to a graph the transaction does not. (An
+    /// There the key is a transaction's routing key (`RESERVED_TXN_KEYS`):
+    /// a transaction strips it and writes the node where it would without it,
+    /// while the expander would read the same key as a graph selector. (An
     /// envelope's own keys are not data on either path, and the bare key on
-    /// a node inside the document is a selector on both.)
-    fn refuse_top_level_graph_key(doc: &serde_json::Value) -> Result<()> {
+    /// a node inside the document is a selector on both.) A context that
+    /// defines `graph` as a term makes it an ordinary property, kept.
+    fn strip_top_level_graph_key(doc: &mut serde_json::Value) -> Result<()> {
         let Some(obj) = doc.as_object().filter(|obj| obj.contains_key("graph")) else {
             return Ok(());
         };
@@ -104,11 +103,9 @@ mod inner {
         }
         let context = crate::parse::edge_annotations::top_level_context(doc)?;
         if fluree_graph_json_ld::is_graph_key("graph", &context) {
-            return Err(TransactError::Parse(
-                "a top-level \"graph\" key routes a transaction and is not read by a bulk \
-                 import; write \"@graph\" to name the node's graph"
-                    .to_string(),
-            ));
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove("graph");
+            }
         }
         Ok(())
     }
@@ -116,52 +113,43 @@ mod inner {
     /// Where a graph name in a bulk-imported JSON-LD document writes: the
     /// default graph (`None`), or a named graph by absolute IRI.
     ///
-    /// A selector is classified as every JSON-LD write position classifies
-    /// it ([`fluree_db_query::parse::classify_written_graph_name`]), against
-    /// the document's top-level `@context` as the transaction parser does;
-    /// what each class means is the import's own. `default` is the default
-    /// graph. A variable has no `where` to bind it. The ledger's system graphs
-    /// are refused as a TriG import refuses them, `config` included: a
-    /// transaction may write the config graph, a bulk import may not.
+    /// A selector resolves as a transaction's data resolves it
+    /// ([`resolve_written_graph`], against the document's top-level
+    /// `@context`), and a named graph's `@id` must be an absolute IRI, as
+    /// there. The ledger's system graphs are then refused as a TriG import
+    /// refuses them, `config` included: a transaction may write the config
+    /// graph, a bulk import may not.
+    ///
+    /// [`resolve_written_graph`]: crate::parse::jsonld::resolve_written_graph
     fn import_graph_name(
         name: fluree_graph_json_ld::adapter::GraphNameRef<'_>,
         context: &fluree_graph_json_ld::ParsedContext,
         ledger_id: &str,
     ) -> Result<Option<String>> {
-        use fluree_db_query::parse::WrittenGraphName as W;
+        use crate::ir::GraphName;
         use fluree_graph_json_ld::adapter::GraphNameRef;
-        let (raw, iri) = match name {
-            GraphNameRef::NamedGraph(id) => (id, id.to_string()),
-            GraphNameRef::Selector(raw) => {
-                let iri = match fluree_db_query::parse::classify_written_graph_name(
-                    raw,
-                    &HashMap::new(),
-                    context,
-                    true,
-                )? {
-                    W::Default => return Ok(None),
-                    W::Expanded(iri) => iri,
-                    W::Alias { iri, .. } => iri.to_string(),
-                    W::Config => fluree_db_core::graph_registry::config_graph_iri(ledger_id),
-                    W::TxnMeta => fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id),
-                    W::Var(_) => {
-                        return Err(TransactError::Parse(format!(
-                            "graph {raw:?} is a variable; a variable graph names the graph a \
-                             \"where\" binds, and an import has no \"where\""
-                        )))
-                    }
-                };
-                (raw, iri)
-            }
+        let graph = match name {
+            GraphNameRef::Selector(raw) => crate::parse::jsonld::resolve_written_graph(
+                raw,
+                &HashMap::new(),
+                context,
+                true,
+                ledger_id,
+                crate::parse::jsonld::GraphRole::Data,
+                &mut fluree_db_query::VarRegistry::new(),
+            )?,
+            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id)?,
         };
-        fluree_db_core::dataset_ref::GraphIri::parse(&iri).map_err(|e| {
-            TransactError::Parse(format!(
-                "graph {raw:?} does not name an absolute IRI ({e}); use a full IRI, a compact \
-                 IRI whose prefix the @context defines, or \"default\""
-            ))
-        })?;
-        refuse_reserved_graph_iri(&iri, ledger_id)?;
-        Ok(Some(iri))
+        match graph {
+            GraphName::Default => Ok(None),
+            GraphName::Iri(iri) => {
+                refuse_reserved_graph_iri(iri.as_str(), ledger_id)?;
+                Ok(Some(iri.as_str().to_string()))
+            }
+            GraphName::Var(_) => Err(TransactError::Parse(
+                "a bulk import has no \"where\" to bind a variable graph".to_string(),
+            )),
+        }
     }
 
     /// Mutable state carried across chunks during an import session.
@@ -1310,7 +1298,7 @@ mod inner {
 
         let mut doc: serde_json::Value = serde_json::from_str(jsonld)
             .map_err(|e| TransactError::Parse(format!("JSON parse error: {e}")))?;
-        refuse_top_level_graph_key(&doc)?;
+        strip_top_level_graph_key(&mut doc)?;
 
         // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
         // `f:reifies*` encoding before expansion, exactly as the transact path
@@ -1351,19 +1339,33 @@ mod inner {
             .map_err(|e| TransactError::Parse(format!("JSON-LD expand error: {e}")))?;
 
         // Graph names resolve against the top-level `@context`, parsed only
-        // for a document that names a graph. A refusal keeps its own error.
+        // for a document that names a graph, and each name once. A refusal
+        // keeps its own error.
+        use fluree_graph_json_ld::adapter::GraphNameRef;
         let mut graph_context: Option<fluree_graph_json_ld::ParsedContext> = None;
+        let mut resolved_selectors: HashMap<String, Option<String>> = HashMap::new();
+        let mut resolved_named_graphs: HashMap<String, Option<String>> = HashMap::new();
         let mut refusal: Option<TransactError> = None;
         let converted =
             fluree_graph_json_ld::adapter::to_graph_events_scoped(&expanded, &mut sink, |name| {
+                let (resolved_names, raw) = match name {
+                    GraphNameRef::Selector(raw) => (&mut resolved_selectors, raw),
+                    GraphNameRef::NamedGraph(raw) => (&mut resolved_named_graphs, raw),
+                };
+                if let Some(graph) = resolved_names.get(raw) {
+                    return Ok(graph.clone());
+                }
                 let resolved = match graph_context.take() {
                     Some(context) => Ok(context),
                     None => crate::parse::edge_annotations::top_level_context(&doc),
                 }
                 .and_then(|context| {
-                    let iri = import_graph_name(name, &context, ledger_id);
+                    let graph = import_graph_name(name, &context, ledger_id);
                     graph_context = Some(context);
-                    iri
+                    graph
+                })
+                .inspect(|graph| {
+                    resolved_names.insert(raw.to_string(), graph.clone());
                 });
                 resolved.map_err(|e| {
                     let message = e.to_string();

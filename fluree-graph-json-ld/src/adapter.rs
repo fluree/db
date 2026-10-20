@@ -56,7 +56,7 @@
 //! assert_eq!(graph.len(), 1);
 //! ```
 
-use crate::graph_shape::{classify_graph_value, named_graph_name, GraphValue};
+use crate::graph_shape::{node_graph, NodeGraph};
 use crate::is_keyword_form;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
 use fluree_vocab::{rdf, reifies_iris};
@@ -97,7 +97,7 @@ pub enum GraphNameRef<'a> {
     /// relative or absolute, or a keyword such as `default`.
     Selector(&'a str),
     /// The (expanded) `@id` of a JSON-LD named graph, already checked by
-    /// [`named_graph_name`]: not a blank node and not a variable.
+    /// [`node_graph`]: not a blank node and not a variable.
     NamedGraph(&'a str),
 }
 
@@ -256,16 +256,13 @@ where
         // graph's own properties stay in the enclosing scope, and its
         // content nodes are written to the graph its `@id` names (after the
         // properties, below).
-        let mut named_graph_content: Option<&[Value]> = None;
-        let scope = match obj.get("@graph").map(classify_graph_value) {
-            None => scope,
-            Some(GraphValue::Selector(raw)) => self.open(GraphNameRef::Selector(raw))?,
-            Some(GraphValue::Content(nodes)) => {
-                named_graph_content = Some(nodes);
+        let mut named_graph_content: Option<(&str, &[Value])> = None;
+        let scope = match node_graph(obj).map_err(AdapterError::InvalidStructure)? {
+            NodeGraph::Enclosing => scope,
+            NodeGraph::Selector(raw) => self.open(GraphNameRef::Selector(raw))?,
+            NodeGraph::NamedGraph { name, content } => {
+                named_graph_content = Some((name, content));
                 scope
-            }
-            Some(GraphValue::Invalid(why)) => {
-                return Err(AdapterError::InvalidStructure(why.to_string()))
             }
         };
 
@@ -383,8 +380,7 @@ where
             }
         }
 
-        if let Some(nodes) = named_graph_content {
-            let name = named_graph_name(obj.get("@id")).map_err(AdapterError::InvalidStructure)?;
+        if let Some((name, nodes)) = named_graph_content {
             let graph = self.open(GraphNameRef::NamedGraph(name))?;
             for node in nodes {
                 self.node(node, graph, None)?;

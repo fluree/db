@@ -53,7 +53,7 @@ pub use context::{Container, ContextEntry, ParsedContext, TypeValue};
 pub use error::{JsonLdError, Result};
 pub use graph_shape::{
     classify_graph_value, doc_shape, envelope_graph_key, is_envelope_graph, is_graph_key,
-    named_graph_name, DocShape, GraphValue,
+    node_graph, DocShape, GraphValue, NodeGraph,
 };
 pub use iri::UnresolvedIriDisposition;
 pub use ndjson_splitter::{FirstLineContextPolicy, NdjsonChunkPayload, NdjsonReader};
