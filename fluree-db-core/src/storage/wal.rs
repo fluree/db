@@ -494,6 +494,12 @@ pub(super) struct Wal {
     /// Test hook: keep every segment until close, so a test can crash the
     /// log with records still in it however slowly it runs.
     hold_segments: AtomicBool,
+    /// Test hook: the background thread does nothing while set, so a test
+    /// counting the flushes of its own writes counts only those.
+    background_paused: AtomicBool,
+    /// Held for each pass of the background thread, so pausing it can wait
+    /// out a pass already under way.
+    background_pass: Mutex<()>,
     /// Owned logs flush every append: on a shared root nothing later flushes
     /// on a payload's behalf, because the head lives in Raft, not in a file.
     flush_every_append: bool,
@@ -1241,6 +1247,8 @@ impl Wal {
             lock: Mutex::new(Some(lock)),
             crashed: AtomicBool::new(false),
             hold_segments: AtomicBool::new(false),
+            background_paused: AtomicBool::new(false),
+            background_pass: Mutex::new(()),
             poisoned: AtomicBool::new(false),
             retiring: Mutex::new(()),
             key_stripes: (0..KEY_STRIPES)
@@ -1626,7 +1634,14 @@ impl Wal {
     }
 
     fn tick(&self) -> io::Result<()> {
-        if self.crashed.load(Ordering::Acquire) || self.poisoned.load(Ordering::Acquire) {
+        let _pass = self
+            .background_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.crashed.load(Ordering::Acquire)
+            || self.poisoned.load(Ordering::Acquire)
+            || self.background_paused.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         let hold = self.hold_segments.load(Ordering::Acquire);
@@ -1665,6 +1680,19 @@ impl Wal {
     #[doc(hidden)]
     pub fn hold_segments(&self) {
         self.hold_segments.store(true, Ordering::Release);
+    }
+
+    /// Pause or resume the background thread: while paused it flushes,
+    /// rotates and retires nothing. Pausing returns once any pass already
+    /// under way has finished, so no flush of the thread's lands after it.
+    #[doc(hidden)]
+    pub fn pause_background(&self, paused: bool) {
+        self.background_paused.store(paused, Ordering::Release);
+        drop(
+            self.background_pass
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     /// Flush the files each closed segment covered, then remove the segment,

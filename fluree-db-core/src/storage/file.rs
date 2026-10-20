@@ -1167,6 +1167,21 @@ impl FileStorage {
         *self.after_checkpoint.0.lock().unwrap() = Some(Box::new(f));
     }
 
+    /// Pause (or resume) the WAL's background thread, which otherwise
+    /// flushes a waiting append, closes a segment a second old and retires
+    /// closed segments on its own schedule. Its flushes count in
+    /// [`Self::fsyncs_issued`], so a test that counts the flushes of its own
+    /// writes pauses it first. Returns once any pass under way has finished.
+    /// Attaches the log.
+    #[doc(hidden)]
+    pub fn pause_wal_background_for_test(&self, paused: bool) -> Result<()> {
+        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        if let Some(log) = self.attach_wal_locked(true)? {
+            log.pause_background(paused);
+        }
+        Ok(())
+    }
+
     /// Delay every WAL device flush by `delay`, so a test can widen the
     /// window in which concurrent commits pile up behind one flush.
     /// Attaches the log.
@@ -3276,6 +3291,8 @@ mod wal_tests {
         let storage = with_wal(dir.path());
         // The first write also creates the segment, which is its own cost.
         commit(&storage, 1).await;
+        // Count this commit's flushes, not the background thread's.
+        storage.pause_wal_background_for_test(true).unwrap();
         let before = storage.fsyncs_issued();
         commit(&storage, 2).await;
         assert_eq!(storage.fsyncs_issued() - before, 1);
@@ -3456,6 +3473,7 @@ mod wal_tests {
         let a = owned(dir.path(), "node-1");
         let b = owned(dir.path(), "node-2");
         a.write_bytes(TXN, b"from a").await.unwrap();
+        a.pause_wal_background_for_test(true).unwrap();
         let before = a.fsyncs_issued();
         a.write_bytes(COMMIT, b"from a").await.unwrap();
         assert_eq!(a.fsyncs_issued() - before, 1, "one flush, for the log");
