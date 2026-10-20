@@ -31,10 +31,10 @@ fluree doc search "termination notice period" -l contracts -n 3
 ```
  1. 12.687  msa-2024.pdf  Master Services Agreement / 12. Term and Termination
     Either party may terminate this Agreement for convenience on ninety (90) days' written notice…
-    urn:fluree:doc:msa-2024.pdf/chunk/97
+    urn:fluree:doc:msa-2024.pdf-chunk-97
  2. 6.801   nda.docx  Term
     This Agreement terminates two years after the Effective Date unless…
-    urn:fluree:doc:nda.docx/chunk/2
+    urn:fluree:doc:nda.docx-chunk-2
 (2 result(s), text, 41 ms)
 ```
 
@@ -63,7 +63,7 @@ A chunk is a node. Its `doc:sourceElement` values are the paragraphs and table c
 fluree query contracts -e '{
   "@context": {"doc": "https://ns.flur.ee/doc#", "nif": "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#"},
   "where": [
-    {"@id": "urn:fluree:doc:msa-2024.pdf/chunk/97", "doc:sourceElement": "?el"},
+    {"@id": "urn:fluree:doc:msa-2024.pdf-chunk-97", "doc:sourceElement": "?el"},
     {"@id": "?el", "doc:pageIndex": "?page", "doc:bbox": "?box", "nif:beginIndex": "?start"}
   ],
   "select": ["?el", "?page", "?box", "?start"]
