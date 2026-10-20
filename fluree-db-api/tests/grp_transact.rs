@@ -17,6 +17,8 @@ mod it_delete_stored_facts;
 mod it_enforce_unique_upsert_indexed;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
+#[path = "it_overflow_iri_delete_index.rs"]
+mod it_overflow_iri_delete_index;
 #[path = "it_raw_txn_parallel_upload.rs"]
 mod it_raw_txn_parallel_upload;
 #[path = "it_rdf_text_parity.rs"]

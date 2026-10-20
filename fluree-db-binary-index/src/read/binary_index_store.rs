@@ -1577,16 +1577,22 @@ impl BinaryIndexStore {
                 Ok(FlakeValue::Ref(Sid::new(0, &bnode_iri)))
             }
             DecodeKind::IriRef => {
-                let iri = self.resolve_subject_iri(o_key).map_err(|e| {
-                    tracing::debug!(
-                        g_id,
-                        o_key,
-                        error = %e,
-                        "binary index failed to resolve IRI ref subject"
-                    );
-                    e
-                })?;
-                Ok(FlakeValue::Ref(self.encode_iri(&iri)))
+                // Decoded as a subject is: re-encoding the IRI through the
+                // namespace table would give an OVERFLOW subject the EMPTY
+                // code, a Sid no stored fact has.
+                let sid = self
+                    .resolve_subject_parts(o_key)
+                    .and_then(|(ns_code, suffix)| self.subject_sid_of_parts(ns_code, suffix))
+                    .map_err(|e| {
+                        tracing::debug!(
+                            g_id,
+                            o_key,
+                            error = %e,
+                            "binary index failed to resolve IRI ref subject"
+                        );
+                        e
+                    })?;
+                Ok(FlakeValue::Ref(sid))
             }
             DecodeKind::StringDict => {
                 let s = self.resolve_string_value(o_key as u32).map_err(|e| {
