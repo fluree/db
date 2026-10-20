@@ -198,6 +198,13 @@ struct DatasetMember {
     ledger_id: Arc<str>,
 }
 
+/// Whether a scan over `members` active graphs deduplicates across them on
+/// fact identity ([`BatchDeduper`]): a union of two or more graphs, in
+/// current mode. A plan over such a union answers as over the merged graph.
+pub(crate) fn union_dedups_on_fact_identity(members: usize, mode: TemporalMode) -> bool {
+    members >= 2 && mode.is_current()
+}
+
 /// Cross-member set-deduplicator for a `>= 2`-member default union.
 ///
 /// Per SPARQL §13.2 the default graph of a dataset is the RDF *merge* (a set)
@@ -713,7 +720,7 @@ impl Operator for DatasetOperator {
                 // (all-constant) pattern still emits zero columns even so; those
                 // zero-column batches are the empty solution mapping, which the
                 // deduper collapses to a single solution (`BatchDeduper::retain_new`).
-                self.dedup = if graphs.len() >= 2 && self.mode.is_current() {
+                self.dedup = if union_dedups_on_fact_identity(graphs.len(), self.mode) {
                     // Soundness coupling: arming dedup on a `>= 2`-member union
                     // requires the plan to have forced `EmitMask::ALL` (via
                     // `PlanningContext::multi_default_graph`) so no variable

@@ -800,6 +800,13 @@ name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]
 
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch.
+[[test]]
+name = "it_union_annotation_chain"
+path = "tests/it_union_annotation_chain.rs"
+required-features = ["native"]
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Test hooks: halting a ledger, and building incrementally without fallback.
 fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }
