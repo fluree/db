@@ -245,7 +245,7 @@ struct DatasetMember {
 ///
 /// Per SPARQL §13.2 the default graph of a dataset is the RDF *merge* (a set)
 /// of its `FROM` graphs, so a fact present in two members is one fact of the
-/// union. A fact is storage's own identity (AJ-66, #2109's `FactIdentity`):
+/// union. A fact is storage's own identity (#2109's `FactIdentity`):
 /// one fact per value and list position. So the key is a row's bindings plus
 /// the fact its members' scans say it matched ([`RowFact`]: a constant
 /// object's matched term, and the list position), and only a fact two members
