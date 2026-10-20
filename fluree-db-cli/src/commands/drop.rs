@@ -13,7 +13,6 @@ pub async fn run(
     force: bool,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if hard && !force {
         return Err(CliError::Usage(format!(
@@ -28,18 +27,16 @@ pub async fn run(
         return result;
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let result = run_remote(name, hard, &client).await;
-            context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
-            // Auto-route operates against the same on-disk storage as `--direct`,
-            // so a successful drop must also clear the local active-ledger pointer
-            // to avoid leaving CLI state pointing at a deleted ledger.
-            if result.is_ok() {
-                clear_if_active(name, dirs)?;
-            }
-            return result;
+    if let Some(client) = context::local_server_client(dirs) {
+        let result = run_remote(name, hard, &client).await;
+        context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+        // Auto-route operates against the same on-disk storage as `--direct`,
+        // so a successful drop must also clear the local active-ledger pointer
+        // to avoid leaving CLI state pointing at a deleted ledger.
+        if result.is_ok() {
+            clear_if_active(name, dirs)?;
         }
+        return result;
     }
 
     run_local(name, hard, dirs).await

@@ -71,7 +71,6 @@ pub async fn run_reindex(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -86,11 +85,7 @@ pub async fn run_reindex(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {

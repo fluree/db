@@ -14,7 +14,7 @@ use fluree_db_api::server_defaults::FlureeDir;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<()> {
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
         let result = run_delta_map_remote(&client, &args).await.map_err(|e| {
@@ -26,12 +26,10 @@ pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir, direct: bool) -
         return result;
     }
 
-    if !direct {
-        if let Some(client) = crate::context::try_server_route_client(dirs) {
-            return run_delta_map_remote(&client, &args)
-                .await
-                .map_err(|e| CliError::Remote(format!("failed to map Delta graph source: {e}")));
-        }
+    if let Some(client) = crate::context::local_server_client(dirs) {
+        return run_delta_map_remote(&client, &args)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to map Delta graph source: {e}")));
     }
 
     run_delta_map_local(args, dirs).await
@@ -432,7 +430,7 @@ impl Ask<'_> {
     }
 
     /// On the named remote, else the local server when there is one, else here.
-    async fn answer(&self, dirs: &FlureeDir, direct: bool) -> CliResult<Value> {
+    async fn answer(&self, dirs: &FlureeDir) -> CliResult<Value> {
         let body = self.body()?;
         let failed = |e| CliError::Remote(format!("delta {}: {e}", self.route()));
         if let Some(remote_name) = self.remote() {
@@ -441,10 +439,8 @@ impl Ask<'_> {
             crate::context::persist_refreshed_tokens(&client, remote_name, dirs).await;
             return result;
         }
-        if !direct {
-            if let Some(client) = crate::context::try_server_route_client(dirs) {
-                return client.delta_read(self.route(), &body).await.map_err(failed);
-            }
+        if let Some(client) = crate::context::local_server_client(dirs) {
+            return client.delta_read(self.route(), &body).await.map_err(failed);
         }
         self.local(dirs).await
     }
@@ -508,12 +504,8 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-pub async fn run_delta_browse(
-    args: DeltaBrowseArgs,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let listing = Ask::Browse(&args).answer(dirs, direct).await?;
+pub async fn run_delta_browse(args: DeltaBrowseArgs, dirs: &FlureeDir) -> CliResult<()> {
+    let listing = Ask::Browse(&args).answer(dirs).await?;
     if args.json {
         print_json(&listing);
     } else {
@@ -556,12 +548,8 @@ fn listing_text(listing: &Value) -> String {
     out
 }
 
-pub async fn run_delta_preview(
-    args: DeltaTableArgs,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let table = Ask::Preview(&args).answer(dirs, direct).await?;
+pub async fn run_delta_preview(args: DeltaTableArgs, dirs: &FlureeDir) -> CliResult<()> {
+    let table = Ask::Preview(&args).answer(dirs).await?;
     if args.json {
         print_json(&table);
     } else {
@@ -634,12 +622,8 @@ fn preview_text(table: &Value) -> String {
     out
 }
 
-pub async fn run_delta_verify(
-    args: DeltaTableArgs,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let access = Ask::Verify(&args).answer(dirs, direct).await?;
+pub async fn run_delta_verify(args: DeltaTableArgs, dirs: &FlureeDir) -> CliResult<()> {
+    let access = Ask::Verify(&args).answer(dirs).await?;
     if args.json {
         print_json(&access);
     } else if access["readable"] == true {
@@ -677,12 +661,8 @@ fn report_diagnostics(answer: &Value) -> bool {
     any_error
 }
 
-pub async fn run_delta_generate(
-    args: DeltaGenerateArgs,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let answer = Ask::Generate(&args).answer(dirs, direct).await?;
+pub async fn run_delta_generate(args: DeltaGenerateArgs, dirs: &FlureeDir) -> CliResult<()> {
+    let answer = Ask::Generate(&args).answer(dirs).await?;
     if args.json {
         print_json(&answer);
         return Ok(());
@@ -704,12 +684,8 @@ pub async fn run_delta_generate(
     Ok(())
 }
 
-pub async fn run_delta_validate(
-    args: DeltaValidateArgs,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let answer = Ask::Validate(&args).answer(dirs, direct).await?;
+pub async fn run_delta_validate(args: DeltaValidateArgs, dirs: &FlureeDir) -> CliResult<()> {
+    let answer = Ask::Validate(&args).answer(dirs).await?;
     if args.json {
         print_json(&answer);
     }

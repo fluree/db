@@ -18,7 +18,7 @@ const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 const RDFS_SUBCLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 
-pub async fn run(action: &ModelClassAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: &ModelClassAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         ModelClassAction::Define {
             dataset,
@@ -38,12 +38,11 @@ pub async fn run(action: &ModelClassAction, dirs: &FlureeDir, direct: bool) -> C
                 *dry_run,
                 remote.as_deref(),
                 dirs,
-                direct,
             )
             .await
         }
         ModelClassAction::Show { dataset, remote } => {
-            run_show(dataset, remote.as_deref(), dirs, direct).await
+            run_show(dataset, remote.as_deref(), dirs).await
         }
     }
 }
@@ -58,7 +57,6 @@ async fn run_define(
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
-    direct: bool,
 ) -> CliResult<()> {
     require_absolute_iri("--class", class)?;
     for parent in subclass_of {
@@ -92,7 +90,7 @@ async fn run_define(
         return Ok(());
     }
 
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    let mode = resolve_mode(dataset, remote, dirs).await?;
     if clear_subclass_of {
         update(&mode, &clear_parents_txn(class, label, &node)).await?;
     } else {
@@ -144,13 +142,8 @@ fn compile(class: &str, subclass_of: &[String], label: Option<&str>) -> Value {
     node
 }
 
-async fn run_show(
-    dataset: &str,
-    remote: Option<&str>,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+async fn run_show(dataset: &str, remote: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
+    let mode = resolve_mode(dataset, remote, dirs).await?;
 
     // Policy classes are rdfs:Class too (the access compiler mints them);
     // they're governance plumbing, not domain vocabulary — exclude them.

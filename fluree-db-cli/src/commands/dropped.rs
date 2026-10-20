@@ -9,16 +9,16 @@ use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::Fluree;
 use serde::Deserialize;
 
-pub async fn run(action: DroppedAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: DroppedAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         DroppedAction::List { remote } => {
-            let target = Target::resolve(dirs, remote.as_deref(), direct).await?;
+            let target = Target::resolve(dirs, remote.as_deref()).await?;
             let result = list(&target).await;
             target.finish(dirs).await;
             result
         }
         DroppedAction::Restore { instance, remote } => {
-            let target = Target::resolve(dirs, remote.as_deref(), direct).await?;
+            let target = Target::resolve(dirs, remote.as_deref()).await?;
             let result = restore(&target, &instance).await;
             target.finish(dirs).await;
             result
@@ -33,7 +33,7 @@ pub async fn run(action: DroppedAction, dirs: &FlureeDir, direct: bool) -> CliRe
                     "use --force to confirm deletion of dropped ledger '{instance}'"
                 )));
             }
-            let target = Target::resolve(dirs, remote.as_deref(), direct).await?;
+            let target = Target::resolve(dirs, remote.as_deref()).await?;
             let result = purge(&target, &instance).await;
             target.finish(dirs).await;
             result
@@ -49,7 +49,7 @@ pub async fn run(action: DroppedAction, dirs: &FlureeDir, direct: bool) -> CliRe
                         .to_string(),
                 ));
             }
-            let target = Target::resolve(dirs, remote.as_deref(), direct).await?;
+            let target = Target::resolve(dirs, remote.as_deref()).await?;
             let result = sweep(&target, dry_run).await;
             target.finish(dirs).await;
             result
@@ -68,20 +68,18 @@ enum Target {
 }
 
 impl Target {
-    async fn resolve(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> CliResult<Self> {
+    async fn resolve(dirs: &FlureeDir, remote_flag: Option<&str>) -> CliResult<Self> {
         if let Some(remote_name) = remote_flag {
             return Ok(Target::Server {
                 client: Box::new(context::build_remote_client(remote_name, dirs).await?),
                 remote_name: remote_name.to_string(),
             });
         }
-        if !direct {
-            if let Some(client) = context::try_server_route_client(dirs) {
-                return Ok(Target::Server {
-                    client: Box::new(client),
-                    remote_name: context::LOCAL_SERVER_REMOTE.to_string(),
-                });
-            }
+        if let Some(client) = context::local_server_client(dirs) {
+            return Ok(Target::Server {
+                client: Box::new(client),
+                remote_name: context::LOCAL_SERVER_REMOTE.to_string(),
+            });
         }
         Ok(Target::Local(Box::new(context::build_fluree(dirs).await?)))
     }

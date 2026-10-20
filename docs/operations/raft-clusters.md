@@ -57,7 +57,9 @@ The client port is the public surface and behaves identically to a non-Raft `flu
 Everything above is reachable from a process that embeds the engine
 directly. `fluree_db_consensus::raft::integration::RaftIntegration::bootstrap`
 builds the consensus half; `FlureeBuilder::build_client_with_nameservice`
-builds the engine against the replicated nameservice;
+builds the engine against the replicated nameservice, with
+`with_storage_wal_owner(<node id>)` on file storage so the node journals the
+shared store under a log of its own and takes no lock on it;
 `fluree_db_consensus::raft::embedded::EmbeddedRaftNode::attach` wires the
 two and starts the per-node tasks. The routers carry no path prefix, so the
 host nests them wherever it likes — `/raft/nameservice` beside other groups

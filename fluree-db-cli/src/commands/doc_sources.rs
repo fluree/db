@@ -77,10 +77,20 @@ pub struct Opened {
 }
 
 impl Opened {
-    pub async fn open(source: &Source, dirs: &FlureeDir) -> CliResult<Self> {
+    /// `project` is the command's own instance on the project's storage, if
+    /// it has one open: a ledger source is read through it, since a second
+    /// instance on that storage would be refused.
+    pub async fn open(
+        source: &Source,
+        project: Option<&Fluree>,
+        dirs: &FlureeDir,
+    ) -> CliResult<Self> {
         match &source.kind {
             SourceKind::Ledger(alias) => {
-                let fluree = context::build_fluree(dirs).await?;
+                let fluree = match project {
+                    Some(fluree) => fluree.clone(),
+                    None => context::build_fluree(dirs).await?,
+                };
                 let ledger_id = context::to_ledger_id(alias)?;
                 if !fluree.ledger_exists(&ledger_id).await? {
                     return Err(CliError::NotFound(format!(
@@ -127,8 +137,12 @@ impl Opened {
     }
 }
 
-pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {
-    let opened = Opened::open(source, dirs).await?;
+pub async fn load_model(
+    source: &Source,
+    project: Option<&Fluree>,
+    dirs: &FlureeDir,
+) -> CliResult<Model> {
+    let opened = Opened::open(source, project, dirs).await?;
     let mut builder = ModelBuilder::default();
     for query in Model::class_queries() {
         builder.add_class_rows(&opened.rows(&query).await?);
@@ -192,7 +206,7 @@ pub async fn load_gazetteer(
     let mut counts = Vec::new();
     for source in sources {
         check_class_scope(source)?;
-        let opened = Opened::open(source, dirs).await?;
+        let opened = Opened::open(source, target.map(|(fluree, _)| fluree), dirs).await?;
         let mut n = 0;
         for (query, predicate) in Gazetteer::queries(source.class.as_deref()) {
             let rows = opened.rows(&query).await?;

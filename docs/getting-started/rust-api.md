@@ -97,18 +97,25 @@ cheap to clone, and clones share its caches, its per-ledger write locks and its 
 instances on one directory, in one process or two, are not coordinated: each serves its own
 cached state, and both index and sweep the same files.
 
-`with_storage_lock()` makes that a startup error. The instance locks the directory, and building
-another one on it, in any process, fails with `ApiError::StorageInUse`. The lock lasts as long as
-the instance: it is released once the instance and every clone of it are dropped, or when the
-process exits, however it exits. A filesystem that cannot lock fails the build; see
+So an instance locks its directory, and building another one on it, in any process, fails with
+`ApiError::StorageInUse`. The lock lasts as long as the instance: it is released once the instance
+and every clone of it are dropped, or when the process exits, however it exits. A restart within
+one process must let the old instance go first, background tasks included, which stop holding it
+at their next poll. A filesystem that cannot lock fails the build; see
 [One process per directory](../operations/storage.md#one-process-per-directory).
 
+A program that only reads a directory another process owns, such as a query peer on a shared
+directory, opts out:
+
 ```rust
-let fluree = FlureeBuilder::file("./data").with_storage_lock().build_async().await?;
+let peer = FlureeBuilder::file("./data").without_storage_lock().build_async().await?;
 ```
 
+A directory journaled under per-process WALs (`with_storage_wal_owner`, as Raft nodes do) or opened
+through a read-only nameservice takes no lock either.
+
 Where code that opens storage cannot easily pass an instance around, `SharedFluree::open` returns
-the one instance this process keeps for a directory, opening it, with the lock, on first use.
+the one instance this process keeps for a directory, opening it on first use.
 Handles dereference to `Fluree`. They own its lifecycle: the instance shuts down once the last
 handle is closed or dropped, `disconnect()` on it does nothing, and a `Fluree` cloned from a handle
 keeps the directory locked until that clone is dropped too:

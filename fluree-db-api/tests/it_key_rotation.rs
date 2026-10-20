@@ -61,6 +61,16 @@ async fn client(path: &Path, keys: &[(u32, &str)], current: u32) -> Fluree {
         .expect("build_client")
 }
 
+/// A second handle beside a live one, as another process would read the store.
+async fn reader(path: &Path, keys: &[(u32, &str)], current: u32) -> Fluree {
+    FlureeBuilder::from_json_ld(&config(path, keys, current))
+        .expect("config")
+        .without_storage_lock()
+        .build_client()
+        .await
+        .expect("build_client")
+}
+
 fn opts(retire: u32) -> KeyRotationOptions {
     KeyRotationOptions {
         retire_key_id: retire,
@@ -190,7 +200,7 @@ async fn rotation_dry_run_scoped_run_full_run_and_verify() {
     assert!(completion.remaining_on_retired < dry.on_retired);
 
     // The record persisted and reads back through a fresh handle.
-    let status = client(data.path(), &[(1, KEY1), (2, KEY2)], 2)
+    let status = reader(data.path(), &[(1, KEY1), (2, KEY2)], 2)
         .await
         .key_rotation_status()
         .await
@@ -643,7 +653,7 @@ async fn reads_during_a_rotation_see_the_same_data() {
         .active_here
     {
         assert_eq!(count_things(&fluree, "live").await, 300);
-        let fresh = client(data.path(), &keys, 2).await;
+        let fresh = reader(data.path(), &keys, 2).await;
         assert_eq!(count_things(&fresh, "live").await, 300);
         during += 1;
     }

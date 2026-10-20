@@ -264,7 +264,6 @@ pub async fn run(
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     connection: Option<&str>,
-    direct: bool,
     tracking: TrackingFlags,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
@@ -395,16 +394,22 @@ pub async fn run(
         // with `NoActiveLedger` (symmetric with the `=REMOTE` arm above). A
         // provided or active ledger still resolves normally.
         match context::resolve_query_target(explicit_ledger, dirs).await {
-            Ok(context::QueryTarget::Ledger(mode)) => context::QueryTarget::Ledger(if direct {
-                mode
-            } else {
-                context::try_server_route(mode, dirs)
-            }),
+            Ok(context::QueryTarget::Ledger(mode)) => context::QueryTarget::Ledger(mode),
             Ok(gs) => gs,
+            // The transport still follows a running server, which owns the
+            // storage, whether or not a ledger is active.
             Err(CliError::NoActiveLedger) if force_connection => {
-                context::QueryTarget::Ledger(LedgerMode::Local {
-                    fluree: Box::new(context::build_fluree(dirs).await?),
-                    alias: String::new(),
+                context::QueryTarget::Ledger(match context::local_server_client(dirs) {
+                    Some(client) => LedgerMode::Tracked {
+                        client: Box::new(client),
+                        remote_alias: String::new(),
+                        local_alias: String::new(),
+                        remote_name: context::LOCAL_SERVER_REMOTE.to_string(),
+                    },
+                    None => LedgerMode::Local {
+                        fluree: Box::new(context::build_fluree(dirs).await?),
+                        alias: String::new(),
+                    },
                 })
             }
             Err(e) => return Err(e),

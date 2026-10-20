@@ -59,6 +59,35 @@ old release fail, and on DynamoDB you can deny it write access with IAM (see
   [Iceberg](../graph-sources/iceberg.md#where-policies-live-the-model-ledger)).
 - **Key rotation covers dropped ledgers**, so retiring a key never leaves a
   restorable ledger unreadable.
+- **One process per storage directory.** Every process that opens a file
+  storage directory now locks it: the server, CLI commands, the Python package
+  and Rust programs. Another process that opens it meanwhile is refused with
+  the holder's pid. A CLI command waits for another command to finish with it
+  (30 seconds, `FLUREE_STORAGE_LOCK_WAIT_SECS`). With a server running, most
+  commands go through it, `create` and `use` now included; the few that cannot
+  yet (`index`, `verify`, `config set-origins`, `graphql`, `track add`,
+  `materialize`, `doc`, and `clone`/`pull`/`push`/`fetch`/`publish`) are
+  refused until it stops. Shared-storage query peers and Raft nodes take no lock; a
+  Rust program that reads a directory another process owns opts out with
+  `FlureeBuilder::without_storage_lock()`. A program that embeds a Raft node
+  builds its engine with `FlureeBuilder::with_storage_wal_owner(<node id>)`, as
+  the server does; without it the node locks the shared store and a second node
+  on it is refused. See
+  [One process per directory](storage.md#one-process-per-directory).
+- **A directory on a filesystem that cannot lock no longer opens.** Some network
+  and FUSE mounts cannot lock a file. 4.2 opened a directory there like any
+  other; now every open of it fails, from the server, the CLI, Python or Rust,
+  until `FLUREE_STORAGE_ALLOW_UNLOCKED=true` opens it without that protection.
+- **`fluree create --from` goes through a running local server.** The file is
+  uploaded for the server to import, and a directory is refused; 4.2 imported
+  both locally. To import a directory, stop the server first.
+- **`fluree memory` no longer opens the project's storage.** In a project, its
+  ledger is a cache in memory, rebuilt from `.fluree-memory/*.ttl` on each run.
+  The `__memory` ledger earlier releases kept in `.fluree/storage` is no longer
+  read. A 4.2 `fluree memory import` wrote only to that ledger, so if you imported
+  memories on 4.2, run `fluree memory export > memories.json` before upgrading
+  and `fluree memory import memories.json` after; import now writes the `.ttl`
+  files.
 
 ### For API clients
 

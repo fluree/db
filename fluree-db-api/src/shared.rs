@@ -3,8 +3,8 @@
 //! [`SharedFluree::open`] gives every caller in a process that opens a root
 //! the same instance, so their writes serialize on its ledger locks and each
 //! sees the others' commits at once. The instance holds the root's lock
-//! ([`FlureeBuilder::with_storage_lock`]) and shuts down when its last handle
-//! is closed or dropped; the handles alone decide when.
+//! ([`FlureeBuilder::without_storage_lock`]) and shuts down when its last
+//! handle is closed or dropped; the handles alone decide when.
 
 use crate::{ApiError, Fluree, FlureeBuilder, Result};
 use std::collections::HashMap;
@@ -257,7 +257,7 @@ async fn build(key: &Path, options: SharedOptions) -> Result<Fluree> {
             key.display()
         ))
     })?;
-    let mut builder = FlureeBuilder::file(path).with_storage_lock();
+    let mut builder = FlureeBuilder::file(path);
     if !options.indexing {
         builder = builder.without_indexing();
     }
@@ -322,7 +322,6 @@ mod tests {
     fn lock_separately(path: &Path) -> Result<Fluree> {
         FlureeBuilder::file(path.to_str().unwrap())
             .without_indexing()
-            .with_storage_lock()
             .build()
     }
 

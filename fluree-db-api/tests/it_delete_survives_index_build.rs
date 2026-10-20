@@ -60,6 +60,15 @@ fn fluree_at(dir: &Path) -> Fluree {
         .expect("file fluree")
 }
 
+/// A second instance beside the live one, reading what is on disk.
+fn fresh_at(dir: &Path) -> Fluree {
+    FlureeBuilder::file(dir.to_string_lossy().to_string())
+        .without_indexing()
+        .without_storage_lock()
+        .build()
+        .expect("fresh file fluree")
+}
+
 async fn sparql(fluree: &Fluree, ledger: LedgerState, body: &str) -> LedgerState {
     commit_sparql(fluree, ledger, body, None).await.ledger
 }
@@ -171,7 +180,7 @@ fn from_alias(ledger_id: &str, graph: Option<&str>, t: Option<i64>) -> String {
 async fn current(fluree: &Fluree, dir: &Path, id: &str, graph: Option<&str>) -> Vec<String> {
     let from = from_alias(id, graph, None);
     let same = objects(fluree, id, &from).await;
-    let fresh = objects(&fluree_at(dir), id, &from).await;
+    let fresh = objects(&fresh_at(dir), id, &from).await;
     assert_eq!(same, fresh, "{from}: the building instance vs a fresh one");
     same
 }
@@ -318,7 +327,7 @@ async fn history_of_new_graph_survives_incremental_build() {
         drop(ledger);
 
         build(&fluree, &id, Build::Incremental).await;
-        let fresh = fluree_at(dir.path());
+        let fresh = fresh_at(dir.path());
         let at = |t| from_alias(&id, target, Some(t));
         assert_eq!(
             objects(&fresh, &id, &at(t_insert - 1)).await,
@@ -444,7 +453,7 @@ async fn background_indexing_keeps_deleted_facts_deleted() {
 
         let from = from_alias(&id, target, None);
         assert_eq!(
-            objects(&fluree_at(dir.path()), &id, &from).await,
+            objects(&fresh_at(dir.path()), &id, &from).await,
             Vec::<String>::new(),
             "{id}: after the background build"
         );
@@ -698,7 +707,7 @@ async fn facts_missing_from_spot_are_rebuilt() {
         empty_spot(&fluree, &id, &mut root, g_id).await;
         publish_root(&fluree, &id, built.index_t, &root).await;
         let from = from_alias(&id, graph, None);
-        let fresh = fluree_at(dir.path());
+        let fresh = fresh_at(dir.path());
         assert_eq!(
             objects(&fresh, &id, &from).await,
             Vec::<String>::new(),

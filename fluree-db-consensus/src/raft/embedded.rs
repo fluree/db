@@ -151,6 +151,14 @@ impl EmbeddedRaftNode {
     /// integration.nameservice()))` — one bus, one nameservice — or
     /// the engine's subscribers and the adapter's events are on
     /// different channels and followers never hear about applies.
+    ///
+    /// On file storage, also build with
+    /// `FlureeBuilder::with_storage_wal_owner(<node id>)`, as
+    /// `fluree-db-server` does with `node-{id}`. Each node then journals
+    /// the shared payload store under a log of its own, which flushes a
+    /// payload before its reference is proposed, and takes no lock on the
+    /// store. Without it the engine locks the store, and a second node on
+    /// it is refused with `ApiError::StorageInUse`.
     pub async fn attach(
         integration: Arc<RaftIntegration>,
         fluree: Arc<Fluree>,

@@ -418,17 +418,7 @@ impl MemoryStore {
         // different branches land in different regions and merge cleanly under
         // a default git merge, while same-memory edits still conflict.
         if let Some(dir) = &self.memory_dir {
-            let (path, header) = match mem.scope {
-                Scope::Repo => (
-                    crate::turtle_io::repo_ttl_path(dir),
-                    crate::turtle_io::REPO_HEADER,
-                ),
-                Scope::User => (
-                    crate::turtle_io::user_ttl_path(dir),
-                    crate::turtle_io::USER_HEADER,
-                ),
-            };
-            crate::turtle_io::insert_memory_into_file(&path, &mem, header)?;
+            insert_into_file(dir, &mem)?;
         }
 
         // Then update the ledger cache
@@ -887,14 +877,24 @@ WHERE {{\n\
     /// Import memories from a JSON array.
     ///
     /// Returns the number of memories imported.
+    /// Import memories exported by [`Self::export`], skipping any whose id
+    /// the store already holds. Returns how many were imported.
+    ///
+    /// The files are the store, so each memory is written to its `.ttl` file
+    /// first and the ledger cache updated after, as [`Self::add`] does.
     pub async fn import(&self, data: Value) -> Result<usize> {
         let _guard = self.lock_mutation().await?;
+        let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
+        self.sync_under_lock().await?;
 
         let memories: Vec<Memory> = serde_json::from_value(data)?;
-        let count = memories.len();
+        let mut imported = 0;
 
         for mut mem in memories {
+            if self.get(&mem.id).await?.is_some() {
+                continue;
+            }
             if crate::secrets::SecretDetector::has_secrets(&mem.content) {
                 mem.content = crate::secrets::SecretDetector::redact(&mem.content);
             }
@@ -909,17 +909,25 @@ WHERE {{\n\
                 }
             }
 
+            if let Some(dir) = &self.memory_dir {
+                insert_into_file(dir, &mem)?;
+            }
             let doc = memory_to_jsonld(&mem);
-
             self.fluree
                 .graph(MEMORY_LEDGER_ID)
                 .transact()
                 .insert(&doc)
                 .commit()
                 .await?;
+            imported += 1;
         }
 
-        Ok(count)
+        if let Some(dir) = &self.memory_dir {
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
+        }
+        drop(file_lock);
+        Ok(imported)
     }
 
     async fn acquire_file_lock(&self) -> Result<Option<std::fs::File>> {
@@ -928,6 +936,21 @@ WHERE {{\n\
             None => Ok(None),
         }
     }
+}
+
+/// Splice `mem` into the `.ttl` file its scope keeps it in.
+fn insert_into_file(dir: &std::path::Path, mem: &Memory) -> Result<()> {
+    let (path, header) = match mem.scope {
+        Scope::Repo => (
+            crate::turtle_io::repo_ttl_path(dir),
+            crate::turtle_io::REPO_HEADER,
+        ),
+        Scope::User => (
+            crate::turtle_io::user_ttl_path(dir),
+            crate::turtle_io::USER_HEADER,
+        ),
+    };
+    crate::turtle_io::insert_memory_into_file(&path, mem, header)
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1301,48 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "the just-added memory should match its own content"
+        );
+    }
+
+    fn file_store(dir: &std::path::Path) -> MemoryStore {
+        MemoryStore::new_ephemeral_ledger(
+            FlureeBuilder::memory().build_memory(),
+            Some(dir.to_path_buf()),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_import_lands_in_the_files_a_fresh_store_rebuilds_from() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = file_store(source_dir.path());
+        let input = crate::types::MemoryInput {
+            kind: MemoryKind::Fact,
+            content: "imports write the turtle files".to_string(),
+            tags: vec![],
+            scope: crate::types::Scope::Repo,
+            severity: None,
+            artifact_refs: vec![],
+            branch: None,
+            rationale: None,
+            alternatives: None,
+        };
+        let id = source.add(input).await.expect("add");
+        let exported = source.export().await.expect("export");
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let imported = file_store(target_dir.path())
+            .import(exported.clone())
+            .await
+            .expect("import");
+        assert_eq!(imported, 1);
+
+        let rebuilt = file_store(target_dir.path());
+        rebuilt.ensure_synced().await.expect("sync");
+        assert!(rebuilt.get(&id).await.expect("get").is_some());
+        assert_eq!(
+            rebuilt.import(exported).await.expect("re-import"),
+            0,
+            "an id the store holds is not imported twice"
         );
     }
 

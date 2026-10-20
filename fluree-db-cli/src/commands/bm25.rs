@@ -92,7 +92,7 @@ async fn resolve_client(
     if direct {
         return Ok(None);
     }
-    Ok(crate::context::try_server_route_client(dirs))
+    Ok(crate::context::local_server_client(dirs))
 }
 
 /// Persist tokens the server refreshed during the call — only meaningful for a

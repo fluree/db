@@ -233,6 +233,7 @@ async fn a_writer_from_before_a_drop_is_refused() {
 async fn a_cache_from_before_a_drop_reloads_after_the_refused_write() {
     let (fluree, tmp) = file_fluree().await;
     let elsewhere = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .without_storage_lock()
         .build()
         .expect("build");
     let marker = |value: &str| {

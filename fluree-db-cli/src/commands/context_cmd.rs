@@ -11,7 +11,6 @@ pub async fn get(
     explicit_ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(explicit_ledger, dirs)?;
     let ledger_id = context::to_ledger_id(&alias)?;
@@ -23,12 +22,10 @@ pub async fn get(
         return result;
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let result = run_remote_get(&alias, &ledger_id, &client).await;
-            context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
-            return result;
-        }
+    if let Some(client) = context::local_server_client(dirs) {
+        let result = run_remote_get(&alias, &ledger_id, &client).await;
+        context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+        return result;
     }
 
     let fluree = context::build_fluree(dirs).await?;
@@ -79,7 +76,6 @@ pub async fn set(
     file: Option<&PathBuf>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(explicit_ledger, dirs)?;
     let ledger_id = context::to_ledger_id(&alias)?;
@@ -130,12 +126,10 @@ pub async fn set(
         return result;
     }
 
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            let result = run_remote_set(&alias, &ledger_id, &ctx_value, &client).await;
-            context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
-            return result;
-        }
+    if let Some(client) = context::local_server_client(dirs) {
+        let result = run_remote_set(&alias, &ledger_id, &ctx_value, &client).await;
+        context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+        return result;
     }
 
     let fluree = context::build_fluree(dirs).await?;

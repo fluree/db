@@ -199,11 +199,7 @@ pub async fn run(a: SyncArgs<'_>) -> CliResult<()> {
         context::build_remote_mode(remote_name, &alias, a.dirs).await?
     } else {
         let mode = context::resolve_ledger_mode(explicit_ledger, a.dirs).await?;
-        if a.direct {
-            mode
-        } else {
-            context::try_server_route(mode, a.dirs)
-        }
+        mode
     };
 
     match mode {
