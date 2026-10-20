@@ -10,9 +10,9 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey, normalize_pred_sid,
-    parallel_map_pooled, subject_probe_lane_plan, ProbeLanePlan, ProbeOps, PsotSubjectSeek,
-    RowFate, SharedOverlayOps,
+    build_psot_cursor_for_predicate, cached_overlay_ops, cursor_projection_sid_otype_okey,
+    normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan, ProbeLanePlan, ProbeOps,
+    PsotSubjectSeek, RowFate, SharedOverlayOps,
 };
 use crate::fast_path_outcome::{FastPathFallback, FastPathOutcome};
 use crate::index_scope::{overlay_carries_novelty, IndexMember, IndexScope, MemberSet, ScopeKind};
@@ -851,19 +851,30 @@ impl CyclicBgpOperator {
     }
 
     /// Whether `read` is a member of a default graph of several graphs that
-    /// holds nothing: the index has no PSOT branch for its graph, and it
-    /// carries no novelty. It contributes no edges, where a missing branch
-    /// otherwise declines the lane (with novelty, rows could live only
-    /// there). A union default graph whose own graph is empty is one. One
-    /// graph keeps declining, as before.
-    fn member_holds_nothing(&self, read: &MemberRead<'_, '_>) -> bool {
-        self.graphs > 1
-            && read
-                .member
-                .store()
-                .branch_for_order(read.member.g_id(), RunSortOrder::Psot)
-                .is_none()
-            && !overlay_carries_novelty(read.member.overlay())
+    /// holds nothing for the predicate `pred_sid`, though the index has no
+    /// PSOT branch for its graph. With no novelty it holds nothing at all.
+    /// With novelty (which belongs to the ledger, not the graph), it holds
+    /// nothing when its graph's novelty has nothing for the predicate. Then
+    /// the member contributes no edges, where a missing branch otherwise
+    /// declines the lane: rows could live only in novelty. A union default
+    /// graph whose own graph is empty is one. One graph keeps declining, as
+    /// before.
+    fn member_holds_nothing(
+        &self,
+        read: &MemberRead<'_, '_>,
+        pred_sid: &fluree_db_core::Sid,
+    ) -> Result<bool> {
+        let (store, g_id) = (read.member.store(), read.member.g_id());
+        if self.graphs <= 1 || store.branch_for_order(g_id, RunSortOrder::Psot).is_some() {
+            return Ok(false);
+        }
+        if !overlay_carries_novelty(read.member.overlay()) {
+            return Ok(true);
+        }
+        Ok(
+            cached_overlay_ops(read.ctx, store, g_id, RunSortOrder::Psot, pred_sid)?
+                .is_some_and(|ops| ops.is_empty()),
+        )
     }
 
     /// The edge's full relation in `read`'s graph. With `list_index`, each
@@ -891,13 +902,15 @@ impl CyclicBgpOperator {
             read.ctx,
             store,
             read.member.g_id(),
-            pred_sid,
+            pred_sid.clone(),
             p_id,
             scan_projection(list_index.is_some()),
         )? {
             Some(cursor) => cursor,
-            None if self.member_holds_nothing(read) => return Ok(Some(Vec::new())),
             None => {
+                if self.member_holds_nothing(read, &pred_sid)? {
+                    return Ok(Some(Vec::new()));
+                }
                 self.log_fast_path_bail("cursor-unavailable", Some(edge));
                 return Ok(None);
             }
@@ -952,13 +965,15 @@ impl CyclicBgpOperator {
             read.ctx,
             store,
             read.member.g_id(),
-            pred_sid,
+            pred_sid.clone(),
             p_id,
             scan_projection(list_index.is_some()),
         )? {
             Some(cursor) => cursor,
-            None if self.member_holds_nothing(read) => return Ok(Some(Vec::new())),
             None => {
+                if self.member_holds_nothing(read, &pred_sid)? {
+                    return Ok(Some(Vec::new()));
+                }
                 self.log_fast_path_bail("cursor-unavailable", Some(edge));
                 return Ok(None);
             }
@@ -1040,8 +1055,8 @@ impl CyclicBgpOperator {
         );
         let _guard = span.enter();
         let store = read.member.store();
-        let p_id = match self.member_p_id(read, edge)? {
-            Ok(Some((_, p_id))) => p_id,
+        let (pred_sid, p_id) = match self.member_p_id(read, edge)? {
+            Ok(Some(pred)) => pred,
             Ok(None) => return Ok(Some(Vec::new())),
             Err(()) => return Ok(None),
         };
@@ -1054,7 +1069,7 @@ impl CyclicBgpOperator {
         // unavailable, never "no rows" — decline rather than dropping rows.
         let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, read.member.g_id(), p_id)
         else {
-            if self.member_holds_nothing(read) {
+            if self.member_holds_nothing(read, &pred_sid)? {
                 return Ok(Some(Vec::new()));
             }
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
@@ -1246,8 +1261,8 @@ impl CyclicBgpOperator {
         );
         let _guard = span.enter();
         let store = read.member.store();
-        let p_id = match self.member_p_id(read, edge)? {
-            Ok(Some((_, p_id))) => p_id,
+        let (pred_sid, p_id) = match self.member_p_id(read, edge)? {
+            Ok(Some(pred)) => pred,
             Ok(None) => return Ok(Some(Vec::new())),
             Err(()) => return Ok(None),
         };
@@ -1260,7 +1275,7 @@ impl CyclicBgpOperator {
         // unavailable, never "no rows" — decline rather than dropping rows.
         let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, read.member.g_id(), p_id)
         else {
-            if self.member_holds_nothing(read) {
+            if self.member_holds_nothing(read, &pred_sid)? {
                 return Ok(Some(Vec::new()));
             }
             self.log_fast_path_bail("cursor-unavailable", Some(edge));

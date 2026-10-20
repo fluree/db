@@ -1908,7 +1908,10 @@ async fn cyclic_lane_reads_one_graph() {
 /// A ledger whose triples all live in named graphs: its own default graph
 /// holds nothing, so the index has no branch for it. Read as the union
 /// default graph, that member contributes no edges and the union variant
-/// still answers; `FROM g2 + g3` is the control.
+/// still answers; `FROM g2 + g3` is the control. Novelty belongs to the
+/// ledger, so after writes the member still holds nothing for `ex:knows`
+/// while the writes land in other graphs; once one lands in the default
+/// graph, the variant stands down and the general plan answers.
 #[tokio::test(flavor = "current_thread")]
 async fn cyclic_union_lane_reads_past_an_empty_member() {
     let trig = r"
@@ -1943,6 +1946,62 @@ async fn cyclic_union_lane_reads_past_an_empty_member() {
         ),
     ];
     let mut failures = Failures::default();
+    check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
+
+    // Novelty on `ex:knows` in g2 and g3 only: the default graph still holds
+    // nothing for it.
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .
+             GRAPH <urn:g2> { ex:p ex:knows ex:q . ex:q ex:knows ex:r . }
+             GRAPH <urn:g3> { ex:r ex:knows ex:p . }",
+        )
+        .execute()
+        .await
+        .expect("write to g2 and g3");
+    let abc_pqr = rows(&[
+        &["a", "b", "c"],
+        &["b", "c", "a"],
+        &["c", "a", "b"],
+        &["p", "q", "r"],
+        &["q", "r", "p"],
+        &["r", "p", "q"],
+    ]);
+    let cases: Vec<LaneCase> = vec![(
+        "the union default graph, novelty in the other graphs",
+        tri(UNION_PRAGMA, ""),
+        xyz,
+        abc_pqr.clone(),
+        true,
+    )];
+    check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
+
+    // Novelty on `ex:knows` in the default graph itself, which the index has
+    // no branch for: its rows live only in novelty, so the variant stands down.
+    fluree
+        .stage(&handle)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .
+             ex:x ex:knows ex:y . ex:y ex:knows ex:z . ex:z ex:knows ex:x .",
+        )
+        .execute()
+        .await
+        .expect("write to the default graph");
+    let mut abc_pqr_xyz = abc_pqr;
+    abc_pqr_xyz.extend(rows(&[
+        &["x", "y", "z"],
+        &["y", "z", "x"],
+        &["z", "x", "y"],
+    ]));
+    abc_pqr_xyz.sort();
+    let cases: Vec<LaneCase> = vec![(
+        "the union default graph, novelty in the default graph",
+        tri(UNION_PRAGMA, ""),
+        xyz,
+        abc_pqr_xyz,
+        false,
+    )];
     check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
     failures.assert_none();
 }
