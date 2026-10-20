@@ -1,7 +1,7 @@
 //! Structure-aware chunking.
 //!
 //! Walks the DoCO graph rather than the text: chunk boundaries fall between
-//! paragraphs, list items, captions and table cells, never mid-sentence by
+//! paragraphs (a list's items among them) and table cells, never mid-sentence by
 //! character count alone; each chunk cites the element IRIs it was built
 //! from; and the `doco:Section → doco:SectionTitle` chain travels with it as
 //! a header path, so retrieval can boost or filter on hierarchy and the
@@ -94,7 +94,7 @@ pub fn chunk_graph(graph_doc: &Value, config: &ChunkConfig) -> Result<Vec<Chunk>
     }
     let Some(root) = graph
         .iter()
-        .find(|el| type_of(el) == "doco:Document")
+        .find(|el| type_of(el) == "foaf:Document")
         .or_else(|| graph.first())
     else {
         return Ok(Vec::new());
@@ -235,7 +235,9 @@ fn walk(node_id: &str, by_id: &HashMap<&str, &Value>, state: &mut WalkState) {
                 walk(child, by_id, state);
             }
         }
-        "doco:Title" | "doco:Paragraph" | "doco:ListItem" | "doco:Caption" => {
+        // A list's items are paragraphs it contains; the list itself is a
+        // container like any other.
+        "doco:Title" | "doco:Paragraph" => {
             if let Some(text) = body_text(node) {
                 state.push_text(text, node_id);
             }
@@ -269,9 +271,15 @@ fn walk(node_id: &str, by_id: &HashMap<&str, &Value>, state: &mut WalkState) {
         // Consumed as its parent's header; repeating it here would put the
         // heading into the body as well.
         "doco:SectionTitle" => {}
-        // Containers, and anything this walker does not know: recurse.
+        // Containers, and anything this walker does not know: recurse,
+        // header first. The document's own title is its root's header, and
+        // the root holds it after the body.
         _ => {
-            for child in children(node) {
+            let header = node.get("po:containsAsHeader").and_then(Value::as_str);
+            if let Some(h) = header {
+                walk(h, by_id, state);
+            }
+            for child in children(node).filter(|c| Some(*c) != header) {
                 walk(child, by_id, state);
             }
         }
@@ -365,7 +373,7 @@ mod tests {
     #[test]
     fn small_doc_yields_one_chunk_with_sources() {
         let g = graph(vec![
-            json!({"@id":"d","@type":"doco:Document","po:contains":["b"]}),
+            json!({"@id":"d","@type":"foaf:Document","po:contains":["b"]}),
             json!({"@id":"b","@type":"doco:BodyMatter","po:contains":["p1","p2"]}),
             json!({"@id":"p1","@type":"doco:Paragraph","nif:isString":"Hello   world."}),
             json!({"@id":"p2","@type":"doco:Paragraph","nif:isString":"Second."}),
@@ -387,7 +395,7 @@ mod tests {
     #[test]
     fn section_titles_become_header_path_and_pop_by_level() {
         let g = graph(vec![
-            json!({"@id":"d","@type":"doco:Document","po:contains":["s1","s2"]}),
+            json!({"@id":"d","@type":"foaf:Document","po:contains":["s1","s2"]}),
             json!({"@id":"s1","@type":"doco:Section","doc:sectionLevel":1,"po:contains":["t1","s11"]}),
             json!({"@id":"t1","@type":"doco:SectionTitle","nif:isString":"Intro"}),
             json!({"@id":"s11","@type":"doco:Section","doc:sectionLevel":2,"po:contains":["t11","p1"]}),
@@ -411,7 +419,7 @@ mod tests {
     #[test]
     fn chunk_is_labelled_by_where_it_starts() {
         let g = graph(vec![
-            json!({"@id":"d","@type":"doco:Document","po:contains":["s1","s2"]}),
+            json!({"@id":"d","@type":"foaf:Document","po:contains":["s1","s2"]}),
             json!({"@id":"s1","@type":"doco:Section","doc:sectionLevel":2,"po:contains":["t1","p1"]}),
             json!({"@id":"t1","@type":"doco:SectionTitle","nif:isString":"Setup"}),
             json!({"@id":"p1","@type":"doco:Paragraph","nif:isString":"short"}),
@@ -438,13 +446,64 @@ mod tests {
     #[test]
     fn table_cells_carry_headers() {
         let g = graph(vec![
-            json!({"@id":"d","@type":"doco:Document","po:contains":["t"]}),
+            json!({"@id":"d","@type":"foaf:Document","po:contains":["t"]}),
             json!({"@id":"t","@type":"doco:Table","po:contains":["c"]}),
             json!({"@id":"c","@type":"doc:TableCell","doc:cellValue":"3 V",
                    "doc:rowHeader":"Supply","doc:columnHeader":"LM358B"}),
         ]);
         let chunks = chunk_graph(&g, &ChunkConfig::default()).unwrap();
         assert_eq!(chunks[0].text, "Supply / LM358B: 3 V");
+    }
+
+    /// Against the engine's own emitter, not a hand-built graph: a fixture
+    /// written to the old shape kept passing after the root and list item
+    /// classes changed under it.
+    #[test]
+    fn engine_graph_keeps_title_lists_and_sections_in_reading_order() {
+        use fluree_doc_model::{to_doco, DocoOptions, Element};
+        let el = |kind: &str, text: &str| Element::new(kind, text, "rust", "layout");
+        let elements = vec![
+            el("doco:Title", "Annual Report"),
+            el("doco:Paragraph", "Prepared for the board."),
+            el("doc:ListItem", "first item"),
+            el("doc:ListItem", "second item"),
+            Element {
+                level: Some(1),
+                ..el("doco:SectionTitle", "Overview")
+            },
+            el("doco:Paragraph", "Revenue rose."),
+        ];
+        let doco = to_doco(
+            &elements,
+            &DocoOptions {
+                base_iri: "urn:t".into(),
+                ..Default::default()
+            },
+        );
+        let cfg = ChunkConfig {
+            min_chars: 10_000,
+            max_chars: 10_000,
+        };
+        let chunks = chunk_doco(&doco, &cfg).unwrap();
+        assert_eq!(chunks.len(), 1);
+        // The title is the root's header, held after the body; it still
+        // reads first.
+        assert_eq!(
+            chunks[0].text,
+            "Annual Report\n\nPrepared for the board.\n\nfirst item\n\nsecond item\n\nRevenue rose."
+        );
+        assert_eq!(chunks[0].source_ids.len(), 5);
+        assert!(chunks[0]
+            .source_ids
+            .iter()
+            .all(|id| id.starts_with("urn:t-")));
+
+        let cfg = ChunkConfig {
+            min_chars: 1,
+            max_chars: 10_000,
+        };
+        let chunks = chunk_doco(&doco, &cfg).unwrap();
+        assert_eq!(chunks.last().unwrap().header_path, vec!["Overview"]);
     }
 
     #[test]

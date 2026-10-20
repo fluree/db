@@ -106,6 +106,8 @@ Example (typed-literal form, suitable for inline policies):
 }
 ```
 
+A `["graph", …]` pattern in a JSON-LD `f:query` names its graph as any JSON-LD query does: a compact IRI whose prefix the query's own `@context` defines is expanded. With `"ex": "http://example.org/"` in that `@context`, `["graph", "ex:acl", {"@id": "?$identity", "ex:mayRead": {"@id": "?$this"}}]` reads the graph `http://example.org/acl`.
+
 > **Inline policies must use full IRIs.** Compact IRIs (`schema:ssn`) inside an inline policy passed through `opts.policy` are not expanded against the request `@context`. Use full IRIs (`http://schema.org/ssn`).
 
 ## SPARQL policy queries
