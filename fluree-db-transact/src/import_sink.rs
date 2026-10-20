@@ -40,7 +40,7 @@ mod inner {
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
-    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -625,6 +625,35 @@ mod inner {
         prefix_map: HashMap<String, String>,
         /// Optional spool context for Tier 2 parallel pipeline.
         spool_ctx: Option<SpoolContext>,
+        /// The named graphs this sink wrote statements to, in first-use
+        /// order, and the graph SID of each.
+        named_graphs: Vec<(Sid, NamedGraphUse)>,
+        /// Graph SID -> index into `named_graphs`.
+        named_graph_slots: HashMap<Sid, usize>,
+    }
+
+    /// A named graph an [`ImportSink`] wrote statements to (JSON-LD `@graph`
+    /// scoping, through [`GraphSink::emit_quad`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NamedGraphUse {
+        /// The graph IRI.
+        pub iri: String,
+        /// Its `g_id` from the spool's shared graph allocator, when a spool
+        /// context is attached. Without one, the serial finalizer assigns it.
+        pub g_id: Option<GraphId>,
+    }
+
+    /// What an [`ImportSink`] produced: see [`ImportSink::into_output`].
+    pub struct ImportSinkOutput {
+        /// The commit writer, holding every flake the sink encoded.
+        pub writer: StreamingCommitWriter,
+        /// Turtle `@prefix` short names: IRI -> short prefix.
+        pub prefix_map: HashMap<String, String>,
+        /// The spool context, if one was attached.
+        pub spool_ctx: Option<SpoolContext>,
+        /// The named graphs the sink wrote, in first-use order. Each one
+        /// new to the import belongs in its commit's `graph_delta`.
+        pub named_graphs: Vec<NamedGraphUse>,
     }
 
     impl<'a> ImportSink<'a> {
@@ -655,6 +684,8 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                named_graphs: Vec::new(),
+                named_graph_slots: HashMap::new(),
             })
         }
 
@@ -678,6 +709,8 @@ mod inner {
                 encode_error: None,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
+                named_graphs: Vec::new(),
+                named_graph_slots: HashMap::new(),
             })
         }
 
@@ -706,6 +739,10 @@ mod inner {
         /// are unchanged by the fallible protocol — `emit_*` still records the
         /// first encode failure and keeps going, and this method is where it
         /// becomes a hard error.
+        ///
+        /// Refuses a sink that wrote to a named graph: its caller has no way
+        /// to record the graph in the commit's `graph_delta`, so the graph
+        /// would be lost. Such a caller uses [`Self::into_output`].
         #[allow(clippy::type_complexity)]
         pub fn into_parts(
             self,
@@ -717,10 +754,30 @@ mod inner {
             ),
             CommitCodecError,
         > {
+            let output = self.into_output()?;
+            if let Some(graph) = output.named_graphs.first() {
+                return Err(CommitCodecError::InvalidOp(format!(
+                    "the import wrote the named graph <{}>, which this import path cannot record",
+                    graph.iri
+                )));
+            }
+            Ok((output.writer, output.prefix_map, output.spool_ctx))
+        }
+
+        /// Consume the sink and return everything it produced, the named
+        /// graphs it wrote included.
+        ///
+        /// Returns an error if any flake failed to encode during parsing.
+        pub fn into_output(self) -> Result<ImportSinkOutput, CommitCodecError> {
             if let Some(err) = self.encode_error {
                 return Err(err);
             }
-            Ok((self.writer, self.prefix_map, self.spool_ctx))
+            Ok(ImportSinkOutput {
+                writer: self.writer,
+                prefix_map: self.prefix_map,
+                spool_ctx: self.spool_ctx,
+                named_graphs: self.named_graphs.into_iter().map(|(_, g)| g).collect(),
+            })
         }
 
         // -- helpers ---------------------------------------------------------
@@ -753,12 +810,36 @@ mod inner {
             }
         }
 
+        /// The `named_graphs` slot of the graph `graph` names, registered on
+        /// first use.
+        fn named_graph_slot(&mut self, graph: TermId) -> Result<usize, SinkError> {
+            let Some(sid) = self.resolve_sid(graph) else {
+                return Err(SinkError::rejected("a graph name must be an IRI"));
+            };
+            if let Some(&slot) = self.named_graph_slots.get(&sid) {
+                return Ok(slot);
+            }
+            let iri = self.ns.iri_for_sid(&sid).ok_or_else(|| {
+                SinkError::rejected(format!(
+                    "graph name {sid:?} uses a namespace code with no prefix"
+                ))
+            })?;
+            let slot = self.named_graphs.len();
+            self.named_graphs
+                .push((sid.clone(), NamedGraphUse { iri, g_id: None }));
+            self.named_graph_slots.insert(sid, slot);
+            Ok(slot)
+        }
+
+        /// One statement: in the default graph (`graph` is `None`), or in a
+        /// named graph by its `named_graphs` slot.
         fn push_triple(
             &mut self,
             subject: TermId,
             predicate: TermId,
             object: TermId,
             list_index: Option<i32>,
+            graph: Option<usize>,
         ) {
             let Some(s) = self.resolve_sid(subject) else {
                 return;
@@ -788,15 +869,27 @@ mod inner {
                 return;
             }
 
-            let flake = Flake::new(
-                s.clone(),
-                p.clone(),
-                o.clone(),
-                dt.clone(),
-                self.t,
-                true,
-                meta,
-            );
+            let flake = match graph {
+                None => Flake::new(
+                    s.clone(),
+                    p.clone(),
+                    o.clone(),
+                    dt.clone(),
+                    self.t,
+                    true,
+                    meta,
+                ),
+                Some(slot) => Flake::new_in_graph(
+                    self.named_graphs[slot].0.clone(),
+                    s.clone(),
+                    p.clone(),
+                    o.clone(),
+                    dt.clone(),
+                    self.t,
+                    true,
+                    meta,
+                ),
+            };
             if let Err(e) = self.writer.push_flake(&flake) {
                 if self.encode_error.is_none() {
                     tracing::error!("ImportSink: flake encode failed: {}", e);
@@ -807,7 +900,7 @@ mod inner {
 
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
-                let written = ctx.write_record(FlakeRecord {
+                let record = FlakeRecord {
                     s: &s,
                     p: &p,
                     o: &o,
@@ -815,7 +908,24 @@ mod inner {
                     lang: lang.as_deref(),
                     list_index,
                     t: self.t,
-                });
+                };
+                let written = match graph {
+                    None => ctx.write_record(record),
+                    // A named graph's record goes under its `g_id` from the
+                    // shared graph allocator, as TriG's named-graph flakes do.
+                    Some(slot) => {
+                        let graph = &mut self.named_graphs[slot].1;
+                        let g_id = match graph.g_id {
+                            Some(g_id) => g_id,
+                            None => {
+                                let g_id = ctx.graph_g_id_for_iri(&graph.iri);
+                                graph.g_id = Some(g_id);
+                                g_id
+                            }
+                        };
+                        ctx.push_named_graph_record(g_id, record)
+                    }
+                };
                 if let Err(e) = written {
                     self.encode_error.get_or_insert(e);
                 }
@@ -923,7 +1033,7 @@ mod inner {
             predicate: TermId,
             object: TermId,
         ) -> SinkResult {
-            self.push_triple(subject, predicate, object, None);
+            self.push_triple(subject, predicate, object, None, None);
             Ok(())
         }
 
@@ -934,7 +1044,40 @@ mod inner {
             object: TermId,
             index: i32,
         ) -> SinkResult {
-            self.push_triple(subject, predicate, object, Some(index));
+            self.push_triple(subject, predicate, object, Some(index), None);
+            Ok(())
+        }
+
+        fn supports_quads(&self) -> bool {
+            true
+        }
+
+        /// A statement in a named graph (JSON-LD `@graph` scoping): the flake
+        /// carries the graph in the commit, and its spool record the graph's
+        /// `g_id`, as TriG's named-graph flakes do. The caller records the
+        /// graph in the commit's `graph_delta` from [`Self::into_output`].
+        fn emit_quad(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            graph: TermId,
+        ) -> SinkResult {
+            let slot = self.named_graph_slot(graph)?;
+            self.push_triple(subject, predicate, object, None, Some(slot));
+            Ok(())
+        }
+
+        fn emit_quad_list_item(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            graph: TermId,
+            index: i32,
+        ) -> SinkResult {
+            let slot = self.named_graph_slot(graph)?;
+            self.push_triple(subject, predicate, object, Some(index), Some(slot));
             Ok(())
         }
 
@@ -1178,6 +1321,89 @@ mod inner {
             ctx.write_record(rec(None)).unwrap();
             let _ = ctx.finish_buffered();
             assert!(config.saw_list_meta.load(Ordering::Relaxed));
+        }
+
+        /// A statement in a named graph carries its graph into the commit,
+        /// a list member its position too, and the sink reports the graph
+        /// for the commit's `graph_delta`.
+        #[test]
+        fn a_named_graph_statement_carries_its_graph_into_the_commit() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+            assert!(sink.supports_quads());
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let o = sink.term_literal("v", Datatype::xsd_string(), None);
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_quad(s, p, o, g).unwrap();
+            let items = sink.term_iri("http://example.org/items");
+            let b = sink.term_iri("http://example.org/b");
+            let g_again = sink.term_iri("http://example.org/g");
+            sink.emit_quad_list_item(s, items, b, g_again, 0).unwrap();
+            sink.emit_triple(s, p, o).unwrap();
+
+            let output = sink.into_output().unwrap();
+            assert_eq!(
+                output.named_graphs,
+                [NamedGraphUse {
+                    iri: "http://example.org/g".to_string(),
+                    g_id: None
+                }]
+            );
+            let result = output.writer.finish(&make_envelope(1)).unwrap();
+            let flakes = read_commit(&result.bytes).unwrap().flakes;
+            let g = ns.lookup_sid_for_iri("http://example.org/g");
+            let graphs: Vec<_> = flakes.iter().map(|f| f.g.clone()).collect();
+            assert_eq!(graphs, [g.clone(), g, None]);
+            assert_eq!(flakes[1].m.as_ref().and_then(|m| m.i), Some(0));
+        }
+
+        /// With a spool, a named-graph record goes under the graph's `g_id`
+        /// from the shared graph allocator, which the sink reports.
+        #[test]
+        fn a_named_graph_record_spools_under_its_g_id() {
+            let ns = NamespaceRegistry::new();
+            let config = make_spool_config(&ns);
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-named-graph-{}.spool",
+                std::process::id()
+            ));
+            sink.set_spool_context(SpoolContext::new(&path, 0, 0, &config).unwrap());
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let o = sink.term_literal("v", Datatype::xsd_string(), None);
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_quad(s, p, o, g).unwrap();
+            sink.emit_triple(s, p, o).unwrap();
+
+            let output = sink.into_output().unwrap();
+            let g_id = output.named_graphs[0]
+                .g_id
+                .expect("a spooled graph has a g_id");
+            assert_eq!(
+                config.graph_alloc.get_or_insert("http://example.org/g") + 1,
+                u32::from(g_id)
+            );
+            let spool = output.spool_ctx.expect("spool");
+            let g_ids: Vec<_> = spool.records.iter().map(|r| r.g_id).collect();
+            assert_eq!(g_ids, [g_id, 0]);
+        }
+
+        /// A caller that cannot record a named graph does not get a writer
+        /// that silently holds one.
+        #[test]
+        fn into_parts_refuses_a_sink_that_wrote_a_named_graph() {
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+            let s = sink.term_iri("http://example.org/a");
+            let p = sink.term_iri("http://example.org/q");
+            let g = sink.term_iri("http://example.org/g");
+            sink.emit_quad(s, p, s, g).unwrap();
+            let err = sink.into_parts().err().expect("refused");
+            assert!(err.to_string().contains("<http://example.org/g>"), "{err}");
         }
 
         #[test]
@@ -1517,6 +1743,8 @@ mod inner {
 pub use inner::BufferedSpoolResult;
 pub use inner::FlakeRecord;
 pub use inner::ImportSink;
+pub use inner::ImportSinkOutput;
+pub use inner::NamedGraphUse;
 pub use inner::SpoolConfig;
 pub use inner::SpoolContext;
 pub use inner::SpoolResult;

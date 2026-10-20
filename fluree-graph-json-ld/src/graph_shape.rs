@@ -152,6 +152,39 @@ pub fn is_envelope_graph(graph: &Value, has_id: bool) -> Result<bool> {
     }
 }
 
+/// The key holding a top-level envelope's content, if `map` is one: a
+/// `@graph` that [`is_envelope_graph`] calls content, or the legacy bare
+/// `graph` key on an object with no `@id`. The expander unwraps an envelope
+/// and keeps only that content.
+pub fn envelope_graph_key(map: &Map<String, Value>) -> Result<Option<&'static str>> {
+    let has_id = map.contains_key("@id") || map.contains_key("id");
+    if let Some(graph) = map.get("@graph") {
+        return Ok(is_envelope_graph(graph, has_id)?.then_some("@graph"));
+    }
+    Ok((map.contains_key("graph") && !has_id).then_some("graph"))
+}
+
+/// The name of a JSON-LD named graph: the `@id` of the node object that
+/// holds the `@graph` content. Fluree has no blank-node graph names, a
+/// variable cannot name one, and a graph object without an `@id` is only
+/// meaningful as the top-level envelope. The caller still checks that the
+/// name is an absolute IRI.
+pub fn named_graph_name(id: Option<&Value>) -> std::result::Result<&str, String> {
+    let Some(Value::String(iri)) = id else {
+        return Err(
+            "a node object with `@graph` content is a JSON-LD named graph and needs an `@id` \
+             naming the graph; only the top-level envelope may omit it"
+                .to_string(),
+        );
+    };
+    if iri.starts_with("_:") || iri.starts_with('?') {
+        return Err(format!(
+            "a JSON-LD named graph must be named by an IRI, not {iri:?}"
+        ));
+    }
+    Ok(iri)
+}
+
 /// True when `key` means `@graph` under `ctx`: the keyword itself, a context
 /// alias of it, or the legacy bare `graph` key **only when the context does
 /// not define `graph` as a term** (a defined term is an ordinary property).

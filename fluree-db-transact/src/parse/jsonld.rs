@@ -26,7 +26,8 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, parse_context, GraphValue, ParsedContext,
+    classify_graph_value, expand_with_context_policy, is_keyword_form, named_graph_name,
+    parse_context, GraphValue, ParsedContext,
 };
 use fluree_vocab::{
     rdf::{self, TYPE},
@@ -1175,18 +1176,7 @@ impl<'a> TemplateParseCtx<'a> {
     /// name is checked even for empty content; `None` then, so an empty graph
     /// is not registered as a write target.
     fn named_graph_scope(&mut self, id: Option<&Value>, empty: bool) -> Result<Option<GraphScope>> {
-        let Some(Value::String(iri)) = id else {
-            return Err(TransactError::Parse(
-                "a node object with `@graph` content is a JSON-LD named graph and needs an `@id` \
-                 naming the graph; only the top-level envelope may omit it"
-                    .to_string(),
-            ));
-        };
-        if iri.starts_with("_:") || iri.starts_with('?') {
-            return Err(TransactError::Parse(format!(
-                "a JSON-LD named graph must be named by an IRI, not {iri:?}"
-            )));
-        }
+        let iri = named_graph_name(id).map_err(TransactError::Parse)?;
         if self.fixed_root.is_some() {
             return Err(TransactError::Parse(
                 "payload must not address named graphs; the target graph is given by the request"
@@ -1808,13 +1798,6 @@ fn parse_expanded_object_with_ctx(
     }
 
     Ok(subject)
-}
-
-/// A key spelled like a JSON-LD keyword (`@` then letters). Keys that
-/// merely start with `@` (`@odata.etag`) are ordinary property names.
-fn is_keyword_form(key: &str) -> bool {
-    key.strip_prefix('@')
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
 /// The node objects of an `@included` value (one node or an array of them).

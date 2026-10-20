@@ -414,6 +414,17 @@ impl GraphSink for Capture<'_, '_> {
     ) -> SinkResult {
         self.sink.emit_quad(subject, predicate, object, graph)
     }
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        graph: TermId,
+        index: i32,
+    ) -> SinkResult {
+        self.sink
+            .emit_quad_list_item(subject, predicate, object, graph, index)
+    }
     fn end_statement(&mut self) {
         self.sink.end_statement();
     }

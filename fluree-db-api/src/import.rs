@@ -5101,6 +5101,7 @@ where
                         Some(&spool_dir),
                         Some(&spool_config),
                         idx,
+                        alias,
                     )
                 } else {
                     parse_chunk(
@@ -5358,6 +5359,7 @@ where
                             Some(&spool_dir),
                             Some(&spool_config),
                             i,
+                            alias,
                         )
                     } else {
                         parse_chunk(
