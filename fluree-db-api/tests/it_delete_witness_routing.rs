@@ -9,9 +9,10 @@
 //! can tell which lane ran. Both directions are asserted on the same ledger:
 //! `MustFire` while it is list-free, `MustNotFire` after one `@list` lands.
 //!
-//! Its own `[[test]]` binary, like `it_upsert_skip_fires`: tracing's
-//! callsite-interest cache is process-global, so a sibling test in a bundled
-//! binary can leave the stamp's callsite disabled.
+//! Its own `[[test]]` binary, like `it_upsert_skip_fires`, which predates the
+//! shared capture helper; with the capture going through
+//! `fluree_test_support::scoped_default`, a sibling can no longer leave the
+//! stamp's callsite disabled.
 
 #[path = "support/span_capture.rs"]
 mod span_capture;
