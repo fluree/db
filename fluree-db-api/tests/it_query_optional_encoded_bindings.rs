@@ -2352,8 +2352,8 @@ const TOPK_SITES: (&str, &str) = (
 enum ObjectCount {
     /// The one-graph lane answers; the union lane stamps nothing.
     One,
-    /// The union lane answers, by this plan when given (`zero`, `single`,
-    /// `disjoint`, `merge`); the one-graph lane declines. A plan the manifest decides on a
+    /// The union lane answers, by this plan when given (`zero`; `rows`, every
+    /// slice one member's; `merge`); the one-graph lane declines. A plan the manifest decides on a
     /// fixture this small (it may hold one leaf per graph) is left unchecked.
     Union(Option<&'static str>),
     /// The union lane declines with this label, by this plan when given; the
@@ -2418,9 +2418,9 @@ fn check_count_routing(
 
 /// `COUNT(?s)` over `?s <p> <o>`: the bound-object count. Over one graph it
 /// counts that graph's rows; over a default graph of several graphs of one
-/// ledger it counts the distinct subjects holding the object in some member,
-/// as the general plan does (its dedup key is `?s` alone, the predicate and
-/// object being constants); over a default graph of none, 0.
+/// ledger it counts the facts holding the object in some member, each once
+/// (one fact per value and list position), as the general plan does;
+/// over a default graph of none, 0.
 ///
 /// Kinds: a and b `T` in g2, a (the identical triple) and d `T` in g3, e `T`
 /// in the default graph, c `U` in g2. Only g3 has `ex:flag`. `ex:n 1`: a holds
@@ -2542,46 +2542,46 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(None),
         ),
         (
-            "D8 FROM g2 + g3, a bare number: distinct subjects across slices",
+            "D8 FROM g2 + g3, a bare number: each slice's facts, the one both hold once",
             count("", from23, "ex:n 1"),
-            n("3"),
+            n("4"),
             ObjectCount::Union(Some("merge")),
         ),
         (
-            "D9 FROM g2 + g3, a list repeating the object, merged",
+            "D9 FROM g2 + g3, a list repeating the object: every item a fact",
             count("", from23, "ex:q 5"),
-            n("2"),
+            n("3"),
             ObjectCount::Union(Some("merge")),
         ),
         (
             "D10 FROM g2 + g3, a list repeating the object (g2 only)",
             count("", from23, "ex:r 5"),
-            n("1"),
-            ObjectCount::Union(Some("merge")),
-        ),
-        (
-            "D15 FROM g2 + g3, two lists repeating the object: rows out of subject order",
-            count("", from23, "ex:w 5"),
             n("2"),
-            ObjectCount::UnionDeclines("list_rows_in_post", Some("merge")),
+            ObjectCount::Union(None),
         ),
         (
-            "D11 FROM g2 + g3, a bare number with a decimal slice: each member's own handle, disjoint subjects",
+            "D15 FROM g2 + g3, two lists repeating the object: every item a fact",
+            count("", from23, "ex:w 5"),
+            n("4"),
+            ObjectCount::Union(None),
+        ),
+        (
+            "D11 FROM g2 + g3, a bare number with a decimal slice in one member",
             count("", from23, "ex:m 1"),
             n("2"),
-            ObjectCount::Union(Some("disjoint")),
+            ObjectCount::Union(Some("rows")),
         ),
         (
             "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf",
             count("", from23, "ex:zz 6"),
             n("1"),
-            ObjectCount::Union(Some("single")),
+            ObjectCount::Union(Some("rows")),
         ),
         (
-            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf: one member's rows, merged",
+            "D14 FROM g2 + g3, a list repeating the object, past g3's last leaf: one member's rows",
             count("", from23, "ex:zz 5"),
-            n("1"),
-            ObjectCount::Union(Some("merge")),
+            n("2"),
+            ObjectCount::Union(Some("rows")),
         ),
         (
             "D16 FROM g2 + g3, interleaved subject ranges, none in common: the merge",
@@ -2590,10 +2590,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(Some("merge")),
         ),
         (
-            "D17 FROM g2 + g3, disjoint subject ranges: the row counts' sum",
+            "D17 FROM g2 + g3, disjoint subject ranges",
             count("", from23, "ex:tag ex:J"),
             n("10"),
-            ObjectCount::Union(Some("disjoint")),
+            ObjectCount::Union(Some("merge")),
         ),
         (
             "D12 FROM NAMED g2 alone: an empty default graph",
@@ -2708,10 +2708,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(None),
         ),
         (
-            "T4 FROM g2 + g3, list rows",
+            "T4 FROM g2 + g3, list rows: every item a fact",
             topk("", from23, "ex:q"),
-            rows(&[&["5", "2"], &["7", "1"]]),
-            ObjectCount::UnionDeclines("list_rows_in_post", None),
+            rows(&[&["5", "3"], &["7", "1"]]),
+            ObjectCount::Union(None),
         ),
         (
             "T5 FROM g2 + g3, decimal objects (arena handles)",
@@ -2914,10 +2914,10 @@ async fn numeric_object_count_over_one_graph_and_a_union() {
             Some(ObjectCount::One),
         ),
         (
-            "1.5, g1 + g2: a in both",
+            "1.5, g1 + g2: a in both, by value: handles in both members",
             count(both, "ex:price 1.5"),
             "4",
-            Some(ObjectCount::Union(None)),
+            Some(ObjectCount::UnionDeclines("arena_type", None)),
         ),
         (
             "3.25, g1: in no arena of g1",
@@ -2962,10 +2962,10 @@ async fn numeric_object_count_over_one_graph_and_a_union() {
             Some(ObjectCount::One),
         ),
         (
-            "big integer, g1 + g2: two subjects",
+            "big integer, g1 + g2: handles in both members",
             count(both, big),
             "2",
-            Some(ObjectCount::Union(None)),
+            Some(ObjectCount::UnionDeclines("arena_type", None)),
         ),
         (
             "typed decimal, g1 + g2: neither lane",

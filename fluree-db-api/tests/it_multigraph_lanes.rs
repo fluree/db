@@ -276,3 +276,39 @@ async fn lane_d_object_count_read_below_its_index() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_numeric_count_indexed() {
+    union_lane_routes(
+        State::Indexed,
+        Shape::BoundNumericCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_numeric_count_with_novelty_in_g2() {
+    union_lane_routes(
+        State::Novelty,
+        Shape::BoundNumericCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lane_d_numeric_count_read_below_its_index() {
+    union_lane_routes(
+        State::Indexed2,
+        Shape::BoundNumericCount,
+        OBJECT_COUNT_SITES,
+        object_count_answered,
+        object_count_route,
+    )
+    .await;
+}
