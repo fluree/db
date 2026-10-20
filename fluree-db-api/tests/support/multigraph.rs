@@ -950,7 +950,8 @@ pub struct Run {
     pub fell_back: Vec<(String, String)>,
 }
 
-fn switch() -> &'static tokio::sync::Mutex<()> {
+/// The lock every run that sets the process-wide fast-path switch holds.
+pub fn switch() -> &'static tokio::sync::Mutex<()> {
     static SWITCH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     SWITCH.get_or_init(|| tokio::sync::Mutex::new(()))
 }

@@ -59,7 +59,7 @@ use crate::sort::SortOperator;
 use crate::sort::SortSpec;
 use crate::stats_query::{
     count_by_predicate_union_operator, stats_count_by_predicate_operator,
-    COUNT_BY_PREDICATE_UNION_SITE,
+    STATS_COUNT_BY_PREDICATE_UNION_SITE,
 };
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -3198,7 +3198,7 @@ fn build_operator_tree_inner(
         && detect_stats_count_by_predicate(query).is_some()
     {
         stamp_fast_path(
-            COUNT_BY_PREDICATE_UNION_SITE,
+            STATS_COUNT_BY_PREDICATE_UNION_SITE,
             FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
         );
     }

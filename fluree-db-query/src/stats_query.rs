@@ -29,21 +29,20 @@
 //! ## Over a default graph of several graphs
 //!
 //! A default graph of two or more graphs of one ledger is the set union of
-//! their triples: a predicate's count there is its number of distinct facts
-//! over the members, a list index aside, which is what the general plan's
-//! dedup leaves. [`count_by_predicate_union_operator`] reads every member's
-//! POST directory as above. A predicate that one member holds, without list
-//! rows, takes that member's count. Any other predicate, one that two members
-//! hold or one with list rows (two items of one `@list` can repeat a value),
-//! is counted by merging its PSOT rows across the members
-//! ([`MergedRangeCursor`]), which drops each repeated fact. A predicate some
-//! member holds big numbers for is counted through a set instead, a big
+//! their facts, a fact being storage's identity: one per value and list
+//! position (AJ-66). A predicate's count there is its number of distinct
+//! facts over the members. [`count_by_predicate_union_operator`] reads every
+//! member's POST directory as above. A predicate one member holds takes that
+//! member's count: one graph's rows are distinct facts. A predicate two or
+//! more members hold is counted by merging its PSOT rows across them
+//! ([`MergedRangeCursor`]), which drops each fact they share. A predicate
+//! some member holds big numbers for is counted through a set instead, a big
 //! number keyed by its value: its encoded key is a handle into an arena per
 //! graph and predicate, so equal keys in two members need not be one value.
-//! Vectors and spatial values decline. The planner picks
-//! it for a scope of several graphs or of none; it stamps its own site
-//! ([`COUNT_BY_PREDICATE_UNION_SITE`]) and runs only when the index alone
-//! answers for every member.
+//! Vectors and spatial values decline. The planner picks this operator for a
+//! scope of several graphs or of none; it stamps its own site
+//! ([`STATS_COUNT_BY_PREDICATE_UNION_SITE`]) and runs only when the index
+//! alone answers for every member.
 
 use crate::binding::{Batch, Binding};
 use crate::context::WellKnownDatatypes;
@@ -56,7 +55,6 @@ use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::arena::numbig::NumBigRepr;
 use fluree_db_binary_index::format::column_block::ColumnId;
-use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryFilter, BinaryIndexStore, ColumnProjection, ColumnSet};
 use fluree_db_core::{FlakeValue, GraphId, OType};
@@ -65,9 +63,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// `fast-path outcome` site of the per-predicate count over a default graph
-/// of several graphs, or of none. It stamps apart from the one-graph
-/// operator's site so a test can tell which of the two answered.
-pub const COUNT_BY_PREDICATE_UNION_SITE: &str = "count_by_predicate_union";
+/// of several graphs, or of none: the one-graph site's name with `_union`, so
+/// a test can tell which of the two answered.
+pub const STATS_COUNT_BY_PREDICATE_UNION_SITE: &str = "stats_count_by_predicate_union";
 
 /// Build the per-predicate count operator. Emits `(pred, count)` rows from
 /// exact POST leaf-directory metadata when the fast-path gate holds; defers
@@ -95,11 +93,10 @@ pub fn stats_count_by_predicate_operator(
                 return Ok(None);
             }
             let store = member.store();
-            let Some(rows) = predicate_rows_post(store, member.g_id())? else {
+            let Some(counts) = exact_count_by_predicate_post(store, member.g_id())? else {
                 return Ok(None);
             };
-            let counts = rows.into_iter().map(|(p_id, rows)| (p_id, rows.rows));
-            predicate_count_batch(store, &batch_schema, counts)
+            predicate_count_batch(store, &batch_schema, counts.into_iter())
         },
         fallback,
         "COUNT by predicate (directory)",
@@ -111,7 +108,7 @@ pub fn stats_count_by_predicate_operator(
 /// `fallback` when the scope is neither, when some member's index does not
 /// answer for it alone, or when a predicate's rows cannot be merged exactly;
 /// each decline over several graphs stamps its reason at
-/// [`COUNT_BY_PREDICATE_UNION_SITE`].
+/// [`STATS_COUNT_BY_PREDICATE_UNION_SITE`].
 pub fn count_by_predicate_union_operator(
     pred_var: VarId,
     count_var: VarId,
@@ -136,7 +133,7 @@ pub fn count_by_predicate_union_operator(
             _ => Ok(None),
         },
         fallback,
-        COUNT_BY_PREDICATE_UNION_SITE,
+        STATS_COUNT_BY_PREDICATE_UNION_SITE,
     )
 }
 
@@ -144,7 +141,7 @@ pub fn count_by_predicate_union_operator(
 /// its fallback.
 fn union_declined(reason: FastPathFallback) -> Option<Batch> {
     stamp_fast_path(
-        COUNT_BY_PREDICATE_UNION_SITE,
+        STATS_COUNT_BY_PREDICATE_UNION_SITE,
         FastPathOutcome::Fallback(reason),
     );
     None
@@ -186,13 +183,12 @@ fn count_by_predicate_union(
     let store = set.store();
     let mut held: BTreeMap<u32, Holders> = BTreeMap::new();
     for member in set.members() {
-        let Some(rows) = predicate_rows_post(store, member.g_id())? else {
+        let Some(rows) = exact_count_by_predicate_post(store, member.g_id())? else {
             return Ok(Err(FastPathFallback::GateDeclined));
         };
         for (p_id, rows) in rows {
             let holders = held.entry(p_id).or_default();
-            holders.rows += rows.rows;
-            holders.list_rows |= rows.list_rows;
+            holders.rows += rows;
             holders.members += 1;
         }
         // Arenas are loaded whole at store open: this reads no storage.
@@ -205,15 +201,14 @@ fn count_by_predicate_union(
     }
     let mut counts = Vec::with_capacity(held.len());
     for (p_id, holders) in held {
-        // One member's rows of one predicate are distinct facts unless two
-        // items of a list repeat a value, or a legacy arena gave one value
-        // two handles.
-        let count = if holders.members == 1 && !holders.list_rows && !holders.numbig_duplicates {
+        // One member's rows of one predicate are distinct facts, unless a
+        // legacy arena gave one value two handles.
+        let count = if holders.members == 1 && !holders.numbig_duplicates {
             Ok(Ok(holders.rows))
         } else if holders.numbig {
             distinct_facts_by_value(set, p_id)
         } else {
-            distinct_facts(set, p_id).map(|merged| merged.map_err(union_fallback))
+            distinct_facts(set, p_id).map(|merged| merged.map_err(|decline| decline.fallback()))
         };
         match count {
             Ok(Ok(count)) => counts.push((p_id, count)),
@@ -233,8 +228,6 @@ fn count_by_predicate_union(
 struct Holders {
     /// Its rows, summed over the members.
     rows: i64,
-    /// Some member's rows may include a list row.
-    list_rows: bool,
     /// How many members hold it.
     members: usize,
     /// Some member holding it has a big-number arena for it.
@@ -244,93 +237,8 @@ struct Holders {
     numbig_duplicates: bool,
 }
 
-/// The number of distinct facts of predicate `p_id` over `set`'s members, a
-/// list index aside, for a predicate some member holds big numbers for. A
-/// big number's `o_key` is a handle into its graph's arena for the predicate,
-/// so two members' handles for one value differ, and one handle can name two
-/// values: each member's rows go into one set, a big number keyed by its
-/// value's normalized repr (one term iff equal reprs, across arenas), any
-/// other object by its `(o_type, o_key)`. Vectors and spatial values, whose
-/// arenas have no such key, decline.
-fn distinct_facts_by_value(
-    set: &MemberSet<'_>,
-    p_id: u32,
-) -> Result<std::result::Result<i64, FastPathFallback>> {
-    #[derive(PartialEq, Eq, Hash)]
-    enum Object {
-        Encoded(u16, u64),
-        Big(NumBigRepr),
-    }
-    let store = set.store();
-    // The range keys' graph is not compared; each member reads its own.
-    let (min, max) = predicate_range_keys(p_id, 0);
-    let mut columns = ColumnSet::single(ColumnId::SId);
-    columns.insert(ColumnId::OType);
-    columns.insert(ColumnId::OKey);
-    let projection = ColumnProjection {
-        output: columns,
-        internal: ColumnSet::EMPTY,
-    };
-    let filter = BinaryFilter {
-        p_id: Some(p_id),
-        ..BinaryFilter::default()
-    };
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    let mut facts: FxHashSet<(u64, Object)> = FxHashSet::default();
-    for member in set.members() {
-        let arena = store
-            .numbig_arenas(member.g_id())
-            .find_map(|(p, arena)| (p == p_id).then_some(arena));
-        let Some(mut cursor) = build_range_cursor(
-            store,
-            member.g_id(),
-            RunSortOrder::Psot,
-            &min,
-            &max,
-            filter.clone(),
-            projection,
-        ) else {
-            return Ok(Err(FastPathFallback::GateDeclined));
-        };
-        cursor.set_to_t(member.to_t());
-        while let Some(batch) = cursor
-            .next_batch()
-            .map_err(|e| QueryError::from_io("count by predicate", e))?
-        {
-            for row in 0..batch.row_count {
-                let o_type = batch.o_type.get(row);
-                let o_key = batch.o_key.get(row);
-                let object = if o_type == numbig {
-                    let Some(value) = arena.and_then(|a| a.get_by_handle(o_key as u32)) else {
-                        return Ok(Err(FastPathFallback::GateDeclined));
-                    };
-                    Object::Big(value.normalized_repr())
-                } else if is_graph_scoped_arena(o_type) {
-                    return Ok(Err(FastPathFallback::ArenaType));
-                } else {
-                    Object::Encoded(o_type, o_key)
-                };
-                facts.insert((batch.s_id.get(row), object));
-            }
-        }
-    }
-    Ok(Ok(facts.len() as i64))
-}
-
-/// The fallback a merge's decline stamps.
-fn union_fallback(decline: MergeDecline) -> FastPathFallback {
-    match decline {
-        MergeDecline::ArenaType { .. } => FastPathFallback::ArenaType,
-        MergeDecline::Novelty => FastPathFallback::Novelty,
-        MergeDecline::ListRows {
-            order: RunSortOrder::Post,
-        } => FastPathFallback::ListRowsInPost,
-        MergeDecline::ListRows { .. } | MergeDecline::NoBranch => FastPathFallback::GateDeclined,
-    }
-}
-
-/// The number of distinct facts of predicate `p_id` over `set`'s members, a
-/// list index aside: its PSOT rows merged, where one fact's rows are adjacent.
+/// The number of distinct facts of predicate `p_id` over `set`'s members:
+/// its PSOT rows merged, where the members' copies of one fact are adjacent.
 fn distinct_facts(
     set: &MemberSet<'_>,
     p_id: u32,
@@ -362,17 +270,84 @@ fn distinct_facts(
     }
 }
 
-/// One predicate's rows in one graph's POST directory.
-#[derive(Debug, Default, Clone, Copy)]
-struct PredicateRows {
-    rows: i64,
-    /// Some leaflet holding the predicate has a list row (`HAS_O_I`). A
-    /// leaflet of several predicates marks every one of them.
-    list_rows: bool,
+/// The number of distinct facts of predicate `p_id` over `set`'s members,
+/// for a predicate some member holds big numbers for. A big number's `o_key`
+/// is a handle into its graph's arena for the predicate, so two members'
+/// handles for one value differ, and one handle can name two values: each
+/// member's rows go into one set of facts `(s, o_type, object, list
+/// position)`, a big number's object its value's normalized repr (one value
+/// iff equal reprs, across arenas; a decimal and an integer of equal digits
+/// differ in it), any other object its `o_key`. Vectors and spatial values,
+/// whose arenas have no such key, decline.
+fn distinct_facts_by_value(
+    set: &MemberSet<'_>,
+    p_id: u32,
+) -> Result<std::result::Result<i64, FastPathFallback>> {
+    #[derive(PartialEq, Eq, Hash)]
+    enum Object {
+        Encoded(u64),
+        Big(NumBigRepr),
+    }
+    let store = set.store();
+    // The range keys' graph is not compared; each member reads its own.
+    let (min, max) = predicate_range_keys(p_id, 0);
+    let mut columns = ColumnSet::single(ColumnId::SId);
+    columns.insert(ColumnId::OType);
+    columns.insert(ColumnId::OKey);
+    columns.insert(ColumnId::OI);
+    let projection = ColumnProjection {
+        output: columns,
+        internal: ColumnSet::EMPTY,
+    };
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        ..BinaryFilter::default()
+    };
+    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
+    // A fact: subject, object type, object, list position.
+    let mut facts: FxHashSet<(u64, u16, Object, u32)> = FxHashSet::default();
+    for member in set.members() {
+        let arena = store
+            .numbig_arenas(member.g_id())
+            .find_map(|(p, arena)| (p == p_id).then_some(arena));
+        let Some(mut cursor) = build_range_cursor(
+            store,
+            member.g_id(),
+            RunSortOrder::Psot,
+            &min,
+            &max,
+            filter.clone(),
+            projection,
+        ) else {
+            return Ok(Err(FastPathFallback::GateDeclined));
+        };
+        cursor.set_to_t(member.to_t());
+        while let Some(batch) = cursor
+            .next_batch()
+            .map_err(|e| QueryError::from_io("count by predicate", e))?
+        {
+            for row in 0..batch.row_count {
+                let o_type = batch.o_type.get(row);
+                let o_key = batch.o_key.get(row);
+                let object = if o_type == numbig {
+                    let Some(value) = arena.and_then(|a| a.get_by_handle(o_key as u32)) else {
+                        return Ok(Err(FastPathFallback::GateDeclined));
+                    };
+                    Object::Big(value.normalized_repr())
+                } else if is_graph_scoped_arena(o_type) {
+                    return Ok(Err(FastPathFallback::ArenaType));
+                } else {
+                    Object::Encoded(o_key)
+                };
+                let o_i = batch.o_i.get_or(row, u32::MAX);
+                facts.insert((batch.s_id.get(row), o_type, object, o_i));
+            }
+        }
+    }
+    Ok(Ok(facts.len() as i64))
 }
 
-/// Exact per-predicate row counts from POST leaf directories, with whether
-/// any of a predicate's rows may be a list row (the leaflet's `HAS_O_I` flag).
+/// Exact per-predicate row counts from POST leaf directories.
 ///
 /// Homogeneous leaflets (`p_const = Some(p)`) contribute `row_count` without
 /// any payload read; mixed-predicate leaflets decode only the `PId` column.
@@ -382,10 +357,10 @@ struct PredicateRows {
 /// emptiness from absence or hard-failing on a transient IO fault. Declining is
 /// lossless here: this function only accumulates a local map and has emitted
 /// nothing, and a genuine IO fault will resurface in the generic scan.
-fn predicate_rows_post(
+fn exact_count_by_predicate_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
-) -> Result<Option<BTreeMap<u32, PredicateRows>>> {
+) -> Result<Option<Vec<(u32, i64)>>> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Post) else {
         return Ok(None);
     };
@@ -399,7 +374,7 @@ fn predicate_rows_post(
         },
     };
 
-    let mut counts: BTreeMap<u32, PredicateRows> = BTreeMap::new();
+    let mut counts: BTreeMap<u32, i64> = BTreeMap::new();
     for leaf_entry in &branch.leaves {
         let handle = match store.open_leaf_handle(
             &leaf_entry.leaf_cid,
@@ -417,11 +392,8 @@ fn predicate_rows_post(
             if entry.row_count == 0 {
                 continue;
             }
-            let list_rows = entry.flags & HAS_O_I != 0;
             if let Some(p) = entry.p_const {
-                let rows = counts.entry(p).or_default();
-                rows.rows += i64::from(entry.row_count);
-                rows.list_rows |= list_rows;
+                *counts.entry(p).or_insert(0) += i64::from(entry.row_count);
             } else {
                 let batch = match handle.load_columns(
                     leaflet_idx,
@@ -435,13 +407,11 @@ fn predicate_rows_post(
                     }
                 };
                 for row in 0..batch.row_count {
-                    let rows = counts.entry(batch.p_id.get(row)).or_default();
-                    rows.rows += 1;
-                    rows.list_rows |= list_rows;
+                    *counts.entry(batch.p_id.get(row)).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    Ok(Some(counts))
+    Ok(Some(counts.into_iter().collect()))
 }
