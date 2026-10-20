@@ -57,8 +57,9 @@ pub struct RdfText {
 /// What [`parse_rdf_text_txn`] read, beside the transaction it built.
 #[derive(Clone, Copy, Debug)]
 pub struct RdfTextSummary {
-    /// See [`RdfTextParts::content_id`].
-    pub content_id: u128,
+    /// See [`RdfTextParts::content_id`]: computed for an upsert that
+    /// scopes its blank nodes by it.
+    pub content_id: Option<u128>,
     /// Data statements in the document (not counting `<#txn-meta>`).
     pub statements: usize,
 }
@@ -78,7 +79,12 @@ pub fn parse_rdf_text_txn(
     opts: TxnOpts,
     ns: &mut NamespaceRegistry,
 ) -> Result<(Txn, RdfTextSummary)> {
-    let parsed = parse_rdf_text(text, placement, ns)?;
+    let parsed = parse_rdf_text(
+        text,
+        placement,
+        ContentIdentity::for_txn(txn_type, &opts),
+        ns,
+    )?;
     into_txn(parsed, txn_type, placement, sync, opts)
 }
 
@@ -99,7 +105,8 @@ pub fn parse_trig_txn(
     if !located.has_blocks() {
         return Ok(None);
     }
-    let parsed = parse_located(&located, Placement::AsWritten, ns)?;
+    let identity = ContentIdentity::for_txn(txn_type, &opts);
+    let parsed = parse_located(&located, Placement::AsWritten, identity, ns)?;
     into_txn(parsed, txn_type, Placement::AsWritten, false, opts).map(Some)
 }
 
@@ -116,8 +123,7 @@ fn into_txn(
         content_id: parts.content_id,
         statements,
     };
-    if txn_type == TxnType::Upsert && opts.skolem_txn_id.is_none() {
-        let id = parts.content_id;
+    if let (TxnType::Upsert, None, Some(id)) = (txn_type, &opts.skolem_txn_id, parts.content_id) {
         let folded = (id as u64) ^ ((id >> 64) as u64);
         opts.skolem_txn_id = Some(format!(
             "upsert{}",
@@ -146,14 +152,43 @@ fn into_txn(
     Ok((txn, summary))
 }
 
+/// Whether [`parse_rdf_text`] computes the document's content identity
+/// ([`RdfTextParts::content_id`]). An upsert scopes its blank nodes by it; no
+/// other lane uses it, and skipping it hashes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentIdentity {
+    Compute,
+    Skip,
+}
+
+impl ContentIdentity {
+    /// Computed for an upsert with no caller-supplied skolem scope: the one
+    /// transaction that scopes its blank nodes by the document's content.
+    fn for_txn(txn_type: TxnType, opts: &TxnOpts) -> Self {
+        if txn_type == TxnType::Upsert && opts.skolem_txn_id.is_none() {
+            ContentIdentity::Compute
+        } else {
+            ContentIdentity::Skip
+        }
+    }
+
+    fn sink(self, ns: &mut NamespaceRegistry) -> TemplateSink<'_> {
+        match self {
+            ContentIdentity::Compute => TemplateSink::with_content_identity(ns),
+            ContentIdentity::Skip => TemplateSink::new(ns),
+        }
+    }
+}
+
 /// Parse `text` into templates under `placement`.
 pub fn parse_rdf_text(
     text: &str,
     placement: Placement<'_>,
+    identity: ContentIdentity,
     ns: &mut NamespaceRegistry,
 ) -> Result<RdfText> {
     if !might_contain_graph_block(text) {
-        let mut sink = TemplateSink::new(ns);
+        let mut sink = identity.sink(ns);
         sink.set_scope(default_scope(placement));
         fluree_graph_turtle::parse(text, &mut sink)?;
         let statements = sink.statements();
@@ -163,7 +198,7 @@ pub fn parse_rdf_text(
         });
     }
     let located = locate(text)?;
-    parse_located(&located, placement, ns)
+    parse_located(&located, placement, identity, ns)
 }
 
 /// The scope a document's default-graph statements land in.
@@ -192,9 +227,10 @@ fn default_scope(placement: Placement<'_>) -> Scope {
 fn parse_located(
     located: &Located<'_>,
     placement: Placement<'_>,
+    identity: ContentIdentity,
     ns: &mut NamespaceRegistry,
 ) -> Result<RdfText> {
-    let mut sink = TemplateSink::new(ns);
+    let mut sink = identity.sink(ns);
     let default_scope = default_scope(placement);
     let mut default_statements = 0usize;
     let mut named_blocks = 0usize;
@@ -226,6 +262,12 @@ fn parse_located(
                             iri
                         }
                     };
+                    // `urn:default` names the default graph, which is no named
+                    // graph: a block by that name is refused on every lane, as
+                    // staging refuses any write graph by that name.
+                    if &*iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+                        return Err(TransactError::DefaultGraphNameAsGraph);
+                    }
                     if &*iri == TXN_META_GRAPH_IRI {
                         cap.sink.set_scope(Scope::TxnMeta);
                     } else {
@@ -497,7 +539,8 @@ mod tests {
 
     fn parse_ok(text: &str, placement: Placement<'_>) -> (RdfText, NamespaceRegistry) {
         let mut ns = NamespaceRegistry::new();
-        let parsed = parse_rdf_text(text, placement, &mut ns).unwrap_or_else(|e| panic!("{e}"));
+        let parsed = parse_rdf_text(text, placement, ContentIdentity::Compute, &mut ns)
+            .unwrap_or_else(|e| panic!("{e}"));
         (parsed, ns)
     }
 
@@ -515,7 +558,7 @@ mod tests {
 
     fn err(text: &str, placement: Placement<'_>) -> String {
         let mut ns = NamespaceRegistry::new();
-        parse_rdf_text(text, placement, &mut ns)
+        parse_rdf_text(text, placement, ContentIdentity::Skip, &mut ns)
             .expect_err("should be refused")
             .to_string()
     }
@@ -747,8 +790,8 @@ mod tests {
              <http://example.org/evil> .",
         ] {
             let mut ns = NamespaceRegistry::new();
-            let e =
-                parse_rdf_text(doc, Placement::AsWritten, &mut ns).expect_err("reserved predicate");
+            let e = parse_rdf_text(doc, Placement::AsWritten, ContentIdentity::Skip, &mut ns)
+                .expect_err("reserved predicate");
             assert!(
                 matches!(e, TransactError::UnsupportedFeature(_))
                     && e.to_string().contains("system-controlled predicate"),
@@ -878,7 +921,11 @@ mod tests {
     // ---- Content identity ------------------------------------------------
 
     fn content_id(doc: &str) -> u128 {
-        parse_ok(doc, Placement::AsWritten).0.parts.content_id
+        parse_ok(doc, Placement::AsWritten)
+            .0
+            .parts
+            .content_id
+            .expect("computed")
     }
 
     #[test]
@@ -907,6 +954,82 @@ mod tests {
             content_id(&meta_only),
             "commit metadata does not change the data's identity"
         );
+    }
+
+    /// The identity is the statements as stored: the spellings of one stored
+    /// literal, a prefixed or full IRI, and a statement written twice give
+    /// the same id; another term, or a renamed blank-node label, does not.
+    /// (Each document holds a blank node, which is what the identity scopes.)
+    #[test]
+    fn content_identity_ignores_how_a_term_is_spelled() {
+        let doc = |body: &str| {
+            format!(
+                "{EX}@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+                 _:anchor ex:q 0 .\n{body}\n"
+            )
+        };
+        let same = [
+            ("ex:s ex:p 1 .", "ex:s ex:p \"1\"^^xsd:integer ."),
+            ("ex:s ex:p true .", "ex:s ex:p \"true\"^^xsd:boolean ."),
+            ("ex:s ex:p 1.5e0 .", "ex:s ex:p \"1.5\"^^xsd:double ."),
+            ("ex:s ex:p 1.0 .", "ex:s ex:p 1.00 ."),
+            ("ex:s ex:p 0.0 .", "ex:s ex:p 0.00 ."),
+            (
+                "ex:s ex:p 123456789012345678901234567890.10 .",
+                "ex:s ex:p 123456789012345678901234567890.1 .",
+            ),
+            ("ex:s ex:p \"x\"@en-US .", "ex:s ex:p \"x\"@en-us ."),
+            ("ex:s ex:p \"x\" .", "ex:s ex:p 'x' ."),
+            ("ex:s ex:p ex:o .", "ex:s ex:p <http://example.org/o> ."),
+            ("_:b ex:p 1 .", "_:b ex:p 1 .\n_:b ex:p 1 ."),
+        ];
+        for (a, b) in same {
+            assert_eq!(content_id(&doc(a)), content_id(&doc(b)), "{a} | {b}");
+        }
+        let different = [
+            ("ex:s ex:p 1 .", "ex:s ex:p \"1\"^^xsd:int ."),
+            ("ex:s ex:p 1 .", "ex:s ex:p \"1\" ."),
+            ("ex:s ex:p \"x\"@en .", "ex:s ex:p \"x\"@fr ."),
+            ("_:b ex:p 1 .", "_:c ex:p 1 ."),
+        ];
+        for (a, b) in different {
+            assert_ne!(content_id(&doc(a)), content_id(&doc(b)), "{a} | {b}");
+        }
+    }
+
+    /// Only an upsert that scopes its blank nodes by the document computes
+    /// the content identity; an insert, or an upsert given a scope, hashes
+    /// nothing.
+    #[test]
+    fn only_an_upsert_computes_the_content_identity() {
+        let doc = format!("{EX}_:b ex:p 1 .\n");
+        let identity = |txn_type, opts: TxnOpts| {
+            let mut ns = NamespaceRegistry::new();
+            parse_rdf_text_txn(&doc, txn_type, Placement::AsWritten, false, opts, &mut ns)
+                .expect("parse")
+                .1
+                .content_id
+        };
+        assert!(identity(TxnType::Upsert, TxnOpts::default()).is_some());
+        assert!(identity(TxnType::Insert, TxnOpts::default()).is_none());
+        // A document with no blank node has nothing for the identity to scope.
+        let mut ns = NamespaceRegistry::new();
+        let no_blank = format!("{EX}ex:s ex:p 1 .\n");
+        let (_, summary) = parse_rdf_text_txn(
+            &no_blank,
+            TxnType::Upsert,
+            Placement::AsWritten,
+            false,
+            TxnOpts::default(),
+            &mut ns,
+        )
+        .expect("parse");
+        assert!(summary.content_id.is_none());
+        let scoped = TxnOpts {
+            skolem_txn_id: Some("caller".to_string()),
+            ..TxnOpts::default()
+        };
+        assert!(identity(TxnType::Upsert, scoped).is_none());
     }
 
     // ---- Placement ---------------------------------------------------------
