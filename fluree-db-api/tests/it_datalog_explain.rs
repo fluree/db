@@ -599,3 +599,110 @@ async fn a_ledger_default_policy_refuses_an_explanation() {
         .expect_err("refused");
     assert!(err.to_string().contains("unrestricted"), "{err}");
 }
+
+fn sparql_rule(id: &str, body: &str) -> Value {
+    json!({
+        "@id": format!("{EX}{id}"),
+        "@type": "https://ns.flur.ee/db#sparql",
+        "@value": format!("PREFIX ex: <{EX}>\n{body}")
+    })
+}
+
+/// A `UNION` body's derivation lists the premises of the branch its row
+/// matched, and the negations inside that branch, not an empty list.
+#[tokio::test]
+async fn a_union_body_is_explained_by_the_branch_its_row_matched() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "datalog/explain-union:main",
+        json!({"@context": ex_ctx(), "@graph": [
+            {"@id": "ex:x1", "ex:a": "one"},
+            {"@id": "ex:x2", "ex:b": "two"}
+        ]}),
+    )
+    .await;
+    let request = |subject: &str| {
+        json!({
+            "@context": ex_ctx(),
+            "reasoning": "datalog",
+            "rules": [sparql_rule(
+                "flag",
+                "CONSTRUCT { ?x a ex:Flagged } WHERE { { ?x ex:a ?v } UNION \
+                 { ?x ex:b ?v FILTER NOT EXISTS { ?x ex:blocked ?z } } }"
+            )],
+            "explain": {"@id": subject, "@type": "ex:Flagged"}
+        })
+    };
+    let premises = |explanation: &Explanation| -> Vec<(Value, Value, Value, bool)> {
+        explanation.facts[0].derivations[0]
+            .premises
+            .iter()
+            .map(|p| {
+                (
+                    p.subject.clone(),
+                    p.predicate.clone(),
+                    p.object.clone(),
+                    p.path,
+                )
+            })
+            .collect()
+    };
+
+    let first = explain_with(&fluree, &ledger, request("ex:x1")).await;
+    assert_eq!(first.facts[0].derivations.len(), 1);
+    assert_eq!(
+        premises(&first),
+        vec![(iri("x1"), iri("a"), json!("one"), false)]
+    );
+    assert!(first.facts[0].derivations[0].absences.is_empty());
+
+    let second = explain_with(&fluree, &ledger, request("ex:x2")).await;
+    assert_eq!(
+        premises(&second),
+        vec![(iri("x2"), iri("b"), json!("two"), false)]
+    );
+    let absences = &second.facts[0].derivations[0].absences;
+    assert_eq!(absences.len(), 1);
+    assert_eq!(
+        absences[0].patterns,
+        vec![[iri("x2"), iri("blocked"), json!("?z")]]
+    );
+}
+
+/// A property path body's derivation lists the path as a premise, its ends
+/// substituted and marked as a path rather than one stored fact.
+#[tokio::test]
+async fn a_property_path_body_is_explained_by_the_path() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "datalog/explain-path:main",
+        json!({"@context": ex_ctx(), "@graph": [
+            {"@id": "ex:n0", "ex:partOf": {"@id": "ex:n1"}},
+            {"@id": "ex:n1", "ex:partOf": {"@id": "ex:n2"}}
+        ]}),
+    )
+    .await;
+    let explanation = explain_with(
+        &fluree,
+        &ledger,
+        json!({
+            "@context": ex_ctx(),
+            "reasoning": "datalog",
+            "rules": [sparql_rule(
+                "within",
+                "CONSTRUCT { ?x ex:within ?y } WHERE { ?x ex:partOf+ ?y }"
+            )],
+            "explain": {"@id": "ex:n0", "ex:within": {"@id": "ex:n2"}}
+        }),
+    )
+    .await;
+    let derivation = &explanation.facts[0].derivations[0];
+    assert_eq!(derivation.premises.len(), 1);
+    let premise = &derivation.premises[0];
+    assert!(premise.path && !premise.derived);
+    assert_eq!(premise.subject, iri("n0"));
+    assert_eq!(premise.predicate, json!(format!("<{EX}partOf>+")));
+    assert_eq!(premise.object, iri("n2"));
+}

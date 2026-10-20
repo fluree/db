@@ -358,13 +358,17 @@ re-runs the body of every repeatable rule whose head can produce the target,
 over asserted plus derived facts, and keeps the rows whose head instantiates
 to one of those facts, compared by full term identity (value, datatype,
 language tag) (`datalog_rules::explain`). Rules that are not repeatable are
-reported, not replayed. Each row becomes a derivation: the body's
-top-level triple patterns instantiated as premises (looked up in the
-asserted facts to mark them derived or not), its `NOT EXISTS` patterns
-instantiated as absences with their graph scope, and, for a grouped
+reported, not replayed. Each row becomes a derivation: the body's triple
+patterns instantiated as premises (looked up in the asserted facts to mark
+them derived or not), its property paths as premises marked `path`, its
+`NOT EXISTS` patterns instantiated as absences with their graph scope, and,
+for a grouped
 subquery, the subquery's patterns re-run without grouping, inside the
 `GRAPH` block that encloses the subquery, and filtered to the row's group
-key. Replays run only when the run derived a matching fact, under the
+key. Patterns inside a `UNION` count for each choice of branches the row
+satisfies: every triple bound by the row and holding over asserted and
+derived facts, every path's ends bound (up to 64 choices; past that, only
+what lies outside the unions is reported). Replays run only when the run derived a matching fact, under the
 reasoning budget's deadline measured from the start of the explanation and
 under the request's cancellation and tracker: the deadline marks the
 explanation incomplete, a cancellation fails it. Explanations are one step

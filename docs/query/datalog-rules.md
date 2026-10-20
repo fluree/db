@@ -557,8 +557,12 @@ rule, the row's bindings, and:
 - **premises**: the body's triple patterns with the row substituted — the
   facts it matched — each marked `derived` when reasoning produced it, so
   explaining that premise in turn walks the derivation back to asserted
-  facts;
-- **absences**: each negated pattern the row passed, with the row
+  facts. A `UNION` contributes the branch the row matched. A property path
+  is listed with its ends substituted and `path` set, its `predicate` the
+  path in SPARQL syntax (`<http://example.org/partOf>+`); it is a
+  connection, not one stored fact;
+- **absences**: each negated pattern the row passed (inside a `UNION`, in
+  the branch it matched), with the row
   substituted and its open variables left as variables, and the graph it
   searched;
 - **groups**: for an aggregating subquery, the group's key, the graph it

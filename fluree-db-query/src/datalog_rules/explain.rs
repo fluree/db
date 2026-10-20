@@ -16,7 +16,10 @@ use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::execute::QueryRequest;
 use crate::ir::pattern::produced_vars_of;
-use crate::ir::{Expression, Function, GraphName, Grouping, Pattern, QueryOutput, Ref, Term};
+use crate::ir::{
+    Expression, Function, GraphName, Grouping, PathModifier, Pattern, PropertyPathPattern,
+    QueryOutput, Ref, Term, TriplePattern,
+};
 use crate::var_registry::{VarId, VarRegistry};
 use crate::ContextConfig;
 use fluree_db_core::clock::Instant;
@@ -105,6 +108,11 @@ pub struct Premise {
     pub graph: Option<String>,
     /// Derived by reasoning rather than asserted.
     pub derived: bool,
+    /// The subject reaches the object through a property path, and
+    /// `predicate` is that path in SPARQL syntax. A path is not one fact, so
+    /// `derived` is false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub path: bool,
 }
 
 /// A negation that held: nothing matched these patterns.
@@ -351,31 +359,10 @@ async fn derivation(
     let snapshot = view.snapshot;
     let bindings = row_bindings(batch, row, vars, snapshot, None);
 
-    let mut premises = Vec::new();
-    let mut absences = Vec::new();
-    let mut grouped = Vec::new();
-    walk(
-        &rule.body.query.patterns,
-        None,
-        &mut |pattern, graph| match pattern {
-            Pattern::Triple(tp) => premises.push((tp.clone(), graph)),
-            Pattern::NotExists(inner) => absences.push((inner.clone(), graph)),
-            Pattern::Filter(expr) => {
-                if let Some(inner) = negated_patterns(expr) {
-                    absences.push((inner.to_vec(), graph));
-                }
-            }
-            Pattern::Subquery(sq) => {
-                if let Some(grouping) = &sq.grouping {
-                    grouped.push((sq.patterns.clone(), group_keys(grouping), graph));
-                }
-            }
-            _ => {}
-        },
-    );
+    let reads = taken_reads(view, &rule.body.query.patterns, batch, row).await?;
 
-    let mut resolved_premises = Vec::with_capacity(premises.len());
-    for (tp, graph) in premises {
+    let mut resolved_premises = Vec::with_capacity(reads.triples.len() + reads.paths.len());
+    for (tp, graph) in reads.triples {
         let term = |r: &Ref| ref_term(r, batch, row, vars, snapshot);
         let object = object_term(&tp.o, tp.dtc.as_ref(), batch, row, vars, snapshot);
         let derived = match (
@@ -392,8 +379,21 @@ async fn derivation(
             object,
             graph: graph.map(|g| g.to_string()),
             derived,
+            path: false,
         });
     }
+    for (path, graph) in reads.paths {
+        resolved_premises.push(Premise {
+            subject: ref_term(&path.subject, batch, row, vars, snapshot),
+            predicate: JsonValue::String(path_text(path, snapshot)),
+            object: ref_term(&path.object, batch, row, vars, snapshot),
+            graph: graph.map(|g| g.to_string()),
+            derived: false,
+            path: true,
+        });
+    }
+    let absences = reads.absences;
+    let grouped = reads.grouped;
 
     let absences = absences
         .into_iter()
@@ -415,7 +415,7 @@ async fn derivation(
 
     let mut groups = Vec::with_capacity(grouped.len());
     for (patterns, keys, graph) in grouped {
-        groups.push(group_inputs(view, rule, env, &patterns, &keys, graph, batch, row).await?);
+        groups.push(group_inputs(view, rule, env, patterns, &keys, graph, batch, row).await?);
     }
 
     Ok(Derivation {
@@ -427,22 +427,236 @@ async fn derivation(
     })
 }
 
-/// Visit the body's top-level patterns, and those inside `GRAPH` blocks with
-/// the graph they read.
-fn walk<'p>(
-    patterns: &'p [Pattern],
-    graph: Option<Arc<str>>,
-    visit: &mut impl FnMut(&'p Pattern, Option<Arc<str>>),
-) {
-    for pattern in patterns {
-        match pattern {
-            Pattern::Graph {
-                name: GraphName::Iri(iri),
-                patterns,
-            } => walk(patterns, Some(iri.clone()), visit),
-            other => visit(other, graph.clone()),
+/// Most combinations of `UNION` branches a derivation tries to match its row
+/// against; a body with more reports only what lies outside its unions.
+const MAX_UNION_ALTERNATIVES: usize = 64;
+
+/// What a body reads: the triples and paths a row matched, the negations it
+/// passed, the grouped subqueries it counted (each with the graph a `GRAPH`
+/// block gives it), and each `UNION`'s branches, collected the same way.
+/// A grouped subquery's patterns, its group keys, and the graph a `GRAPH`
+/// block gives it.
+type GroupedRead<'p> = (&'p [Pattern], Vec<VarId>, Option<Arc<str>>);
+
+#[derive(Clone, Default)]
+struct BodyReads<'p> {
+    triples: Vec<(&'p TriplePattern, Option<Arc<str>>)>,
+    paths: Vec<(&'p PropertyPathPattern, Option<Arc<str>>)>,
+    absences: Vec<(&'p [Pattern], Option<Arc<str>>)>,
+    grouped: Vec<GroupedRead<'p>>,
+    unions: Vec<Vec<BodyReads<'p>>>,
+}
+
+impl<'p> BodyReads<'p> {
+    fn collect(patterns: &'p [Pattern], graph: Option<Arc<str>>) -> Self {
+        let mut reads = Self::default();
+        reads.add(patterns, graph);
+        reads
+    }
+
+    fn add(&mut self, patterns: &'p [Pattern], graph: Option<Arc<str>>) {
+        for pattern in patterns {
+            match pattern {
+                Pattern::Graph {
+                    name: GraphName::Iri(iri),
+                    patterns,
+                } => self.add(patterns, Some(iri.clone())),
+                Pattern::Triple(tp) => self.triples.push((tp, graph.clone())),
+                Pattern::PropertyPath(path) => self.paths.push((path, graph.clone())),
+                Pattern::NotExists(inner) => self.absences.push((inner, graph.clone())),
+                Pattern::Filter(expr) => {
+                    if let Some(inner) = negated_patterns(expr) {
+                        self.absences.push((inner, graph.clone()));
+                    }
+                }
+                Pattern::Subquery(sq) => {
+                    if let Some(grouping) = &sq.grouping {
+                        self.grouped
+                            .push((&sq.patterns, group_keys(grouping), graph.clone()));
+                    }
+                }
+                Pattern::Union(branches) => self.unions.push(
+                    branches
+                        .iter()
+                        .map(|branch| Self::collect(branch, graph.clone()))
+                        .collect(),
+                ),
+                _ => {}
+            }
         }
     }
+
+    /// The reads outside any `UNION`.
+    fn outside_unions(&self) -> Self {
+        Self {
+            unions: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// Every choice of one branch per `UNION`, nested ones included, as the
+    /// reads of the chosen branches; `None` past `limit` choices.
+    fn branch_choices(&self, limit: usize) -> Option<Vec<Self>> {
+        let mut choices = vec![Self::default()];
+        for branches in &self.unions {
+            let mut next = Vec::new();
+            for choice in &choices {
+                for branch in branches {
+                    for nested in branch.branch_choices(limit)? {
+                        let mut combined = choice.clone();
+                        combined.extend(branch.outside_unions());
+                        combined.extend(nested);
+                        next.push(combined);
+                        if next.len() > limit {
+                            return None;
+                        }
+                    }
+                }
+            }
+            choices = next;
+        }
+        Some(choices)
+    }
+
+    /// Add `other`'s reads, skipping any already here.
+    fn extend(&mut self, other: Self) {
+        for read in other.triples {
+            if !self
+                .triples
+                .iter()
+                .any(|(tp, g)| std::ptr::eq(*tp, read.0) && *g == read.1)
+            {
+                self.triples.push(read);
+            }
+        }
+        for read in other.paths {
+            if !self
+                .paths
+                .iter()
+                .any(|(path, g)| std::ptr::eq(*path, read.0) && *g == read.1)
+            {
+                self.paths.push(read);
+            }
+        }
+        for read in other.absences {
+            if !self
+                .absences
+                .iter()
+                .any(|(inner, g)| std::ptr::eq(*inner, read.0) && *g == read.1)
+            {
+                self.absences.push(read);
+            }
+        }
+        for read in other.grouped {
+            if !self
+                .grouped
+                .iter()
+                .any(|(inner, _, g)| std::ptr::eq(*inner, read.0) && *g == read.2)
+            {
+                self.grouped.push(read);
+            }
+        }
+    }
+}
+
+/// The body's reads for this row: those outside any `UNION`, plus those of
+/// each choice of branches the row satisfies (every triple bound and holding
+/// over asserted and derived facts, every path's ends bound).
+async fn taken_reads<'p>(
+    view: GraphDbRef<'_>,
+    patterns: &'p [Pattern],
+    batch: &Batch,
+    row: usize,
+) -> Result<BodyReads<'p>> {
+    let reads = BodyReads::collect(patterns, None);
+    let mut taken = reads.outside_unions();
+    let Some(choices) = reads.branch_choices(MAX_UNION_ALTERNATIVES) else {
+        return Ok(taken);
+    };
+    for choice in choices {
+        if branch_holds(view, &choice, batch, row).await? {
+            taken.extend(choice);
+        }
+    }
+    Ok(taken)
+}
+
+async fn branch_holds(
+    view: GraphDbRef<'_>,
+    reads: &BodyReads<'_>,
+    batch: &Batch,
+    row: usize,
+) -> Result<bool> {
+    for (tp, graph) in &reads.triples {
+        let (Some(s), Some(p), Some(o)) = (
+            node(&tp.s, batch, row),
+            node(&tp.p, batch, row),
+            object_id(&tp.o, tp.dtc.as_ref(), batch, row),
+        ) else {
+            return Ok(false);
+        };
+        if !asserted(view, graph.as_deref(), &s, &p, &o).await? {
+            return Ok(false);
+        }
+    }
+    Ok(reads.paths.iter().all(|(path, _)| {
+        node(&path.subject, batch, row).is_some() && node(&path.object, batch, row).is_some()
+    }))
+}
+
+/// A property path in SPARQL syntax, with full IRIs.
+fn path_text(path: &PropertyPathPattern, snapshot: &LedgerSnapshot) -> String {
+    let iri = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .map_or_else(|| sid.to_string(), |iri| format!("<{iri}>"))
+    };
+    let step = |predicates: &[Sid], inverse: bool| {
+        let alternatives = predicates.iter().map(iri).collect::<Vec<_>>().join("|");
+        let alternatives = if predicates.len() > 1 {
+            format!("({alternatives})")
+        } else {
+            alternatives
+        };
+        if inverse {
+            format!("^{alternatives}")
+        } else {
+            alternatives
+        }
+    };
+    let first = if path.wildcard {
+        "<any>".to_string()
+    } else {
+        step(&path.predicates, path.first_inverse)
+    };
+    let unit = if path.sequence_steps.is_empty() {
+        first
+    } else {
+        let steps = path
+            .sequence_steps
+            .iter()
+            .map(|s| step(&s.predicates, s.inverse));
+        format!(
+            "({})",
+            std::iter::once(first)
+                .chain(steps)
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    };
+    let repeat = match (path.min_hops, path.max_hops) {
+        (None, None) => match path.modifier {
+            PathModifier::OneOrMore => "+".to_string(),
+            PathModifier::ZeroOrMore => "*".to_string(),
+            PathModifier::ZeroOrOne => "?".to_string(),
+        },
+        (min, max) => format!(
+            "{{{},{}}}",
+            min.map(|n| n.to_string()).unwrap_or_default(),
+            max.map(|n| n.to_string()).unwrap_or_default()
+        ),
+    };
+    format!("{unit}{repeat}")
 }
 
 /// The patterns a negating filter requires to be empty.
