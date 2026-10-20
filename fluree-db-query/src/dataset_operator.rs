@@ -37,7 +37,7 @@ use crate::error::{QueryError, Result};
 use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
-use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::operator::{BoxedOperator, Operator, OperatorState, RowFact};
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
@@ -201,20 +201,24 @@ struct DatasetMember {
 /// Cross-member set-deduplicator for a `>= 2`-member default union.
 ///
 /// Per SPARQL §13.2 the default graph of a dataset is the RDF *merge* (a set)
-/// of its `FROM` graphs, so a triple present in two members must be emitted
-/// once. This holds a persistent seen-set across `next_batch` calls (the
-/// operator streams one member's batch per call) and drops rows whose full
-/// binding tuple has already been emitted.
+/// of its `FROM` graphs, so a fact present in two members is one fact of the
+/// union. A fact is storage's own identity (#2109's `FactIdentity`):
+/// one fact per value and list position. So the key is a row's bindings plus
+/// the fact its members' scans say it matched ([`RowFact`]: a constant
+/// object's matched term, and the list position), and only a fact two members
+/// both hold collapses: a union with a graph that adds nothing answers as the
+/// graph alone. This holds a persistent seen-set across `next_batch` calls
+/// (the operator streams one member's batch per call).
 ///
-/// Hashing mirrors [`DistinctOperator`](crate::distinct): rows are normalized
-/// with [`EqualityNorm`] so a late-materialized `EncodedSid`/`EncodedLit` and
-/// its decoded `Sid`/`Lit` twin collapse to one row. `Binding`'s manual
-/// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
-/// (see [`DatasetOperator::open`]).
+/// Hashing mirrors [`DistinctOperator`](crate::distinct): bindings are
+/// normalized with [`EqualityNorm`] so a late-materialized
+/// `EncodedSid`/`EncodedLit` and its decoded `Sid`/`Lit` twin collapse to one
+/// row. `Binding`'s manual `Eq`/`Hash` exclude history metadata, so this is
+/// only armed in current mode (see [`DatasetOperator::open`]).
 ///
 /// MEMORY CLIFF (documented like `whole_graph_facts`'s): unlike a
 /// single-graph scan, a `>= 2`-member default union is no longer
-/// bounded-memory streaming — the seen-set grows O(distinct emitted rows)
+/// bounded-memory streaming — the seen-set grows O(distinct emitted facts)
 /// with full normalized `Binding` signatures as keys, exactly like a
 /// user-requested `DISTINCT` (which is the price of §13.2 set semantics; a
 /// hash-only key was rejected because a collision would silently DROP a
@@ -223,14 +227,15 @@ struct DatasetMember {
 /// it forgoes the per-member count-only shortcut (surfaced to EXPLAIN via
 /// `plan_details.default_union_set_merge`).
 struct BatchDeduper {
-    seen: HashMap<Vec<Binding>, (), FxBuildHasher>,
+    seen: HashMap<FactRow, (), FxBuildHasher>,
     norm: Option<EqualityNorm>,
-    /// Whether the empty solution mapping has already been emitted. A ground
-    /// (all-constant) pattern like `{ <s> <p> <o> }` emits a zero-column schema
-    /// even under forced `EmitMask::ALL` (only variable positions form columns),
-    /// so its matches can't be keyed by the row-tuple set below. The empty
-    /// mapping is itself a single set key, so it must survive at most once.
-    seen_empty: bool,
+}
+
+/// A union row's dedup key: its normalized bindings and the fact it matched.
+#[derive(PartialEq, Eq, Hash)]
+struct FactRow {
+    bindings: Vec<Binding>,
+    fact: Option<RowFact>,
 }
 
 impl BatchDeduper {
@@ -238,42 +243,61 @@ impl BatchDeduper {
         Self {
             seen: HashMap::with_hasher(FxBuildHasher),
             norm: equality_norm(ctx),
-            seen_empty: false,
         }
     }
 
-    /// Retain only rows whose (normalized) binding tuple has not been emitted
+    /// Retain only rows whose fact (normalized bindings plus `facts[row]`,
+    /// the member scan's [`RowFact`]s for `batch`) has not been emitted
     /// before, returning a batch of the new rows (may be empty).
-    fn retain_new(&mut self, batch: Batch) -> Result<Batch> {
-        // A ground (all-constant) pattern emits the empty solution mapping with
-        // no columns. Under set-merge (SPARQL §13.2) that mapping is a single
-        // solution, so a triple present in N default-union members must yield
-        // ONE empty solution, not N: emit it on first sight, suppress after.
-        // (`next_batch` only forwards non-empty batches, so a first-sight batch
-        // always carries at least one empty row; collapse its whole count to 1.)
+    fn retain_new(&mut self, batch: Batch, facts: Option<&[RowFact]>) -> Result<Batch> {
+        if facts.is_some_and(|f| f.len() != batch.len()) {
+            return Err(QueryError::Internal(
+                "a union member's row facts do not match its batch".to_string(),
+            ));
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let normalized_fact = |row: usize| -> Option<RowFact> {
+            facts.map(|f| RowFact {
+                object: f[row]
+                    .object
+                    .as_ref()
+                    .map(|o| normalize_for_key(o, dicts, gv)),
+                list_index: f[row].list_index,
+            })
+        };
+        // A ground (all-constant) pattern emits the empty solution mapping
+        // with no columns: one solution per fact it matched.
         if batch.schema().is_empty() {
-            if self.seen_empty {
-                return Ok(Batch::empty_schema_with_len(0));
+            let mut kept = 0;
+            for row in 0..batch.len() {
+                let key = FactRow {
+                    bindings: Vec::new(),
+                    fact: normalized_fact(row),
+                };
+                if self.seen.insert(key, ()).is_none() {
+                    kept += 1;
+                }
             }
-            self.seen_empty = true;
-            return Ok(Batch::empty_schema_with_len(1));
+            return Ok(Batch::empty_schema_with_len(kept));
         }
         let num_cols = batch.schema().len();
-        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
         for row_idx in 0..batch.len() {
-            let signature: Vec<Binding> = (0..num_cols)
-                .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), dicts, gv))
-                .collect();
+            let key = FactRow {
+                bindings: (0..num_cols)
+                    .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), dicts, gv))
+                    .collect(),
+                fact: normalized_fact(row_idx),
+            };
             let mut h = FxHasher::default();
-            signature.hash(&mut h);
+            key.hash(&mut h);
             let hash = h.finish();
             let entry = self
                 .seen
                 .raw_entry_mut()
-                .from_hash(hash, |sig| *sig == signature);
+                .from_hash(hash, |seen| *seen == key);
             if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
-                v.insert_hashed_nocheck(hash, signature, ());
+                v.insert_hashed_nocheck(hash, key, ());
                 for (col_idx, col) in columns.iter_mut().enumerate() {
                     col.push(batch.get_by_col(row_idx, col_idx).clone());
                 }
@@ -722,6 +746,15 @@ impl Operator for DatasetOperator {
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;
                     self.apply_member_directives(inner.as_mut());
+                    // The dedup keys on the fact each row matched, which only
+                    // the member's scan knows.
+                    if self.dedup.is_some() && !inner.record_row_facts() {
+                        return Err(QueryError::Internal(
+                            "multi-default-graph set-dedup armed on a member that cannot \
+                             record the facts its rows match"
+                                .to_string(),
+                        ));
+                    }
                     let mut per_graph_ctx = self.member_ctx(ctx, graph);
 
                     // When provenance stamping is needed (multi-ledger),
@@ -785,6 +818,10 @@ impl Operator for DatasetOperator {
             match batch {
                 Some(ref b) if b.is_empty() => continue,
                 Some(batch) => {
+                    let facts = match self.dedup {
+                        Some(_) => self.members[self.current_member].operator.take_row_facts(),
+                        None => None,
+                    };
                     let result = if self.needs_provenance {
                         let ledger_id = &self.members[self.current_member].ledger_id;
                         stamp_provenance(batch, ledger_id, ctx)?
@@ -798,7 +835,7 @@ impl Operator for DatasetOperator {
                     // yields nothing — fetch the member's next batch.
                     let result = match &mut self.dedup {
                         Some(dedup) => {
-                            let deduped = dedup.retain_new(result)?;
+                            let deduped = dedup.retain_new(result, facts.as_deref())?;
                             // Each RETAINED row grows the resident seen-set;
                             // charge fuel so a budget bounds the memory cliff
                             // (see the BatchDeduper doc).
