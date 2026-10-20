@@ -2063,7 +2063,8 @@ type CountLaneCase = (
 /// at open through `fast_path_store`: the FIRST-header grouped count and
 /// bound-object count, and the per-predicate directory count. Each must answer
 /// over one graph, and decline at open over several, where it read the scope's
-/// `binary_g_id` member alone. Kinds: a and b `T` (default graph, g2), c `U`
+/// `binary_g_id` member alone; the per-predicate count over several graphs is
+/// its union variant's instead. Kinds: a and b `T` (default graph, g2), c `U`
 /// (g2), d `T` (g3); tags: a and b `x`, d `y`.
 #[tokio::test(flavor = "current_thread")]
 async fn count_lanes_read_one_graph() {
@@ -2187,21 +2188,23 @@ async fn count_lanes_read_one_graph() {
             rows(&[&["kind", "2"], &["tag", "1"]]),
             true,
         ),
+        // Over several graphs the per-predicate count is the union variant's,
+        // which reads every member; the one-graph count is not planned.
         (
-            "COUNT by predicate (directory)",
+            "stats_count_by_predicate_union",
             "per-predicate count, union",
             per_predicate(UNION_PRAGMA, ""),
             &["p", "n"],
             rows(&[&["kind", "4"], &["tag", "3"]]),
-            false,
+            true,
         ),
         (
-            "COUNT by predicate (directory)",
+            "stats_count_by_predicate_union",
             "per-predicate count, FROM g2 + g3",
             per_predicate("", from2),
             &["p", "n"],
             rows(&[&["kind", "3"], &["tag", "2"]]),
-            false,
+            true,
         ),
     ];
     let mut failures = Failures::default();
@@ -2229,14 +2232,17 @@ async fn count_lanes_read_one_graph() {
         // The lane was reached either way. The FIRST-header lanes stamp
         // `proceed` when planned and a decline when they fall back at open;
         // the directory count stamps once, at open. Either way the lane
-        // answered when it was reached and stamped no decline.
+        // answered when it was reached and stamped no decline, of any reason.
         let seen = stamps(&store, before, site);
         let reached = !seen.is_empty();
         let declined = seen.iter().any(|o| o == "fallback:gate_declined");
+        let other = seen
+            .iter()
+            .any(|o| o != "proceed" && o != "fallback:gate_declined");
         failures.eq(
-            (reached, declined),
-            (true, !must_fire),
-            &format!("{label}: `{site}` (reached, declined)"),
+            (reached, declined, other),
+            (true, !must_fire, false),
+            &format!("{label}: `{site}` (reached, declined, declined otherwise)"),
         );
     }
     failures.assert_none();
