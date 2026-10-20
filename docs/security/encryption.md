@@ -598,7 +598,15 @@ its session directory behind
   those releases read them. A reindex writes a new index, its leaves and
   dictionaries, as version 2; commits and other objects it does not rewrite
   stay version 1. A key rotation rewrites each blob on the retiring key as
-  version 2. Releases before this one cannot read version 2.
+  version 2. Releases before this one cannot read version 2, so:
+  - After a key rotation, an earlier release cannot read the ledger's history
+    either, commits from before the upgrade included: a rollback that
+    reindexes from those commits ([Rolling
+    back](../operations/upgrading-from-4.2.md#rolling-back)) no longer works.
+  - On a store several processes share (Raft nodes, which write commits from
+    whichever node owns the branch, and query peers), every process reading
+    it must run this release before any process writes to it with this
+    release.
 
 Modern CPUs with AES-NI instructions provide hardware acceleration, minimizing the performance impact.
 
