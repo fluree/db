@@ -1905,6 +1905,48 @@ async fn cyclic_lane_reads_one_graph() {
     failures.assert_none();
 }
 
+/// A ledger whose triples all live in named graphs: its own default graph
+/// holds nothing, so the index has no branch for it. Read as the union
+/// default graph, that member contributes no edges and the union variant
+/// still answers; `FROM g2 + g3` is the control.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_union_lane_reads_past_an_empty_member() {
+    let trig = r"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g2> { ex:a ex:knows ex:b . ex:b ex:knows ex:c . }
+        GRAPH <urn:g3> { ex:c ex:knows ex:a . }
+    ";
+    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-empty-member:main", trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let tri = |prologue: &str, ds: &str| {
+        format!(
+            "{prologue}{PREFIXES}SELECT ?x ?y ?z {ds} \
+             WHERE {{ ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:knows ?x }}"
+        )
+    };
+    let xyz: &'static [&'static str] = &["x", "y", "z"];
+    let abc = rows(&[&["a", "b", "c"], &["b", "c", "a"], &["c", "a", "b"]]);
+    let cases: Vec<LaneCase> = vec![
+        (
+            "the union default graph, its own graph empty",
+            tri(UNION_PRAGMA, ""),
+            xyz,
+            abc.clone(),
+            true,
+        ),
+        (
+            "FROM g2 + g3",
+            tri("", "FROM <urn:g2> FROM <urn:g3>"),
+            xyz,
+            abc,
+            true,
+        ),
+    ];
+    let mut failures = Failures::default();
+    check_lane_cases(&fluree, &handle, "cyclic_bgp_union", cases, &mut failures).await;
+    failures.assert_none();
+}
+
 /// The cyclic join's union variant sits behind the fast-path kill switch, so
 /// the general plan stays its oracle: with the switch on, the variant stamps
 /// its own site `fallback:kill_switch` and the general plan answers. The

@@ -22,6 +22,7 @@ use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::plan_node::PlanChild;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::ObjKind;
@@ -825,6 +826,22 @@ impl CyclicBgpOperator {
         })
     }
 
+    /// Whether `read` is a member of a default graph of several graphs that
+    /// holds nothing: the index has no PSOT branch for its graph, and it
+    /// carries no novelty. It contributes no edges, where a missing branch
+    /// otherwise declines the lane (with novelty, rows could live only
+    /// there). A union default graph whose own graph is empty is one. One
+    /// graph keeps declining, as before.
+    fn member_holds_nothing(&self, read: &MemberRead<'_, '_>) -> bool {
+        self.graphs > 1
+            && read
+                .member
+                .store()
+                .branch_for_order(read.member.g_id(), RunSortOrder::Psot)
+                .is_none()
+            && !overlay_carries_novelty(read.member.overlay())
+    }
+
     fn scan_ref_relation(
         &self,
         read: &MemberRead<'_, '_>,
@@ -852,6 +869,7 @@ impl CyclicBgpOperator {
             cursor_projection_sid_otype_okey(),
         )? {
             Some(cursor) => cursor,
+            None if self.member_holds_nothing(read) => return Ok(Some(Vec::new())),
             None => {
                 self.log_fast_path_bail("cursor-unavailable", Some(edge));
                 return Ok(None);
@@ -907,6 +925,7 @@ impl CyclicBgpOperator {
             cursor_projection_sid_otype_okey(),
         )? {
             Some(cursor) => cursor,
+            None if self.member_holds_nothing(read) => return Ok(Some(Vec::new())),
             None => {
                 self.log_fast_path_bail("cursor-unavailable", Some(edge));
                 return Ok(None);
@@ -999,6 +1018,9 @@ impl CyclicBgpOperator {
         // unavailable, never "no rows" — decline rather than dropping rows.
         let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, read.member.g_id(), p_id)
         else {
+            if self.member_holds_nothing(read) {
+                return Ok(Some(Vec::new()));
+            }
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
             return Ok(None);
         };
@@ -1195,6 +1217,9 @@ impl CyclicBgpOperator {
         // unavailable, never "no rows" — decline rather than dropping rows.
         let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, read.member.g_id(), p_id)
         else {
+            if self.member_holds_nothing(read) {
+                return Ok(Some(Vec::new()));
+            }
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
             return Ok(None);
         };
