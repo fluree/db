@@ -2353,7 +2353,7 @@ enum ObjectCount {
     /// The one-graph lane answers; the union lane stamps nothing.
     One,
     /// The union lane answers, by this plan when given (`zero`, `single`,
-    /// `merge`); the one-graph lane declines. A plan the manifest decides on a
+    /// `disjoint`, `merge`); the one-graph lane declines. A plan the manifest decides on a
     /// fixture this small (it may hold one leaf per graph) is left unchecked.
     Union(Option<&'static str>),
     /// The union lane declines with this label, by this plan when given; the
@@ -2431,14 +2431,22 @@ fn check_count_routing(
 /// one subject's rows are not together. `ex:m 1`: h's decimal `1.0` in g2,
 /// i's integer `1` in g3. `ex:zz`, only in g2 and committed later, so that no
 /// leaf of g3 can span it: k's `6`, and f's list `(5 5)`.
+///
+/// `ex:tag`: p00..p09 are introduced in order (by `ex:seq` in the default
+/// graph), g2 tags the even ones `I` and g3 the odd ones, so the members'
+/// subject ranges interleave with no subject in common; q00..q04 tagged `J` in
+/// g2 and q05..q09 in g3 hold disjoint ranges.
 #[tokio::test(flavor = "current_thread")]
 async fn object_count_over_one_graph_and_a_union() {
     let ledger_id = "it/object-count-graphs:main";
     let trig = r#"
         @prefix ex: <http://example.org/> .
         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        ex:p00 ex:seq 0 . ex:p01 ex:seq 1 . ex:p02 ex:seq 2 . ex:p03 ex:seq 3 . ex:p04 ex:seq 4 . ex:p05 ex:seq 5 . ex:p06 ex:seq 6 . ex:p07 ex:seq 7 . ex:p08 ex:seq 8 . ex:p09 ex:seq 9 .
+        ex:q00 ex:seq 10 . ex:q01 ex:seq 11 . ex:q02 ex:seq 12 . ex:q03 ex:seq 13 . ex:q04 ex:seq 14 . ex:q05 ex:seq 15 . ex:q06 ex:seq 16 . ex:q07 ex:seq 17 . ex:q08 ex:seq 18 . ex:q09 ex:seq 19 .
         ex:e ex:kind ex:T .
         GRAPH <urn:g2> {
+            ex:p00 ex:tag ex:I . ex:p02 ex:tag ex:I . ex:p04 ex:tag ex:I . ex:p06 ex:tag ex:I . ex:p08 ex:tag ex:I . ex:q00 ex:tag ex:J . ex:q01 ex:tag ex:J . ex:q02 ex:tag ex:J . ex:q03 ex:tag ex:J . ex:q04 ex:tag ex:J .
             ex:a ex:kind ex:T ; ex:n 1 , "1.0e0"^^xsd:double .
             ex:b ex:kind ex:T ; ex:n 1 .
             ex:c ex:kind ex:U .
@@ -2454,6 +2462,7 @@ async fn object_count_over_one_graph_and_a_union() {
             ex:c ex:n "1.0e0"^^xsd:double .
             ex:g ex:q 5 .
             ex:i ex:m 1 .
+            ex:p01 ex:tag ex:I . ex:p03 ex:tag ex:I . ex:p05 ex:tag ex:I . ex:p07 ex:tag ex:I . ex:p09 ex:tag ex:I . ex:q05 ex:tag ex:J . ex:q06 ex:tag ex:J . ex:q07 ex:tag ex:J . ex:q08 ex:tag ex:J . ex:q09 ex:tag ex:J .
         }
     "#;
     // A second commit: a reindex replays commits in order and numbers each
@@ -2557,10 +2566,10 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::UnionDeclines("list_rows_in_post", Some("merge")),
         ),
         (
-            "D11 FROM g2 + g3, a bare number with a decimal slice: each member's own handle",
+            "D11 FROM g2 + g3, a bare number with a decimal slice: each member's own handle, disjoint subjects",
             count("", from23, "ex:m 1"),
             n("2"),
-            ObjectCount::Union(Some("merge")),
+            ObjectCount::Union(Some("disjoint")),
         ),
         (
             "D13 FROM g2 + g3, a predicate only g2 holds, past g3's last leaf",
@@ -2573,6 +2582,18 @@ async fn object_count_over_one_graph_and_a_union() {
             count("", from23, "ex:zz 5"),
             n("1"),
             ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D16 FROM g2 + g3, interleaved subject ranges, none in common: the merge",
+            count("", from23, "ex:tag ex:I"),
+            n("10"),
+            ObjectCount::Union(Some("merge")),
+        ),
+        (
+            "D17 FROM g2 + g3, disjoint subject ranges: the row counts' sum",
+            count("", from23, "ex:tag ex:J"),
+            n("10"),
+            ObjectCount::Union(Some("disjoint")),
         ),
         (
             "D12 FROM NAMED g2 alone: an empty default graph",

@@ -668,7 +668,7 @@ fn pid_prefix_v6_from_entry(entry: &LeafletDirEntryV3) -> (u32, u16, u64) {
 }
 
 /// Load a V3 leaflet's columns, using the `LeafletCache` when available, and
-/// the list index too when `with_o_i`.
+/// the `extra` columns too.
 #[allow(clippy::too_many_arguments)]
 fn load_v6_batch(
     leaf_bytes: &[u8],
@@ -678,13 +678,10 @@ fn load_v6_batch(
     cache: &Option<&Arc<fluree_db_binary_index::LeafletCache>>,
     leaf_id: u128,
     leaflet_idx: u32,
-    with_o_i: bool,
+    extra: ColumnSet,
 ) -> Result<fluree_db_binary_index::ColumnBatch> {
-    let mut needed = ColumnSet::EMPTY;
+    let mut needed = extra;
     needed.insert(ColumnId::OKey);
-    if with_o_i {
-        needed.insert(ColumnId::OI);
-    }
     if entry.o_type_const.is_none() {
         needed.insert(ColumnId::OType);
     }
@@ -777,7 +774,7 @@ fn count_bound_object_v6(
                 o_type.as_u16(),
                 o_key,
                 cancellation,
-                ListRows::Count,
+                SliceRead::ONE_GRAPH,
             )?)?;
         }
         return Ok(total);
@@ -799,7 +796,7 @@ fn count_bound_object_v6(
         target_o_type,
         target_o_key,
         cancellation,
-        ListRows::Count,
+        SliceRead::ONE_GRAPH,
     )?)
 }
 
@@ -815,14 +812,53 @@ enum ListRows {
 }
 
 /// A one-graph count, which counts list rows and so never declines.
-fn one_graph_count(count: std::result::Result<i64, FastPathFallback>) -> Result<i64> {
-    count.map_err(|reason| {
+fn one_graph_count(count: std::result::Result<SliceRowCount, FastPathFallback>) -> Result<i64> {
+    count.map(|count| count.rows).map_err(|reason| {
         QueryError::Internal(format!("a one-graph object count declined: {reason:?}"))
     })
 }
 
+/// How a slice's rows are read.
+#[derive(Clone, Copy, Debug)]
+struct SliceRead {
+    lists: ListRows,
+    /// Also find the least and greatest subject among the rows.
+    subject_bounds: bool,
+}
+
+impl SliceRead {
+    /// One graph's count: list rows count, no subject bounds.
+    const ONE_GRAPH: SliceRead = SliceRead {
+        lists: ListRows::Count,
+        subject_bounds: false,
+    };
+}
+
+/// A slice's rows: how many, and, when asked, the least and greatest subject
+/// among them (`None` for no rows).
+#[derive(Clone, Copy, Debug, Default)]
+struct SliceRowCount {
+    rows: i64,
+    subjects: Option<(u64, u64)>,
+}
+
+impl SliceRowCount {
+    fn add(&mut self, rows: i64, low: u64, high: u64) {
+        self.rows += rows;
+        self.subjects = Some(match self.subjects {
+            Some((lo, hi)) => (lo.min(low), hi.max(high)),
+            None => (low, high),
+        });
+    }
+}
+
 /// Rows of predicate `p_id` whose object is exactly `(target_o_type, target_o_key)`,
 /// or, under [`ListRows::Decline`], `ListRowsInPost` at the first list row.
+///
+/// With `subject_bounds`, also the rows' least and greatest subject. A leaflet
+/// that is all the slice gives them from its directory keys with no row
+/// decoded: without list rows, POST orders a slice's rows by subject. Any
+/// other leaflet decodes its subjects.
 fn count_object_key_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -830,8 +866,12 @@ fn count_object_key_v6(
     target_o_type: u16,
     target_o_key: u64,
     cancellation: &QueryCancellation,
-    lists: ListRows,
-) -> Result<std::result::Result<i64, FastPathFallback>> {
+    read: SliceRead,
+) -> Result<std::result::Result<SliceRowCount, FastPathFallback>> {
+    let SliceRead {
+        lists,
+        subject_bounds,
+    } = read;
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
@@ -858,7 +898,7 @@ fn count_object_key_v6(
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
 
     let target_prefix = (target_o_type, target_o_key);
-    let mut total: i64 = 0;
+    let mut total = SliceRowCount::default();
     let cache = store.leaflet_cache();
 
     for leaf_idx in leaf_range.clone() {
@@ -953,7 +993,23 @@ fn count_object_key_v6(
                 if check_o_i {
                     return Ok(Err(FastPathFallback::ListRowsInPost));
                 }
-                total += entry.row_count as i64;
+                if subject_bounds && entry.flags & HAS_O_I == 0 {
+                    let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
+                    let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
+                    total.add(
+                        i64::from(entry.row_count),
+                        first.s_id.as_u64(),
+                        last.s_id.as_u64(),
+                    );
+                } else if subject_bounds {
+                    // List rows order this leaflet by `(o_i, s)`: its keys
+                    // bound no subject. Only `ListRows::Count` reaches here.
+                    return Err(QueryError::Internal(
+                        "subject bounds over list rows".to_string(),
+                    ));
+                } else {
+                    total.rows += i64::from(entry.row_count);
+                }
                 continue;
             }
 
@@ -966,7 +1022,16 @@ fn count_object_key_v6(
                 leaf_id,
                 u32::try_from(i)
                     .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
-                check_o_i,
+                {
+                    let mut extra = ColumnSet::EMPTY;
+                    if check_o_i {
+                        extra.insert(ColumnId::OI);
+                    }
+                    if subject_bounds {
+                        extra.insert(ColumnId::SId);
+                    }
+                    extra
+                },
             )?;
 
             for row in 0..batch.row_count {
@@ -985,7 +1050,12 @@ fn count_object_key_v6(
                     if check_o_i && batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
                         return Ok(Err(FastPathFallback::ListRowsInPost));
                     }
-                    total += 1;
+                    if subject_bounds {
+                        let s_id = batch.s_id.get(row);
+                        total.add(1, s_id, s_id);
+                    } else {
+                        total.rows += 1;
+                    }
                 }
             }
         }
@@ -1154,7 +1224,7 @@ pub(crate) fn group_count_v6(
                 leaf_id,
                 u32::try_from(i)
                     .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
-                false,
+                ColumnSet::EMPTY,
             )?;
 
             for row in 0..batch.row_count {
@@ -1899,6 +1969,8 @@ fn compute_group_by_object_star_topk(
 /// The union count reads identity from here and nowhere else. Dedup on fact
 /// identity instead would return `(o_type, o_key, o_i, s_id)`; rows then
 /// arrive in POST order already, and no source ever declines for order.
+/// Every key must hold the subject: [`disjoint_subject_count`] relies on rows
+/// of disjoint subject ranges sharing no key.
 type UnionCountKey = u64;
 
 #[inline]
@@ -2302,11 +2374,14 @@ fn count_bound_object_union(
                 o_type,
                 o_key,
                 cancellation,
-                ListRows::Decline,
+                SliceRead {
+                    lists: ListRows::Decline,
+                    subject_bounds: false,
+                },
             )? {
                 Ok(count) => {
                     stamp_union_count_plan("single");
-                    return Ok(Ok(count));
+                    return Ok(Ok(count.rows));
                 }
                 // List rows can share a key, so the row count is not the
                 // answer: read the rows through the merge instead.
@@ -2324,6 +2399,12 @@ fn count_bound_object_union(
             })
             .collect(),
     };
+    if pairs.len() > 1 {
+        if let Some(total) = disjoint_subject_count(store, p_id, &pairs, cancellation)? {
+            stamp_union_count_plan("disjoint");
+            return Ok(Ok(total));
+        }
+    }
     stamp_union_count_plan("merge");
     let mut sources = Vec::with_capacity(pairs.len());
     for (g_id, o_type, o_key) in pairs {
@@ -2342,6 +2423,40 @@ fn count_bound_object_union(
 
 /// The groups a grouped object count keeps, best first: `(o_type, o_key, count)`.
 type TopKGroups = Vec<(u16, u64, i64)>;
+
+/// The count of `(member, slice)` pairs whose rows hold pairwise disjoint
+/// subject ranges, or `None` to merge them.
+///
+/// Every [`union_count_key`] holds the subject, so rows of disjoint subject
+/// ranges share no key, and without list rows a pair's rows are distinct keys:
+/// the count is the sum of the pairs' row counts. A leaflet that is all the
+/// slice gives its count and its subjects from the directory, with no row
+/// decoded. Two members holding disjoint parts of one slice (graphs of
+/// different subjects) are the case this serves.
+fn disjoint_subject_count(
+    store: &BinaryIndexStore,
+    p_id: u32,
+    pairs: &[(GraphId, u16, u64)],
+    cancellation: &QueryCancellation,
+) -> Result<Option<i64>> {
+    let read = SliceRead {
+        lists: ListRows::Decline,
+        subject_bounds: true,
+    };
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(pairs.len());
+    let mut total = 0;
+    for &(g_id, o_type, o_key) in pairs {
+        let Ok(count) = count_object_key_v6(store, g_id, p_id, o_type, o_key, cancellation, read)?
+        else {
+            return Ok(None);
+        };
+        total += count.rows;
+        ranges.extend(count.subjects);
+    }
+    ranges.sort_unstable();
+    let disjoint = ranges.windows(2).all(|w| w[0].1 < w[1].0);
+    Ok(disjoint.then_some(total))
+}
 
 /// `GROUP BY ?o` with `COUNT(?s)` over `?s <p> ?o`, the best `limit` groups,
 /// in a default graph of several graphs, every member current.
