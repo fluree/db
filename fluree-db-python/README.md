@@ -455,7 +455,9 @@ A process forked after Fluree started in its parent cannot use it: the
 engine's threads do not survive a fork, and the lock state they leave behind
 is unsafe to reuse, so the child raises `FlureeError` rather than risk a
 crash. A connection opened before the fork raises `FlureeError` in the child
-too, and is left alone when the child exits. For a `multiprocessing` pool,
+too, and is left alone when the child exits. The child does not keep the
+directory locked: once the parent closes it or exits, another process can
+open it. For a `multiprocessing` pool,
 use the `spawn` or `forkserver` start method
 (`multiprocessing.get_context("spawn")`; Python before 3.14 defaults to
 `fork` on Linux), and have each process that uses Fluree open a database of

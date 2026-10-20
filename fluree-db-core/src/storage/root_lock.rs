@@ -4,6 +4,9 @@
 //! state, runs its own indexer and sweeps files the other may still need. The
 //! lock is advisory and belongs to an open handle, so the operating system
 //! releases it however the holder exits; the file left on disk means nothing.
+//! A child forked without exec shares that handle, so dropping the lock
+//! unlocks it rather than waiting for every copy to close, and the child
+//! gives its copy up as it starts, for a parent that exits without dropping.
 
 use fs2::FileExt;
 use std::collections::HashSet;
@@ -23,7 +26,7 @@ pub const ALLOW_UNLOCKED_ENV_VAR: &str = "FLUREE_STORAGE_ALLOW_UNLOCKED";
 /// An exclusive lock on a file storage root, held until dropped.
 #[derive(Debug)]
 pub struct RootLock {
-    _handle: Option<File>,
+    handle: Option<File>,
     /// This root's entry in [`HELD_HERE`], while this lock holds it.
     held_here: Option<PathBuf>,
 }
@@ -87,7 +90,7 @@ impl RootLock {
                      filesystem cannot lock, without protection from a second process"
                 );
                 return Ok(Self {
-                    _handle: None,
+                    handle: None,
                     held_here: None,
                 });
             }
@@ -98,8 +101,10 @@ impl RootLock {
             .set_len(0)
             .and_then(|()| writeln!(file, "{}", std::process::id()));
         held_here().insert(key.clone());
+        #[cfg(unix)]
+        fork::track(&file);
         Ok(Self {
-            _handle: Some(file),
+            handle: Some(file),
             held_here: Some(key),
         })
     }
@@ -111,6 +116,82 @@ impl Drop for RootLock {
         // have taken it and entered it in the set by then.
         if let Some(key) = self.held_here.take() {
             held_here().remove(&key);
+        }
+        if let Some(file) = &self.handle {
+            let _ = FileExt::unlock(file);
+            // While the descriptor is still open, so its number is not reused.
+            #[cfg(unix)]
+            fork::untrack(file);
+        }
+    }
+}
+
+/// A child forked without exec shares each held lock's open file with its
+/// parent, and a lock the parent never unlocks lasts until every copy
+/// closes, so the root would stay locked after the parent exited. The child
+/// gives up its copies as it starts.
+#[cfg(unix)]
+mod fork {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Once;
+
+    /// The descriptors of the locks this process holds, readable without a
+    /// lock from a child forked mid-update. A child forked while more than
+    /// 64 roots are held keeps the rest locked until it exits.
+    static HELD: [AtomicI32; 64] = [const { AtomicI32::new(-1) }; 64];
+    static AT_FORK: Once = Once::new();
+
+    pub(super) fn track(file: &File) {
+        AT_FORK.call_once(|| {
+            // SAFETY: the handler makes only async-signal-safe calls.
+            unsafe { libc::pthread_atfork(None, None, Some(release_in_child)) };
+        });
+        let fd = file.as_raw_fd();
+        for slot in &HELD {
+            if slot
+                .compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(super) fn untrack(file: &File) {
+        let fd = file.as_raw_fd();
+        for slot in &HELD {
+            if slot
+                .compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Points each held descriptor at /dev/null. Unlocking would free the
+    /// parent's lock as well, and closing would free the number for reuse
+    /// under a `File` the child still owns.
+    extern "C" fn release_in_child() {
+        if HELD.iter().all(|slot| slot.load(Ordering::Acquire) < 0) {
+            return;
+        }
+        // SAFETY: open, dup2, fcntl and close are async-signal-safe.
+        unsafe {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+            if null < 0 {
+                return;
+            }
+            for slot in &HELD {
+                let fd = slot.load(Ordering::Acquire);
+                // dup2 clears close-on-exec, which the lock file had.
+                if fd >= 0 && libc::dup2(null, fd) == fd {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+            libc::close(null);
         }
     }
 }
@@ -219,6 +300,62 @@ mod tests {
         let second = RootLock::acquire(dir.path());
 
         assert!(second.is_err(), "{second:?}");
+    }
+
+    /// A forked child holds a copy like this one until it exits.
+    #[test]
+    fn a_copy_of_the_handle_does_not_keep_a_dropped_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = RootLock::acquire(dir.path()).unwrap();
+        let copy = held.handle.as_ref().unwrap().try_clone().unwrap();
+
+        drop(held);
+
+        RootLock::acquire(dir.path()).expect("the copy kept the root locked");
+        drop(copy);
+    }
+
+    /// The parent closes its handle without unlocking, as exiting does, once
+    /// the child has started.
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_child_does_not_keep_the_root_locked_after_its_parent_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = RootLock::acquire(dir.path()).unwrap();
+        let (mut started, mut release) = ([0; 2], [0; 2]);
+        // SAFETY: the child makes only async-signal-safe calls.
+        let child = unsafe {
+            assert_eq!(libc::pipe(started.as_mut_ptr()), 0);
+            assert_eq!(libc::pipe(release.as_mut_ptr()), 0);
+            let child = libc::fork();
+            if child == 0 {
+                libc::close(release[1]);
+                libc::write(started[1], [1u8].as_ptr().cast(), 1);
+                let mut byte = 0u8;
+                libc::read(release[0], (&raw mut byte).cast(), 1);
+                libc::_exit(0);
+            }
+            assert!(child > 0, "fork failed");
+            libc::close(release[0]);
+            let mut byte = 0u8;
+            libc::read(started[0], (&raw mut byte).cast(), 1);
+            child
+        };
+        let file = held.handle.take().unwrap();
+        fork::untrack(&file);
+        drop(held);
+        drop(file);
+
+        let reacquired = RootLock::acquire(dir.path());
+
+        // SAFETY: closing the write end lets the child exit; it is reaped here.
+        unsafe {
+            libc::close(release[1]);
+            libc::close(started[0]);
+            libc::close(started[1]);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        reacquired.expect("the forked child kept the root locked");
     }
 
     #[test]
