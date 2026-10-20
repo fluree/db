@@ -12,9 +12,11 @@ guide explains the contract and the example program.
 - `claims.ttl` — sample cases, documents and reference data.
 
 ```python
+from pathlib import Path
 import fluree
+
 with fluree.connect("./data") as conn:
-    conn.create("claims").insert("claims.ttl")
+    conn.create("claims").insert(Path("claims.ttl"))
 ```
 
 ```sh

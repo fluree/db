@@ -85,9 +85,11 @@ The example directory has the worker, a manifest and sample data. To run it
 from the command line:
 
 ```python
+from pathlib import Path
 import fluree
+
 with fluree.connect("./data") as conn:
-    conn.create("claims").insert("claims.ttl")
+    conn.create("claims").insert(Path("claims.ttl"))
 ```
 
 ```sh

@@ -5,6 +5,8 @@ generation record, replay without the model, failed and stale runs."""
 import dataclasses
 import importlib.util
 import json
+import re
+import shutil
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +16,7 @@ import pytest
 import fluree
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "reference_worker"
+GUIDE = EXAMPLE.parents[2] / "docs" / "guides" / "custom-stages-python.md"
 _spec = importlib.util.spec_from_file_location("reference_worker", EXAMPLE / "worker.py")
 assert _spec is not None and _spec.loader is not None
 worker = importlib.util.module_from_spec(_spec)
@@ -303,14 +306,25 @@ def test_native_rules_can_read_a_published_graph(ledger):
     assert [c for (c,) in rows] == [EX + "case4", EX + "case5"]
 
 
-def test_the_command_line_runs_the_example_manifest(tmp_path, capsys):
-    with fluree.connect(tmp_path) as conn:
-        conn.create("claims").insert(EXAMPLE / "claims.ttl")
-    worker.main([str(EXAMPLE / "manifest.json"), "--storage", str(tmp_path)])
+def setup_step(page):
+    """The documented setup step: the Python block on ``page`` that creates the ledger."""
+    blocks = re.findall(r"```python\n(.*?)```", page.read_text(encoding="utf-8"), re.S)
+    return next(block for block in blocks if 'conn.create("claims")' in block)
+
+
+def test_the_command_line_runs_the_example_manifest(tmp_path, monkeypatch, capsys):
+    """Set up as the example's README and the guide say, from a copy of the
+    example's data."""
+    setup = setup_step(EXAMPLE / "README.md")
+    assert setup_step(GUIDE) == setup
+    shutil.copy(EXAMPLE / "claims.ttl", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    exec(setup, {})
+    worker.main([str(EXAMPLE / "manifest.json"), "--storage", "./data"])
     printed = capsys.readouterr().out
     assert "extract: Published(generation=1" in printed
     assert "gate: Published(generation=1" in printed
-    with fluree.connect(tmp_path) as conn:
+    with fluree.connect(tmp_path / "data") as conn:
         assert outcomes(conn.ledger("claims")) == V1
 
 
