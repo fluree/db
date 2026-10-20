@@ -8,7 +8,10 @@
 //! When the `shacl` feature is enabled, [`validate_view_with_shacl`] validates a
 //! staged view against SHACL shapes.
 
-use crate::current_facts::{CurrentFacts, ListFree, ResolveStats, Retraction, Slot, StoredFact};
+use crate::current_facts::{
+    graph_id_in, CurrentFacts, DeleteResolver, FactIdentity, FactTerm, ListFree, ResolveStats,
+    Retraction, Slot, StoredFact,
+};
 use crate::delete_witness::{witnessed_templates, WitnessContext};
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator, WriteGraph};
@@ -23,7 +26,7 @@ use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
 use fluree_db_core::{
-    Flake, FlakeMeta, FlakeValue, GraphId, GraphPosition, MemberRef, Sid, TargetError, TargetLedger,
+    Flake, FlakeValue, GraphId, GraphPosition, MemberRef, Sid, TargetError, TargetLedger,
 };
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
@@ -827,6 +830,17 @@ pub async fn stage_with_graph_delta(
         } else {
             FlakeAccumulator::mixed(64)
         };
+        // An operation that retracts and asserts tells its facts apart the
+        // way storage does: a DELETE of a stored value and an INSERT of the
+        // same value written with more detail than the index keeps are one
+        // fact, and cancel rather than commit both at one `t`.
+        if !pure_delete
+            && (!txn.delete_templates.is_empty()
+                || txn.sync_graph.is_some()
+                || txn.txn_type == TxnType::Upsert)
+        {
+            acc = acc.with_identity(crate::current_facts::FactIdentity::new(&ledger));
+        }
 
         let where_span = tracing::debug_span!(
             "where_exec",
@@ -1389,20 +1403,13 @@ fn route_var_graphs(
     Ok(())
 }
 
-/// Content identity of a flake, ignoring its graph, transaction time, and
-/// assertion flag. Two flakes with the same identity denote "the same triple"
-/// and may be moved between graphs by carrying only a different `g`.
-type FlakeContent = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
-
-fn flake_content(f: &Flake) -> FlakeContent {
-    (
-        f.s.clone(),
-        f.p.clone(),
-        f.o.clone(),
-        f.dt.clone(),
-        f.m.clone(),
-    )
-}
+/// A fact as a graph-transfer destination tells it apart, ignoring the graph
+/// it was read from, transaction time and assertion flag: subject, predicate
+/// and the object's identity in the destination ([`FactIdentity`]). A fact
+/// the source and destination share, whatever term each holds it under, is
+/// left in place, so the destination's retraction and the source's
+/// assertion never land at one `t`, where storage keeps the retraction.
+type FlakeContent = (Sid, Sid, FactTerm);
 
 /// Default for [`whole_graph_scan_limit`]: ~2 GB peak at the accumulator's
 /// two-copies-per-fact profile. Any graph that worked before the limit
@@ -1772,6 +1779,13 @@ async fn stage_graph_mgmt(
                         whole_graph_facts(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
                             .await?;
 
+                    // Every fact compared below is told apart as the
+                    // destination will hold it.
+                    let ids = FactIdentity::new(&ledger);
+                    let dest_in = graph_id_in(&ledger, &dest_sid);
+                    let flake_content = |f: &Flake| -> FlakeContent {
+                        (f.s.clone(), f.p.clone(), ids.in_graph(dest_in, f))
+                    };
                     let dest_contents: HashSet<FlakeContent> = dest_facts
                         .iter()
                         .map(|f| flake_content(f.flake()))
@@ -2407,8 +2421,9 @@ struct SubjectDelta {
     has_retract: bool,
     /// Classes asserted via rdf:type in this transaction.
     asserted_classes: Vec<Sid>,
-    /// (p, o, dt) of this subject's retractions, for full-removal detection.
-    retracts: Vec<(Sid, FlakeValue, Sid)>,
+    /// Predicate and fact identity ([`FactIdentity`]) of this subject's
+    /// retractions, for full-removal detection.
+    retracts: HashSet<(Sid, FactTerm)>,
 }
 
 /// Both sides of each restated pair (see
@@ -2488,6 +2503,7 @@ async fn enforce_modify_policies(
     if needs_classes || needs_lifecycle {
         // Gather per-subject deltas from the staged batch.
         let mut deltas: HashMap<(GraphId, Sid), SubjectDelta> = HashMap::new();
+        let ids = FactIdentity::new(ledger);
         for flake in flakes {
             let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
             let d = deltas.entry((g_id, flake.s.clone())).or_default();
@@ -2504,7 +2520,7 @@ async fn enforce_modify_policies(
                 d.has_retract = true;
                 if needs_lifecycle {
                     d.retracts
-                        .push((flake.p.clone(), flake.o.clone(), flake.dt.clone()));
+                        .insert((flake.p.clone(), ids.in_graph(Some(g_id), flake)));
                 }
             }
         }
@@ -2630,11 +2646,15 @@ async fn classify_subject_lifecycle(
         // Update so no create/delete grant is consumed by a no-op.
         return Ok(WriteVerb::Update);
     }
+    // By fact identity: a retraction names a fact as the stored-fact read
+    // resolves it, which can be another term of the fact than this read
+    // returns (an indexed `x^^xsd:integer` read here, retracted as the
+    // `x^^xsd:nonNegativeInteger` written since the build).
+    let ids = FactIdentity::new(ledger);
     let fully_retracted = pre_flakes.iter().filter(|f| f.op).all(|pre| {
         delta
             .retracts
-            .iter()
-            .any(|(p, o, dt)| p == &pre.p && o == &pre.o && dt == &pre.dt)
+            .contains(&(pre.p.clone(), ids.in_graph(Some(g_id), pre)))
     });
     Ok(if fully_retracted {
         WriteVerb::Delete
@@ -2804,7 +2824,7 @@ async fn stream_where_into_accumulator(
     pure_delete: bool,
     fixed_graph_iris: &[String],
     reverse_graph: &mut HashMap<Sid, GraphId>,
-    acc: &mut FlakeAccumulator,
+    acc: &mut FlakeAccumulator<'_>,
     view_policy: Option<&PolicyContext>,
 ) -> Result<WhereStreamStats> {
     // Lower transaction WHERE clause to query patterns.
@@ -3145,7 +3165,7 @@ async fn stream_where_into_accumulator(
     }
     // Which DELETE templates a WHERE triple witnesses, and whether the
     // ledger can hold a list position at all: together they decide which
-    // retractions need no read (see `CurrentFacts::resolve_intents`).
+    // retractions need no read (see `DeleteResolver`).
     //
     // Graphs compare as the ledger graph ids the dataset above reads: its
     // default graph when that is one ledger graph, and `named_reads` for
@@ -3186,7 +3206,7 @@ async fn stream_where_into_accumulator(
             },
         );
     }
-    let current_facts = CurrentFacts::new(ledger);
+    let mut resolver = DeleteResolver::new(ledger, list_free);
     let mut resolve_stats = ResolveStats::default();
     // Under a non-root policy, intents that name no stored fact still go to
     // the modify-policy check (see `stage_with_graph_delta`).
@@ -3245,10 +3265,9 @@ async fn stream_where_into_accumulator(
         };
         // Resolve BEFORE push (see the doc comment above).
         let routing: &HashMap<Sid, GraphId> = reverse_graph;
-        let (retractions, stats) = current_facts
-            .resolve_intents(
+        let (retractions, stats) = resolver
+            .resolve(
                 intents,
-                list_free.as_ref(),
                 |f| resolve_flake_graph_id(f, routing),
                 collect_unmatched.then_some(&mut unmatched_intents),
             )
@@ -3291,6 +3310,7 @@ async fn stream_where_into_accumulator(
             matched = resolve_stats.matched,
             phantom_intents = resolve_stats.phantom_intents,
             slot_reads = resolve_stats.slot_reads,
+            point_reads = resolve_stats.point_reads,
             "delete intent resolution"
         );
     }

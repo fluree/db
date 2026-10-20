@@ -249,6 +249,7 @@
   - [CLI reference](unstructured/cli/README.md)
     - [ingest](unstructured/cli/ingest.md)
     - [search](unstructured/cli/search.md)
+    - [parse](unstructured/cli/parse.md)
   - [Reference](unstructured/reference/README.md)
     - [Configuration](unstructured/reference/configuration.md)
     - [Vocabulary](unstructured/reference/vocabulary.md)

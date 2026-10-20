@@ -131,6 +131,68 @@ fn unregistered_graphs(
         .collect())
 }
 
+/// A merge's or revert's net change, named as `state` stores each fact, for
+/// the kinds of value whose index key two terms can share
+/// ([`FlakeValue::index_key_may_merge_terms`]). The net change was folded
+/// from commits written against other states, so it can name such a fact
+/// under a term `state` does not hold it under. An assertion of a fact
+/// `state` holds is dropped, as a restatement; a retraction retracts the
+/// fact under every term `state` holds it by (novelty holds the subtypes of
+/// one big integer apart until the next index build), or is dropped when
+/// `state` holds none. Otherwise storage could meet a retraction and an
+/// assertion of one fact at one `t`, and keep the retraction, or keep a term
+/// the change meant to remove.
+///
+/// Only those kinds are read, one read per slot they touch
+/// ([`CurrentFacts::all_named_by`]); any other change is returned as is.
+///
+/// [`FlakeValue::index_key_may_merge_terms`]: fluree_db_core::FlakeValue::index_key_may_merge_terms
+/// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
+async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>> {
+    use fluree_db_transact::{CurrentFacts, Slot};
+    let asked: Vec<(usize, Slot)> = flakes
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.o.index_key_may_merge_terms())
+        .filter_map(|(n, f)| Slot::in_ledger(state, &f.g, &f.s, &f.p).map(|slot| (n, slot)))
+        .collect();
+    if asked.is_empty() {
+        return Ok(flakes);
+    }
+    let items: Vec<(Slot, &Flake)> = asked
+        .iter()
+        .map(|(n, slot)| (slot.clone(), &flakes[*n]))
+        .collect();
+    let named = CurrentFacts::new(state).all_named_by(&items).await?;
+    let mut keep = vec![true; flakes.len()];
+    let mut renamed = Vec::new();
+    let mut more = Vec::new();
+    for ((n, _), held) in asked.iter().zip(named) {
+        let flake = &flakes[*n];
+        match (flake.op, held.is_empty()) {
+            (true, false) | (false, true) => keep[*n] = false,
+            (false, false) => {
+                let mut retractions = held
+                    .into_iter()
+                    .map(|fact| fact.retract(flake.t).into_flake());
+                if let Some(first) = retractions.next() {
+                    renamed.push((*n, first));
+                }
+                more.extend(retractions);
+            }
+            (true, true) => {}
+        }
+    }
+    let mut flakes = flakes;
+    for (n, retraction) in renamed {
+        flakes[n] = retraction;
+    }
+    let mut keep = keep.into_iter();
+    flakes.retain(|_| keep.next().unwrap_or(true));
+    flakes.extend(more);
+    Ok(flakes)
+}
+
 impl crate::Fluree {
     /// Stage `flakes` onto `state` and validate the result against the
     /// ledger's SHACL configuration and shapes.
@@ -205,6 +267,7 @@ impl crate::Fluree {
         let resolved = self
             .apply_two_way_strategy(source_flakes, conflicts, strategy, &target_state)
             .await?;
+        let resolved = as_stored(&target_state, resolved).await?;
         self.stage_validated(target_state, resolved, namespace_delta, graph_iris, "merge")
             .await
     }
@@ -228,6 +291,7 @@ impl crate::Fluree {
         let staged = self
             .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
             .await?;
+        let staged = as_stored(&target_state, staged).await?;
         if staged.is_empty() {
             return Ok(None);
         }
