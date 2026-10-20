@@ -1609,6 +1609,44 @@ mod tests {
         assert_eq!(sizes, vec![7, 1]);
     }
 
+    /// Rows two members hold are walked together until one differs. With one
+    /// predicate of one type and no list rows, both members' leaflets carry
+    /// `p_id`, `o_type` and `o_i` as one constant, so the walk compares
+    /// `(s_id, o_key)` as slices. After a shared first row, the second differs
+    /// in its object alone, then in its subject alone: either way both rows
+    /// are facts.
+    #[test]
+    fn a_shared_stretch_ends_at_a_differing_subject_or_object() {
+        let shared: Row = (1, 5, STR, 10, NO_LIST);
+        let seconds: [(Row, Row); 2] = [
+            ((2, 5, STR, 10, NO_LIST), (2, 5, STR, 11, NO_LIST)),
+            ((2, 5, STR, 10, NO_LIST), (3, 5, STR, 10, NO_LIST)),
+        ];
+        for (a, b) in seconds {
+            let (g1, g2) = (vec![shared, a], vec![shared, b]);
+            for order in ORDERS {
+                let members = vec![member(order, &[&g1[..]]), member(order, &[&g2[..]])];
+                for leaflet in members.iter().flatten() {
+                    let leaflet = leaflet.as_ref().unwrap();
+                    assert!(
+                        matches!(
+                            (&leaflet.p_id, &leaflet.o_type, &leaflet.o_i),
+                            (
+                                ColumnData::Const(_),
+                                ColumnData::Const(_),
+                                ColumnData::Const(_)
+                            )
+                        ),
+                        "the members' leaflets take the slice walk"
+                    );
+                }
+                let out = drain(&mut merge(order, members)).unwrap();
+                assert_eq!(out.len(), 3, "{order:?}: {out:?}");
+                assert_is_the_union(order, &[g1.clone(), g2.clone()], &out);
+            }
+        }
+    }
+
     /// Construction over a real (empty) store: a set that is not current
     /// declines `Novelty`; a current one whose members the index holds
     /// nothing for (a default graph with every fact in named graphs) merges
