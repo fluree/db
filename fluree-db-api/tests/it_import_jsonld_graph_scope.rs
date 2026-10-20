@@ -2,9 +2,9 @@
 //!
 //! Each document is written by `insert` and by a bulk import, and the
 //! statements of every graph are compared with the expected ones. The
-//! import is read from the index it built, and again after a full rebuild
-//! from its commits, which find each named graph through the commit's
-//! `graph_delta`.
+//! import is read three ways: from the index it built, after a full rebuild
+//! from its commits, and with no index at all, where a load replays the
+//! commits and finds each named graph through the commit's `graph_delta`.
 
 use fluree_db_api::{Fluree, FlureeBuilder, ReindexOptions};
 use serde_json::{json, Value};
@@ -82,8 +82,13 @@ async fn transact(doc: &Value) -> Result<Vec<String>, String> {
 }
 
 /// Import `files` into a fresh ledger at `dir`: the one file, or a
-/// directory holding them all.
-async fn import_into(dir: &Path, files: &[(&str, String)]) -> Result<(), String> {
+/// directory holding them all. With `build_index` off the import writes its
+/// commits only.
+async fn import_into(
+    dir: &Path,
+    files: &[(&str, String)],
+    build_index: bool,
+) -> Result<(), String> {
     let data = tempfile::tempdir().unwrap();
     for (name, body) in files {
         std::fs::write(data.path().join(name), body).unwrap();
@@ -97,6 +102,7 @@ async fn import_into(dir: &Path, files: &[(&str, String)]) -> Result<(), String>
         .import(&source)
         .threads(1)
         .memory_budget_mb(256)
+        .build_index(build_index)
         .execute()
         .await
         .map(|_| ())
@@ -105,10 +111,10 @@ async fn import_into(dir: &Path, files: &[(&str, String)]) -> Result<(), String>
 
 /// Import `files` and read the statements back. The statements read from
 /// the index the import built must equal those read after a full rebuild of
-/// its commits.
+/// its commits, and those read from its commits alone.
 async fn import_files(files: &[(&str, String)]) -> Result<Vec<String>, String> {
     let dir = tempfile::tempdir().unwrap();
-    import_into(dir.path(), files).await?;
+    import_into(dir.path(), files, true).await?;
 
     let fluree = fluree_at(dir.path());
     let ledger = fluree.ledger(IMPORT).await.expect("load");
@@ -128,6 +134,17 @@ async fn import_files(files: &[(&str, String)]) -> Result<Vec<String>, String> {
         indexed, rebuilt,
         "a rebuild from the commits reads the same graphs"
     );
+
+    let unindexed = tempfile::tempdir().unwrap();
+    import_into(unindexed.path(), files, false).await?;
+    let fluree = fluree_at(unindexed.path());
+    let ledger = fluree.ledger(IMPORT).await.expect("load");
+    assert!(
+        ledger.index_t() < ledger.t(),
+        "the commits are read without an index"
+    );
+    let replayed = statements(&fluree, IMPORT).await;
+    assert_eq!(indexed, replayed, "the commits alone read the same graphs");
     Ok(indexed)
 }
 
@@ -139,7 +156,7 @@ async fn import(name: &str, body: &str) -> Result<Vec<String>, String> {
 /// ledger holds afterwards.
 async fn import_refused(doc: &Value) -> (Option<String>, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
-    let refusal = import_into(dir.path(), &[("data.jsonld", doc.to_string())])
+    let refusal = import_into(dir.path(), &[("data.jsonld", doc.to_string())], true)
         .await
         .err();
     let fluree = fluree_at(dir.path());
@@ -487,7 +504,7 @@ async fn bulk_import_anchors_an_annotation_to_its_graph() {
             fluree.insert(ledger, &doc).await.expect("insert");
             TXN
         } else {
-            import_into(dir.path(), &[("data.jsonld", doc.to_string())])
+            import_into(dir.path(), &[("data.jsonld", doc.to_string())], true)
                 .await
                 .expect("import");
             IMPORT
