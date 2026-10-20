@@ -15,7 +15,7 @@ mod span_capture;
 #[path = "support/multigraph.rs"]
 mod multigraph;
 
-use multigraph::{check, Fixture, Run, Scope, Shape, State, Surface, SCOPES, SHAPES};
+use multigraph::{check, Fixture, Kind, Run, Scope, Shape, State, Surface, SCOPES, SHAPES};
 
 /// Every shape, scope and surface over fixture A in `state`.
 async fn every_scope_answers_by_hand(state: State) {
@@ -76,29 +76,23 @@ enum LaneRoute {
     Neither,
 }
 
-/// The route of a union lane in `scope` and `state` (design §5's table). The
-/// union sites take a default graph of several graphs of one ledger, and of
-/// none; novelty and a read below the index decline them. Novelty is
-/// ledger-wide, so it also turns the one-graph sites off in every scope.
+/// The route of a union lane in `scope` and `state` (design §5's table), by
+/// what the index scope makes of the scope's default graph. The union sites
+/// take a default graph of several graphs of one ledger, an empty member
+/// among them, and of none; novelty and a read below the index decline them.
+/// Novelty is ledger-wide, so it also turns the one-graph sites off in every
+/// scope.
 fn union_lane_route(scope: Scope, state: State) -> LaneRoute {
-    let union = matches!(
-        scope,
-        Scope::FromG1G2
-            | Scope::FromG1G2Connection
-            | Scope::FromG0G1G2
-            | Scope::UnionPragma
-            | Scope::UnionOpts
-            | Scope::UnionConfig
-    );
-    match scope {
-        Scope::TwoLedgers => LaneRoute::Neither,
+    match scope.kind() {
+        Kind::None => LaneRoute::Neither,
         // A default graph of none answers nothing, novelty or not.
-        Scope::FromNamedOnly => LaneRoute::Union,
-        Scope::TimeTravel => LaneRoute::UnionDeclines("fallback:novelty"),
-        _ if state == State::Novelty && union => LaneRoute::UnionDeclines("fallback:novelty"),
-        _ if state == State::Novelty => LaneRoute::Neither,
-        _ if union => LaneRoute::Union,
-        _ => LaneRoute::One,
+        Kind::Empty => LaneRoute::Union,
+        Kind::Union if scope == Scope::TimeTravel || state == State::Novelty => {
+            LaneRoute::UnionDeclines("fallback:novelty")
+        }
+        Kind::Union => LaneRoute::Union,
+        Kind::One if state == State::Novelty => LaneRoute::Neither,
+        Kind::One => LaneRoute::One,
     }
 }
 
