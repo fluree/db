@@ -1,6 +1,6 @@
 //! Fixture A for the lanes that read several graphs of one ledger, checked
 //! before any lane leans on it. In every scope of design §5's table and every
-//! fixture state, the answer to each of the five shapes, with fast paths off
+//! fixture state, the answer to each of the six shapes, with fast paths off
 //! (the general plan) and on, equals the answer written by hand in
 //! `support/multigraph.rs`, and the query's `index scope` stamp is the one the
 //! scope must get.
