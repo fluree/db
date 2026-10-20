@@ -1649,12 +1649,14 @@ impl Operator for NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
         group_vars: &[VarId],
+        bound_vars: &[VarId],
     ) -> Result<Option<Vec<CountGroup>>> {
         if !self.state.can_next()
             || !self.batched_eligible
             || self.right_new_vars.is_empty()
             || self.inline_has_bind()
             || group_vars.is_empty()
+            || !bound_vars.is_empty()
         {
             return Ok(None);
         }
@@ -3864,7 +3866,7 @@ mod tests {
         join.batched_output.push_back(buffered_count_rows(&join, 3));
         assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .is_none());
@@ -3933,7 +3935,7 @@ mod tests {
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[VarId(0)]));
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .is_none());
@@ -3953,13 +3955,13 @@ mod tests {
         // A key introduced on the right or absent after projection must decline
         // without consuming even already-buffered output.
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(1)])
+            .drain_grouped_count(&ctx, &[VarId(1)], &[])
             .await
             .unwrap()
             .is_none());
         assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
         let groups = join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .unwrap();
@@ -3986,7 +3988,7 @@ mod tests {
         let mut join = count_join(vec![], vec![]);
         join.open(&ctx).await.unwrap();
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .unwrap()
@@ -4011,7 +4013,7 @@ mod tests {
             join.open(&ctx).await.unwrap();
             join.batched_output.push_back(buffered_count_rows(&join, 1));
             let err = join
-                .drain_grouped_count(&ctx, &[VarId(0)])
+                .drain_grouped_count(&ctx, &[VarId(0)], &[])
                 .await
                 .unwrap_err();
             if cancelled {

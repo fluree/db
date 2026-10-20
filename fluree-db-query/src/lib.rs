@@ -115,6 +115,7 @@ pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
 pub mod union;
+pub mod union_group_count;
 pub mod unwind;
 pub mod values;
 pub mod var_registry;

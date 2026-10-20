@@ -131,10 +131,15 @@ pub trait Operator: Send + Sync {
     /// exactly once. Empty input returns an empty vector. Returning `None` must
     /// leave the input untouched so the consumer can aggregate ordinary rows.
     /// Do not forward through row-changing operators such as DISTINCT or LIMIT.
+    ///
+    /// `bound_vars` are the variables a `COUNT(?v)` reads: such a count is a
+    /// row count only if every row binds `?v`, so a drain that cannot show
+    /// that for each of them returns `None`.
     async fn drain_grouped_count(
         &mut self,
         _ctx: &ExecutionContext<'_>,
         _group_vars: &[VarId],
+        _bound_vars: &[VarId],
     ) -> Result<Option<Vec<CountGroup>>> {
         Ok(None)
     }

@@ -985,35 +985,52 @@ impl Operator for GroupAggregateOperator {
         }
 
         // A join can count matches before expanding them into output rows when
-        // all group keys come from its driving side. Other aggregates and
-        // DISTINCT retain ordinary row consumption.
+        // all group keys come from its driving side, and a union of graphs can
+        // count one pattern's rows from its members' indexes. Every aggregate
+        // must count rows: `COUNT(*)`, or `COUNT(?v)` of a variable the child
+        // shows bound in every row. Other aggregates and DISTINCT retain
+        // ordinary row consumption.
         if self.emit_iter.is_none()
             && !self.group_key_indices.is_empty()
             && !self.agg_specs.is_empty()
-            && self
+        {
+            // `None` for `COUNT(*)`, `Some(?v)` for `COUNT(?v)`; any other
+            // aggregate leaves the rows to the loops below.
+            let row_counts: Option<Vec<Option<VarId>>> = self
                 .agg_specs
                 .iter()
-                .all(|spec| matches!(spec.function, AggregateFn::CountAll))
-        {
-            let group_vars = &self.in_schema[..self.group_key_indices.len()];
-            if let Some(groups) = self.child.drain_grouped_count(ctx, group_vars).await? {
-                let states = groups
-                    .into_iter()
-                    .map(|group| {
-                        i64::try_from(group.count).map_err(|_| {
-                            QueryError::execution("grouped COUNT(*) exceeds i64::MAX")
-                        })?;
-                        Ok(GroupState {
-                            key_bindings: group.keys,
-                            agg_states: self
-                                .agg_specs
-                                .iter()
-                                .map(|_| AggState::Count { n: group.count })
-                                .collect(),
+                .map(|spec| match spec.function {
+                    AggregateFn::CountAll => Some(None),
+                    AggregateFn::Count(v) => Some(Some(v)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(row_counts) = row_counts {
+                let bound_vars: Vec<VarId> = row_counts.into_iter().flatten().collect();
+                let group_vars = &self.in_schema[..self.group_key_indices.len()];
+                if let Some(groups) = self
+                    .child
+                    .drain_grouped_count(ctx, group_vars, &bound_vars)
+                    .await?
+                {
+                    let states = groups
+                        .into_iter()
+                        .map(|group| {
+                            i64::try_from(group.count).map_err(|_| {
+                                QueryError::execution("grouped COUNT(*) exceeds i64::MAX")
+                            })?;
+                            Ok(GroupState {
+                                key_bindings: group.keys,
+                                agg_states: self
+                                    .agg_specs
+                                    .iter()
+                                    .map(|_| AggState::Count { n: group.count })
+                                    .collect(),
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                self.emit_iter = Some(GroupEmitIter::Vec(states.into_iter()));
+                        .collect::<Result<Vec<_>>>()?;
+                    self.emit_iter = Some(GroupEmitIter::Vec(states.into_iter()));
+                }
             }
         }
 

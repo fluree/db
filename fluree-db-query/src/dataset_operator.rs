@@ -34,12 +34,17 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::index_scope::IndexScope;
 use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
-use crate::operator::{BoxedOperator, Operator, OperatorState, RowFact};
+use crate::operator::{BoxedOperator, CountGroup, Operator, OperatorState, RowFact};
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
+use crate::union_group_count::{
+    count_groups_over_union, GroupedPosition, UnionGroupCount, PARTITIONED_GROUP_BY_UNION_SITE,
+};
 use crate::var_registry::VarId;
 
 // =============================================================================
@@ -81,6 +86,17 @@ pub trait DatasetBuilder: Send + Sync {
     /// its empty-mapping batches are collapsed separately by `BatchDeduper`.
     fn emit_is_full(&self) -> bool {
         true
+    }
+
+    /// The grouped count of `group_vars` this builder's rows answer from a
+    /// union of graphs' indexes ([`crate::union_group_count`]), counting rows
+    /// that bind every one of `bound_vars`. Default: none.
+    fn union_group_count(
+        &self,
+        _group_vars: &[VarId],
+        _bound_vars: &[VarId],
+    ) -> Option<UnionGroupCount<'_>> {
+        None
     }
 }
 
@@ -185,6 +201,33 @@ impl DatasetBuilder for ScanDatasetBuilder {
         (!self.pattern.s.is_var() || self.emit.s)
             && (!self.pattern.p.is_var() || self.emit.p)
             && (!self.pattern.o.is_var() || self.emit.o)
+    }
+
+    /// A current-mode scan of `?s <p> ?o` (two variables, a bound predicate,
+    /// no datatype constraint) with no object bounds or inline operators: each
+    /// of its rows is one fact of `<p>`, binding both variables. It answers a
+    /// grouped count by `?s` or by `?o`.
+    fn union_group_count(
+        &self,
+        group_vars: &[VarId],
+        bound_vars: &[VarId],
+    ) -> Option<UnionGroupCount<'_>> {
+        if !self.mode.is_current() || self.object_bounds.is_some() || !self.inline_ops.is_empty() {
+            return None;
+        }
+        let (s, _, o) = crate::execute::operator_tree::validate_simple_triple(&self.pattern)?;
+        let position = match group_vars {
+            [v] if *v == s => GroupedPosition::Subject,
+            [v] if *v == o => GroupedPosition::Object,
+            _ => return None,
+        };
+        bound_vars
+            .iter()
+            .all(|v| *v == s || *v == o)
+            .then_some(UnionGroupCount {
+                pattern: &self.pattern,
+                position,
+            })
     }
 }
 
@@ -347,6 +390,9 @@ pub struct DatasetOperator {
     /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
     /// partial top-k into the global one.
     topk: Option<(Vec<SortSpec>, usize)>,
+    /// Whether a row has been drawn from the members since `open`; a grouped
+    /// count drain answers only an undrawn input.
+    drawn: bool,
 }
 
 impl DatasetOperator {
@@ -392,6 +438,7 @@ impl DatasetOperator {
             dedup: None,
             row_budget: None,
             topk: None,
+            drawn: false,
         }
     }
 
@@ -793,6 +840,7 @@ impl Operator for DatasetOperator {
         }
 
         let graphs = ctx.active_graphs();
+        self.drawn = true;
 
         debug_assert!(
             match &graphs {
@@ -903,6 +951,7 @@ impl Operator for DatasetOperator {
             return Ok(Some(n));
         }
 
+        self.drawn = true;
         let mut total: u64 = 0;
         while self.current_member < self.members.len() {
             let n = match &graphs {
@@ -925,6 +974,51 @@ impl Operator for DatasetOperator {
         Ok(Some(total))
     }
 
+    /// A default graph of several graphs of one ledger counts one pattern's
+    /// rows per group from its members' indexes (lane A, see
+    /// [`crate::union_group_count`]) when every member's index answers for
+    /// it, instead of draining and deduplicating the members' decoded rows.
+    /// A default graph of none answers no group. Each answer or decline
+    /// stamps [`PARTITIONED_GROUP_BY_UNION_SITE`]; the kill switch declines.
+    async fn drain_grouped_count(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        group_vars: &[VarId],
+        bound_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
+        if self.state != OperatorState::Open || self.drawn {
+            return Ok(None);
+        }
+        let Some(spec) = self.builder.union_group_count(group_vars, bound_vars) else {
+            return Ok(None);
+        };
+        let scope = ctx.index_scope();
+        if !matches!(scope, Some(IndexScope::Union(_) | IndexScope::Empty)) {
+            return Ok(None);
+        }
+        let declined = |reason| {
+            stamp_fast_path(
+                PARTITIONED_GROUP_BY_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+            Ok(None)
+        };
+        if crate::execute::fast_paths_disabled() {
+            return declined(FastPathFallback::KillSwitch);
+        }
+        let groups = match &scope {
+            Some(IndexScope::Union(set)) => match count_groups_over_union(ctx, set, &spec)? {
+                Ok(groups) => groups,
+                Err(reason) => return declined(reason),
+            },
+            // A default graph of none holds no row.
+            _ => Vec::new(),
+        };
+        stamp_fast_path(PARTITIONED_GROUP_BY_UNION_SITE, FastPathOutcome::Proceed);
+        self.state = OperatorState::Exhausted;
+        Ok(Some(groups))
+    }
+
     fn close(&mut self) {
         for member in &mut self.members {
             member.operator.close();
@@ -944,6 +1038,65 @@ impl Operator for DatasetOperator {
 mod tests {
     use super::*;
     use crate::var_registry::VarId;
+
+    /// A scan builder offers a grouped count over a union of graphs only for
+    /// `?s <p> ?o` in current mode with nothing applied to its rows, grouped
+    /// by `?s` or `?o`, every counted variable one the pattern binds.
+    #[test]
+    fn scan_builder_offers_a_union_group_count_for_one_plain_pattern() {
+        use crate::ir::triple::{Ref, Term};
+        use fluree_db_core::Sid;
+
+        let (s, o, other) = (VarId(0), VarId(1), VarId(2));
+        let p = Ref::Sid(Sid::new(100, "n"));
+        let plain = TriplePattern::new(Ref::Var(s), p.clone(), Term::Var(o));
+        let builder = |pattern: TriplePattern, bounds, inline_ops, mode| {
+            ScanDatasetBuilder::new(pattern, bounds, inline_ops, EmitMask::ALL, None, mode)
+        };
+        let current = builder(plain.clone(), None, Vec::new(), TemporalMode::Current);
+        let position = |b: &ScanDatasetBuilder, group: &[VarId], bound: &[VarId]| {
+            b.union_group_count(group, bound).map(|spec| spec.position)
+        };
+
+        assert_eq!(
+            position(&current, &[s], &[]),
+            Some(GroupedPosition::Subject)
+        );
+        assert_eq!(
+            position(&current, &[o], &[s, o]),
+            Some(GroupedPosition::Object)
+        );
+        // Two keys, a key the pattern does not bind, a count it cannot show
+        // bound in every row.
+        assert_eq!(position(&current, &[s, o], &[]), None);
+        assert_eq!(position(&current, &[other], &[]), None);
+        assert_eq!(position(&current, &[o], &[other]), None);
+
+        let history = builder(plain.clone(), None, Vec::new(), TemporalMode::History);
+        assert_eq!(position(&history, &[o], &[]), None);
+        let bounded = builder(
+            plain.clone(),
+            Some(ObjectBounds::new()),
+            Vec::new(),
+            TemporalMode::Current,
+        );
+        assert_eq!(position(&bounded, &[o], &[]), None);
+        let bind = InlineOperator::Bind {
+            var: other,
+            expr: crate::ir::Expression::Var(o),
+        };
+        let inline = builder(plain, None, vec![bind], TemporalMode::Current);
+        assert_eq!(position(&inline, &[o], &[]), None);
+
+        // A constant object, a variable predicate, one variable twice.
+        let constant = TriplePattern::new(Ref::Var(s), p.clone(), Term::Sid(Sid::new(100, "T1")));
+        let wildcard = TriplePattern::new(Ref::Var(s), Ref::Var(other), Term::Var(o));
+        let repeated = TriplePattern::new(Ref::Var(s), p, Term::Var(s));
+        for pattern in [constant, wildcard, repeated] {
+            let b = builder(pattern, None, Vec::new(), TemporalMode::Current);
+            assert_eq!(position(&b, &[s], &[]), None);
+        }
+    }
 
     /// Verify ScanDatasetBuilder produces operators with consistent schema.
     #[test]
