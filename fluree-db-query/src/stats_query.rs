@@ -62,7 +62,7 @@ use fluree_db_binary_index::{
     BinaryFilter, BinaryIndexStore, ColumnData, ColumnProjection, ColumnSet,
 };
 use fluree_db_core::{FlakeValue, GraphId, OType};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -218,7 +218,7 @@ fn count_by_predicate_union(
             let counted = if holders.members == 1 && !holders.numbig_duplicates {
                 Counted::Rows(holders.rows)
             } else if holders.numbig {
-                Counted::ByValue
+                Counted::ByValue(holders.rows)
             } else {
                 Counted::Merge
             };
@@ -242,7 +242,7 @@ fn count_by_predicate_union(
         let count = match counted {
             Counted::Rows(rows) => rows,
             Counted::Merge => merged.get(&p_id).copied().unwrap_or(0),
-            Counted::ByValue => match distinct_facts_by_value(set, p_id) {
+            Counted::ByValue(rows) => match distinct_facts_by_value(set, p_id, rows) {
                 Ok(Ok(count)) => count,
                 Ok(Err(reason)) => return Ok(Err(reason)),
                 Err(e) => return Ok(Err(read_failed(e))),
@@ -260,8 +260,9 @@ enum Counted {
     Rows(i64),
     /// Merged across the members that hold it.
     Merge,
-    /// Through a set keyed by value: some member holds big numbers for it.
-    ByValue,
+    /// Through a set keyed by value, sized for its rows over the members:
+    /// some member holds big numbers for it.
+    ByValue(i64),
 }
 
 /// The decline a failed read stamps: the generic scan runs, and a genuine
@@ -342,19 +343,16 @@ fn distinct_facts(
 /// is a handle into its graph's arena for the predicate, so two members'
 /// handles for one value differ, and one handle can name two values: each
 /// member's rows go into one set of facts `(s, o_type, object, list
-/// position)`, a big number's object its value's normalized repr (one value
-/// iff equal reprs, across arenas; a decimal and an integer of equal digits
-/// differ in it), any other object its `o_key`. Vectors and spatial values,
-/// whose arenas have no such key, decline.
+/// position)`, a big number's object the id of its value's normalized repr
+/// (one value iff equal reprs, across arenas; a decimal and an integer of
+/// equal digits differ in it), resolved once per handle, any other object its
+/// `o_key`. Vectors and spatial values, whose arenas have no such key,
+/// decline.
 fn distinct_facts_by_value(
     set: &MemberSet<'_>,
     p_id: u32,
+    rows: i64,
 ) -> Result<std::result::Result<i64, FastPathFallback>> {
-    #[derive(PartialEq, Eq, Hash)]
-    enum Object {
-        Encoded(u64),
-        Big(NumBigRepr),
-    }
     let store = set.store();
     // The range keys' graph is not compared; each member reads its own.
     let (min, max) = predicate_range_keys(p_id, 0);
@@ -371,8 +369,12 @@ fn distinct_facts_by_value(
         ..BinaryFilter::default()
     };
     let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    // A fact: subject, object type, object, list position.
-    let mut facts: FxHashSet<(u64, u16, Object, u32)> = FxHashSet::default();
+    // A fact: subject, object type, object, list position. A big number's
+    // object is the id of its value: one per distinct normalized repr across
+    // the members, so equal values share it whatever their handles.
+    let mut facts: FxHashSet<(u64, u16, u64, u32)> =
+        FxHashSet::with_capacity_and_hasher(usize::try_from(rows).unwrap_or(0), Default::default());
+    let mut value_ids: FxHashMap<NumBigRepr, u64> = FxHashMap::default();
     for member in set.members() {
         if indexes_nothing(store, member.g_id()) {
             continue;
@@ -380,6 +382,9 @@ fn distinct_facts_by_value(
         let arena = store
             .numbig_arenas(member.g_id())
             .find_map(|(p, arena)| (p == p_id).then_some(arena));
+        // This member's handles, each resolved to its value's id once: a
+        // predicate holds few values beside its rows.
+        let mut handle_ids: FxHashMap<u32, u64> = FxHashMap::default();
         let Some(mut cursor) = build_range_cursor(
             store,
             member.g_id(),
@@ -400,14 +405,23 @@ fn distinct_facts_by_value(
                 let o_type = batch.o_type.get(row);
                 let o_key = batch.o_key.get(row);
                 let object = if o_type == numbig {
-                    let Some(value) = arena.and_then(|a| a.get_by_handle(o_key as u32)) else {
-                        return Ok(Err(FastPathFallback::GateDeclined));
-                    };
-                    Object::Big(value.normalized_repr())
+                    let handle = o_key as u32;
+                    match handle_ids.get(&handle) {
+                        Some(&id) => id,
+                        None => {
+                            let Some(value) = arena.and_then(|a| a.get_by_handle(handle)) else {
+                                return Ok(Err(FastPathFallback::GateDeclined));
+                            };
+                            let next = value_ids.len() as u64;
+                            let id = *value_ids.entry(value.normalized_repr()).or_insert(next);
+                            handle_ids.insert(handle, id);
+                            id
+                        }
+                    }
                 } else if is_graph_scoped_arena(o_type) {
                     return Ok(Err(FastPathFallback::ArenaType));
                 } else {
-                    Object::Encoded(o_key)
+                    o_key
                 };
                 let o_i = batch.o_i.get_or(row, u32::MAX);
                 facts.insert((batch.s_id.get(row), o_type, object, o_i));
