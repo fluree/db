@@ -258,6 +258,13 @@ pub enum ApiError {
     #[error("Ledger configuration error: {0}")]
     LedgerConfig(String),
 
+    /// The ledger config could not be read (a storage or read failure).
+    /// Nothing in the request is wrong, and a retry can succeed. The same
+    /// condition on a transaction's staging lanes is
+    /// [`TransactError::ConfigUnavailable`](fluree_db_transact::TransactError::ConfigUnavailable).
+    #[error("Ledger config unavailable: {0}")]
+    ConfigUnavailable(String),
+
     /// A materialize pass's subject accumulator outgrew its memory budget.
     ///
     /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
@@ -466,6 +473,12 @@ pub enum ApiError {
     /// Indexing not available (disabled mode)
     #[error("Indexing is disabled - no background indexer configured")]
     IndexingDisabled,
+
+    /// Another open instance holds the file storage root: one in another
+    /// process, or a second one built in this process. `holder` is its
+    /// process id when known.
+    #[error("{}", storage_in_use_message(root, *holder))]
+    StorageInUse { root: String, holder: Option<u32> },
 
     /// Refresh did not reach the requested minimum `t` value.
     ///
@@ -695,6 +708,8 @@ impl ApiError {
             | ApiError::ReindexConflict { .. }
             | ApiError::GraphSourceRetracted(_) => 409,
 
+            ApiError::StorageInUse { .. } => 423,
+
             // Read-after-write: the ledger has not caught up to the `t` the
             // caller asked for.
             ApiError::AwaitTNotReached { .. } => 408,
@@ -744,6 +759,10 @@ impl ApiError {
             ApiError::Transact(TE::NoveltyAtMax | TE::NoveltyWouldExceed { .. }) => 503,
             // Permanent: datatype IDs are never released.
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => 422,
+            // The ledger config could not be read: a storage failure, whichever
+            // lane read it. Nothing in the request is wrong, and it is not
+            // capacity pressure, so not a 503.
+            ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => 500,
             ApiError::Transact(_) => 400,
 
             ApiError::Indexer(e) => {
@@ -812,6 +831,7 @@ impl ApiError {
                 // distinct codes.
                 413 => errors::PAYLOAD_TOO_LARGE,
                 422 => errors::INVALID_TRANSACTION,
+                423 => errors::STORAGE_IN_USE,
                 _ => errors::INTERNAL,
             },
 
@@ -843,6 +863,7 @@ impl ApiError {
 
             ApiError::IndexTimeout(_) => errors::INDEX_TIMEOUT,
             ApiError::IndexingDisabled => errors::INDEXING_DISABLED,
+            ApiError::StorageInUse { .. } => errors::STORAGE_IN_USE,
             ApiError::ReindexConflict { .. } => errors::REINDEX_CONFLICT,
             ApiError::Indexer(e) => {
                 use crate::wasm_compat::IndexerError;
@@ -900,6 +921,9 @@ impl ApiError {
                 errors::NOVELTY_AT_MAX
             }
             ApiError::Transact(TE::DatatypeLimitExceeded { .. }) => errors::DATATYPE_LIMIT_EXCEEDED,
+            ApiError::ConfigUnavailable(_) | ApiError::Transact(TE::ConfigUnavailable(_)) => {
+                errors::STORAGE_READ
+            }
             ApiError::Transact(_) => errors::INVALID_TRANSACTION,
 
             ApiError::InvalidLedgerId(_)
@@ -951,6 +975,23 @@ impl ApiError {
             message: message.into(),
         }
     }
+}
+
+fn storage_in_use_message(root: &str, holder: Option<u32>) -> String {
+    if holder == Some(std::process::id()) {
+        return format!(
+            "storage '{root}' is already open in this process; \
+             use that instance instead of opening the storage again"
+        );
+    }
+    let by = holder
+        .map(|pid| format!(" (pid {pid})"))
+        .unwrap_or_default();
+    format!(
+        "storage '{root}' is in use by another Fluree process{by}. Only one process \
+         can open a storage directory; to share it, run `fluree server` on it and \
+         send requests to the server"
+    )
 }
 
 /// The HTTP status for a query engine error, wherever it surfaces: wrapped in
@@ -1030,7 +1071,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 47
+    const VARIANTS: usize = 48
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + cfg!(feature = "iceberg") as usize;
@@ -1241,6 +1282,14 @@ mod tests {
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),
             (
+                ApiError::StorageInUse {
+                    root: "x".into(),
+                    holder: None,
+                },
+                423,
+                STORAGE_IN_USE,
+            ),
+            (
                 ApiError::ReindexConflict {
                     expected: 1,
                     found: 2,
@@ -1311,6 +1360,23 @@ mod tests {
             ),
             (ApiError::Json(json), 500, INTERNAL),
             (ApiError::ledger_config("x"), 500, CONFIG),
+            // A ledger config read failure, from the API's own reads (the
+            // policy context, a query's config) and from a staging lane.
+            (ApiError::ConfigUnavailable("x".into()), 500, STORAGE_READ),
+            (
+                ApiError::Transact(TE::ConfigUnavailable("x".into())),
+                500,
+                STORAGE_READ,
+            ),
+            (
+                ApiError::Transact(TE::RequestOverrideRefused {
+                    setting: "opts.shapes".into(),
+                    graph: "default".into(),
+                    control: "f:OverrideNone".into(),
+                }),
+                400,
+                INVALID_TRANSACTION,
+            ),
             (
                 ApiError::MaterializeMemoryBudget {
                     table: "t".into(),
@@ -1378,6 +1444,7 @@ mod tests {
                 | ApiError::Json(_)
                 | ApiError::Config(_)
                 | ApiError::LedgerConfig(_)
+                | ApiError::ConfigUnavailable(_)
                 | ApiError::MaterializeMemoryBudget { .. }
                 | ApiError::OntologyImport(_)
                 | ApiError::Format(_)
@@ -1398,6 +1465,7 @@ mod tests {
                 | ApiError::Http { .. }
                 | ApiError::IndexTimeout(_)
                 | ApiError::IndexingDisabled
+                | ApiError::StorageInUse { .. }
                 | ApiError::AwaitTNotReached { .. }
                 | ApiError::CommitContention { .. }
                 | ApiError::ReindexConflict { .. }

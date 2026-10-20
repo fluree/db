@@ -1569,9 +1569,12 @@ impl StorageRead for FileStorage {
                         dirs_to_visit.push(path);
                     }
                 } else if file_type.is_file() {
-                    // A staging file left by an interrupted write is not
-                    // content and must not be handed out as an address.
-                    if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
+                    // A staging file left by an interrupted write, and the
+                    // root's lock file, are not content and must not be
+                    // handed out as addresses.
+                    if is_tmp_artifact(&entry.file_name().to_string_lossy())
+                        || entry.file_name() == super::ROOT_LOCK_FILE
+                    {
                         continue;
                     }
                     // Convert back to relative path from base, as an address
@@ -3763,6 +3766,22 @@ mod wal_tests {
             .write_bytes(&format!("fluree:file://{WAL_DIR}/x.bin"), b"x")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn listing_keeps_out_the_root_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = crate::storage::RootLock::acquire(dir.path()).unwrap();
+        let storage = with_wal(dir.path());
+        commit(&storage, 1).await;
+        let listed = storage.list_prefix("").await.unwrap();
+        assert!(!listed.is_empty());
+        assert!(
+            listed
+                .iter()
+                .all(|a| !a.contains(crate::storage::ROOT_LOCK_FILE)),
+            "{listed:?}"
+        );
     }
 
     fn contested_root(dir: &Path) -> (FileStorage, std::fs::File) {

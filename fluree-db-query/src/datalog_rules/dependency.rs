@@ -13,9 +13,12 @@
 
 use super::{DatalogRule, DatalogRuleSet, HeadTerm, RuleHead};
 use crate::eval::function_supported_for_bool_cache as function_is_repeatable;
-use crate::ir::{Expression, GraphName, Pattern, Query, Ref, Term, TriplePattern};
+use crate::ir::{
+    Expression, Function, GraphName, Grouping, Pattern, Query, Ref, Term, TriplePattern,
+};
 use crate::parse::IriEncoder;
 use fluree_db_core::{is_rdf_type, is_reserved_reifies_predicate, Sid};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -95,6 +98,22 @@ impl Access {
         }
     }
 
+    /// The facts this access touches, for diagnostics, with IRIs spelled out.
+    fn describe(&self, iri: &impl Fn(&Sid) -> Option<String>) -> String {
+        let name = |sid: &Sid| iri(sid).unwrap_or_else(|| sid.to_string());
+        let facts = match &self.predicate {
+            PredicateFootprint::Exact(p) => format!("{} facts", name(p)),
+            PredicateFootprint::Class(c) => format!("rdf:type {} facts", name(c)),
+            PredicateFootprint::Reifier => "edge annotations".to_string(),
+            PredicateFootprint::Any => "facts of any predicate".to_string(),
+        };
+        match &self.graph {
+            GraphScope::Default => facts,
+            GraphScope::Named(g) => format!("{facts} in graph {g}"),
+            GraphScope::AnyNamed => format!("{facts} in any named graph"),
+        }
+    }
+
     /// Whether a read with this footprint may match a fact written by `write`.
     pub fn may_observe(&self, write: &Access) -> bool {
         self.graph.may_overlap(&write.graph) && self.predicate.may_overlap(&write.predicate)
@@ -112,8 +131,20 @@ pub struct RuleFootprint {
     /// reads a match's transaction metadata (`t`, `op`), or uses a shortest
     /// path, whose chosen path can change as edges are added.
     /// Only a repeatable rule may run once instead of every round, or re-read
-    /// only new facts in a recursive group.
+    /// only new facts in a recursive group. `NOW()` and `TODAY()` are
+    /// repeatable here: every rule body in a run sees one evaluation time.
     pub repeatable: bool,
+    /// The body calls `NOW()` or `TODAY()`, so the run needs an evaluation
+    /// time.
+    pub reads_clock: bool,
+    /// The reads made under a negation (`NOT EXISTS`, `!EXISTS`). Each is
+    /// also in `reads`. A rule may negate only facts that are complete
+    /// before it runs, so none of these may observe its own group's writes.
+    pub negated_reads: Vec<Access>,
+    /// The reads made inside a grouped or aggregating subquery. Each is also
+    /// in `reads`, and none may observe its own group's writes: a count over
+    /// facts still being derived would change as they arrive.
+    pub aggregated_reads: Vec<Access>,
 }
 
 impl RuleFootprint {
@@ -135,12 +166,40 @@ impl RuleFootprint {
         walker.footprint
     }
 
+    /// The rule negates or aggregates facts, so its conclusions are only
+    /// meaningful once everything it reads that way is complete.
+    pub fn is_non_monotone(&self) -> bool {
+        self.non_monotone_construct().is_some()
+    }
+
+    /// What makes the rule non-monotone, for messages.
+    pub fn non_monotone_construct(&self) -> Option<&'static str> {
+        if !self.negated_reads.is_empty() {
+            Some("negation")
+        } else if !self.aggregated_reads.is_empty() {
+            Some("an aggregate")
+        } else {
+            None
+        }
+    }
+
     /// Whether some read of `self` may observe some write of `producer`.
     pub fn depends_on(&self, producer: &RuleFootprint) -> bool {
         self.reads
             .iter()
             .any(|read| producer.writes.iter().any(|write| read.may_observe(write)))
     }
+}
+
+/// The expressions a grouping phase evaluates: its HAVING and per-group
+/// binds.
+pub(super) fn grouping_expressions(grouping: &Grouping) -> impl Iterator<Item = &Expression> {
+    let (having, binds) = match grouping {
+        Grouping::Implicit { having, binds, .. } | Grouping::Explicit { having, binds, .. } => {
+            (having, binds)
+        }
+    };
+    having.iter().chain(binds.iter().map(|(_, expr)| expr))
 }
 
 /// What `patterns` may read in the default graph.
@@ -164,6 +223,11 @@ pub(super) fn query_tail_reads<E: IriEncoder + ?Sized>(query: &Query, encoder: &
 struct FootprintWalker<'e, E: ?Sized> {
     encoder: &'e E,
     footprint: RuleFootprint,
+    /// Inside a negation, at any depth. Double negation counts as negated
+    /// too: the stratification check stays conservative.
+    negated: bool,
+    /// Inside a grouped or aggregating subquery, at any depth.
+    aggregated: bool,
 }
 
 impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
@@ -174,7 +238,23 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                 repeatable: true,
                 ..Default::default()
             },
+            negated: false,
+            aggregated: false,
         }
+    }
+
+    /// Walk `f` with every read it makes counted as aggregated.
+    fn under_aggregation(&mut self, f: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.aggregated, true);
+        f(self);
+        self.aggregated = outer;
+    }
+
+    /// Walk `f` with every read it makes counted as negated.
+    fn under_negation(&mut self, f: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.negated, true);
+        f(self);
+        self.negated = outer;
     }
 
     fn read_query_tail(&mut self, query: &Query) {
@@ -192,6 +272,12 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
 
     fn read(&mut self, graph: &GraphScope, predicate: PredicateFootprint) {
         let access = Access::new(graph, predicate);
+        if self.negated && !self.footprint.negated_reads.contains(&access) {
+            self.footprint.negated_reads.push(access.clone());
+        }
+        if self.aggregated && !self.footprint.aggregated_reads.contains(&access) {
+            self.footprint.aggregated_reads.push(access.clone());
+        }
         if !self.footprint.reads.contains(&access) {
             self.footprint.reads.push(access);
         }
@@ -223,10 +309,11 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                 Pattern::Filter(expr)
                 | Pattern::Bind { expr, .. }
                 | Pattern::Unwind { list: expr, .. } => self.read_expression(expr, graph),
+                Pattern::Minus(inner) | Pattern::NotExists(inner) => {
+                    self.under_negation(|w| w.read_patterns(inner, graph));
+                }
                 Pattern::Optional(inner)
-                | Pattern::Minus(inner)
                 | Pattern::Exists(inner)
-                | Pattern::NotExists(inner)
                 | Pattern::DefaultGraphSource { patterns: inner } => {
                     self.read_patterns(inner, graph);
                 }
@@ -268,9 +355,21 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                     self.read(graph, predicate);
                 }
                 Pattern::Subquery(sub) => {
-                    self.read_patterns(&sub.patterns, graph);
-                    for (_, expr) in &sub.order_binds {
-                        self.read_expression(expr, graph);
+                    let read_subquery = |w: &mut Self| {
+                        w.read_patterns(&sub.patterns, graph);
+                        for (_, expr) in &sub.order_binds {
+                            w.read_expression(expr, graph);
+                        }
+                        if let Some(grouping) = &sub.grouping {
+                            for expr in grouping_expressions(grouping) {
+                                w.read_expression(expr, graph);
+                            }
+                        }
+                    };
+                    if sub.grouping.is_some() {
+                        self.under_aggregation(read_subquery);
+                    } else {
+                        read_subquery(self);
                     }
                 }
                 Pattern::Values { .. } => {}
@@ -288,13 +387,31 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
 
     fn read_expression(&mut self, expr: &Expression, graph: &GraphScope) {
         match expr {
-            Expression::Exists { patterns, .. } => self.read_patterns(patterns, graph),
+            Expression::Exists { patterns, negated } => {
+                if *negated {
+                    self.under_negation(|w| w.read_patterns(patterns, graph));
+                } else {
+                    self.read_patterns(patterns, graph);
+                }
+            }
             Expression::Call { func, args } => {
-                if !function_is_repeatable(func) {
+                if matches!(func, Function::Now | Function::Today) {
+                    self.footprint.reads_clock = true;
+                } else if !function_is_repeatable(func) {
                     self.footprint.repeatable = false;
                 }
-                for arg in args {
-                    self.read_expression(arg, graph);
+                // Anything under `NOT` may be negated; the validator admits an
+                // `EXISTS` only where its polarity is readable.
+                if matches!(func, Function::Not) {
+                    self.under_negation(|w| {
+                        for arg in args {
+                            w.read_expression(arg, graph);
+                        }
+                    });
+                } else {
+                    for arg in args {
+                        self.read_expression(arg, graph);
+                    }
                 }
             }
             Expression::PatternComprehension { .. } => {
@@ -331,7 +448,8 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
         }
     }
 
-    /// Derived facts always land in the default graph.
+    /// A head writes into its named graph, else into the graph the rules run
+    /// against.
     fn write_head(&mut self, head: &RuleHead) {
         let predicate = match (&head.predicate, &head.object) {
             (HeadTerm::Sid(p), HeadTerm::Sid(class)) if is_rdf_type(p) => {
@@ -340,7 +458,11 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
             (HeadTerm::Sid(p), _) => PredicateFootprint::Exact(p.clone()),
             (HeadTerm::Var(_) | HeadTerm::Literal { .. }, _) => PredicateFootprint::Any,
         };
-        let access = Access::new(&GraphScope::Default, predicate);
+        let graph = match &head.graph {
+            Some(iri) => GraphScope::Named(iri.clone()),
+            None => GraphScope::Default,
+        };
+        let access = Access::new(&graph, predicate);
         if !self.footprint.writes.contains(&access) {
             self.footprint.writes.push(access);
         }
@@ -440,6 +562,110 @@ impl RuleDependencies {
             stages[stage_of[c]].push(component);
         }
         stages
+    }
+
+    /// Whether some rule negates or aggregates facts its own recursive group
+    /// derives. Such a program has no stratification: those facts are not
+    /// complete before the rule reads them, so no evaluation order is sound.
+    /// The error names the facts read and the cycle, the offending rule
+    /// first: `ex:a -not-> ex:b -> ex:a` (or `-agg->`), where each arrow reads
+    /// facts from the rule it points to. `iri` spells out predicates and
+    /// classes.
+    pub fn unstratified(
+        &self,
+        rule_set: &DatalogRuleSet,
+        iri: impl Fn(&Sid) -> Option<String>,
+    ) -> Option<String> {
+        let name = |i: usize| rule_set.rules[i].name.as_str();
+        for component in self.components.iter().filter(|c| c.recursive) {
+            for &consumer in &component.rules {
+                let footprint = &self.footprints[consumer];
+                let non_monotone_reads = footprint
+                    .negated_reads
+                    .iter()
+                    .map(|read| (read, "not", "negates"))
+                    .chain(
+                        footprint
+                            .aggregated_reads
+                            .iter()
+                            .map(|read| (read, "agg", "aggregates")),
+                    );
+                for (negated, arrow, verb) in non_monotone_reads {
+                    let Some((producer, write)) = component.rules.iter().find_map(|&p| {
+                        self.footprints[p]
+                            .writes
+                            .iter()
+                            .find(|write| negated.may_observe(write))
+                            .map(|write| (p, write))
+                    }) else {
+                        continue;
+                    };
+                    // A read of every predicate is the analysis's limit, not
+                    // something the rule wrote, so say what read it and
+                    // which of its facts close the cycle.
+                    let facts = match negated.predicate {
+                        PredicateFootprint::Any => format!(
+                            "{} (a variable predicate, a `*` or `?` path, a negated property \
+                             set, or another read the analysis cannot narrow), among them {}",
+                            negated.describe(&iri),
+                            write.describe(&iri)
+                        ),
+                        _ => negated.describe(&iri),
+                    };
+                    let mut cycle = vec![name(consumer)];
+                    cycle.extend(
+                        self.path_within(&component.rules, producer, consumer)
+                            .into_iter()
+                            .map(name),
+                    );
+                    let arrows = cycle
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| match i {
+                            0 => (*n).to_string(),
+                            1 => format!(" -{arrow}-> {n}"),
+                            _ => format!(" -> {n}"),
+                        })
+                        .collect::<String>();
+                    return Some(format!(
+                        "datalog rule {} {verb} {facts}, which depend on its own conclusions \
+                         ({arrows}; each arrow reads facts from the rule it points to). \
+                         Negation and aggregation need what they read to be complete before \
+                         the rule runs, which a cycle through them prevents",
+                        name(consumer)
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Rules on a dependency path `from` → … → `to` inside one component,
+    /// following reads (each rule reads from the next), `from` and `to`
+    /// included. A component is strongly connected, so one exists.
+    fn path_within(&self, component: &[usize], from: usize, to: usize) -> Vec<usize> {
+        if from == to {
+            return vec![from];
+        }
+        let mut previous: HashMap<usize, usize> = HashMap::new();
+        let mut queue = VecDeque::from([from]);
+        'search: while let Some(rule) = queue.pop_front() {
+            for &next in &self.depends_on[rule] {
+                if next != from && component.contains(&next) && !previous.contains_key(&next) {
+                    previous.insert(next, rule);
+                    if next == to {
+                        break 'search;
+                    }
+                    queue.push_back(next);
+                }
+            }
+        }
+        let mut path = vec![to];
+        while let Some(&before) = path.last().and_then(|at| previous.get(at)) {
+            path.push(before);
+        }
+        path.reverse();
+        path
     }
 
     /// One line naming each group in order, recursive groups starred, for
@@ -564,6 +790,7 @@ mod tests {
             reads: reads.into_iter().map(default).collect(),
             writes: writes.into_iter().map(default).collect(),
             repeatable: true,
+            ..Default::default()
         }
     }
 

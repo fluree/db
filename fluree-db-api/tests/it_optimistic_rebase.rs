@@ -291,7 +291,23 @@ async fn a_stage_on_a_subject_written_under_a_moved_code_is_restaged() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stage_behind_a_commit_that_adds_a_shape_is_validated_against_it() {
     let (_dir, fluree, handle) = open().await;
-    update(&fluree, &handle, "INSERT DATA { ex:seed ex:p 0 }").await;
+    // The ledger config enables SHACL: shapes are enforced only where it does.
+    let config = fluree_db_core::graph_registry::config_graph_iri(LEDGER);
+    update(
+        &fluree,
+        &handle,
+        &format!(
+            "PREFIX f: <https://ns.flur.ee/db#> \
+             INSERT DATA {{ \
+               ex:seed ex:p 0 . \
+               GRAPH <{config}> {{ \
+                 <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> . \
+                 <urn:config:shacl> f:shaclEnabled true . \
+               }} \
+             }}"
+        ),
+    )
+    .await;
 
     let (parked, release) = handle.gate_next_optimistic_stage_for_test();
     let behind = {
@@ -440,6 +456,129 @@ async fn a_stage_checked_for_uniqueness_is_restaged_behind_a_duplicate() {
         0,
         "a uniqueness check reads beyond the subjects it writes"
     );
+    assert_eq!(
+        count(&fluree, &handle, "SELECT ?u WHERE { ?u ex:email \"x\" }").await,
+        1
+    );
+    fluree.disconnect().await;
+}
+
+/// Uniqueness enabled in config, with `ex:a ex:email "x"` stored and no
+/// property declared unique yet.
+async fn seed_uniqueness_enabled(fluree: &Fluree, handle: &LedgerHandle) {
+    let config = format!(
+        "@prefix f: <https://ns.flur.ee/db#> .
+         @prefix ex: <http://example.org/> .
+         ex:a ex:email \"x\" .
+         GRAPH <{}> {{
+           <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:transact> .
+           <urn:config:transact> f:uniqueEnabled true .
+         }}",
+        fluree_db_core::config_graph_iri(LEDGER)
+    );
+    fluree
+        .stage(handle)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("enable uniqueness");
+}
+
+fn assert_unique_violation(err: &fluree_db_api::ApiError) {
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "rejected for the right reason: {err:?}"
+    );
+}
+
+/// A stage staged while no property was declared unique ran no uniqueness
+/// check, so it is bounded to its own subjects, and a commit that declares a
+/// property unique touches only the property. That commit changes what
+/// staging depends on: what was staged before it stages again, and meets the
+/// declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stage_behind_a_commit_that_declares_a_property_unique_is_checked_against_it() {
+    let (_dir, fluree, handle) = open().await;
+    seed_uniqueness_enabled(&fluree, &handle).await;
+
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = {
+        let fluree = fluree.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            fluree
+                .stage(&handle)
+                .sparql_update(&format!("{PREFIX}INSERT DATA {{ ex:b ex:email \"x\" }}"))
+                .execute()
+                .await
+                .map(|r| r.receipt.t)
+        })
+    };
+    parked.await.expect("the write parks after staging");
+
+    update(
+        &fluree,
+        &handle,
+        "PREFIX f: <https://ns.flur.ee/db#> INSERT DATA { ex:email f:enforceUnique true }",
+    )
+    .await;
+    release.send(true).unwrap();
+
+    let err = behind
+        .await
+        .expect("task")
+        .expect_err("the property was declared unique ahead of the write");
+    assert_unique_violation(&err);
+    assert_eq!(
+        handle.write_path_stats().rebased,
+        0,
+        "nothing re-bases across a commit that declares a property unique"
+    );
+    assert_eq!(
+        count(&fluree, &handle, "SELECT ?u WHERE { ?u ex:email \"x\" }").await,
+        1
+    );
+    fluree.disconnect().await;
+}
+
+/// The same for a transaction: a write staged in it before another commit
+/// declares a property unique is checked against the declaration when the
+/// transaction commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transaction_behind_a_commit_that_declares_a_property_unique_is_checked_against_it() {
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+    let (_dir, fluree, handle) = open().await;
+    seed_uniqueness_enabled(&fluree, &handle).await;
+
+    let mut transaction = fluree
+        .begin_transaction(LEDGER, TransactionOptions::default())
+        .await
+        .expect("begin");
+    transaction
+        .stage(TxnOperation::SparqlUpdate(
+            format!("{PREFIX}INSERT DATA {{ ex:b ex:email \"x\" }}"),
+            None,
+        ))
+        .await
+        .expect("nothing is unique yet");
+
+    update(
+        &fluree,
+        &handle,
+        "PREFIX f: <https://ns.flur.ee/db#> INSERT DATA { ex:email f:enforceUnique true }",
+    )
+    .await;
+
+    let err = transaction
+        .commit(Default::default())
+        .await
+        .expect_err("the property was declared unique before the transaction committed");
+    assert_unique_violation(&err);
     assert_eq!(
         count(&fluree, &handle, "SELECT ?u WHERE { ?u ex:email \"x\" }").await,
         1
