@@ -30,7 +30,7 @@
 //!
 //! A default graph of two or more graphs of one ledger is the set union of
 //! their facts, a fact being storage's identity: one per value and list
-//! position (AJ-66). A predicate's count there is its number of distinct
+//! position. A predicate's count there is its number of distinct
 //! facts over the members. [`count_by_predicate_union_operator`] reads every
 //! member's POST directory as above. A predicate one member holds takes that
 //! member's count: one graph's rows are distinct facts. A predicate two or
@@ -50,7 +50,9 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_common::{build_range_cursor, predicate_range_keys, FastPathOperator};
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::index_scope::{IndexScope, MemberSet};
-use crate::merged_cursor::{is_graph_scoped_arena, MergeDecline, MergedRangeCursor};
+use crate::merged_cursor::{
+    indexes_nothing, is_graph_scoped_arena, MergeDecline, MergedRangeCursor,
+};
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::arena::numbig::NumBigRepr;
@@ -185,6 +187,10 @@ fn count_by_predicate_union(
     let store = set.store();
     let mut held: BTreeMap<u32, Holders> = BTreeMap::new();
     for member in set.members() {
+        // A current member the index holds nothing for holds nothing.
+        if indexes_nothing(store, member.g_id()) {
+            continue;
+        }
         let Some(rows) = exact_count_by_predicate_post(store, member.g_id())? else {
             return Ok(Err(FastPathFallback::GateDeclined));
         };
@@ -368,6 +374,9 @@ fn distinct_facts_by_value(
     // A fact: subject, object type, object, list position.
     let mut facts: FxHashSet<(u64, u16, Object, u32)> = FxHashSet::default();
     for member in set.members() {
+        if indexes_nothing(store, member.g_id()) {
+            continue;
+        }
         let arena = store
             .numbig_arenas(member.g_id())
             .find_map(|(p, arena)| (p == p_id).then_some(arena));

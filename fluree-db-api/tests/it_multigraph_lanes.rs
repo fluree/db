@@ -145,10 +145,12 @@ async fn lane_e_read_below_its_index() {
 }
 
 /// Big numbers in the per-predicate count over several graphs. A big number
-/// is a handle into an arena per graph and predicate, so lane E keys each by
-/// its value: `1.5` and `1.50` are one value; a big integer is keyed by value
-/// whatever XSD subtype wrote it; a decimal and an integer of equal
-/// magnitude are two values; a value in one member stays its own.
+/// is a handle into an arena per graph and predicate, so the count keys each
+/// by its value: `1.5` and `1.50` are one value; a big integer is keyed by
+/// value whatever XSD subtype wrote it; a decimal and an integer of equal
+/// magnitude are two values; a value in one member stays its own. The
+/// ledger's default graph is empty, so the union default graph has a member
+/// the index holds nothing for, which the count leaves out.
 const NUMBIG_LEDGER: &str = "it/mg-lanes-numbig:main";
 const NUMBIG_TRIG: &str = r#"
 @prefix ex: <http://example.org/> .
@@ -177,18 +179,27 @@ async fn numbig_counts(
 ) -> (Vec<String>, Vec<String>) {
     use serde_json::json;
     let (store, guard) = span_capture::init_test_tracing();
+    // No graphs: the union default graph.
+    let union_default = graphs.is_empty();
     let rows: Vec<(String, String)> = if jsonld {
-        let from: Vec<String> = graphs
-            .iter()
-            .map(|g| format!("{NUMBIG_LEDGER}#{g}"))
-            .collect();
-        let q = json!({
+        let from = if union_default {
+            json!(NUMBIG_LEDGER)
+        } else {
+            json!(graphs
+                .iter()
+                .map(|g| format!("{NUMBIG_LEDGER}#{g}"))
+                .collect::<Vec<_>>())
+        };
+        let mut q = json!({
             "@context": {"ex": "http://example.org/"},
             "from": from,
             "select": ["?p", "(count ?s)"],
             "where": [{"@id": "?s", "?p": "?o"}],
             "groupBy": ["?p"]
         });
+        if union_default {
+            q["opts"] = json!({"unionDefaultGraph": true});
+        }
         let result = fluree.query_connection(&q).await.expect("JSON-LD query");
         let ledger = fluree.ledger(NUMBIG_LEDGER).await.expect("ledger");
         let out = result
@@ -202,7 +213,13 @@ async fn numbig_counts(
             .collect()
     } else {
         let from: String = graphs.iter().map(|g| format!("FROM <{g}> ")).collect();
-        let q = format!("SELECT ?p (COUNT(?s) AS ?c) {from} WHERE {{ ?s ?p ?o }} GROUP BY ?p");
+        let pragma = if union_default {
+            "# PRAGMA union-default-graph: true\n"
+        } else {
+            ""
+        };
+        let q =
+            format!("{pragma}SELECT ?p (COUNT(?s) AS ?c) {from} WHERE {{ ?s ?p ?o }} GROUP BY ?p");
         let out = view
             .query(fluree)
             .sparql(&q)
@@ -265,7 +282,7 @@ async fn lane_e_keys_big_numbers_by_value() {
     let view = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
 
     let want = |rows: &[&str]| -> Vec<String> { rows.iter().map(|r| (*r).to_string()).collect() };
-    let cases: [(&[&str], Vec<String>, bool); 2] = [
+    let cases: [(&[&str], Vec<String>, bool); 3] = [
         (
             &["urn:g1"],
             want(&["big=1", "dec=1", "mag=1", "one=1"]),
@@ -276,6 +293,9 @@ async fn lane_e_keys_big_numbers_by_value() {
             want(&["big=1", "dec=1", "mag=2", "one=1"]),
             true,
         ),
+        // The union default graph: g0 (empty: the index holds nothing for
+        // it), g1 and g2.
+        (&[], want(&["big=1", "dec=1", "mag=2", "one=1"]), true),
     ];
     let _switch = multigraph::switch().lock().await;
     let mut failures = Vec::new();
