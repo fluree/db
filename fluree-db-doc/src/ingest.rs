@@ -144,9 +144,8 @@ pub fn parse_file(
     vlm: Option<&Arc<VlmReader>>,
 ) -> Result<(SourceMeta, ParsedDocument)> {
     let data = std::fs::read(path).map_err(|e| DocError::Io(format!("{}: {e}", path.display())))?;
-    let kind = SourceKind::from_path(path)
-        .ok_or_else(|| DocError::Unsupported(path.display().to_string()))?
-        .refine(&data);
+    let kind = SourceKind::detect(path, &data)
+        .ok_or_else(|| DocError::Unsupported(path.display().to_string()))?;
     let meta = SourceMeta {
         path: path.to_path_buf(),
         relative_path: relative_path.to_string(),

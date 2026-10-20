@@ -45,8 +45,7 @@ pub enum SourceKind {
 
 impl SourceKind {
     pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        Some(match ext.as_str() {
+        Some(match extension(path)?.as_str() {
             "pdf" => Self::Pdf,
             "md" | "markdown" | "txt" | "text" => Self::Markdown,
             "html" | "htm" | "xhtml" => Self::Html,
@@ -64,25 +63,28 @@ impl SourceKind {
         })
     }
 
-    /// The kind the content declares where the name says only "text". A
-    /// transcript or a saved email arrives as `.txt` as often as not: `.vtt`
-    /// has no registered type on most systems, and a mail client saves a
-    /// message under whatever name it likes.
-    pub fn refine(self, data: &[u8]) -> Self {
-        if self != Self::Markdown {
-            return self;
+    /// The kind of `path` holding `data`: its name, except that a name
+    /// saying only "text" defers to the content. A transcript or a saved
+    /// email arrives as `.txt` as often as not: `.vtt` has no registered
+    /// type on most systems, and a mail client saves a message under
+    /// whatever name it likes. A `.md` is not second-guessed: a memo that
+    /// opens with `From:` and `To:` lines is still a memo.
+    pub fn detect(path: &Path, data: &[u8]) -> Option<Self> {
+        let kind = Self::from_path(path)?;
+        if !matches!(extension(path)?.as_str(), "txt" | "text") {
+            return Some(kind);
         }
         if let Some(format) = fluree_doc_transcript::Format::sniff(data) {
-            return match format {
+            return Some(match format {
                 fluree_doc_transcript::Format::WebVtt => Self::WebVtt,
                 fluree_doc_transcript::Format::Srt => Self::Srt,
-            };
+            });
         }
-        match fluree_doc_email::Format::sniff(data) {
+        Some(match fluree_doc_email::Format::sniff(data) {
             Some(fluree_doc_email::Format::Eml) => Self::Eml,
             Some(fluree_doc_email::Format::Msg) => Self::Msg,
-            None => self,
-        }
+            None => kind,
+        })
     }
 
     pub fn media_type(self) -> &'static str {
@@ -118,6 +120,10 @@ impl SourceKind {
             Self::Image => "image",
         }
     }
+}
+
+fn extension(path: &Path) -> Option<String> {
+    Some(path.extension()?.to_str()?.to_ascii_lowercase())
 }
 
 /// The file extensions [`SourceKind::from_path`] reads, for messages that
@@ -503,17 +509,23 @@ mod tests {
 
     #[test]
     fn a_transcript_or_an_email_saved_as_text_is_read_as_one() {
+        let detect = |name: &str, data: &[u8]| SourceKind::detect(Path::new(name), data);
         let vtt = b"WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n<v Ana>Shall we start?\n";
-        assert_eq!(SourceKind::Markdown.refine(vtt), SourceKind::WebVtt);
+        assert_eq!(detect("call.txt", vtt), Some(SourceKind::WebVtt));
         let eml = b"From: Ana <ana@example.org>\r\nTo: Bo <bo@example.org>\r\n\
                     Subject: Budget\r\nDate: Tue, 7 Oct 2026 10:00:00 +0000\r\n\r\nSee attached.\r\n";
-        assert_eq!(SourceKind::Markdown.refine(eml), SourceKind::Eml);
+        assert_eq!(detect("budget.TXT", eml), Some(SourceKind::Eml));
         assert_eq!(
-            SourceKind::Markdown.refine(b"# Notes\n\nNothing to see."),
-            SourceKind::Markdown
+            detect("notes.txt", b"# Notes\n\nNothing to see."),
+            Some(SourceKind::Markdown)
         );
-        // A binary format's name is trusted.
-        assert_eq!(SourceKind::Pdf.refine(vtt), SourceKind::Pdf);
+        // Every other name is trusted, Markdown included: this memo would
+        // sniff as an email, and read as one it loses its heading and table.
+        let memo = b"From: Ana <ana@example.org>\nTo: Bo <bo@example.org>\nSubject: Q3 plan\n\n\
+                     # Q3 plan\n\n| Item | Owner |\n|---|---|\n| Budget | Ana |\n";
+        assert_eq!(detect("memo.txt", memo), Some(SourceKind::Eml));
+        assert_eq!(detect("memo.md", memo), Some(SourceKind::Markdown));
+        assert_eq!(detect("call.pdf", vtt), Some(SourceKind::Pdf));
     }
 
     #[test]
