@@ -15,7 +15,9 @@ mod span_capture;
 #[path = "support/multigraph.rs"]
 mod multigraph;
 
-use multigraph::{assert_routing, check, Fixture, Graphs, Shape, State, Surface, SCOPES, SHAPES};
+use multigraph::{
+    assert_routing, check, Fixture, Kind, Scope, Shape, State, Surface, SCOPES, SHAPES,
+};
 
 /// Every shape, scope and surface over fixture A in `state`.
 async fn every_scope_answers_by_hand(state: State) {
@@ -67,10 +69,11 @@ const CYCLIC_UNION: &str = "cyclic_bgp_union";
 
 /// The triangle in every scope and surface of fixture A in `state`, answered
 /// by hand and by the general plan, and routed by scope: the union variant
-/// answers a default graph of several graphs, and of none; the one-graph
-/// lane answers one graph; neither runs inside `GRAPH` (its inner plan is
-/// seeded, and the planner builds the cyclic operator only for an unseeded
-/// pattern list) or over two ledgers.
+/// answers a default graph of several graphs (an empty default graph among
+/// them included: a member that holds nothing adds no edges), and of none;
+/// the one-graph lane answers one graph; neither runs inside `GRAPH` (its
+/// inner plan is seeded, and the planner builds the cyclic operator only for
+/// an unseeded pattern list) or over two ledgers.
 async fn triangle_routes_by_scope(state: State) {
     let fx = Fixture::build(state).await;
     let mut failures = Vec::new();
@@ -84,12 +87,16 @@ async fn triangle_routes_by_scope(state: State) {
                 continue;
             }
             let run = check(&fx, scope, Shape::Triangle, surface, &mut failures).await;
-            let (must_fire, must_not_fire): (&[&str], &[&str]) = match scope.graphs() {
-                Graphs::G1G2 | Graphs::G0G1G2 | Graphs::Empty => (&[CYCLIC_UNION], &[CYCLIC]),
-                Graphs::G0 | Graphs::G1 => (&[CYCLIC], &[CYCLIC_UNION]),
-                Graphs::G2 | Graphs::PerNamedGraph | Graphs::G0Other => {
+            let (must_fire, must_not_fire): (&[&str], &[&str]) = match (scope, scope.kind()) {
+                // The planner builds the cyclic operator only for an unseeded
+                // pattern list, and GRAPH seeds its inner plan.
+                (Scope::GraphG2 | Scope::GraphVar, _) | (_, Kind::None) => {
                     (&[], &[CYCLIC, CYCLIC_UNION])
                 }
+                // Several graphs, an empty default graph among them included,
+                // and a default graph of none.
+                (_, Kind::Union | Kind::Empty) => (&[CYCLIC_UNION], &[CYCLIC]),
+                (_, Kind::One) => (&[CYCLIC], &[CYCLIC_UNION]),
             };
             assert_routing(&run, must_fire, must_not_fire, &mut failures);
             runs += 1;
