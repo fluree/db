@@ -72,6 +72,10 @@ pub struct Pragmas {
     /// `# PRAGMA reasoning-max-seconds: <n>` — OWL2-RL materialization budget
     /// (max wall-clock seconds). Collected verbatim; validates during lowering.
     pub reasoning_max_seconds: Option<String>,
+    /// `# PRAGMA reasoning-time: <datetime>` — what `NOW()` and `TODAY()`
+    /// return in datalog rule bodies (JSON-LD `reasoningTime`). Collected
+    /// verbatim; validates during lowering.
+    pub reasoning_time: Option<String>,
     /// `# PRAGMA include-system-facts: true` — surface the `f:reifies*`
     /// edge-annotation encoding in variable-predicate scans (JSON-LD
     /// `opts.includeSystemFacts`). Queries only.

@@ -168,6 +168,57 @@ struct ConfigCacheEntry {
     config: Option<Arc<LedgerConfig>>,
 }
 
+/// Log once per ledger load when the ledger holds shapes that no graph's
+/// config enforces (ledger info's `shacl-not-configured` diagnostic): shapes
+/// are enforced only where the config sets `f:shaclEnabled true`, so such a
+/// ledger admits every write without a word. Reads the ledger only when its
+/// index stats or novelty show a shape. Returns the config it read, keyed as the
+/// handle's config cache keys it, so the first request does not read it
+/// again. A failure to check is logged at debug and does not fail the load.
+#[cfg(feature = "shacl")]
+async fn warn_if_shapes_unenforced(
+    state: &LedgerState,
+) -> Option<(i64, Option<Arc<LedgerConfig>>)> {
+    let to_t = state.t();
+    let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+    if !crate::config_resolver::may_hold_shapes(&state.snapshot, overlay, to_t) {
+        return None;
+    }
+    let checked = async {
+        let config =
+            crate::config_resolver::resolve_ledger_config(&state.snapshot, overlay, to_t).await?;
+        let diagnostic = crate::config_resolver::unenforced_shapes(
+            &state.snapshot,
+            overlay,
+            to_t,
+            config.as_ref(),
+        )
+        .await?;
+        Ok::<_, ApiError>((config.map(Arc::new), diagnostic))
+    }
+    .await;
+    match checked {
+        Ok((config, diagnostic)) => {
+            if let Some(diagnostic) = diagnostic {
+                tracing::warn!(
+                    ledger_id = %state.ledger_id(),
+                    "{} (see ledger info configDiagnostics)",
+                    diagnostic.message
+                );
+            }
+            Some((state.novelty.config_write_t, config))
+        }
+        Err(error) => {
+            tracing::debug!(
+                ledger_id = %state.ledger_id(),
+                %error,
+                "could not check the ledger's shapes against its config at load"
+            );
+            None
+        }
+    }
+}
+
 /// Lock ordering invariant: always acquire `state` before `binary_store`.
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
@@ -1716,11 +1767,14 @@ impl LedgerManager {
                     }
                 };
                 tracing::debug!(alias = %canonical_alias, "ledger.load.binary_store.done");
-                Ok(LedgerHandle::new(
-                    canonical_alias.clone(),
-                    state,
-                    binary_store,
-                ))
+                #[cfg(feature = "shacl")]
+                let loaded_config = warn_if_shapes_unenforced(&state).await;
+                let handle = LedgerHandle::new(canonical_alias.clone(), state, binary_store);
+                #[cfg(feature = "shacl")]
+                if let Some((key, config)) = loaded_config {
+                    handle.config_cache_put(key, config).await;
+                }
+                Ok(handle)
             }
             Err(e) => Err(e),
         };

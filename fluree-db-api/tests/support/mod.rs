@@ -235,6 +235,35 @@ pub fn instances_sharing_storage() -> (MemoryFluree, MemoryFluree) {
 }
 
 // =============================================================================
+// SHACL helpers
+// =============================================================================
+
+/// A ledger config node that enables SHACL, to write with a test's shapes (in
+/// a JSON-LD `@graph`, or on its own). Shapes are enforced only where the
+/// ledger config sets `f:shaclEnabled true`. Full IRIs, so it needs no
+/// `@context`.
+pub fn shacl_enabled_config_node() -> JsonValue {
+    json!({
+        "@id": "urn:config:main",
+        "@type": "https://ns.flur.ee/db#LedgerConfig",
+        "@graph": "config",
+        "https://ns.flur.ee/db#shaclDefaults": {
+            "@id": "urn:config:shacl",
+            "https://ns.flur.ee/db#shaclEnabled": true
+        }
+    })
+}
+
+/// Commit [`shacl_enabled_config_node`] to `ledger`.
+pub async fn enable_shacl(fluree: &MemoryFluree, ledger: MemoryLedger) -> MemoryLedger {
+    fluree
+        .insert(ledger, &shacl_enabled_config_node())
+        .await
+        .expect("enable SHACL in the ledger config")
+        .ledger
+}
+
+// =============================================================================
 // Common seeding helpers
 // =============================================================================
 

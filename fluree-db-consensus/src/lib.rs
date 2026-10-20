@@ -942,6 +942,14 @@ pub enum SubmissionError {
     #[error("{message}")]
     LifecycleConflict { message: String },
 
+    /// The ledger config could not be read while executing the submission
+    /// (HTTP 500, `err:storage/ReadFailure`): a storage failure, not
+    /// anything in the request, and not capacity pressure. Typed so the HTTP
+    /// layer can surface the storage code; an `Execution` status alone
+    /// cannot carry it.
+    #[error("{message}")]
+    ConfigUnavailable { message: String },
+
     /// Every commit attempt lost its race with other writers to the ledger
     /// (HTTP 503, `err:db/CommitContention`, `Retry-After`). Retryable, and
     /// typed because a 503 `Execution` status reads as unsettled.
@@ -990,7 +998,9 @@ impl SubmissionError {
             Self::DatatypeLimitExceeded { .. } | Self::CommitNotFound { .. } => true,
             // Refused at publication: the commit never landed.
             Self::Fenced { .. } | Self::LifecycleConflict { .. } => true,
-
+            // Read before commit construction: the submission did not commit,
+            // and a keyed retry re-executes it.
+            Self::ConfigUnavailable { .. } => true,
             // Every attempt's commit failed its head check, so nothing
             // committed; settled, like the novelty refusals, so a keyed retry
             // re-executes.

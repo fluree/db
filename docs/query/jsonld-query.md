@@ -601,7 +601,8 @@ Scope patterns to a named graph:
 
 Notes:
 - `fromNamed` is an object whose keys are dataset-local aliases. Each value is an object with `@id` (ledger reference) and optional `@graph` (graph selector IRI).
-- The second element of `["graph", ...]` can be a dataset-local alias (recommended) or a graph IRI.
+- The second element of `["graph", ...]` can be a dataset-local alias (recommended), a graph IRI, or a variable. A compact IRI whose prefix the query's `@context` defines is expanded, as SPARQL expands `GRAPH ex:products`: with `"ex": "http://example.org/ns/"`, `"ex:products"` names `http://example.org/ns/products`. A name that is not an IRI is an alias and is kept as written, and so is any name the query's own `fromNamed` spells exactly that way, or the dataset the query runs against registers (a Rust `DataSetDb`, or a graph source `from` names).
+- A node-level `@graph` scopes one node (and the nodes nested in it) the same way: `{"@id": "?product", "@graph": "products", "ex:name": "?name"}`. Its name can be a dataset-local alias, a graph IRI, or a compact IRI your `@context` expands, resolved as in a transaction's `insert` and `delete`. (The keywords `"config"` and `"txn-meta"` name a ledger's graphs only in an update's `where`, which knows its ledger. In a query, `"default"` names the query's default graph, which a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph) widens to every graph; `"urn:default"` names the default graph alone.)
 - The legacy `"from-named": [...]` array format is still accepted for backward compatibility.
 - For dataset and named-graph configuration details, see `docs/query/datasets.md`.
 

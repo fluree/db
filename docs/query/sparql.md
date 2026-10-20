@@ -1355,6 +1355,16 @@ offending operation. Ordered uniqueness checking requires this; for SHACL it
 is a deliberate choice (every intermediate state must satisfy the shapes,
 like a database without deferred constraints).
 
+What is enforced is read once, from the state before the request: the ledger
+config, the shapes and the uniqueness constraints. Shapes from another ledger
+(a cross-ledger `f:shapesSource`) are read at the head the request first reads
+that ledger at. An operation that turns
+SHACL or uniqueness off, or removes a shape or a constraint, does not relax
+the checks on a later operation in the same request, and one that turns them
+on does not apply them to the request, as in a single transaction. The config
+checks (a setting group split across graphs, a second value for a
+single-valued setting) run once, on the request's result.
+
 ### SPARQL UPDATE Restrictions
 
 Current restrictions / boundaries:
@@ -1407,6 +1417,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 |--------|-------|------------|----------------|--------|
 | `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
 | `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `reasoning-time` | ISO 8601 datetime | queries | `reasoningTime` | — |
 | `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
 | `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
 | `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |

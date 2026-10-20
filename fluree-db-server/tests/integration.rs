@@ -4,7 +4,7 @@ use fluree_db_api::{
 };
 use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_novelty::Commit;
-use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode};
+use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode, ServerRole};
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
 use fluree_vocab::namespaces::{FLUREE_DB, XSD};
 use fluree_vocab::xsd_names;
@@ -26,6 +26,56 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
     let telemetry = TelemetryConfig::with_server_config(&cfg);
     let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
     (tmp, state)
+}
+
+fn locking_config(root: &std::path::Path) -> ServerConfig {
+    ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(root.to_path_buf()),
+        storage_lock: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_transaction_server_on_a_locked_root_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = locking_config(tmp.path());
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let _first = AppState::new(cfg.clone(), telemetry.clone())
+        .await
+        .expect("first server");
+
+    let refused = AppState::new(cfg, telemetry)
+        .await
+        .err()
+        .expect("second server on the root");
+
+    assert!(
+        matches!(refused, fluree_db_api::ApiError::StorageInUse { .. }),
+        "{refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_storage_peer_reads_a_locked_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = locking_config(tmp.path());
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let _transactor = AppState::new(cfg.clone(), telemetry.clone())
+        .await
+        .expect("transaction server");
+
+    let peer = ServerConfig {
+        server_role: ServerRole::Peer,
+        tx_server_url: Some("http://127.0.0.1:9".to_string()),
+        peer_subscribe_all: true,
+        ..cfg
+    };
+    AppState::new(peer, telemetry)
+        .await
+        .expect("a peer opens its transaction server's root");
 }
 
 #[tokio::test(flavor = "multi_thread")]

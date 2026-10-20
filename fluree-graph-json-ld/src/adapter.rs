@@ -21,8 +21,10 @@
 //! A node with `@graph` names a graph holding the nodes in it, emitted as
 //! quads to a sink that [supports
 //! them](fluree_graph_ir::GraphSink::supports_quads). A sink that does not
-//! refuses the document, as it refuses reifiers it cannot hold, rather than
-//! losing that graph's contents or folding them into its default graph.
+//! refuses the document with [`AdapterError::Unsupported`], as it refuses
+//! reifiers it cannot hold, rather than losing that graph's contents or
+//! folding them into its default graph. (A top-level envelope is unwrapped by
+//! expansion and never reaches the adapter.)
 //!
 //! # Example
 //!
@@ -68,6 +70,10 @@ pub enum AdapterError {
     /// Conversion stops at the first such error.
     #[error("Sink error: {0}")]
     Sink(#[from] fluree_graph_ir::SinkError),
+
+    /// Well-formed JSON-LD this adapter cannot represent faithfully.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Result type for adapter operations
@@ -234,9 +240,9 @@ fn process_node<S: GraphSink>(
             // folding it into its default graph.
             "@graph" => {
                 if !sink.supports_quads() {
-                    return Err(AdapterError::InvalidStructure(
-                        "a node with @graph names a graph, which this destination does not \
-                         hold; load named graphs as TriG or N-Quads"
+                    return Err(AdapterError::Unsupported(
+                        "JSON-LD `@graph` graph scoping is not supported by bulk import; \
+                         use `fluree insert`, or import the data as TriG or N-Quads"
                             .to_string(),
                     ));
                 }
@@ -1409,7 +1415,7 @@ mod tests {
 
         let err = to_graph_events(&expanded, &mut GraphCollectorSink::new()).unwrap_err();
         assert!(
-            matches!(&err, AdapterError::InvalidStructure(msg) if msg.contains("@graph")),
+            matches!(&err, AdapterError::Unsupported(msg) if msg.contains("@graph")),
             "{err:?}"
         );
     }
@@ -1432,5 +1438,65 @@ mod tests {
             .find(|t| matches!(&t.p, Term::Iri(iri) if iri.as_ref() == "http://example.org/q"))
             .unwrap();
         assert_ne!(q.s, q.o, "the anonymous node merged with _:-b1");
+    }
+
+    /// Graph scoping is refused, not folded into the default graph: a node's
+    /// graph selector used to be dropped (its statements landed in the
+    /// default graph) and a named graph's content was dropped entirely.
+    #[test]
+    fn graph_scoping_is_refused_not_folded() {
+        for doc in [
+            json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:a", "@graph": "ex:g", "ex:p": 1}
+            ]}),
+            json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:g", "@graph": [
+                {"@id": "ex:a", "ex:p": 1}
+            ]}),
+        ] {
+            let expanded = crate::expand(&doc).unwrap();
+            let mut sink = GraphCollectorSink::new();
+            let err = to_graph_events(&expanded, &mut sink).unwrap_err();
+            assert!(matches!(err, AdapterError::Unsupported(_)), "{doc}: {err}");
+        }
+        // An envelope is unwrapped by expansion and imports as before.
+        let envelope = json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+            {"@id": "ex:a", "ex:p": 1}, {"@id": "ex:b", "ex:p": 2}
+        ]});
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&crate::expand(&envelope).unwrap(), &mut sink).unwrap();
+        assert_eq!(sink.graph().len(), 2);
+    }
+
+    /// Bulk import reads `@reverse` and `@included` as the transaction
+    /// parser does; they used to be dropped.
+    #[test]
+    fn reverse_and_included_are_read_like_the_transaction_parser() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child", "@type": "@id"}
+            },
+            "@id": "ex:kid",
+            "parent": "ex:mom",
+            "@included": [{"@id": "ex:other", "ex:p": 1}]
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let graph = sink.graph();
+        assert_eq!(graph.len(), 2, "{graph:?}");
+        let iri = |t: &Term| match t {
+            Term::Iri(iri) => iri.to_string(),
+            other => format!("{other:?}"),
+        };
+        let child = graph
+            .iter()
+            .find(|t| iri(&t.p) == "http://example.org/child")
+            .expect("the reverse statement");
+        assert_eq!(iri(&child.s), "http://example.org/mom");
+        assert_eq!(iri(&child.o), "http://example.org/kid");
+        assert!(graph
+            .iter()
+            .any(|t| iri(&t.s) == "http://example.org/other"));
     }
 }

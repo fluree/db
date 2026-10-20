@@ -90,6 +90,39 @@ async fn main() -> Result<()> {
 `build_async()` replays the storage's write-ahead log without blocking the async runtime.
 `build()` builds the same instance from synchronous code that has entered a Tokio runtime (for example with `Runtime::enter`), replaying the log on the calling thread.
 
+### One instance per storage directory
+
+An instance owns its storage directory. Share it within a process by cloning it: `Fluree` is
+cheap to clone, and clones share its caches, its per-ledger write locks and its indexer. Two
+instances on one directory, in one process or two, are not coordinated: each serves its own
+cached state, and both index and sweep the same files.
+
+`with_storage_lock()` makes that a startup error. The instance locks the directory, and building
+another one on it, in any process, fails with `ApiError::StorageInUse`. The lock lasts as long as
+the instance: it is released once the instance and every clone of it are dropped, or when the
+process exits, however it exits. A filesystem that cannot lock fails the build; see
+[One process per directory](../operations/storage.md#one-process-per-directory).
+
+```rust
+let fluree = FlureeBuilder::file("./data").with_storage_lock().build_async().await?;
+```
+
+Where code that opens storage cannot easily pass an instance around, `SharedFluree::open` returns
+the one instance this process keeps for a directory, opening it, with the lock, on first use.
+Handles dereference to `Fluree`. They own its lifecycle: the instance shuts down once the last
+handle is closed or dropped, `disconnect()` on it does nothing, and a `Fluree` cloned from a handle
+keeps the directory locked until that clone is dropped too:
+
+```rust
+use fluree_db_api::{SharedFluree, SharedOptions};
+
+let fluree = SharedFluree::open("./data", SharedOptions::default()).await?;
+fluree.create_ledger("mydb").await?;
+fluree.close().await;
+```
+
+To use one directory from several processes, run a [server](../operations/running-fluree.md) on it.
+
 ### Bulk import (high throughput)
 
 For initial ledger bootstraps (large Turtle or JSON-LD datasets), Fluree exposes a bulk import
@@ -700,7 +733,13 @@ writes, read between them, and commit them as one commit, use a
 Each `stage` applies its write over the ones before it (an update's `WHERE`
 sees an earlier insert), and is validated as it is staged: a write that fails
 to parse, is denied by policy, or violates SHACL returns an error and is left
-out, and the transaction carries on without it. `db()` reads the staged state.
+out, and the transaction carries on without it. Which shapes, uniqueness
+constraints and config apply is read once, from the state the transaction
+began on: a write that changes them does not change how a later write in the
+same transaction is checked. A model ledger the config names is read at the
+head the transaction's first lookup of it found. The config checks (a setting group split across
+graphs, a second value for a single-valued setting) run once, on what the
+transaction commits. `db()` reads the staged state.
 `commit` writes everything as one commit, keeping only the net change: a fact
 one write adds and a later one removes is not committed. If another commit
 lands first, a transaction that was never read is re-based over it when they
@@ -1315,8 +1354,11 @@ async fn main() -> Result<()> {
 ```
 
 `validation` is present for every non-fast-forward preview unless
-`MergePreviewOpts::include_validation` is `false`. A fast-forward adopts
-commits that were validated when they were authored, so it carries none.
+`MergePreviewOpts::include_validation` is `false`, and for a fast-forward
+when the target's config enables SHACL or uniqueness, or the commits it
+adopts carry config settings (a field the config reader reads, or a write to a config or txn-meta graph of this ledger): the merge checks them
+against the target's config as it is before the merge. Any other
+fast-forward carries none.
 
 #### Tuning the preview
 

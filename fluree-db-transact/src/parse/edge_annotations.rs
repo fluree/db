@@ -53,7 +53,10 @@
 //! module emits.
 
 use crate::error::{Result, TransactError};
-use fluree_graph_json_ld::{expand_iri, parse_context, ParsedContext, TypeValue};
+use fluree_graph_json_ld::{
+    classify_graph_value, expand_iri, is_graph_key, parse_context, GraphValue, ParsedContext,
+    TypeValue,
+};
 use fluree_vocab::{rdf, reifies_iris};
 use serde_json::{json, Map, Value};
 
@@ -363,14 +366,11 @@ pub(crate) fn emit_reifies_object_payload(shape: &ReifiedObjectShape) -> (Value,
 }
 
 /// Mutable counter used to mint unique blank-node IDs for anonymous
-/// annotation subjects. Threaded through the recursion so siblings
-/// don't collide.
+/// annotation subjects. Threaded through the recursion so the minted
+/// labels don't collide.
 pub(crate) struct LowerCtx {
     /// Counter for `_:fluree_ann_N` blank-node IDs.
     next_anon_id: usize,
-    /// Sibling top-level nodes synthesized during lowering. Each entry
-    /// is a complete node-map ready for the standard parser to ingest.
-    siblings: Vec<Value>,
     /// When `true`, an empty `@annotation: {}` block mints a fresh
     /// property-less annotation subject (LPG mode — Cypher
     /// relationships retain identity without properties). When
@@ -385,17 +385,21 @@ impl LowerCtx {
     fn new(lpg_mode: bool) -> Self {
         Self {
             next_anon_id: 0,
-            siblings: Vec::new(),
             lpg_mode,
         }
     }
 
     fn mint_blank(&mut self) -> String {
-        let id = format!("_:fluree_ann_{}", self.next_anon_id);
+        let id = format!("{ANN_BLANK_PREFIX}{}", self.next_anon_id);
         self.next_anon_id += 1;
         id
     }
 }
+
+/// Label prefix of the blank nodes the lowering mints for anonymous
+/// annotation subjects and objects. Reserved: the firewall refuses user
+/// labels that start with it.
+const ANN_BLANK_PREFIX: &str = "_:fluree_ann_";
 
 /// Reject any user-authored `f:reifies*` IRI before lowering runs, so
 /// the firewall doesn't fire on the IRIs that this module
@@ -446,6 +450,17 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
                 if opaque && k == "@value" {
                     continue;
                 }
+                // The lowering labels anonymous annotation nodes with a
+                // reserved prefix; a user node with such a label would merge
+                // with one of them.
+                if k == "@id" || *k == effective.id_key {
+                    if let Some(label) = v.as_str().filter(|s| s.starts_with(ANN_BLANK_PREFIX)) {
+                        return Err(TransactError::Parse(format!(
+                            "blank-node label {label:?} uses the prefix {ANN_BLANK_PREFIX:?}, \
+                             which is reserved for edge-annotation nodes; choose another label"
+                        )));
+                    }
+                }
                 let expanded_key = if k.starts_with('@') {
                     k.clone()
                 } else {
@@ -476,15 +491,10 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
 /// `@annotation` / `@edge` / `@reifies` blocks into the equivalent
 /// `f:reifies*` triples.
 ///
-/// The transformation is in-place on the structure of `doc` plus
-/// possibly appended sibling nodes (returned alongside). Callers
-/// should re-wrap accordingly:
-///
-/// - Single-node form `{ ... }` → `{"@graph": [<original>, <siblings>...]}`
-///   when siblings exist, otherwise unchanged.
-/// - Array form `[...]` → original array with siblings appended.
-/// - Envelope form `{"@graph": [...]}` → siblings appended to the
-///   existing `@graph` array.
+/// The transformation is in place: each annotation becomes a node
+/// included (`@included`) in the node that is its edge's subject, so the
+/// parser writes it in exactly the scope (graph) it writes that edge in.
+/// The document keeps its shape.
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
     let top_ctx = top_level_context(doc)?;
     scan_user_authored_reifies_iris(doc, &top_ctx)?;
@@ -512,14 +522,9 @@ pub fn lower_edge_annotations_after_firewall(
     let mut ctx = LowerCtx::new(lpg_mode);
     let walk_ctx = WalkCtx {
         json_ld: top_ctx,
-        graph: None,
+        root: true,
     };
-    lower_value_with_subject(doc, None, &walk_ctx, &mut ctx)?;
-
-    if !ctx.siblings.is_empty() {
-        attach_siblings(doc, ctx.siblings);
-    }
-    Ok(())
+    lower_value_with_subject(doc, None, &walk_ctx, &mut ctx)
 }
 
 /// Parse the document's top-level `@context` once. Used by both the
@@ -668,7 +673,19 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
         out_where: &mut new_where_patterns,
         next_var: &mut next_var,
     };
-    walk_delete_for_annotations(&mut delete_val, &top_ctx, None, &mut sink)?;
+    match &mut delete_val {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                match graph_sugar_mut(item) {
+                    Some((name, pattern)) => {
+                        walk_delete_for_annotations(pattern, &top_ctx, name.as_deref(), &mut sink)?;
+                    }
+                    None => walk_delete_for_annotations(item, &top_ctx, None, &mut sink)?,
+                }
+            }
+        }
+        other => walk_delete_for_annotations(other, &top_ctx, None, &mut sink)?,
+    }
 
     // Splice the new templates into the delete clause. Convert
     // single-object form to an array, then append.
@@ -867,55 +884,126 @@ fn walk_delete_for_annotations(
                 })
                 .map(String::from);
 
-            // Per-node `@graph: "<iri>"` overrides the inherited
-            // graph for this subtree. Mirrors
-            // `extract_node_graph_selector` from the assertion-side
-            // walker so the two paths agree on graph scoping.
-            let node_graph: Option<String> = match map.get("@graph") {
-                Some(Value::String(s)) => Some(s.clone()),
-                Some(Value::Object(g)) => g.get("@id").and_then(Value::as_str).map(String::from),
-                _ => None,
+            // A per-node graph selector overrides the inherited graph for
+            // this subtree, and a named graph's content is in the graph its
+            // `@id` names: the same classifier and the same reading as the
+            // assertion-side walker and the parser.
+            let graph_key = graph_entry_key(map, effective_ctx, false);
+            let (node_graph, content_graph): (Option<String>, Option<String>) = match graph_key
+                .as_ref()
+                .and_then(|k| map.get(k))
+                .map(classify_graph_value)
+            {
+                Some(GraphValue::Selector(raw)) => (Some(raw.to_string()), None),
+                Some(GraphValue::Content(_)) => (
+                    None,
+                    parent_id.as_deref().map(|id| {
+                        fluree_graph_json_ld::expand_iri_with_vocab(id, effective_ctx, false)
+                    }),
+                ),
+                _ => (None, None),
             };
             let node_graph_ref = node_graph.as_deref();
             let effective_graph: Option<&str> = node_graph_ref.or(inherited_graph);
 
-            // First pass: find predicate keys whose value carries an
+            // First pass: find the edges whose value carries an
             // `@annotation`, lift them into retract templates, and
-            // remove from the parent. We collect mutations first to
-            // avoid borrowing twice.
-            let predicate_keys: Vec<String> = map
+            // remove them from the parent. Keys are read as the insert
+            // walker reads them (`classify_edge_key`): a property, a term
+            // defined with `@reverse`, or the `@reverse` keyword's map.
+            // The retract goes to the edge's graph: this node's scope.
+            let keys: Vec<String> = map
                 .keys()
-                .filter(|k| !k.starts_with('@') && *k != effective_ctx.id_key.as_str())
+                .filter(|k| {
+                    *k != effective_ctx.id_key.as_str() && graph_key.as_deref() != Some(k.as_str())
+                })
                 .cloned()
                 .collect();
 
             let mut keys_to_remove: Vec<String> = Vec::new();
-            for key in predicate_keys {
+            for key in keys {
+                let edge = classify_edge_key(&key, effective_ctx);
                 let value = map.get_mut(&key).expect("collected key");
-                lift_annotations_under_predicate(
-                    parent_id.as_deref(),
-                    &key,
-                    value,
-                    effective_ctx,
-                    effective_graph,
-                    sink,
-                    &mut |strip_predicate| {
-                        if strip_predicate {
-                            keys_to_remove.push(key.clone());
+                match edge {
+                    EdgeKey::Forward => lift_annotations_under_predicate(
+                        Direction::Forward {
+                            subject: parent_id.as_deref().unwrap_or_default(),
+                        },
+                        parent_id.is_some(),
+                        &key,
+                        value,
+                        effective_ctx,
+                        effective_graph,
+                        sink,
+                        &mut |strip| {
+                            if strip {
+                                keys_to_remove.push(key.clone());
+                            }
+                        },
+                    )?,
+                    EdgeKey::Reverse(property) => lift_annotations_under_predicate(
+                        Direction::Reverse {
+                            object: parent_id.as_deref().unwrap_or_default(),
+                        },
+                        parent_id.is_some(),
+                        &property,
+                        value,
+                        effective_ctx,
+                        effective_graph,
+                        sink,
+                        &mut |strip| {
+                            if strip {
+                                keys_to_remove.push(key.clone());
+                            }
+                        },
+                    )?,
+                    EdgeKey::Keyword("@reverse") => {
+                        if let Value::Object(reverse) = value {
+                            let mut properties_to_remove: Vec<String> = Vec::new();
+                            for (property, values) in reverse.iter_mut() {
+                                lift_annotations_under_predicate(
+                                    Direction::Reverse {
+                                        object: parent_id.as_deref().unwrap_or_default(),
+                                    },
+                                    parent_id.is_some(),
+                                    property,
+                                    values,
+                                    effective_ctx,
+                                    effective_graph,
+                                    sink,
+                                    &mut |strip| {
+                                        if strip {
+                                            properties_to_remove.push(property.clone());
+                                        }
+                                    },
+                                )?;
+                            }
+                            for property in properties_to_remove {
+                                reverse.remove(&property);
+                            }
+                            if reverse.is_empty() {
+                                keys_to_remove.push(key.clone());
+                            }
                         }
-                    },
-                )?;
+                    }
+                    EdgeKey::Keyword(_) => {}
+                }
             }
             for k in keys_to_remove {
                 map.remove(&k);
             }
 
             // Second pass: recurse into remaining (non-stripped)
-            // child values to handle nested delete shapes.
+            // child values to handle nested delete shapes. A named graph's
+            // content is in the graph it names.
             let remaining: Vec<String> = map.keys().cloned().collect();
             for key in remaining {
+                let scope = match content_graph.as_deref() {
+                    Some(named) if graph_key.as_deref() == Some(key.as_str()) => Some(named),
+                    _ => effective_graph,
+                };
                 if let Some(v) = map.get_mut(&key) {
-                    walk_delete_for_annotations(v, effective_ctx, effective_graph, sink)?;
+                    walk_delete_for_annotations(v, effective_ctx, scope, sink)?;
                 }
             }
             Ok(())
@@ -924,20 +1012,24 @@ fn walk_delete_for_annotations(
     }
 }
 
-/// Process the value of a single predicate inside a delete clause.
-/// When the value is an object containing an `@annotation` block,
-/// lift it into a retract template (appended to `out`) and signal
-/// the caller to strip the predicate from the parent.
+/// Process the value of a single edge inside a delete clause. When the
+/// value is an object containing an `@annotation` block, lift it into a
+/// retract template (appended to `out`) and signal the caller to strip
+/// the edge from the parent.
 ///
-/// `inherited_graph` is the named-graph in scope at the predicate-
-/// value's parent; per-object `@graph` overrides apply on the inner
-/// node and propagate via the recursion in `walk_delete_for_annotations`.
+/// `edge_graph` is the graph the edge is in: the scope of the node that
+/// states it (its own selector, else the inherited one). A value's own
+/// `@graph` scopes that value's subtree, not the edge, exactly as on the
+/// insert side. `has_parent_id` says whether the node carries an `@id`
+/// (the edge's subject, or for a reverse property its object).
+#[allow(clippy::too_many_arguments)]
 fn lift_annotations_under_predicate(
-    parent_subject: Option<&str>,
+    direction: Direction<'_>,
+    has_parent_id: bool,
     predicate: &str,
     value: &mut Value,
     ctx: &ParsedContext,
-    inherited_graph: Option<&str>,
+    edge_graph: Option<&str>,
     sink: &mut DeleteAnnotationSink<'_>,
     strip_callback: &mut dyn FnMut(bool),
 ) -> Result<()> {
@@ -951,11 +1043,12 @@ fn lift_annotations_under_predicate(
             for mut item in std::mem::take(items) {
                 let mut item_stripped = false;
                 lift_annotations_under_predicate(
-                    parent_subject,
+                    direction,
+                    has_parent_id,
                     predicate,
                     &mut item,
                     ctx,
-                    inherited_graph,
+                    edge_graph,
                     sink,
                     &mut |s| item_stripped = s,
                 )?;
@@ -974,27 +1067,16 @@ fn lift_annotations_under_predicate(
             if !map.contains_key(ANNOTATION_KEY) && !map.contains_key(EDGE_KEY) {
                 return Ok(());
             }
-            let parent_subject = parent_subject.ok_or_else(|| {
-                TransactError::Parse(
+            if !has_parent_id {
+                return Err(TransactError::Parse(
                     "delete-clause @annotation requires the enclosing predicate to have a \
                      parent @id (the subject of the reified edge)"
                         .to_string(),
-                )
-            })?;
-
-            // Per-object `@graph` selector on the *base edge object*
-            // overrides the inherited graph. Mirrors the
-            // assertion-side walker's per-node graph extraction.
-            // Captured BEFORE shape classification so a Ref object's
-            // graph selector is preserved (literal value-objects
-            // never carry `@graph` — the classifier whitelist
-            // rejects it as a stray key).
-            let object_graph: Option<String> = match map.get("@graph") {
-                Some(Value::String(s)) => Some(s.clone()),
-                Some(Value::Object(g)) => g.get("@id").and_then(Value::as_str).map(String::from),
-                _ => None,
-            };
-            let effective_graph: Option<&str> = object_graph.as_deref().or(inherited_graph);
+                ));
+            }
+            // The value's own `@graph` selector scopes the value's node, not
+            // the edge: it is stripped below before classifying.
+            let object_graph_key = graph_entry_key(map, ctx, false);
 
             let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
             let Some(ann_block) = ann_block else {
@@ -1012,8 +1094,17 @@ fn lift_annotations_under_predicate(
             // selector before classifying so it doesn't trip the
             // identifier-typed value-object stray-key check (it lives
             // on the parent node, not on a value-object).
-            map.remove("@graph");
-            let object_shape = if map.contains_key("@value") || map.contains_key("@language") {
+            if let Some(key) = &object_graph_key {
+                map.remove(key);
+            }
+            let is_value_object = map.contains_key("@value") || map.contains_key("@language");
+            if is_value_object && matches!(direction, Direction::Reverse { .. }) {
+                return Err(TransactError::Parse(format!(
+                    "a reverse property's value is a node, the subject of the edge; \
+                     '{predicate}' has a literal value"
+                )));
+            }
+            let value_shape = if is_value_object {
                 // Mirror the insert-path guard: annotated literals
                 // must NOT rely on @context coercion, since the
                 // synthesized f:reifies* bundle would otherwise decode
@@ -1047,13 +1138,20 @@ fn lift_annotations_under_predicate(
                 ReifiedObjectShape::Iri(object_id)
             };
 
+            let (subject, object_shape) = match (direction, value_shape) {
+                (Direction::Forward { subject }, shape) => (subject.to_string(), shape),
+                (Direction::Reverse { object }, ReifiedObjectShape::Iri(value_id)) => {
+                    (value_id, ReifiedObjectShape::Iri(object.to_string()))
+                }
+                (Direction::Reverse { .. }, _) => unreachable!("refused above"),
+            };
             build_annotation_delete(
-                parent_subject,
+                &subject,
                 predicate,
                 &object_shape,
                 ann_block,
                 ctx,
-                effective_graph,
+                edge_graph,
                 sink,
             )?;
 
@@ -1164,25 +1262,14 @@ fn build_annotation_delete(
         edge.insert("@id".to_string(), json!(parent_subject));
         edge.insert(predicate.to_string(), object_payload.clone());
         where_node.insert(REIFIES_KEY.to_string(), Value::Object(edge));
+        // The annotation lives in its edge's graph: scope the pattern to
+        // it with a node-level `@graph`, whose name the `where` resolves
+        // exactly as the delete template's (a compact IRI, `"default"`,
+        // `"config"`, a `fromNamed` alias).
         if let Some(graph) = graph_iri {
-            // Named-graph case: wrap the node in the JLDQ s-expression
-            // graph form `["graph", "<iri>", { ...patterns... }]` so
-            // the WHERE evaluation scopes its triple matches to the
-            // named graph. Without the wrapper a default-graph WHERE
-            // would not see flakes that live only inside the named
-            // graph, and the variable would never bind.
-            //
-            // The graph name is stored unchanged through to execution
-            // (`GraphName::Iri(Arc::from(name))` in `parse/lower.rs`),
-            // so we expand compact IRIs here against the document's
-            // top-level `@context` rather than leaving them for a
-            // resolution pass that doesn't run for this position.
-            let expanded_graph = expand_iri(graph, ctx);
-            sink.out_where
-                .push(json!(["graph", expanded_graph, Value::Object(where_node),]));
-        } else {
-            sink.out_where.push(Value::Object(where_node));
+            where_node.insert("@graph".to_string(), Value::String(graph.to_string()));
         }
+        sink.out_where.push(Value::Object(where_node));
 
         var
     };
@@ -1207,9 +1294,9 @@ fn build_annotation_delete(
     // retract flakes (`g = None`) which can't cancel named-graph
     // assertions — flake identity includes `g`. Mirrors the
     // assertion-side `build_annotation_sibling` graph emission so
-    // assert and retract round-trip exactly.
+    // assert and retract round-trip exactly; the parser adds the
+    // `f:reifiesGraph` retraction from the scope (`GraphScope::emit`).
     if let Some(graph) = graph_iri {
-        template.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
         template.insert("@graph".to_string(), Value::String(graph.to_string()));
     }
     sink.out_templates.push(Value::Object(template));
@@ -1219,15 +1306,14 @@ fn build_annotation_delete(
 /// Inherited context for the lowering walker.
 ///
 /// `json_ld` is used for compact-IRI resolution checks (the same
-/// context the firewall scan resolves against). `graph` is the
-/// in-effect named-graph IRI for the current node — propagated from
-/// envelope-level `@graph` selectors and per-node `@graph: "<iri>"`
-/// keys, so synthetic annotation siblings can carry `f:reifiesGraph`
-/// when the reified edge lives in a named graph.
+/// context the firewall scan resolves against). The walker tracks no
+/// graph: an annotation node is included in its edge's subject node,
+/// so the parser places both in one scope.
 #[derive(Clone, Copy)]
 pub(crate) struct WalkCtx<'a> {
     json_ld: &'a ParsedContext,
-    graph: Option<&'a str>,
+    /// The document root: its bare `graph` key is a routing key.
+    root: bool,
 }
 
 /// Recursively reject `@annotation` / `@edge` / `@reifies` anywhere
@@ -1315,39 +1401,20 @@ fn ensure_subject_id(
     new_id
 }
 
-/// Construct the synthetic top-level node for an annotation. Returns a
-/// node-map containing `@id` (the annotation subject) plus the seven
-/// `f:reifies*` predicates and the body properties.
-///
-/// `base_subject_id` is `None` when we cannot determine the surrounding
-/// node's `@id` from the local context (e.g. the parent had not yet
-/// been finalized when we entered this call). In that case we pass the
-/// resolution responsibility to the caller via a deferred-id scheme:
-/// the synthetic node carries `f:reifiesSubject` as a *placeholder*
-/// blank-node reference that the second lowering pass binds.
-///
-/// In v1, the surrounding `lower_object` already runs before this
-/// helper for top-level objects, so `base_subject_id` is always
-/// populated by the call chain that reaches the inline form. The
-/// `None` arm exists for future deeper nesting and is rejected at
-/// runtime as a deferred shape.
-fn build_annotation_sibling(
-    base_subject_id: Option<&str>,
+/// The node for one annotation of the edge `(subject, predicate, object)`:
+/// `@id` (the annotation subject), the `f:reifies*` predicates pinning the
+/// edge, and the body properties. The caller includes it in the edge's
+/// subject node, so it is written in the edge's own scope; the parser then
+/// anchors the bundle to the graph it lands in (`f:reifiesGraph`,
+/// `GraphScope::emit`).
+fn build_annotation_node(
+    subject: &str,
     predicate: &str,
     object: &ReifiedObjectShape,
     ann_block: Value,
-    base_graph: Option<&str>,
     json_ld: &ParsedContext,
     ctx: &mut LowerCtx,
 ) -> Result<Option<Value>> {
-    let base_subject_id = base_subject_id.ok_or_else(|| {
-        TransactError::UnsupportedFeature(
-            "edge annotations on deeply-nested predicate paths are not supported in v1; \
-             attach @annotation to a single hop from a top-level @id"
-                .to_string(),
-        )
-    })?;
-
     let Value::Object(mut ann_map) = ann_block else {
         return Err(TransactError::Parse(
             "@annotation value must be a JSON object describing the annotation subject".to_string(),
@@ -1384,10 +1451,7 @@ fn build_annotation_sibling(
     ann_map.insert("@id".to_string(), json!(ann_id.clone()));
 
     // f:reifies* predicates pinning the base edge.
-    ann_map.insert(
-        reifies_iris::SUBJECT.to_string(),
-        json!({"@id": base_subject_id}),
-    );
+    ann_map.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
     ann_map.insert(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
@@ -1405,20 +1469,6 @@ fn build_annotation_sibling(
         ann_map.insert(reifies_iris::LANG.to_string(), json!(lang));
     }
 
-    // f:reifiesGraph — emitted iff the reified edge lives in a named
-    // graph. Default-graph edges omit it (absence = default);
-    // `fold_slots_into_links` puts the link in its template's graph.
-    //
-    // The synthetic annotation node *also* lives in the same named
-    // graph as the edge it reifies, so we set its own `@graph`
-    // selector to the same IRI. Otherwise the annotation flakes
-    // would land in the default graph while the edge is in a named
-    // graph — a partition that breaks both visibility and cascade.
-    if let Some(graph_iri) = base_graph {
-        ann_map.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph_iri}));
-        ann_map.insert("@graph".to_string(), json!(graph_iri));
-    }
-
     // f:reifiesDatatype is intentionally omitted at lowering time —
     // we don't know the object's datatype before JSON-LD expansion.
     // `fold_slots_into_links` takes it from the `f:reifiesObject` value.
@@ -1429,13 +1479,13 @@ fn build_annotation_sibling(
 /// Lower a `@reifies` block on the enclosing node: the node is a reifier,
 /// and each triple the block describes becomes its `rdf:reifies` link
 /// without being asserted (RDF 1.2). An array reifies several triples; the
-/// first rides on the node, the rest on siblings with the same `@id`.
+/// first rides on the node, the rest on nodes with the same `@id` included
+/// in it, so in its scope.
 fn lower_reifies_block(
     map: &mut Map<String, Value>,
     reifier: &str,
     reifies_val: Value,
-    graph: Option<&str>,
-    ctx: &mut LowerCtx,
+    json_ld: &ParsedContext,
 ) -> Result<()> {
     let blocks = match reifies_val {
         Value::Array(blocks) if !blocks.is_empty() => blocks,
@@ -1446,18 +1496,19 @@ fn lower_reifies_block(
         }
         block => vec![block],
     };
+    let mut included = Vec::new();
     for (i, block) in blocks.into_iter().enumerate() {
         let slots = reifies_slots(block)?;
         if i == 0 {
             map.extend(slots);
         } else {
-            let mut sibling = slots;
-            sibling.insert("@id".to_string(), json!(reifier));
-            if let Some(graph) = graph {
-                sibling.insert("@graph".to_string(), json!(graph));
-            }
-            ctx.siblings.push(Value::Object(sibling));
+            let mut node = slots;
+            node.insert("@id".to_string(), json!(reifier));
+            included.push(Value::Object(node));
         }
+    }
+    if !included.is_empty() {
+        include_nodes(map, json_ld, included);
     }
     Ok(())
 }
@@ -1538,54 +1589,6 @@ fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
     Ok(slots)
 }
 
-/// Append synthetic sibling nodes to the document so the standard
-/// parser ingests them alongside the original payload.
-fn attach_siblings(doc: &mut Value, siblings: Vec<Value>) {
-    if siblings.is_empty() {
-        return;
-    }
-    match doc {
-        Value::Object(map) => {
-            // Envelope form: append to the existing @graph.
-            if let Some(Value::Array(arr)) = map.get_mut("@graph") {
-                arr.extend(siblings);
-                return;
-            }
-            // Single-node form: rewrap as `{"@graph": [original, siblings...]}`,
-            // preserving the @context at the top level.
-            let original = std::mem::replace(map, Map::new());
-            // Move @context out (if any) to keep it at the envelope level.
-            let mut envelope = Map::new();
-            let mut original_node = original;
-            if let Some(ctx) = original_node.remove("@context") {
-                envelope.insert("@context".to_string(), ctx);
-            }
-            // Lift transactor-reserved keys (routing / control, e.g. a body-form
-            // `ledger`) out of the data node up to the envelope, where
-            // `strip_opts_for_expansion` removes them before expansion.
-            // Without this, rewrapping buries them inside `@graph` and they
-            // leak as stray predicates on the subject (e.g. `<s> ledger "...").
-            for key in super::RESERVED_TXN_KEYS {
-                if let Some(v) = original_node.remove(*key) {
-                    envelope.insert((*key).to_string(), v);
-                }
-            }
-            let mut graph_items = Vec::with_capacity(1 + siblings.len());
-            graph_items.push(Value::Object(original_node));
-            graph_items.extend(siblings);
-            envelope.insert("@graph".to_string(), Value::Array(graph_items));
-            *map = envelope;
-        }
-        Value::Array(arr) => {
-            arr.extend(siblings);
-        }
-        _ => {
-            // Top-level scalar shouldn't occur for a transaction
-            // document; the rest of the parser will reject it.
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Two-pass lowering: the first pass needs the *parent's* `@id` to set
 // `f:reifiesSubject`, but the parent's id may be assigned (via a fresh
@@ -1607,43 +1610,18 @@ pub(crate) fn lower_value_with_subject(
 ) -> Result<()> {
     match value {
         Value::Array(items) => {
+            let item_walk = WalkCtx {
+                root: false,
+                ..*walk
+            };
             for item in items {
-                lower_value_with_subject(item, parent_subject, walk, ctx)?;
+                lower_value_with_subject(item, parent_subject, &item_walk, ctx)?;
             }
             Ok(())
         }
         Value::Object(map) => lower_object_with_subject(map, parent_subject, walk, ctx),
         _ => Ok(()),
     }
-}
-
-/// True when `map` is an envelope wrapper rather than a node-map. The
-/// transactor's envelope form is `{"@context": ..., "@graph": [...]}`
-/// or just `{"@graph": [...]}` — the wrapper holds no predicates of
-/// its own and must not be treated as a node (e.g. by minting an @id
-/// for it, which would then become a stray subject).
-///
-/// `opts` is a known top-level transactor key (stripped before
-/// JSON-LD expansion by `strip_opts_for_expansion`); allowing it here
-/// keeps documents like `{"@context": ..., "opts": ..., "@graph": [...]}`
-/// classified as envelopes so we don't mint a synthetic subject for the
-/// outer wrapper.
-///
-/// The transactor-reserved routing / dataset keys ([`super::RESERVED_TXN_KEYS`],
-/// e.g. body-ledger `ledger`, `from`) ride along in the JSON body and must be
-/// tolerated here too — without this, a body-ledger `{"ledger": "...",
-/// "@context": ..., "@graph": [...]}` document is misclassified as a node-map,
-/// the `@graph` array is skipped during `@annotation` lowering, and
-/// annotations silently survive raw into JSON-LD expansion as dangling literal
-/// predicates (no reification bundle).
-fn is_envelope(map: &Map<String, Value>) -> bool {
-    if !matches!(map.get("@graph"), Some(Value::Array(_))) {
-        return false;
-    }
-    map.keys().all(|k| {
-        matches!(k.as_str(), "@context" | "@graph")
-            || super::RESERVED_TXN_KEYS.contains(&k.as_str())
-    })
 }
 
 /// True when `map` is a transaction wrapper (UPDATE / explicit
@@ -1748,19 +1726,6 @@ fn opaque_subtree(map: &Map<String, Value>, ctx: Option<&ParsedContext>) -> bool
     })
 }
 
-/// Extract a per-node graph selector. Returns the raw IRI / variable
-/// string when present, `None` otherwise. Per-node `@graph` differs
-/// from envelope `@graph` (which is an array of nodes) — this only
-/// fires on the per-node form.
-fn extract_node_graph_selector(map: &Map<String, Value>) -> Option<String> {
-    let val = map.get("@graph")?;
-    match val {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(g) => g.get("@id").and_then(|x| x.as_str()).map(String::from),
-        _ => None,
-    }
-}
-
 fn lower_object_with_subject(
     map: &mut Map<String, Value>,
     _parent_subject: Option<&str>,
@@ -1802,17 +1767,6 @@ fn lower_object_with_subject(
         return Ok(());
     }
 
-    // Envelope form: recurse into `@graph` only. Don't mint an @id
-    // for the wrapper (it isn't a node). The envelope's `@graph`
-    // is the default-graph wrapper, so child nodes inherit the same
-    // graph context as the envelope.
-    if is_envelope(map) {
-        if let Some(graph_val) = map.get_mut("@graph") {
-            lower_value_with_subject(graph_val, None, walk, ctx)?;
-        }
-        return Ok(());
-    }
-
     // Transaction-wrapper form: an UPDATE-style document
     // `{"where": ..., "delete": ..., "insert": ..., "upsert": ...,
     // "values": ..., "opts": ..., "ledger": ..., "@context": ...}`.
@@ -1822,30 +1776,23 @@ fn lower_object_with_subject(
     // a fresh top-level document. `where`, `values`, `opts`, and
     // `ledger` are query/control clauses (no annotations to lower at
     // this layer) so we skip them.
+    //
+    // The update's own `graph` key needs no handling here: each annotation
+    // node is included in its edge's subject node, so it is written in
+    // whatever scope the parser gives that node. `next_anon_id` stays
+    // shared so blank-node ids don't collide across clauses.
     if is_transaction_wrapper(map) {
+        let clause_walk = WalkCtx {
+            root: false,
+            ..*walk
+        };
         for clause in ["insert", "delete", "upsert"] {
             if let Some(clause_val) = map.get_mut(clause) {
-                // Siblings synthesized while lowering a clause belong to THAT
-                // clause's payload, not the top-level wrapper. Scope the
-                // accumulator to the clause: take it empty, recurse, then
-                // attach whatever this clause produced back onto its own
-                // value. `next_anon_id` stays shared so blank-node ids don't
-                // collide across clauses.
-                let outer = std::mem::take(&mut ctx.siblings);
-                lower_value_with_subject(clause_val, None, walk, ctx)?;
-                let clause_siblings = std::mem::replace(&mut ctx.siblings, outer);
-                attach_siblings(clause_val, clause_siblings);
+                lower_clause_value(clause_val, &clause_walk, ctx)?;
             }
         }
         return Ok(());
     }
-
-    // Compute the in-effect graph selector for this node and its
-    // children. Per-node `@graph: "<iri>"` overrides; otherwise we
-    // inherit from the walker.
-    let node_graph = extract_node_graph_selector(map);
-    let node_graph_ref = node_graph.as_deref();
-    let effective_graph = node_graph_ref.or(walk.graph);
 
     // Merge any per-node `@context` into the walker's parent context.
     // Without this, a node-local term definition (e.g. `"joinedAt":
@@ -1870,10 +1817,53 @@ fn lower_object_with_subject(
     };
     let effective_json_ld: &ParsedContext = local_merged.as_ref().unwrap_or(walk.json_ld);
 
+    // This node's `@graph` entry, read by the classifier the parser uses.
+    let graph_key = graph_entry_key(map, effective_json_ld, walk.root);
+    let has_id = map.contains_key("@id")
+        || (effective_json_ld.id_key != "@id" && map.contains_key(&effective_json_ld.id_key));
+    // The document's own top-level `@graph` is read the way the parser reads
+    // it (`doc_shape`): without an `@id`, any node content, a bare `{"@id"}`
+    // included, makes the document an envelope.
+    let root_envelope = walk.root
+        && !has_id
+        && map
+            .get("@graph")
+            .is_some_and(|g| matches!(fluree_graph_json_ld::is_envelope_graph(g, false), Ok(true)));
+    let (content_graph, content_in_scope) = match graph_key
+        .as_ref()
+        .and_then(|k| map.get(k))
+        .map(classify_graph_value)
+    {
+        _ if root_envelope => (false, true),
+        Some(GraphValue::Selector(_)) => (false, false),
+        // A JSON-LD named graph: its content is nodes in the graph its `@id`
+        // names.
+        Some(GraphValue::Content(_)) if has_id => (true, false),
+        // An envelope (a graph object without `@id`): the content nodes are
+        // in this scope, and the wrapper's other keys are not a node's
+        // properties.
+        Some(GraphValue::Content(_)) => (false, true),
+        // An invalid `@graph` value (a value object, a number, ...) is the
+        // parser's to refuse, but an annotation keyword inside it is refused
+        // here by name, as on any other value wrapper.
+        Some(GraphValue::Invalid(_)) => {
+            if let Some(value) = graph_key.as_ref().and_then(|k| map.get(k)) {
+                scan_nested_annotation_keywords(value, effective_json_ld)?;
+            }
+            (false, false)
+        }
+        None => (false, false),
+    };
     let child_walk = WalkCtx {
         json_ld: effective_json_ld,
-        graph: effective_graph,
+        root: false,
     };
+    if content_in_scope {
+        if let Some(content) = graph_key.as_ref().and_then(|k| map.get_mut(k)) {
+            lower_value_with_subject(content, None, &child_walk, ctx)?;
+        }
+        return Ok(());
+    }
 
     // 1. Honor `@reifies` on this node. Subject minting must use the
     //    merged context so a node-local `@id` alias is recognized.
@@ -1882,7 +1872,7 @@ fn lower_object_with_subject(
         // The lower function reads `map`'s `@id` directly, so the mint
         // must run first.
         let reifier = ensure_subject_id(map, &child_walk, ctx);
-        lower_reifies_block(map, &reifier, val, child_walk.graph, ctx)?;
+        lower_reifies_block(map, &reifier, val, effective_json_ld)?;
     }
 
     // 2. Walk predicate-value pairs. Skip JSON-LD keywords plus their
@@ -1907,12 +1897,20 @@ fn lower_object_with_subject(
     // `it_transact::object_var_test`, and the `it_txn_meta::*`
     // negative-validation tests when the lowering pass ran on
     // ordinary (non-annotation) transactions.
+    //
+    // Each annotation found becomes a node included in this node (the
+    // subject or, for a reverse property, the object of the edges it
+    // annotates), added once the walk is done.
     let id_alias = effective_json_ld.id_key.as_str();
     let type_alias = effective_json_ld.type_key.as_str();
     let keys: Vec<String> = map.keys().cloned().collect();
     let mut minted_id: Option<String> = read_existing_subject_id(map, &child_walk);
+    let mut included: Vec<Value> = Vec::new();
     for key in keys {
         if key == "@id" || key == "@context" || key == "@graph" || key == "@type" {
+            continue;
+        }
+        if graph_key.as_deref() == Some(key.as_str()) {
             continue;
         }
         if key == id_alias || key == type_alias {
@@ -1925,40 +1923,195 @@ fn lower_object_with_subject(
             )));
         }
 
-        let predicate = key.clone();
+        let edge = classify_edge_key(&key, effective_json_ld);
+        match edge {
+            EdgeKey::Keyword("@index") => continue,
+            // Included nodes are nodes in their own right, in this scope.
+            EdgeKey::Keyword("@included") => {
+                if let Some(v) = map.get_mut(&key) {
+                    lower_value_with_subject(v, None, &child_walk, ctx)?;
+                }
+                continue;
+            }
+            // A nested value's properties are this node's: an annotation
+            // inside it would be lowered against the wrong edge.
+            EdgeKey::Keyword("@nest") => {
+                if map.get(&key).is_some_and(value_subtree_carries_annotation) {
+                    return Err(TransactError::Parse(
+                        "edge annotations inside @nest are not supported; state the edge as an \
+                         ordinary property of its subject"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            }
+            _ => {}
+        }
 
-        // Mint the parent @id lazily — only if this predicate's value
-        // actually carries an annotation we'll need to anchor. Use an
-        // immutable peek first so the borrow of `map` is released
-        // before we hand it back mutably to `ensure_subject_id`.
-        if minted_id.is_none() {
-            let needs_mint = map
-                .get(&key)
-                .map(value_subtree_carries_annotation)
-                .unwrap_or(false);
-            if needs_mint {
-                minted_id = Some(ensure_subject_id(map, &child_walk, ctx));
+        // Mint this node's @id lazily — only if the value actually carries
+        // an annotation we'll need to anchor. Use an immutable peek first so
+        // the borrow of `map` is released before we hand it back mutably to
+        // `ensure_subject_id`.
+        if minted_id.is_none() && map.get(&key).is_some_and(value_subtree_carries_annotation) {
+            minted_id = Some(ensure_subject_id(map, &child_walk, ctx));
+        }
+        // `intercept_annotations_for_edges` only consults the node's id
+        // when it finds an annotation block; a placeholder is safe when no
+        // annotation is present because it returns early without using it.
+        let node_id = minted_id.clone().unwrap_or_default();
+
+        let value = map.get_mut(&key).expect("key collected from this map");
+        match edge {
+            // `@reverse`: a map of properties whose values are the subjects
+            // of edges pointing at this node.
+            EdgeKey::Keyword("@reverse") => {
+                if let Value::Object(reverse) = value {
+                    for (property, values) in reverse.iter_mut() {
+                        let direction = Direction::Reverse { object: &node_id };
+                        intercept_annotations_for_edges(
+                            direction,
+                            property,
+                            values,
+                            &child_walk,
+                            ctx,
+                            &mut included,
+                        )?;
+                    }
+                }
+            }
+            // A term defined with `@reverse`: its values are the subjects.
+            EdgeKey::Reverse(property) => {
+                let direction = Direction::Reverse { object: &node_id };
+                intercept_annotations_for_edges(
+                    direction,
+                    &property,
+                    value,
+                    &child_walk,
+                    ctx,
+                    &mut included,
+                )?;
+            }
+            _ => {
+                let direction = Direction::Forward { subject: &node_id };
+                intercept_annotations_for_edges(
+                    direction,
+                    &key,
+                    value,
+                    &child_walk,
+                    ctx,
+                    &mut included,
+                )?;
             }
         }
 
-        let value = map.get_mut(&key).expect("key collected from this map");
-
-        // `intercept_annotations_for_predicate` only consults
-        // `parent_subject` when it finds an annotation block; passing a
-        // synthetic placeholder when no annotation is present is safe
-        // because the function returns early without using it.
-        let placeholder = String::new();
-        let parent = minted_id.as_deref().unwrap_or(&placeholder);
-        intercept_annotations_for_predicate(parent, &predicate, value, &child_walk, ctx)?;
-
         // Recurse into the rewritten value to catch nested forms.
-        // Reborrow because intercept_* may have mutated the map.
         if let Some(v) = map.get_mut(&key) {
             let parent_ref = minted_id.as_deref();
             lower_value_with_subject(v, parent_ref, &child_walk, ctx)?;
         }
     }
+
+    // A named graph's content: nodes in the graph the node names.
+    if content_graph {
+        if let Some(content) = graph_key.as_ref().and_then(|key| map.get_mut(key)) {
+            lower_value_with_subject(content, None, &child_walk, ctx)?;
+        }
+    }
+
+    if !included.is_empty() {
+        include_nodes(map, effective_json_ld, included);
+    }
     Ok(())
+}
+
+/// What a node's key is, as an edge of that node: a JSON-LD keyword
+/// (directly or through a context alias), a term defined with `@reverse`
+/// (its values are the subjects of edges pointing at the node; the reverse
+/// property's IRI), or an ordinary property.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EdgeKey<'a> {
+    Keyword(&'a str),
+    Reverse(String),
+    Forward,
+}
+
+/// Classify `key` against `ctx`. Shared by the insert and delete walkers, so
+/// both read a key the same way the expander does.
+fn classify_edge_key<'a>(key: &'a str, ctx: &'a ParsedContext) -> EdgeKey<'a> {
+    if key.starts_with('@') {
+        return EdgeKey::Keyword(key);
+    }
+    match ctx.get(key) {
+        Some(entry) => match (&entry.id, &entry.reverse) {
+            (Some(id), _) if id.starts_with('@') => EdgeKey::Keyword(id.as_str()),
+            (None, Some(reverse)) => EdgeKey::Reverse(reverse.clone()),
+            _ => EdgeKey::Forward,
+        },
+        None => EdgeKey::Forward,
+    }
+}
+
+/// Add `nodes` to `map`'s `@included` (under the key the document already
+/// uses for it, a context alias included), keeping any nodes already there.
+fn include_nodes(map: &mut Map<String, Value>, ctx: &ParsedContext, nodes: Vec<Value>) {
+    let key = map
+        .keys()
+        .find(|k| classify_edge_key(k, ctx) == EdgeKey::Keyword("@included"))
+        .cloned()
+        .unwrap_or_else(|| "@included".to_string());
+    match map.get_mut(&key) {
+        Some(Value::Array(existing)) => existing.extend(nodes),
+        Some(single) => {
+            let node = std::mem::take(single);
+            *single = Value::Array(std::iter::once(node).chain(nodes).collect());
+        }
+        None => {
+            map.insert(key, Value::Array(nodes));
+        }
+    }
+}
+
+/// Lower an update clause's value. A `["graph", <name>, <pattern>]` item
+/// scopes its pattern to that graph, exactly as the parser scopes it.
+fn lower_clause_value(value: &mut Value, walk: &WalkCtx<'_>, ctx: &mut LowerCtx) -> Result<()> {
+    let Value::Array(items) = value else {
+        return lower_value_with_subject(value, None, walk, ctx);
+    };
+    for item in items.iter_mut() {
+        match graph_sugar_mut(item) {
+            Some((_, pattern)) => lower_value_with_subject(pattern, None, walk, ctx)?,
+            None => lower_value_with_subject(item, None, walk, ctx)?,
+        }
+    }
+    Ok(())
+}
+
+/// The name (when it is a graph selector) and pattern of a
+/// `["graph", <name>, <pattern>]` update-template item.
+fn graph_sugar_mut(item: &mut Value) -> Option<(Option<String>, &mut Value)> {
+    let Value::Array(arr) = item else {
+        return None;
+    };
+    if arr.len() != 3 || arr[0].as_str() != Some("graph") {
+        return None;
+    }
+    let name = match classify_graph_value(&arr[1]) {
+        GraphValue::Selector(raw) => Some(raw.to_string()),
+        _ => None,
+    };
+    Some((name, &mut arr[2]))
+}
+
+/// The key of `map`'s `@graph` entry: the keyword, a context alias of it, or
+/// the legacy bare `graph` key. At the document root a bare `graph` key is
+/// the transaction's routing key, stripped before parsing, not a selector.
+fn graph_entry_key(map: &Map<String, Value>, ctx: &ParsedContext, root: bool) -> Option<String> {
+    if map.contains_key("@graph") {
+        return Some("@graph".to_string());
+    }
+    map.keys()
+        .find(|k| is_graph_key(k, ctx) && !(root && k.as_str() == "graph"))
+        .cloned()
 }
 
 /// Read an already-present subject id from a node-map, honoring the
@@ -2009,19 +2162,32 @@ fn value_subtree_carries_annotation(value: &Value) -> bool {
     }
 }
 
-/// Variant of `intercept_annotations_in_value` that has the parent
-/// subject available, so `f:reifiesSubject` can be set correctly.
-fn intercept_annotations_for_predicate(
-    parent_subject: &str,
+/// Which end of the annotated edges the walked node is.
+#[derive(Clone, Copy)]
+enum Direction<'a> {
+    /// The node is the subject; each value is an edge's object.
+    Forward { subject: &'a str },
+    /// A reverse property: each value is an edge's subject, and the node is
+    /// the object.
+    Reverse { object: &'a str },
+}
+
+/// Lower the `@annotation` blocks on `value` (one value, or an array of
+/// them), the objects (or, for a reverse property, the subjects) of the
+/// node's `predicate` edges: each becomes an annotation node, pushed to
+/// `included` for the node to include.
+fn intercept_annotations_for_edges(
+    direction: Direction<'_>,
     predicate: &str,
     value: &mut Value,
     walk: &WalkCtx<'_>,
     ctx: &mut LowerCtx,
+    included: &mut Vec<Value>,
 ) -> Result<()> {
     match value {
         Value::Array(items) => {
             for item in items {
-                intercept_annotations_for_predicate(parent_subject, predicate, item, walk, ctx)?;
+                intercept_annotations_for_edges(direction, predicate, item, walk, ctx, included)?;
             }
             Ok(())
         }
@@ -2053,35 +2219,49 @@ fn intercept_annotations_for_predicate(
             // work — building `ReifiedObjectShape::Iri` directly from
             // the returned id.
             let is_value_object_shape = map.contains_key("@value") || map.contains_key("@language");
-            let shape = if is_value_object_shape {
-                // Reject @context-coerced literals before classifying
-                // so the synthesized f:reifies* bundle's EdgeKey
-                // cannot silently diverge from the base flake's.
-                reject_context_coercion_on_annotated_literal(map, predicate, walk.json_ld)?;
-                classify_reified_object(map)?
-            } else if let Some(shape) = triple_term_shape(map, walk.json_ld.id_key.as_str()) {
-                shape
-            } else {
-                let object_id = ensure_subject_id(map, walk, ctx);
-                ReifiedObjectShape::Iri(object_id)
-            };
-
             if reifies_iris::ALL.contains(&predicate) || predicate == fluree_vocab::rdf::REIFIES {
                 return Err(TransactError::UnsupportedFeature(format!(
                     "'{predicate}' is a system-controlled predicate; use @annotation instead"
                 )));
             }
-            let synth = build_annotation_sibling(
-                Some(parent_subject),
-                predicate,
-                &shape,
-                ann_block,
-                walk.graph,
-                walk.json_ld,
-                ctx,
-            )?;
+            let synth = match direction {
+                Direction::Forward { subject } => {
+                    let shape = if is_value_object_shape {
+                        // Reject @context-coerced literals before classifying
+                        // so the synthesized f:reifies* bundle's EdgeKey
+                        // cannot silently diverge from the base flake's.
+                        reject_context_coercion_on_annotated_literal(map, predicate, walk.json_ld)?;
+                        classify_reified_object(map)?
+                    } else if let Some(shape) = triple_term_shape(map, walk.json_ld.id_key.as_str())
+                    {
+                        shape
+                    } else {
+                        ReifiedObjectShape::Iri(ensure_subject_id(map, walk, ctx))
+                    };
+                    build_annotation_node(subject, predicate, &shape, ann_block, walk.json_ld, ctx)?
+                }
+                // The value is the edge's subject, and must be a node.
+                Direction::Reverse { object } => {
+                    if is_value_object_shape {
+                        return Err(TransactError::Parse(format!(
+                            "a reverse property's value is a node, the subject of the edge; \
+                             '{predicate}' has a literal value"
+                        )));
+                    }
+                    let subject = ensure_subject_id(map, walk, ctx);
+                    let shape = ReifiedObjectShape::Iri(object.to_string());
+                    build_annotation_node(
+                        &subject,
+                        predicate,
+                        &shape,
+                        ann_block,
+                        walk.json_ld,
+                        ctx,
+                    )?
+                }
+            };
             if let Some(node) = synth {
-                ctx.siblings.push(node);
+                included.push(node);
             }
             // None = empty body in RDF mode = no-op (no attachment row
             // written, base edge stays a plain triple).
@@ -2209,6 +2389,14 @@ mod tests {
         Ok(doc)
     }
 
+    /// The annotation nodes the lowering included in `node` (the edge's
+    /// subject).
+    fn included(node: &Value) -> &Vec<Value> {
+        node.get("@included")
+            .and_then(Value::as_array)
+            .expect("annotation nodes are included in the edge's subject")
+    }
+
     // ---- Reserved-key sync guard ----------------------------------------
 
     #[test]
@@ -2221,9 +2409,10 @@ mod tests {
         for key in super::super::RESERVED_TXN_KEYS {
             let mut envelope = obj_map(json!({ "@graph": [] }));
             envelope.insert((*key).to_string(), json!("x"));
-            assert!(
-                is_envelope(&envelope),
-                "is_envelope must tolerate reserved key {key:?}"
+            assert_eq!(
+                fluree_graph_json_ld::doc_shape(&envelope).unwrap(),
+                fluree_graph_json_ld::DocShape::Envelope,
+                "an envelope must tolerate reserved key {key:?}"
             );
 
             // Use a clause key the reserved key never collides with.
@@ -2435,8 +2624,7 @@ mod tests {
             }
         });
         let result = lower(doc).expect("explicit @type must lower cleanly");
-        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
-        let sibling = &graph[1];
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({"@value": "2024-01-01", "@type": "xsd:date"})
@@ -2597,21 +2785,10 @@ mod tests {
             }]
         });
         let result = lower(doc).expect("node-local id alias must lower cleanly");
-        // The lowered doc wraps the original + sibling in @graph (the
-        // top-level @graph envelope already exists, so the sibling is
-        // appended in-place).
-        let graph = result
-            .get("@graph")
-            .and_then(|g| g.as_array())
-            .expect("envelope @graph form");
-        let sibling = graph
-            .iter()
-            .find(|v| {
-                v.as_object()
-                    .map(|m| m.contains_key(reifies_iris::SUBJECT))
-                    .unwrap_or(false)
-            })
-            .expect("annotation sibling must be appended");
+        // The annotation node is included in the edge's subject, the
+        // envelope's one node.
+        let node = &result.get("@graph").and_then(|g| g.as_array()).unwrap()[0];
+        let sibling = &included(node)[0];
         // f:reifiesSubject must point at the user's IRI, not a minted
         // blank — confirming the alias was resolved from the merged
         // (node-local) context.
@@ -2809,15 +2986,11 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        // Must wrap in @graph since we added a sibling.
-        let graph = result
-            .get("@graph")
-            .and_then(|g| g.as_array())
-            .expect("envelope @graph form");
-        assert_eq!(graph.len(), 2, "original + 1 annotation sibling");
+        // The annotation node is included in the edge's subject.
+        assert_eq!(included(&result).len(), 1, "one annotation node");
 
         // Original node: no @annotation key remains.
-        let original = &graph[0];
+        let original = &result;
         let nested = original.get("ex:worksFor").unwrap();
         assert!(
             !nested.as_object().unwrap().contains_key("@annotation"),
@@ -2825,7 +2998,7 @@ mod tests {
         );
 
         // Sibling: has f:reifiesSubject/Predicate/Object pointing at the edge.
-        let sibling = &graph[1];
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get(reifies_iris::SUBJECT).unwrap(),
             &json!({"@id": "ex:alice"})
@@ -2852,7 +3025,7 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let sibling = &result.get("@graph").unwrap().as_array().unwrap()[1];
+        let sibling = &included(&result)[0];
         let id = sibling.get("@id").and_then(|v| v.as_str()).unwrap();
         assert!(
             id.starts_with("_:fluree_ann_"),
@@ -2873,7 +3046,7 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let sibling = &result.get("@graph").unwrap().as_array().unwrap()[1];
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get("@id").unwrap(),
             &json!("ex:employment-1"),
@@ -2897,9 +3070,8 @@ mod tests {
             }
         });
         let result = lower(doc).expect("aliased @id on annotated ref must lower cleanly");
-        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
-        assert_eq!(graph.len(), 2, "original + sibling");
-        let sibling = &graph[1];
+        assert_eq!(included(&result).len(), 1, "one annotation node");
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({ "@id": "ex:acme" }),
@@ -2918,7 +3090,7 @@ mod tests {
         });
         let result = lower(doc).unwrap();
         // Same shape as the @annotation case.
-        assert_eq!(result.get("@graph").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(included(&result).len(), 1);
     }
 
     #[test]
@@ -2932,15 +3104,11 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let graph = result
-            .get("@graph")
-            .and_then(|g| g.as_array())
-            .expect("envelope @graph form");
-        assert_eq!(graph.len(), 2, "original + 1 annotation sibling");
+        assert_eq!(included(&result).len(), 1, "one annotation node");
 
         // Original payload retains the literal value object minus
         // @annotation.
-        let original = &graph[0];
+        let original = &result;
         let nested = original.get("ex:joinedAt").unwrap().as_object().unwrap();
         assert_eq!(nested.get("@value"), Some(&json!("2024-01-01")));
         assert_eq!(nested.get("@type"), Some(&json!("xsd:date")));
@@ -2949,7 +3117,7 @@ mod tests {
         // Sibling carries f:reifiesObject as the canonicalized value-
         // object — not an @id reference. f:reifiesLang must be absent
         // (no @language).
-        let sibling = &graph[1];
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({"@value": "2024-01-01", "@type": "xsd:date"})
@@ -2971,8 +3139,7 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
-        let sibling = &graph[1];
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({"@value": "chat", "@language": "fr"})
@@ -2992,8 +3159,7 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
-        let sibling = &graph[1];
+        let sibling = &included(&result)[0];
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
             &json!({"@value": "Alice"})
@@ -3182,10 +3348,9 @@ mod tests {
         });
         let lowered = lower_delete(doc).unwrap();
         let t = find_retract_template(&lowered);
-        assert_eq!(
-            t.get(reifies_iris::GRAPH).unwrap(),
-            &json!({"@id": "ex:hr-graph"})
-        );
+        // The template is scoped to the edge's graph; the parser anchors it
+        // (`f:reifiesGraph`) from that scope, so the lowering does not.
+        assert!(t.get(reifies_iris::GRAPH).is_none(), "{t:?}");
         assert_eq!(t.get("@graph").unwrap(), &json!("ex:hr-graph"));
         assert_eq!(
             t.get(reifies_iris::OBJECT).unwrap(),
@@ -3241,6 +3406,25 @@ mod tests {
         assert!(err.to_string().contains("system-controlled"));
     }
 
+    /// W9: the lowering's anonymous annotation nodes are `_:fluree_ann_N`; a
+    /// user node labelled that way would merge with one of them.
+    #[test]
+    fn rejects_user_label_in_the_annotation_prefix() {
+        for doc in [
+            json!({"@id": "_:fluree_ann_0", "ex:p": 1}),
+            json!({"@id": "ex:a", "ex:knows": {"@id": "_:fluree_ann_3"}}),
+            json!({"@context": {"id": "@id"}, "id": "_:fluree_ann_1", "ex:p": 1}),
+        ] {
+            let err = lower(doc.clone()).unwrap_err().to_string();
+            assert!(
+                err.starts_with("Parse error: ") && err.contains("_:fluree_ann_"),
+                "{doc}: {err}"
+            );
+        }
+        // Other labels are untouched.
+        lower(json!({"@id": "_:fluree_annotation", "ex:p": 1})).unwrap();
+    }
+
     #[test]
     fn reifies_on_insert_names_its_triple_without_asserting_it() {
         let doc = json!({
@@ -3252,16 +3436,22 @@ mod tests {
             ]
         });
         let lowered = lower(doc).expect("lower");
-        let nodes = lowered["@graph"].as_array().expect("reifier + sibling");
-        assert_eq!(nodes.len(), 2, "{lowered:#}");
-        assert_eq!(nodes[0]["ex:role"], "Engineer");
-        assert_eq!(nodes[0][reifies_iris::SUBJECT], json!({"@id": "ex:alice"}));
-        assert_eq!(nodes[0][reifies_iris::OBJECT], json!({"@id": "ex:acme"}));
-        assert_eq!(nodes[1]["@id"], "ex:employment-1");
-        assert_eq!(nodes[1][reifies_iris::PREDICATE], json!({"@id": "ex:age"}));
-        assert_eq!(nodes[1][reifies_iris::OBJECT], json!({"@value": 42}));
+        assert_eq!(lowered["ex:role"], "Engineer");
+        assert_eq!(lowered[reifies_iris::SUBJECT], json!({"@id": "ex:alice"}));
+        assert_eq!(lowered[reifies_iris::OBJECT], json!({"@id": "ex:acme"}));
+        // The second triple rides on a node with the reifier's `@id`,
+        // included in it, so written in its scope.
+        let included = lowered["@included"].as_array().expect("the second triple");
+        assert_eq!(included.len(), 1, "{lowered:#}");
+        assert_eq!(included[0]["@id"], "ex:employment-1");
+        assert_eq!(
+            included[0][reifies_iris::PREDICATE],
+            json!({"@id": "ex:age"})
+        );
+        assert_eq!(included[0][reifies_iris::OBJECT], json!({"@value": 42}));
         assert!(
-            nodes.iter().all(|n| n.get("ex:worksFor").is_none()),
+            lowered.get("ex:worksFor").is_none()
+                && included.iter().all(|n| n.get("ex:worksFor").is_none()),
             "the triple is not asserted"
         );
     }
@@ -3387,10 +3577,9 @@ mod tests {
     #[test]
     fn annotation_in_named_graph_emits_reifies_graph() {
         // When the parent node is in a named graph (per-node @graph
-        // selector), the synthetic annotation sibling must carry both
-        // `f:reifiesGraph` (so the decoder pins the right graph) and
-        // its own `@graph` (so the annotation flakes land in the same
-        // named graph as the reified edge).
+        // selector), the annotation node is included in the parent, so the
+        // parser writes it in the parent's (the edge's) graph. It carries
+        // no graph of its own.
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
             "@id": "ex:alice",
@@ -3401,22 +3590,12 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let graph = result
-            .get("@graph")
-            .and_then(|g| g.as_array())
-            .expect("envelope @graph form");
-        let sibling = &graph[1];
-
-        assert_eq!(
-            sibling.get(reifies_iris::GRAPH).unwrap(),
-            &json!({"@id": "ex:hr-graph"}),
-            "f:reifiesGraph should pin the reified edge's named graph"
-        );
-        assert_eq!(
-            sibling.get("@graph").unwrap(),
-            &json!("ex:hr-graph"),
-            "annotation sibling should land in the same named graph as its edge"
-        );
+        assert_eq!(result.get("@graph"), Some(&json!("ex:hr-graph")));
+        let sibling = &included(&result)[0];
+        assert!(sibling.get("@graph").is_none(), "{sibling}");
+        // The anchor comes from the parser's scope (`GraphScope::emit`), the
+        // one place that writes it.
+        assert!(sibling.get(reifies_iris::GRAPH).is_none(), "{sibling}");
     }
 
     #[test]
@@ -3431,14 +3610,14 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        let sibling = &result.get("@graph").unwrap().as_array().unwrap()[1];
+        let sibling = &included(&result)[0];
         assert!(
             sibling.get(reifies_iris::GRAPH).is_none(),
             "f:reifiesGraph must be absent for default-graph edges"
         );
         assert!(
             sibling.get("@graph").is_none(),
-            "annotation sibling must not pin a named graph for default-graph edges"
+            "an annotation node never pins a graph of its own"
         );
     }
 

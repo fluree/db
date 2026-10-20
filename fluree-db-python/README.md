@@ -454,6 +454,8 @@ without reading the message:
   `value`, `graph`, `existing_subject` and `new_subject`.
 - `ConflictError`: when a commit lost a race, `expected_t` and `head_t` say
   where the ledger was and where it moved to.
+- `DatabaseInUseError`: the directory is open in another process; `pid` is
+  that process's id when it could be read.
 
 ```python
 try:
@@ -522,24 +524,31 @@ thread's writes land on the latest commit. A transaction that read the ledger
 raises `ConflictError` when another write lands before it commits; hand such
 work to `transact`, which runs it again.
 
-One process owns a database directory, through one connection that its
-threads share. A second process, or a second connection, that opens the same
-directory is not coordinated with the first: it does not see the first's
-commits, and both index and clean up the same files. To share a database
-across processes, run a Fluree server and send their requests to it.
-`":memory:"` connections and directories of their own have no such limit.
+One process owns a database directory. Every connection the process opens
+to it, from any thread, shares one engine, so each sees the others' commits
+at once; the engine shuts down when the last of them closes. They must agree
+on `indexing`: opening the directory again with the other setting raises
+`InvalidRequestError`. Another process that opens the directory meanwhile
+raises `DatabaseInUseError`, which names the process holding it. To share a
+database across processes, run a Fluree server on it and send their requests
+to the server. `":memory:"` connections and directories of their own have no
+such limit. A directory on a filesystem that cannot lock it (some network and
+FUSE mounts) fails to open unless `FLUREE_STORAGE_ALLOW_UNLOCKED=true` is set,
+which opens it without that protection.
 
 A process forked after Fluree started in its parent cannot use it: the
 engine's threads do not survive a fork, and the lock state they leave behind
 is unsafe to reuse, so the child raises `FlureeError` rather than risk a
 crash. A connection opened before the fork raises `FlureeError` in the child
-too, and is left alone when the child exits. For a `multiprocessing` pool,
+too, and is left alone when the child exits. The child does not keep the
+directory locked: once the parent closes it or exits, another process can
+open it. For a `multiprocessing` pool,
 use the `spawn` or `forkserver` start method
 (`multiprocessing.get_context("spawn")`; Python before 3.14 defaults to
 `fork` on Linux), and have each process that uses Fluree open a database of
 its own. Serve a web app from one worker process with threads or asyncio
-(gunicorn `--workers 1 --threads 8`, or one uvicorn worker), not several
-workers on one directory.
+(gunicorn `--workers 1 --threads 8`, or one uvicorn worker): with several
+workers on one directory, all but the first raise `DatabaseInUseError`.
 
 ## Development
 

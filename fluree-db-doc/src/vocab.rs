@@ -1,7 +1,9 @@
 //! The vocabulary the chunk graph is written in.
 //!
-//! Structure elements come from the engine already typed with DoCO / NIF
-//! terms under `https://ns.flur.ee/doc#` (`doc:`). Chunks extend that same
+//! Structure elements come from the engine already typed: DoCO wherever it
+//! has a class, `foaf:Document` for the root, Dublin Core for what a file
+//! declares about itself, NIF for offsets, and `https://ns.flur.ee/doc#`
+//! (`doc:`) for the parts no standard ontology names. Chunks extend that same
 //! namespace so a ledger built here and one built by Fluree AI's hosted
 //! pipeline describe documents with one vocabulary.
 
@@ -15,6 +17,8 @@ pub const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
 pub const SKOS_NS: &str = "http://www.w3.org/2004/02/skos/core#";
 pub const SCHEMA_NS: &str = "https://schema.org/";
+pub const DCTERMS_NS: &str = "http://purl.org/dc/terms/";
+pub const FOAF_NS: &str = "http://xmlns.com/foaf/0.1/";
 
 /// A retrieval unit cut from a document's structure.
 pub const CHUNK: &str = "doc:Chunk";
@@ -103,8 +107,10 @@ pub fn source_document_iri() -> String {
     format!("{DOC_NS}sourceDocument")
 }
 
-/// The `@context` every emitted graph carries. A superset of the engine's
-/// DoCO context so the structure and chunk graphs can share one transaction.
+/// The `@context` for what this pipeline adds to the engine's graph. The
+/// transaction merges it over the engine's own context, which carries the
+/// structure graph's prefixes and coercions, so neither has to repeat the
+/// other.
 pub fn context() -> serde_json::Value {
     serde_json::json!({
         "doc": DOC_NS,
@@ -117,6 +123,8 @@ pub fn context() -> serde_json::Value {
         "xsd": XSD_NS,
         "skos": SKOS_NS,
         "schema": SCHEMA_NS,
+        "dcterms": DCTERMS_NS,
+        "foaf": FOAF_NS,
         "po:contains": { "@type": "@id" },
         "doc:sourceElement": { "@type": "@id" },
         "doc:sourceDocument": { "@type": "@id" },

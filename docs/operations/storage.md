@@ -378,6 +378,35 @@ shares the store must be upgraded together. See
 - High IOPS capability
 - Regular backups
 
+### One process per directory
+
+A file storage directory is used by one process at a time; threads within it share it. Two
+processes on one directory are not coordinated: each serves its own cached view of the ledgers,
+and both index and clean up the same files. To use one directory from several processes, run a
+[server](running-fluree.md) on it and send their requests to the server.
+
+A Fluree server (`fluree server run` or `start`) and the Python package lock the directory for as
+long as they have it open, through a `.fluree-lock` file at its root. A second server or Python
+process that opens the directory meanwhile is refused, with the process id of the one that holds
+it. The lock belongs to the running process, so a crash or `kill -9` releases it; the file left
+behind means nothing. Shared-storage query peers and Raft nodes, which share a directory with other
+processes on purpose, take no lock.
+
+Not every process takes the lock yet. CLI commands such as `fluree insert` route to a running
+server, but with `--direct`, or with no server running, they open the directory themselves and
+unlocked, so running one beside a Python process that has the directory open is unprotected. A
+Rust program takes the lock only when it asks for it (`FlureeBuilder::with_storage_lock()`, or
+`SharedFluree`).
+
+A filesystem that cannot lock (some network and FUSE mounts) fails to open. Set
+`FLUREE_STORAGE_ALLOW_UNLOCKED=true` to open it anyway, without protection from a second process.
+Any other error taking the lock, such as a lock file the process may not write, fails the open too.
+
+A lock keeps out only the processes whose operating system sees it. A container and its host that
+share a directory through a Docker Desktop bind mount both take the lock without error, as do two
+machines on an NFS mount with local-only locking (`nolock` or `local_lock`). Neither is refused, so
+make sure only one of them opens the directory.
+
 ### Durability
 
 **Filesystem syncing (FSYNC) is on by default.** Fluree flushes committed data

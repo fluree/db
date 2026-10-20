@@ -214,6 +214,7 @@ impl<'a> CypherLowering<'a> {
             unmatched_optional: fluree_db_query::UnmatchedOptional::Poisoned,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
+            update_where_names_ledger_default: false,
             opts: self.opts,
             vars: self.vars,
             txn_meta: Vec::new(),

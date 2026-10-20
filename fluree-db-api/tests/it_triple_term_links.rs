@@ -1901,6 +1901,7 @@ async fn triple_constructs_the_terms_links_hold() {
 async fn shacl_sparql_constraints_see_the_transactions_links() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = support::genesis_ledger(&fluree, "it/triple-term-links:shacl-staged").await;
+    let ledger = support::enable_shacl(&fluree, ledger).await;
     let ledger = fluree
         .insert_turtle(
             ledger,
