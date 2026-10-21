@@ -344,14 +344,7 @@ fn push_literal_suffix(
 
 fn push_blank(out: &mut String, label: &str) {
     out.push_str("_:");
-    if syntax::is_blank_node_label(label) {
-        out.push_str(label);
-    } else {
-        out.push('x');
-        for b in label.bytes() {
-            let _ = write!(out, "{b:02x}");
-        }
-    }
+    syntax::push_blank_label(out, label);
 }
 
 #[cfg(test)]

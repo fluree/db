@@ -773,26 +773,37 @@ fn write_turtle_batch<W: Write>(
 
 /// Write a subject term as Turtle (prefixed name, `<iri>`, or `_:bnode`).
 ///
-/// Blank-node labels are written verbatim, deliberately: an export has to
-/// round-trip, and rewriting a label to fit the Turtle grammar would merge two
-/// distinct nodes onto one id (contrast `crate::validate`, whose report output
-/// sanitizes because it does not round-trip).
-///
-/// Current blank-node ids are all writable as-is: import mints `[0-9a-z-]`
-/// (see `fluree_db_core::skolem`), staged transactions mint hex, `BNODE()`
-/// mints a UUID. Ledgers imported by Fluree 4.1.4 or earlier hold ids that
-/// embedded the ledger id, so they contain `/` and `:` and an export of such a
-/// ledger emits Turtle that strict parsers reject — the identity is preserved,
-/// the syntax is not. Re-importing the source fixes it.
+/// A blank node is written by its stored label, so re-inserting the export
+/// addresses the same `_:fdb-…` node. Labels minted now are all valid Turtle:
+/// import mints `[0-9a-z-]` (see `fluree_db_core::skolem`), a transaction
+/// mints hex plus the label it was given or a `-`-prefixed one of its own,
+/// and `BNODE()` mints a UUID. Older data can hold labels the grammar
+/// rejects: SPARQL UPDATE used to mint labels such as `#bnpl0` and `[]0`,
+/// and imports by Fluree 4.1.4 or earlier embedded the ledger id (`/`, `:`).
+/// Those are escaped as every RDF text writer escapes them
+/// ([`syntax::escape_blank_label`]), so the export parses, and the node
+/// re-inserts as a new blank node.
 fn write_turtle_iri_or_bnode<W: Write>(
     w: &mut W,
     iri: &str,
     prefixes: &PrefixMap,
 ) -> io::Result<()> {
-    if iri.starts_with("_:") {
-        w.write_all(iri.as_bytes())
-    } else {
-        prefixes.write_iri(w, iri)
+    write_bnode_or(w, iri, |w| prefixes.write_iri(w, iri))
+}
+
+/// Write `iri` as a blank node when it is one (see
+/// [`write_turtle_iri_or_bnode`]), else as `write_iri` writes it.
+fn write_bnode_or<W: Write>(
+    w: &mut W,
+    iri: &str,
+    write_iri: impl FnOnce(&mut W) -> io::Result<()>,
+) -> io::Result<()> {
+    match iri.strip_prefix("_:") {
+        Some(label) => {
+            w.write_all(b"_:")?;
+            syntax::write_blank_label(w, label)
+        }
+        None => write_iri(w),
     }
 }
 
@@ -1639,16 +1650,10 @@ fn write_batch<W: Write>(
 // Term formatting
 // ---------------------------------------------------------------------------
 
-/// Write a subject term: `<iri>` or `_:bnode`.
+/// Write a subject term: `<iri>` or `_:bnode` (see
+/// [`write_turtle_iri_or_bnode`] for blank-node labels).
 fn write_iri_or_bnode<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
-    if iri.starts_with("_:") {
-        // Blank node — emit as-is (no angle brackets)
-        w.write_all(iri.as_bytes())
-    } else {
-        w.write_all(b"<")?;
-        syntax::write_iri(w, iri)?;
-        w.write_all(b">")
-    }
+    write_bnode_or(w, iri, |w| syntax::write_iri_ref(w, iri))
 }
 
 /// Write an object value as an N-Triples term.
@@ -2256,6 +2261,26 @@ mod tests {
         let mut buf = Vec::new();
         write_iri_or_bnode(&mut buf, "_:b123").unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "_:b123");
+    }
+
+    /// A stored label the Turtle grammar rejects is escaped, in N-Triples and
+    /// Turtle alike; a valid one, the `-` mints included, is written as is.
+    #[test]
+    fn blank_labels_the_grammar_rejects_are_escaped() {
+        let pm = PrefixMap::from_context(&serde_json::json!({}));
+        for (stored, written) in [
+            ("_:fdb-1a-0--bnpl0", "_:fdb-1a-0--bnpl0"),
+            ("_:fdb-1a-0-#bnpl0", "_:x6664622d31612d302d23626e706c30"),
+            ("_:fdb-1a-0-[]0", "_:x6664622d31612d302d5b5d30"),
+            ("_:fdb-lubm:main-1", "_:x6664622d6c75626d3a6d61696e2d31"),
+        ] {
+            let mut nt = Vec::new();
+            write_iri_or_bnode(&mut nt, stored).unwrap();
+            assert_eq!(String::from_utf8(nt).unwrap(), written, "{stored}");
+            let mut ttl = Vec::new();
+            write_turtle_iri_or_bnode(&mut ttl, stored, &pm).unwrap();
+            assert_eq!(String::from_utf8(ttl).unwrap(), written, "{stored}");
+        }
     }
 
     #[test]

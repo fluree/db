@@ -59,6 +59,10 @@ Every ledger has two system graphs, `urn:fluree:<ledger>:main#txn-meta` (commit 
 
 `--system-graphs` emits them anyway, for diagnostics. Use `--format ledger` to move a ledger — it carries commits rather than re-serializing triples, and round-trips losslessly.
 
+### Blank nodes
+
+Blank nodes are written by their stored labels (`_:fdb-…`), so inserting an export back into a ledger addresses the same nodes. Older data can hold labels that Turtle and N-Triples don't allow: labels earlier versions minted for a SPARQL UPDATE's `[ … ]`, `( … )` and annotations (such as `_:fdb-…-#bnpl0`), and labels from imports by Fluree 4.1.4 or earlier, which contain `/` and `:`. Export writes such a label as `_:x` followed by the label's hex, as query results do, so the file parses; a node written that way inserts as a new blank node with the same properties. JSON-LD export writes every label as stored. (`fluree create --from` gives every blank node a new id whatever its label.)
+
 ### Edge annotations (RDF 1.2)
 
 An edge annotation attaches a reifier to one specific triple: `ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |}`. Fluree stores that as seven reserved `f:reifies*` system facts plus the reifier's own properties. Export used to emit those system facts verbatim — output no other RDF 1.2 tool understands, and which Fluree's own insert and update surfaces reject as system-controlled predicates.

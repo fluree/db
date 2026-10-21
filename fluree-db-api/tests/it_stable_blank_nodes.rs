@@ -496,3 +496,61 @@ async fn sparql_update_blank_nodes_export_and_reinsert_as_the_same_nodes() {
         }
     }
 }
+
+/// A stored label the Turtle grammar rejects, as SPARQL UPDATE used to mint,
+/// exports escaped: the export parses, and re-inserting it gives a new blank
+/// node with the same properties and links.
+#[tokio::test]
+async fn a_stored_label_turtle_rejects_exports_escaped() {
+    use fluree_db_api::export::ExportFormat;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let source = "it/stable-bnodes/legacy-label:main";
+    fluree.create_ledger(source).await.expect("create");
+    let legacy = "_:fdb-1a-0-#bnpl0";
+    fluree
+        .graph(source)
+        .transact()
+        .insert(&json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:s", "ex:param": {"@id": legacy}},
+                {"@id": legacy, "ex:name": "q"}
+            ]
+        }))
+        .commit()
+        .await
+        .expect("insert");
+
+    for (name, format) in [
+        ("ttl", ExportFormat::Turtle),
+        ("nt", ExportFormat::NTriples),
+    ] {
+        let text = export(&fluree, source, format).await;
+        assert!(!text.contains("#bnpl0"), "{name}: {text}");
+        assert!(
+            text.contains("_:x6664622d"),
+            "{name}: escaped label: {text}"
+        );
+        let copy = format!("it/stable-bnodes/legacy-copy-{name}:main");
+        fluree.create_ledger(&copy).await.expect("create copy");
+        fluree
+            .graph(&copy)
+            .transact()
+            .insert_turtle(&text)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{name}: re-insert: {e}\n{text}"));
+        let ledger = fluree.ledger(&copy).await.expect("load copy");
+        let names = select_strings(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": ctx(),
+                "select": "?n",
+                "where": [{"@id": "ex:s", "ex:param": "?p"}, {"@id": "?p", "ex:name": "?n"}]
+            }),
+        )
+        .await;
+        assert_eq!(names, ["q"], "{name}");
+    }
+}
