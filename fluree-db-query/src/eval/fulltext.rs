@@ -220,19 +220,7 @@ fn build_novelty_delta(
             let list_idx = flake.m.as_ref().and_then(|m| m.i);
             let triple_key = (flake.s.clone(), string_id, list_idx);
 
-            // Keep only the latest op (highest t; at one t the assert,
-            // `fluree_db_core::same_t`)
-            match latest_ops.entry(triple_key) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((flake.t, flake.op, text));
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let &(t0, op0, _) = e.get();
-                    if fluree_db_core::same_t::supersedes((flake.t, flake.op), (t0, op0)) {
-                        e.insert((flake.t, flake.op, text));
-                    }
-                }
-            }
+            keep_latest_op(&mut latest_ops, triple_key, flake.t, flake.op, text);
         },
     );
 
@@ -878,9 +866,46 @@ fn score_tf_saturation(doc_text: &str, query_text: &str) -> f64 {
     score
 }
 
+/// Keep the op that holds for `key` (the highest `t`; at one `t` the assert,
+/// `fluree_db_core::same_t`), whatever order the overlay yields them in.
+fn keep_latest_op<K: std::hash::Hash + Eq>(
+    latest: &mut HashMap<K, (i64, bool, String)>,
+    key: K,
+    t: i64,
+    op: bool,
+    text: String,
+) {
+    match latest.entry(key) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert((t, op, text));
+        }
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let &(t0, op0, _) = e.get();
+            if fluree_db_core::same_t::supersedes((t, op), (t0, op0)) {
+                e.insert((t, op, text));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retraction and an assertion of one value at one `t` leave the
+    /// assertion, in either order; a later retraction then removes it.
+    #[test]
+    fn keep_latest_op_holds_the_assertion_at_one_t() {
+        for ops in [[false, true], [true, false]] {
+            let mut latest: HashMap<u32, (i64, bool, String)> = HashMap::new();
+            for op in ops {
+                keep_latest_op(&mut latest, 7, 5, op, "text".to_string());
+            }
+            assert!(latest[&7].1, "ops {ops:?}");
+            keep_latest_op(&mut latest, 7, 6, false, "text".to_string());
+            assert_eq!(latest[&7], (6, false, "text".to_string()));
+        }
+    }
 
     #[test]
     fn test_score_basic_match() {
@@ -1222,17 +1247,7 @@ mod tests {
         for flake in [&flake_i0, &flake_i1] {
             let list_idx = flake.m.as_ref().and_then(|m| m.i);
             let triple_key = (flake.s.clone(), 42_u32, list_idx); // string_id = 42 (mock)
-            match latest_ops.entry(triple_key) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((flake.t, flake.op, text.clone()));
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let &(t0, op0, _) = e.get();
-                    if fluree_db_core::same_t::supersedes((flake.t, flake.op), (t0, op0)) {
-                        e.insert((flake.t, flake.op, text.clone()));
-                    }
-                }
-            }
+            keep_latest_op(&mut latest_ops, triple_key, flake.t, flake.op, text.clone());
         }
 
         // With list_index in the key, we should have 2 separate entries

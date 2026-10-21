@@ -2247,6 +2247,29 @@ fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
 mod tests {
     use super::*;
 
+    /// A retraction and an assertion of one untranslated fact at one `t`
+    /// leave the fact, in either order; a later retraction removes it.
+    #[test]
+    fn surviving_untranslated_holds_a_same_t_pairs_assertion() {
+        let f = |t: i64, op: bool| {
+            Flake::new(
+                fluree_db_core::Sid::new(100, "s"),
+                fluree_db_core::Sid::new(100, "p"),
+                fluree_db_core::FlakeValue::String("v".to_string()),
+                fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                t,
+                op,
+                None,
+            )
+        };
+        for ops in [[false, true], [true, false]] {
+            let out = surviving_untranslated(ops.iter().map(|&op| f(5, op)).collect());
+            assert_eq!(out.len(), 1, "{ops:?}");
+            assert!(out[0].op);
+        }
+        assert!(surviving_untranslated(vec![f(5, false), f(5, true), f(6, false)]).is_empty());
+    }
+
     #[test]
     fn test_write_iri_or_bnode() {
         let mut buf = Vec::new();

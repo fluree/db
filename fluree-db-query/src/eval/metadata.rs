@@ -1048,3 +1048,40 @@ fn comparable_opt_to_binding(v: Option<ComparableValue>) -> Result<Binding> {
         None => Ok(Binding::Unbound),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn type_flake(class: &str, t: i64, op: bool) -> Flake {
+        Flake::new(
+            Sid::new(100, "s"),
+            Sid::new(1, "type"),
+            FlakeValue::Ref(Sid::new(100, class)),
+            Sid::new(1, "id"),
+            t,
+            op,
+            None,
+        )
+    }
+
+    /// A retraction and an assertion of one reference at one `t` leave it
+    /// held, in either order; a later retraction removes it.
+    #[test]
+    fn a_same_t_pair_of_a_reference_holds_it() {
+        for ops in [[false, true], [true, false]] {
+            let flakes = ops.iter().map(|&op| type_flake("A", 5, op)).collect();
+            assert_eq!(
+                merge_latest_ref_objects(flakes),
+                vec![Sid::new(100, "A")],
+                "{ops:?}"
+            );
+        }
+        let flakes = vec![
+            type_flake("A", 5, false),
+            type_flake("A", 5, true),
+            type_flake("A", 6, false),
+        ];
+        assert!(merge_latest_ref_objects(flakes).is_empty());
+    }
+}
