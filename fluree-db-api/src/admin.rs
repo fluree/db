@@ -2684,6 +2684,12 @@ impl crate::Fluree {
             }
         }
 
+        // A rebuild re-derives history from the commit log: it must leave out
+        // what retention suppresses, or reindexing would bring it back.
+        indexer_config.history_suppression = self
+            .suppressed_history_for_index(ledger_id.as_str())
+            .await?;
+
         // Reindex is a user-triggered API call; create a fuel-enabled,
         // no-limit tracker per request so the response can report total fuel.
         // Indexing never enforces a fuel limit (measurement only) — a partial

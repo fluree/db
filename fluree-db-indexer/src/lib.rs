@@ -48,7 +48,7 @@ pub mod stats;
 // Re-export main types
 pub use config::{
     ConfiguredFulltextProperty, ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig,
-    WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
+    SuppressedHistory, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
@@ -61,9 +61,9 @@ pub use gc::{
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
-    BuildObserver, GcGuard, Housekeeping, Housekeepings, IndexCompletion, IndexOutcome, IndexPhase,
-    IndexRequestCorrelation, IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator,
-    MaintenanceGuard, ReleaseWindow,
+    BuildDirectives, BuildObserver, GcGuard, Housekeeping, Housekeepings, IndexCompletion,
+    IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot, IndexerHandle,
+    IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
 };
 #[cfg(feature = "embedded-orchestrator")]
 pub use orchestrator::{

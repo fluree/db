@@ -933,6 +933,7 @@ where
                     build_progress: None,
                     stage_marker: None,
                     term_builder: None,
+                    history_drop: shared.history_drop_for(&config.history_suppression, g_id),
                 };
 
                 let v3_result = crate::build_indexes_from_remapped_commits(

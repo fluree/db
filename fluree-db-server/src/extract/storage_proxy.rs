@@ -251,6 +251,8 @@ mod tests {
                 .into_iter()
                 .map(|l| fluree_db_api::LedgerId::parse(l).unwrap())
                 .collect(),
+            audit_all: false,
+            audit_ledgers: Default::default(),
         };
 
         assert!(principal.has_storage_permissions());
@@ -270,6 +272,8 @@ mod tests {
             identity: None,
             storage_all: true,
             storage_ledgers: HashSet::new(),
+            audit_all: false,
+            audit_ledgers: Default::default(),
         };
 
         assert!(principal.has_storage_permissions());
@@ -287,6 +291,8 @@ mod tests {
             identity: None,
             storage_all: false,
             storage_ledgers: HashSet::new(),
+            audit_all: false,
+            audit_ledgers: Default::default(),
         };
 
         assert!(!principal.has_storage_permissions());

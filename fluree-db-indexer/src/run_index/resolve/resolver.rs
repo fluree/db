@@ -1380,6 +1380,43 @@ impl SharedResolverState {
     /// `self.fulltext_hook_config` and consulted by
     /// [`FulltextHook::on_op`](crate::fulltext_hook::FulltextHook::on_op)
     /// on every record.
+    /// The history `suppressed` leaves out of graph `g_id`'s index, by this
+    /// build's predicate ids. `None` when nothing applies to the graph.
+    pub fn history_drop_for(
+        &self,
+        suppressed: &[crate::config::SuppressedHistory],
+        g_id: u16,
+    ) -> Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>> {
+        if suppressed.is_empty() {
+            return None;
+        }
+        let graph_id = |iri: &str| -> Option<u16> {
+            if iri == fluree_db_core::graph_registry::DEFAULT_GRAPH_IRI {
+                return Some(0);
+            }
+            self.graphs
+                .get(iri)
+                .and_then(|raw| u16::try_from(raw + 1).ok())
+        };
+        let mut drop = fluree_db_binary_index::format::history_sidecar::HistoryDrop::default();
+        for rule in suppressed {
+            let applies = match &rule.graph_iri {
+                Some(iri) => graph_id(iri) == Some(g_id),
+                None => !rule
+                    .except_graph_iris
+                    .iter()
+                    .any(|iri| graph_id(iri) == Some(g_id)),
+            };
+            if !applies {
+                continue;
+            }
+            if let Some(p_id) = self.predicates.get(&rule.predicate_iri) {
+                drop.insert(p_id, rule.from_t, rule.until_t);
+            }
+        }
+        (!drop.is_empty()).then(|| std::sync::Arc::new(drop))
+    }
+
     pub fn configure_fulltext_properties(
         &mut self,
         properties: &[crate::config::ConfiguredFulltextProperty],

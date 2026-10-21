@@ -845,6 +845,8 @@ mod tests {
             ledger_read_ledgers: None,
             ledger_write_all: None,
             ledger_write_ledgers: None,
+            ledger_audit_all: None,
+            ledger_audit_ledgers: None,
             fluree_identity: Some("did:key:z6MkTest".to_string()),
             fluree_policy: None,
         }

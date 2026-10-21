@@ -145,6 +145,9 @@ pub struct BuildConfig {
     /// term-carrying chunk then fails the build rather than emitting
     /// dangling handles).
     pub term_builder: Option<Arc<std::sync::Mutex<fluree_db_binary_index::dict::TermDictBuilder>>>,
+    /// History entries retention leaves out of this graph (rebuild only).
+    pub history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 }
 
 /// Result of the V3 build pipeline.
@@ -1317,6 +1320,7 @@ pub fn build_indexes_from_commits(
         // build_all_indexes still clamps to the number of buildable orders.
         max_concurrency: fd_plan.order_concurrency,
         fan_in_cap: fd_plan.merge_fan_in_per_order,
+        history_drop: None,
     };
 
     let mut order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
@@ -1745,6 +1749,7 @@ pub fn build_indexes_from_remapped_commits(
         // come from the same plan so they cannot drift apart.
         max_concurrency: rebuild_fd_plan.order_concurrency,
         fan_in_cap: rebuild_fd_plan.merge_fan_in_per_order,
+        history_drop: config.history_drop.clone(),
     };
 
     let order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
@@ -1881,6 +1886,7 @@ mod tests {
             build_progress: None,
             stage_marker: None,
             term_builder: None,
+            history_drop: None,
         }
     }
 
@@ -2034,6 +2040,7 @@ mod tests {
                 build_progress: None,
                 stage_marker: None,
                 term_builder: None,
+                history_drop: None,
             };
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, None, None, plan)
@@ -2171,6 +2178,7 @@ mod tests {
                 build_progress: None,
                 stage_marker: None,
                 term_builder: None,
+                history_drop: None,
             };
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, Some(TYPE_P), Some(membership), plan)

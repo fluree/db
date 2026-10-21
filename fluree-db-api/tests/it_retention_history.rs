@@ -441,3 +441,165 @@ async fn removing_a_current_occurrence_retracts_it() {
         vec![json!("a@x")]
     );
 }
+
+/// The number of history entries in the default graph's index sidecars,
+/// read straight from storage (as a raw index reader would, past any serving
+/// check).
+async fn indexed_history_entries(fluree: &Fluree, ledger_id: &str) -> usize {
+    use fluree_db_core::ContentStore;
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .expect("record");
+    let root_id = record.index_head_id.clone().expect("indexed");
+    let store = fluree.content_store(&record.storage_namespace());
+    let root_bytes = store.get(&root_id).await.unwrap();
+    let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes).unwrap();
+    let mut entries = 0;
+    for order in &root.default_graph_orders {
+        for leaf in &order.leaves {
+            let Some(cid) = &leaf.sidecar_cid else {
+                continue;
+            };
+            let bytes = store.get(cid).await.unwrap();
+            // FHS1: 8-byte header, then per leaflet a u32 count and 31-byte entries.
+            let mut pos = 8;
+            while pos + 4 <= bytes.len() {
+                let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                entries += n;
+                pos += 4 + n * 31;
+            }
+        }
+    }
+    entries
+}
+
+#[tokio::test]
+async fn no_history_compacts_the_index_history() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/nohist-compact").await;
+    for n in 1..=3 {
+        upsert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:c", "ex:count": n}),
+        )
+        .await;
+    }
+    fluree
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
+    let before = indexed_history_entries(&fluree, &id).await;
+    assert!(
+        before > 0,
+        "the counter's past values are in the index history"
+    );
+
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    fluree.run_retention(&id).await.expect("pass");
+    let mut backfilled = false;
+    for _ in 0..200 {
+        let status = fluree.retention_status(&id).await.unwrap();
+        let r = status.registration.unwrap();
+        if r.history_backfilled >= r.journal.generation && r.journal.generation > 0 {
+            backfilled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(backfilled, "the backfill rebuild did not finish");
+    assert_eq!(
+        indexed_history_entries(&fluree, &id).await,
+        0,
+        "the backfill left no history for the counter"
+    );
+
+    // Later changes leave no history in the next build either.
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 4}),
+    )
+    .await;
+    fluree
+        .reindex(&id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
+    assert_eq!(indexed_history_entries(&fluree, &id).await, 0);
+    // Current state is intact.
+    assert_eq!(
+        read(&fluree, &id, json!(id), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        vec![json!(4)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_builds_leave_suppressed_history_out() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .build()
+            .unwrap(),
+    );
+    fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        }),
+    );
+    let id = ledger(&fluree, "it/nohist-incremental").await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
+    )
+    .await;
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    // The worker records the rule and rebuilds once.
+    let mut ready = false;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(r) = fluree.retention_status(&id).await.unwrap().registration {
+            if r.journal.generation > 0 && r.history_backfilled >= r.journal.generation {
+                ready = true;
+                break;
+            }
+        }
+    }
+    assert!(ready, "the rule and its backfill");
+    // Incremental builds over later changes add no history for the counter.
+    for n in 2..=5 {
+        upsert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:c", "ex:count": n}),
+        )
+        .await;
+    }
+    let mut indexed = false;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+        if record.index_t >= record.commit_t {
+            indexed = true;
+            break;
+        }
+    }
+    assert!(indexed, "the background indexer caught up");
+    assert_eq!(indexed_history_entries(&fluree, &id).await, 0);
+    assert_eq!(
+        read(&fluree, &id, json!(id), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        vec![json!(5)]
+    );
+}

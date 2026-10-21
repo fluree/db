@@ -52,6 +52,14 @@ pub struct Registration {
     /// The removal journal: what the branch's history no longer serves.
     #[serde(default, skip_serializing_if = "super::journal::Journal::is_empty")]
     pub journal: super::journal::Journal,
+    /// The journal generation whose history rules the index has been rebuilt
+    /// for (the backfill that drops existing history from the index).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub history_backfilled: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The branch's registration, if any, with the config value it was read from.

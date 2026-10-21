@@ -350,3 +350,39 @@ mod tests {
         assert_eq!(refs[2].max_t, 7);
     }
 }
+
+/// History entries an index build leaves out, by predicate over ranges of
+/// `t`: retention that keeps no history (`f:noHistory`) for a predicate.
+///
+/// A range covers whole transitions of the predicate's facts, so what is
+/// left still replays consistently from the head back to any point after the
+/// range. Reads of points inside a range are refused before they reach the
+/// index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryDrop {
+    by_p_id: std::collections::HashMap<u32, Vec<(i64, i64)>>,
+}
+
+impl HistoryDrop {
+    /// Leave out `p_id`'s history entries with `from_t <= t < until_t`.
+    pub fn insert(&mut self, p_id: u32, from_t: i64, until_t: Option<i64>) {
+        self.by_p_id
+            .entry(p_id)
+            .or_default()
+            .push((from_t, until_t.unwrap_or(i64::MAX)));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_p_id.is_empty()
+    }
+
+    /// Whether `entry` is left out.
+    #[inline]
+    pub fn drops(&self, entry: &HistEntryV2) -> bool {
+        self.by_p_id.get(&entry.p_id).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(from, until)| *from <= i64::from(entry.t) && i64::from(entry.t) < *until)
+        })
+    }
+}

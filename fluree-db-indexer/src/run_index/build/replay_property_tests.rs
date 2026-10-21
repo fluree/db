@@ -252,6 +252,7 @@ fn build_leaf_via_rebuild(
         g_id: 0,
         progress: None,
         fan_in_cap: usize::MAX,
+        history_drop: None,
     };
     let result = build_index(&config).unwrap();
     let leaf = &result.graphs[0].leaf_infos[0];
@@ -319,6 +320,7 @@ fn run_incremental(case: &Case, case_id: usize) -> (LeafView, Option<(u32, u8)>)
         leaflet_target_rows: 100,
         leaf_target_rows: 1000,
         collect_matched: false,
+        history_drop: None,
     };
     let result = update_branch(
         &branch_bytes,

@@ -235,6 +235,29 @@ impl Fluree {
         out
     }
 
+    /// The history an index build of `ledger_id` leaves out: its
+    /// `f:noHistory` rules.
+    pub(crate) async fn suppressed_history_for_index(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Vec<fluree_db_indexer::SuppressedHistory>> {
+        let Some(suppression) = self.suppression_for(ledger_id).await? else {
+            return Ok(Vec::new());
+        };
+        Ok(suppression
+            .journal
+            .history_rules
+            .iter()
+            .map(|rule| fluree_db_indexer::SuppressedHistory {
+                predicate_iri: rule.predicate.clone(),
+                graph_iri: rule.graph.clone(),
+                except_graph_iris: rule.except_graphs.clone(),
+                from_t: rule.from_t,
+                until_t: rule.until_t,
+            })
+            .collect())
+    }
+
     /// Refuse `read` of `ledger_id` when it needs suppressed history.
     pub(crate) async fn refuse_suppressed_history(
         &self,

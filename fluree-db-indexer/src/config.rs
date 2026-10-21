@@ -43,6 +43,19 @@ pub trait FulltextConfigProvider: std::fmt::Debug + Send + Sync {
 ///
 /// Keeping these distinct lets the indexer route scoping precisely:
 /// the hook's `any_graph` tier covers `AnyGraph`; the `per_graph` tier
+/// A predicate whose history an index build leaves out, over
+/// `[from_t, until_t)` (`f:noHistory`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuppressedHistory {
+    pub predicate_iri: String,
+    /// The graph the rule is limited to; `None` for every data graph.
+    pub graph_iri: Option<String>,
+    /// Graphs a ledger-wide rule leaves alone.
+    pub except_graph_iris: Vec<String>,
+    pub from_t: i64,
+    pub until_t: Option<i64>,
+}
+
 /// covers the rest with the correct `GraphId`.
 #[derive(Debug, Clone)]
 pub enum ConfiguredFulltextScope {
@@ -305,6 +318,11 @@ pub struct IndexerConfig {
     /// [`IndexerConfig::with_fulltext_config_provider`].
     pub fulltext_config_provider: Option<Arc<dyn FulltextConfigProvider>>,
 
+    /// Predicates whose history retention leaves out of the index
+    /// (`f:noHistory`), refreshed per build from the ledger's removal
+    /// journal by the background worker's build observer. Empty by default.
+    pub history_suppression: Vec<SuppressedHistory>,
+
     /// Pre-discovered commit CIDs (`t`, cid) with `t > index_t`, sorted
     /// ascending by `t`, supplied by the nameservice's commit-CID index.
     ///
@@ -390,6 +408,7 @@ impl Default for IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             fulltext_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
@@ -427,6 +446,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             fulltext_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
@@ -457,6 +477,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             fulltext_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
@@ -487,6 +508,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
+            history_suppression: Vec::new(),
             fulltext_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,

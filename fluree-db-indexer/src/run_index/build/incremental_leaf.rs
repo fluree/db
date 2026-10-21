@@ -66,6 +66,9 @@ pub struct LeafUpdateInput<'a> {
     /// Existing history sidecar bytes (None if no sidecar exists).
     /// Used to carry forward existing history for touched leaflets.
     pub sidecar_bytes: Option<&'a [u8]>,
+    /// History entries retention leaves out.
+    pub history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 }
 
 /// A new leaf blob produced by the update.
@@ -696,7 +699,7 @@ fn assemble_output_leaves(
     let mut origins = origins.into_iter();
     for group in leaves {
         let leaflet_origins = origins.by_ref().take(group.len()).collect();
-        let leaf_info = build_leaf_from_group(group, input.order)?;
+        let leaf_info = build_leaf_from_group(group, input.order, input.history_drop.as_deref())?;
         output.push(NewLeafBlob {
             info: leaf_info,
             leaflet_origins,
@@ -718,14 +721,19 @@ fn build_leaf_from_group(
         bool,
     )>,
     order: RunSortOrder,
+    history_drop: Option<&fluree_db_binary_index::format::history_sidecar::HistoryDrop>,
 ) -> io::Result<LeafInfo> {
     use fluree_db_binary_index::format::leaflet::EncodedLeaflet;
 
-    // Build sidecar from history entries.
+    // Build sidecar from history entries, leaving out what retention drops
+    // (carried-forward history included).
     let mut sidecar_builder = HistSidecarBuilder::new();
     for (_, history, _) in &group {
         sidecar_builder.start_leaflet();
         for entry in history {
+            if history_drop.is_some_and(|d| d.drops(entry)) {
+                continue;
+            }
             sidecar_builder.push_entry(*entry);
         }
     }
@@ -1000,6 +1008,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1028,6 +1037,7 @@ mod tests {
             leaflet_target_rows: 50,
             leaf_target_rows: 100,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
         let output = update_leaf(&input).unwrap();
 
@@ -1096,6 +1106,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
         let output = update_leaf(&input).unwrap();
         let origin = |leaflet_idx, copied| LeafletOrigin {
@@ -1134,6 +1145,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1164,6 +1176,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1191,6 +1204,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1227,6 +1241,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1272,6 +1287,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
         let gen1 = update_leaf(&input).unwrap();
         assert_eq!(gen1.leaves.len(), 1);
@@ -1294,6 +1310,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: empty_sidecar.as_deref(),
+            history_drop: None,
         };
         let gen2 = update_leaf(&input)
             .expect("merging novelty into an emptied-by-retract leaflet must not fail");
@@ -1382,6 +1399,7 @@ mod tests {
             leaflet_target_rows: 2,
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
         let gen1 = update_leaf(&input).unwrap();
         assert_eq!(gen1.leaves.len(), 1);
@@ -1402,6 +1420,7 @@ mod tests {
             leaflet_target_rows: 2,
             leaf_target_rows: 10000,
             sidecar_bytes: gen1.leaves[0].info.sidecar_bytes.as_deref(),
+            history_drop: None,
         };
         let gen2 = update_leaf(&input)
             .expect("merging novelty into an emptied middle leaflet must not fail");
@@ -1470,6 +1489,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: leaf.sidecar_bytes.as_deref(),
+            history_drop: None,
         };
         let gen2 = update_leaf(&input)
             .expect("merging novelty into a rebuild-emitted empty partition must not fail");
@@ -1530,6 +1550,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10000,
             sidecar_bytes: leaf.sidecar_bytes.as_deref(),
+            history_drop: None,
         };
         let gen2 = update_leaf(&input).unwrap();
         assert_eq!(gen2.leaves.len(), 1);
@@ -1581,6 +1602,7 @@ mod tests {
             leaflet_target_rows: 3, // Force split: 7 rows / 3 = 3 leaflets
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
+            history_drop: None,
         };
 
         let output = update_leaf(&input).unwrap();

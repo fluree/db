@@ -377,6 +377,9 @@ struct Phase2Task {
     sorted_superseded: Vec<RunRecordV2>,
     sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
+    /// History entries retention leaves out of this graph.
+    history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 }
 
 /// Graph-scoped V2 fact identity: `(g_id, s_id, p_id, o_type, o_key, o_i)`.
@@ -453,6 +456,7 @@ async fn execute_phase2_task(
         sorted_superseded,
         sorted_superseded_ops,
         kind,
+        history_drop,
     } = task;
 
     let branch_config = BranchUpdateConfig {
@@ -464,6 +468,7 @@ async fn execute_phase2_task(
         // Fact identity is order-independent; collect base-row matches from
         // the SPOT task only (they feed the Phase 3b stats deltas).
         collect_matched: order == RunSortOrder::Spot,
+        history_drop: history_drop.clone(),
     };
 
     let started = Instant::now();
@@ -586,6 +591,7 @@ async fn execute_phase2_task(
                 order,
                 g_id,
                 config,
+                history_drop.clone(),
             )?;
             let new_leaf_count = fresh.new_leaf_blobs.len();
             let update = if fresh.leaf_entries.is_empty() {
@@ -838,6 +844,9 @@ pub async fn incremental_index(
                 sorted_superseded,
                 sorted_superseded_ops,
                 kind,
+                history_drop: novelty
+                    .shared
+                    .history_drop_for(&config.history_suppression, g_id),
             });
         }
     }
@@ -4922,6 +4931,7 @@ fn check_base_facts_agree(outputs: &[Phase2TaskOutput]) -> Result<()> {
 /// from absent, exactly as a full rebuild resolves its complete log: the
 /// transitions go to the history sidecar and only a final assert becomes a
 /// row. A fact whose net op is a retraction leaves history and no row.
+#[allow(clippy::too_many_arguments)]
 fn build_fresh_branch_v3(
     sorted_records: &[RunRecordV2],
     sorted_ops: &[u8],
@@ -4930,6 +4940,9 @@ fn build_fresh_branch_v3(
     order: RunSortOrder,
     g_id: u16,
     config: &IndexerConfig,
+    history_drop: Option<
+        std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>,
+    >,
 ) -> Result<BranchUpdateResult> {
     use crate::run_index::build::incremental_leaf::NewLeafBlob;
     use crate::run_index::build::novelty_merge::gather_identity_events;
@@ -4941,6 +4954,7 @@ fn build_fresh_branch_v3(
     let leaf_target = config.leaf_rows;
 
     let mut writer = LeafWriter::new(order, leaflet_target, leaf_target, 1);
+    writer.set_history_drop(history_drop);
     let mut events = Vec::new();
     let mut si = 0;
     for (rec, &op) in sorted_records.iter().zip(sorted_ops) {
@@ -5371,6 +5385,7 @@ mod warm_tests {
             RunSortOrder::Spot,
             0,
             &config,
+            None,
         )
         .expect("fresh branch");
         let rows: u64 = fresh.leaf_entries.iter().map(|e| e.row_count).sum();
@@ -5391,6 +5406,7 @@ mod warm_tests {
             RunSortOrder::Spot,
             0,
             &config,
+            None,
         );
         assert!(stranded.is_err(), "a stranded superseded event must fail");
     }
@@ -5418,6 +5434,7 @@ mod warm_tests {
                 sorted_superseded: Vec::new(),
                 sorted_superseded_ops: Vec::new(),
                 kind,
+                history_drop: None,
             };
             let output = execute_phase2_task(
                 task,
@@ -5470,6 +5487,7 @@ mod warm_tests {
                 sorted_superseded: Vec::new(),
                 sorted_superseded_ops: Vec::new(),
                 kind,
+                history_drop: None,
             };
             let output = execute_phase2_task(
                 task,
@@ -5692,6 +5710,7 @@ mod warm_tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 10_000,
             sidecar_bytes: None,
+            history_drop: None,
         })
         .unwrap();
         let blob = output.leaves.into_iter().next().unwrap();

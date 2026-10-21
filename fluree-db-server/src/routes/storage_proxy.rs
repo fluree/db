@@ -950,6 +950,15 @@ pub async fn get_object_by_cid(
         .map_err(|e| ServerError::internal(e.to_string()))
 }
 
+/// Content that holds what a ledger's history may no longer serve: commit
+/// and transaction blobs, and index history sidecars.
+fn is_audit_kind(kind: ContentKind) -> bool {
+    matches!(
+        kind,
+        ContentKind::Commit | ContentKind::Txn | ContentKind::HistorySidecar
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,13 +1003,4 @@ mod tests {
             assert!(!is_allowed_object_kind(kind), "{kind:?} must NOT be served");
         }
     }
-}
-
-/// Content that holds what a ledger's history may no longer serve: commit
-/// and transaction blobs, and index history sidecars.
-fn is_audit_kind(kind: ContentKind) -> bool {
-    matches!(
-        kind,
-        ContentKind::Commit | ContentKind::Txn | ContentKind::HistorySidecar
-    )
 }

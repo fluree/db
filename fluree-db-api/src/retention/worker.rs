@@ -41,6 +41,8 @@ pub(crate) struct RetentionRuntime {
     pub(crate) cache: ScheduleCache,
     /// Removal journals held between reads.
     pub(crate) suppressions: super::suppression::SuppressionCache,
+    /// Branches whose history backfill (a rebuild) is running.
+    backfills: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl RetentionRuntime {
@@ -152,14 +154,24 @@ struct RetentionBuildObserver {
 
 #[async_trait::async_trait]
 impl BuildObserver for RetentionBuildObserver {
-    async fn before_build(&self, record: &NsRecord) -> std::result::Result<(), String> {
+    async fn before_build(
+        &self,
+        record: &NsRecord,
+    ) -> std::result::Result<fluree_db_indexer::BuildDirectives, String> {
         let Some(fluree) = self.fluree.upgrade() else {
-            return Ok(());
+            return Ok(Default::default());
         };
         fluree
             .observe_build_for_retention(record)
             .await
-            .map_err(|e| format!("retention activation check: {e}"))
+            .map_err(|e| format!("retention activation check: {e}"))?;
+        let history_suppression = fluree
+            .suppressed_history_for_index(record.ledger_id.as_ref())
+            .await
+            .map_err(|e| format!("retention journal: {e}"))?;
+        Ok(fluree_db_indexer::BuildDirectives {
+            history_suppression,
+        })
     }
 }
 
@@ -174,6 +186,64 @@ impl RetentionWriter for BorrowedWriter<'_> {
 }
 
 impl Fluree {
+    /// Rebuild `ledger_id`'s index once its journal has history rules the
+    /// index was not yet rebuilt for: incremental builds drop suppressed
+    /// history only from the leaves they touch, so existing history goes in
+    /// one rebuild. Runs in the background; a failure is retried on a later
+    /// pass.
+    pub(crate) fn backfill_history_if_needed(
+        &self,
+        ledger_id: &str,
+        registration: &registry::Registration,
+    ) {
+        let journal = &registration.journal;
+        let open_rules = journal.history_rules.iter().any(|r| r.until_t.is_none());
+        if !open_rules || registration.history_backfilled >= journal.generation {
+            return;
+        }
+        if !self
+            .retention
+            .backfills
+            .lock()
+            .insert(ledger_id.to_string())
+        {
+            return;
+        }
+        let fluree = self.clone();
+        let ledger_id = ledger_id.to_string();
+        let generation = journal.generation;
+        tokio::spawn(async move {
+            let outcome = fluree
+                .reindex(&ledger_id, crate::ReindexOptions::default())
+                .await;
+            match outcome {
+                Ok(_) => {
+                    if let Ok(ns) = fluree.publisher() {
+                        let _ = registry::update(ns, &ledger_id, |current| {
+                            let current = current?;
+                            (current.history_backfilled < generation).then(|| {
+                                registry::Registration {
+                                    history_backfilled: generation,
+                                    ..current.clone()
+                                }
+                            })
+                        })
+                        .await;
+                    }
+                    tracing::info!(
+                        ledger_id,
+                        generation,
+                        "retention: history backfill rebuilt the index"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(ledger_id, error = %e, "retention: history backfill failed; will retry");
+                }
+            }
+            fluree.retention.backfills.lock().remove(&ledger_id);
+        });
+    }
+
     /// Housekeeping that runs the retention worker, committing through
     /// `writer` (this instance directly when `None`). Install it on the
     /// worker that owns catch-up, composed with any other housekeeping (see

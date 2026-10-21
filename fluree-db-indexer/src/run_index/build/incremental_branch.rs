@@ -55,6 +55,9 @@ pub struct BranchUpdateConfig {
     /// [`BranchUpdateMeta::matched`]. Fact identity is order-independent, so
     /// callers running all four sort orders enable this for one order only.
     pub collect_matched: bool,
+    /// History entries retention leaves out of this graph.
+    pub history_drop:
+        Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
 }
 
 /// Result of a branch update.
@@ -418,6 +421,7 @@ fn make_leaf_update_input<'a>(
         leaflet_target_rows: config.leaflet_target_rows,
         leaf_target_rows,
         sidecar_bytes,
+        history_drop: config.history_drop.clone(),
     })
 }
 
@@ -840,6 +844,7 @@ mod parity_tests {
             leaflet_target_rows: 50,
             leaf_target_rows: 200,
             collect_matched: false,
+            history_drop: None,
         };
 
         let (serial_meta, serial_blobs) = run_mode(
@@ -940,6 +945,7 @@ mod parity_tests {
             leaflet_target_rows: 50,
             leaf_target_rows: 200,
             collect_matched: false,
+            history_drop: None,
         };
 
         let serial = run_mode(

@@ -6454,6 +6454,7 @@ where
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
                     term_builder: Some(std::sync::Arc::clone(&term_builder)),
+                    history_drop: None,
                 };
                 std::fs::create_dir_all(&cfg_g0.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6484,6 +6485,7 @@ where
                         build_progress: None,
                         stage_marker: None,
                         term_builder: Some(std::sync::Arc::clone(&term_builder)),
+                        history_drop: None,
                     };
                     std::fs::create_dir_all(&cfg_g1.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6522,6 +6524,7 @@ where
                         build_progress: None,
                         stage_marker: None,
                         term_builder: Some(std::sync::Arc::clone(&term_builder)),
+                        history_drop: None,
                     };
                     std::fs::create_dir_all(&cfg_ng.run_dir).map_err(|e| index_build_error(&e))?;
 

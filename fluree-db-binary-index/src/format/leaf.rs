@@ -126,6 +126,8 @@ pub struct LeafWriter {
     leaf_target_rows: usize,
     zstd_level: i32,
     skip_history: bool,
+    /// History entries retention leaves out.
+    history_drop: Option<std::sync::Arc<super::history_sidecar::HistoryDrop>>,
 
     // Current leaflet accumulation.
     record_buf: Vec<RunRecordV2>,
@@ -191,6 +193,7 @@ impl LeafWriter {
             leaf_target_rows,
             zstd_level,
             skip_history: false,
+            history_drop: None,
             record_buf: Vec::with_capacity(leaflet_target_rows),
             sidecar_builder: HistSidecarBuilder::new(),
             current_segment_started: false,
@@ -211,6 +214,14 @@ impl LeafWriter {
     /// Skip history sidecar production (import fast path).
     pub fn set_skip_history(&mut self, skip: bool) {
         self.skip_history = skip;
+    }
+
+    /// Leave out the history entries `drop` covers (retention).
+    pub fn set_history_drop(
+        &mut self,
+        drop: Option<std::sync::Arc<super::history_sidecar::HistoryDrop>>,
+    ) {
+        self.history_drop = drop.filter(|d| !d.is_empty());
     }
 
     /// Push a record into the writer.
@@ -310,7 +321,7 @@ impl LeafWriter {
     /// (no materialized row) push history only; those entries are committed to the
     /// current leaflet by the next `push_record` (or by `finish`).
     pub fn push_history_entry(&mut self, entry: HistEntryV2) {
-        if self.skip_history {
+        if self.skip_history || self.history_drop.as_ref().is_some_and(|d| d.drops(&entry)) {
             return;
         }
         self.pending_history.push(entry);

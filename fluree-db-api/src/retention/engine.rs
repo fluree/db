@@ -770,6 +770,9 @@ impl Fluree {
             }
         }
         cache.put(ledger_id, blob, schedule, persisted_at);
+        if let Some(current) = registry::read(ns, ledger_id).await?.1 {
+            self.backfill_history_if_needed(ledger_id, &current);
+        }
         Ok(report)
     }
 

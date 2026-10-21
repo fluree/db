@@ -1033,7 +1033,14 @@ pub trait BuildObserver: Send + Sync {
     async fn before_build(
         &self,
         record: &fluree_db_nameservice::NsRecord,
-    ) -> std::result::Result<(), String>;
+    ) -> std::result::Result<BuildDirectives, String>;
+}
+
+/// What a [`BuildObserver`] asks of the build it was shown.
+#[derive(Clone, Debug, Default)]
+pub struct BuildDirectives {
+    /// History the build leaves out of the index (retention).
+    pub history_suppression: Vec<crate::config::SuppressedHistory>,
 }
 
 /// The build observer, shared with the worker's handle like housekeeping.
@@ -2425,10 +2432,15 @@ impl BackgroundIndexerWorker {
 
         let observer = self.build_observer.read().ok().and_then(|o| o.clone());
         if let Some(observer) = observer {
-            if let Err(e) = observer.before_build(&record).await {
-                warn!(ledger_id = %ledger_id, error = %e, "build observer failed; build deferred");
-                self.schedule_retry(ledger_id, &e).await;
-                return;
+            match observer.before_build(&record).await {
+                Ok(directives) => {
+                    job_config.history_suppression = directives.history_suppression;
+                }
+                Err(e) => {
+                    warn!(ledger_id = %ledger_id, error = %e, "build observer failed; build deferred");
+                    self.schedule_retry(ledger_id, &e).await;
+                    return;
+                }
             }
         }
         let result = crate::build_index_for_record_with_tracker(
