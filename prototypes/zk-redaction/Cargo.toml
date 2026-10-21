@@ -1,0 +1,12 @@
+# ZK redaction prototype (DATA_ERASURE.md, PR 4). Isolated from the main
+# workspace so RISC Zero never enters normal runtime dependencies.
+[workspace]
+resolver = "2"
+members = ["core", "host", "methods"]
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+debug = 1
+lto = true

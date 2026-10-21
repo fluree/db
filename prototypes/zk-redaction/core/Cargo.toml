@@ -1,0 +1,22 @@
+[package]
+name = "zk-redaction-core"
+version = "0.1.0"
+edition = "2021"
+description = "The V4 commit redaction transform, shared by the zkVM guest and the host"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+ruzstd = "0.8"
+ed25519-dalek = { version = "2.1", default-features = false }
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", optional = true }
+
+[features]
+# Hash with the `sha2` crate (host side); the guest supplies the zkVM's
+# accelerated SHA-256 instead.
+host-sha = ["dep:sha2"]
+
+[dev-dependencies]
+fluree-db-core = { path = "../../../fluree-db-core", features = ["credential"] }
+fluree-db-credential = { path = "../../../fluree-db-credential" }
+sha2 = "0.10"
