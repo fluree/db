@@ -65,6 +65,10 @@ mod inner {
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
         pub prefix_map: HashMap<String, String>,
+        /// The owners whose list a chunk has stored compactly, for chunks
+        /// that do not spool (a spooled chunk shares
+        /// `SpoolConfig::list_owners`).
+        pub list_owners: crate::lists::ClaimedOwners,
     }
 
     impl ImportState {
@@ -85,6 +89,7 @@ mod inner {
                 // dict_id+1 convention so spooled and fallback g_ids agree.
                 next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
                 prefix_map: HashMap::new(),
+                list_owners: Default::default(),
             }
         }
     }
@@ -173,6 +178,9 @@ mod inner {
         )
         .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
             let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
@@ -334,6 +342,9 @@ mod inner {
         )
         .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
             let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
@@ -525,6 +536,9 @@ mod inner {
         )
         .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
             let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)

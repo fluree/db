@@ -805,6 +805,7 @@ pub async fn stage_with_graph_delta(
             None => None,
         };
 
+        let list_txn_id = txn_id.clone();
         let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id);
         generator.set_graph_table(&write_table);
 
@@ -909,6 +910,7 @@ pub async fn stage_with_graph_delta(
         }
         // Every graph is resolved, and the upsert wave has read its slots:
         // release the table's borrow of the ledger.
+        let lists = generator.take_lists();
         drop(generator);
 
         // Graph-sync wave: retract every current fact of the target graph
@@ -945,6 +947,17 @@ pub async fn stage_with_graph_delta(
                 "graph-sync retractions generated"
             );
             acc.push_retractions(current.into_iter().map(|f| f.retract(new_t)));
+        }
+
+        // The asserted lists, each compact or a chain (see `crate::lists`).
+        // Decided once every retraction is in and before any cancels: list
+        // members an upsert or sync restates are retracted here, so the list
+        // stays compact and cancels to nothing.
+        if !lists.is_empty() {
+            let stored =
+                crate::lists::store_lists(&ledger, lists, &list_txn_id, |fact| acc.retracts(fact))
+                    .await?;
+            acc.push_assertions(stored);
         }
 
         let retraction_count = stream_stats.retraction_count;
@@ -1922,6 +1935,36 @@ async fn stage_graph_mgmt(
                                 }
                             }
                         }
+                    }
+
+                    // ADD merges the source into the destination, so a source list
+                    // on a property where the destination holds one is a second
+                    // list there (see `crate::lists`). COPY/MOVE make the
+                    // destination the source, whose lists copy as they are.
+                    if !*clear_dest && rehomed.iter().any(|f| f.m.as_ref().is_some_and(|m| m.i.is_some())) {
+                        let txn_id = generate_txn_id();
+                        let (members, mut kept): (Vec<Flake>, Vec<Flake>) = rehomed
+                            .into_iter()
+                            .partition(|f| f.m.as_ref().is_some_and(|m| m.i.is_some()));
+                        let mut owners: Vec<crate::lists::Owner> = Vec::new();
+                        let mut by_owner: HashMap<crate::lists::Owner, Vec<Flake>> = HashMap::new();
+                        for f in members {
+                            let owner = (f.g.clone(), f.s.clone(), f.p.clone());
+                            if !by_owner.contains_key(&owner) {
+                                owners.push(owner.clone());
+                            }
+                            by_owner.entry(owner).or_default().push(f);
+                        }
+                        let lists = owners
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(n, owner)| {
+                                let members = by_owner.remove(&owner)?;
+                                Some(crate::lists::PendingList::new(members, format!("{txn_id}--l{n}-")))
+                            })
+                            .collect();
+                        kept.extend(crate::lists::store_lists(&ledger, lists, &txn_id, |_| false).await?);
+                        rehomed = kept;
                     }
 
                     // The content set the transfer will land in the destination —

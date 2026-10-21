@@ -213,6 +213,27 @@ impl<'l> FlakeAccumulator<'l> {
         }
     }
 
+    /// Whether a retraction of `fact`, a stored fact, has been pushed.
+    pub fn retracts(&self, fact: &Flake) -> bool {
+        match &self.inner {
+            AccInner::PureRetract(graphs) => graphs.get(&fact.g).is_some_and(|f| f.contains(fact)),
+            AccInner::Mixed(graphs) => {
+                let Some(graph) = graphs.get(&fact.g) else {
+                    return false;
+                };
+                let key = self
+                    .identity
+                    .as_ref()
+                    .and_then(|ids| ids.key(graph.g_id, fact));
+                let bucket = match key {
+                    Some(key) => graph.by_key.get(&(fact.s.clone(), fact.p.clone(), key)),
+                    None => graph.by_term.get(fact),
+                };
+                bucket.is_some_and(|b| b.retract_count > 0)
+            }
+        }
+    }
+
     /// Drain into the final SPOT-sorted survivor set.
     ///
     /// For pure-DELETE: every unique retracted fact contributes one survivor.

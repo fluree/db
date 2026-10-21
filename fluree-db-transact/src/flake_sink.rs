@@ -5,6 +5,7 @@
 
 use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
+use crate::lists::PendingList;
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 #[cfg(test)]
@@ -59,6 +60,11 @@ pub struct FlakeSink<'a> {
     blank_counter: u32,
     /// Accumulated assertion flakes
     flakes: Vec<Flake>,
+    /// Lists in the order begun: their members, compact, and the label
+    /// their chain's cells would be minted under.
+    lists: Vec<(Vec<Flake>, String)>,
+    /// The list each subject and predicate is adding items to.
+    open_lists: HashMap<(Sid, Sid), usize>,
     /// Namespace registry for IRI → Sid conversion and code allocation
     ns_registry: &'a mut NamespaceRegistry,
     /// Transaction time stamp for all generated flakes
@@ -84,6 +90,8 @@ impl<'a> FlakeSink<'a> {
             blank_labels: HashMap::new(),
             blank_counter: 0,
             flakes: Vec::new(),
+            lists: Vec::new(),
+            open_lists: HashMap::new(),
             ns_registry,
             t,
             txn_id,
@@ -101,11 +109,28 @@ impl<'a> FlakeSink<'a> {
     /// this is the sink's *product*. Deferred-error semantics are unchanged
     /// by the fallible protocol — `emit_*` still records the first violation
     /// and keeps going, and this method is where it becomes a hard error.
+    ///
+    /// The document's lists are stored as a document no ledger holds would
+    /// store them ([`crate::lists::store_new_lists`]); a write to a ledger
+    /// takes them from [`Self::into_flakes_and_lists`] instead.
     pub fn into_flakes(self) -> Result<Vec<Flake>, TransactError> {
+        let (mut flakes, lists) = self.into_flakes_and_lists()?;
+        flakes.extend(crate::lists::store_new_lists(lists));
+        Ok(flakes)
+    }
+
+    /// The flakes and, separately, the lists the document writes, for
+    /// [`crate::lists::store_lists`] to store against the ledger.
+    pub fn into_flakes_and_lists(self) -> Result<(Vec<Flake>, Vec<PendingList>), TransactError> {
         if let Some(err) = self.invariant_error {
             return Err(err);
         }
-        Ok(self.flakes)
+        let lists = self
+            .lists
+            .into_iter()
+            .map(|(members, cells)| PendingList::new(members, cells))
+            .collect();
+        Ok((self.flakes, lists))
     }
 
     // -- helpers -------------------------------------------------------------
@@ -298,9 +323,21 @@ impl GraphSink for FlakeSink<'_> {
         object: TermId,
         index: i32,
     ) -> SinkResult {
-        if let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) {
-            self.flakes.push(flake);
-        }
+        let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) else {
+            return Ok(());
+        };
+        let owner = (flake.s.clone(), flake.p.clone());
+        let list = match self.open_lists.get(&owner) {
+            Some(&list) if index != 0 => list,
+            _ => {
+                let cells = format!("{}--l{}-", self.txn_id, self.lists.len());
+                self.lists.push((Vec::new(), cells));
+                let list = self.lists.len() - 1;
+                self.open_lists.insert(owner, list);
+                list
+            }
+        };
+        self.lists[list].0.push(flake);
         Ok(())
     }
 

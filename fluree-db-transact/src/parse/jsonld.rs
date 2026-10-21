@@ -1001,6 +1001,8 @@ fn expand_update_graph_iri(v: &Value, context: &ParsedContext, strict: bool) -> 
 #[derive(Debug, Default)]
 struct BlankIssuer {
     next: usize,
+    /// Lists issued, for [`TripleTemplate::list_id`].
+    lists: u32,
     /// Numbers of user `_:bN` labels to skip (the re-parse).
     skip: std::collections::HashSet<usize>,
     /// Numbers of the user `_:bN` labels seen in this parse.
@@ -1009,6 +1011,12 @@ struct BlankIssuer {
 }
 
 impl BlankIssuer {
+    /// A list id unique in the document.
+    fn issue_list(&mut self) -> u32 {
+        self.lists += 1;
+        self.lists - 1
+    }
+
     fn issue(&mut self) -> TemplateTerm {
         while self.skip.contains(&self.next) {
             self.next += 1;
@@ -1786,6 +1794,7 @@ fn parse_expanded_object_with_ctx(
                         object,
                         None,
                         None,
+                        None,
                     );
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -1819,6 +1828,7 @@ fn parse_expanded_object_with_ctx(
                 parsed_value.term,
                 parsed_value.dtc,
                 parsed_value.list_index,
+                parsed_value.list_id,
             );
         }
     }
@@ -1910,6 +1920,7 @@ fn parse_reverse_properties(
                     owner.clone(),
                     None,
                     None,
+                    None,
                 );
             }
         }
@@ -1982,6 +1993,8 @@ struct ParsedValue {
     term: TemplateTerm,
     dtc: Option<DatatypeConstraint>,
     list_index: Option<i32>,
+    /// The `@list` this value is a member of (see [`TripleTemplate::list_id`]).
+    list_id: Option<u32>,
 }
 
 impl ParsedValue {
@@ -1990,6 +2003,7 @@ impl ParsedValue {
             term,
             dtc: None,
             list_index: None,
+            list_id: None,
         }
     }
 
@@ -2399,6 +2413,7 @@ fn parse_list_value_with_ctx(
     let first = &items[0];
     let mut parsed = parse_single_list_item_with_ctx(first, scope, ctx, out)?;
     parsed.list_index = Some(0);
+    parsed.list_id = Some(ctx.blanks.issue_list());
     Ok(parsed)
 }
 
@@ -2430,10 +2445,12 @@ fn parse_list_values_with_ctx(
     }
 
     // Parse each item with its index
+    let list = ctx.blanks.issue_list();
     let mut results = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let mut parsed = parse_single_list_item_with_ctx(item, scope, ctx, out)?;
         parsed.list_index = Some(index as i32);
+        parsed.list_id = Some(list);
         results.push(parsed);
     }
 

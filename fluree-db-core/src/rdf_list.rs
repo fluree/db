@@ -34,19 +34,19 @@ pub struct Lists {
     /// `rdf:nil`: a cell without exactly one `rdf:first` and one `rdf:rest`,
     /// or a cycle.
     pub malformed: usize,
-    /// Values that are not lists.
-    pub other: usize,
+    /// The values that are not lists, in value order.
+    pub values: Vec<FlakeValue>,
 }
 
 impl Lists {
     /// No values at all.
     pub fn is_missing(&self) -> bool {
-        self.lists.is_empty() && self.malformed == 0 && self.other == 0
+        self.lists.is_empty() && self.malformed == 0 && self.values.is_empty()
     }
 
     /// The members, when the values are exactly one well-formed list.
     pub fn single(mut self) -> Option<Vec<FlakeValue>> {
-        (self.lists.len() == 1 && self.malformed == 0 && self.other == 0)
+        (self.lists.len() == 1 && self.malformed == 0 && self.values.is_empty())
             .then(|| self.lists.pop())
             .flatten()
     }
@@ -75,9 +75,9 @@ pub async fn read_lists(db: GraphDbRef<'_>, values: &[Flake]) -> Result<Lists> {
             FlakeValue::Ref(head) => match walk_chain(db, head).await? {
                 Chain::List(items) => out.lists.push(items),
                 Chain::Malformed => out.malformed += 1,
-                Chain::NotAList => out.other += 1,
+                Chain::NotAList => out.values.push(flake.o.clone()),
             },
-            _ => out.other += 1,
+            other => out.values.push(other.clone()),
         }
     }
     Ok(out)
