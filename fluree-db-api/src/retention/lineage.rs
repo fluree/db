@@ -269,8 +269,9 @@ impl Fluree {
             let Some(flake) = commits[&cid].get(removal.slot as usize).filter(|f| f.op) else {
                 continue;
             };
+            // Current as this occurrence, not as a later reassertion.
             for stored in super::removal::stored_terms(&state, flake).await? {
-                if !current.iter().any(|(f, _)| *f == stored) {
+                if stored.t == flake.t && !current.iter().any(|(f, _)| *f == stored) {
                     current.push((stored, removal));
                 }
             }

@@ -1040,6 +1040,14 @@ async fn a_view_held_across_a_removal_refuses_the_removed_value() {
                 Err(ApiError::HistoryUnavailable(_))
             ));
         }
+        // Nor once the cache has let the ledger go.
+        fluree.disconnect_ledger(&id).await;
+        for view in [&view, &held] {
+            assert!(matches!(
+                fluree.query(view, &email_query()).await,
+                Err(ApiError::HistoryUnavailable(_))
+            ));
+        }
         assert!(read(&fluree, &id, json!(id), "ex:alice", "ex:email")
             .await
             .unwrap()
@@ -1408,6 +1416,52 @@ async fn a_later_pass_publishes_a_journal_an_earlier_one_could_not() {
             json!(format!("{copy}@t:{t1}")),
             "ex:c",
             "ex:count"
+        )
+        .await
+    ));
+}
+
+/// A restore retracts a removed occurrence the archive holds as current, but
+/// not the same value asserted again after the removal.
+#[tokio::test]
+async fn a_restore_keeps_a_value_reasserted_after_its_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let id = ledger(&fluree, "it/reasserted").await;
+    let doc = json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"});
+    let t1 = insert(&fluree, &id, doc.clone()).await;
+    fluree
+        .remove_occurrences(&id, select("alice", None))
+        .await
+        .expect("remove");
+    let t3 = insert(&fluree, &id, doc).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+
+    let restored = fluree
+        .restore_ledger("it/reasserted-copy", &mut archive.as_slice())
+        .await
+        .expect("restore");
+    let copy = restored.ledger_id;
+    assert_eq!(restored.commit_t, t3, "nothing was retracted");
+    assert_eq!(
+        read(&fluree, &copy, json!(copy), "ex:alice", "ex:email")
+            .await
+            .unwrap(),
+        vec![json!("a@old")]
+    );
+    assert!(unavailable(
+        read(
+            &fluree,
+            &copy,
+            json!(format!("{copy}@t:{t1}")),
+            "ex:alice",
+            "ex:email"
         )
         .await
     ));

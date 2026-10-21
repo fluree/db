@@ -207,7 +207,7 @@ impl Fluree {
     /// Whether a read of `db` is of its ledger's current state: a view not
     /// built as of an earlier point, and not overtaken since by a head this
     /// instance knows of. Takes no ledger lock, so a query issued inside a
-    /// transaction can ask; with a ledger cache, it does no I/O either.
+    /// transaction can ask; for a cached ledger, it does no I/O either.
     pub(crate) async fn reads_current_state(&self, db: &crate::GraphDb) -> Result<bool> {
         if db.historical {
             return Ok(false);
@@ -218,9 +218,14 @@ impl Fluree {
         let Ok(id) = fluree_db_core::LedgerId::parse(&db.ledger_id) else {
             return Ok(true);
         };
-        let head = match self.ledger_manager.as_ref() {
-            Some(manager) => manager.known_head(&id),
-            // Nothing in memory follows the heads; the nameservice has them.
+        let known = self
+            .ledger_manager
+            .as_ref()
+            .and_then(|manager| manager.known_head(&id));
+        let head = match known {
+            Some(head) => Some(head),
+            // Nothing in memory follows this ledger's head (no cache, or
+            // not cached now); the nameservice has it.
             None => self
                 .nameservice()
                 .lookup(id.as_str())
