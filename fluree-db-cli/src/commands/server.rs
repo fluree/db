@@ -7,36 +7,19 @@
 use crate::cli::ServerAction;
 use crate::config;
 use crate::error::{CliError, CliResult};
+use crate::local_server::{
+    is_fluree_process, is_process_alive, meta_path, read_meta, same_path, ServerMeta,
+};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_server::config_file::load_and_merge_config;
 use fluree_db_server::{
     init_logging, shutdown_tracer, FlureeServer, ServerConfig, TelemetryConfig,
 };
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-
-/// Metadata persisted alongside the PID file for `restart` and `status`.
-#[derive(Debug, Serialize, Deserialize)]
-struct ServerMeta {
-    pid: u32,
-    listen_addr: String,
-    storage_path: String,
-    #[serde(default)]
-    connection_config: Option<String>,
-    #[serde(default)]
-    bolt_listen_addr: Option<String>,
-    config_path: Option<String>,
-    started_at: String,
-    /// The raw args passed to the `_child` process (for `restart`).
-    args: Vec<String>,
-    /// The storage root the server locks, if it locks one.
-    #[serde(default)]
-    locked_root: Option<PathBuf>,
-}
 
 // ---------------------------------------------------------------------------
 // File paths within data_dir
@@ -48,10 +31,6 @@ fn pid_path(data_dir: &Path) -> PathBuf {
 
 fn log_path(data_dir: &Path) -> PathBuf {
     data_dir.join("server.log")
-}
-
-fn meta_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("server.meta.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +147,7 @@ async fn run_foreground(
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
-    let mut server_config = build_server_config(
+    let server_config = build_server_config(
         config_override,
         listen_addr,
         storage_path,
@@ -180,7 +159,6 @@ async fn run_foreground(
         profile,
         extra_args,
     )?;
-    server_config.storage_lock = true;
 
     // A memory server keeps nothing in a project, so it needs no `.fluree/`
     // and writes no server.meta.json (so no CLI auto-routing either).
@@ -233,8 +211,8 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         listen_addr: server_config.listen_addr.to_string(),
         storage_path: server_config
             .storage_path
-            .as_ref()
-            .map(|p| p.display().to_string())
+            .as_deref()
+            .map(|path| recorded_path(path).display().to_string())
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: server_config
             .connection_config
@@ -244,8 +222,16 @@ fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>)
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: Vec::new(),
-        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
+        locked_root: server_config.owned_storage_path().map(recorded_path),
     }
+}
+
+/// A path as `server.meta.json` records it: absolute, so a command run from
+/// any directory compares it with its own storage.
+fn recorded_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn write_meta(meta_file: &Path, meta: &ServerMeta) {
@@ -367,8 +353,8 @@ async fn run_start(
         listen_addr: server_config.listen_addr.to_string(),
         storage_path: server_config
             .storage_path
-            .as_ref()
-            .map(|p| p.display().to_string())
+            .as_deref()
+            .map(|path| recorded_path(path).display().to_string())
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: server_config
             .connection_config
@@ -378,7 +364,7 @@ async fn run_start(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args,
-        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
+        locked_root: server_config.owned_storage_path().map(recorded_path),
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| CliError::Server(format!("failed to serialize metadata: {e}")))?;
@@ -417,9 +403,7 @@ struct Recorded {
 
 fn recorded_server(data_dir: &Path) -> Option<Recorded> {
     let pid = read_pid(&pid_path(data_dir))?;
-    let locked_root = fs::read_to_string(meta_path(data_dir))
-        .ok()
-        .and_then(|s| serde_json::from_str::<ServerMeta>(&s).ok())
+    let locked_root = read_meta(data_dir)
         .filter(|meta| meta.pid == pid)
         .and_then(|meta| meta.locked_root);
     Some(Recorded { pid, locked_root })
@@ -442,8 +426,17 @@ fn already_running(server_config: &ServerConfig, recorded: Option<&Recorded>) ->
             .map(|r| running(r.pid));
     };
     match fluree_db_core::RootLock::acquire(root) {
-        Ok(_probe) => recorded
-            .filter(|r| r.locked_root.as_deref() != Some(root) && is_process_alive(r.pid))
+        Ok(probe) if probe.is_locked() => recorded
+            .filter(|r| {
+                !r.locked_root
+                    .as_deref()
+                    .is_some_and(|locked| same_path(locked, root))
+                    && is_process_alive(r.pid)
+            })
+            .map(|r| running(r.pid)),
+        // Opened unprotected, so the lock cannot tell and the pid answers.
+        Ok(_) => recorded
+            .filter(|r| is_process_alive(r.pid))
             .map(|r| running(r.pid)),
         Err(fluree_db_core::RootLockError::Unsupported(error)) => Some(format!(
             "storage {} is on a filesystem that cannot lock it ({error}); set {}=true to \
@@ -546,7 +539,7 @@ async fn run_start_with_child_args(
         storage_path: child_args
             .windows(2)
             .find(|w| w[0] == "--storage-path")
-            .map(|w| w[1].clone())
+            .map(|w| recorded_path(Path::new(&w[1])).display().to_string())
             .unwrap_or_else(|| "(memory)".into()),
         connection_config: child_args
             .windows(2)
@@ -874,7 +867,6 @@ async fn run_child(args: &[String]) -> CliResult<()> {
 
     let mut server_config = ServerConfig::from_arg_matches(&matches)
         .map_err(|e| CliError::Server(format!("failed to build server config: {e}")))?;
-    server_config.storage_lock = true;
 
     // Merge config file values (the child inherits --config-file if present)
     if let Err(e) = load_and_merge_config(&mut server_config, &matches) {
@@ -1323,50 +1315,6 @@ fn send_signal(_pid: u32, _sig: Signal) {
     eprintln!("Signal sending is only supported on Unix. Use task manager to stop the server.");
 }
 
-#[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_process_alive(_pid: u32) -> bool {
-    // Conservative: assume alive if we can't check
-    true
-}
-
-/// Validate that a PID belongs to a Fluree server process (not a recycled PID).
-///
-/// On Linux, reads `/proc/<pid>/cmdline`. On macOS (and Linux fallback), uses
-/// `ps -o command=` to get the full argv and checks for "fluree" + "server child".
-/// Returns true if we can confirm it's ours, or if we can't check (conservative).
-#[cfg(unix)]
-fn is_fluree_process(pid: u32) -> bool {
-    // Try /proc/<pid>/cmdline first (Linux). Fields are NUL-separated.
-    if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
-        let cmdline = String::from_utf8_lossy(&raw);
-        // Look for "server" + "child" in the command line (our _child pattern)
-        return cmdline.contains("fluree") && cmdline.contains("server");
-    }
-    // Fallback: use `ps -o command=` for the full argv (works on macOS and Linux).
-    // `command=` gives the full command line, not just the executable name.
-    if let Ok(output) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    {
-        if output.status.success() {
-            let cmd = String::from_utf8_lossy(&output.stdout);
-            return cmd.contains("fluree") && cmd.contains("server");
-        }
-    }
-    // Can't verify — assume it's ours (conservative)
-    true
-}
-
-#[cfg(not(unix))]
-fn is_fluree_process(_pid: u32) -> bool {
-    true
-}
-
 fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path)
         .ok()
@@ -1732,6 +1680,29 @@ mod tests {
             already_running(&file_backed(dir.path()), Some(&reused)),
             None
         );
+    }
+
+    /// A `start` run from another directory can name the root another way.
+    #[test]
+    fn start_ignores_a_live_pid_recorded_for_the_free_root_under_another_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let reused = recorded(Some(&dir.path().join("sub").join("..")));
+
+        assert_eq!(
+            already_running(&file_backed(dir.path()), Some(&reused)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_server_records_the_root_it_locks_as_an_absolute_path() {
+        let meta = foreground_meta(&file_backed(Path::new("relative/storage")), None);
+
+        let root = meta
+            .locked_root
+            .expect("a file-backed server locks its root");
+        assert!(root.is_absolute(), "{}", root.display());
     }
 
     /// A connection-config server, or one on other storage, leaves this

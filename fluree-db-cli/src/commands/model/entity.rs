@@ -217,7 +217,7 @@ fn compile(entity: &str, label: Option<&str>, specs: &[PropertySpec], closed: bo
     json!({"@graph": [class_node, shape]})
 }
 
-pub async fn run(action: &ModelEntityAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: &ModelEntityAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         ModelEntityAction::Define {
             dataset,
@@ -237,12 +237,11 @@ pub async fn run(action: &ModelEntityAction, dirs: &FlureeDir, direct: bool) -> 
                 *dry_run,
                 remote.as_deref(),
                 dirs,
-                direct,
             )
             .await
         }
         ModelEntityAction::Show { dataset, remote } => {
-            run_show(dataset, remote.as_deref(), dirs, direct).await
+            run_show(dataset, remote.as_deref(), dirs).await
         }
     }
 }
@@ -257,7 +256,6 @@ async fn run_define(
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
-    direct: bool,
 ) -> CliResult<()> {
     require_absolute_iri("--entity", entity)?;
     let specs: Vec<PropertySpec> = property_specs
@@ -314,7 +312,7 @@ async fn run_define(
     // is NOT owned: it's shared authorship with `model class define`
     // (hierarchy, label), so it stays additive — except rdfs:label, which
     // is replaced when --label is given so re-labeling stays idempotent.
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    let mode = resolve_mode(dataset, remote, dirs).await?;
     let children_q = json!({
         "select": ["?child"],
         "where": [{"@id": &shape_iri, format!("{SH}property"): "?child"}]
@@ -344,13 +342,8 @@ async fn run_define(
     Ok(())
 }
 
-async fn run_show(
-    dataset: &str,
-    remote: Option<&str>,
-    dirs: &FlureeDir,
-    direct: bool,
-) -> CliResult<()> {
-    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+async fn run_show(dataset: &str, remote: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
+    let mode = resolve_mode(dataset, remote, dirs).await?;
     let q = json!({
         "@context": {"sh": SH},
         "select": {"?shape": ["*", {"sh:property": ["*"]}]},

@@ -33,7 +33,6 @@ fn locking_config(root: &std::path::Path) -> ServerConfig {
         cors_enabled: false,
         indexing_enabled: false,
         storage_path: Some(root.to_path_buf()),
-        storage_lock: true,
         ..Default::default()
     }
 }

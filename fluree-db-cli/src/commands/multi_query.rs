@@ -16,7 +16,7 @@
 //!    `fluree query` running locally without a server.
 
 use crate::cli::PolicyArgs;
-use crate::context::{self, try_server_route_client};
+use crate::context;
 use crate::error::{CliError, CliResult};
 use crate::input;
 use colored::Colorize;
@@ -166,7 +166,7 @@ pub async fn run(
         None if !direct => {
             // Auto-route through local server if one is running;
             // fall back to in-process when none is found.
-            match try_server_route_client(dirs) {
+            match context::local_server_client(dirs) {
                 Some(client) => {
                     let client = client.with_policy(policy.clone());
                     client

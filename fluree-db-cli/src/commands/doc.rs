@@ -256,7 +256,7 @@ async fn setup_extraction(
 
     let model = match &args.model {
         Some(spec) => Some(Arc::new(
-            doc_sources::load_model(&Source::parse(spec), dirs).await?,
+            doc_sources::load_model(&Source::parse(spec), target, dirs).await?,
         )),
         None => None,
     };

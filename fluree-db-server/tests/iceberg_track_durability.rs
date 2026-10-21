@@ -34,6 +34,22 @@ const TARGET: &str = "silver_{tenant_id}_{user_id}:main";
 const SETTLE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(50);
 
+/// A restart within one process. The first instance's background tasks stop
+/// at their next poll, and its storage lock goes with their last `Fluree`
+/// clone, so the next instance waits for that rather than meeting it.
+async fn restart_in(tmp: &TempDir, first: Arc<AppState>) -> Arc<AppState> {
+    drop(first);
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while fluree_db_core::RootLock::acquire(tmp.path()).is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first instance never released its storage"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    state_in(tmp).await
+}
+
 async fn state_in(tmp: &TempDir) -> Arc<AppState> {
     let cfg = ServerConfig {
         cors_enabled: false,
@@ -134,10 +150,8 @@ async fn a_tracked_job_survives_a_restart() {
         })
         .await
         .expect("persist");
-    drop(first);
-
     // Second instance over the same storage — nothing calls track.
-    let state = state_in(&tmp).await;
+    let state = restart_in(&tmp, first).await;
     let app = build_router(state.clone());
 
     let body = poll_until(&app, "the persisted job to be restored", has_job).await;
@@ -188,9 +202,7 @@ async fn an_untracked_job_is_not_restored() {
             .is_empty(),
         "forget must clear the durable record"
     );
-    drop(first);
-
-    let state = state_in(&tmp).await;
+    let state = restart_in(&tmp, first).await;
     let app = build_router(state.clone());
 
     // Give restore its chance, then assert it stayed out.

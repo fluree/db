@@ -67,13 +67,17 @@ pub use commit::{
     build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
-pub use current_facts::{CurrentFacts, Origin, Retraction, Slot, StoredFact};
+pub use current_facts::{
+    graph_id_in, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey, Origin, Retraction, Slot,
+    StoredFact, DELETE_POINT_READ_SITE,
+};
 pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::FlakeGenerator;
 pub use ir::{
-    GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues, TemplateGraph,
-    TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
+    AddressName, GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues,
+    TemplateGraph, TemplateTerm, TemplateTripleTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    WriteGraphs,
 };
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,
@@ -83,8 +87,8 @@ pub use namespace::{
     SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
 pub use parse::{
-    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, Placement, RdfText,
-    RdfTextSummary,
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, ContentIdentity,
+    Placement, RdfText, RdfTextSummary,
 };
 pub use parse::{
     might_contain_graph_block, parse_graph_insert, parse_sync_transaction, parse_transaction,

@@ -726,6 +726,7 @@ async fn load_with_new_connection_placeholder() {
     let _ledger1 = fluree.insert(ledger0, &insert).await.unwrap().ledger;
 
     let fluree2 = FlureeBuilder::file(storage_path)
+        .without_storage_lock()
         .build()
         .expect("build file fluree2");
     let query = json!({

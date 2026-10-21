@@ -65,7 +65,6 @@ pub async fn run(
     field_terminator: &str,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     // Each batch becomes literal AST rows inlined into one query/transaction
     // (see `expand_unwind_match` in fluree-db-cypher), so an unbounded
@@ -89,11 +88,7 @@ pub async fn run(
         context::build_remote_mode(remote_name, &alias, dirs).await?
     } else {
         let mode = context::resolve_ledger_mode(ledger_flag, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {

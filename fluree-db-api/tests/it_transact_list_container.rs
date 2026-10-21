@@ -39,6 +39,7 @@ async fn list_container_serialization_test() {
 
     // Create second connection to test loading from disk
     let fluree2 = FlureeBuilder::file(test_dir_str)
+        .without_storage_lock()
         .build()
         .expect("build file fluree2");
 
@@ -111,6 +112,7 @@ async fn list_container_multiple_values_test() {
 
     // Load with new connection
     let fluree2 = FlureeBuilder::file(test_dir_str)
+        .without_storage_lock()
         .build()
         .expect("build file fluree2");
     let loaded_ledger = fluree2.ledger(ledger_id).await.unwrap();
@@ -270,6 +272,7 @@ async fn list_container_with_objects_test() {
 
     // Load with new connection
     let fluree2 = FlureeBuilder::file(test_dir_str)
+        .without_storage_lock()
         .build()
         .expect("build file fluree2");
     let loaded_ledger = fluree2.ledger(ledger_id).await.unwrap();

@@ -2412,37 +2412,46 @@ mod tests {
         assert!(ns.list_branches("../beside").await.is_err());
     }
 
-    /// A branch whose name begins with `/` keeps its record under the
-    /// ledger's directory, and dropping the branch drops that record.
+    /// A branch whose name begins with `/` is no ledger address: publishing,
+    /// looking up and dropping it are refused, and nothing is written for it.
+    /// A record an older version wrote for one stays under the ledger's
+    /// directory, untouched.
     #[tokio::test]
-    async fn a_branch_beginning_with_a_slash_drops_its_own_record() {
+    async fn a_branch_beginning_with_a_slash_is_refused_and_its_record_kept() {
         let (temp, ns) = setup().await;
         // Rooted in this test's directory, so the name stays inside it however
         // it is read.
         let branch = format!("{}/legacy", temp.path().display());
         assert!(branch.starts_with('/'));
         let ledger_id = format!("lg:{branch}");
-        crate::testing::create(&ns, "lg:main").await.unwrap();
-        crate::testing::create(&ns, &ledger_id).await.unwrap();
-        ns.publish_commit(&ledger_id, 1, &test_cid("commit-1"))
-            .await
-            .unwrap();
         let record = ns.ns_path("lg", &branch).unwrap();
         assert!(record.starts_with(temp.path().join(NS_VERSION).join("lg")));
-        assert!(record.exists());
 
-        let name = fluree_db_core::LedgerName::parse("lg").unwrap();
-        let crate::lifecycle::BranchDrop::Purge(dropped) =
-            crate::lifecycle::begin_drop_branch(&ns, &name, &branch)
-                .await
-                .unwrap()
-        else {
-            panic!("a branch with no children is purged");
-        };
-        crate::lifecycle::finish_drop_branch(&ns, &name, &dropped)
+        let refused = ns
+            .publish_commit(&ledger_id, 1, &test_cid("commit-1"))
+            .await;
+        assert!(matches!(refused, Err(NameServiceError::InvalidId(_))));
+        assert!(!record.exists());
+        assert!(!PathBuf::from(format!("{branch}.json")).exists());
+
+        crate::testing::create(&ns, "lg:placeholder").await.unwrap();
+        ns.publish_commit("lg:placeholder", 1, &test_cid("commit-1"))
             .await
             .unwrap();
-        assert!(ns.lookup(&ledger_id).await.unwrap().is_none());
+        let placeholder = ns.ns_path("lg", "placeholder").unwrap();
+        let json = std::fs::read_to_string(&placeholder)
+            .unwrap()
+            .replace("placeholder", &branch);
+        std::fs::remove_file(&placeholder).unwrap();
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, &json).unwrap();
+
+        let lookup = ns.lookup(&ledger_id).await;
+        assert!(matches!(lookup, Err(NameServiceError::InvalidId(_))));
+        let name = fluree_db_core::LedgerName::parse("lg").unwrap();
+        let dropped = crate::lifecycle::begin_drop_branch(&ns, &name, &branch).await;
+        assert!(dropped.is_err(), "{dropped:?}");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), json);
     }
 
     // ========== Graph Source Tests ==========

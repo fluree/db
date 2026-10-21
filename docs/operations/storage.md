@@ -385,18 +385,25 @@ processes on one directory are not coordinated: each serves its own cached view 
 and both index and clean up the same files. To use one directory from several processes, run a
 [server](running-fluree.md) on it and send their requests to the server.
 
-A Fluree server (`fluree server run` or `start`) and the Python package lock the directory for as
-long as they have it open, through a `.fluree-lock` file at its root. A second server or Python
-process that opens the directory meanwhile is refused, with the process id of the one that holds
-it. The lock belongs to the running process, so a crash or `kill -9` releases it; the file left
-behind means nothing. Shared-storage query peers and Raft nodes, which share a directory with other
-processes on purpose, take no lock.
+Every process that opens a file storage directory locks it for as long as it has it open,
+through a `.fluree-lock` file at its root: a Fluree server, a CLI command, the Python package, and
+a Rust program. Another process that opens the directory meanwhile is refused, with the process id
+of the one that holds it. The lock belongs to the running process, so a crash or `kill -9`
+releases it; the file left behind means nothing. Shared-storage query peers and Raft nodes, which
+share a directory with other processes on purpose, take no lock.
 
-Not every process takes the lock yet. CLI commands such as `fluree insert` route to a running
-server, but with `--direct`, or with no server running, they open the directory themselves and
-unlocked, so running one beside a Python process that has the directory open is unprotected. A
-Rust program takes the lock only when it asks for it (`FlureeBuilder::with_storage_lock()`, or
-`SharedFluree`).
+CLI commands often run side by side, each holding the directory only for its own short run, so a
+command that finds it held waits for it: up to 30 seconds, or `FLUREE_STORAGE_LOCK_WAIT_SECS`
+(`0` refuses at once). With a server running on the directory, most commands are sent through it
+and never open the directory (see [Auto-Routing](../cli/server.md#auto-routing)). The rest, and
+any command run with `--direct`, are refused at once, since the server holds the directory for as
+long as it runs: `index`, `verify`, `config set-origins`, `graphql`, `track add`, `materialize`,
+`doc`, and the commands that copy ledgers between servers (`clone`, `pull`, `push`, `fetch`,
+`publish`). Stop the server to run them. `fluree memory` keeps its ledger in memory, rebuilt from `.fluree-memory/*.ttl`, and
+never opens the directory.
+
+A Rust program that reads a directory another process owns opts out with
+`FlureeBuilder::without_storage_lock()`.
 
 A filesystem that cannot lock (some network and FUSE mounts) fails to open. Set
 `FLUREE_STORAGE_ALLOW_UNLOCKED=true` to open it anyway, without protection from a second process.

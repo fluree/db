@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::query::multi::MultiQueryError;
-use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
+use fluree_db_api::query::multi::{
+    MultiQueryBounds, MultiQueryRequest, MultiQueryStatus, MultiQueryValidationError,
+};
 use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
 
@@ -337,6 +339,10 @@ async fn multi_query_partial_failure_per_alias_via_in_process_api() {
     assert!(response.errors.contains_key("bad"));
 }
 
+/// SPARQL with a parse error the parser recovers from, naming `mq-users:main`.
+const RECOVERED: &str =
+    "SELECT ?n FROM <mq-users:main> WHERE { ?u <http://schema.org/name> ?n . ?u }";
+
 #[tokio::test]
 async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in_process_api() {
     // A sub-query that does not parse is reported under its alias, in either
@@ -360,6 +366,10 @@ async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in
             "bad_jsonld": {
                 "language": "jsonld",
                 "query": { "from": "mq-users:main", "select": 42, "where": { "@id": "?u" } }
+            },
+            "bad_recovered": {
+                "language": "sparql",
+                "query": RECOVERED
             }
         }
     }))
@@ -374,13 +384,24 @@ async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias_via_in
 
     assert_eq!(response.status, MultiQueryStatus::Partial);
     assert!(response.results.contains_key("good"));
-    for alias in ["bad_sparql", "bad_jsonld"] {
+    for alias in ["bad_sparql", "bad_jsonld", "bad_recovered"] {
         assert!(
             response.errors.contains_key(alias),
             "{alias}: {:?}",
             response.errors
         );
     }
+    // A parse error the parser recovers from is reported for the text as
+    // written, though the sibling puts its `FROM` ledger in the snapshot.
+    let parsed = fluree_db_sparql::parse_sparql(RECOVERED);
+    assert!(
+        parsed.has_errors() && parsed.ast.is_some(),
+        "the fixture must parse with an error and still yield an AST"
+    );
+    let first = parsed.errors().next().expect("an error").message.clone();
+    let reported = response.errors["bad_recovered"].to_string();
+    assert!(reported.contains(&first), "{first:?} not in {reported}");
+    assert!(response.snapshot.ledgers.contains_key("mq-users:main"));
     // The SPARQL sub-query that does not parse reads nothing, so its `FROM`
     // is not in the snapshot.
     assert!(
@@ -625,4 +646,624 @@ async fn multi_query_builder_default_format_unchanged_without_format_call() {
         !dump.contains("@value"),
         "default format should NOT wrap literals in @value, got: {dump}"
     );
+}
+
+// =============================================================================
+// Every member a sub-query reads is read at the snapshot
+// =============================================================================
+
+/// `mq-hist:main` at t=1 holds Alice and Brian; t=2 adds Carol.
+async fn seed_two_commits(fluree: &MemoryFluree) {
+    let ledger = fluree
+        .insert(
+            genesis_ledger(fluree, "mq-hist:main").await,
+            &json!({
+                "@context": { "schema": "http://schema.org/" },
+                "@graph": [
+                    { "@id": "http://example.org/alice", "schema:name": "Alice" },
+                    { "@id": "http://example.org/brian", "schema:name": "Brian" }
+                ]
+            }),
+        )
+        .await
+        .expect("seed t=1")
+        .ledger;
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "schema": "http://schema.org/" },
+                "@id": "http://example.org/carol",
+                "schema:name": "Carol"
+            }),
+        )
+        .await
+        .expect("seed t=2");
+}
+
+/// Each sub-query reads `mq-hist:main` through another dataset position or
+/// spelling; under `asOf: 1` every one reads the ledger at t=1, and the
+/// envelope lists the ledger once, by its canonical id.
+#[tokio::test]
+async fn multi_query_every_member_is_read_at_the_snapshot() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_two_commits(&fluree).await;
+    let bs = char::from_u32(0x5c).unwrap();
+    let sparql = |text: String| json!({ "language": "sparql", "query": text });
+    let names = "?s <http://schema.org/name> ?n";
+    let jsonld = |mut query: serde_json::Value| {
+        query["select"] = json!(["?n"]);
+        json!({ "language": "jsonld", "query": query })
+    };
+    let where_named = json!([["graph", "h", { "@id": "?s", "http://schema.org/name": "?n" }]]);
+    let cases = [
+        (
+            "sparql urn",
+            sparql(format!(
+                "SELECT ?n FROM <urn:fluree:mq-hist:main> WHERE {{ {names} }}"
+            )),
+        ),
+        (
+            "sparql escaped",
+            sparql(format!(
+                "SELECT ?n FROM <mq-hist{bs}u003Amain> WHERE {{ {names} }}"
+            )),
+        ),
+        (
+            "sparql prefixed",
+            sparql(format!(
+                "PREFIX m: <mq-hist:> SELECT ?n FROM m:main WHERE {{ {names} }}"
+            )),
+        ),
+        (
+            "sparql base",
+            sparql(format!(
+                "BASE <mq-hist:> SELECT ?n FROM <main> WHERE {{ {names} }}"
+            )),
+        ),
+        (
+            "jsonld fromNamed",
+            jsonld(json!({
+                "from": "mq-hist:main",
+                "fromNamed": { "h": { "@id": "mq-hist:main" } },
+                "where": where_named
+            })),
+        ),
+        (
+            "jsonld from-named",
+            jsonld(json!({
+                "from": "mq-hist:main",
+                "from-named": [{ "@id": "mq-hist:main", "alias": "h" }],
+                "where": where_named
+            })),
+        ),
+        (
+            "jsonld opts.from",
+            jsonld(json!({
+                "from": "mq-hist:main",
+                "opts": { "from": "urn:fluree:mq-hist:main" },
+                "where": { "@id": "?s", "http://schema.org/name": "?n" }
+            })),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, sub) in cases {
+        let envelope: MultiQueryRequest =
+            serde_json::from_value(json!({ "asOf": 1, "queries": { "a": sub } }))
+                .expect("envelope deserialises");
+        let response = match fluree.multi_query().envelope(envelope).execute().await {
+            Ok(response) => response,
+            Err(e) => {
+                failures.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
+        let text = serde_json::to_string(&response.results).unwrap();
+        if response.status != MultiQueryStatus::Ok
+            || !text.contains("Alice")
+            || text.contains("Carol")
+            || response.snapshot.ledgers.keys().collect::<Vec<_>>() != ["mq-hist:main"]
+        {
+            failures.push(format!(
+                "{name}: {:?} {text} {:?} {:?}",
+                response.status, response.errors, response.snapshot.ledgers
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// With no `asOf`, a member spelled `urn:fluree:` resolves the snapshot of
+/// the ledger it names.
+#[tokio::test]
+async fn multi_query_a_urn_member_resolves_its_ledgers_snapshot() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_two_commits(&fluree).await;
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "queries": {
+            "a": {
+                "language": "sparql",
+                "query": "SELECT ?n FROM <urn:fluree:mq-hist:main> \
+                          WHERE { ?s <http://schema.org/name> ?n }"
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+    let response = fluree
+        .multi_query()
+        .envelope(envelope)
+        .execute()
+        .await
+        .expect("envelope executes");
+    assert_eq!(
+        response.status,
+        MultiQueryStatus::Ok,
+        "{:?}",
+        response.errors
+    );
+    assert_eq!(
+        response.snapshot.ledgers.get("mq-hist:main"),
+        Some(&json!(2))
+    );
+}
+
+/// A ledger a JSON-LD sub-query names only in its named graphs is resolved at
+/// envelope entry: listed in the snapshot when it exists, and the envelope's
+/// not-found when it does not.
+#[tokio::test]
+async fn multi_query_named_graph_ledgers_are_resolved_at_entry() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+    let envelope = |named: &str| -> MultiQueryRequest {
+        serde_json::from_value(json!({
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "from": "mq-users:main",
+                        "fromNamed": { "o": { "@id": named } },
+                        "select": ["?id"],
+                        "where": [["graph", "o", { "@id": "?o", "http://example.org/orderId": "?id" }]]
+                    }
+                }
+            }
+        }))
+        .expect("envelope deserialises")
+    };
+    let response = fluree
+        .multi_query()
+        .envelope(envelope("mq-orders:main"))
+        .execute()
+        .await
+        .expect("envelope executes");
+    assert_eq!(
+        response.status,
+        MultiQueryStatus::Ok,
+        "{:?}",
+        response.errors
+    );
+    let mut listed: Vec<&String> = response.snapshot.ledgers.keys().collect();
+    listed.sort();
+    assert_eq!(listed, ["mq-orders:main", "mq-users:main"], "{listed:?}");
+
+    let err = fluree
+        .multi_query()
+        .envelope(envelope("mq-absent:main"))
+        .execute()
+        .await
+        .expect_err("a missing ledger fails the envelope");
+    match err {
+        MultiQueryError::Snapshot(e) => assert!(e.is_not_found(), "{e}"),
+        other => panic!("expected a snapshot not-found, got {other:?}"),
+    }
+}
+
+/// A named member keeps the name the query wrote it by: under the envelope's
+/// snapshot, `GRAPH ?g` over a member written `mq-hist:main` binds `mq-hist:main`, on
+/// both surfaces, as the same query alone does, and reads it at the snapshot.
+#[tokio::test]
+async fn multi_query_a_named_member_keeps_its_name_at_the_snapshot() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_two_commits(&fluree).await;
+    let sparql = json!({
+        "language": "sparql",
+        "query": "SELECT ?g ?n FROM NAMED <mq-hist:main> \
+                  WHERE { GRAPH ?g { ?s <http://schema.org/name> ?n } }"
+    });
+    let jsonld = json!({
+        "language": "jsonld",
+        "query": {
+            "from": "mq-hist:main",
+            "from-named": ["mq-hist:main"],
+            "select": ["?g", "?n"],
+            "where": [["graph", "?g", { "@id": "?s", "http://schema.org/name": "?n" }]]
+        }
+    });
+    let mut failures = Vec::new();
+    for as_of in [json!(1), serde_json::Value::Null] {
+        let mut envelope = json!({ "queries": { "sparql": sparql, "jsonld": jsonld } });
+        if !as_of.is_null() {
+            envelope["asOf"] = as_of.clone();
+        }
+        let envelope: MultiQueryRequest =
+            serde_json::from_value(envelope).expect("envelope deserialises");
+        let response = fluree
+            .multi_query()
+            .envelope(envelope)
+            .execute()
+            .await
+            .expect("envelope executes");
+        let mut sparql_rows: Vec<(String, String)> = response.results["sparql"]["results"]
+            ["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{:?}", response.errors))
+            .iter()
+            .map(|b| {
+                (
+                    b["g"]["value"].as_str().unwrap_or_default().to_string(),
+                    b["n"]["value"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        sparql_rows.sort();
+        let mut jsonld_rows: Vec<(String, String)> = response.results["jsonld"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{:?}", response.errors))
+            .iter()
+            .map(|row| {
+                (
+                    row[0].as_str().unwrap_or_default().to_string(),
+                    row[1].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        jsonld_rows.sort();
+        let names: &[&str] = if as_of.is_null() {
+            &["Alice", "Brian", "Carol"]
+        } else {
+            &["Alice", "Brian"]
+        };
+        let want: Vec<(String, String)> = names
+            .iter()
+            .map(|n| ("mq-hist:main".to_string(), (*n).to_string()))
+            .collect();
+        for (surface, rows) in [("sparql", &sparql_rows), ("jsonld", &jsonld_rows)] {
+            if rows != &want {
+                failures.push(format!("asOf {as_of}, {surface}: {rows:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// With no envelope `asOf`, a member that names its own time keeps it on
+/// both surfaces, while the envelope still resolves the ledger's head.
+#[tokio::test]
+async fn multi_query_a_member_naming_its_own_time_keeps_it() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_two_commits(&fluree).await;
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "queries": {
+            "sparql": {
+                "language": "sparql",
+                "query": "SELECT ?n FROM <mq-hist:main@t:1> WHERE { ?s <http://schema.org/name> ?n }"
+            },
+            "jsonld": {
+                "language": "jsonld",
+                "query": {
+                    "from": { "@id": "mq-hist:main", "t": 1 },
+                    "select": ["?n"],
+                    "where": { "@id": "?s", "http://schema.org/name": "?n" }
+                }
+            },
+            "head": {
+                "language": "jsonld",
+                "query": {
+                    "from": "mq-hist:main",
+                    "select": ["?n"],
+                    "where": { "@id": "?s", "http://schema.org/name": "?n" }
+                }
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+    let response = fluree
+        .multi_query()
+        .envelope(envelope)
+        .execute()
+        .await
+        .expect("envelope executes");
+    assert_eq!(
+        response.status,
+        MultiQueryStatus::Ok,
+        "{:?}",
+        response.errors
+    );
+    assert_eq!(
+        response.snapshot.ledgers.get("mq-hist:main"),
+        Some(&json!(2))
+    );
+    let text = |alias: &str| serde_json::to_string(&response.results[alias]).unwrap();
+    for alias in ["sparql", "jsonld"] {
+        assert!(
+            text(alias).contains("Brian") && !text(alias).contains("Carol"),
+            "{alias}: {}",
+            text(alias)
+        );
+    }
+    assert!(text("head").contains("Carol"), "{}", text("head"));
+}
+
+// =============================================================================
+// Validation reads the body the dispatcher runs
+// =============================================================================
+
+/// `mq-hist:main` (two commits) and `mq-other:main` (one).
+async fn seed_hist_and_other(fluree: &MemoryFluree) {
+    seed_two_commits(fluree).await;
+    fluree
+        .insert(
+            genesis_ledger(fluree, "mq-other:main").await,
+            &json!({
+                "@context": { "schema": "http://schema.org/" },
+                "@id": "http://example.org/olga",
+                "schema:name": "Olga"
+            }),
+        )
+        .await
+        .expect("seed mq-other:main");
+}
+
+/// One JSON-LD sibling over `mq-other:main`, the envelope's and the alias's `opts`
+/// set as given.
+fn layered_envelope(
+    envelope_opts: serde_json::Value,
+    alias_opts: serde_json::Value,
+    body_extra: serde_json::Value,
+    as_of: serde_json::Value,
+) -> MultiQueryRequest {
+    let mut body = json!({
+        "from": "mq-other:main",
+        "select": ["?n"],
+        "where": [["graph", "h", { "@id": "?s", "http://schema.org/name": "?n" }]]
+    });
+    for (k, v) in body_extra.as_object().into_iter().flatten() {
+        body[k] = v.clone();
+    }
+    let mut envelope = json!({
+        "queries": { "a": { "language": "jsonld", "query": body } }
+    });
+    if !envelope_opts.is_null() {
+        envelope["opts"] = envelope_opts;
+    }
+    if !alias_opts.is_null() {
+        envelope["queries"]["a"]["opts"] = alias_opts;
+    }
+    if !as_of.is_null() {
+        envelope["asOf"] = as_of;
+    }
+    serde_json::from_value(envelope).expect("envelope deserialises")
+}
+
+/// A ledger a sibling's `fromNamed` adds, in its body or in the envelope's or
+/// the alias's `opts`, is one the sibling reads: validation counts it against
+/// the bound, and the snapshot pins it and lists it, as for its `from`.
+#[tokio::test]
+async fn multi_query_a_from_named_ledger_is_counted_and_pinned_in_every_layer() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_hist_and_other(&fluree).await;
+    let named = json!({ "fromNamed": { "h": { "@id": "mq-hist:main" } } });
+    let none = serde_json::Value::Null;
+    let mut failures = Vec::new();
+    for (layer, envelope_opts, alias_opts, body_extra) in [
+        ("body", none.clone(), none.clone(), named.clone()),
+        ("envelope", named.clone(), none.clone(), json!({})),
+        ("alias", none.clone(), named.clone(), json!({})),
+    ] {
+        let envelope = layered_envelope(
+            envelope_opts.clone(),
+            alias_opts.clone(),
+            body_extra.clone(),
+            serde_json::Value::Null,
+        );
+        let ledgers = fluree_db_api::query::multi::validate_envelope_ledgers(
+            &envelope,
+            &MultiQueryBounds::DEFAULT,
+        )
+        .expect("validates");
+        let distinct: Vec<&String> = ledgers.distinct.iter().collect();
+        if distinct != ["mq-hist:main", "mq-other:main"] {
+            failures.push(format!("{layer}: validation reports {distinct:?}"));
+        }
+        let one = MultiQueryBounds {
+            max_distinct_ledgers: 1,
+            ..MultiQueryBounds::DEFAULT
+        };
+        match fluree
+            .multi_query()
+            .envelope(envelope)
+            .bounds(one)
+            .execute()
+            .await
+        {
+            Err(MultiQueryError::Validation(
+                MultiQueryValidationError::TooManyDistinctLedgers { actual: 2, .. },
+            )) => {}
+            other => failures.push(format!("{layer}: bound of 1 gave {other:?}")),
+        }
+        // An integer `asOf` is for one ledger, and this sibling reads two.
+        let envelope = layered_envelope(
+            envelope_opts.clone(),
+            alias_opts.clone(),
+            body_extra.clone(),
+            json!(1),
+        );
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Err(MultiQueryError::Validation(
+                MultiQueryValidationError::AsOfIntegerMultiLedger { distinct: 2 },
+            )) => {}
+            other => failures.push(format!("{layer}: integer asOf gave {other:?}")),
+        }
+        // With no `asOf`, the envelope resolves both ledgers' heads: listed
+        // and read.
+        let envelope = layered_envelope(
+            envelope_opts,
+            alias_opts,
+            body_extra,
+            serde_json::Value::Null,
+        );
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Ok(response) => {
+                let mut listed: Vec<&String> = response.snapshot.ledgers.keys().collect();
+                listed.sort();
+                let text = serde_json::to_string(&response.results).unwrap();
+                if listed != ["mq-hist:main", "mq-other:main"] || !text.contains("Carol") {
+                    failures.push(format!(
+                        "{layer}: snapshot {listed:?}, results {text}, errors {:?}",
+                        response.errors
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{layer}: {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// How a refused envelope's validation error is recognised.
+type RefusedBy = fn(&MultiQueryValidationError) -> bool;
+
+/// The outer `opts` may add to a sibling's dataset but not change a part the
+/// body names: a different default graph from the envelope or the alias is a
+/// 400, as is a history end, and a pin there collides with an envelope
+/// `asOf`. The same default graph, or `opts` that name no dataset, compose.
+#[tokio::test]
+async fn multi_query_outer_opts_may_not_change_the_dataset_the_body_names() {
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    seed_hist_and_other(&fluree).await;
+    let null = serde_json::Value::Null;
+    let iso = json!("2099-01-01T00:00:00Z");
+    let refused: Vec<(&str, MultiQueryRequest, RefusedBy)> = vec![
+        (
+            "envelope opts.from",
+            layered_envelope(
+                json!({ "from": "mq-hist:main" }),
+                null.clone(),
+                json!({}),
+                json!(1),
+            ),
+            |e| e.to_string().contains("names its default graphs"),
+        ),
+        (
+            "alias opts.from",
+            layered_envelope(
+                null.clone(),
+                json!({ "from": "mq-hist:main" }),
+                json!({}),
+                json!(1),
+            ),
+            |e| e.to_string().contains("names its default graphs"),
+        ),
+        (
+            "alias opts.ledger",
+            layered_envelope(
+                null.clone(),
+                json!({ "ledger": "mq-hist:main" }),
+                json!({}),
+                null.clone(),
+            ),
+            |e| e.to_string().contains("names its default graphs"),
+        ),
+        (
+            "envelope opts.fromNamed over the body's",
+            layered_envelope(
+                json!({ "fromNamed": { "h": { "@id": "mq-hist:main" } } }),
+                null.clone(),
+                json!({ "fromNamed": { "h": { "@id": "mq-other:main" } } }),
+                null.clone(),
+            ),
+            |e| e.to_string().contains("names its named graphs"),
+        ),
+        (
+            "envelope opts.to",
+            layered_envelope(
+                json!({ "to": "mq-other:main@t:1" }),
+                null.clone(),
+                json!({}),
+                null.clone(),
+            ),
+            |e| matches!(e, MultiQueryValidationError::HistoryQueryInEnvelope { .. }),
+        ),
+        (
+            "a pin in the envelope's named graphs under asOf",
+            layered_envelope(
+                json!({ "fromNamed": { "h": { "@id": "mq-hist:main", "t": 1 } } }),
+                null.clone(),
+                json!({}),
+                iso.clone(),
+            ),
+            |e| matches!(e, MultiQueryValidationError::AsOfCollision { .. }),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, envelope, expected) in refused {
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Err(MultiQueryError::Validation(e)) if expected(&e) => {}
+            other => failures.push(format!("{name}: {other:?}")),
+        }
+    }
+    let composed = [
+        (
+            "envelope opts.from naming the body's own",
+            layered_envelope(
+                json!({ "from": "mq-other:main" }),
+                null.clone(),
+                json!({}),
+                null.clone(),
+            ),
+        ),
+        (
+            "the body's own opts.from over the envelope's",
+            layered_envelope(
+                json!({ "from": "mq-hist:main" }),
+                null.clone(),
+                json!({ "opts": { "from": "mq-other:main" } }),
+                null.clone(),
+            ),
+        ),
+        (
+            "outer opts naming no dataset",
+            layered_envelope(
+                json!({ "meta": true }),
+                json!({ "max-fuel": 1_000_000 }),
+                json!({}),
+                null.clone(),
+            ),
+        ),
+    ];
+    for (name, envelope) in composed {
+        match fluree.multi_query().envelope(envelope).execute().await {
+            Ok(response) if response.status == MultiQueryStatus::Ok => {}
+            Ok(response) => failures.push(format!("{name}: {:?}", response.errors)),
+            Err(e) => failures.push(format!("{name}: {e:?}")),
+        }
+    }
+    // A body that names no `from` of its own is refused as before, whatever
+    // the outer `opts` name.
+    let mut envelope = layered_envelope(
+        json!({ "from": "mq-other:main" }),
+        null.clone(),
+        json!({}),
+        null,
+    );
+    envelope.queries["a"]
+        .query
+        .as_object_mut()
+        .unwrap()
+        .remove("from");
+    match fluree.multi_query().envelope(envelope).execute().await {
+        Err(MultiQueryError::Validation(MultiQueryValidationError::MissingFrom { .. })) => {}
+        other => failures.push(format!("no body from: {other:?}")),
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }

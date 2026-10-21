@@ -6,16 +6,14 @@ use comfy_table::{ContentArrangement, Table};
 use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
-pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> CliResult<()> {
+pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         return run_remote(remote_name, dirs).await;
     }
 
     // Auto-route to local server for listing if available
-    if !direct {
-        if let Some(client) = context::try_server_route_client(dirs) {
-            return run_remote_with_client(&client, dirs).await;
-        }
+    if let Some(client) = context::local_server_client(dirs) {
+        return run_remote_with_client(&client, dirs).await;
     }
 
     let fluree = context::build_fluree(dirs).await?;

@@ -7,7 +7,7 @@ use fluree_db_core::graph_registry::{
     config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
 };
 
-pub async fn run(action: GraphAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: GraphAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         GraphAction::List {
             ledger,
@@ -19,7 +19,6 @@ pub async fn run(action: GraphAction, dirs: &FlureeDir, direct: bool) -> CliResu
                 ledger.as_deref(),
                 dirs,
                 remote.as_deref(),
-                direct,
                 json,
                 include_system,
             )
@@ -29,7 +28,7 @@ pub async fn run(action: GraphAction, dirs: &FlureeDir, direct: bool) -> CliResu
             iri,
             ledger,
             remote,
-        } => run_drop(&iri, ledger.as_deref(), dirs, remote.as_deref(), direct).await,
+        } => run_drop(&iri, ledger.as_deref(), dirs, remote.as_deref()).await,
     }
 }
 
@@ -37,7 +36,6 @@ async fn run_list(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
     json: bool,
     include_system: bool,
 ) -> CliResult<()> {
@@ -50,11 +48,7 @@ async fn run_list(
     } else {
         let mode = {
             let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-            if direct {
-                mode
-            } else {
-                context::try_server_route(mode, dirs)
-            }
+            mode
         };
         match mode {
             LedgerMode::Tracked {
@@ -238,7 +232,6 @@ async fn run_drop(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if iri.is_empty() {
         return Err(CliError::Usage(
@@ -257,11 +250,7 @@ async fn run_drop(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {

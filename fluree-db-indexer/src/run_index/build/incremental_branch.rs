@@ -220,7 +220,7 @@ where
         superseded_ops,
         &manifest,
         cmp,
-    );
+    )?;
 
     // Touched leaves: the per-leaf `update_leaf` (decode → merge → zstd re-encode)
     // is the CPU-bound work. On a multi-core box with enough touched leaves we fan
@@ -259,10 +259,10 @@ fn slice_streams_to_leaves<'a>(
     superseded_ops: &'a [u8],
     manifest: &BranchManifest,
     cmp: fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
-) -> Vec<StreamSlices<'a>> {
-    let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, manifest, cmp);
-    let superseded_slices = slice_novelty_to_leaves(superseded, superseded_ops, manifest, cmp);
-    novelty_slices
+) -> io::Result<Vec<StreamSlices<'a>>> {
+    let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, manifest, cmp)?;
+    let superseded_slices = slice_novelty_to_leaves(superseded, superseded_ops, manifest, cmp)?;
+    Ok(novelty_slices
         .into_iter()
         .zip(superseded_slices)
         .map(|((novelty, novelty_ops), (superseded, superseded_ops))| {
@@ -278,7 +278,7 @@ fn slice_streams_to_leaves<'a>(
                 superseded_ops,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Which per-leaf CoW drain to run. Split out so tests can force either path and
@@ -677,7 +677,7 @@ pub fn touched_leaf_refs(
 ) -> io::Result<Vec<(ContentId, Option<ContentId>)>> {
     let manifest = read_branch_from_bytes(existing_branch_bytes)?;
     let cmp = cmp_v2_for_order(order);
-    let slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp);
+    let slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp)?;
     let mut refs = Vec::new();
     for (i, (nov_slice, _ops)) in slices.iter().enumerate() {
         if !nov_slice.is_empty() {
@@ -702,13 +702,24 @@ fn slice_novelty_to_leaves<'a>(
     ops: &'a [u8],
     manifest: &BranchManifest,
     cmp: fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
-) -> Vec<(&'a [RunRecordV2], &'a [u8])> {
+) -> io::Result<Vec<(&'a [RunRecordV2], &'a [u8])>> {
     let n_leaves = manifest.leaves.len();
     if n_leaves == 0 {
-        return vec![];
+        // No leaf to route into: returning no slices would drop the novelty
+        // silently. Callers build a branch with no leaves fresh instead.
+        if novelty.is_empty() {
+            return Ok(vec![]);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} novelty records routed to a branch with no leaves",
+                novelty.len()
+            ),
+        ));
     }
     if n_leaves == 1 {
-        return vec![(novelty, ops)];
+        return Ok(vec![(novelty, ops)]);
     }
 
     let mut result = Vec::with_capacity(n_leaves);
@@ -731,7 +742,7 @@ fn slice_novelty_to_leaves<'a>(
         }
     }
 
-    result
+    Ok(result)
 }
 
 // ============================================================================
@@ -783,7 +794,7 @@ mod parity_tests {
     ) -> (BranchUpdateMeta, Vec<NewLeafBlob>) {
         let manifest = read_branch_from_bytes(branch_bytes).unwrap();
         let cmp = cmp_v2_for_order(config.order);
-        let slices = slice_streams_to_leaves(novelty, ops, &[], &[], &manifest, cmp);
+        let slices = slice_streams_to_leaves(novelty, ops, &[], &[], &manifest, cmp).unwrap();
         let mut blobs: Vec<NewLeafBlob> = Vec::new();
         let meta = drain_branch(
             &manifest,
@@ -799,6 +810,20 @@ mod parity_tests {
         )
         .unwrap();
         (meta, blobs)
+    }
+
+    /// Novelty handed to a branch with no leaves is an error: there is no leaf
+    /// to route it into, and an empty result would drop it.
+    #[test]
+    fn leafless_branch_refuses_novelty() {
+        let manifest = read_branch_from_bytes(&build_branch_bytes(RunSortOrder::Spot, 3, &[]))
+            .expect("leafless branch");
+        let cmp = cmp_v2_for_order(RunSortOrder::Spot);
+        let novelty = [rec(1, 1, 5, 2)];
+        assert!(slice_novelty_to_leaves(&novelty, &[1], &manifest, cmp).is_err());
+        assert!(slice_novelty_to_leaves(&[], &[], &manifest, cmp)
+            .expect("no novelty")
+            .is_empty());
     }
 
     /// Many touched leaves spanning several windows: the serial and the

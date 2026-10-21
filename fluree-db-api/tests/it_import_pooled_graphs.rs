@@ -1425,8 +1425,8 @@ async fn default_labels_at(
 /// A fact asserted and retracted within the window that writes a graph's
 /// first rows stays retracted, and keeps its lived interval for an earlier
 /// `t` — for a new graph joining the pool, a new graph with trees of its
-/// own, and a default graph whose only order has no leaves (a TriG import
-/// with no default-graph triples).
+/// own, and a default graph with no leaves (a TriG import with no
+/// default-graph triples writes none).
 #[tokio::test]
 async fn a_fact_retracted_in_a_trees_first_window_stays_retracted() {
     let db_dir = tempfile::tempdir().unwrap();
@@ -1439,16 +1439,12 @@ async fn a_fact_retracted_in_a_trees_first_window_stays_retracted() {
         "@prefix ex: <http://example.org/> .\nex:seed { ex:s ex:label \"seed\" . }\n",
     )
     .await;
-    // The default graph has a SPOT order with no leaves, and no other order.
+    // The default graph has no leaves.
     let base = latest_root(db_dir.path());
     assert!(base
         .default_graph_orders
         .iter()
         .all(|o| o.leaves.is_empty()));
-    assert!(base
-        .default_graph_orders
-        .iter()
-        .any(|o| o.order == fluree_db_binary_index::RunSortOrder::Spot));
     // t=2: ex:own gets trees of its own; ex:fresh joins the pool.
     set_graph_placement(
         &fluree,
@@ -2974,6 +2970,7 @@ async fn cached_readers_adopt_a_root_compacted_at_the_same_t() {
     let connect = || {
         FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
             .without_indexing()
+            .without_storage_lock()
             .build()
             .expect("build file-backed Fluree")
     };

@@ -44,6 +44,7 @@ use super::run_record_v2::{
     cmp_v2_for_order, ordered_key_from_stored, ordered_key_len, read_ordered_key_v2,
     write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
 };
+use super::transitions::resolve_transitions;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -331,6 +332,34 @@ impl LeafWriter {
         self.flush_leaf_if_target_reached()?;
 
         Ok(())
+    }
+
+    /// Write one fact identity's complete event log, for a branch with no
+    /// prior state for it: the events resolve from absent (see
+    /// [`resolve_transitions`]), the transitions go to the sidecar, and the
+    /// final assert, if any, becomes the row. Returns whether a row was
+    /// written.
+    ///
+    /// `events` holds `(record, op)` pairs (1 = assert, 0 = retract) in any
+    /// order and is left holding the sidecar transitions.
+    pub fn push_lifecycle(&mut self, events: &mut Vec<(RunRecordV2, u8)>) -> io::Result<bool> {
+        let row = resolve_transitions(events, false);
+        for &(rec, op) in events.iter() {
+            self.push_history_entry(HistEntryV2 {
+                s_id: rec.s_id,
+                p_id: rec.p_id,
+                o_type: rec.o_type,
+                o_key: rec.o_key,
+                o_i: rec.o_i,
+                t: rec.t,
+                op,
+                g_id: rec.g_id,
+            });
+        }
+        match row {
+            Some(row) => self.push_record(row).map(|()| true),
+            None => Ok(false),
+        }
     }
 
     /// Push a history entry for the fact whose row (if any) comes next.

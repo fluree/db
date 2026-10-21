@@ -619,6 +619,29 @@ async fn a_rollback_keeps_the_blank_nodes_staged_before_it() {
     assert_eq!(select(&fluree, &txn.db().await.unwrap(), ITEM).await, item);
 }
 
+/// A Turtle upsert names its blank nodes from the document, so staging it
+/// again on a rollback, and committing it, keeps the identities the caller
+/// already read.
+#[tokio::test]
+async fn a_rollback_keeps_a_turtle_upserts_blank_nodes() {
+    const ITEM: &str = "SELECT ?item WHERE { ex:order ex:item ?item }";
+    let fluree = fluree().await;
+    let mut txn = begin(&fluree).await;
+    txn.stage(TxnOperation::UpsertTurtle(
+        "@prefix ex: <http://example.org/> .\nex:order ex:item [ ex:sku \"A1\" ] .\n".into(),
+    ))
+    .await
+    .unwrap();
+    let item = select(&fluree, &txn.db().await.unwrap(), ITEM).await;
+    assert_eq!(item.len(), 1, "{item:?}");
+    let savepoint = txn.savepoint();
+    txn.stage(insert("bob", "Bob", 40)).await.unwrap();
+    txn.rollback_to(savepoint).await.unwrap();
+    assert_eq!(select(&fluree, &txn.db().await.unwrap(), ITEM).await, item);
+    txn.commit(CommitOpts::default()).await.unwrap();
+    assert_eq!(select(&fluree, &head(&fluree).await, ITEM).await, item);
+}
+
 fn tracked(max_fuel: Option<u64>) -> TransactionOptions {
     TransactionOptions {
         tracking: TrackingOptions {

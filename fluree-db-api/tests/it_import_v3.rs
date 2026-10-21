@@ -849,17 +849,13 @@ ex:bob a ex:User ;
     );
 
     // Phase 4: Publish the rebuilt root to nameservice so ledger() loads it.
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index_fenced(
-            "test/v3-rebuild:main",
-            crate::support::fence_of(&fluree, "test/v3-rebuild:main").await,
-            index_result.index_t,
-            &index_result.root_id,
-        )
-        .await
-        .expect("publish rebuilt root");
+    crate::support::publish_built_index(
+        &fluree,
+        "test/v3-rebuild:main",
+        index_result.index_t,
+        &index_result.root_id,
+    )
+    .await;
 
     // Phase 5: Reload the ledger from the rebuilt FIR6 root.
     let rebuilt_ledger = fluree
@@ -1007,17 +1003,13 @@ ex:bob a ex:User ;
     .await
     .expect("V3 rebuild should succeed");
 
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index_fenced(
-            "test/v3-incr:main",
-            crate::support::fence_of(&fluree, "test/v3-incr:main").await,
-            rebuild_result.index_t,
-            &rebuild_result.root_id,
-        )
-        .await
-        .expect("publish rebuild root");
+    crate::support::publish_built_index(
+        &fluree,
+        "test/v3-incr:main",
+        rebuild_result.index_t,
+        &rebuild_result.root_id,
+    )
+    .await;
 
     // Phase 3: Transact new data — introduces a new subject IRI (ex:cam)
     // and new string literal ("Cam"), creating a commit gap from the rebuild root.
@@ -1098,17 +1090,13 @@ ex:bob a ex:User ;
     );
 
     // Phase 5: Publish and reload.
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index_fenced(
-            "test/v3-incr:main",
-            crate::support::fence_of(&fluree, "test/v3-incr:main").await,
-            index_result.index_t,
-            &index_result.root_id,
-        )
-        .await
-        .expect("publish incremental root");
+    crate::support::publish_built_index(
+        &fluree,
+        "test/v3-incr:main",
+        index_result.index_t,
+        &index_result.root_id,
+    )
+    .await;
 
     let incr_ledger = fluree
         .ledger("test/v3-incr:main")
@@ -1289,17 +1277,13 @@ ex:remove a ex:User ;
     .expect("V3 rebuild should succeed");
 
     // Publish and reload.
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index_fenced(
-            "test/v3-retract:main",
-            crate::support::fence_of(&fluree, "test/v3-retract:main").await,
-            index_result.index_t,
-            &index_result.root_id,
-        )
-        .await
-        .expect("publish rebuilt root");
+    crate::support::publish_built_index(
+        &fluree,
+        "test/v3-retract:main",
+        index_result.index_t,
+        &index_result.root_id,
+    )
+    .await;
 
     let rebuilt_ledger = fluree
         .ledger("test/v3-retract:main")

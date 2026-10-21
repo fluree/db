@@ -108,6 +108,12 @@ impl RootLock {
             held_here: Some(key),
         })
     }
+
+    /// Whether this lock keeps other opens out. False for a root opened
+    /// unprotected under [`ALLOW_UNLOCKED_ENV_VAR`].
+    pub fn is_locked(&self) -> bool {
+        self.handle.is_some()
+    }
 }
 
 impl Drop for RootLock {

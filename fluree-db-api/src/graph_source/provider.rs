@@ -330,7 +330,7 @@ impl FlureeIndexProvider<'_> {
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
         match record {
             Some(record) if record.retracted => Err(graph_source_not_found(graph_source_id)),
             record => Ok(record),

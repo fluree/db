@@ -275,8 +275,11 @@ async fn drop_named_graph_preserves_history_at_older_t() {
 
     // pre-drop t via DatasetSpec: alpha is still populated.
     let alpha_alias = format!("{ledger_id}#{ALPHA_IRI}");
-    let spec = DatasetSpec::new()
-        .with_default(GraphSource::new(&alpha_alias).with_time(TimeSpec::AtT(pre_drop_t)));
+    let spec = DatasetSpec::new().with_default(
+        GraphSource::parse(&alpha_alias)
+            .unwrap()
+            .with_time(TimeSpec::AtT(pre_drop_t)),
+    );
     let dataset = fluree
         .build_dataset_view(&spec)
         .await

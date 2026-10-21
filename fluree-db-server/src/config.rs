@@ -452,13 +452,6 @@ pub struct ServerConfig {
     #[arg(skip)]
     pub memory_displaced: Option<String>,
 
-    /// Hold the file storage root's lock while the server runs, so a second
-    /// server or another process cannot open it meanwhile. Set by the CLI's
-    /// `server run` and `server start`; embedders opt in. Not an option.
-    /// Only a server that [owns its root](Self::owns_storage_root) takes it.
-    #[arg(skip)]
-    pub storage_lock: bool,
-
     /// Enable CORS (Cross-Origin Resource Sharing). On by default;
     /// `--cors-enabled=false` turns it off.
     #[arg(
@@ -977,7 +970,6 @@ impl Default for ServerConfig {
             connection_config: None,
             memory: false,
             memory_displaced: None,
-            storage_lock: false,
             iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
@@ -1087,9 +1079,9 @@ impl ServerConfig {
     }
 
     /// Whether this server is the only process meant to open its storage
-    /// root, and so locks it when [`Self::storage_lock`] asks. A
-    /// shared-storage peer reads its transaction server's root, and Raft
-    /// nodes share one payload root, both on purpose.
+    /// root, and so locks it. A shared-storage peer reads its transaction
+    /// server's root, and Raft nodes share one payload root, both on
+    /// purpose.
     pub fn owns_storage_root(&self) -> bool {
         #[cfg(feature = "raft")]
         if self.raft_enabled {

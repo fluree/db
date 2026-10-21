@@ -7,7 +7,6 @@ pub async fn run(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
     graph: Option<&str>,
 ) -> CliResult<()> {
     // Reject ledger#fragment syntax — use --graph instead
@@ -28,11 +27,7 @@ pub async fn run(
     } else {
         let mode = context::resolve_ledger_mode(ledger, dirs).await;
         match mode {
-            Ok(m) => Ok(if direct {
-                m
-            } else {
-                context::try_server_route(m, dirs)
-            }),
+            Ok(m) => Ok(m),
             Err(CliError::NotFound(_)) => {
                 // Ledger not found — try graph source lookup
                 let alias = context::resolve_ledger(ledger, dirs)?;

@@ -998,7 +998,6 @@ fn lower_insert_data(
         bnodes,
         &mut write_graphs,
         None,
-        IllTyped::Refuse,
     )?;
 
     Ok(Txn {
@@ -1016,7 +1015,6 @@ fn lower_insert_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1055,7 +1053,6 @@ fn lower_delete_data(
         bnodes,
         &mut write_graphs,
         None,
-        IllTyped::AsStored,
     )?;
 
     Ok(Txn {
@@ -1073,7 +1070,6 @@ fn lower_delete_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1176,7 +1172,6 @@ fn lower_delete_where(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs: BTreeSet::new(),
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1225,7 +1220,6 @@ fn lower_delete_where_with_graphs(
         &mut bnodes,
         &mut write_graphs,
         None,
-        IllTyped::AsStored,
     )?;
 
     Ok(Txn {
@@ -1243,7 +1237,6 @@ fn lower_delete_where_with_graphs(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph: None,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1417,11 +1410,17 @@ fn lower_modify(
         Vec::new()
     };
 
-    let default_template_graph: Option<Arc<str>> = with_graph_iri.as_deref().map(|iri| {
-        write_graphs.insert(iri.to_string());
-        Arc::from(iri)
-    });
-    let template_default_graph = with_graph_iri.clone();
+    // `WITH <urn:default>` names the default graph, which templates write
+    // without naming a graph; any other `WITH` IRI is their graph.
+    let default_template_graph: Option<Arc<str>> = with_graph_iri
+        .as_deref()
+        .filter(|iri| {
+            fluree_db_core::GraphSel::keyword(iri) != Some(fluree_db_core::GraphSel::Default)
+        })
+        .map(|iri| {
+            write_graphs.insert(iri.to_string());
+            Arc::from(iri)
+        });
 
     let sparql_where = SparqlWhereClause {
         prologue: prologue.clone(),
@@ -1452,7 +1451,6 @@ fn lower_modify(
             bnodes,
             &mut write_graphs,
             default_template_graph.clone(),
-            IllTyped::AsStored,
         )?
     } else {
         Vec::new()
@@ -1474,7 +1472,6 @@ fn lower_modify(
             bnodes,
             &mut write_graphs,
             default_template_graph.clone(),
-            IllTyped::Refuse,
         )?
     } else {
         Vec::new()
@@ -1495,14 +1492,12 @@ fn lower_modify(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         write_graphs,
-        template_default_graph,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lower_quad_pattern_to_templates(
     elements: &[QuadPatternElement],
     prologue: &Prologue,
@@ -1511,15 +1506,14 @@ fn lower_quad_pattern_to_templates(
     bnodes: &mut BlankNodeCounter,
     write_graphs: &mut BTreeSet<String>,
     default_graph: Option<Arc<str>>,
-    ill_typed: IllTyped,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
     for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
-                let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes, ill_typed)?;
+                let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
                 if let Some(iri) = &default_graph {
-                    t = t.in_template_default_graph(Arc::clone(iri));
+                    t = t.in_graph(Arc::clone(iri));
                 }
                 out.push(t);
             }
@@ -1530,7 +1524,7 @@ fn lower_quad_pattern_to_templates(
                     let iri: Arc<str> = Arc::from(iri);
                     for tp in triples {
                         out.push(
-                            lower_triple_to_template(tp, prologue, ns, vars, bnodes, ill_typed)?
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
                                 .in_graph(Arc::clone(&iri)),
                         );
                     }
@@ -1541,7 +1535,7 @@ fn lower_quad_pattern_to_templates(
                     let graph_var = vars.get_or_insert(&format!("?{}", v.name));
                     for tp in triples {
                         out.push(
-                            lower_triple_to_template(tp, prologue, ns, vars, bnodes, ill_typed)?
+                            lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
                                 .with_graph_var(graph_var),
                         );
                     }
@@ -1559,7 +1553,6 @@ fn lower_triple_to_template(
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeCounter,
-    ill_typed: IllTyped,
 ) -> Result<TripleTemplate, LowerError> {
     let subject = subject_to_template(&triple.subject, prologue, ns, vars, bnodes)?;
     let predicate = predicate_to_template(&triple.predicate, prologue, ns, vars)?;
@@ -1567,7 +1560,7 @@ fn lower_triple_to_template(
     // Object needs special handling for literal metadata
     let (object, dtc) = match &triple.object {
         Term::Literal(lit) => {
-            let result = literal_to_template(lit, prologue, ns, ill_typed)?;
+            let result = literal_to_template(lit, prologue, ns)?;
             (result.term, result.dtc)
         }
         other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
@@ -1580,7 +1573,6 @@ fn lower_triple_to_template(
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
         graph: TemplateGraph::Default,
-        graph_from_template_default: false,
     })
 }
 
@@ -1688,7 +1680,6 @@ fn lower_triple_to_delete_template_delete_where(
         dtc,
         list_index: None,
         graph: TemplateGraph::Default,
-        graph_from_template_default: false,
     })
 }
 
@@ -1769,7 +1760,7 @@ fn delete_where_object_template(
             (TemplateTerm::Sid(ns.sid_for_iri(&expanded)), None)
         }
         Term::Literal(lit) => {
-            let r = literal_to_template(lit, prologue, ns, IllTyped::AsStored)?;
+            let r = literal_to_template(lit, prologue, ns)?;
             (r.term, r.dtc)
         }
         Term::BlankNode(bn) => {
@@ -1959,7 +1950,7 @@ fn object_to_template(
             Ok(TemplateTerm::Sid(ns.sid_for_iri(&expanded)))
         }
         // Literals should go through literal_to_template for metadata; this is a fallback
-        Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns, IllTyped::Refuse)?.term),
+        Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns)?.term),
         Term::BlankNode(bn) => {
             let label = match &bn.value {
                 BlankNodeValue::Labeled(l) => {
@@ -1983,7 +1974,7 @@ fn object_to_template(
             let p = predicate_to_template(&tt.predicate, prologue, ns, vars)?;
             let (o, dtc) = match &tt.object {
                 Term::Literal(lit) => {
-                    let result = literal_to_template(lit, prologue, ns, IllTyped::Refuse)?;
+                    let result = literal_to_template(lit, prologue, ns)?;
                     (result.term, result.dtc)
                 }
                 other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
@@ -1994,24 +1985,11 @@ fn object_to_template(
     }
 }
 
-/// How a template lowers a typed literal whose lexical form its datatype
-/// does not accept (`"abc"^^xsd:integer`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IllTyped {
-    /// Refuse it: an insert template writes what it names.
-    Refuse,
-    /// Keep the lexical form as a string with the declared datatype, the
-    /// form a Turtle write stores an ill-typed literal in. A DELETE names
-    /// what is stored, and a term that is not stored retracts nothing.
-    AsStored,
-}
-
 /// Convert SPARQL Literal to TemplateTerm with datatype/language metadata.
 fn literal_to_template(
     lit: &Literal,
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
-    ill_typed: IllTyped,
 ) -> Result<LiteralResult, LowerError> {
     match &lit.value {
         SparqlLiteralValue::Simple(s) => Ok(LiteralResult {
@@ -2025,11 +2003,7 @@ fn literal_to_template(
         SparqlLiteralValue::Typed { value, datatype } => {
             let dt_iri = expand_iri(datatype, prologue)?;
             let dt_sid = ns.sid_for_iri(&dt_iri);
-            let coerced = match coerce_typed_flake_value(value, &dt_iri, lit.span) {
-                Ok(coerced) => coerced,
-                Err(_) if ill_typed == IllTyped::AsStored => FlakeValue::String(value.to_string()),
-                Err(e) => return Err(e),
-            };
+            let coerced = coerce_typed_flake_value(value, &dt_iri, lit.span)?;
             Ok(LiteralResult {
                 term: TemplateTerm::Value(coerced),
                 dtc: Some(DatatypeConstraint::Explicit(dt_sid)),

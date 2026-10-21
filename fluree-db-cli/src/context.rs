@@ -8,8 +8,7 @@ use fluree_db_nameservice::RemoteName;
 use fluree_db_nameservice_sync::{
     RemoteAuth, RemoteAuthType, RemoteConfig, RemoteEndpoint, SyncConfigStore,
 };
-use serde::Deserialize;
-use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -21,8 +20,19 @@ pub fn set_remote_timeout(timeout: Duration) {
     let _ = REMOTE_TIMEOUT.set(timeout);
 }
 
+/// Bypass a running local server: `--direct`, set once at startup.
+static DIRECT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_direct(direct: bool) {
+    DIRECT.store(direct, Ordering::Relaxed);
+}
+
+pub(crate) fn direct() -> bool {
+    DIRECT.load(Ordering::Relaxed)
+}
+
 /// Get the configured remote HTTP timeout.
-fn remote_timeout() -> Duration {
+pub(crate) fn remote_timeout() -> Duration {
     REMOTE_TIMEOUT
         .get()
         .copied()
@@ -102,14 +112,12 @@ pub async fn resolve_query_target(
 ) -> CliResult<QueryTarget> {
     let alias = resolve_ledger(explicit, dirs)?;
 
-    // Strip `#fragment` (e.g., `#txn-meta`) for ledger resolution.
-    // The fragment selects a named graph and is handled later by
-    // `fluree.view()` / `parse_graph_ref()`. Existence checks and
+    // Strip `#fragment` (e.g., `#txn-meta`) for ledger resolution, where the
+    // address grammar splits it ([`AddressText`](fluree_db_core::AddressText)).
+    // The fragment selects a named graph and is read later, when the view
+    // parses the alias as a typed address. Existence checks and
     // tracked-config lookups must use just the ledger portion.
-    let (ledger_part, _graph_fragment) = match alias.split_once('#') {
-        Some((base, _frag)) => (base, Some(_frag)),
-        None => (alias.as_str(), None),
-    };
+    let ledger_part = fluree_db_core::AddressText::split(&alias).before_graph();
 
     // Try compound remote/ledger syntax (e.g., "origin/mydb")
     if let Some(mode) = try_compound_remote_syntax(ledger_part, dirs).await? {
@@ -117,6 +125,12 @@ pub async fn resolve_query_target(
         // server can resolve the graph. Currently remote doesn't support this,
         // but it avoids silently dropping the fragment.
         return Ok(QueryTarget::Ledger(mode));
+    }
+
+    // A server running on the project's storage answers for it, so the
+    // storage is not opened beside it.
+    if let Some(server) = crate::local_server::route(dirs) {
+        return local_server_target(&server, alias.clone(), ledger_part, dirs).await;
     }
 
     let fluree = build_fluree(dirs).await?;
@@ -561,10 +575,76 @@ pub async fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
         .without_indexing()
         .with_novelty_thresholds(min_bytes, max_bytes);
 
-    builder
-        .build_async()
-        .await
-        .map_err(|e| CliError::Config(format!("failed to initialize Fluree: {e}")))
+    open_waiting(builder, dirs, storage_lock_wait()).await
+}
+
+/// How long a command waits for storage another process holds; `0` refuses
+/// at once.
+pub const STORAGE_LOCK_WAIT_ENV_VAR: &str = "FLUREE_STORAGE_LOCK_WAIT_SECS";
+const DEFAULT_STORAGE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+fn storage_lock_wait() -> Duration {
+    std::env::var(STORAGE_LOCK_WAIT_ENV_VAR)
+        .ok()
+        .and_then(|secs| secs.trim().parse().ok())
+        .map_or(DEFAULT_STORAGE_LOCK_WAIT, Duration::from_secs)
+}
+
+/// Build `builder`'s file-backed instance, waiting while another process
+/// holds its storage.
+///
+/// Commands often run side by side (scripts, agents), each holding the
+/// storage only for its own short run, so one that finds it held waits up to
+/// `wait` for it. A server holds its storage for as long as it runs, so a
+/// command that meets one is refused at once and pointed at the server.
+async fn open_waiting(
+    builder: FlureeBuilder,
+    dirs: &FlureeDir,
+    wait: Duration,
+) -> CliResult<Fluree> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut waiting = false;
+    loop {
+        let error = match builder.clone().build_async().await {
+            Ok(fluree) => return Ok(fluree),
+            Err(error) => error,
+        };
+        let fatal = |error| CliError::Config(format!("failed to initialize Fluree: {error}"));
+        let fluree_db_api::ApiError::StorageInUse { root, holder } = &error else {
+            return Err(fatal(error));
+        };
+        let server = crate::local_server::LocalServer::find(dirs)
+            .filter(|server| server.holds_storage || *holder == Some(server.pid))
+            .map(|server| server.pid);
+        if let Some(server) = server {
+            // A command that can go through the server only gets here
+            // under `--direct`.
+            let hint = if direct() {
+                "drop --direct to send the command through it".to_string()
+            } else {
+                "this command does not go through a server yet, so stop the server \
+                 first (`fluree server stop`)"
+                    .to_string()
+            };
+            return Err(CliError::Config(format!(
+                "a Fluree server (pid {server}) is running on {root}; {hint}"
+            )));
+        }
+        if *holder == Some(std::process::id()) || std::time::Instant::now() >= deadline {
+            return Err(fatal(error));
+        }
+        if !waiting {
+            let by = holder
+                .map(|pid| format!(" (pid {pid})"))
+                .unwrap_or_default();
+            eprintln!(
+                "  {} {root} is in use by another Fluree process{by}; waiting for it",
+                "storage:".yellow().bold()
+            );
+            waiting = true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Build the Fluree instance that backs the developer-memory store
@@ -642,145 +722,55 @@ pub async fn persist_refreshed_tokens(
 /// Token persistence is skipped for this value.
 pub const LOCAL_SERVER_REMOTE: &str = "";
 
-/// Minimal mirror of `ServerMeta` from `commands/server.rs`.
-/// Only the fields needed for auto-routing are included.
-#[derive(Deserialize)]
-struct ServerMeta {
-    pid: u32,
-    listen_addr: String,
-}
-
-/// Attempt to route a `LedgerMode::Local` through a locally-running server.
-///
-/// If `server.meta.json` exists, the PID is alive, and the server process
-/// looks like a Fluree server, this returns `LedgerMode::Tracked` pointing
-/// to `http://{listen_addr}/fluree`. Otherwise returns the original mode.
-///
-/// A hint is printed to stderr so the user knows the request was routed.
-pub fn try_server_route(mode: LedgerMode, dirs: &FlureeDir) -> LedgerMode {
-    let alias = match &mode {
-        LedgerMode::Local { alias, .. } => alias.clone(),
-        // Already tracked/remote — nothing to do
-        LedgerMode::Tracked { .. } => return mode,
-    };
-
-    let meta_path = dirs.data_dir().join("server.meta.json");
-    let meta: ServerMeta = match fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-    {
-        Some(m) => m,
-        None => return mode, // No server.meta.json or can't parse it
-    };
-
-    // Verify the server process is alive
-    if !is_process_alive(meta.pid) {
-        // Server crashed or was killed — warn and fall back to direct
-        eprintln!(
-            "  {} local server (pid {}) is no longer running; executing directly",
-            "notice:".yellow().bold(),
-            meta.pid
-        );
-        return mode;
+/// The target a server on the project's storage gives `alias`, in the order
+/// local resolution uses: a ledger or graph source it holds ("local wins"),
+/// else a tracked remote of that name, else the server, which reports a name
+/// it lacks.
+async fn local_server_target(
+    server: &crate::local_server::LocalServer,
+    alias: String,
+    ledger_part: &str,
+    dirs: &FlureeDir,
+) -> CliResult<QueryTarget> {
+    let ledger_id = to_ledger_id(ledger_part)?;
+    let client = server.client();
+    let held =
+        client.ledger_exists(&ledger_id).await? || serves_graph_source(&client, &ledger_id).await?;
+    if !held {
+        let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+        if let Some(tracked) = store.get_tracked(&ledger_id) {
+            return build_tracked_target(&store, &tracked, ledger_part).await;
+        }
     }
-
-    if !is_fluree_process(meta.pid) {
-        // PID is alive but not a Fluree server — stale meta file
-        eprintln!(
-            "  {} pid {} is not a Fluree server; executing directly",
-            "notice:".yellow().bold(),
-            meta.pid
-        );
-        return mode;
-    }
-
-    // Build HTTP client pointing to the local server.
-    // The server mounts its API at /v1/fluree (matches the discovery endpoint's
-    // api_base_url). This is the same path that `fluree remote add` resolves via
-    // /.well-known/fluree.json.
-    let base_url = format!("http://{}/v1/fluree", meta.listen_addr);
-    let client = RemoteLedgerClient::with_timeout(&base_url, None, remote_timeout());
-
-    eprintln!(
-        "  {} routing through local server at {} (use {} to bypass)",
-        "server:".cyan().bold(),
-        meta.listen_addr,
-        "--direct".bold()
-    );
-
-    LedgerMode::Tracked {
+    server.announce();
+    Ok(QueryTarget::Ledger(LedgerMode::Tracked {
         client: Box::new(client),
         remote_alias: alias.clone(),
         local_alias: alias,
         remote_name: LOCAL_SERVER_REMOTE.to_string(),
-    }
+    }))
 }
 
-/// Check if a local server is running and return a client for it.
-///
-/// Used by commands like `list` that don't operate on a specific ledger
-/// but can still benefit from server routing.
-pub fn try_server_route_client(dirs: &FlureeDir) -> Option<RemoteLedgerClient> {
-    let meta_path = dirs.data_dir().join("server.meta.json");
-    let meta: ServerMeta = fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())?;
-
-    if !is_process_alive(meta.pid) || !is_fluree_process(meta.pid) {
-        return None;
-    }
-
-    let base_url = format!("http://{}/v1/fluree", meta.listen_addr);
-
-    eprintln!(
-        "  {} routing through local server at {} (use {} to bypass)",
-        "server:".cyan().bold(),
-        meta.listen_addr,
-        "--direct".bold()
-    );
-
-    Some(RemoteLedgerClient::with_timeout(
-        &base_url,
-        None,
-        remote_timeout(),
-    ))
+/// Whether the server lists a graph source under `ledger_id`.
+async fn serves_graph_source(client: &RemoteLedgerClient, ledger_id: &LedgerId) -> CliResult<bool> {
+    let listed = client.list_ledgers().await?;
+    let wanted = ledger_id.to_string();
+    Ok(listed.as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            let field = |key| entry.get(key).and_then(serde_json::Value::as_str);
+            field("type").is_some_and(|kind| kind != "Ledger")
+                && matches!((field("name"), field("branch")), (Some(name), Some(branch))
+                    if format!("{name}:{branch}") == wanted)
+        })
+    }))
 }
 
-// ---------------------------------------------------------------------------
-// Process liveness helpers (mirrored from commands/server.rs)
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_process_alive(_pid: u32) -> bool {
-    true
-}
-
-#[cfg(unix)]
-fn is_fluree_process(pid: u32) -> bool {
-    if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
-        let cmdline = String::from_utf8_lossy(&raw);
-        return cmdline.contains("fluree") && cmdline.contains("server");
-    }
-    if let Ok(output) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    {
-        if output.status.success() {
-            let cmd = String::from_utf8_lossy(&output.stdout);
-            return cmd.contains("fluree") && cmd.contains("server");
-        }
-    }
-    true
-}
-
-#[cfg(not(unix))]
-fn is_fluree_process(_pid: u32) -> bool {
-    true
+/// A client for the local server, for a command that is not about one
+/// ledger; `None` when there is none or `--direct` bypasses it.
+pub fn local_server_client(dirs: &FlureeDir) -> Option<RemoteLedgerClient> {
+    let server = crate::local_server::route(dirs)?;
+    server.announce();
+    Some(server.client())
 }
 
 #[cfg(test)]
@@ -963,5 +953,70 @@ mod tests {
             Ok(_) => panic!("expected a Tracked target"),
             Err(e) => panic!("resolution failed: {e:?}"),
         }
+    }
+
+    fn storage_builder(dirs: &FlureeDir) -> FlureeBuilder {
+        FlureeBuilder::file(
+            config::resolve_storage_path(dirs)
+                .to_string_lossy()
+                .to_string(),
+        )
+        .without_ledger_caching()
+        .without_indexing()
+    }
+
+    fn hold_storage(dirs: &FlureeDir) -> fluree_db_core::RootLock {
+        fluree_db_core::RootLock::acquire(&config::resolve_storage_path(dirs)).unwrap()
+    }
+
+    const HOLD_ROOT_ENV: &str = "FLUREE_CLI_TEST_HOLD_ROOT";
+
+    /// Not a test of its own: the other process
+    /// `a_command_waits_for_storage_another_process_lets_go_of` starts, which
+    /// holds a storage root for a moment.
+    #[test]
+    fn hold_a_root_for_a_moment() {
+        let Ok(root) = std::env::var(HOLD_ROOT_ENV) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let _held = fluree_db_core::RootLock::acquire(&root).unwrap();
+        std::fs::write(root.join("held"), "").unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+
+    #[tokio::test]
+    async fn a_command_waits_for_storage_another_process_lets_go_of() {
+        let (_tmp, dirs) = temp_dirs();
+        let root = config::resolve_storage_path(&dirs);
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "context::tests::hold_a_root_for_a_moment"])
+            .env(HOLD_ROOT_ENV, &root)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !root.join("held").exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "holder never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        open_waiting(storage_builder(&dirs), &dirs, Duration::from_secs(60))
+            .await
+            .expect("opened once the holder let go");
+        assert!(holder.wait().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn without_a_wait_a_held_storage_is_refused_at_once() {
+        let (_tmp, dirs) = temp_dirs();
+        let _held = hold_storage(&dirs);
+
+        let refused = open_waiting(storage_builder(&dirs), &dirs, Duration::ZERO).await;
+
+        assert!(refused.is_err());
     }
 }

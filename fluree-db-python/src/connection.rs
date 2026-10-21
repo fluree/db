@@ -353,9 +353,7 @@ impl Connection {
     #[staticmethod]
     fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>) -> PyResult<Self> {
         let config = to_json(config)?;
-        let builder = FlureeBuilder::from_json_ld(&config)
-            .map_err(api_error)?
-            .with_storage_lock();
+        let builder = FlureeBuilder::from_json_ld(&config).map_err(api_error)?;
         let fluree = block_on(py, builder.build_client())?.map_err(api_error)?;
         Ok(Self {
             fluree: Database::new(fluree),

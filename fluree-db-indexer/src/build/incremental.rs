@@ -408,7 +408,7 @@ struct Phase2Task {
     sorted_ops: Vec<u8>,
     /// Superseded events for this (graph, order), sorted like
     /// `sorted_records`. Their real-transition subset becomes history-sidecar
-    /// entries in the leaf merge.
+    /// entries in the leaf merge, or in a folded tree.
     sorted_superseded: Vec<RunRecordV2>,
     sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
@@ -429,14 +429,26 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
 }
 
 enum Phase2TaskUpdate {
-    Default { leaf_entries: Vec<LeafEntry> },
-    Branch { branch_cid: ContentId },
+    Default {
+        leaf_entries: Vec<LeafEntry>,
+    },
+    Branch {
+        branch_cid: ContentId,
+    },
+    /// A graph's folded tree with nothing to hold: the root keeps what it had
+    /// for this order (no tree, or one with no leaves), which the next build
+    /// again finds no base facts in.
+    Unchanged,
 }
 
 struct Phase2TaskOutput {
     seq: usize,
     target: TreeTarget,
     order: RunSortOrder,
+    /// The task merged into a base tree with leaves, rather than writing a
+    /// folded tree. A graph's four tasks must agree
+    /// ([`check_base_facts_agree`]).
+    base_facts: bool,
     update: Phase2TaskUpdate,
     replaced_leaf_cids: Vec<ContentId>,
     replaced_sidecar_cids: Vec<ContentId>,
@@ -473,6 +485,23 @@ async fn write_folded_tree(
         ..
     } = build_folded_tree(facts, order, target.branch_g_id(), config)?;
     let new_leaf_count = new_leaf_blobs.len();
+    // A graph whose facts net to no row and no history gets no tree: one with
+    // no leaves would route no later novelty.
+    if leaf_entries.is_empty() && target != TreeTarget::Pool {
+        return Ok(Phase2TaskOutput {
+            seq,
+            target,
+            order,
+            base_facts: false,
+            update: Phase2TaskUpdate::Unchanged,
+            replaced_leaf_cids,
+            replaced_sidecar_cids,
+            new_leaf_count,
+            fetch_stats: Phase2FetchStatsSnapshot::default(),
+            matched: Vec::new(),
+            graph_deltas,
+        });
+    }
     upload_leaf_blobs(
         content_store.as_ref(),
         tracker,
@@ -496,6 +525,7 @@ async fn write_folded_tree(
         seq,
         target,
         order,
+        base_facts: false,
         update,
         replaced_leaf_cids,
         replaced_sidecar_cids,
@@ -605,6 +635,7 @@ async fn execute_phase2_task(
                 seq,
                 target,
                 order,
+                base_facts: true,
                 update: Phase2TaskUpdate::Default {
                     leaf_entries: meta.leaf_entries,
                 },
@@ -671,6 +702,7 @@ async fn execute_phase2_task(
                 seq,
                 target,
                 order,
+                base_facts: true,
                 update: Phase2TaskUpdate::Branch { branch_cid },
                 replaced_leaf_cids: meta.replaced_leaf_cids,
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
@@ -797,6 +829,10 @@ pub async fn incremental_index(
     );
 
     // ---- Phase 2: Per-(graph, order) branch updates ----
+    check_order_sets(
+        &novelty.base_root.default_graph_orders,
+        &novelty.base_root.named_graphs,
+    )?;
     let all_orders = [
         RunSortOrder::Spot,
         RunSortOrder::Psot,
@@ -1163,6 +1199,7 @@ pub async fn incremental_index(
     let mut phase2_outputs: Vec<Phase2TaskOutput> =
         phase2_results.into_iter().collect::<Result<Vec<_>>>()?;
     phase2_outputs.sort_unstable_by_key(|output| output.seq);
+    check_base_facts_agree(&phase2_outputs)?;
 
     // Fact identities the SPOT merges matched against existing base rows.
     // Phase 3b derives materialized-state stat deltas from this: an assert of
@@ -1198,6 +1235,7 @@ pub async fn incremental_index(
             (Phase2TaskUpdate::Branch { branch_cid }, TreeTarget::Pool) => {
                 root_builder.set_pool_branch(output.order, branch_cid);
             }
+            (Phase2TaskUpdate::Unchanged, _) => {}
         }
         for (g_id, delta) in output.graph_deltas {
             let total = pool_deltas.entry(g_id).or_default();
@@ -5804,8 +5842,107 @@ fn finish_fresh_branch(
     })
 }
 
-/// Build a fresh V3 branch from pure novelty for a named graph.
+/// Refuse a base root in which a graph has base facts in some of the four
+/// orders but not all of them.
 ///
+/// A graph's four orders hold one fact set, so they have facts in all of them
+/// or none. An order without them takes the fresh path and is built from this
+/// window's novelty alone, without the graph's base facts. Aborting falls back
+/// to a full rebuild, which builds every order from the commits.
+///
+/// An order with no leaves holds no facts, the same as a missing one. Bulk
+/// import used to write such an order: a SPOT with no leaves for a graph it had
+/// no quads for, such as the default graph of a TriG file whose quads are all
+/// in named graphs, or a named graph from an empty `GRAPH` block. An
+/// incremental build then used to leave that SPOT empty while writing the
+/// window's facts to the other three orders, which this refuses.
+///
+/// The default graph's leaves are inline in the root. A named graph's are in
+/// its branches, but a branch with no leaves is exactly
+/// `build_branch_bytes(order, g_id, &[])` (the decoder reads one branch
+/// version, and every writer builds branches with that function), so its CID
+/// identifies it without a fetch. That costs a hash per branch, about as much
+/// as decoding the root, so it's done only for a named graph with some orders
+/// but not all, like the older import's. One with all four is taken as having
+/// facts in all four here, and [`check_base_facts_agree`] checks the graphs
+/// this window writes to once Phase 2 has fetched their branches.
+fn check_order_sets(
+    default_graph_orders: &[fluree_db_binary_index::format::index_root::DefaultGraphOrder],
+    named_graphs: &[fluree_db_binary_index::format::index_root::NamedGraphRouting],
+) -> Result<()> {
+    use fluree_db_binary_index::format::branch::build_branch_bytes;
+    let mut all = RunSortOrder::all_build_orders().to_vec();
+    all.sort_unstable();
+    let complete = |mut orders: Vec<RunSortOrder>| {
+        orders.sort_unstable();
+        orders.dedup();
+        orders.is_empty() || orders == all
+    };
+    let default_orders = default_graph_orders
+        .iter()
+        .filter(|o| !o.leaves.is_empty())
+        .map(|o| o.order)
+        .collect();
+    let named_complete = |ng: &fluree_db_binary_index::format::index_root::NamedGraphRouting| {
+        complete(ng.orders.iter().map(|(order, _)| *order).collect())
+            || complete(
+                ng.orders
+                    .iter()
+                    .filter(|(order, cid)| {
+                        *cid != ContentId::new(
+                            ContentKind::IndexBranch,
+                            &build_branch_bytes(*order, ng.g_id, &[]),
+                        )
+                    })
+                    .map(|(order, _)| *order)
+                    .collect(),
+            )
+    };
+    let partial = if complete(default_orders) {
+        named_graphs
+            .iter()
+            .find(|ng| !named_complete(ng))
+            .map(|ng| ng.g_id)
+    } else {
+        Some(0)
+    };
+    match partial {
+        Some(g_id) => Err(IndexerError::IncrementalAbort(format!(
+            "base root has facts in some but not all sort orders for graph {g_id}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a window in which a graph's four tasks disagree on whether the base
+/// holds facts for it: some merged into a branch with leaves while others
+/// wrote a folded tree. The pool is not checked here.
+///
+/// This is [`check_order_sets`] for a named graph with all four orders, which
+/// it leaves alone: whether each branch has leaves is known here, once Phase 2
+/// has fetched it, at no extra cost. An incremental build used to leave such a
+/// graph a SPOT with no leaves beside three orders that hold its facts, so the
+/// graph's next write is refused and the full rebuild restores SPOT; until then
+/// it's carried as it is, as an untouched graph always is. It runs after the
+/// tasks, so an abort here leaves this build's uploads unreferenced, as an
+/// abort in Phase 3 does.
+fn check_base_facts_agree(outputs: &[Phase2TaskOutput]) -> Result<()> {
+    let mut base_facts: std::collections::BTreeMap<fluree_db_core::GraphId, bool> =
+        std::collections::BTreeMap::new();
+    for output in outputs {
+        // The pool's secondary orders take writes as delta runs, not tasks.
+        let TreeTarget::Graph(g_id) = output.target else {
+            continue;
+        };
+        if *base_facts.entry(g_id).or_insert(output.base_facts) != output.base_facts {
+            return Err(IndexerError::IncrementalAbort(format!(
+                "base root has facts in some but not all sort orders for graph {g_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build predicate SIDs from resolver state for the index root.
 fn build_predicate_sids(
     shared: &crate::run_index::resolve::resolver::SharedResolverState,
@@ -6206,6 +6343,276 @@ mod warm_tests {
             o_type: OType::XSD_INTEGER.as_u16(),
             g_id: 0,
         }
+    }
+
+    /// A folded tree materializes only facts whose window ends asserted;
+    /// a fact asserted then retracted leaves its two transitions in the
+    /// sidecar and no row.
+    #[test]
+    fn folded_tree_writes_no_row_for_a_retracted_fact() {
+        // s=2 asserted at t=2; s=4 asserted at t=2, then retracted at t=3.
+        let window = [(record(2, 2), 1), (record(4, 3), 0), (record(4, 2), 1)];
+        let (facts, _) = fold_graph_log(&PooledGraphLog::default(), window);
+        let tree = build_folded_tree(&facts, RunSortOrder::Spot, 0, &IndexerConfig::small())
+            .expect("folded tree");
+        let rows: u64 = tree.leaf_entries.iter().map(|e| e.row_count).sum();
+        assert_eq!(rows, 1, "only the asserted fact is a row");
+        let sidecars = tree
+            .new_leaf_blobs
+            .iter()
+            .filter(|b| b.info.sidecar_bytes.is_some())
+            .count();
+        assert_eq!(sidecars, 1, "the retracted fact's history is kept");
+    }
+
+    /// A graph's task whose facts net to no row and no history publishes no
+    /// tree: a branch with no leaves would route no later novelty.
+    #[tokio::test]
+    async fn fresh_task_with_nothing_to_hold_publishes_no_branch() {
+        let store: Arc<dyn fluree_db_core::storage::ContentStore> =
+            Arc::new(fluree_db_core::storage::content_store_for(
+                fluree_db_core::MemoryStorage::new(),
+                &fluree_db_core::StorageNamespace::parse_legacy("test/fresh-empty:main").unwrap(),
+            ));
+        // A retraction of a fact that was never asserted: no transition.
+        let folded = || Phase2TaskKind::Folded {
+            facts: Arc::new(fold_graph_log(&PooledGraphLog::default(), [(record(2, 2), 0)]).0),
+        };
+        for (g_id, kind) in [
+            (0, folded()),
+            (3, folded()),
+            (0, Phase2TaskKind::DefaultExisting { leaves: Vec::new() }),
+        ] {
+            let task = Phase2Task {
+                seq: 0,
+                target: TreeTarget::Graph(g_id),
+                purge: Arc::new(Vec::new()),
+                order: RunSortOrder::Spot,
+                sorted_records: vec![record(2, 2)],
+                sorted_ops: vec![0],
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                kind,
+            };
+            let output = execute_phase2_task(
+                task,
+                &IndexerConfig::small(),
+                Arc::clone(&store),
+                fluree_db_core::tracking::Tracker::disabled(),
+                Arc::new(Semaphore::new(4)),
+                4,
+            )
+            .await
+            .expect("phase 2 task");
+            assert!(
+                matches!(output.update, Phase2TaskUpdate::Unchanged),
+                "g_id={g_id}: an empty tree must not be published"
+            );
+        }
+    }
+
+    /// A branch with no leaves holds no base facts, so its novelty is built
+    /// fresh, for the default graph and for a named graph alike.
+    #[tokio::test]
+    async fn leafless_branch_is_built_fresh() {
+        use fluree_db_binary_index::format::branch::{build_branch_bytes, read_branch_from_bytes};
+        let store: Arc<dyn fluree_db_core::storage::ContentStore> =
+            Arc::new(fluree_db_core::storage::content_store_for(
+                fluree_db_core::MemoryStorage::new(),
+                &fluree_db_core::StorageNamespace::parse_legacy("test/leafless:main").unwrap(),
+            ));
+        let leafless = build_branch_bytes(RunSortOrder::Spot, 3, &[]);
+        let leafless_cid = store
+            .put(ContentKind::IndexBranch, &leafless)
+            .await
+            .expect("put leafless branch");
+        let kinds = [
+            (0, Phase2TaskKind::DefaultExisting { leaves: Vec::new() }),
+            (
+                3,
+                Phase2TaskKind::NamedExisting {
+                    branch_cid: leafless_cid,
+                },
+            ),
+        ];
+        for (g_id, kind) in kinds {
+            let task = Phase2Task {
+                seq: 0,
+                target: TreeTarget::Graph(g_id),
+                purge: Arc::new(Vec::new()),
+                order: RunSortOrder::Spot,
+                sorted_records: vec![record(2, 2)],
+                sorted_ops: vec![1],
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                kind,
+            };
+            let output = execute_phase2_task(
+                task,
+                &IndexerConfig::small(),
+                Arc::clone(&store),
+                fluree_db_core::tracking::Tracker::disabled(),
+                Arc::new(Semaphore::new(4)),
+                4,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("g_id={g_id}: {e}"));
+            assert!(
+                !output.base_facts,
+                "g_id={g_id}: a branch with no leaves holds no base facts"
+            );
+            let rows: u64 = match output.update {
+                Phase2TaskUpdate::Default { leaf_entries } => {
+                    leaf_entries.iter().map(|e| e.row_count).sum()
+                }
+                Phase2TaskUpdate::Branch { branch_cid } => {
+                    let bytes = store.get(&branch_cid).await.expect("new branch");
+                    read_branch_from_bytes(&bytes)
+                        .expect("decode branch")
+                        .leaves
+                        .iter()
+                        .map(|e| e.row_count)
+                        .sum()
+                }
+                Phase2TaskUpdate::Unchanged => 0,
+            };
+            assert_eq!(rows, 1, "g_id={g_id}: the asserted fact must land");
+        }
+    }
+
+    /// Every graph in a base root has facts in all four orders or none, and an
+    /// order with no leaves has none.
+    #[test]
+    fn partial_order_root_is_refused() {
+        use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
+        use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
+        let leaf = LeafEntry {
+            first_key: record(1, 1),
+            last_key: record(1, 1),
+            row_count: 1,
+            leaf_cid: ContentId::new(ContentKind::IndexLeaf, b"leaf"),
+            sidecar_cid: None,
+        };
+        // Each order with `leaves` leaves.
+        let default = |orders: &[(RunSortOrder, usize)]| -> Vec<DefaultGraphOrder> {
+            orders
+                .iter()
+                .map(|&(order, leaves)| DefaultGraphOrder {
+                    order,
+                    leaves: vec![leaf.clone(); leaves],
+                })
+                .collect()
+        };
+        // Each order with a branch that has leaves (`true`) or none (`false`),
+        // the latter written as every writer writes one.
+        let named = |orders: &[(RunSortOrder, bool)]| NamedGraphRouting {
+            g_id: 3,
+            orders: orders
+                .iter()
+                .map(|&(order, leaves)| {
+                    let bytes = if leaves {
+                        b"branch".to_vec()
+                    } else {
+                        build_branch_bytes(order, 3, &[])
+                    };
+                    (order, ContentId::new(ContentKind::IndexBranch, &bytes))
+                })
+                .collect(),
+        };
+        let [spot, psot, post, opst] = [
+            RunSortOrder::Spot,
+            RunSortOrder::Psot,
+            RunSortOrder::Post,
+            RunSortOrder::Opst,
+        ];
+
+        for (defaults, named_graphs) in [
+            (default(&[]), vec![]),
+            (
+                default(&[(spot, 1), (psot, 1), (post, 1), (opst, 1)]),
+                vec![named(&[
+                    (spot, true),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
+            // No facts anywhere: what bulk import wrote for a graph it had no
+            // quads for, or a rebuild for a graph that netted to nothing.
+            (default(&[(spot, 0)]), vec![named(&[(spot, false)])]),
+            (
+                default(&[(spot, 0), (psot, 0), (post, 0), (opst, 0)]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, false),
+                    (post, false),
+                    (opst, false),
+                ])],
+            ),
+            // A named graph with all four orders is left to
+            // `check_base_facts_agree`, which sees its branches' leaves.
+            (
+                default(&[]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
+        ] {
+            assert!(check_order_sets(&defaults, &named_graphs).is_ok());
+        }
+        for (defaults, named_graphs) in [
+            (default(&[(spot, 1), (psot, 1)]), vec![]),
+            // SPOT left with no leaves while the window's facts went to the
+            // other three orders.
+            (
+                default(&[(spot, 0), (psot, 1), (post, 1), (opst, 1)]),
+                vec![],
+            ),
+            (default(&[]), vec![named(&[(spot, true), (psot, true)])]),
+            (default(&[]), vec![named(&[(spot, false), (psot, true)])]),
+        ] {
+            assert!(matches!(
+                check_order_sets(&defaults, &named_graphs),
+                Err(IndexerError::IncrementalAbort(_))
+            ));
+        }
+    }
+
+    /// A graph whose tasks disagree on whether the base holds its facts is an
+    /// abort; agreement either way is fine.
+    #[test]
+    fn tasks_that_disagree_on_base_facts_are_refused() {
+        let output = |target: TreeTarget, base_facts: bool| Phase2TaskOutput {
+            seq: 0,
+            target,
+            order: RunSortOrder::Spot,
+            base_facts,
+            update: Phase2TaskUpdate::Unchanged,
+            replaced_leaf_cids: Vec::new(),
+            replaced_sidecar_cids: Vec::new(),
+            new_leaf_count: 0,
+            fetch_stats: Phase2FetchStatsSnapshot::default(),
+            matched: Vec::new(),
+            graph_deltas: GraphDeltas::new(),
+        };
+        let graph = |g_id, base_facts| output(TreeTarget::Graph(g_id), base_facts);
+        assert!(check_base_facts_agree(&[
+            graph(0, true),
+            graph(0, true),
+            graph(3, false),
+            graph(3, false),
+            // The pool's orders are not one task each, and are not checked.
+            output(TreeTarget::Pool, true),
+            output(TreeTarget::Pool, false),
+        ])
+        .is_ok());
+        assert!(matches!(
+            check_base_facts_agree(&[graph(0, true), graph(3, false), graph(3, true)]),
+            Err(IndexerError::IncrementalAbort(_))
+        ));
     }
 
     fn cache_leaflet(

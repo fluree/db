@@ -12,8 +12,8 @@ use crate::run_index::build::fd_plan::{
 };
 use crate::run_index::build::graph_scope::{GraphScope, PoolGraphs};
 use crate::run_index::build::index_build::{
-    build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, IndexBuildError, IndexBuildResult,
-    PersistingLeafWriter,
+    build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, GraphIndexResult, IndexBuildError,
+    IndexBuildResult, PersistingLeafWriter,
 };
 use crate::run_index::build::merge::KWayMerge;
 use crate::run_index::runs::run_file::StreamingRunFileWriter;
@@ -1538,7 +1538,10 @@ fn build_spot_index_from_commits(
         rows
     };
 
-    let result = writer.finish()?;
+    // A graph with no records in this import (the default graph of a TriG file
+    // whose quads are all in named graphs, say) publishes no SPOT branch, as
+    // the secondary orders publish none.
+    let graphs: Vec<GraphIndexResult> = writer.finish()?.into_iter().collect();
     let merge_duplicates_removed: u64 = merge_duplicates.values().sum();
     tracing::info!(
         g_id,
@@ -1550,7 +1553,7 @@ fn build_spot_index_from_commits(
     log_index_memory("spot_build:complete_before_stats_finish");
     Ok(SpotBuild {
         result: IndexBuildResult {
-            graphs: vec![result],
+            graphs,
             total_rows,
             index_dir: index_dir.to_path_buf(),
             elapsed: t0.elapsed(),
@@ -1826,15 +1829,9 @@ mod tests {
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
 
-    #[test]
-    fn end_to_end_v3_build() {
-        let dir = std::env::temp_dir().join("fluree_test_v3_e2e");
-        let _ = std::fs::remove_dir_all(&dir);
-        let run_dir = dir.join("runs");
-        let index_dir = dir.join("index");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::create_dir_all(&index_dir).unwrap();
-
+    /// One sorted commit chunk holding three default-graph records, with
+    /// identity remaps, under `dir`.
+    fn three_record_commit(dir: &std::path::Path) -> Vec<CommitInput> {
         // Create a minimal V2-native sorted commit file with a few records.
         let commit_path = dir.join("commit_00000.fsv2");
 
@@ -1899,7 +1896,7 @@ mod tests {
         let str_data: Vec<u8> = (0u32..10).flat_map(u32::to_le_bytes).collect();
         std::fs::write(&str_remap_path, &str_data).unwrap();
 
-        let commits = vec![CommitInput {
+        vec![CommitInput {
             commit_path,
             record_count: spool_info.record_count,
             subject_remap_path: subj_remap_path,
@@ -1907,12 +1904,18 @@ mod tests {
             lang_remap: vec![],
             types_map_path: None,
             term_table: None,
-        }];
+        }]
+    }
 
-        let config = BuildConfig {
+    fn build_config(dir: &std::path::Path, g_id: fluree_db_core::GraphId) -> BuildConfig {
+        let run_dir = dir.join("runs");
+        let index_dir = dir.join("index");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        BuildConfig {
             run_dir,
-            index_dir: index_dir.clone(),
-            g_id: 0,
+            index_dir,
+            g_id,
             leaflet_target_rows: 100,
             leaf_target_rows: 1000,
             zstd_level: 1,
@@ -1924,7 +1927,16 @@ mod tests {
             stage_marker: None,
             term_builder: None,
             pool: None,
-        };
+        }
+    }
+
+    #[test]
+    fn end_to_end_v3_build() {
+        let dir = std::env::temp_dir().join("fluree_test_v3_e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let commits = three_record_commit(&dir);
+        let config = build_config(&dir, 0);
 
         let (result, _spot_class_stats) =
             build_indexes_from_commits(&commits, &config, None).unwrap();
@@ -1955,6 +1967,27 @@ mod tests {
         assert_eq!(leaf_dir[1].p_const, Some(2));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A graph with no records in the import (here the commit's records are
+    /// all in the default graph) publishes no branch in any order: SPOT, built
+    /// on its own, must not publish one with no leaves.
+    #[test]
+    fn graph_without_records_publishes_no_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let commits = three_record_commit(dir.path());
+        let config = build_config(dir.path(), 3);
+
+        let (result, _spot_class_stats) =
+            build_indexes_from_commits(&commits, &config, None).unwrap();
+
+        assert_eq!(result.total_rows, 0);
+        for (order, order_result) in &result.order_results {
+            assert!(
+                order_result.graphs.is_empty(),
+                "{order:?} published a branch for a graph with no records"
+            );
+        }
     }
 
     /// The hierarchical SPOT merge (chunk count above the fan-in cap) must

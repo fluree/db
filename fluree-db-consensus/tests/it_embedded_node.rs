@@ -58,11 +58,13 @@ async fn an_embedder_can_stand_up_a_raft_node_and_write_through_it() {
         let _ = axum::serve(listener, app).await;
     });
 
-    // 3. Engine half: one bus, one nameservice, shared with the adapter.
+    // 3. Engine half: one bus, one nameservice, shared with the adapter,
+    //    and a log of the node's own on the payload store.
     let ns: Arc<dyn NameServicePublisher> = integration.nameservice();
     let fluree = Arc::new(
         FlureeBuilder::file(data_dir.path().to_string_lossy().as_ref())
             .with_event_bus(Arc::clone(&integration.event_bus))
+            .with_storage_wal_owner("node-7")
             .build_client_with_nameservice(NameServiceMode::ReadWrite(Arc::clone(&ns)))
             .await
             .expect("engine builds"),
@@ -159,6 +161,28 @@ async fn an_embedder_can_stand_up_a_raft_node_and_write_through_it() {
     node.shutdown().await;
 }
 
+/// Nodes share one payload store. Each engine, built as `attach` asks, opens
+/// it beside the others instead of being refused its lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_built_per_the_contract_share_one_payload_store() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let mut engines = Vec::new();
+    for node_id in [1u64, 2] {
+        let raft_dir = tempfile::tempdir().expect("raft dir");
+        let integration =
+            RaftIntegration::bootstrap(RaftBootstrapConfig::new(node_id, raft_dir.path()))
+                .await
+                .expect("bootstrap");
+        let fluree = FlureeBuilder::file(data_dir.path().to_string_lossy().as_ref())
+            .with_event_bus(Arc::clone(&integration.event_bus))
+            .with_storage_wal_owner(format!("node-{node_id}"))
+            .build_client_with_nameservice(NameServiceMode::ReadWrite(integration.nameservice()))
+            .await
+            .unwrap_or_else(|e| panic!("node {node_id} builds on the shared store: {e}"));
+        engines.push((fluree, integration, raft_dir));
+    }
+}
+
 /// Stand up a single-voter embedded node with `configure` applied to the
 /// attach config, and return the pieces a test drives.
 async fn stand_up(
@@ -191,6 +215,7 @@ async fn stand_up(
     let fluree = Arc::new(
         FlureeBuilder::file(data_dir.path().to_string_lossy().as_ref())
             .with_event_bus(Arc::clone(&integration.event_bus))
+            .with_storage_wal_owner(format!("node-{node_id}"))
             .build_client_with_nameservice(NameServiceMode::ReadWrite(ns))
             .await
             .expect("engine builds"),

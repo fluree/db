@@ -280,12 +280,11 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
 
     /// Execute: fetch the commit blob, decode it, resolve IRIs, return detail.
     pub async fn execute(self) -> Result<CommitDetail> {
-        // 1. Load the ledger to get namespace_codes for IRI resolution
-        let handle = self
-            .graph
-            .fluree
-            .ledger_cached(&self.graph.ledger_id)
-            .await?;
+        // 1. Load the ledger to get namespace_codes for IRI resolution. A
+        // commit belongs to the whole ledger, so a graph or pin in the handle's
+        // address does not narrow it.
+        let ledger_id = self.graph.id()?.clone();
+        let handle = self.graph.fluree.ledger_cached(ledger_id.as_str()).await?;
         let snapshot = handle.snapshot().await;
         let namespace_codes = snapshot.snapshot.shared_namespaces();
 

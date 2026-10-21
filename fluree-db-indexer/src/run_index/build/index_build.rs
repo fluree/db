@@ -13,13 +13,11 @@ use super::merge::KWayMerge;
 use crate::run_index::runs::run_file::StreamingRunFileWriter;
 use crate::run_index::runs::streaming_reader::StreamingRunReader;
 use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
-use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::leaf::{LeafInfo, LeafWriter};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, identity_v2_for_order, RunRecordV2,
 };
-use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_core::ContentId;
 use fluree_db_core::GraphId;
 use std::io;
@@ -262,28 +260,9 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
             events.extend(history);
             events.push((record, op));
             // A rebuild sees the complete log, so lifecycles walk from
-            // absent; `events` is left holding the sidecar transitions.
-            let row = resolve_transitions(&mut events, false);
-            if !config.skip_history {
-                for &(rec, rec_op) in &events {
-                    writer.push_history_entry(
-                        fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
-                            s_id: rec.s_id,
-                            p_id: rec.p_id,
-                            o_type: rec.o_type,
-                            o_key: rec.o_key,
-                            o_i: rec.o_i,
-                            t: rec.t,
-                            op: rec_op,
-                            g_id: rec.g_id,
-                        },
-                    );
-                }
-            }
-            // Identities without a materialized row (final state absent)
-            // still count toward progress below.
-            if let Some(row) = row {
-                writer.push_record(row)?;
+            // absent. Identities without a materialized row (final state
+            // absent) still count toward progress below.
+            if writer.push_lifecycle(&mut events)? {
                 total_rows += 1;
             }
         }
@@ -303,8 +282,9 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
         }
     }
 
-    let result = writer.finish()?;
-    let graph_results = vec![result];
+    // A graph whose log nets to no row and no history publishes no branch, as
+    // for a graph with no records at all.
+    let graph_results: Vec<GraphIndexResult> = writer.finish()?.into_iter().collect();
 
     // Reclaim the cascade's final-pass intermediates (a full zstd copy of
     // this order) now that the merge has consumed them, instead of carrying
@@ -494,17 +474,31 @@ impl PersistingLeafWriter {
         Ok(())
     }
 
-    pub(crate) fn push_history_entry(&mut self, entry: HistEntryV2) {
-        self.inner.push_history_entry(entry);
+    pub(crate) fn push_lifecycle(
+        &mut self,
+        events: &mut Vec<(RunRecordV2, u8)>,
+    ) -> io::Result<bool> {
+        let wrote_row = self.inner.push_lifecycle(events)?;
+        for info in self.inner.drain_completed_leaves() {
+            self.persisted.push(persist_leaf(&self.graph_dir, info)?);
+        }
+        Ok(wrote_row)
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<GraphIndexResult> {
+    /// The graph's result, or `None` when the writer produced no leaf. A graph
+    /// with nothing to hold (no records, or only retractions of facts never
+    /// asserted) is left out of the root, so a root never lists an order with
+    /// no leaves.
+    pub(crate) fn finish(mut self) -> io::Result<Option<GraphIndexResult>> {
         // `finish()` flushes the trailing leaf into the completed-leaves buffer;
         // persist that final batch (everything prior was drained per-push).
         let pool_members = self.inner.take_pool_members();
         let final_batch = self.inner.finish()?;
         for info in final_batch {
             self.persisted.push(persist_leaf(&self.graph_dir, info)?);
+        }
+        if self.persisted.is_empty() {
+            return Ok(None);
         }
         build_graph_index_result(
             self.g_id,
@@ -513,6 +507,7 @@ impl PersistingLeafWriter {
             self.persisted,
             pool_members,
         )
+        .map(Some)
     }
 }
 
@@ -855,6 +850,7 @@ pub fn build_all_indexes(
 mod tests {
     use super::*;
     use crate::run_index::runs::run_file::write_run_file;
+    use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
     use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3, decode_leaf_header_v3};
     use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
     use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
@@ -1178,6 +1174,50 @@ mod tests {
             vec![(10, 1, 1), (10, 2, 0)],
             "transitions preceding a row are recorded; the surviving row \
              carries its own assert and the never-asserted retract leaves none"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A graph whose log is only retractions of facts never asserted has no
+    /// row and no history, so the build publishes no branch for it.
+    #[test]
+    fn build_publishes_no_branch_for_a_graph_with_nothing_to_hold() {
+        let dir = std::env::temp_dir().join("fluree_test_build_v2_nothing_to_hold");
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_dir = dir.join("runs");
+        let index_dir = dir.join("index");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let records = vec![make_rec(0, 20, 1, OType::XSD_INTEGER.as_u16(), 200, 3)];
+        crate::run_index::runs::run_file::write_run_file_with_op(
+            &run_dir.join("run_00000.frn"),
+            &records,
+            &[0],
+            RunSortOrder::Spot,
+            3,
+            3,
+        )
+        .unwrap();
+
+        let config = IndexBuildConfig {
+            run_dir,
+            index_dir,
+            sort_order: RunSortOrder::Spot,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 1000,
+            zstd_level: 1,
+            import_unique_asserts: false,
+            skip_history: false,
+            g_id: 0,
+            progress: None,
+            fan_in_cap: usize::MAX,
+        };
+        let result = build_index(&config).unwrap();
+        assert_eq!(result.total_rows, 0);
+        assert!(
+            result.graphs.is_empty(),
+            "a graph with no leaves must not be published"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

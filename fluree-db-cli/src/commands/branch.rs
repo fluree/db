@@ -7,7 +7,7 @@ use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::DropStatus;
 use fluree_db_core::ledger_id::split_ledger_id;
 
-pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
+pub async fn run(action: BranchAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         BranchAction::Create {
             name,
@@ -23,34 +23,23 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                 at.as_deref(),
                 dirs,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
         BranchAction::List { ledger, remote } => {
-            run_list(ledger.as_deref(), dirs, remote.as_deref(), direct).await
+            run_list(ledger.as_deref(), dirs, remote.as_deref()).await
         }
         BranchAction::Drop {
             name,
             ledger,
             remote,
-        } => run_drop(&name, ledger.as_deref(), dirs, remote.as_deref(), direct).await,
+        } => run_drop(&name, ledger.as_deref(), dirs, remote.as_deref()).await,
         BranchAction::Rebase {
             name,
             ledger,
             strategy,
             remote,
-        } => {
-            run_rebase(
-                &name,
-                ledger.as_deref(),
-                &strategy,
-                dirs,
-                remote.as_deref(),
-                direct,
-            )
-            .await
-        }
+        } => run_rebase(&name, ledger.as_deref(), &strategy, dirs, remote.as_deref()).await,
         BranchAction::Merge {
             source,
             target,
@@ -65,7 +54,6 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                 ledger.as_deref(),
                 dirs,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -93,7 +81,6 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                 ledger.as_deref(),
                 dirs,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -136,7 +123,6 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                 ledger.as_deref(),
                 dirs,
                 remote.as_deref(),
-                direct,
             )
             .await
         }
@@ -154,7 +140,6 @@ async fn run_create(
     at: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -170,11 +155,7 @@ async fn run_create(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {
@@ -238,7 +219,6 @@ async fn run_list(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -253,11 +233,7 @@ async fn run_list(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {
@@ -349,7 +325,6 @@ async fn run_drop(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -365,11 +340,7 @@ async fn run_drop(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {
@@ -433,7 +404,6 @@ async fn run_rebase(
     strategy: &str,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -451,11 +421,7 @@ async fn run_rebase(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     let conflict_strategy = fluree_db_api::ConflictStrategy::from_str_name(strategy)
@@ -554,7 +520,6 @@ async fn run_merge(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
@@ -572,11 +537,7 @@ async fn run_merge(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     let conflict_strategy = fluree_db_api::ConflictStrategy::from_str_name(strategy)
@@ -681,7 +642,6 @@ async fn run_revert(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     // Validate selection: positional commits XOR --from/--to range. Clap
     // already rejects partial range (`--from` without `--to` and vice versa)
@@ -750,11 +710,7 @@ async fn run_revert(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     let conflict_strategy = fluree_db_api::ConflictStrategy::from_str_name(strategy)
@@ -1115,7 +1071,6 @@ async fn run_diff(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
-    direct: bool,
 ) -> CliResult<()> {
     // Translate `0` to "unbounded" only for local mode — the HTTP layer
     // always enforces a hard cap, so requesting unbounded over the wire
@@ -1197,11 +1152,7 @@ async fn run_diff(
 
     let mode = {
         let mode = context::resolve_ledger_mode(ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
-        }
+        mode
     };
 
     match mode {
