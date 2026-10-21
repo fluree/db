@@ -167,7 +167,7 @@ class Connection:
         """Create a ledger, optionally bulk-loading RDF files into it.
 
         ``source`` is a file or a directory of Turtle, TriG, N-Triples,
-        N-Quads, or JSON-LD files. Bulk loading needs a file-backed connection.
+        N-Quads, or JSON-LD files.
         """
         src = None if source is None else Path(source)
         return Ledger(self, self._native.create(ledger, src))
