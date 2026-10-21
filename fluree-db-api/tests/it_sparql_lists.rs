@@ -267,3 +267,241 @@ async fn every_path_shape_reaches_the_cells() {
         assert_eq!(found.len(), n, "{query}: {found:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// SPARQL UPDATE writes lists as RDF too.
+// ---------------------------------------------------------------------------
+
+async fn update(fluree: &fluree_db_api::Fluree, ledger: LedgerState, body: &str) -> LedgerState {
+    let text = format!("{PREFIXES}{body}");
+    let parsed = fluree_db_sparql::parse_sparql(&text);
+    assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &parsed.ast.expect("ast"),
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower");
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .unwrap_or_else(|e| panic!("update: {e}\n{body}"))
+        .ledger
+}
+
+/// `ex:s ex:items`'s values in Fluree's view: a compact list's members, and
+/// a list stored as triples as its head.
+async fn values(fluree: &fluree_db_api::Fluree, ledger: &LedgerState, s: &str) -> Vec<JsonValue> {
+    let result = support::query_jsonld(
+        fluree,
+        ledger,
+        &json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?x",
+            "where": {"@id": s, "ex:items": "?x"}
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    result.as_array().cloned().unwrap_or_default()
+}
+
+async fn lists(ledger: &LedgerState, s: &str) -> Vec<Vec<i64>> {
+    support::stored_int_lists(
+        ledger,
+        &format!("http://example.org/{s}"),
+        "http://example.org/items",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_update_edits_a_member_in_place() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "edit", "ex:s ex:items (1 2 3) .").await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "DELETE { ?c rdf:first 2 } INSERT { ?c rdf:first 20 } \
+         WHERE { ex:s ex:items/rdf:rest ?c . ?c rdf:first 2 }",
+    )
+    .await;
+    assert_eq!(lists(&ledger, "s").await, [vec![1, 20, 3]]);
+    let stored = values(&fluree, &ledger, "ex:s").await;
+    assert!(
+        stored.len() == 3 && stored.iter().all(JsonValue::is_number),
+        "compact: {stored:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_update_appends_to_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "append", "ex:s ex:items (1 2 3) .").await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "DELETE { ?last rdf:rest rdf:nil } INSERT { ?last rdf:rest ( 4 ) } \
+         WHERE { ex:s ex:items/rdf:rest* ?last . ?last rdf:rest rdf:nil }",
+    )
+    .await;
+    assert_eq!(lists(&ledger, "s").await, [vec![1, 2, 3, 4]]);
+    assert_eq!(values(&fluree, &ledger, "ex:s").await.len(), 4, "compact");
+}
+
+#[tokio::test]
+async fn deleting_a_list_deletes_its_cells() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "delete", "ex:s ex:items (1 2 3) ; ex:name \"s\" .").await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "DELETE { ex:s ex:items ?l . ?c ?p ?o } \
+         WHERE { ex:s ex:items ?l . ?l rdf:rest* ?c . ?c ?p ?o }",
+    )
+    .await;
+    let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
+    assert_eq!(all.len(), 1, "only ex:name is left: {all:?}");
+}
+
+/// A list whose owner's edge a write deletes, naming its cells in no
+/// insertion, goes with the edge: its cells are unreachable, and deleting a
+/// subject stays a delete.
+#[tokio::test]
+async fn deleting_the_owners_edge_deletes_the_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "orphan", "ex:s ex:items (1 2 3) .").await;
+    let ledger = update(&fluree, ledger, "DELETE WHERE { ex:s ?p ?o }").await;
+    let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
+    assert!(all.is_empty(), "{all:?}");
+}
+
+/// The edge moved, the cells are named again: the list moves, still compact.
+#[tokio::test]
+async fn moving_a_list_keeps_it_compact() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "move", "ex:s ex:items (1 2 3) .").await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "DELETE { ex:s ex:items ?l } INSERT { ex:t ex:items ?l } WHERE { ex:s ex:items ?l }",
+    )
+    .await;
+    assert!(lists(&ledger, "s").await.is_empty());
+    assert_eq!(lists(&ledger, "t").await, [vec![1, 2, 3]]);
+    assert_eq!(values(&fluree, &ledger, "ex:t").await.len(), 3, "compact");
+}
+
+/// N-Triples has no `( … )`: a list in it is a chain of the document's blank
+/// nodes, stored as the list it is, and upserted again as no change.
+#[tokio::test]
+async fn a_chain_written_out_is_stored_as_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let chain = "<http://example.org/s> <http://example.org/items> _:a .
+        _:a <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+        _:a <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:b .
+        _:b <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+        _:b <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+        ";
+    let ledger = support::genesis_ledger(&fluree, "it/sparql-lists/chain");
+    let ledger = fluree
+        .insert_turtle(ledger, chain)
+        .await
+        .expect("insert")
+        .ledger;
+    assert_eq!(
+        values(&fluree, &ledger, "ex:s").await,
+        [json!(1), json!(2)],
+        "compact"
+    );
+    let t = ledger.t();
+    let ledger = fluree
+        .upsert_turtle(ledger, chain)
+        .await
+        .expect("upsert")
+        .ledger;
+    assert_eq!(
+        ledger.t(),
+        t,
+        "the same list upserted again changes nothing"
+    );
+    let ledger = update(
+        &fluree,
+        ledger,
+        "INSERT DATA { ex:u ex:items _:c . _:c rdf:first 3 ; rdf:rest rdf:nil }",
+    )
+    .await;
+    assert_eq!(
+        values(&fluree, &ledger, "ex:u").await,
+        [json!(3)],
+        "compact"
+    );
+}
+
+/// A `( … )` an update writes is stored compactly when it is the first list
+/// on its property, and as triples beside one.
+#[tokio::test]
+async fn insert_data_writes_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "insert", "ex:a ex:name \"a\" .").await;
+    let ledger = update(&fluree, ledger, "INSERT DATA { ex:t ex:items (1 2) }").await;
+    assert_eq!(
+        values(&fluree, &ledger, "ex:t").await,
+        [json!(1), json!(2)],
+        "compact"
+    );
+    let ledger = update(&fluree, ledger, "INSERT DATA { ex:t ex:items (3 4) }").await;
+    assert_eq!(lists(&ledger, "t").await, [vec![1, 2], vec![3, 4]]);
+    let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
+    assert_eq!(all.len(), 1 + 2 * (1 + 2 * 2), "{all:?}");
+}
+
+/// `ex:s ex:items 2` is no triple of the list, so a write of it is a write
+/// of a plain value beside it.
+#[tokio::test]
+async fn a_plain_value_write_leaves_the_members() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "plain", "ex:s ex:items (1 2 3) .").await;
+    let ledger = update(&fluree, ledger, "DELETE DATA { ex:s ex:items 2 }").await;
+    assert_eq!(lists(&ledger, "s").await, [vec![1, 2, 3]]);
+    let ledger = update(&fluree, ledger, "INSERT DATA { ex:s ex:items 2 }").await;
+    let found = rows(&fluree, &ledger, "SELECT ?o WHERE { ex:s ex:items ?o }").await;
+    assert_eq!(found.len(), 2, "the head and the value: {found:?}");
+    assert!(found.contains(&json!([2])), "{found:?}");
+    let members = rows(
+        &fluree,
+        &ledger,
+        "SELECT ?a ?b ?c WHERE { ex:s ex:items (?a ?b ?c) }",
+    )
+    .await;
+    assert_eq!(members, [json!([1, 2, 3])]);
+}
+
+/// A cell something else names is no longer a plain cell: the list is stored
+/// as its triples, the same RDF.
+#[tokio::test]
+async fn a_shared_cell_stores_the_list_as_triples() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "shared", "ex:s ex:items (1 2 3) .").await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "INSERT { ex:t ex:tail ?c } WHERE { ex:s ex:items/rdf:rest ?c }",
+    )
+    .await;
+    assert_eq!(lists(&ledger, "s").await, [vec![1, 2, 3]]);
+    let stored = values(&fluree, &ledger, "ex:s").await;
+    assert_eq!(stored.len(), 1, "the head, stored: {stored:?}");
+    let tail = rows(
+        &fluree,
+        &ledger,
+        "SELECT ?x WHERE { ex:t ex:tail/rdf:rest*/rdf:first ?x }",
+    )
+    .await;
+    assert_eq!(tail, [json!([2]), json!([3])]);
+}

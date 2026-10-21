@@ -17,7 +17,7 @@ use fluree_db_core::{id_datatype_sid, Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_ledger::LedgerState;
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A list a transaction writes, before it is decided how to store it.
 #[derive(Debug, Clone)]
@@ -109,6 +109,112 @@ impl PendingList {
         }
         out
     }
+}
+
+/// The lists among the assertions `flakes` written as explicit chains, each
+/// as its members in compact form (see [`PendingList::new`]), and the
+/// assertions left. A chain is an edge, by a subject that is no cell and not
+/// on `rdf:first` / `rdf:rest`, to a cell, each cell holding one `rdf:first`
+/// and one `rdf:rest` in the edge's graph, the last's `rdf:nil`, and named
+/// by nothing else. `is_cell` says which nodes may be cells: blank nodes
+/// nothing outside the assertions can name.
+pub fn chain_lists(
+    flakes: Vec<Flake>,
+    is_cell: impl Fn(&Sid) -> bool,
+) -> (Vec<Flake>, Vec<Vec<Flake>>) {
+    let (first, rest, nil) = (
+        Sid::new(RDF, RDF_FIRST),
+        Sid::new(RDF, RDF_REST),
+        Sid::new(RDF, RDF_NIL),
+    );
+    let mut of: HashMap<&Sid, Vec<usize>> = HashMap::new();
+    let mut into: HashMap<&Sid, usize> = HashMap::new();
+    for f in &flakes {
+        if f.p == first && is_cell(&f.s) {
+            of.entry(&f.s).or_default();
+        }
+    }
+    if of.is_empty() {
+        return (flakes, Vec::new());
+    }
+    for (i, f) in flakes.iter().enumerate() {
+        if let Some(triples) = of.get_mut(&f.s) {
+            triples.push(i);
+        }
+        if let FlakeValue::Ref(o) = &f.o {
+            if of.contains_key(o) {
+                *into.entry(o).or_default() += 1;
+            }
+        }
+    }
+    let mut taken = vec![false; flakes.len()];
+    let mut lists = Vec::new();
+    'edges: for (e, edge) in flakes.iter().enumerate() {
+        let FlakeValue::Ref(head) = &edge.o else {
+            continue;
+        };
+        if !of.contains_key(head) || is_cell(&edge.s) || edge.p == first || edge.p == rest {
+            continue;
+        }
+        let mut used = vec![e];
+        let mut firsts = Vec::new();
+        let mut at = head;
+        while *at != nil {
+            let Some(triples) = of.get(at) else {
+                continue 'edges;
+            };
+            let [a, b] = triples[..] else {
+                continue 'edges;
+            };
+            let (f, r) = if flakes[a].p == first { (a, b) } else { (b, a) };
+            let (fl, rl) = (&flakes[f], &flakes[r]);
+            let plain = fl.p == first
+                && rl.p == rest
+                && fl.g == edge.g
+                && rl.g == edge.g
+                && into.get(at) == Some(&1)
+                && !used.contains(&f);
+            let FlakeValue::Ref(next) = &rl.o else {
+                continue 'edges;
+            };
+            if !plain {
+                continue 'edges;
+            }
+            used.extend([f, r]);
+            firsts.push(f);
+            at = next;
+        }
+        for &u in &used {
+            taken[u] = true;
+        }
+        lists.push(
+            firsts
+                .iter()
+                .enumerate()
+                .map(|(k, &f)| {
+                    let member = &flakes[f];
+                    let lang = member.m.as_ref().and_then(|m| m.lang.as_deref());
+                    Flake {
+                        g: edge.g.clone(),
+                        s: edge.s.clone(),
+                        p: edge.p.clone(),
+                        o: member.o.clone(),
+                        dt: member.dt.clone(),
+                        t: edge.t,
+                        op: true,
+                        m: FlakeMeta::from_parts(lang, Some(k as i32)),
+                    }
+                })
+                .collect(),
+        );
+    }
+    let left = flakes
+        .into_iter()
+        .zip(taken)
+        .filter(|(_, taken)| !taken)
+        .map(|(f, _)| f)
+        .collect();
+    (left, lists)
 }
 
 /// The flakes that store `lists`: each compact when it is the first list on

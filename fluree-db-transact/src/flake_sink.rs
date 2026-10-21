@@ -121,16 +121,33 @@ impl<'a> FlakeSink<'a> {
 
     /// The flakes and, separately, the lists the document writes, for
     /// [`crate::lists::store_lists`] to store against the ledger.
+    ///
+    /// A list written out as a chain of the document's blank nodes is one of
+    /// them, as a `( … )` is ([`crate::lists::chain_lists`]).
     pub fn into_flakes_and_lists(self) -> Result<(Vec<Flake>, Vec<PendingList>), TransactError> {
         if let Some(err) = self.invariant_error {
             return Err(err);
         }
-        let lists = self
+        let mut lists: Vec<PendingList> = self
             .lists
             .into_iter()
             .map(|(members, cells)| PendingList::new(members, cells))
             .collect();
-        Ok((self.flakes, lists))
+        let minted = self
+            .ns_registry
+            .blank_node_sid(&format!("{}-", self.txn_id))
+            .name;
+        let (flakes, chained) = crate::lists::chain_lists(self.flakes, |sid| {
+            sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE
+                && sid.name.starts_with(minted.as_ref())
+        });
+        lists.extend(
+            chained
+                .into_iter()
+                .enumerate()
+                .map(|(i, members)| PendingList::new(members, format!("{}--x{i}-", self.txn_id))),
+        );
+        Ok((flakes, lists))
     }
 
     // -- helpers -------------------------------------------------------------

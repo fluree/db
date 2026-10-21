@@ -43,7 +43,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// A list, named by the graph, subject and predicate that own it.
-type Owner = (GraphId, Sid, Sid);
+pub type Owner = (GraphId, Sid, Sid);
 
 /// A list and its members in position order.
 type List = (Owner, Vec<Flake>);
@@ -121,7 +121,7 @@ impl ListView {
     }
 
     /// The blank node for cell `k` of `owner`'s list.
-    fn cell(&self, owner: &Owner, k: usize) -> Sid {
+    pub fn cell(&self, owner: &Owner, k: usize) -> Sid {
         let mut table = self
             .lists
             .lock()
@@ -136,6 +136,26 @@ impl ListView {
             }
         };
         Sid::new(BLANK_NODE, format!("l{n}-{k}"))
+    }
+
+    /// The list and position `sid` names, when it is a cell this request
+    /// named.
+    pub fn cell_of(&self, sid: &Sid) -> Option<(Owner, usize)> {
+        self.decode(sid)
+    }
+
+    /// The members of `owner`'s list as this request read them, in position
+    /// order: cell `k` holds member `k`.
+    pub fn members_of(&self, owner: &Owner) -> Option<Vec<Flake>> {
+        let reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reads
+            .values()
+            .flat_map(|lists| lists.iter())
+            .find(|(o, _)| o == owner)
+            .map(|(_, members)| members.clone())
     }
 
     /// The list and position `sid` names, when it is a cell of this request.
@@ -193,13 +213,23 @@ pub fn apply(
     overlay: &dyn OverlayProvider,
     store: Option<&Arc<BinaryIndexStore>>,
 ) -> Result<Vec<Pattern>> {
-    let store = store
-        .cloned()
-        .or_else(|| crate::context::ExecutionContext::extract_binary_store(snapshot));
-    Ok(match ListView::for_db(snapshot, overlay, store.as_ref())? {
+    Ok(match view_for(snapshot, overlay, store)? {
         Some(view) => rewrite_patterns(patterns, &view, &|iri| snapshot.encode_iri(iri)),
         None => patterns,
     })
+}
+
+/// [`ListView::for_db`], reading the snapshot's own index store when `store`
+/// is not given.
+pub fn view_for(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    store: Option<&Arc<BinaryIndexStore>>,
+) -> Result<Option<Arc<ListView>>> {
+    let store = store
+        .cloned()
+        .or_else(|| crate::context::ExecutionContext::extract_binary_store(snapshot));
+    ListView::for_db(snapshot, overlay, store.as_ref())
 }
 
 fn rewrite_pattern(

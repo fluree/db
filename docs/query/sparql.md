@@ -1350,6 +1350,30 @@ INSERT DATA {
 }
 ```
 
+### Lists
+
+An update reads and writes lists as [RDF lists](#rdf-lists): a `( … )` in a template writes one, and a WHERE that binds a list's cells lets the templates change them.
+
+```sparql
+# data: ex:s ex:items (1 2 3) .
+
+# Replace a member
+DELETE { ?c rdf:first 2 } INSERT { ?c rdf:first 20 }
+WHERE  { ex:s ex:items/rdf:rest ?c . ?c rdf:first 2 }
+
+# Append
+DELETE { ?last rdf:rest rdf:nil } INSERT { ?last rdf:rest ( 4 ) }
+WHERE  { ex:s ex:items/rdf:rest* ?last . ?last rdf:rest rdf:nil }
+
+# Move the list to another subject
+DELETE { ex:s ex:items ?l } INSERT { ex:t ex:items ?l }
+WHERE  { ex:s ex:items ?l }
+```
+
+- `ex:s ex:items 2` is no triple of the list: `DELETE DATA { ex:s ex:items 2 }` leaves the member, and `INSERT DATA { ex:s ex:items 2 }` adds a value beside the list.
+- Deleting a list's edge from its owner deletes the list, unless the update's insertions name one of its cells. `DELETE WHERE { ex:s ?p ?o }` removes every value of `ex:s`, its lists included.
+- A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property.
+
 ### Typed Literals
 
 Specify datatypes explicitly:

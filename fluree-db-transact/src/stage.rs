@@ -730,6 +730,27 @@ pub async fn stage_with_graph_delta(
             .clone()
             .unwrap_or_else(generate_txn_id);
 
+        // A SPARQL WHERE reads lists as RDF does (`fluree_db_query::list_view`),
+        // so its rows can name list cells, which nothing stores, and any write
+        // can state a list as a chain of the blank nodes it mints: the writes
+        // that name a cell edit or write the list (`crate::list_edits`), and
+        // can assert cells as triples even when the update only deletes.
+        let view = if txn.rdf_list_view
+            && (txn.sparql_where.is_some() || !txn.where_patterns.is_empty())
+        {
+            fluree_db_query::list_view::view_for(
+                &ledger.snapshot,
+                ledger.as_graph_db_ref(0).overlay,
+                None,
+            )?
+        } else {
+            None
+        };
+        let mut list_edits = (view.is_some()
+            || crate::list_edits::ListEdits::writes_chain(&txn.insert_templates))
+        .then(|| crate::list_edits::ListEdits::new(view, &txn_id));
+        let pure_retract = pure_delete && list_edits.is_none();
+
         // Every graph the update writes, fixed or bound per solution, resolves
         // in this ledger through the one graph-position table: its own
         // address writes the default graph and registers nothing, and `L#<g>`
@@ -813,7 +834,7 @@ pub async fn stage_with_graph_delta(
         // projecting / materializing / hydrating in the same step. This keeps
         // peak memory bounded by one batch (plus the accumulator's survivor
         // set) rather than by the total WHERE cardinality.
-        let mut acc = if pure_delete {
+        let mut acc = if pure_retract {
             FlakeAccumulator::pure_delete(64)
         } else if txn.sync_graph.is_some() || txn.txn_type == TxnType::Upsert {
             // The payload is a set: a fact it states twice must not out-vote
@@ -861,6 +882,7 @@ pub async fn stage_with_graph_delta(
                 &mut reverse_graph,
                 &mut acc,
                 options.policy_ctx,
+                list_edits.as_mut(),
             )
             .await?;
             let span = tracing::Span::current();
@@ -910,8 +932,18 @@ pub async fn stage_with_graph_delta(
         }
         // Every graph is resolved, and the upsert wave has read its slots:
         // release the table's borrow of the ledger.
-        let lists = generator.take_lists();
+        let mut lists = generator.take_lists();
         drop(generator);
+
+        if let Some(edits) = list_edits.take() {
+            let routing = &reverse_graph;
+            let stored = edits
+                .store(&ledger, |f| resolve_flake_graph_id(f, routing), new_t)
+                .await?;
+            acc.push_retractions(stored.retractions);
+            acc.push_assertions(stored.assertions);
+            lists.extend(stored.lists);
+        }
 
         // Graph-sync wave: retract every current fact of the target graph
         // (see [`Txn::sync_graph`]). The accumulator nets retract+assert of
@@ -968,7 +1000,7 @@ pub async fn stage_with_graph_delta(
         // check below. Without one, cancellation keeps nothing.
         let restricted = options.policy_ctx.is_some_and(|p| !p.wrapper().is_root());
         let mut restated: Vec<(Flake, Flake)> = Vec::new();
-        let mut flakes = if pure_delete {
+        let mut flakes = if pure_retract {
             let _span =
                 tracing::debug_span!("dedup_retractions", retraction_count = retraction_count)
                     .entered();
@@ -2869,6 +2901,7 @@ async fn stream_where_into_accumulator(
     reverse_graph: &mut HashMap<Sid, GraphId>,
     acc: &mut FlakeAccumulator<'_>,
     view_policy: Option<&PolicyContext>,
+    mut list_edits: Option<&mut crate::list_edits::ListEdits>,
 ) -> Result<WhereStreamStats> {
     // Lower transaction WHERE clause to query patterns.
     //
@@ -2883,6 +2916,12 @@ async fn stream_where_into_accumulator(
         // This also assigns VarIds to any variables referenced in WHERE patterns.
         lower_where_patterns(&txn.where_patterns, &ledger.snapshot, &mut txn.vars)?
     };
+    if let Some(view) = list_edits.as_deref().and_then(|edits| edits.view()) {
+        query_patterns =
+            fluree_db_query::list_view::rewrite_patterns(query_patterns, view, &|iri: &str| {
+                ledger.snapshot.encode_iri(iri)
+            });
+    }
 
     // If VALUES clause present, prepend it as first pattern (seeds the join).
     //
@@ -3249,7 +3288,8 @@ async fn stream_where_into_accumulator(
             },
         );
     }
-    let mut resolver = DeleteResolver::new(ledger, list_free);
+    let mut resolver =
+        DeleteResolver::new(ledger, list_free).hiding_list_members(txn.rdf_list_view);
     let mut resolve_stats = ResolveStats::default();
     // Under a non-root policy, intents that name no stored fact still go to
     // the modify-policy check (see `stage_with_graph_delta`).
@@ -3296,8 +3336,11 @@ async fn stream_where_into_accumulator(
         );
         let intents = {
             let _g = delete_span.enter();
-            let intents =
+            let mut intents =
                 generator.generate_retract_intents(&txn.delete_templates, &witnessed, &batch)?;
+            if let Some(edits) = list_edits.as_deref_mut() {
+                intents = edits.divert_intents(intents);
+            }
             route_var_graphs(
                 ledger,
                 generator.written_graphs(),
@@ -3330,7 +3373,10 @@ async fn stream_where_into_accumulator(
             );
             let assertions = {
                 let _g = insert_span.enter();
-                let a = generator.generate_assertions(&txn.insert_templates, &batch)?;
+                let mut a = generator.generate_assertions(&txn.insert_templates, &batch)?;
+                if let Some(edits) = list_edits.as_deref_mut() {
+                    a = edits.divert_assertions(a);
+                }
                 route_var_graphs(
                     ledger,
                     generator.written_graphs(),

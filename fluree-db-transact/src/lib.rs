@@ -41,6 +41,7 @@ pub mod error;
 pub mod flake_sink;
 pub mod generate;
 pub mod ir;
+mod list_edits;
 pub mod lists;
 pub mod lower_cypher_update;
 pub mod lower_sparql_update;
