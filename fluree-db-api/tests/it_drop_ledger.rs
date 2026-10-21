@@ -871,6 +871,129 @@ async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
     assert!(fluree.db(child_id).await.expect("child still loads").t > 0);
 }
 
+/// A branch an earlier release let begin with `/` is listed under its id,
+/// but no nameservice operation addresses that id. Dropping its ledger, in
+/// either mode, is refused before anything is touched: the branch's record
+/// and files stay as the older release left them, and so does the rest of
+/// the ledger. The fixture writes the branch the way an older release left
+/// it, since `create_branch` refuses the name.
+#[tokio::test]
+async fn a_ledger_drop_with_a_legacy_branch_is_refused_before_deleting_anything() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = |id: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": id, "ex:val": 1}]
+        })
+    };
+    let main = fluree.create_ledger("slashed").await.expect("create");
+    fluree
+        .insert(main, &txn("ex:a"))
+        .await
+        .expect("insert main");
+    fluree
+        .create_branch("slashed", "placeholder", None, None)
+        .await
+        .expect("create placeholder");
+    let placeholder = fluree.ledger("slashed:placeholder").await.expect("load");
+    fluree
+        .insert(placeholder, &txn("ex:b"))
+        .await
+        .expect("insert placeholder");
+    fluree.disconnect_ledger("slashed:placeholder").await;
+    // The branch `/old`: its files under the path its id names, and its
+    // record under the ledger's records.
+    let legacy_files = tmp.path().join("slashed").join("old");
+    std::fs::rename(
+        tmp.path().join("slashed").join("placeholder"),
+        &legacy_files,
+    )
+    .expect("move the branch's files");
+    let records = tmp.path().join("ns@v2").join("slashed");
+    let json = std::fs::read_to_string(records.join("placeholder.json"))
+        .expect("placeholder record")
+        .replace("placeholder", "/old");
+    std::fs::remove_file(records.join("placeholder.json")).expect("remove placeholder");
+    std::fs::write(records.join("old.json"), &json).expect("write the branch's record");
+
+    let legacy_id = "slashed:/old";
+    let listed = || async {
+        let mut ids: Vec<String> = fluree
+            .nameservice()
+            .all_records()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        listed().await,
+        [legacy_id, "slashed:main"],
+        "listed under its id"
+    );
+    let Err(refused) = fluree.db(legacy_id).await else {
+        panic!("a request cannot name the branch");
+    };
+    assert!(
+        refused.to_string().contains("cannot begin with '/'"),
+        "{refused}"
+    );
+
+    let files = |dir: std::path::PathBuf| {
+        let mut out = Vec::new();
+        let mut dirs = vec![dir];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+    let legacy_before = files(legacy_files.clone());
+    let main_before = files(tmp.path().join("slashed").join("main"));
+    assert!(!legacy_before.is_empty(), "fixture: the branch has files");
+    for mode in [DropMode::Soft, DropMode::Hard] {
+        let err = fluree
+            .drop_ledger("slashed", mode)
+            .await
+            .expect_err("a ledger holding the branch is not dropped");
+        let err = err.to_string();
+        assert!(
+            err.contains(legacy_id) && err.contains("Nothing was dropped"),
+            "{mode:?}: {err}"
+        );
+        assert_eq!(
+            files(legacy_files.clone()),
+            legacy_before,
+            "{mode:?}: its files stay"
+        );
+        assert_eq!(
+            files(tmp.path().join("slashed").join("main")),
+            main_before,
+            "{mode:?}: the rest of the ledger stays"
+        );
+        assert_eq!(
+            std::fs::read_to_string(records.join("old.json")).expect("record"),
+            json,
+            "{mode:?}: its record stays"
+        );
+        assert_eq!(listed().await, [legacy_id, "slashed:main"], "{mode:?}");
+    }
+    fluree.disconnect_ledger("slashed").await;
+    assert!(fluree.db("slashed").await.expect("main still loads").t > 0);
+}
+
 /// A branch drop that cannot list ledgers must fail before touching anything:
 /// deleting the record while keeping the files would leave them unreachable.
 #[tokio::test]
