@@ -59,7 +59,7 @@ impl PendingList {
 
     /// `s p cell0`, then `cellK rdf:first memberK` and `cellK rdf:rest` the
     /// next cell or `rdf:nil`.
-    fn into_chain(self) -> Vec<Flake> {
+    pub(crate) fn into_chain(self) -> Vec<Flake> {
         let Some(first) = self.members.first() else {
             return Vec::new();
         };

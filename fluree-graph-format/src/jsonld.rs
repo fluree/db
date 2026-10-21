@@ -974,6 +974,33 @@ mod tests {
         );
     }
 
+    /// A collection named only from its own cells, or from a cycle of
+    /// collections, has nowhere to be written inline: it keeps its triples.
+    #[test]
+    fn unanchored_collections_keep_their_triples() {
+        let cell = |l: &str| Term::blank(l);
+        let (first, rest, nil) = (
+            || Term::iri(rdf::FIRST),
+            || Term::iri(rdf::REST),
+            || Term::iri(rdf::NIL),
+        );
+        let mut graph = Graph::new();
+        graph.add_triple(cell("a"), first(), cell("a"));
+        graph.add_triple(cell("a"), rest(), nil());
+        graph.add_triple(cell("b"), first(), cell("c"));
+        graph.add_triple(cell("b"), rest(), nil());
+        graph.add_triple(cell("c"), first(), cell("b"));
+        graph.add_triple(cell("c"), rest(), nil());
+        graph.sort();
+
+        let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+        assert_eq!(
+            result["@graph"].as_array().map(Vec::len),
+            Some(3),
+            "{result}"
+        );
+    }
+
     #[test]
     fn test_format_nan_and_infinity() {
         let mut graph = Graph::new();

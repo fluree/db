@@ -369,16 +369,52 @@ async fn deleting_a_list_deletes_its_cells() {
     assert_eq!(all.len(), 1, "only ex:name is left: {all:?}");
 }
 
-/// A list whose owner's edge a write deletes, naming its cells in no
-/// insertion, goes with the edge: its cells are unreachable, and deleting a
-/// subject stays a delete.
+/// RDF's reading: the cells are triples of their own, which deleting the
+/// owner's edge leaves, however each list is stored.
 #[tokio::test]
-async fn deleting_the_owners_edge_deletes_the_list() {
+async fn deleting_the_owners_edge_leaves_the_cells() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = ledger_with(&fluree, "orphan", "ex:s ex:items (1 2 3) .").await;
-    let ledger = update(&fluree, ledger, "DELETE WHERE { ex:s ?p ?o }").await;
+    let ledger = ledger_with(&fluree, "orphan", "ex:s ex:items (1 2), (3 4) .").await;
+    let ledger = update(&fluree, ledger, "DELETE WHERE { ex:s ex:items ?l }").await;
+    assert!(values(&fluree, &ledger, "ex:s").await.is_empty());
     let all = rows(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
-    assert!(all.is_empty(), "{all:?}");
+    assert_eq!(all.len(), 2 * 2 * 2, "{all:?}");
+    let members = rows(
+        &fluree,
+        &ledger,
+        "SELECT ?x WHERE { ?c rdf:first ?x } ORDER BY ?x",
+    )
+    .await;
+    assert_eq!(members, [json!([1]), json!([2]), json!([3]), json!([4])]);
+}
+
+/// ADD and COPY leave the source's list in both graphs, the same RDF list:
+/// the same head, and a second ADD adds nothing.
+#[tokio::test]
+async fn a_list_added_or_copied_is_the_same_list_in_both_graphs() {
+    let data = "GRAPH ex:g1 { ex:s ex:items (1 2) . } GRAPH ex:g2 { ex:t ex:name ex:n . }";
+    let joined =
+        "SELECT ?h WHERE { GRAPH ex:g1 { ex:s ex:items ?h } GRAPH ex:g2 { ex:s ex:items ?h } }";
+    for op in ["ADD", "COPY"] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = ledger_with(&fluree, &format!("transfer-{op}"), data).await;
+        let ledger = update(&fluree, ledger, &format!("{op} ex:g1 TO ex:g2")).await;
+        assert_eq!(
+            rows(&fluree, &ledger, joined).await.len(),
+            1,
+            "{op}: one head"
+        );
+        let t = ledger.t();
+        let ledger = update(&fluree, ledger, &format!("{op} ex:g1 TO ex:g2")).await;
+        assert_eq!(ledger.t(), t, "{op} again changes nothing");
+        let members = rows(
+            &fluree,
+            &ledger,
+            "SELECT ?x WHERE { GRAPH ex:g2 { ex:s ex:items/rdf:rest*/rdf:first ?x } } ORDER BY ?x",
+        )
+        .await;
+        assert_eq!(members, [json!([1]), json!([2])], "{op}");
+    }
 }
 
 /// The edge moved, the cells are named again: the list moves, still compact.
@@ -504,4 +540,97 @@ async fn a_shared_cell_stores_the_list_as_triples() {
     )
     .await;
     assert_eq!(tail, [json!([2]), json!([3])]);
+}
+
+/// A zero-length match pairs every node with itself, the cells and
+/// `rdf:nil` included, whichever predicate the path names.
+#[tokio::test]
+async fn a_zero_length_path_reaches_the_cells_on_any_predicate() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "zero",
+        "ex:s ex:items (ex:a ex:b) ; ex:name ex:n .",
+    )
+    .await;
+    let found = rows(&fluree, &ledger, "SELECT ?x ?y WHERE { ?x ex:name* ?y }").await;
+    // ex:s, ex:n, two cells, rdf:nil, ex:a and ex:b with themselves, and
+    // the name edge.
+    assert_eq!(found.len(), 7 + 1, "{found:?}");
+}
+
+/// A variable the pattern repeats takes one term, whether or not a row bound
+/// it before.
+#[tokio::test]
+async fn a_repeated_variable_takes_one_term() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "repeat", "ex:s ex:items (1 2) .").await;
+    let found = rows(
+        &fluree,
+        &ledger,
+        "SELECT ?x WHERE { VALUES ?x { UNDEF 7 } ?x rdf:first ?x }",
+    )
+    .await;
+    assert!(found.is_empty(), "no cell is its own member: {found:?}");
+}
+
+/// An `EXISTS` inside an expression reads the same graph as the patterns
+/// around it.
+#[tokio::test]
+async fn an_exists_expression_reads_lists_as_rdf() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "exists", "ex:s ex:items (1 2) .").await;
+    for (query, expected) in [
+        (
+            "SELECT ?ok WHERE { BIND(EXISTS { ex:s ex:items ?h . ?h rdf:first 1 } AS ?ok) }",
+            true,
+        ),
+        (
+            "SELECT ?ok WHERE { BIND(EXISTS { ex:s ex:items 1 } AS ?ok) }",
+            false,
+        ),
+    ] {
+        let found = rows(&fluree, &ledger, query).await;
+        assert_eq!(found, [json!([expected])], "{query}");
+    }
+}
+
+/// A collection named only from its own cells has nowhere to be written
+/// inline, and keeps its triples.
+#[tokio::test]
+async fn construct_keeps_a_collection_it_cannot_inline() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "self-list", "ex:s ex:name ex:n .").await;
+    let query =
+        format!("{PREFIXES}CONSTRUCT {{ _:a rdf:first _:a ; rdf:rest rdf:nil }} WHERE {{ }}");
+    let result = support::query_sparql(&fluree, &ledger, &query)
+        .await
+        .expect("construct");
+    let graph = result.to_construct(&ledger.snapshot).expect("jsonld");
+    assert_eq!(graph["@graph"].as_array().map(Vec::len), Some(1), "{graph}");
+}
+
+/// A list in the ledger leaves a wildcard pattern streaming: `LIMIT 1`
+/// reads the first batch, not every triple.
+#[tokio::test]
+async fn a_limit_stops_a_list_view_scan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ttl: String = (0..12_000)
+        .map(|i| format!("ex:s{i} ex:name {i} .\n"))
+        .collect();
+    ttl.push_str("ex:owner ex:items (1 2) .\n");
+    let ledger = ledger_with(&fluree, "limit", &ttl).await;
+    let view = support::graphdb_from_ledger(&ledger);
+    let mut fuel = Vec::new();
+    for limit in [" LIMIT 1", ""] {
+        let query = format!("{PREFIXES}SELECT ?s ?p ?o WHERE {{ ?s ?p ?o }}{limit}");
+        let tracked = view
+            .query(&fluree)
+            .sparql(&query)
+            .execute_tracked()
+            .await
+            .expect("query");
+        fuel.push(tracked.fuel.expect("fuel"));
+    }
+    assert!(fuel[0] < fuel[1] / 3.0, "LIMIT 1 vs all: {fuel:?}");
 }

@@ -1371,8 +1371,14 @@ WHERE  { ex:s ex:items ?l }
 ```
 
 - `ex:s ex:items 2` is no triple of the list: `DELETE DATA { ex:s ex:items 2 }` leaves the member, and `INSERT DATA { ex:s ex:items 2 }` adds a value beside the list.
-- Deleting a list's edge from its owner deletes the list, unless the update's insertions name one of its cells. `DELETE WHERE { ex:s ?p ?o }` removes every value of `ex:s`, its lists included.
-- A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property.
+- Deleting a list's edge from its owner leaves its cells, as it does for any RDF list. To delete a list with its cells:
+
+  ```sparql
+  DELETE { ex:s ex:items ?l . ?c ?p ?o }
+  WHERE  { ex:s ex:items ?l . ?l rdf:rest* ?c . ?c ?p ?o }
+  ```
+- After `ADD` or `COPY`, a list is in both graphs as the same list, with the same cells.
+- A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property, and a list `ADD` or `COPY` leaves in two graphs.
 
 ### Typed Literals
 

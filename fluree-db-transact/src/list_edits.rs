@@ -9,9 +9,13 @@
 //! insertions (SPARQL 1.1 Update §3.1.3). Every chain then hanging from an
 //! owner's edge, its cells plain and named by nothing else, is stored
 //! compactly ([`crate::lists`]); every other triple as it is, a WHERE cell
-//! as a blank node minted for it. A stored list whose owner's edge the write
-//! deletes, and whose cells it names in no insertion, goes with its edge:
-//! its cells are unreachable, and a write deleting a subject stays a delete.
+//! as a blank node minted for it. Deleting the owner's edge leaves the
+//! cells, as it does for any RDF list.
+//!
+//! Storing a list again can stage facts the write did not change as RDF:
+//! the members of a list stored as triples instead, and the triples that
+//! restate its cells. Those are reported apart ([`StoredEdits::unjudged`]),
+//! so a modify policy judges what the write changed.
 
 use crate::current_facts::{CurrentFacts, RetractIntent, Retraction, Slot, StoredFact};
 use crate::error::{Result, TransactError};
@@ -45,6 +49,10 @@ pub(crate) struct StoredEdits {
     pub assertions: Vec<Flake>,
     /// The lists stored compactly, unless their owner holds another.
     pub lists: Vec<PendingList>,
+    /// Of the retractions and assertions, those that store again RDF the
+    /// write leaves as it is: the members of a list none of whose triples it
+    /// deletes, and the triples restating a list's cells.
+    pub unjudged: Vec<Flake>,
 }
 
 /// A triple of the edited lists, in the graph it is in.
@@ -176,8 +184,10 @@ impl ListEdits {
             lang: None,
         };
         let mut graph: Vec<Triple> = Vec::new();
+        let mut of_list: Vec<usize> = Vec::new();
         if let Some(view) = &self.view {
-            for (owner, (read, _)) in owners.iter().zip(&lists) {
+            for (i, (owner, (read, _))) in owners.iter().zip(&lists).enumerate() {
+                let start = graph.len();
                 let (g, s, p) = owner;
                 graph.push(node(*g, s.clone(), p, view.cell(owner, 0)));
                 for (k, member) in read.iter().enumerate() {
@@ -197,35 +207,21 @@ impl ListEdits {
                     };
                     graph.push(node(*g, cell, &rest, next));
                 }
+                of_list.extend(std::iter::repeat_n(i, graph.len() - start));
             }
         }
-        let inserted: HashSet<Owner> = asserts
-            .iter()
-            .flat_map(|t| [Some(&t.s), ref_of(&t.o)])
-            .flatten()
-            .filter_map(|sid| self.view_cell(sid).map(|(owner, _)| owner))
-            .collect();
-        let gone: HashSet<&Owner> = owners
-            .iter()
-            .filter(|owner| !inserted.contains(*owner))
-            .filter(|owner| {
-                self.view.as_ref().is_some_and(|view| {
-                    retracts.contains(&node(
-                        owner.0,
-                        owner.1.clone(),
-                        &owner.2,
-                        view.cell(owner, 0),
-                    ))
-                })
-            })
-            .collect();
-        graph.retain(|t| {
-            let of_gone = |sid: &Sid| {
-                self.view_cell(sid)
-                    .is_some_and(|(owner, _)| gone.contains(&owner))
-            };
-            !retracts.contains(t) && !of_gone(&t.s) && !ref_of(&t.o).is_some_and(of_gone)
-        });
+        // The lists the write deletes a triple of; the triples left of the
+        // rest are restated as they are.
+        let mut edited: HashSet<usize> = HashSet::new();
+        let mut restated: HashSet<Triple> = HashSet::new();
+        for (triple, &list) in graph.iter().zip(&of_list) {
+            if retracts.contains(triple) {
+                edited.insert(list);
+            } else {
+                restated.insert(triple.clone());
+            }
+        }
+        graph.retain(|t| !retracts.contains(t));
         let mut present: HashSet<Triple> = graph.iter().cloned().collect();
         for t in asserts {
             if present.insert(t.clone()) {
@@ -234,14 +230,20 @@ impl ListEdits {
         }
 
         let mut flakes = Vec::with_capacity(graph.len());
+        let mut restating: HashSet<FlakeKey> = HashSet::new();
         for triple in graph {
             let g_sid = graph_sid(ledger, &mut graph_sids, triple.g)?;
             let m = FlakeMeta::from_parts(triple.lang.as_deref(), None);
+            let restates = restated.contains(&triple);
             let Triple { s, p, o, dt, .. } = triple;
-            flakes.push(match g_sid {
+            let flake = match g_sid {
                 Some(g) => Flake::new_in_graph(g, s, p, o, dt, t, true, m),
                 None => Flake::new(s, p, o, dt, t, true, m),
-            });
+            };
+            if restates {
+                restating.insert(key_of(&flake));
+            }
+            flakes.push(flake);
         }
         let (left, chained) = crate::lists::chain_lists(flakes, |sid| self.is_cell(sid));
 
@@ -260,7 +262,7 @@ impl ListEdits {
         // is unchanged: neither retracted nor stored again.
         let mut chained: Vec<Option<Vec<Flake>>> = chained.into_iter().map(Some).collect();
         let mut out = StoredEdits::default();
-        for (owner, (read, stored)) in owners.iter().zip(lists) {
+        for (i, (owner, (read, stored))) in owners.iter().zip(lists).enumerate() {
             let g_sid = graph_sid(ledger, &mut graph_sids, owner.0)?;
             let same = chained.iter().position(|list| {
                 list.as_ref().is_some_and(|members| {
@@ -276,10 +278,16 @@ impl ListEdits {
                 })
             });
             match same {
-                Some(i) => chained[i] = None,
-                None => out
-                    .retractions
-                    .extend(stored.into_iter().map(|f| f.retract(t))),
+                Some(n) => chained[n] = None,
+                None => {
+                    for fact in stored {
+                        let retraction = fact.retract(t);
+                        if !edited.contains(&i) {
+                            out.unjudged.push(retraction.flake().clone());
+                        }
+                        out.retractions.push(retraction);
+                    }
+                }
             }
         }
         for (i, mut members) in chained.into_iter().flatten().enumerate() {
@@ -290,8 +298,12 @@ impl ListEdits {
                 .push(PendingList::new(members, format!("{}--e{i}-", self.txn_id)));
         }
         for mut flake in left {
+            let restates = restating.contains(&key_of(&flake));
             flake.s = stored_as(&flake.s);
             value_as(&mut flake.o);
+            if restates {
+                out.unjudged.push(flake.clone());
+            }
             out.assertions.push(flake);
         }
         Ok(out)
@@ -354,6 +366,20 @@ fn lang_of(f: &Flake) -> Option<String> {
 
 fn is_member(f: &Flake) -> bool {
     f.m.as_ref().is_some_and(|m| m.i.is_some())
+}
+
+/// A fact as the triples of a list name it, its graph included.
+type FlakeKey = (Option<Sid>, Sid, Sid, FlakeValue, Sid, Option<String>);
+
+fn key_of(f: &Flake) -> FlakeKey {
+    (
+        f.g.clone(),
+        f.s.clone(),
+        f.p.clone(),
+        f.o.clone(),
+        f.dt.clone(),
+        lang_of(f),
+    )
 }
 
 fn member_key(f: &Flake) -> (FlakeValue, Sid, Option<FlakeMeta>) {

@@ -39,7 +39,7 @@ use fluree_db_core::{
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// A list, named by the graph, subject and predicate that own it.
@@ -116,7 +116,7 @@ impl ListView {
 
     /// Whether a triple on predicate `p` can be a list triple: an owner edge
     /// or a cell's `rdf:first` / `rdf:rest`.
-    fn matches_predicate(&self, p: &Sid) -> bool {
+    pub(crate) fn matches_predicate(&self, p: &Sid) -> bool {
         self.may_hold_lists(p) || is_rdf_first(p) || is_rdf_rest(p)
     }
 
@@ -254,19 +254,29 @@ fn rewrite_pattern(
             }
         }
         Pattern::PropertyPath(mut pp) => {
-            let steps = pp
-                .sequence_steps
-                .iter()
-                .flat_map(|step| step.predicates.iter());
-            if pp
-                .predicates
-                .iter()
-                .chain(steps)
-                .any(|p| view.matches_predicate(p))
-            {
+            // A zero-length match pairs every node of the graph with itself,
+            // the cells and `rdf:nil` included, whatever the path's predicates.
+            let zero_length = matches!(
+                pp.modifier,
+                crate::ir::PathModifier::ZeroOrMore | crate::ir::PathModifier::ZeroOrOne
+            );
+            if zero_length || walks_lists(&pp, view) {
                 pp.list_view = Some(Arc::clone(view));
             }
             Pattern::PropertyPath(pp)
+        }
+        // An `EXISTS` inside an expression reads the same graph.
+        Pattern::Filter(mut expr) => {
+            rewrite_expression(&mut expr, view, encode);
+            Pattern::Filter(expr)
+        }
+        Pattern::Bind { var, mut expr } => {
+            rewrite_expression(&mut expr, view, encode);
+            Pattern::Bind { var, expr }
+        }
+        Pattern::Unwind { var, mut list } => {
+            rewrite_expression(&mut list, view, encode);
+            Pattern::Unwind { var, list }
         }
         // A remote endpoint answers its own patterns.
         Pattern::Service(_) => pattern,
@@ -274,10 +284,37 @@ fn rewrite_pattern(
     }
 }
 
+/// Whether `pp` can step along a list triple in `view`.
+pub(crate) fn walks_lists(pp: &crate::ir::PropertyPathPattern, view: &ListView) -> bool {
+    let steps = pp
+        .sequence_steps
+        .iter()
+        .flat_map(|step| step.predicates.iter());
+    pp.predicates
+        .iter()
+        .chain(steps)
+        .any(|p| view.matches_predicate(p))
+}
+
+fn rewrite_expression(
+    expr: &mut crate::ir::Expression,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    expr.for_each_embedded_patterns_mut(&mut |patterns| {
+        *patterns = rewrite_patterns(std::mem::take(patterns), view, encode);
+    });
+}
+
 /// Whether `patterns` hold a [`ListViewPattern`] anywhere.
 pub fn has_list_view(patterns: &[Pattern]) -> bool {
     patterns.iter().any(|p| match p {
         Pattern::ListView(_) => true,
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            let mut found = false;
+            expr.for_each_embedded_patterns(&mut |patterns| found |= has_list_view(patterns));
+            found
+        }
         Pattern::Optional(xs)
         | Pattern::Minus(xs)
         | Pattern::Exists(xs)
@@ -306,7 +343,9 @@ pub struct ListViewOperator {
     mode: TemporalMode,
     schema: Arc<[VarId]>,
     state: OperatorState,
-    pending: VecDeque<Batch>,
+    /// The input batch being joined, and the join of its stored triples,
+    /// drained before its list triples are computed.
+    current: Option<(Batch, NestedLoopJoinOperator)>,
 }
 
 impl ListViewOperator {
@@ -327,13 +366,17 @@ impl ListViewOperator {
             mode,
             schema: schema.into(),
             state: OperatorState::Created,
-            pending: VecDeque::new(),
+            current: None,
         }
     }
 
     /// `input` joined with the pattern's stored triples that are not list
-    /// members.
-    async fn stored(&self, ctx: &ExecutionContext<'_>, input: &Batch) -> Result<Vec<Batch>> {
+    /// members, opened.
+    async fn stored(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        input: &Batch,
+    ) -> Result<NestedLoopJoinOperator> {
         let seed = BatchSeedOperator::from_batch(input.clone());
         let mut join = NestedLoopJoinOperator::new(
             Box::new(seed),
@@ -348,14 +391,7 @@ impl ListViewOperator {
             join = join.hiding_list_members();
         }
         join.open(ctx).await?;
-        let mut out = Vec::new();
-        while let Some(batch) = join.next_batch(ctx).await? {
-            if !batch.is_empty() {
-                out.push(batch);
-            }
-        }
-        join.close();
-        Ok(out)
+        Ok(join)
     }
 
     /// `input` joined with the list triples that match the pattern.
@@ -379,11 +415,10 @@ impl ListViewOperator {
                 cache.insert(key.clone(), found);
             }
             let width = input.schema().len();
-            for triple in &cache[&key] {
+            for triple in cache[&key].iter().filter(|triple| repeats_agree(t, triple)) {
                 let mut values: Vec<Binding> = (0..width)
                     .map(|c| input.get_by_col(row, c).clone())
                     .collect();
-                let mut ok = true;
                 for (var, value) in [
                     (t.s.as_var(), Binding::sid(triple.s.clone())),
                     (t.p.as_var(), Binding::sid(triple.p.clone())),
@@ -403,15 +438,9 @@ impl ListViewOperator {
                         if values[col] == Binding::Unbound {
                             values[col] = value;
                         }
-                    } else if col < values.len() {
-                        // A variable this triple repeats (`?x ?p ?x`).
-                        ok &= values[col] == value;
-                    } else {
+                    } else if col == values.len() {
                         values.push(value);
                     }
-                }
-                if !ok {
-                    continue;
                 }
                 for (col, value) in columns.iter_mut().zip(values) {
                     col.push(value);
@@ -515,6 +544,17 @@ impl ListViewOperator {
         out.retain(|t| o.matches(&t.o));
         Ok(out)
     }
+}
+
+/// Whether `triple` gives each variable `t` repeats (`?x ?p ?x`) one term.
+/// Checked on the triple, not the input, whose binding for the variable can
+/// be encoded where the triple's is not.
+fn repeats_agree(t: &TriplePattern, triple: &ListTriple) -> bool {
+    let (s, p, o) = (t.s.as_var(), t.p.as_var(), t.o.as_var());
+    let o_is = |sid: &Sid| matches!(&triple.o, Binding::Sid { sid: o, .. } if o == sid);
+    (s.is_none() || s != p || triple.s == triple.p)
+        && (s.is_none() || s != o || o_is(&triple.s))
+        && (p.is_none() || p != o || o_is(&triple.p))
 }
 
 /// A list triple: an owner edge or a cell's `rdf:first` / `rdf:rest`.
@@ -893,14 +933,25 @@ impl Operator for ListViewOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
-        self.pending.clear();
+        self.current = None;
         Ok(())
     }
 
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         loop {
-            if let Some(batch) = self.pending.pop_front() {
-                return Ok(Some(batch));
+            if let Some((_, join)) = self.current.as_mut() {
+                match join.next_batch(ctx).await? {
+                    Some(batch) if batch.is_empty() => continue,
+                    Some(batch) => return Ok(Some(batch)),
+                    None => {
+                        let (input, mut join) = self.current.take().expect("current");
+                        join.close();
+                        if let Some(lists) = self.lists(ctx, &input).await? {
+                            return Ok(Some(lists));
+                        }
+                        continue;
+                    }
+                }
             }
             if self.state != OperatorState::Open {
                 return Ok(None);
@@ -913,17 +964,16 @@ impl Operator for ListViewOperator {
                 continue;
             }
             ctx.check_cancelled()?;
-            let stored = self.stored(ctx, &input).await?;
-            self.pending.extend(stored);
-            if let Some(lists) = self.lists(ctx, &input).await? {
-                self.pending.push_back(lists);
-            }
+            let join = self.stored(ctx, &input).await?;
+            self.current = Some((input, join));
         }
     }
 
     fn close(&mut self) {
+        if let Some((_, mut join)) = self.current.take() {
+            join.close();
+        }
         self.child.close();
-        self.pending.clear();
         self.state = OperatorState::Closed;
     }
 }

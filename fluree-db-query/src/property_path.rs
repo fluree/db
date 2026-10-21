@@ -1225,7 +1225,12 @@ impl PropertyPathOperator {
     /// lane reads a single graph's index).
     fn id_lane(&self, ctx: &ExecutionContext<'_>) -> Result<Option<PathIdLane>> {
         // Raw ids name no list cell, which nothing stores.
-        if self.pattern.is_composite() || self.pattern.list_view.is_some() {
+        let walks_lists = self
+            .pattern
+            .list_view
+            .as_deref()
+            .is_some_and(|view| crate::list_view::walks_lists(&self.pattern, view));
+        if self.pattern.is_composite() || walks_lists {
             return Ok(None);
         }
         let Some(store) = ctx.binary_store.as_ref() else {

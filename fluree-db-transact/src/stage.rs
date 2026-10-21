@@ -935,6 +935,9 @@ pub async fn stage_with_graph_delta(
         let mut lists = generator.take_lists();
         drop(generator);
 
+        // What storing edited lists again stages without changing them as
+        // RDF, which no modify policy judges (see `crate::list_edits`).
+        let mut unjudged: HashSet<(Option<Sid>, bool, Flake)> = HashSet::new();
         if let Some(edits) = list_edits.take() {
             let routing = &reverse_graph;
             let stored = edits
@@ -943,6 +946,7 @@ pub async fn stage_with_graph_delta(
             acc.push_retractions(stored.retractions);
             acc.push_assertions(stored.assertions);
             lists.extend(stored.lists);
+            unjudged.extend(stored.unjudged.into_iter().map(|f| (f.g.clone(), f.op, f)));
         }
 
         // Graph-sync wave: retract every current fact of the target graph
@@ -1158,10 +1162,17 @@ pub async fn stage_with_graph_delta(
                     hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
                         .await?;
                 let judged: std::borrow::Cow<'_, [Flake]> =
-                    if stream_stats.unmatched_intents.is_empty() && hidden.is_empty() {
+                    if stream_stats.unmatched_intents.is_empty()
+                        && hidden.is_empty()
+                        && unjudged.is_empty()
+                    {
                         std::borrow::Cow::Borrowed(&flakes)
                     } else {
-                        let mut all = flakes.clone();
+                        let mut all: Vec<Flake> = flakes
+                            .iter()
+                            .filter(|f| !unjudged.contains(&(f.g.clone(), f.op, (*f).clone())))
+                            .cloned()
+                            .collect();
                         all.extend(stream_stats.unmatched_intents.iter().cloned());
                         all.extend(hidden);
                         std::borrow::Cow::Owned(all)
@@ -1616,6 +1627,9 @@ async fn stage_graph_mgmt(
 
         let new_t = ledger.t() + 1;
         let mut flakes: Vec<Flake> = Vec::new();
+        // What a transfer stages without changing as RDF, which no modify
+        // policy judges: a source's lists stored again as chains.
+        let mut unjudged: HashSet<(Option<Sid>, bool, Flake)> = HashSet::new();
         // Ledger g_id -> graph Sid, for every named graph our flakes touch;
         // becomes the reverse routing map for novelty application / policy.
         let mut graph_sids: HashMap<GraphId, Sid> = HashMap::new();
@@ -1969,33 +1983,55 @@ async fn stage_graph_mgmt(
                         }
                     }
 
-                    // ADD merges the source into the destination, so a source list
-                    // on a property where the destination holds one is a second
-                    // list there (see `crate::lists`). COPY/MOVE make the
-                    // destination the source, whose lists copy as they are.
-                    if !*clear_dest && rehomed.iter().any(|f| f.m.as_ref().is_some_and(|m| m.i.is_some())) {
+                    // After ADD or COPY each list is in both graphs, the same
+                    // RDF list: the same cells. A compact list's cells are its
+                    // graph's own, so each is stored in both as one chain of
+                    // the same blank nodes, and the source's members as that
+                    // chain too. MOVE's source goes, and its lists move as
+                    // they are.
+                    let is_member = |f: &Flake| f.m.as_ref().is_some_and(|m| m.i.is_some());
+                    if !*clear_src && rehomed.iter().any(is_member) {
+                        if let (Some(src_g), Some(sid)) = (src_g_id, &src_sid) {
+                            graph_sids.entry(src_g).or_insert_with(|| sid.clone());
+                        }
                         let txn_id = generate_txn_id();
-                        let (members, mut kept): (Vec<Flake>, Vec<Flake>) = rehomed
-                            .into_iter()
-                            .partition(|f| f.m.as_ref().is_some_and(|m| m.i.is_some()));
-                        let mut owners: Vec<crate::lists::Owner> = Vec::new();
-                        let mut by_owner: HashMap<crate::lists::Owner, Vec<Flake>> = HashMap::new();
+                        let (members, mut kept): (Vec<Flake>, Vec<Flake>) =
+                            rehomed.into_iter().partition(|f| is_member(f));
+                        let mut owners: Vec<(Sid, Sid)> = Vec::new();
+                        let mut by_owner: HashMap<(Sid, Sid), Vec<Flake>> = HashMap::new();
                         for f in members {
-                            let owner = (f.g.clone(), f.s.clone(), f.p.clone());
+                            let owner = (f.s.clone(), f.p.clone());
                             if !by_owner.contains_key(&owner) {
                                 owners.push(owner.clone());
                             }
                             by_owner.entry(owner).or_default().push(f);
                         }
-                        let lists = owners
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(n, owner)| {
-                                let members = by_owner.remove(&owner)?;
-                                Some(crate::lists::PendingList::new(members, format!("{txn_id}--l{n}-")))
-                            })
-                            .collect();
-                        kept.extend(crate::lists::store_lists(&ledger, lists, &txn_id, |_| false).await?);
+                        for (n, owner) in owners.into_iter().enumerate() {
+                            let members = by_owner.remove(&owner).unwrap_or_default();
+                            let chain = crate::lists::PendingList::new(
+                                members,
+                                format!("{txn_id}--g{n}-"),
+                            )
+                            .into_chain();
+                            for f in &chain {
+                                let in_source = Flake {
+                                    g: src_sid.clone(),
+                                    ..f.clone()
+                                };
+                                unjudged.insert((in_source.g.clone(), true, in_source.clone()));
+                                flakes.push(in_source);
+                            }
+                            kept.extend(chain);
+                        }
+                        for f in src_flakes.iter().filter(|f| is_member(f)) {
+                            let retraction = Flake {
+                                op: false,
+                                t: new_t,
+                                ..(*f).clone()
+                            };
+                            unjudged.insert((retraction.g.clone(), false, retraction.clone()));
+                            flakes.push(retraction);
+                        }
                         rehomed = kept;
                     }
 
@@ -2069,13 +2105,18 @@ async fn stage_graph_mgmt(
                 let hidden =
                     hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
                         .await?;
-                let judged: std::borrow::Cow<'_, [Flake]> = if hidden.is_empty() {
-                    std::borrow::Cow::Borrowed(&flakes)
-                } else {
-                    let mut all = flakes.clone();
-                    all.extend(hidden);
-                    std::borrow::Cow::Owned(all)
-                };
+                let judged: std::borrow::Cow<'_, [Flake]> =
+                    if hidden.is_empty() && unjudged.is_empty() {
+                        std::borrow::Cow::Borrowed(&flakes)
+                    } else {
+                        let mut all: Vec<Flake> = flakes
+                            .iter()
+                            .filter(|f| !unjudged.contains(&(f.g.clone(), f.op, (*f).clone())))
+                            .cloned()
+                            .collect();
+                        all.extend(hidden);
+                        std::borrow::Cow::Owned(all)
+                    };
                 enforce_modify_policies(&judged, policy, &ledger, options.tracker, &reverse_graph)
                     .await?;
             }
