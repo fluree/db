@@ -331,6 +331,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Ledger management (read-only)
         .route("/ledgers", get(ledger::list_ledgers))
         .route("/info/*ledger", get(ledger::info_ledger_tail))
+        .route("/retention/*ledger", get(ledger::retention_status_tail))
         .route("/exists/*ledger", get(ledger::exists_ledger_tail))
         .route("/branch/*ledger", get(ledger::list_branches))
         .route("/merge-preview/*ledger", get(ledger::merge_preview))

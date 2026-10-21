@@ -3011,6 +3011,43 @@ curl "http://localhost:8090/v1/fluree/info/mydb:main" \
   -H "Authorization: Bearer eyJ..."
 ```
 
+### GET /retention/{ledger-id}
+
+A branch's [TTL](../transactions/ttl.md) retention status: whether it is registered for expiration processing, the commit its retention input is honored from, how far the worker has read its commits, scheduled and expired counts, the next due time, and problems that block or degrade processing.
+
+**URL:**
+```
+GET /retention/{ledger-id}
+```
+
+**Response:**
+
+```json
+{
+  "ledgerId": "mydb:main",
+  "active": true,
+  "registration": {
+    "activeSinceT": 12,
+    "watermarkT": 40,
+    "schedule": "bafy...",
+    "nextDueMs": 1792584000000,
+    "pending": 18,
+    "lastPassMs": 1792580412000,
+    "expiredTotal": 351,
+    "retries": 2
+  },
+  "maintenanceRunning": true,
+  "overdue": 0
+}
+```
+
+`active` is `false` (and `registration` absent) for a ledger that never wrote a lifetime or configured one. `maintenanceRunning` and `overdue` describe the node that answers: in a cluster, ask the leader.
+
+**Status Codes:**
+- `200 OK` - Ledger found
+- `401 Unauthorized` - Authentication required
+- `404 Not Found` - Ledger not found
+
 ### GET /exists/{ledger-id}
 
 Check if a ledger exists in the nameservice.

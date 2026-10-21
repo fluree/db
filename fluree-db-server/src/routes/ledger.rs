@@ -1053,6 +1053,37 @@ pub async fn info_ledger_tail(
     info(State(state), headers, bearer, axum::extract::Query(query)).await
 }
 
+/// A branch's retention status: whether it is registered for TTL
+/// processing, its activation boundary and watermark, scheduled and expired
+/// counts, the next due time, problems that block or degrade processing, and
+/// whether this node runs the retention worker.
+///
+/// GET /fluree/retention/<ledger...>
+pub async fn retention_status_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    bearer: MaybeDataBearer,
+) -> Result<Response> {
+    let data_auth = state.config.data_auth();
+    if data_auth.mode == crate::config::DataAuthMode::Required && bearer.0.is_none() {
+        return Err(ServerError::unauthorized("Bearer token required"));
+    }
+    if let Some(p) = bearer.0.as_ref() {
+        if !p.can_read(&crate::error::scope_id(&ledger)?) {
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+    if state.fluree.nameservice().lookup(&ledger).await?.is_none() {
+        return Err(ServerError::Api(ApiError::NotFound(ledger)));
+    }
+    let status = state
+        .fluree
+        .retention_status(&ledger)
+        .await
+        .map_err(ServerError::Api)?;
+    Ok(Json(status).into_response())
+}
+
 /// Simplified ledger info for proxy storage mode (nameservice lookup only).
 /// Falls back to graph source lookup if ledger is not found.
 async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) -> Result<Response> {

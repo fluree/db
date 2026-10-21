@@ -194,6 +194,20 @@ These predicates live in the ledger's `#config` named graph and declare which pr
 | `f:FullTextProperty` | `https://ns.flur.ee/db#FullTextProperty` | Class of each `f:property` entry |
 | `f:target` | `https://ns.flur.ee/db#target` | IRI of the property being indexed (on `f:FullTextProperty`) |
 
+### Retention (TTL) predicates
+
+`f:ttlSeconds` and `f:expiresAt` are TTL instructions on a value's annotation or a transaction's txn-meta; `f:retentionDefaults` and its entries live in the `#config` graph. See [Time to live (TTL)](../transactions/ttl.md).
+
+| Term | IRI | Description |
+|------|-----|-------------|
+| `f:ttlSeconds` | `https://ns.flur.ee/db#ttlSeconds` | Lifetime in whole seconds: on an annotation, in txn-meta, or on an `f:RetentionProperty` entry |
+| `f:expiresAt` | `https://ns.flur.ee/db#expiresAt` | Absolute deadline (`xsd:dateTime` with an offset): on an annotation or in txn-meta |
+| `f:retentionDefaults` | `https://ns.flur.ee/db#retentionDefaults` | Setting group on `f:LedgerConfig` / `f:GraphConfig` |
+| `f:RetentionDefaults` | `https://ns.flur.ee/db#RetentionDefaults` | Class of the setting-group node |
+| `f:RetentionProperty` | `https://ns.flur.ee/db#RetentionProperty` | Class of each `f:property` entry |
+| `f:noHistory` | `https://ns.flur.ee/db#noHistory` | Reserved on an entry; not supported yet |
+| `f:retentionControl` | `https://ns.flur.ee/db#retentionControl` | System txn-meta marker on a commit that carries retention input |
+
 ---
 
 ## Search query vocabulary
@@ -353,6 +367,7 @@ These predicates define ledger-level configuration stored in the config graph. S
 | `f:reasoningDefaults` | `https://ns.flur.ee/db#reasoningDefaults` | OWL/RDFS reasoning defaults |
 | `f:datalogDefaults` | `https://ns.flur.ee/db#datalogDefaults` | Datalog rule defaults |
 | `f:transactDefaults` | `https://ns.flur.ee/db#transactDefaults` | Transaction constraint defaults |
+| `f:retentionDefaults` | `https://ns.flur.ee/db#retentionDefaults` | Value lifetime (TTL) defaults |
 | `f:queryDefaults` | `https://ns.flur.ee/db#queryDefaults` | Query defaults (ledger-scoped: `f:LedgerConfig` only) |
 
 ### Policy fields

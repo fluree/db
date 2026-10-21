@@ -479,6 +479,11 @@ error listing the supported set.
   (`SET n = {name: "Alice"}`), or add a label (`SET n:Admin`). Map replace
   removes prior scalar node properties while preserving labels, relationships,
   and relationship sidecar metadata.
+- **Value lifetimes** — wrap a property value in `fluree.ttl(value, seconds)`
+  or `fluree.expiresAt(value, datetime("..."))` in `CREATE`, `SET` or
+  `MERGE ... ON CREATE SET` to have it retracted when its lifetime ends
+  (`SET d.status = fluree.ttl("online", $seconds)`). The stored value is the
+  plain value; see [Time to live](../transactions/ttl.md#cypher-flureettl-and-flureeexpiresat).
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
