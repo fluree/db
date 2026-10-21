@@ -11,8 +11,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 const EX: &str = "http://example.org/";
-const TXN: &str = "it/jsonld-scope-txn:main";
-const IMPORT: &str = "it/jsonld-scope-import:main";
+/// One ledger id for both lanes (each has its own storage root), so a
+/// document that names the ledger's own address means the same on both.
+const TXN: &str = "it/jsonld-scope:main";
+const IMPORT: &str = TXN;
 
 fn fluree_at(dir: &Path) -> Fluree {
     FlureeBuilder::file(dir.to_string_lossy().to_string())
@@ -247,6 +249,28 @@ fn graph_scoped_forms() -> Vec<(&'static str, Value, Vec<&'static str>)> {
             vec!["g: ex:a ex:q v"],
         ),
         (
+            "a selector naming this ledger's own address",
+            json!({"@context": c, "@id": "ex:a", "@graph": format!("urn:fluree:{TXN}"), "ex:q": "v"}),
+            vec!["default: ex:a ex:q v"],
+        ),
+        (
+            "a selector naming this ledger's bare address",
+            json!({"@context": c, "@id": "ex:a", "@graph": TXN, "ex:q": "v"}),
+            vec!["default: ex:a ex:q v"],
+        ),
+        (
+            "a selector naming one of this ledger's graphs by its address",
+            json!({"@context": c, "@id": "ex:a", "@graph": format!("urn:fluree:{TXN}#{EX}g"),
+                "ex:q": "v"}),
+            vec!["g: ex:a ex:q v"],
+        ),
+        (
+            "a named graph named by this ledger's own address",
+            json!({"@context": c, "@id": format!("urn:fluree:{TXN}"),
+                "@graph": [{"@id": "ex:a", "ex:q": "v"}]}),
+            vec!["default: ex:a ex:q v"],
+        ),
+        (
             "a selector naming the default graph",
             json!({"@context": c, "@id": "ex:a", "@graph": "default", "ex:q": "v"}),
             vec!["default: ex:a ex:q v"],
@@ -406,9 +430,6 @@ async fn bulk_import_across_files_shares_each_named_graph() {
 enum Insert {
     Refuses,
     Writes,
-    /// The document names the import ledger's own graph, which is just
-    /// another graph to the transaction's ledger.
-    NotComparable,
 }
 
 /// What a bulk import cannot place, it refuses rather than skips, and
@@ -436,7 +457,7 @@ async fn bulk_import_refuses_what_it_cannot_place() {
             "the txn-meta graph by IRI",
             node(json!(format!("urn:fluree:{IMPORT}#txn-meta"))),
             "reserved",
-            Insert::NotComparable,
+            Insert::Refuses,
         ),
         ("a variable", node(json!("?g")), "variable", Insert::Refuses),
         (
