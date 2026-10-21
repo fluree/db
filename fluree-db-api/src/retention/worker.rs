@@ -167,7 +167,7 @@ struct BorrowedWriter<'a>(&'a Fluree);
 #[async_trait::async_trait]
 impl RetentionWriter for BorrowedWriter<'_> {
     async fn submit(&self, ledger_id: &str, batch: RetentionBatch) -> Result<SubmitOutcome> {
-        self.0.commit_retention_batch(ledger_id, batch).await
+        super::writer::outcome_of(self.0.commit_retention_batch(ledger_id, batch).await)
     }
 }
 

@@ -30,6 +30,7 @@ pub use fluree_raft_core::http;
 pub mod local;
 #[cfg(feature = "raft")]
 pub mod raft;
+pub mod retention;
 
 pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
 pub use local::LocalCommitter;
@@ -225,6 +226,11 @@ pub enum TransactionBody {
         graph_iri: Option<String>,
         payload: GraphBody,
     },
+    /// A retention worker's expiration batch: exact retractions verified
+    /// against one head (`fluree_db_api::retention::RetentionBatch`, encoded
+    /// as hex), committed only while that head is current. Appended last, as
+    /// above.
+    Retention { batch: String },
 }
 
 /// The triples of a [`TransactionBody::GraphInsert`].
@@ -261,6 +267,7 @@ impl TransactionBody {
             Self::JsonLdUpdate(_) => "update",
             Self::JsonLdGraphSync { .. } | Self::RdfGraphSync { .. } => "graph-sync",
             Self::GraphInsert { .. } => "graph-insert",
+            Self::Retention { .. } => "retention",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -323,6 +330,10 @@ impl TransactionBody {
                         hasher.update(text.as_bytes());
                     }
                 }
+            }
+            Self::Retention { batch } => {
+                hasher.update(b"retention");
+                hasher.update(batch.as_bytes());
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -401,6 +412,8 @@ pub enum BodyKind {
     RdfGraphSync,
     /// Graph insert. Appended last (see `JsonLdGraphSync`).
     GraphInsert,
+    /// Retention expiration batch. Appended last (see `JsonLdGraphSync`).
+    Retention,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -412,6 +425,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
             TransactionBody::RdfGraphSync { .. } => BodyKind::RdfGraphSync,
             TransactionBody::GraphInsert { .. } => BodyKind::GraphInsert,
+            TransactionBody::Retention { .. } => BodyKind::Retention,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,

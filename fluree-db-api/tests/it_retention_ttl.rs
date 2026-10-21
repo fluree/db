@@ -564,3 +564,340 @@ async fn retention_config_is_validated() {
         .await
         .expect("a valid config");
 }
+
+async fn cypher(fluree: &Fluree, ledger_id: &str, statement: &str) -> fluree_db_api::Result<()> {
+    let mut txn = fluree
+        .begin_cypher_transaction(
+            ledger_id,
+            fluree_db_api::GovernanceOptions::default(),
+            fluree_db_api::TrackingOptions::default(),
+        )
+        .await?;
+    fluree
+        .cypher_transaction_write(&mut txn, statement, None)
+        .await?;
+    fluree.commit_cypher_transaction(txn).await.map(|_| ())
+}
+
+async fn cypher_rows(fluree: &Fluree, ledger_id: &str, query: &str) -> usize {
+    let db = fluree.db(ledger_id).await.unwrap();
+    let result = fluree.query_cypher(&db, query).await.unwrap();
+    result.to_cypher_typed_table(&db).await.unwrap().1.len()
+}
+
+#[tokio::test]
+async fn cypher_wrappers_schedule_scalar_properties() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-cypher").await;
+    cypher(
+        &fluree,
+        &id,
+        r#"CREATE (:Device {id: "d1", status: fluree.ttl("online", 60), model: "x"})"#,
+    )
+    .await
+    .expect("create with fluree.ttl");
+    cypher(
+        &fluree,
+        &id,
+        r#"MATCH (d:Device {id: "d1"}) SET d.mode = fluree.expiresAt("eco", datetime("2031-01-01T00:00:00Z"))"#,
+    )
+    .await
+    .expect("set with fluree.expiresAt");
+    // A wrapper is a write value only.
+    let db = fluree.db(&id).await.unwrap();
+    assert!(fluree
+        .query_cypher(&db, "MATCH (d:Device) RETURN fluree.ttl(d.status, 5)")
+        .await
+        .is_err());
+    assert!(cypher(
+        &fluree,
+        &id,
+        r#"MATCH (d:Device) SET d.status = fluree.ttl("on", "P1M")"#
+    )
+    .await
+    .is_err());
+    assert!(cypher(
+        &fluree,
+        &id,
+        r#"MATCH (d:Device) SET d.mode = fluree.expiresAt("x", "2031-01-01T00:00:00")"#
+    )
+    .await
+    .is_err());
+
+    let start = now_ms();
+    let report = fluree.run_retention_at(&id, start).await.expect("pass");
+    assert_eq!(report.pending, 2, "{report:?}");
+    let report = fluree
+        .run_retention_at(&id, start + 61_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &id,
+            "MATCH (d:Device) WHERE d.status IS NOT NULL RETURN d"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &id,
+            "MATCH (d:Device) WHERE d.model = 'x' RETURN d"
+        )
+        .await,
+        1
+    );
+    let report = fluree
+        .run_retention_at(&id, 1_924_992_000_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &id,
+            "MATCH (d:Device) WHERE d.mode IS NOT NULL RETURN d"
+        )
+        .await,
+        0
+    );
+}
+
+/// Commit a JSON-LD insert without the API's post-staging checks: the way
+/// annotations written before TTL support reach a ledger. No
+/// `f:retentionControl` marker.
+async fn commit_unmarked(fluree: &Fluree, ledger_id: &str, doc: &JsonValue) {
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::parse_transaction(
+        doc,
+        fluree_db_transact::TxnType::Insert,
+        fluree_db_transact::TxnOpts::default(),
+        &mut ns,
+        ledger_id,
+    )
+    .expect("parse");
+    let (view, ns) =
+        fluree_db_transact::stage(ledger, txn, ns, fluree_db_transact::StageOptions::new())
+            .await
+            .expect("stage");
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree.default_index_config(),
+            fluree_db_api::CommitOpts::default(),
+        )
+        .await
+        .expect("commit");
+}
+
+#[tokio::test]
+async fn annotations_written_before_the_activation_boundary_are_not_instructions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-boundary").await;
+    commit_unmarked(
+        &fluree,
+        &id,
+        &json!({
+            "@context": ctx(),
+            "@id": "ex:s",
+            "ex:v": {"@value": "old", "@annotation": {"f:ttlSeconds": 1}}
+        }),
+    )
+    .await;
+    let report = fluree
+        .run_retention_at(&id, now_ms() + HOUR_MS)
+        .await
+        .expect("pass");
+    assert!(
+        report.inactive,
+        "an unmarked annotation activated: {report:?}"
+    );
+
+    // A marked write activates the ledger from its own commit: the earlier
+    // annotation still is not an instruction.
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:w": {"@value": "new", "@ttl": 1}}),
+    )
+    .await;
+    let report = fluree
+        .run_retention_at(&id, now_ms() + HOUR_MS)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:s", "ex:v").await,
+        vec![json!("old")]
+    );
+    assert!(objects(&fluree, &id, &id, "ex:s", "ex:w").await.is_empty());
+}
+
+#[tokio::test]
+async fn ttl_on_a_value_shared_by_several_annotations_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-shared").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA { ex:a ex:knows ex:b {| ex:since 2020 |} .
+                           ex:a ex:knows ex:b {| ex:since 2021 |} . }",
+        )
+        .commit()
+        .await
+        .expect("two relationships on one triple");
+    let err = fluree
+        .graph(&id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+             INSERT DATA { ex:a ex:knows ex:b {| f:ttlSeconds 60 |} . }",
+        )
+        .commit()
+        .await
+        .expect_err("TTL on a shared triple");
+    assert!(err.to_string().contains("share"), "{err}");
+
+    // One annotation plus a TTL on the same reifier is an unambiguous value.
+    fluree
+        .graph(&id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+             INSERT DATA { ex:a ex:likes ex:b {| ex:since 2020 ; f:ttlSeconds 60 |} . }",
+        )
+        .commit()
+        .await
+        .expect("TTL with provenance on one annotation");
+}
+
+#[tokio::test]
+async fn named_graph_values_expire_in_their_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-named-graph").await;
+    insert(
+        &fluree,
+        &id,
+        json!({
+            "@context": ctx(),
+            "@graph": [
+                {"@id": "ex:s", "@graph": "ex:g1", "ex:v": {"@value": "in-g1", "@ttl": 60}},
+                {"@id": "ex:s", "ex:v": "in-default"}
+            ]
+        }),
+    )
+    .await;
+    let start = now_ms();
+    let report = fluree
+        .run_retention_at(&id, start + 61_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:s", "ex:v").await,
+        vec![json!("in-default")]
+    );
+    let query = json!({
+        "@context": ctx(),
+        "from": id,
+        "select": "?o",
+        "where": {"@graph": "ex:g1", "@id": "ex:s", "ex:v": "?o"}
+    });
+    let in_g1 = fluree.query_connection(&query).await.expect("query");
+    let ledger = fluree.ledger(&id).await.unwrap();
+    assert_eq!(
+        in_g1.to_jsonld(&ledger.snapshot).unwrap(),
+        json!([]),
+        "the named-graph value expired"
+    );
+}
+
+#[tokio::test]
+async fn the_schedule_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().to_string();
+    let start = now_ms();
+    let id = {
+        let fluree = FlureeBuilder::file(path.clone())
+            .without_indexing()
+            .build()
+            .expect("fluree");
+        let id = ledger(&fluree, "it/ttl-restart").await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 60}}),
+        )
+        .await;
+        let report = fluree.run_retention_at(&id, start).await.expect("pass");
+        assert_eq!(report.pending, 1);
+        id
+    };
+    let fluree = FlureeBuilder::file(path)
+        .without_indexing()
+        .build()
+        .expect("reopen");
+    let registration = fluree
+        .retention_status(&id)
+        .await
+        .expect("status")
+        .registration
+        .expect("still registered");
+    assert!(registration.schedule.is_some(), "{registration:?}");
+    assert_eq!(registration.pending, 1);
+    let report = fluree
+        .run_retention_at(&id, start + 61_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert_eq!(report.discovered_commits, 0, "rebuilt instead of loaded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_background_worker_expires_on_its_own() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .build()
+            .expect("fluree"),
+    );
+    assert!(fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        })
+    ));
+    let id = ledger(&fluree, "it/ttl-worker").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 1}, "ex:k": "kept"}),
+    )
+    .await;
+    let mut gone = false;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if objects(&fluree, &id, &id, "ex:s", "ex:v").await.is_empty() {
+            gone = true;
+            break;
+        }
+    }
+    let status = fluree.retention_status(&id).await.expect("status");
+    assert!(gone, "not expired by the worker: {status:?}");
+    assert!(status.active && status.maintenance_running, "{status:?}");
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:s", "ex:k").await,
+        vec![json!("kept")]
+    );
+}

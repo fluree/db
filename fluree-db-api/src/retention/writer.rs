@@ -20,6 +20,13 @@ use crate::{ApiError, Fluree, Result};
 /// The `f:identity` recorded on retention commits.
 pub const RETENTION_IDENTITY: &str = "urn:fluree:system:retention";
 
+/// How a consensus path reports a batch whose head moved before it staged.
+pub const HEAD_MOVED: &str = "retention batch: head moved";
+
+/// How a consensus path reports a batch it did not stage because the
+/// ledger's novelty is near its limit.
+pub const DEFERRED: &str = "retention batch: deferred";
+
 /// Retractions to commit against `expected_t`.
 #[derive(Clone, Debug)]
 pub struct RetentionBatch {
@@ -92,7 +99,18 @@ impl RetentionWriter for DirectRetentionWriter {
         let Some(fluree) = self.fluree.upgrade() else {
             return Ok(SubmitOutcome::Deferred);
         };
-        fluree.commit_retention_batch(ledger_id, batch).await
+        outcome_of(fluree.commit_retention_batch(ledger_id, batch).await)
+    }
+}
+
+/// A batch commit's result as a [`SubmitOutcome`]: a moved head and novelty
+/// backpressure are outcomes, not failures.
+pub fn outcome_of(result: Result<crate::CommitReceipt>) -> Result<SubmitOutcome> {
+    match result {
+        Ok(receipt) => Ok(SubmitOutcome::Committed { t: receipt.t }),
+        Err(e) if e.is_commit_conflict() => Ok(SubmitOutcome::HeadMoved),
+        Err(ApiError::Transact(TransactError::NoveltyAtMax)) => Ok(SubmitOutcome::Deferred),
+        Err(e) => Err(e),
     }
 }
 
@@ -102,13 +120,44 @@ const NOVELTY_HEADROOM: f64 = 0.5;
 
 impl Fluree {
     /// Commit a retention batch if the branch head is still the one it was
-    /// verified against. The ledger write lock is held from that check
-    /// through the commit, so no write can slip in between.
+    /// verified against. A moved head is a commit conflict and a ledger near
+    /// its novelty limit is `NoveltyAtMax`; see [`outcome_of`].
     pub async fn commit_retention_batch(
         &self,
         ledger_id: &str,
         batch: RetentionBatch,
-    ) -> Result<SubmitOutcome> {
+    ) -> Result<crate::CommitReceipt> {
+        let (write_guard, staged) = self.build_retention_commit(ledger_id, batch).await?;
+        match write_guard {
+            Some(guard) => self.apply_staged_detached(guard, staged).await,
+            None => {
+                let id = LedgerId::parse(ledger_id)?;
+                let record = self
+                    .nameservice()
+                    .lookup(&id)
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+                let content_store = self.content_store(&record.storage_namespace());
+                staged
+                    .apply(&content_store, self.publisher()?)
+                    .await
+                    .map(|(receipt, _)| receipt)
+                    .map_err(ApiError::from)
+            }
+        }
+    }
+
+    /// Stage a retention batch as a commit without publishing it, holding
+    /// the ledger write lock from the head check on: a consensus worker
+    /// persists and publishes it through its own path.
+    pub async fn build_retention_commit(
+        &self,
+        ledger_id: &str,
+        batch: RetentionBatch,
+    ) -> Result<(
+        Option<crate::LedgerWriteGuard>,
+        fluree_db_transact::StagedCommit,
+    )> {
         let id = LedgerId::parse(ledger_id)?;
         let record = self
             .nameservice()
@@ -120,11 +169,14 @@ impl Fluree {
             .await?;
         let (write_guard, mut state) = self.lock_or_load(&id, store.clone(), record).await?;
         if state.t() != batch.expected_t {
-            return Ok(SubmitOutcome::HeadMoved);
+            return Err(ApiError::Transact(TransactError::CommitConflict {
+                expected_t: batch.expected_t,
+                head_t: state.t(),
+            }));
         }
         let max = self.index_config.reindex_max_bytes;
         if max > 0 && state.novelty_size() as f64 >= max as f64 * NOVELTY_HEADROOM {
-            return Ok(SubmitOutcome::Deferred);
+            return Err(ApiError::Transact(TransactError::NoveltyAtMax));
         }
         if state.head_temporal.is_none() && state.head_commit_id.is_some() {
             state
@@ -147,7 +199,6 @@ impl Fluree {
                     id: Some(cid.clone()),
                     t: view.base().t(),
                 });
-        let namespace = view.base().storage_namespace();
         let staged = fluree_db_transact::build_commit(
             view,
             ns_registry,
@@ -157,22 +208,7 @@ impl Fluree {
             commit_opts,
         )
         .await?;
-        let applied = match write_guard {
-            Some(guard) => self.apply_staged_detached(guard, staged).await,
-            None => {
-                let content_store = self.content_store(&namespace);
-                staged
-                    .apply(&content_store, self.publisher()?)
-                    .await
-                    .map(|(receipt, _)| receipt)
-                    .map_err(ApiError::from)
-            }
-        };
-        match applied {
-            Ok(receipt) => Ok(SubmitOutcome::Committed { t: receipt.t }),
-            Err(e) if e.is_commit_conflict() => Ok(SubmitOutcome::HeadMoved),
-            Err(e) => Err(e),
-        }
+        Ok((write_guard, staged))
     }
 }
 

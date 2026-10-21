@@ -582,7 +582,10 @@ async fn build_direct_fluree(
     // Only the worker that owns catch-up runs its ticks. Under Raft that is
     // the leader-scope worker, which `Server::run` gives its own.
     if config.indexing_enabled && catchup_sweeps == CatchupSweeps::Owned {
-        fluree.start_lifecycle_housekeeping(config.orphan_sweep_interval());
+        fluree.start_maintenance(
+            config.orphan_sweep_interval(),
+            Some(config.retention_options()),
+        );
     }
 
     tracing::info!(

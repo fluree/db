@@ -239,6 +239,14 @@ fn parse_postfix(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
                 let start = e.span();
                 s.advance();
                 let prop = parse_ident_or_keyword(s)?;
+                // `ns.fn(...)`: a namespaced function call, such as the
+                // `fluree.ttl(...)` write wrapper.
+                if matches!(s.peek_kind(), TokenKind::LParen) {
+                    if let Some(namespace) = dotted_name(&e) {
+                        e = parse_call_args(s, format!("{namespace}.{prop}"), start)?;
+                        continue;
+                    }
+                }
                 let end = s.peek_span();
                 e = Expr::Prop(Box::new(e), prop, start.union(end));
             }
@@ -255,6 +263,41 @@ fn parse_postfix(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         }
     }
     Ok(e)
+}
+
+/// `a` or `a.b.c` as a dotted name, for a namespaced call.
+fn dotted_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(v) => Some(v.name.clone()),
+        Expr::Prop(base, prop, _) => dotted_name(base).map(|b| format!("{b}.{prop}")),
+        _ => None,
+    }
+}
+
+/// A call's parenthesized argument list, the `(` next.
+fn parse_call_args(
+    s: &mut TokenStream,
+    name: String,
+    start: SourceSpan,
+) -> Result<Expr, Diagnostic> {
+    s.expect(&TokenKind::LParen)?;
+    let distinct = s.eat(&TokenKind::Distinct).is_some();
+    let mut args = Vec::new();
+    if !matches!(s.peek_kind(), TokenKind::RParen) {
+        loop {
+            args.push(parse_expr(s)?);
+            if s.eat(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+    }
+    let end = s.expect(&TokenKind::RParen)?;
+    Ok(Expr::Call(FuncCall {
+        name,
+        args,
+        distinct,
+        span: start.union(end),
+    }))
 }
 
 fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {

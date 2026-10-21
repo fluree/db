@@ -638,6 +638,10 @@ impl Worker {
             .await
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 
+        if let TransactionBody::Retention { batch } = &body {
+            return self.stage_retention(&ledger_id, batch).await;
+        }
+
         let policy_ctx = build_policy_context(&self.staging.fluree, &ledger_handle, &governance)
             .await
             .map_err(submission_to_stage)?;
@@ -696,6 +700,9 @@ impl Worker {
                 staged.upsert_turtle(text.as_str())
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+            TransactionBody::Retention { .. } => {
+                unreachable!("a retention batch stages before the builder")
+            }
             TransactionBody::Cypher { .. } => {
                 match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
                     crate::local::CypherWriteUnderLock::Resolved(resolved) => {
@@ -794,6 +801,74 @@ impl Worker {
                 commit_t,
                 flake_count: receipt.flake_count,
                 tally,
+            }),
+            install: Some(StagedStateInstall {
+                write_guard,
+                new_state,
+                commit_t,
+            }),
+        })
+    }
+
+    /// Stage a retention batch: exact retractions committed only against the
+    /// head they were verified at. A moved head (or novelty near its limit)
+    /// poisons the entry at once with a reason the submitting worker reads
+    /// as "recompute", instead of retrying a batch that can never apply.
+    async fn stage_retention(
+        &self,
+        ledger_id: &str,
+        batch: &str,
+    ) -> Result<StagedOutcome, WorkerError> {
+        use fluree_db_api::retention::{DEFERRED, HEAD_MOVED};
+        let batch = crate::local::decode_retention_batch(batch).map_err(|e| {
+            stage(PoisonReason::BodyMalformed {
+                error: e.to_string(),
+            })
+        })?;
+        let expected_t = batch.expected_t;
+        let built = self
+            .staging
+            .fluree
+            .build_retention_commit(ledger_id, batch)
+            .await;
+        let (write_guard, staged_commit) = match built {
+            Ok(built) => built,
+            Err(e) if e.is_commit_conflict() => {
+                return Err(stage(PoisonReason::BodyMalformed {
+                    error: format!("{HEAD_MOVED} (verified at t {expected_t}): {e}"),
+                }))
+            }
+            Err(ApiError::Transact(fluree_db_api::TransactError::NoveltyAtMax)) => {
+                return Err(stage(PoisonReason::BodyMalformed {
+                    error: DEFERRED.to_string(),
+                }))
+            }
+            Err(e) => return Err(build_commit_failure(e)),
+        };
+        let write_guard = write_guard
+            .ok_or_else(|| stage_failure("retention batch: the ledger manager holds no lock"))?;
+        let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
+            stage(PoisonReason::WorkerPanic {
+                message: "build_retention_commit produced a commit without commit.id".into(),
+            })
+        })?;
+        let commit_t = staged_commit.commit.t;
+        self.persist_staged_blobs(
+            &self.storage_namespace().await?,
+            &commit_cid,
+            &staged_commit,
+            "retention",
+        )
+        .await?;
+        let (receipt, new_state) = staged_commit
+            .finalize_state()
+            .map_err(|e| stage_failure(&format!("finalize_state failed: {e}")))?;
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Transact(TransactApplied {
+                commit_id: commit_cid,
+                commit_t,
+                flake_count: receipt.flake_count,
+                tally: None,
             }),
             install: Some(StagedStateInstall {
                 write_guard,

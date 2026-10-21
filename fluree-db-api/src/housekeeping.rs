@@ -363,10 +363,34 @@ impl Fluree {
         self: &Arc<Self>,
         orphan_sweep_interval: Option<Duration>,
     ) -> bool {
+        self.start_maintenance(orphan_sweep_interval, None)
+    }
+
+    /// Install this instance's maintenance on its background indexer, which
+    /// must own catch-up: [`lifecycle_housekeeping`](Self::lifecycle_housekeeping)
+    /// and, with `retention` settings, the retention worker committing
+    /// directly ([`retention_housekeeping`](Self::retention_housekeeping) and
+    /// its build observer). Returns `false`, installing nothing, when it has
+    /// no background indexer.
+    pub fn start_maintenance(
+        self: &Arc<Self>,
+        orphan_sweep_interval: Option<Duration>,
+        retention: Option<crate::retention::RetentionOptions>,
+    ) -> bool {
         let crate::tx::IndexingMode::Background(handle) = &self.indexing_mode else {
             return false;
         };
-        handle.set_housekeeping(self.lifecycle_housekeeping(orphan_sweep_interval));
+        let lifecycle = self.lifecycle_housekeeping(orphan_sweep_interval);
+        match retention {
+            Some(options) => {
+                handle.set_housekeeping(Arc::new(fluree_db_indexer::Housekeepings(vec![
+                    lifecycle,
+                    self.retention_housekeeping(None, options),
+                ])));
+                handle.set_build_observer(self.retention_build_observer());
+            }
+            None => handle.set_housekeeping(lifecycle),
+        }
         true
     }
 }

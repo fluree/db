@@ -255,7 +255,8 @@ fn body_kind_tag(kind: BodyKind) -> &'static str {
         | BodyKind::TurtleUpsert
         | BodyKind::TrigUpsert
         | BodyKind::Sparql
-        | BodyKind::Cypher => "transact",
+        | BodyKind::Cypher
+        | BodyKind::Retention => "transact",
         BodyKind::Pushed => "push",
         BodyKind::Revert => "revert",
         BodyKind::Merge => "merge",

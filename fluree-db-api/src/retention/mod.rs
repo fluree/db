@@ -27,7 +27,10 @@ pub use engine::PassReport;
 pub use registry::Registration;
 pub use worker::RetentionOptions;
 pub(crate) use worker::RetentionRuntime;
-pub use writer::{RetentionBatch, RetentionWriter, SubmitOutcome, RETENTION_IDENTITY};
+pub use writer::{
+    outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome, DEFERRED, HEAD_MOVED,
+    RETENTION_IDENTITY,
+};
 
 use fluree_db_core::Sid;
 use serde::Serialize;

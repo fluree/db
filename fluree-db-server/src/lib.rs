@@ -851,6 +851,17 @@ impl FlureeServerBuilder {
                 let rotation_fluree = Arc::clone(&state_inner.fluree);
                 let housekeeping_fluree = Arc::clone(&state_inner.fluree);
                 let orphan_sweep_interval = state_inner.config.orphan_sweep_interval();
+                let retention_options = state_inner.config.retention_options();
+                // Expiration batches go through the cluster's committer, which
+                // exists once `attach` returns; until then they wait.
+                let retention_committer: Arc<
+                    std::sync::OnceLock<Arc<dyn fluree_db_consensus::SubmittingCommitter>>,
+                > = Arc::default();
+                let retention_writer: Arc<dyn fluree_db_api::retention::RetentionWriter> = Arc::new(
+                    fluree_db_consensus::retention::CommitterRetentionWriter::new(Arc::clone(
+                        &retention_committer,
+                    )),
+                );
                 let rotation_holder = routes::rotation_holder(&state_inner);
                 let leader_tasks = move || {
                     let nameservice: std::sync::Arc<
@@ -863,10 +874,16 @@ impl FlureeServerBuilder {
                     );
                     let worker = worker.with_event_bus(Arc::clone(&event_bus));
                     // This worker owns catch-up, so its ticks also finish
-                    // lifecycle operations a crashed leader left.
-                    handle.set_housekeeping(
+                    // lifecycle operations a crashed leader left, and run the
+                    // retention worker. Both stop with leadership.
+                    handle.set_housekeeping(Arc::new(fluree_db_indexer::Housekeepings(vec![
                         housekeeping_fluree.lifecycle_housekeeping(orphan_sweep_interval),
-                    );
+                        housekeeping_fluree.retention_housekeeping(
+                            Some(Arc::clone(&retention_writer)),
+                            retention_options.clone(),
+                        ),
+                    ])));
+                    handle.set_build_observer(housekeeping_fluree.retention_build_observer());
                     // The handle owns the worker's ShutdownTrigger:
                     // dropping it fires the shutdown oneshot and `run()`
                     // exits on its FIRST select — silently, before its
@@ -921,6 +938,7 @@ impl FlureeServerBuilder {
                 )
                 .await;
                 state_inner.committer = Arc::clone(&node.committer);
+                let _ = retention_committer.set(Arc::clone(&node.committer));
                 state_inner.raft = Some(Arc::clone(integration));
                 Some(node)
             }

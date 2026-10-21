@@ -66,6 +66,85 @@ pub enum LowerCypherError {
     ReservedPredicate(String),
 }
 
+/// A TTL instruction: its predicate IRI and canonical value.
+type TtlInstruction = (&'static str, FlakeValue);
+
+/// `fluree.ttl(value, lifetime)` / `fluree.expiresAt(value, deadline)` as
+/// the outermost value of a property write: the value, and the TTL
+/// instruction (predicate IRI and canonical value) its annotation carries.
+/// A lifetime is whole seconds or a day/time duration string; a deadline is
+/// an RFC 3339 string or `datetime("...")` with a time zone.
+fn ttl_wrapper(value: &Expr) -> Result<Option<(&Expr, TtlInstruction)>, LowerCypherError> {
+    let Expr::Call(call) = value else {
+        return Ok(None);
+    };
+    let name = call.name.to_ascii_lowercase();
+    let absolute = match name.as_str() {
+        "fluree.ttl" => false,
+        "fluree.expiresat" => true,
+        _ => return Ok(None),
+    };
+    let [inner, lifetime] = call.args.as_slice() else {
+        return Err(LowerCypherError::rejected(format!(
+            "{}(value, {}) takes two arguments",
+            call.name,
+            if absolute { "deadline" } else { "lifetime" }
+        )));
+    };
+    if ttl_wrapper(inner)?.is_some() {
+        return Err(LowerCypherError::rejected(
+            "a value takes one TTL wrapper".to_string(),
+        ));
+    }
+    let instruction = if absolute {
+        let text = match lifetime {
+            Expr::Lit(Literal::String(s, _)) => s.as_str(),
+            Expr::Call(c) if c.name.eq_ignore_ascii_case("datetime") => match c.args.as_slice() {
+                [Expr::Lit(Literal::String(s, _))] => s.as_str(),
+                _ => {
+                    return Err(LowerCypherError::rejected(
+                        "fluree.expiresAt needs a literal deadline: datetime(\"...\") with a time zone"
+                            .to_string(),
+                    ))
+                }
+            },
+            _ => {
+                return Err(LowerCypherError::rejected(
+                    "fluree.expiresAt needs a literal deadline (a string or datetime(\"...\"), or a parameter)"
+                        .to_string(),
+                ))
+            }
+        };
+        let instant = crate::ttl_input::expires_at(text).map_err(LowerCypherError::rejected)?;
+        (
+            fluree_vocab::retention_iris::EXPIRES_AT,
+            FlakeValue::DateTime(Box::new(fluree_db_core::DateTime::from_instant(instant))),
+        )
+    } else {
+        let seconds = match lifetime {
+            Expr::Lit(Literal::Integer(n, _)) => u64::try_from(*n).map_err(|_| {
+                LowerCypherError::rejected("a TTL may not be negative".to_string())
+            })?,
+            Expr::Lit(Literal::String(s, _)) => {
+                crate::ttl_input::duration_seconds(s).map_err(LowerCypherError::rejected)?
+            }
+            _ => {
+                return Err(LowerCypherError::rejected(
+                    "fluree.ttl needs a literal lifetime (whole seconds or a duration such as \"PT1H\", or a parameter)"
+                        .to_string(),
+                ))
+            }
+        };
+        let seconds = i64::try_from(seconds)
+            .map_err(|_| LowerCypherError::rejected("TTL too large".to_string()))?;
+        (
+            fluree_vocab::retention_iris::TTL_SECONDS,
+            FlakeValue::Long(seconds),
+        )
+    };
+    Ok(Some((inner, instruction)))
+}
+
 impl LowerCypherError {
     fn unsupported(s: impl Into<String>) -> Self {
         Self::Unsupported(s.into())
@@ -1017,16 +1096,9 @@ impl<'a> CypherLowering<'a> {
         //
         // The old-value lookup is collected (not pushed) so `lower_set` can emit
         // all items' lookups as one UNION instead of cross-joining OPTIONALs.
-        let objs = self.expr_to_object_terms(value)?;
         let subj = self.var_term(target);
         old_values.push((target.to_string(), pred_iri, pred_sid.clone()));
-        for obj in objs {
-            self.insert_templates.push(TripleTemplate::new(
-                subj.clone(),
-                TemplateTerm::Sid(pred_sid.clone()),
-                obj,
-            ));
-        }
+        self.emit_value(&subj, &pred_sid, value)?;
         Ok(())
     }
 
@@ -1074,13 +1146,7 @@ impl<'a> CypherLowering<'a> {
             let pred_iri = self.resolve_predicate(key)?;
             let pred_sid = self.ns.sid_for_iri(&pred_iri);
             let subj = self.var_term(target);
-            for obj in self.expr_to_object_terms(val_expr)? {
-                self.insert_templates.push(TripleTemplate::new(
-                    subj.clone(),
-                    TemplateTerm::Sid(pred_sid.clone()),
-                    obj,
-                ));
-            }
+            self.emit_value(&subj, &pred_sid, val_expr)?;
         }
         Ok(())
     }
@@ -1517,13 +1583,7 @@ impl<'a> CypherLowering<'a> {
                 let pred_sid = self.ns.sid_for_iri(&pred_iri);
                 // null / empty list → nothing on a new node; a list → one triple
                 // per element (multi-valued predicate).
-                for obj in self.expr_to_object_terms(value)? {
-                    self.insert_templates.push(TripleTemplate::new(
-                        subj.clone(),
-                        TemplateTerm::Sid(pred_sid.clone()),
-                        obj,
-                    ));
-                }
+                self.emit_value(subj, &pred_sid, value)?;
             }
             SetItem::MapMerge { target, map } => {
                 if !target_ok(target) {
@@ -1537,13 +1597,7 @@ impl<'a> CypherLowering<'a> {
                     let pred_sid = self.ns.sid_for_iri(&pred_iri);
                     // null / empty list asserts nothing; a list asserts one
                     // triple per element.
-                    for obj in self.expr_to_object_terms(val)? {
-                        self.insert_templates.push(TripleTemplate::new(
-                            subj.clone(),
-                            TemplateTerm::Sid(pred_sid.clone()),
-                            obj,
-                        ));
-                    }
+                    self.emit_value(subj, &pred_sid, val)?;
                 }
             }
             SetItem::Labels { target, labels } => {
@@ -1786,6 +1840,40 @@ impl<'a> CypherLowering<'a> {
         ));
     }
 
+    /// Assert `subj pred value`, one triple per term the value expands to. A
+    /// `fluree.ttl(v, lifetime)` / `fluree.expiresAt(v, deadline)` value
+    /// asserts `v` and gives each asserted term its own TTL annotation; the
+    /// wrapper itself is never stored.
+    fn emit_value(
+        &mut self,
+        subj: &TemplateTerm,
+        pred_sid: &Sid,
+        value: &Expr,
+    ) -> Result<(), LowerCypherError> {
+        let (inner, ttl) = match ttl_wrapper(value)? {
+            Some((inner, ttl)) => (inner, Some(ttl)),
+            None => (value, None),
+        };
+        for obj in self.expr_to_object_terms(inner)? {
+            self.insert_templates.push(TripleTemplate::new(
+                subj.clone(),
+                TemplateTerm::Sid(pred_sid.clone()),
+                obj.clone(),
+            ));
+            if let Some((ttl_iri, ttl_value)) = &ttl {
+                let ann = self.fresh_bnode();
+                self.emit_reifier_link(&ann, subj, pred_sid, &obj);
+                let ttl_sid = self.ns.sid_for_iri(ttl_iri);
+                self.insert_templates.push(TripleTemplate::new(
+                    ann,
+                    TemplateTerm::Sid(ttl_sid),
+                    TemplateTerm::Value(ttl_value.clone()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn emit_property_triples(
         &mut self,
         subj: &TemplateTerm,
@@ -1796,13 +1884,7 @@ impl<'a> CypherLowering<'a> {
             let pred_sid = self.ns.sid_for_iri(&pred_iri);
             // Null / empty-list values expand to no term ("no property"); a list
             // value expands to one term per element (multi-valued predicate).
-            for obj in self.expr_to_object_terms(val_expr)? {
-                self.insert_templates.push(TripleTemplate::new(
-                    subj.clone(),
-                    TemplateTerm::Sid(pred_sid.clone()),
-                    obj,
-                ));
-            }
+            self.emit_value(subj, &pred_sid, val_expr)?;
         }
         Ok(())
     }

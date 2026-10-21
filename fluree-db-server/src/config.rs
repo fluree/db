@@ -548,6 +548,16 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_ORPHAN_SWEEP_INTERVAL_SECS", default_value_t = 0)]
     pub orphan_sweep_interval_secs: u64,
 
+    /// How often the retention worker runs a pass over TTL-enabled ledgers
+    /// (seconds)
+    ///
+    /// Runs on the node that owns the indexer's catch-up tick, which also
+    /// wakes it. Expired values are retracted within about one interval of
+    /// their deadline, plus processing time. Ledgers without retention
+    /// config or TTL writes are never visited.
+    #[arg(long, env = "FLUREE_RETENTION_INTERVAL_SECS", default_value_t = 15)]
+    pub retention_interval_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 35% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -981,6 +991,7 @@ impl Default for ServerConfig {
             gc_hard_max_old_indexes: None,
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             orphan_sweep_interval_secs: 0,
+            retention_interval_secs: 15,
             cache_max_mb: None,
             cache_dictionary_max_mb: None,
             disk_cache_max_mb: None,
@@ -1067,6 +1078,14 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The retention worker's settings (`--retention-interval-secs`).
+    pub fn retention_options(&self) -> fluree_db_api::retention::RetentionOptions {
+        fluree_db_api::retention::RetentionOptions {
+            interval: std::time::Duration::from_secs(self.retention_interval_secs.max(1)),
+            ..Default::default()
+        }
+    }
+
     /// `--orphan-sweep-interval-secs`, `None` when off.
     pub fn orphan_sweep_interval(&self) -> Option<std::time::Duration> {
         (self.orphan_sweep_interval_secs > 0)
