@@ -1587,14 +1587,18 @@ fn test_construct_template_blank_node_property_list() {
 
 #[test]
 fn test_blank_node_property_list_label_no_user_collision() {
-    // A user blank node literally named `_:#bnpl0` is impossible (the lexer
-    // rejects `#`), so the synthetic property-list node cannot be addressed or
-    // accidentally joined. A user label like `_b` near a `[ … ]` stays distinct:
-    // `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3 triples, and the
-    // synthetic node is its own variable.
+    // A user blank node literally named `_:-bnpl0` is impossible (a label
+    // can't start with `-`), so the synthetic property-list node cannot be
+    // addressed or accidentally joined. A user label like `_b` near a `[ … ]`
+    // stays distinct: `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3
+    // triples, and the synthetic node is its own variable.
     let ast = assert_parses("SELECT ?o WHERE { ?s :p _:b . ?s :q [ :r ?o ] }");
     if let QueryBody::Select(q) = &ast.body {
         assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+    for synthetic in ["-bnpl0", "-coll0", "-reif0"] {
+        let query = format!("SELECT ?o WHERE {{ _:{synthetic} :p ?o }}");
+        assert!(parse(&query).has_errors(), "{query} must not parse");
     }
 }
 
