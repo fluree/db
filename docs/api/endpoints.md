@@ -3043,6 +3043,8 @@ GET /retention/{ledger-id}
 
 `active` is `false` (and `registration` absent) for a ledger that never wrote a lifetime or configured one. `maintenanceRunning` and `overdue` describe the node that answers: in a cluster, ask the leader.
 
+A ledger with [history retention](../transactions/history-retention.md#status) also reports `registration.journal` (its `f:noHistory` rules and removals, never the removed values) and `registration.historyBackfilled`.
+
 **Status Codes:**
 - `200 OK` - Ledger found
 - `401 Unauthorized` - Authentication required
@@ -3877,6 +3879,51 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 - `500 Internal Server Error` — reindex failed
 
 When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
+
+### POST /remove/{ledger-id}
+
+Remove selected occurrences of facts from what a ledger serves, now and in history. See [History retention](../transactions/history-retention.md#targeted-removal). Admin-protected; in a cluster the request is forwarded to the leader.
+
+**URL:**
+```
+POST /remove/{ledger-id}
+```
+
+**Request Body:**
+
+```json
+{
+  "matching": [
+    {
+      "subject": "https://example.org/alice",
+      "predicate": "https://example.org/email",
+      "object": "alice@old.example"
+    }
+  ],
+  "occurrences": [{ "commit": "bafy...", "slot": 3 }]
+}
+```
+
+Either list may be empty. `matching[].graph` names a graph (absent for the default graph). `matching[].object` takes `{"@id": ...}` for a reference, and selects every value when absent.
+
+**Response:**
+
+```json
+{
+  "requestId": "removal-5d1e...",
+  "scopeT": 41,
+  "manifest": [{ "commit": "bafy...", "slot": 3 }],
+  "retractedT": 42,
+  "generation": 4
+}
+```
+
+`retractedT` is the commit that retracted occurrences still current, if any. In a cluster, `unacknowledgedReplicas` lists replicas that had not applied the removal when the request returned.
+
+**Status Codes:**
+- `200 OK` - Removed
+- `401 Unauthorized` - Admin token required
+- `404 Not Found` - Ledger not found, or nothing in its history matches the request
 
 ### POST /sweep
 

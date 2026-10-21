@@ -389,7 +389,7 @@ and how configured properties interact with `@fulltext`-datatype values.
 
 **Group predicate**: `f:retentionDefaults`
 
-Gives predicates a default lifetime: every value of the predicate asserted after the config commit is retracted by the background retention worker once its lifetime ends. See [Time to live (TTL)](../transactions/ttl.md) for per-value lifetimes, renewal and how expiration runs.
+Gives predicates a default lifetime: every value of the predicate asserted after the config commit is retracted by the background retention worker once its lifetime ends. See [Time to live (TTL)](../transactions/ttl.md) for per-value lifetimes, renewal and how expiration runs. `f:noHistory` stops serving a predicate's superseded values; see [History retention](../transactions/history-retention.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -401,7 +401,7 @@ Each `f:RetentionProperty` entry:
 |-------|------|---------|-------------|
 | `f:target` | IRI (exactly one) | required | The predicate the entry governs |
 | `f:ttlSeconds` | non-negative integer | inherit | Lifetime from the commit time of each new assertion. `0` turns an inherited duration off for future assertions |
-| `f:noHistory` | boolean | inherit; system default `false` | Reserved for dropping obsolete history. Not supported yet: `true` is refused |
+| `f:noHistory` | boolean | inherit; system default `false` | `true` stops serving the predicate's superseded values: reads that need them fail with `410`, and the index drops them. See [History retention](../transactions/history-retention.md) |
 
 ```json
 {

@@ -195,6 +195,6 @@ Commits and annotations written before a ledger's first TTL-aware write are not 
 
 - **Shared relationships.** A TTL on a triple that several annotations or relationships share (parallel Cypher relationships, for example) is refused, because expiring the triple would end all of them. If sharing appears after a value was scheduled, the value is left in place when it comes due, and status reports it.
 - **List occurrences** cannot carry annotations, so they cannot carry a TTL.
-- **Not erasure.** Expiration retracts current state. History, the commit log and backups still hold the value. Removing history is a separate feature.
+- **Not erasure.** Expiration retracts current state. History, the commit log and backups still hold the value. To stop serving a value's history, see [History retention](history-retention.md).
 
 See [Setting groups: retention defaults](../ledger-config/setting-groups.md#retention-defaults) for the config schema.

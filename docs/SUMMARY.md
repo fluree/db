@@ -151,6 +151,7 @@
   - [Conditional updates (atomic / compare-and-swap)](transactions/conditional-updates.md)
   - [Retractions](transactions/retractions.md)
   - [Time to live (TTL)](transactions/ttl.md)
+  - [History retention](transactions/history-retention.md)
   - [Turtle ingest](transactions/turtle.md)
   - [Signed / credentialed transactions](transactions/signed-transactions.md)
   - [Commit receipts and tx-id](transactions/commit-receipts.md)

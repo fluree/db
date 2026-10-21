@@ -40,7 +40,7 @@ fluree export mydb --format ledger --no-indexes -o mydb.flpack
 fluree export mydb --remote prod --format ledger -o mydb.flpack
 ```
 
-`--format ledger` (alias `--format flpack`) writes the full `fluree-pack-v1` archive — commits, txn blobs, and (unless `--no-indexes`) index artifacts — plus a `phase: "nameservice"` manifest frame that lets the importer reconstruct commit/index head pointers.
+`--format ledger` (alias `--format flpack`) writes the full `fluree-pack-v1` archive — commits, txn blobs, and (unless `--no-indexes`) index artifacts — plus a `phase: "nameservice"` manifest frame that lets the importer reconstruct commit/index head pointers. For a ledger with [history retention](../transactions/history-retention.md), the manifest's `retention` member carries the removal journal, and the restored ledger refuses the same history its source did.
 
 `-o FILE` is required when stdout is a TTY (the archive is binary). Pipe-friendly forms work too: `fluree export mydb --format ledger > mydb.flpack`.
 

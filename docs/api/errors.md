@@ -301,6 +301,22 @@ and create it again over the new ledger. See
 [When the Source Ledger Is Dropped](../indexing-and-search/bm25.md#when-the-source-ledger-is-dropped)
 and [Iceberg → Access policy](../graph-sources/iceberg.md#where-policies-live-the-model-ledger).
 
+#### 410 Gone
+
+`err:db/HistoryUnavailable`: the read needs history that the ledger's [history retention](../transactions/history-retention.md) no longer serves. This happens for a query as of an earlier point, a history range, or an export that could touch an `f:noHistory` predicate or a removed occurrence. It also happens for a search of a full-text or vector index that has not yet synced past such a change.
+
+```json
+{
+  "error": "history unavailable: <https://example.org/count> keeps no history (f:noHistory) on mydb:main; read it as of the current head",
+  "status": 410,
+  "@type": "err:db/HistoryUnavailable"
+}
+```
+
+**How to Fix:**
+- Read as of the current head, or narrow the query to predicates and subjects the retention does not cover
+- For a search index, retry once it has synced
+
 #### 413 Payload Too Large
 
 The request was refused because of its size. The server emits **two distinct
@@ -503,6 +519,7 @@ of them indicate a fault in the request. The `@type` identifies the cause:
 | `err:db/NoveltyAtMax` | Novelty backpressure: in-memory novelty is at `reindex_max_bytes` (or this transaction would cross it, while still fitting once novelty drains). Clears when the indexer catches up. |
 | `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
 | `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
+| `err:db/ReplicaNotCurrent` | A cluster replica could not confirm it holds the current [removal journal](../transactions/history-retention.md#clusters) of a ledger with history retention, so it did not serve that ledger's history. Clears once the replica reaches a leader. |
 | `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 
 **Example:**
