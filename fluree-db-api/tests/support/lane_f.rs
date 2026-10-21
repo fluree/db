@@ -381,10 +381,23 @@ impl Fixture {
         dataset: &str,
         shape: Shape,
     ) -> Result<Vec<String>, String> {
+        self.sparql_where(ledger, prologue, dataset, shape.body(), shape.vars())
+            .await
+    }
+
+    /// `SELECT` of `vars` over `ledger` with `dataset` and `body` as the
+    /// whole `WHERE` clause, rows rendered as [`expected`] renders them.
+    pub async fn sparql_where(
+        &self,
+        ledger: &str,
+        prologue: &str,
+        dataset: &str,
+        body: &str,
+        vars: &[&str],
+    ) -> Result<Vec<String>, String> {
         let query = format!(
-            "{prologue}PREFIX ex: <{EX}>\nSELECT ?{} {dataset} WHERE {{ {} }}",
-            shape.vars().join(" ?"),
-            shape.body()
+            "{prologue}PREFIX ex: <{EX}>\nSELECT ?{} {dataset} WHERE {{ {body} }}",
+            vars.join(" ?"),
         );
         let handle = self.fluree.ledger_cached(ledger).await.expect("ledger");
         let view = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
@@ -399,9 +412,7 @@ impl Fixture {
             .ok_or_else(|| format!("{query}: {json}"))?
             .iter()
             .map(|b| {
-                shape
-                    .vars()
-                    .iter()
+                vars.iter()
                     .map(|v| {
                         let term = &b[*v];
                         let value = term["value"].as_str().unwrap_or_default();
@@ -430,13 +441,25 @@ pub struct Run {
 }
 
 pub async fn run(fx: &Fixture, ledger: &str, prologue: &str, dataset: &str, shape: Shape) -> Run {
+    run_where(fx, ledger, prologue, dataset, shape.body(), shape.vars()).await
+}
+
+/// [`run`] for `body` as the whole `WHERE` clause.
+pub async fn run_where(
+    fx: &Fixture,
+    ledger: &str,
+    prologue: &str,
+    dataset: &str,
+    body: &str,
+    vars: &[&str],
+) -> Run {
     let _switch = switch().lock().await;
     set_fast_paths_disabled(false);
     let (store, guard) = init_test_tracing();
-    let fast = fx.sparql(ledger, prologue, dataset, shape).await;
+    let fast = fx.sparql_where(ledger, prologue, dataset, body, vars).await;
     drop(guard);
     set_fast_paths_disabled(true);
-    let generic = fx.sparql(ledger, prologue, dataset, shape).await;
+    let generic = fx.sparql_where(ledger, prologue, dataset, body, vars).await;
     set_fast_paths_disabled(false);
     let stamps = outcomes(&store);
     Run {

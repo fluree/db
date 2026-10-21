@@ -249,3 +249,34 @@ async fn lane_f_union_probes_follow_each_members_novelty() {
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A one-graph join whose probed graph has no PSOT branch: the default graph
+/// (fixture F's facts are all in g1 and g2) and a named graph first written
+/// after the index, each holding left rows in novelty only. The probed
+/// predicate has no novelty there, so the graph holds nothing for the probe:
+/// the join answers with no rows, rather than failing to find the branch.
+#[tokio::test(flavor = "current_thread")]
+async fn a_probe_over_a_graph_with_no_branch_finds_nothing() {
+    use lane_f::{fact, Obj, LEDGER};
+    let fx = lane_f::Fixture::build().await;
+    fx.write(
+        LEDGER,
+        &[
+            fact("", "a", "sel", Obj::Iri("y0".into())),
+            fact("urn:g3", "b", "sel", Obj::Iri("y0".into())),
+        ],
+    )
+    .await;
+    let mut failures = Vec::new();
+    let body = lane_f::Shape::Subject.body();
+    let in_g3 = format!("GRAPH <urn:g3> {{ {body} }}");
+    for (name, dataset, body) in [
+        ("default graph", "", body),
+        ("FROM g3", "FROM <urn:g3>", body),
+        ("GRAPH g3", "", in_g3.as_str()),
+    ] {
+        let run = lane_f::run_where(&fx, LEDGER, "", dataset, body, &["y", "o"]).await;
+        check_lane_f(name, &run, &[], &[], &[], &mut failures);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
