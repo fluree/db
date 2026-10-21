@@ -102,6 +102,16 @@ impl Fluree {
         Ok(self.suppression_for(&ledger_id).await?.is_some())
     }
 
+    /// What a ledger archive carries of `ledger_id`'s retention (its
+    /// activation and removal journal); `None` without a registration.
+    pub async fn retention_archive_section(
+        &self,
+        ledger_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
+        registry::archived(&self.nameservice_mode, &ledger_id).await
+    }
+
     /// The retention status of `ledger_id`.
     pub async fn retention_status(&self, ledger_id: &str) -> Result<RetentionStatus> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();

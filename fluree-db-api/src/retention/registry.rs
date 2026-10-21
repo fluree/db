@@ -63,8 +63,8 @@ fn is_zero(n: &u64) -> bool {
 }
 
 /// The branch's registration, if any, with the config value it was read from.
-pub(crate) async fn read(
-    ns: &dyn NameServicePublisher,
+pub(crate) async fn read<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
+    ns: &N,
     ledger_id: &str,
 ) -> Result<(Option<ConfigValue>, Option<Registration>)> {
     let config = ns.get_config(ledger_id).await?;
@@ -84,12 +84,23 @@ pub(crate) async fn read(
 pub(crate) async fn update(
     ns: &dyn NameServicePublisher,
     ledger_id: &str,
+    update: impl FnMut(Option<&Registration>) -> Option<Registration>,
+) -> Result<Option<Registration>> {
+    let Some(record) = ns.lookup(ledger_id).await? else {
+        return Err(ApiError::NotFound(ledger_id.to_string()));
+    };
+    update_fenced(ns, ledger_id, record.fence, update).await
+}
+
+/// [`update`] under `fence`, for a record not yet visible to lookups (a
+/// ledger being restored).
+pub(crate) async fn update_fenced(
+    ns: &dyn NameServicePublisher,
+    ledger_id: &str,
+    fence: Option<fluree_db_nameservice::Fence>,
     mut update: impl FnMut(Option<&Registration>) -> Option<Registration>,
 ) -> Result<Option<Registration>> {
     for _ in 0..CAS_ATTEMPTS {
-        let Some(record) = ns.lookup(ledger_id).await? else {
-            return Err(ApiError::NotFound(ledger_id.to_string()));
-        };
         let (config, current) = read(ns, ledger_id).await?;
         let Some(next) = update(current.as_ref()) else {
             return Ok(current);
@@ -103,7 +114,7 @@ pub(crate) async fn update(
         payload.extra.insert(EXTRA_KEY.to_string(), value);
         let new = ConfigValue::new(v + 1, Some(payload));
         match ns
-            .push_config_fenced(ledger_id, record.fence, config.as_ref(), &new)
+            .push_config_fenced(ledger_id, fence, config.as_ref(), &new)
             .await?
         {
             ConfigCasResult::Updated => return Ok(Some(next)),
@@ -138,4 +149,54 @@ pub(crate) async fn activate(
     })
     .await
     .map(|_| ())
+}
+
+/// What a ledger archive carries of the source's retention: its activation
+/// boundary and removal journal, so a restored copy serves no history the
+/// source no longer served.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchivedRetention {
+    pub(crate) active_since_t: i64,
+    #[serde(default)]
+    pub(crate) journal: super::journal::Journal,
+}
+
+/// The archive's retention section for `ledger_id`, if it is registered.
+pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
+    ns: &N,
+    ledger_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(registration) = read(ns, ledger_id).await?.1 else {
+        return Ok(None);
+    };
+    let archived = ArchivedRetention {
+        active_since_t: registration.active_since_t,
+        journal: registration.journal,
+    };
+    serde_json::to_value(archived)
+        .map(Some)
+        .map_err(|e| ApiError::internal(format!("retention registration: {e}")))
+}
+
+/// Register a restored ledger from its archive's retention section. Its
+/// expiry schedule is rebuilt from its commits, and its index history
+/// compacted again.
+pub(crate) async fn restore(
+    ns: &dyn NameServicePublisher,
+    record: &fluree_db_nameservice::NsRecord,
+    archived: &serde_json::Value,
+) -> Result<()> {
+    let archived: ArchivedRetention = serde_json::from_value(archived.clone())
+        .map_err(|e| ApiError::http(400, format!(".flpack retention section: {e}")))?;
+    update_fenced(ns, record.ledger_id.as_str(), record.fence, |_| {
+        Some(Registration {
+            active_since_t: archived.active_since_t,
+            watermark_t: archived.active_since_t - 1,
+            journal: archived.journal.clone(),
+            ..Default::default()
+        })
+    })
+    .await?;
+    Ok(())
 }

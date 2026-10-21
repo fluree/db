@@ -2384,6 +2384,9 @@ impl Fluree {
             // re-put of the (content-addressed) blob is idempotent.
             self.push_default_context(record, &ctx_json).await?;
         }
+        if let Some(retention) = manifest.get("retention") {
+            crate::retention::registry::restore(self.publisher()?, record, retention).await?;
+        }
 
         Ok(RestoreResult {
             ledger_id: new_ledger_id.to_string(),

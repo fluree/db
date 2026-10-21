@@ -5469,6 +5469,11 @@ impl Fluree {
         if let Some(ctx_cid) = record.default_context.as_ref() {
             manifest["default_context_id"] = serde_json::Value::String(ctx_cid.to_string());
         }
+        // The removal journal, so the restored ledger serves no history this
+        // one no longer serves.
+        if let Some(retention) = self.retention_archive_section(&canonical_id).await? {
+            manifest["retention"] = retention;
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<pack::PackChunk>(64);
 

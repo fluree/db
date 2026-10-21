@@ -69,11 +69,6 @@ fn is_retention_config_term(flake: &Flake) -> bool {
                 || &*c.name == local(config_iris::RETENTION_PROPERTY_CLASS)))
 }
 
-/// Whether `f:noHistory: true` may be activated. Index-history suppression
-/// is not implemented yet, so activating it is refused rather than accepted
-/// as a no-op.
-const NO_HISTORY_SUPPORTED: bool = true;
-
 /// Validate what a staged write carries for retention and mark its commit.
 ///
 /// `authoring` is false for branch operations, which carry instructions an
@@ -113,20 +108,8 @@ async fn validate_retention_config(view: &StagedLedger) -> Result<(), GuardError
         return Ok(());
     };
     let mut problems: Vec<String> = Vec::new();
-    let check_group = |group: &fluree_db_core::ledger_config::RetentionDefaults,
-                       problems: &mut Vec<String>| {
-        problems.extend(group.problems.iter().cloned());
-        for entry in &group.properties {
-            if !NO_HISTORY_SUPPORTED && entry.no_history == Some(true) {
-                problems.push(format!(
-                    "f:noHistory true on <{}> is not supported yet",
-                    entry.target
-                ));
-            }
-        }
-    };
     if let Some(group) = &config.retention {
-        check_group(group, &mut problems);
+        problems.extend(group.problems.iter().cloned());
     }
     let mut graphs_with_retention: HashMap<&str, usize> = HashMap::new();
     for graph in &config.graph_overrides {
@@ -143,7 +126,7 @@ async fn validate_retention_config(view: &StagedLedger) -> Result<(), GuardError
             ));
         }
         *graphs_with_retention.entry(target).or_default() += 1;
-        check_group(group, &mut problems);
+        problems.extend(group.problems.iter().cloned());
     }
     for (target, count) in graphs_with_retention {
         if count > 1 {

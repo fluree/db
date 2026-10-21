@@ -216,6 +216,10 @@ pub struct NsRecordResponse {
     /// compute) modes. Omitted when the posture could not be resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serving: Option<Vec<&'static str>>,
+    /// The ledger's retention activation and removal journal, for archives
+    /// built from this record. Omitted for a ledger without retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<serde_json::Value>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -520,6 +524,11 @@ pub async fn get_ns_record(
         branches: ns_record.branches,
         storage_root: ns_record.storage_root.clone(),
         serving,
+        retention: state
+            .fluree
+            .retention_archive_section(&ledger_id)
+            .await
+            .map_err(ServerError::Api)?,
     };
     let body_bytes = serde_json::to_vec(&body).map_err(|e| ServerError::internal(e.to_string()))?;
 

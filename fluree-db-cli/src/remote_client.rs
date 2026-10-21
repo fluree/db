@@ -2755,11 +2755,43 @@ impl RemoteLedgerClient {
             ))
         })?;
 
-        let manifest = build_archive_manifest(ns_record, request.want_index_root_id.is_some());
+        let mut manifest = build_archive_manifest(ns_record, request.want_index_root_id.is_some());
+        // The removal journal, so a copy restored from the archive serves
+        // no history the source no longer serves.
+        if let Some(retention) = self.fetch_ns_retention(ledger).await? {
+            manifest["retention"] = retention;
+        }
         let stream = resp
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string()));
         splice_archive_stream(stream, writer, &manifest).await
+    }
+
+    /// The retention section the storage proxy reports beside a ledger's
+    /// NsRecord: present only for a ledger with a retention registration.
+    async fn fetch_ns_retention(
+        &self,
+        ledger: &str,
+    ) -> Result<Option<serde_json::Value>, RemoteLedgerError> {
+        let url = format!(
+            "{}/storage/ns/{}",
+            self.base_url,
+            encode_ledger_segment(ledger)
+        );
+        let resp = self
+            .send_raw(reqwest::Method::GET, &url, "application/json", None, None)
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+        let mut body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))?;
+        Ok(body
+            .get_mut("retention")
+            .map(serde_json::Value::take)
+            .filter(|v| !v.is_null()))
     }
 
     /// Fetch the NsRecord via the storage proxy.

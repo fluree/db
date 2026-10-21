@@ -722,3 +722,49 @@ async fn sparql_time_travel_honors_a_removal() {
         1
     );
 }
+
+/// A ledger archive carries the removal journal: a copy restored from it
+/// refuses the same history its source did.
+#[tokio::test]
+async fn a_restored_archive_keeps_the_removal_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let id = ledger(&fluree, "it/removal-archive").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@old"},
+            {"@id": "ex:bob", "ex:email": "b@old"}
+        ]}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    let restored = fluree
+        .restore_ledger("it/removal-restored", &mut archive.as_slice())
+        .await
+        .expect("restore")
+        .ledger_id;
+
+    let at_t1 = json!(format!("{restored}@t:{t1}"));
+    assert!(unavailable(
+        read(&fluree, &restored, at_t1.clone(), "ex:alice", "ex:email").await
+    ));
+    assert_eq!(
+        read(&fluree, &restored, at_t1, "ex:bob", "ex:email")
+            .await
+            .unwrap(),
+        vec![json!("b@old")]
+    );
+}
