@@ -56,6 +56,7 @@ use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, Fast
 use fluree_db_query::BinaryRangeProvider;
 use num_bigint::BigInt;
 use rustc_hash::{FxHashMap, FxHasher};
+use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -654,7 +655,8 @@ impl<'l> FactIdentity<'l> {
         // Every retraction of a key pairs with an assertion of it: one fact
         // can be retracted under several terms (novelty holding a big integer
         // under two subtypes), and a retraction left over would still pair.
-        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), Vec<&'f Flake>> =
+        // One per key is the usual case, held inline.
+        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), SmallVec<[&'f Flake; 1]>> =
             FxHashMap::default();
         for &f in slot
             .iter()
