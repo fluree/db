@@ -198,9 +198,9 @@ impl EmbeddedRaftNode {
             .map(|rx| spawn_release_task(Arc::clone(&fluree), rx));
 
         let nameservice = integration.nameservice();
-        // A cluster writes SHA2-256 only: minting another hash needs every
-        // member, present and future, to read it, which membership does not
-        // yet record or enforce.
+        // A cluster writes and admits SHA2-256 only: another hash needs
+        // every member, present and future, to read it, which membership
+        // does not yet record or enforce.
         if fluree.configured_content_hash() != fluree_db_core::HashAlgorithm::Sha2_256 {
             tracing::warn!(
                 configured = %fluree.configured_content_hash(),
@@ -208,8 +208,8 @@ impl EmbeddedRaftNode {
             );
         }
         fluree.set_content_hash_readers_confirmed(false);
-        // Historical reads of retention-enabled ledgers confirm this
-        // replica's removal journal is current.
+        // Historical reads confirm this replica's removal journal is
+        // current.
         fluree.set_retention_replicas(Arc::new(
             crate::raft::nameservice::read_index::RaftReplicaSync(Arc::clone(&nameservice)),
         ));

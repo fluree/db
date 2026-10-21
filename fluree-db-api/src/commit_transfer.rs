@@ -370,6 +370,8 @@ impl Fluree {
         // 2.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
         let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        admit_bundle_hashes(self, decoded.iter().chain(&merged), &request.blobs)
+            .map_err(PushError::into_api_error)?;
         validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
         let content_store = self.branched_content_store(base_state.ledger_id()).await?;
         validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
@@ -766,6 +768,7 @@ impl Fluree {
 struct PushCommitDecoded {
     commit: fluree_db_novelty::Commit,
     bytes: Vec<u8>,
+    id: ContentId,
     /// The commit's address digest (its CID's, algorithm included).
     digest_hex: String,
 }
@@ -785,6 +788,37 @@ fn pushed_commit_id(
         ))),
         None => Ok(ContentId::new(ContentKind::Commit, bytes)),
     }
+}
+
+/// Refuse a bundle holding content `fluree` does not admit (see
+/// [`Fluree::admits_content_id`]): its commits, the parents and
+/// transactions they reference, and the blobs riding with them.
+fn admit_bundle_hashes<'a>(
+    fluree: &Fluree,
+    commits: impl IntoIterator<Item = &'a PushCommitDecoded>,
+    blobs: &HashMap<String, Base64Bytes>,
+) -> std::result::Result<(), PushError> {
+    let refuse = |id: &ContentId| {
+        if fluree.admits_content_id(id) {
+            Ok(())
+        } else {
+            Err(PushError::Invalid(format!(
+                "{id} is not hashed with SHA2-256, the only hash this cluster admits"
+            )))
+        }
+    };
+    for decoded in commits {
+        refuse(&decoded.id)?;
+        for id in decoded.commit.parents.iter().chain(&decoded.commit.txn) {
+            refuse(id)?;
+        }
+    }
+    for key in blobs.keys() {
+        if let Ok(id) = key.parse::<ContentId>() {
+            refuse(&id)?;
+        }
+    }
+    Ok(())
 }
 
 /// The CIDs named for `count` pushed commits, if the sender named them.
@@ -940,9 +974,8 @@ fn decode_and_validate_commit_chain(
             )));
         }
 
-        let digest_hex =
-            pushed_commit_id(ids.map(|ids| &ids[idx]), &bytes, &format!("commit[{idx}]"))?
-                .address_digest();
+        let id = pushed_commit_id(ids.map(|ids| &ids[idx]), &bytes, &format!("commit[{idx}]"))?;
+        let digest_hex = id.address_digest();
 
         // Note: commit blobs are applied to the server-selected `ledger_id` via CAS.
         // We do not currently enforce a ledger identity embedded inside the commit bytes.
@@ -982,6 +1015,7 @@ fn decode_and_validate_commit_chain(
         out.push(PushCommitDecoded {
             commit,
             bytes,
+            id,
             digest_hex,
         });
     }
@@ -1011,15 +1045,16 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
-            let digest_hex = pushed_commit_id(
+            let id = pushed_commit_id(
                 ids.map(|ids| &ids[idx]),
                 &bytes,
                 &format!("merged_commits[{idx}]"),
-            )?
-            .address_digest();
+            )?;
+            let digest_hex = id.address_digest();
             Ok(PushCommitDecoded {
                 commit,
                 bytes,
+                id,
                 digest_hex,
             })
         })
@@ -2242,6 +2277,15 @@ impl Fluree {
                                             "invalid .flpack: Data frame before Header",
                                         ));
                                     }
+                                    if !self.admits_content_id(&cid) {
+                                        return Err(ApiError::http(
+                                            422,
+                                            format!(
+                                                "archived {cid} is not hashed with SHA2-256, \
+                                                 the only hash this cluster admits"
+                                            ),
+                                        ));
+                                    }
                                     // Count at dispatch: any write failure aborts the
                                     // whole restore (and rolls it back), so only the
                                     // success path ever returns these counts.
@@ -2569,6 +2613,8 @@ impl Fluree {
         // 4.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
         let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        admit_bundle_hashes(self, decoded.iter().chain(&merged), &request.blobs)
+            .map_err(PushError::into_api_error)?;
         validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
         let content_store = self.branched_content_store(base_state.ledger_id()).await?;
         validate_ancestry_present(content_store.as_ref(), &decoded, &merged)

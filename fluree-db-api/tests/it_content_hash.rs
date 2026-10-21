@@ -371,3 +371,57 @@ async fn unsupported_hashes_are_refused_by_the_store() {
     assert_eq!(bogus.hash_algorithm(), None);
     assert!(store.put_with_id(&bogus, &[0, 1, 2]).await.is_err());
 }
+
+/// An instance whose readers are not known to support SHA2-512 (a cluster
+/// member) admits none of it, by push, pull or restore.
+#[tokio::test]
+async fn unconfirmed_readers_refuse_other_hashes_on_every_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = file_fluree(dir.path(), HashAlgorithm::Sha2_512);
+    source.create_ledger(LEDGER).await.unwrap();
+    insert_name(&source, LEDGER, "alice", "Alice").await;
+    insert_name(&source, LEDGER, "bob", "Bob").await;
+
+    let receiver = FlureeBuilder::memory().build_memory();
+    receiver.set_content_hash_readers_confirmed(false);
+    let refused = |e: fluree_db_api::ApiError| e.to_string().contains("SHA2-256");
+
+    let pushed = "it/content-hash-member-push:main";
+    receiver.create_ledger(pushed).await.unwrap();
+    let push = receiver
+        .push_commits(
+            pushed,
+            bundle(&source, LEDGER, true).await,
+            &GovernanceOptions::default(),
+            &index_config(),
+        )
+        .await;
+    assert!(push.is_err_and(refused), "push admitted SHA2-512");
+
+    let pulled = "it/content-hash-member-pull:main";
+    receiver.create_ledger(pulled).await.unwrap();
+    let pull = receiver
+        .import_commits_incremental(pulled, bundle(&source, LEDGER, true).await)
+        .await;
+    assert!(pull.is_err_and(refused), "pull admitted SHA2-512");
+
+    let mut archive = Vec::new();
+    source
+        .archive_ledger(LEDGER, false, &mut archive)
+        .await
+        .expect("archive");
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = file_fluree(target_dir.path(), HashAlgorithm::Sha2_256);
+    target.set_content_hash_readers_confirmed(false);
+    let restored = "it/content-hash-member-restore";
+    let restore = target
+        .restore_ledger(restored, &mut archive.as_slice())
+        .await;
+    assert!(restore.is_err_and(refused), "restore admitted SHA2-512");
+    // The name was released: once confirmed, the same restore succeeds.
+    target.set_content_hash_readers_confirmed(true);
+    target
+        .restore_ledger(restored, &mut archive.as_slice())
+        .await
+        .expect("restore once confirmed");
+}

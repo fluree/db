@@ -807,6 +807,8 @@ impl Committer for QueuedTransactor {
         let content_store = self.fluree.content_store(&namespace);
         // A commit the sender named is stored under that CID, checked
         // against its bytes; one it did not is the SHA2-256 of its bytes.
+        // What the commits reference is checked when they are staged.
+        let fluree = &self.fluree;
         let upload = |blobs: Vec<Vec<u8>>, named: Vec<ContentId>| {
             let content_store = content_store.clone();
             async move {
@@ -817,6 +819,15 @@ impl Committer for QueuedTransactor {
                             "push names {} CIDs for {} commits",
                             named.len(),
                             blobs.len()
+                        ),
+                    });
+                }
+                if let Some(id) = named.iter().find(|id| !fluree.admits_content_id(id)) {
+                    return Err(SubmissionError::Execution {
+                        status: 422,
+                        message: format!(
+                            "pushed commit {id} is not hashed with SHA2-256, the only hash \
+                             this cluster admits"
                         ),
                     });
                 }
