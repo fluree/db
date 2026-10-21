@@ -30,6 +30,8 @@ use fluree_db_core::index_stats::{
 use fluree_db_core::sid::Sid;
 use std::io;
 
+pub use fluree_db_core::stats_wire::GraphWidth;
+
 // ============================================================================
 // Shared helpers: Sid wire encoding
 // ============================================================================
@@ -132,7 +134,7 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
     let mut sorted_graphs: Vec<&GraphStatsEntry> = graphs.iter().collect();
     sorted_graphs.sort_by_key(|g| g.g_id);
 
-    buf.extend_from_slice(&(sorted_graphs.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&(sorted_graphs.len() as u32).to_le_bytes());
     for g in &sorted_graphs {
         buf.extend_from_slice(&g.g_id.to_le_bytes());
         buf.extend_from_slice(&g.flakes.to_le_bytes());
@@ -235,7 +237,7 @@ const HISTORICAL_TAIL_TAG: u8 = 1;
 ///     [sid tuple][n: u8][n tag bytes]
 /// [graph_count: u16 LE]
 ///   per graph (sorted by g_id; graphs with no sets skipped):
-///     [g_id: u16 LE][prop_count: u32 LE]
+///     [g_id: u32 LE][prop_count: u32 LE]
 ///     per property (sorted by p_id; empty sets skipped):
 ///       [p_id: u32 LE][n: u8][n tag bytes]
 /// ```
@@ -285,7 +287,7 @@ fn encode_historical_tail(buf: &mut Vec<u8>, stats: &IndexStats) {
         })
         .collect();
     graph_sets.sort_by_key(|&(g_id, _)| g_id);
-    buf.extend_from_slice(&(graph_sets.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&(graph_sets.len() as u32).to_le_bytes());
     for (g_id, props) in &graph_sets {
         buf.extend_from_slice(&g_id.to_le_bytes());
         buf.extend_from_slice(&(props.len() as u32).to_le_bytes());
@@ -373,12 +375,12 @@ fn encode_datatypes(buf: &mut Vec<u8>, datatypes: &[(u8, u64)]) {
 /// Thin wrapper over [`decode_stats_with_len`] — one implementation parses
 /// the format (including the historical tail), so a field cannot be filled by
 /// one entry point and forgotten by the other.
-pub fn decode_stats(data: &[u8]) -> io::Result<IndexStats> {
-    decode_stats_with_len(data).map(|(stats, _)| stats)
+pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<IndexStats> {
+    decode_stats_with_len(data, width).map(|(stats, _)| stats)
 }
 
 /// One graph's rows in the tail: `(g_id, [(p_id, tags)])`.
-type GraphTagSets = Vec<(u16, Vec<(u32, Vec<u8>)>)>;
+type GraphTagSets = Vec<(fluree_db_core::GraphId, Vec<(u32, Vec<u8>)>)>;
 
 // ============================================================================
 // Schema encode
@@ -500,8 +502,8 @@ pub fn decode_schema(data: &[u8]) -> io::Result<IndexSchema> {
 /// Decode stats and the number of bytes consumed. The format has one parser,
 /// `fluree_db_core::stats_wire::decode_stats`, shared with the snapshot's
 /// metadata-only root decoder.
-pub fn decode_stats_with_len(data: &[u8]) -> io::Result<(IndexStats, usize)> {
-    fluree_db_core::stats_wire::decode_stats(data)
+pub fn decode_stats_with_len(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, usize)> {
+    fluree_db_core::stats_wire::decode_stats(data, width)
 }
 
 /// Decode schema and return bytes consumed.
@@ -591,7 +593,7 @@ mod tests {
         };
 
         let bytes = encode_stats(&stats);
-        let decoded = decode_stats(&bytes).unwrap();
+        let decoded = decode_stats(&bytes, GraphWidth::Wide).unwrap();
 
         assert_eq!(decoded.flakes, 0);
         assert_eq!(decoded.size, 0);
@@ -649,7 +651,7 @@ mod tests {
         };
 
         let bytes = encode_stats(&stats);
-        let decoded = decode_stats(&bytes).unwrap();
+        let decoded = decode_stats(&bytes, GraphWidth::Wide).unwrap();
 
         assert_eq!(decoded.flakes, 50_000);
         assert_eq!(decoded.size, 1_000_000);
@@ -698,7 +700,7 @@ mod tests {
         };
 
         let bytes = encode_stats(&stats);
-        let decoded = decode_stats(&bytes).unwrap();
+        let decoded = decode_stats(&bytes, GraphWidth::Wide).unwrap();
 
         let props = decoded.properties.unwrap();
         assert_eq!(props.len(), 2);
@@ -746,7 +748,7 @@ mod tests {
         };
 
         let bytes = encode_stats(&stats);
-        let decoded = decode_stats(&bytes).unwrap();
+        let decoded = decode_stats(&bytes, GraphWidth::Wide).unwrap();
 
         let classes = decoded.classes.unwrap();
         assert_eq!(classes.len(), 1);
@@ -795,13 +797,14 @@ mod tests {
             count,
             properties,
         };
-        let graph = |g_id: u16, classes: Option<Vec<ClassStatEntry>>| GraphStatsEntry {
-            g_id,
-            flakes: 10,
-            size: 0,
-            properties: vec![],
-            classes,
-        };
+        let graph =
+            |g_id: fluree_db_core::GraphId, classes: Option<Vec<ClassStatEntry>>| GraphStatsEntry {
+                g_id,
+                flakes: 10,
+                size: 0,
+                properties: vec![],
+                classes,
+            };
         vec![
             graph(
                 0,
@@ -869,9 +872,10 @@ mod tests {
             links: None,
         };
         let bytes = encode_stats(&stats);
-        let (via_core, consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        let (via_core, consumed) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
-        for decoded in [decode_stats(&bytes).unwrap(), via_core] {
+        for decoded in [decode_stats(&bytes, GraphWidth::Wide).unwrap(), via_core] {
             assert_eq!(
                 decoded.historical_since_t,
                 Some(0),
@@ -948,7 +952,7 @@ mod tests {
         b.extend_from_slice(&0u32.to_le_bytes()); // aggregate properties
         b.extend_from_slice(&0u32.to_le_bytes()); // aggregate classes
 
-        let decoded = decode_stats(&b).unwrap();
+        let decoded = decode_stats(&b, GraphWidth::Narrow).unwrap();
         let graph = &decoded.graphs.as_ref().unwrap()[0];
         let classes = graph.classes.as_ref().unwrap();
         assert_eq!(classes[0].class_sid, sid(5, "Person"));
@@ -975,7 +979,7 @@ mod tests {
                 }],
             }],
         };
-        let graph = |g_id: u16, classes: Vec<ClassStatEntry>| GraphStatsEntry {
+        let graph = |g_id: fluree_db_core::GraphId, classes: Vec<ClassStatEntry>| GraphStatsEntry {
             g_id,
             flakes: 10,
             size: 0,
@@ -1008,8 +1012,15 @@ mod tests {
             want.contains("count: 7"),
             "Person summed across graphs: {want}"
         );
-        assert_eq!(format!("{:?}", decode_stats(&bytes).unwrap().classes), want);
-        let (via_core, consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(
+            format!(
+                "{:?}",
+                decode_stats(&bytes, GraphWidth::Wide).unwrap().classes
+            ),
+            want
+        );
+        let (via_core, consumed) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(format!("{:?}", via_core.classes), want);
     }
@@ -1071,7 +1082,7 @@ mod tests {
         };
 
         let bytes = encode_stats(&stats);
-        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (decoded, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.flakes, 42);
     }
@@ -1113,14 +1124,14 @@ mod tests {
         let bytes = encode_stats(&stats);
         let expected = vec![1u8, 7];
 
-        let via_decode_stats = decode_stats(&bytes).unwrap();
+        let via_decode_stats = decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(
             via_decode_stats.properties.as_ref().unwrap()[0].observed_datatypes,
             expected,
             "binary-index decode_stats did not re-derive observed_datatypes"
         );
 
-        let (via_with_len, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (via_with_len, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(
             via_with_len.properties.as_ref().unwrap()[0].observed_datatypes,
@@ -1128,7 +1139,8 @@ mod tests {
             "binary-index decode_stats_with_len did not re-derive observed_datatypes"
         );
 
-        let (via_core, _) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        let (via_core, _) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(
             via_core.properties.as_ref().unwrap()[0].observed_datatypes,
             expected,
@@ -1207,11 +1219,12 @@ mod tests {
             assert_eq!(gp.observed_datatypes, vec![1, 7], "{who}: graph observed");
         };
 
-        let (via_with_len, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (via_with_len, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len(), "tail bytes left unconsumed");
         check(&via_with_len, "decode_stats_with_len");
 
-        let (via_core, core_consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        let (via_core, core_consumed) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(core_consumed, bytes.len());
         check(&via_core, "fluree-db-core mirror");
     }
@@ -1226,7 +1239,7 @@ mod tests {
         stats.historical_since_t = None; // encoder writes no tail
 
         let bytes = encode_stats(&stats);
-        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (decoded, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.historical_since_t, None);
         assert!(decoded.properties.as_ref().unwrap()[0]
@@ -1236,7 +1249,8 @@ mod tests {
             .historical_datatypes
             .is_empty());
 
-        let (via_core, _) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        let (via_core, _) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(via_core.historical_since_t, None);
     }
 
@@ -1287,11 +1301,12 @@ mod tests {
                 count: 231_170,
             },
         ];
-        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (decoded, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.links.as_ref(), Some(&expected));
         assert_eq!(decoded.historical_since_t, Some(2), "historical tail kept");
-        let (via_core, _) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        let (via_core, _) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(via_core.links, Some(expected));
 
         let without = encode_stats(&stats_with_historical());
@@ -1300,7 +1315,7 @@ mod tests {
             &without[..],
             "appended, not interleaved"
         );
-        let (decoded, _) = decode_stats_with_len(&without).unwrap();
+        let (decoded, _) = decode_stats_with_len(&without, GraphWidth::Wide).unwrap();
         assert_eq!(decoded.links, None);
     }
 
@@ -1315,11 +1330,12 @@ mod tests {
         bytes.push(255); // future tail version
         bytes.extend_from_slice(&[1, 2, 3, 4]); // opaque future payload
 
-        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (decoded, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.historical_since_t, None);
 
-        let (via_core, core_consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        let (via_core, core_consumed) =
+            fluree_db_core::stats_wire::decode_stats(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(core_consumed, bytes.len());
         assert_eq!(via_core.historical_since_t, None);
     }
@@ -1337,7 +1353,7 @@ mod tests {
             .clear();
 
         let bytes = encode_stats(&stats);
-        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        let (decoded, consumed) = decode_stats_with_len(&bytes, GraphWidth::Wide).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.historical_since_t, Some(2));
         assert!(decoded.properties.as_ref().unwrap()[0]

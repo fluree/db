@@ -12,7 +12,7 @@
 //! | field          | type     |
 //! |----------------|----------|
 //! | magic          | `FHLL`   |
-//! | version        | u16 = 2  |
+//! | version        | u16 = 3  |
 //! | precision      | u8 = 8   |
 //! | index_t        | i64      |
 //! | entry count    | u32      |
@@ -21,7 +21,7 @@
 //! then one zstd frame whose decompressed payload is the entries, sorted by
 //! `(g_id, p_id)`:
 //!
-//! `g_id u16, p_id u32, count u64, last_modified_t i64, n_datatypes u8,
+//! `g_id u32, p_id u32, count u64, last_modified_t i64, n_datatypes u8,
 //! n × (tag u8, count u64), values HLL, subjects HLL`
 //!
 //! Each HLL is a representation tag followed by either 256 register bytes
@@ -29,6 +29,10 @@
 //! sorted by index (sparse), whichever is smaller; ties go to dense. Most
 //! (graph, property) entries in a many-graph ledger touch a handful of
 //! registers, which is what makes sparse worth a second representation.
+//!
+//! # Format v2 (read only)
+//!
+//! `main`'s format: the same, with `g_id u16`.
 //!
 //! # Format v1 (read only)
 //!
@@ -46,7 +50,10 @@ use fluree_db_core::GraphId;
 use super::id_hook::{GraphPropertyKey, IdPropertyHll};
 
 const MAGIC: [u8; 4] = *b"FHLL";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
+
+/// `main`'s binary format: 16-bit graph ids. Read, never written.
+const FORMAT_VERSION_MAIN: u16 = 2;
 const HEADER_LEN: usize = 4 + 2 + 1 + 8 + 4 + 4;
 const ZSTD_LEVEL: i32 = 1;
 /// Far above any plausible sketch; bounds what a corrupt or hostile header
@@ -61,7 +68,7 @@ const HLL_DENSE: u8 = 0;
 const HLL_SPARSE: u8 = 1;
 
 /// Smallest encoded entry: fixed fields, no datatypes, two empty sparse HLLs.
-const MIN_ENTRY_LEN: usize = 2 + 4 + 8 + 8 + 1 + 2 * 3;
+const MIN_ENTRY_LEN: usize = 4 + 4 + 8 + 8 + 1 + 2 * 3;
 
 /// Why a persisted sketch could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -277,7 +284,7 @@ fn decode_v2(bytes: &[u8]) -> std::result::Result<HllSketchBlob, SketchDecodeErr
         })?);
     header.take(MAGIC.len())?;
     let version = header.u16()?;
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_MAIN {
         return Err(SketchDecodeError::Unsupported(format!(
             "format version {version}"
         )));
@@ -294,7 +301,9 @@ fn decode_v2(bytes: &[u8]) -> std::result::Result<HllSketchBlob, SketchDecodeErr
 
     let payload = decompress(&bytes[HEADER_LEN..], payload_len)?;
 
-    if entry_count > payload.len() / MIN_ENTRY_LEN {
+    let narrow = version == FORMAT_VERSION_MAIN;
+    let min_entry_len = MIN_ENTRY_LEN - if narrow { 2 } else { 0 };
+    if entry_count > payload.len() / min_entry_len {
         return Err(malformed(format!(
             "{entry_count} entries cannot fit in {} payload bytes",
             payload.len()
@@ -303,7 +312,11 @@ fn decode_v2(bytes: &[u8]) -> std::result::Result<HllSketchBlob, SketchDecodeErr
     let mut r = Cursor::new(&payload);
     let mut entries: Vec<HllPropertyEntry> = Vec::with_capacity(entry_count);
     for _ in 0..entry_count {
-        let g_id = r.u16()?;
+        let g_id = if narrow {
+            u32::from(r.u16()?)
+        } else {
+            r.u32()?
+        };
         let p_id = r.u32()?;
         if let Some(prev) = entries.last() {
             if (prev.g_id, prev.p_id) >= (g_id, p_id) {
@@ -722,7 +735,7 @@ mod tests {
 
     #[test]
     fn bytes_do_not_depend_on_insertion_order() {
-        let encode = |order: &[(u16, u32)]| {
+        let encode = |order: &[(GraphId, u32)]| {
             let mut source = fixture_properties();
             let mut map = HashMap::new();
             for &(g_id, p_id) in order {
@@ -768,7 +781,7 @@ mod tests {
     }
 
     fn entry(
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         p_id: u32,
         datatypes: &[(u8, u64)],
         values: &[u8],
@@ -852,6 +865,24 @@ mod tests {
         assert_eq!(blob.entries[0].values_hll.registers()[4], 57);
     }
 
+    /// A graph id past 16 bits round-trips, and `main`'s v2 sketch (16-bit
+    /// graph ids) still decodes, so a `main` ledger's first v5 index carries
+    /// its registers forward.
+    #[test]
+    fn graph_ids_are_32_bit_and_main_sketches_decode() {
+        let payload = entry(70_000, 1, &[], &sparse(&[(4, 57)]), &sparse(&[]));
+        let blob = HllSketchBlob::from_bytes(&Header::entries(1).encode(&payload)).unwrap();
+        assert_eq!(blob.entries[0].g_id, 70_000);
+
+        let mut main_payload = 9u16.to_le_bytes().to_vec();
+        main_payload.extend_from_slice(&entry(0, 1, &[], &sparse(&[(4, 57)]), &sparse(&[]))[4..]);
+        let mut header = Header::entries(1);
+        header.version = FORMAT_VERSION_MAIN;
+        let blob = HllSketchBlob::from_bytes(&header.encode(&main_payload)).unwrap();
+        assert_eq!(blob.entries[0].g_id, 9);
+        assert_eq!(blob.entries[0].values_hll.registers()[4], 57);
+    }
+
     #[test]
     fn rejects_every_truncation() {
         let bytes = HllSketchBlob::from_properties(10, &fixture_properties())
@@ -885,8 +916,8 @@ mod tests {
     fn unsupported_version_and_precision_are_distinct_from_corruption() {
         let payload = entry(0, 1, &[], &sparse(&[]), &sparse(&[]));
         let mut header = Header::entries(1);
-        header.version = 3;
-        assert!(unsupported_err(&header.encode(&payload)).contains("version 3"));
+        header.version = 4;
+        assert!(unsupported_err(&header.encode(&payload)).contains("version 4"));
 
         let mut header = Header::entries(1);
         header.precision = 12;

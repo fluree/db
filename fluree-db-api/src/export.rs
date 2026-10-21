@@ -5,12 +5,14 @@
 
 use crate::export_annotations::AnnotationProbe;
 use fluree_db_binary_index::format::branch::BranchManifest;
+use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::read::types::sort_overlay_ops;
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::edge::EdgeKey;
+use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
 use fluree_db_query::binary_scan::{
@@ -117,19 +119,58 @@ pub fn is_system_graph(g_id: GraphId) -> bool {
     g_id == SYSTEM_GRAPH_TXN_META || g_id == SYSTEM_GRAPH_CONFIG
 }
 
-/// The SPOT branch to scan for `g_id`, or an empty one.
+/// A cursor over `g_id`'s rows in SPOT order: its own SPOT branch, the
+/// pooled tree's GSPO range for the graph, or an empty branch.
 ///
 /// A graph with no branch is not a graph with no rows: an un-indexed ledger has
 /// no branch for *any* graph while holding its whole contents in the novelty
 /// overlay, and an indexed ledger has no branch for a graph first written after
-/// the last index build. Returning an empty [`BranchManifest`] rather than
-/// bailing lets [`BinaryCursor`] exhaust its (zero-length) leaf range and fall
-/// through to its overlay-only tail, which emits exactly those rows. Bailing
-/// instead is what made `fluree export` fail on a never-indexed ledger.
-fn spot_branch(store: &Arc<BinaryIndexStore>, g_id: GraphId) -> Arc<BranchManifest> {
-    match store.branch_for_order(g_id, RunSortOrder::Spot) {
-        Some(b) => Arc::clone(b),
-        None => Arc::new(BranchManifest { leaves: Vec::new() }),
+/// the last index build. An empty [`BranchManifest`] rather than bailing lets
+/// [`BinaryCursor`] exhaust its (zero-length) leaf range and fall through to its
+/// overlay-only tail, which emits exactly those rows. Bailing instead is what
+/// made `fluree export` fail on a never-indexed ledger.
+///
+/// With the graph fixed, GSPO rows come in SPOT order, so overlay ops sorted
+/// by SPOT (all carrying this graph) merge as they do for a dedicated tree.
+fn spot_cursor(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    projection: ColumnProjection,
+) -> BinaryCursor {
+    match store.graph_tree(g_id, RunSortOrder::Spot) {
+        Some(tree) if tree.g_filter.is_some() => {
+            let bound = |s: u64, p: u32, o_type: u16, o: u64, o_i: u32| RunRecordV2 {
+                s_id: SubjectId(s),
+                o_key: o,
+                p_id: p,
+                t: 0,
+                o_i,
+                o_type,
+                g_id,
+            };
+            BinaryCursor::new(
+                Arc::clone(store),
+                tree.order,
+                tree.branch,
+                &bound(0, 0, 0, 0, 0),
+                &bound(u64::MAX, u32::MAX, u16::MAX, u64::MAX, u32::MAX),
+                BinaryFilter {
+                    g_id: tree.g_filter,
+                    ..Default::default()
+                },
+                projection,
+            )
+        }
+        tree => BinaryCursor::scan_all(
+            Arc::clone(store),
+            RunSortOrder::Spot,
+            tree.map_or_else(
+                || Arc::new(BranchManifest { leaves: Vec::new() }),
+                |t| t.branch,
+            ),
+            BinaryFilter::default(),
+            projection,
+        ),
     }
 }
 
@@ -583,22 +624,11 @@ pub async fn export_graph_turtle<W: Write>(
     prefixes: &PrefixMap,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch = spot_branch(store, config.g_id);
-
-    let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
     // the cursor merges base rows against overlay ops on the full V3 identity
     // (s_id, p_id, o_type, o_key, o_i). A narrower projection makes the missing
     // columns read as defaults and corrupts the merge.
-    let projection = ColumnProjection::all();
-
-    let mut cursor = BinaryCursor::scan_all(
-        Arc::clone(store),
-        RunSortOrder::Spot,
-        branch,
-        filter,
-        projection,
-    );
+    let mut cursor = spot_cursor(store, config.g_id, ColumnProjection::all());
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
     let ann = AnnotationContext::new(&resolver, config);
@@ -897,22 +927,11 @@ pub async fn export_graph_jsonld<W: Write>(
     prefixes: &PrefixMap,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch = spot_branch(store, config.g_id);
-
-    let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
     // the cursor merges base rows against overlay ops on the full V3 identity
     // (s_id, p_id, o_type, o_key, o_i). A narrower projection makes the missing
     // columns read as defaults and corrupts the merge.
-    let projection = ColumnProjection::all();
-
-    let mut cursor = BinaryCursor::scan_all(
-        Arc::clone(store),
-        RunSortOrder::Spot,
-        branch,
-        filter,
-        projection,
-    );
+    let mut cursor = spot_cursor(store, config.g_id, ColumnProjection::all());
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
     let ann = AnnotationContext::new(&resolver, config);
@@ -1606,22 +1625,11 @@ pub async fn export_graph_ntriples<W: Write>(
     config: &ExportConfig<'_>,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch = spot_branch(store, config.g_id);
-
-    let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
     // the cursor merges base rows against overlay ops on the full V3 identity
     // (s_id, p_id, o_type, o_key, o_i). A narrower projection makes the missing
     // columns read as defaults and corrupts the merge.
-    let projection = ColumnProjection::all();
-
-    let mut cursor = BinaryCursor::scan_all(
-        Arc::clone(store),
-        RunSortOrder::Spot,
-        branch,
-        filter,
-        projection,
-    );
+    let mut cursor = spot_cursor(store, config.g_id, ColumnProjection::all());
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
     let ann = AnnotationContext::new(&resolver, config);

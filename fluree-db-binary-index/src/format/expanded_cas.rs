@@ -5,7 +5,8 @@
 //! garbage-record diff production — also need the CIDs sitting behind
 //! the root's branch manifests:
 //!
-//! - **Named-graph branches** (`FBR3`) routing to leaf + sidecar CIDs.
+//! - **Named-graph and pooled-tree branches** (`FBR3`) routing to leaf +
+//!   sidecar CIDs.
 //! - **Legacy annotation-arena branches**, which old roots still name and
 //!   whose leaves stay reachable until a build releases them.
 //!
@@ -116,10 +117,8 @@ impl ChainCasIds {
     pub async fn add_root(&mut self, store: &dyn ContentStore, root: &IndexRoot) -> Result<()> {
         self.ids.extend(root.all_cas_ids());
 
-        for named_graph in &root.named_graphs {
-            for (_, branch_cid) in &named_graph.orders {
-                self.expand_named_graph_branch(store, branch_cid).await?;
-            }
+        for branch_cid in root.branches().map(|(_, _, cid)| cid) {
+            self.expand_named_graph_branch(store, branch_cid).await?;
         }
 
         if let Some(ref arena) = root.legacy_annotation_arena {
@@ -141,7 +140,7 @@ impl ChainCasIds {
         self.ids
     }
 
-    /// Named-graph branch (`FBR3`) → leaf + sidecar CIDs.
+    /// Named-graph or pooled-tree branch (`FBR3`) → leaf + sidecar CIDs.
     async fn expand_named_graph_branch(
         &mut self,
         store: &dyn ContentStore,
@@ -226,30 +225,28 @@ pub async fn collect_root_cas_ids_expanded_tolerant(
 ) -> HashSet<ContentId> {
     let mut ids: HashSet<ContentId> = root.all_cas_ids().into_iter().collect();
 
-    for ng in &root.named_graphs {
-        for (_, branch_cid) in &ng.orders {
-            match store.get(branch_cid).await {
-                Ok(bytes) => match read_branch_from_bytes(&bytes) {
-                    Ok(manifest) => {
-                        for leaf in &manifest.leaves {
-                            ids.insert(leaf.leaf_cid.clone());
-                            if let Some(ref sc) = leaf.sidecar_cid {
-                                ids.insert(sc.clone());
-                            }
+    for branch_cid in root.branches().map(|(_, _, cid)| cid) {
+        match store.get(branch_cid).await {
+            Ok(bytes) => match read_branch_from_bytes(&bytes) {
+                Ok(manifest) => {
+                    for leaf in &manifest.leaves {
+                        ids.insert(leaf.leaf_cid.clone());
+                        if let Some(ref sc) = leaf.sidecar_cid {
+                            ids.insert(sc.clone());
                         }
                     }
-                    Err(e) => tracing::warn!(
-                        branch_cid = %branch_cid,
-                        error = %e,
-                        "failed to decode named-graph branch during CID expansion, skipping"
-                    ),
-                },
+                }
                 Err(e) => tracing::warn!(
                     branch_cid = %branch_cid,
                     error = %e,
-                    "failed to read named-graph branch during CID expansion, skipping"
+                    "failed to decode index branch during CID expansion, skipping"
                 ),
-            }
+            },
+            Err(e) => tracing::warn!(
+                branch_cid = %branch_cid,
+                error = %e,
+                "failed to read index branch during CID expansion, skipping"
+            ),
         }
     }
 
@@ -427,6 +424,7 @@ mod tests {
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            pool: None,
         }
     }
 
@@ -569,6 +567,52 @@ mod tests {
         let ids = collect_root_cas_ids_expanded_tolerant(&store, &root).await;
         // Still contains the direct branch CIDs from all_cas_ids().
         assert!(arena.branches().all(|branch| ids.contains(branch)));
+    }
+
+    /// The pooled tree's leaves and sidecars are as reachable as a named
+    /// graph's: pack, fork, sweep and drop all walk them.
+    #[tokio::test]
+    async fn pooled_branches_expand_in_both_modes() {
+        let store = MemoryContentStore::new();
+        let leaf_cid = store
+            .put(ContentKind::IndexLeaf, b"pooled-leaf")
+            .await
+            .unwrap();
+        let sidecar_cid = cid(ContentKind::HistorySidecar, b"pooled-sidecar");
+        let key = RunRecordV2 {
+            s_id: SubjectId(1),
+            o_key: 0,
+            p_id: 1,
+            t: 1,
+            o_i: LIST_INDEX_NONE,
+            o_type: 0,
+            g_id: 3,
+        };
+        let branch = build_branch_bytes(
+            RunSortOrder::Gspo,
+            0,
+            &[LeafEntry {
+                first_key: key,
+                last_key: key,
+                row_count: 1,
+                leaf_cid: leaf_cid.clone(),
+                sidecar_cid: Some(sidecar_cid.clone()),
+            }],
+        );
+        let branch_cid = store.put(ContentKind::IndexBranch, &branch).await.unwrap();
+        let mut root = minimal_root();
+        root.pool = Some(crate::format::index_root::PoolRouting {
+            members: vec![crate::format::index_root::PoolMember::new(3)],
+            orders: vec![(RunSortOrder::Gspo, branch_cid)],
+            deltas: Vec::new(),
+        });
+
+        let strict = collect_root_cas_ids_expanded(&store, &root).await.unwrap();
+        let tolerant = collect_root_cas_ids_expanded_tolerant(&store, &root).await;
+        for ids in [&strict, &tolerant] {
+            assert!(ids.contains(&leaf_cid), "pooled leaf missing");
+            assert!(ids.contains(&sidecar_cid), "pooled sidecar missing");
+        }
     }
 
     /// Roots that carry a manifest over unchanged must not make the chain

@@ -495,7 +495,7 @@ impl PatternOptionalBuilder {
         let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
         let mut matched = 0usize;
         let branch =
-            store.branch_for_order(ctx.binary_g_id, fluree_db_binary_index::RunSortOrder::Opst);
+            store.dedicated_branch(ctx.binary_g_id, fluree_db_binary_index::RunSortOrder::Opst);
         if let (Some(p_id), Some(branch)) = (store.sid_to_p_id(&pred_sid), branch) {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();

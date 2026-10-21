@@ -128,12 +128,15 @@ impl PeerState {
         let mut ledgers = self.ledgers.write().await;
 
         // A ledger created under the name since replaces the watermark, at
-        // whatever t it starts.
+        // whatever t it starts; so does another root at the index's t.
         let changed = match ledgers.get(ledger_id) {
             Some(existing) => {
                 existing.instance != instance
                     || commit_t > existing.commit_t
                     || index_t > existing.index_t
+                    || (index_t == existing.index_t
+                        && index_head_id.is_some()
+                        && index_head_id != existing.index_head_id)
             }
             None => true,
         };
@@ -402,6 +405,21 @@ mod tests {
 
         let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
         assert_eq!(ledger.index_t, 5);
+
+        // Another root at the same index_t (compaction, reindex)
+        let root = || Some("index-5-compacted".to_string());
+        assert!(
+            state
+                .update_ledger(&id("books:main"), 5, 5, None, root(), None)
+                .await
+        );
+        assert!(
+            !state
+                .update_ledger(&id("books:main"), 5, 5, None, root(), None)
+                .await
+        );
+        let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
+        assert_eq!(ledger.index_head_id, root());
     }
 
     #[tokio::test]

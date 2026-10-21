@@ -141,6 +141,30 @@ fn decode_snapshot(bytes: Vec<u8>) -> Result<(LedgerSnapshot, ())> {
     Ok((LedgerSnapshot::from_root_bytes(&bytes)?, ()))
 }
 
+/// The index root a ledger state has installed, as an index update sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstalledIndex {
+    /// The installed index's `t`.
+    pub t: i64,
+    /// The installed root.
+    pub id: Option<ContentId>,
+    /// The root the installed root replaced.
+    pub replaced: Option<ContentId>,
+}
+
+impl InstalledIndex {
+    /// Whether the root `id` at `t` replaces this one: a newer index, or
+    /// another root at the same `t` (a compaction, a reindex). Never the root
+    /// this one replaced, which a record read before the replacement still
+    /// names: at an equal `t` nothing else orders the two.
+    pub fn is_replaced_by(&self, t: i64, id: &ContentId) -> bool {
+        match &self.id {
+            Some(installed) if t == self.t => id != installed && self.replaced.as_ref() != Some(id),
+            _ => t > self.t,
+        }
+    }
+}
+
 /// Ledger state combining indexed LedgerSnapshot with novelty overlay
 ///
 /// Provides a consistent view of the ledger by combining:
@@ -611,6 +635,15 @@ impl LedgerState {
         self.snapshot.t
     }
 
+    /// The installed index root, the one it replaced, and its `t`.
+    pub fn installed_index(&self) -> InstalledIndex {
+        InstalledIndex {
+            t: self.snapshot.t,
+            id: self.head_index_id.clone(),
+            replaced: self.snapshot.prev_index.clone(),
+        }
+    }
+
     /// Get the ledger ID
     pub fn ledger_id(&self) -> &fluree_db_core::LedgerId {
         &self.snapshot.ledger_id
@@ -778,8 +811,10 @@ impl LedgerState {
 
     /// Apply a pre-loaded LedgerSnapshot as the new index.
     ///
-    /// Same validation as `apply_index()` but takes an already-loaded LedgerSnapshot,
-    /// avoiding the storage I/O call. This enables the API level to:
+    /// Same validation as `apply_index()`, except that another root at the
+    /// current `t` is installed (see [`InstalledIndex::is_replaced_by`]), but
+    /// takes an already-loaded LedgerSnapshot, avoiding the storage I/O call.
+    /// Returns whether the snapshot was installed. This enables the API level to:
     /// 1. Read root bytes once
     /// 2. Load `BinaryIndexStore` and attach `BinaryRangeProvider` to the LedgerSnapshot
     /// 3. Apply the enriched LedgerSnapshot here in a brief, non-async swap
@@ -790,7 +825,7 @@ impl LedgerState {
         &mut self,
         new_snapshot: LedgerSnapshot,
         index_id: Option<&ContentId>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Verify ledger ID matches
         if new_snapshot.ledger_id != self.snapshot.ledger_id {
             return Err(LedgerError::ledger_id_mismatch(
@@ -799,13 +834,18 @@ impl LedgerState {
             ));
         }
 
-        // Verify forward progress on index
+        // Verify forward progress on index. Another root at the same `t` is
+        // installed like an advance, and clears no novelty.
         let current_index_t = self.snapshot.t;
         if new_snapshot.t < current_index_t {
             return Err(LedgerError::stale_index(new_snapshot.t, current_index_t));
         }
-        if new_snapshot.t == current_index_t {
-            return Ok(());
+        let replaces = match index_id {
+            Some(id) => self.installed_index().is_replaced_by(new_snapshot.t, id),
+            None => new_snapshot.t > current_index_t,
+        };
+        if !replaces {
+            return Ok(false);
         }
 
         let phase = fluree_db_core::clock::Instant::now();
@@ -933,7 +973,7 @@ impl LedgerState {
             record.index_t = self.snapshot.t;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Overlay staged flakes as committed novelty at `t()+1` WITHOUT a
@@ -1535,6 +1575,66 @@ mod tests {
         // Before the fix, apply_loaded_db reset dict_novelty and lost this mapping.
         assert_eq!(state.dict_novelty.strings.watermark(), 2);
         assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
+    }
+
+    #[test]
+    fn apply_loaded_db_replaces_the_root_at_its_t_and_keeps_novelty() {
+        use fluree_db_core::IndexType;
+
+        // A compaction or reindex publishes another root at the installed
+        // index's `t`. It replaces the installed root, never the reverse; the
+        // commit past `t` stays in novelty, its string still resolvable.
+        let root_a = ContentId::new(ContentKind::IndexRoot, b"root-a");
+        let root_b = ContentId::new(ContentKind::IndexRoot, b"root-b");
+        let indexed = || {
+            let mut snapshot = LedgerSnapshot::genesis("test:main");
+            snapshot.t = 1;
+            snapshot.string_watermark = 1;
+            snapshot
+        };
+        let mut state = LedgerState::new(indexed(), Novelty::new(1));
+        state.head_index_id = Some(root_a.clone());
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+        let flakes_t2 = vec![Flake::new(
+            Sid::new(0, "ex:s"),
+            Sid::new(0, "ex:p"),
+            FlakeValue::String("a".to_string()),
+            Sid::new(2, "string"),
+            2,
+            true,
+            None,
+        )];
+        Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes_t2);
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t2, 2, &reverse_graph)
+            .unwrap();
+
+        // The installed root again changes nothing.
+        let mut again = indexed();
+        again
+            .insert_namespace_code(100, "http://example.org/again/".to_string())
+            .unwrap();
+        assert!(!state.apply_loaded_db(again, Some(&root_a)).unwrap());
+        assert!(state.snapshot.namespaces().get(&100).is_none());
+
+        let mut replacement = indexed();
+        replacement
+            .insert_namespace_code(100, "http://example.org/replacement/".to_string())
+            .unwrap();
+        replacement.prev_index = Some(root_a.clone());
+        assert!(state.apply_loaded_db(replacement, Some(&root_b)).unwrap());
+        assert_eq!(state.head_index_id, Some(root_b.clone()));
+
+        // The root it replaced, offered again, is not stepped back to.
+        assert!(!state.apply_loaded_db(indexed(), Some(&root_a)).unwrap());
+        assert_eq!(state.head_index_id, Some(root_b));
+        assert_eq!(
+            state.snapshot.namespaces().get(&100).map(String::as_str),
+            Some("http://example.org/replacement/")
+        );
+        assert_eq!((state.index_t(), state.t()), (1, 2));
+        assert_eq!(state.novelty.iter_index(IndexType::Spot).count(), 1);
+        assert_eq!(state.dict_novelty.strings.resolve_string(2), Some("a"));
     }
 
     #[tokio::test]

@@ -1,9 +1,10 @@
-//! API-side `FulltextConfigProvider` implementation.
+//! API-side `LedgerConfigProvider` implementation.
 //!
 //! Wires the indexer's per-build config refresh hook to the ledger's live
-//! `f:fullTextDefaults`. Used by background / CLI incremental indexing so
-//! those paths keep collecting configured plain-string values after the
-//! first reindex that picked up the config.
+//! `f:fullTextDefaults` and `f:graphPlacement`. Used by background / CLI
+//! incremental indexing so those paths keep collecting configured
+//! plain-string values after the first reindex that picked up the config,
+//! and place named graphs as the config currently asks.
 //!
 //! Config changes still require a manual reindex to take full effect on
 //! existing data (see `docs/indexing-and-search/fulltext.md` §"Reindexing
@@ -18,30 +19,30 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fluree_db_core::{config_graph_iri, first_t_where_graph_registered, GraphRegistrationProbe};
-use fluree_db_indexer::{ConfiguredFulltextProperty, FulltextConfigProvider};
+use fluree_db_indexer::{LedgerConfigProvider, LedgerIndexingConfig};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NameServiceLookup;
 
 use crate::StorageBackend;
 
 /// Provider backed by this connection's storage + nameservice. Loads the
-/// target ledger on each call and resolves `f:fullTextDefaults` against
-/// the current state. Failures log + return empty — a bad config read
+/// target ledger on each call and resolves its indexing config against the
+/// current state. Failures log + return the default — a bad config read
 /// should never block indexing.
-pub(crate) struct ApiFulltextConfigProvider {
+pub(crate) struct ApiLedgerConfigProvider {
     pub(crate) backend: StorageBackend,
     pub(crate) nameservice: Arc<dyn NameServiceLookup>,
     pub(crate) leaflet_cache: Arc<fluree_db_binary_index::LeafletCache>,
 }
 
-impl std::fmt::Debug for ApiFulltextConfigProvider {
+impl std::fmt::Debug for ApiLedgerConfigProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApiFulltextConfigProvider").finish()
+        f.debug_struct("ApiLedgerConfigProvider").finish()
     }
 }
 
-impl ApiFulltextConfigProvider {
-    async fn resolve(&self, ledger_id: &str) -> Result<Vec<ConfiguredFulltextProperty>, String> {
+impl ApiLedgerConfigProvider {
+    async fn resolve(&self, ledger_id: &str) -> Result<LedgerIndexingConfig, String> {
         // 0. Envelope-only short-circuit.
         //
         // The config graph (`config_graph_iri(ledger_id)`) must be
@@ -98,10 +99,10 @@ impl ApiFulltextConfigProvider {
                         tracing::debug!(
                             ledger_id,
                             cfg_iri = %cfg_iri,
-                            "fulltext config provider: config graph never registered; \
+                            "ledger config provider: config graph never registered; \
                              skipping LedgerState::load + resolve_ledger_config"
                         );
-                        return Ok(Vec::new());
+                        return Ok(LedgerIndexingConfig::default());
                     }
                     GraphRegistrationProbe::Found(t) => {
                         // FUTURE OPTIMIZATION (per PR #1211 review by @bplatz):
@@ -120,7 +121,7 @@ impl ApiFulltextConfigProvider {
                             ledger_id,
                             cfg_iri = %cfg_iri,
                             first_t = t,
-                            "fulltext config provider: config graph registered; \
+                            "ledger config provider: config graph registered; \
                              proceeding with full state load + resolve"
                         );
                     }
@@ -128,7 +129,7 @@ impl ApiFulltextConfigProvider {
                         tracing::debug!(
                             ledger_id,
                             cfg_iri = %cfg_iri,
-                            "fulltext config provider: envelope-only probe inconclusive \
+                            "ledger config provider: envelope-only probe inconclusive \
                              (v3 envelope on chain); falling through to full state load"
                         );
                     }
@@ -162,7 +163,7 @@ impl ApiFulltextConfigProvider {
         .await
         .map_err(|e| format!("load binary index store: {e}"))?;
 
-        // 3. Resolve `f:fullTextDefaults` against the loaded state.
+        // 3. Resolve the ledger config against the loaded state.
         //
         // Use `state.t()` (= max(novelty.t, snapshot.t)) as the upper bound so
         // config flakes committed since the last index are visible. On a
@@ -177,27 +178,24 @@ impl ApiFulltextConfigProvider {
                 .map_err(|e| format!("resolve_ledger_config: {e}"))?;
 
         Ok(ledger_config
-            .map(|cfg| crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg))
+            .map(|cfg| crate::config_resolver::indexing_config_for_indexer(&cfg))
             .unwrap_or_default())
     }
 }
 
 #[async_trait]
-impl FulltextConfigProvider for ApiFulltextConfigProvider {
-    async fn fulltext_configured_properties(
-        &self,
-        ledger_id: &str,
-    ) -> Vec<ConfiguredFulltextProperty> {
+impl LedgerConfigProvider for ApiLedgerConfigProvider {
+    async fn indexing_config(&self, ledger_id: &str) -> LedgerIndexingConfig {
         match self.resolve(ledger_id).await {
-            Ok(list) => list,
+            Ok(config) => config,
             Err(e) => {
                 tracing::warn!(
                     ledger_id,
                     error = %e,
-                    "fulltext config provider failed; continuing without configured properties \
-                     (@fulltext datatype path still works)"
+                    "ledger config provider failed; continuing without configured properties \
+                     (@fulltext datatype path still works) and with automatic graph placement"
                 );
-                Vec::new()
+                LedgerIndexingConfig::default()
             }
         }
     }

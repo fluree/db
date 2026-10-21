@@ -2485,7 +2485,7 @@ mod ledger_scoped_from_tests {
         ScopeRegistry::Fixed(
             graphs
                 .iter()
-                .zip(3u16..)
+                .zip(3..)
                 .map(|(iri, g)| (iri.to_string(), g))
                 .collect(),
         )

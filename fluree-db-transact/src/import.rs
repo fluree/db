@@ -57,11 +57,11 @@ mod inner {
         pub import_time: String,
         /// Named graph IRI → g_id mapping (stable across chunks).
         /// g_id 0 = default graph, 1 = txn-meta, 2 = config, 3+ = user-defined.
-        pub graph_ids: HashMap<String, u16>,
+        pub graph_ids: HashMap<String, fluree_db_core::GraphId>,
         /// Next available g_id for user-defined named graphs. Only used by the
         /// non-spooling fallback; the spooling path allocates from the shared
         /// graph allocator instead (see `import_trig_commit`).
-        pub next_gid: u16,
+        pub next_gid: fluree_db_core::GraphId,
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
         pub prefix_map: HashMap<String, String>,
@@ -553,7 +553,7 @@ mod inner {
         // 4. Process named graphs
         // Use session-level graph ID allocation for stability across chunks.
         // Only new mappings (introduced by this commit) go into graph_delta.
-        let mut graph_delta: HashMap<u16, String> = HashMap::new();
+        let mut graph_delta: HashMap<fluree_db_core::GraphId, String> = HashMap::new();
 
         // Reserved system graphs are refused HERE because bulk import bypasses
         // staging entirely: #1838's data-write guard lives in `stage()`
@@ -603,7 +603,7 @@ mod inner {
                 None => Some(block.iri.clone()),
             };
 
-            let graph: Option<(u16, Sid)> = match block_graph {
+            let graph: Option<(fluree_db_core::GraphId, Sid)> = match block_graph {
                 None => None,
                 Some(iri) => {
                     // Refuse by literal IRI, mirroring the staged-write guard's

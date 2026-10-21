@@ -25,7 +25,8 @@ use fluree_db_core::ContentId;
 use rayon::prelude::*;
 
 use super::incremental_leaf::{
-    update_leaf, LeafUpdateInput, LeafUpdateOutput, NewLeafBlob, StreamSlices,
+    update_leaf, GraphDeltas, LeafUpdateInput, LeafUpdateOutput, NewLeafBlob, PoolMerge,
+    StreamSlices,
 };
 
 /// Minimum number of *touched* leaves before fanning the per-leaf CoW out across
@@ -44,7 +45,7 @@ pub struct BranchUpdateConfig {
     /// Sort order.
     pub order: RunSortOrder,
     /// Graph id.
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Zstd compression level for re-encoded leaflets.
     pub zstd_level: i32,
     /// Target rows per leaflet.
@@ -55,6 +56,18 @@ pub struct BranchUpdateConfig {
     /// [`BranchUpdateMeta::matched`]. Fact identity is order-independent, so
     /// callers running all four sort orders enable this for one order only.
     pub collect_matched: bool,
+    /// Pooled tree only: what the update does besides merging novelty.
+    pub pool: PoolUpdate,
+}
+
+/// What a pooled-tree branch update does besides merging novelty.
+#[derive(Debug, Clone, Default)]
+pub struct PoolUpdate {
+    /// Graphs leaving the pool, sorted (see [`PoolMerge::purge`]).
+    pub purge: Vec<fluree_db_core::GraphId>,
+    /// Report each graph's change in rows and history in
+    /// [`BranchUpdateMeta::graph_deltas`]. Like matches, one order suffices.
+    pub tally: bool,
 }
 
 /// Result of a branch update.
@@ -74,6 +87,9 @@ pub struct BranchUpdateResult {
     /// Novelty ops whose identity matched an existing base row (empty unless
     /// [`BranchUpdateConfig::collect_matched`] is set).
     pub matched: Vec<RunRecordV2>,
+    /// Each graph's change in rows and history (empty unless
+    /// [`PoolUpdate::tally`] is set).
+    pub graph_deltas: GraphDeltas,
 }
 
 /// Branch-assembly metadata from a streaming update — everything the caller
@@ -96,6 +112,9 @@ pub struct BranchUpdateMeta {
     /// Novelty ops whose identity matched an existing base row (empty unless
     /// [`BranchUpdateConfig::collect_matched`] is set).
     pub matched: Vec<RunRecordV2>,
+    /// Each graph's change in rows and history (empty unless
+    /// [`PoolUpdate::tally`] is set).
+    pub graph_deltas: GraphDeltas,
 }
 
 // ============================================================================
@@ -152,6 +171,7 @@ where
         branch_bytes: meta.branch_bytes,
         branch_cid: meta.branch_cid,
         matched: meta.matched,
+        graph_deltas: meta.graph_deltas,
     })
 }
 
@@ -319,6 +339,7 @@ where
         new_leaf_count,
         collect_matched: _,
         matched,
+        graph_deltas,
     } = acc;
 
     let branch_bytes = build_branch_bytes(config.order, config.g_id, &leaf_entries);
@@ -332,6 +353,7 @@ where
         branch_cid,
         new_leaf_count,
         matched,
+        graph_deltas,
     })
 }
 
@@ -351,6 +373,7 @@ struct BranchAcc {
     /// `matched`; otherwise they are dropped at drain time.
     collect_matched: bool,
     matched: Vec<RunRecordV2>,
+    graph_deltas: GraphDeltas,
 }
 
 impl BranchAcc {
@@ -362,6 +385,7 @@ impl BranchAcc {
             new_leaf_count: 0,
             collect_matched,
             matched: Vec::new(),
+            graph_deltas: GraphDeltas::new(),
         }
     }
 }
@@ -390,7 +414,7 @@ fn make_leaf_update_input<'a>(
     leaf_bytes: &'a [u8],
     sidecar_bytes: Option<&'a [u8]>,
     slices: StreamSlices<'a>,
-    config: &BranchUpdateConfig,
+    config: &'a BranchUpdateConfig,
 ) -> io::Result<LeafUpdateInput<'a>> {
     let existing_header = decode_leaf_header_v3(leaf_bytes)?;
     let estimated_rows = (existing_header.total_rows as usize).saturating_add(slices.novelty.len());
@@ -418,6 +442,10 @@ fn make_leaf_update_input<'a>(
         leaflet_target_rows: config.leaflet_target_rows,
         leaf_target_rows,
         sidecar_bytes,
+        pool: PoolMerge {
+            purge: &config.pool.purge,
+            tally: config.pool.tally,
+        },
     })
 }
 
@@ -441,6 +469,11 @@ where
     }
     if acc.collect_matched {
         acc.matched.extend(output.matched);
+    }
+    for (g, d) in output.graph_deltas {
+        let total = acc.graph_deltas.entry(g).or_default();
+        total.rows += d.rows;
+        total.history += d.history;
     }
 
     for mut new_leaf in output.leaves {
@@ -834,6 +867,7 @@ mod parity_tests {
         assert!(novelty.len() >= PARALLEL_BRANCH_MIN_TOUCHED_LEAVES);
 
         let config = BranchUpdateConfig {
+            pool: Default::default(),
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -934,6 +968,7 @@ mod parity_tests {
             ops.push(1u8);
         }
         let config = BranchUpdateConfig {
+            pool: Default::default(),
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,

@@ -3859,7 +3859,7 @@ struct IndexBuildInput<'a> {
     prefix_map: &'a HashMap<String, String>,
     /// User-defined named graph g_ids (>= 2) to build index segments for.
     /// Empty for single-graph imports.
-    named_g_ids: Vec<u16>,
+    named_g_ids: Vec<fluree_db_core::GraphId>,
     /// Actual split mode the import used; written into the root and predicate sids.
     ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
     /// Whether any imported record carried an RDF-list position (OR'd across
@@ -4059,7 +4059,7 @@ struct ChunkImportResult {
     rdf_type_p_id: u32,
     /// User-defined named graph g_ids (>= 2) to build index segments for.
     /// Empty for single-graph imports.
-    named_g_ids: Vec<u16>,
+    named_g_ids: Vec<fluree_db_core::GraphId>,
     /// Split mode the allocator actually used (the ns preflight may coarsen it to
     /// `HostPlusN`). Recorded into the root, predicate sids, and genesis commit so
     /// reads split IRIs the same way the dictionary was keyed.
@@ -5543,7 +5543,7 @@ where
 
         // txn-meta is always pre-seeded as dict_id=0 in the graph allocator
         // (via SharedDictAllocator::new_graph), so g_id = dict_id + 1 = 1.
-        let g_id: u16 = 1;
+        let g_id: fluree_db_core::GraphId = 1;
 
         // meta_chunk_idx = number of data chunks (next sequential index).
         let meta_chunk_idx = sort_write_handles.len();
@@ -6077,10 +6077,10 @@ where
     // skipped entirely and the optimized default-graph path pays nothing. g_id 1
     // (txn-meta) is built separately; g_id 2 (config) is not populated by bulk
     // RDF import.
-    let v3_named_g_ids: Vec<u16> = {
+    let v3_named_g_ids: Vec<fluree_db_core::GraphId> = {
         let graph_count = spool_config.graph_alloc.len();
-        (u32::from(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)..=graph_count)
-            .map(|g| g as u16)
+        (fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID..=graph_count)
+            .map(|g| g as fluree_db_core::GraphId)
             .collect()
     };
 
@@ -6345,7 +6345,15 @@ where
         let v3_remap_counter = remap_counter.clone();
         let v3_build_counter = build_counter.clone();
         let v3_stage_marker = stage_marker.clone();
-        let v3_named_g_ids = input.named_g_ids;
+        // Place each user named graph: a large one keeps its own tree (its own
+        // per-graph pass), the rest share the pooled tree (one pass for all).
+        let (v3_dedicated_g_ids, v3_named_g_ids) =
+            fluree_db_indexer::run_index::build::graph_scope::place_named_graphs(
+                &fluree_db_indexer::run_index::build::graph_scope::PlacementPolicy::automatic(),
+                &input.named_g_ids,
+                &v3_sorted_commit_infos,
+            );
+        let pooled_g_ids = v3_named_g_ids.clone();
 
         config.emit_progress(ImportPhase::PreparingIndex {
             stage: "Generating per-order runs",
@@ -6454,6 +6462,7 @@ where
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
                     term_builder: Some(std::sync::Arc::clone(&term_builder)),
+                    pool: None,
                 };
                 std::fs::create_dir_all(&cfg_g0.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6484,6 +6493,7 @@ where
                         build_progress: None,
                         stage_marker: None,
                         term_builder: Some(std::sync::Arc::clone(&term_builder)),
+                        pool: None,
                     };
                     std::fs::create_dir_all(&cfg_g1.run_dir).map_err(|e| index_build_error(&e))?;
 
@@ -6499,19 +6509,22 @@ where
                     None
                 };
 
-                // Build index segments for each user-defined named graph
-                // (g_id >= FIRST_USER_GRAPH_ID, i.e. 3+). Each is a separate
-                // pass over the commit blobs filtered to its g_id, mirroring the
-                // g_id=1 (txn-meta) build.
+                // Every user-defined named graph (g_id >= FIRST_USER_GRAPH_ID)
+                // goes into the pooled tree, built in one pass over the commit
+                // blobs: its rows keep their graphs, so the SPOT stream comes
+                // out in GSPO order and the other orders carry the graph last.
                 // Empty for single-graph imports — zero cost on that hot path.
                 // Done before stats finalize so named-graph flakes contribute
                 // to the shared IdStatsHook (per-graph stats).
                 let mut v3_named_results: Vec<fluree_db_indexer::BuildResult> = Vec::new();
-                for &ng_id in &v3_named_g_ids {
+                // Large named graphs: a separate pass over the commit blobs per
+                // graph, filtered to its g_id, mirroring the g_id=1 build.
+                for &ng_id in &v3_dedicated_g_ids {
                     let cfg_ng = fluree_db_indexer::BuildConfig {
                         run_dir: v3_run_dir.join(format!("v3_runs_g{ng_id}")),
                         index_dir: v3_index_dir.clone(),
                         g_id: ng_id,
+                        pool: None,
                         leaflet_target_rows: v3_leaflet_target_rows,
                         leaf_target_rows: v3_leaf_target_rows,
                         zstd_level: 1,
@@ -6524,15 +6537,6 @@ where
                         term_builder: Some(std::sync::Arc::clone(&term_builder)),
                     };
                     std::fs::create_dir_all(&cfg_ng.run_dir).map_err(|e| index_build_error(&e))?;
-
-                    // Fold this named graph's per-class SPOT stats into the
-                    // default-graph accumulator. All `SpotClassStats` maps are
-                    // keyed by `(g_id, class_sid)` over the same global id space
-                    // (assigned once at spool, shared across passes), and the
-                    // g_ids are disjoint, so the merge is a key-wise union.
-                    // Ref-targets whose class this pass couldn't resolve (e.g. a
-                    // ref into another graph) stay counted as `@id` flakes and
-                    // simply don't contribute a target-class entry.
                     let (ng_result, ng_spot) = fluree_db_indexer::build_indexes_from_commits(
                         &commits,
                         &cfg_ng,
@@ -6546,6 +6550,49 @@ where
                         }
                     }
                     v3_named_results.push(ng_result);
+                }
+                if !v3_named_g_ids.is_empty() {
+                    let cfg_pool = fluree_db_indexer::BuildConfig {
+                        run_dir: v3_run_dir.join("v3_runs_pool"),
+                        index_dir: v3_index_dir.clone(),
+                        g_id: 0,
+                        pool: Some(std::sync::Arc::new(
+                            fluree_db_indexer::run_index::build::graph_scope::PoolGraphs::new(
+                                v3_named_g_ids.iter().copied(),
+                            ),
+                        )),
+                        leaflet_target_rows: v3_leaflet_target_rows,
+                        leaf_target_rows:
+                            fluree_db_indexer::run_index::build::graph_scope::pooled_leaf_rows(
+                                v3_leaflet_target_rows,
+                            ),
+                        zstd_level: 1,
+                        run_budget_bytes: v3_run_budget,
+                        worker_count: v3_worker_count,
+                        fd_budget,
+                        remap_progress: None,
+                        build_progress: None,
+                        stage_marker: None,
+                        term_builder: Some(std::sync::Arc::clone(&term_builder)),
+                    };
+                    std::fs::create_dir_all(&cfg_pool.run_dir).map_err(|e| index_build_error(&e))?;
+
+                    // Per-class SPOT stats are keyed by `(g_id, class_sid)` over
+                    // one global id space, and the pool's graphs are disjoint
+                    // from the default graph's, so the merge is a key-wise union.
+                    let (pool_result, pool_spot) = fluree_db_indexer::build_indexes_from_commits(
+                        &commits,
+                        &cfg_pool,
+                        stats_hook.as_mut(),
+                    )
+                    .map_err(|e| index_build_error(&e))?;
+                    if let Some(ng) = pool_spot {
+                        match &mut spot_class_stats {
+                            Some(acc) => acc.merge(ng),
+                            slot => *slot = Some(ng),
+                        }
+                    }
+                    v3_named_results.push(pool_result);
                 }
 
                 let stats_output = stats_hook.map(|h| {
@@ -6771,12 +6818,12 @@ where
 
         let mut graph_ids = std::collections::BTreeSet::new();
         for g_id_str in uploaded_dicts.numbig.keys() {
-            if let Ok(g_id) = g_id_str.parse::<u16>() {
+            if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                 graph_ids.insert(g_id);
             }
         }
         for g_id_str in uploaded_dicts.vectors.keys() {
-            if let Ok(g_id) = g_id_str.parse::<u16>() {
+            if let Ok(g_id) = g_id_str.parse::<fluree_db_core::GraphId>() {
                 graph_ids.insert(g_id);
             }
         }
@@ -6998,6 +7045,7 @@ where
             ))
         };
 
+        let pool = v3_uploaded.pool_routing(&pooled_g_ids);
         // Build default_graph_orders from V3 upload result.
         let default_graph_orders: Vec<DefaultGraphOrder> = v3_uploaded
             .default_graph_orders
@@ -7071,6 +7119,7 @@ where
             // Same source as the spool object resolution (SpoolConfig): the root
             // version must match how the import encoded decimals.
             decimal_encoding: IMPORT_DECIMAL_ENCODING,
+            pool,
         };
 
         // Encode and upload FIR6 root.

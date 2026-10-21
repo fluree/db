@@ -292,7 +292,7 @@ mod tests {
     fn test_hook_datatype_overrides_configured_set() {
         // A property that is ALSO in the configured set, but the value's
         // datatype is @fulltext — datatype wins, always English.
-        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u16, 5u32)]);
+        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u32, 5u32)]);
         let mut hook = FulltextHook::new();
         hook.on_op(make_input(
             0,
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_hook_collects_configured_property_with_lang_id() {
-        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u16, 5u32)]);
+        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u32, 5u32)]);
         let mut hook = FulltextHook::new();
         hook.on_op(make_input(
             0,
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_hook_skips_non_lex_kind() {
         let mut hook = FulltextHook::new();
-        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u16, 5u32)]);
+        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u32, 5u32)]);
 
         // @fulltext dt but wrong o_kind (REF_ID)
         hook.on_op(make_input(

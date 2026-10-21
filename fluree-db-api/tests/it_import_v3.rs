@@ -1352,8 +1352,8 @@ ex:c ex:amount "1234567890123456789.5"^^xsd:decimal .
         .expect("decimal import should succeed");
     assert!(result.root_id.is_some(), "index should have been built");
 
-    // The import must write a v3 (inline-decimal) root: byte 4 of the FIR6
-    // header is the version, and ROOT_V6_VERSION_INLINE_DECIMAL == 3.
+    // The import must write a v5 root (inline decimals): byte 4 of the FIR6
+    // header is the version, and ROOT_V6_VERSION_V5 == 3.
     let fir6_files = find_files_with_magic(db_dir.path(), b"FIR6");
     assert!(!fir6_files.is_empty(), "expected a FIR6 root file");
     let root_bytes = std::fs::read(&fir6_files[0]).expect("read FIR6 root");

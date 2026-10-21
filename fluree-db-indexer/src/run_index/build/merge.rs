@@ -18,11 +18,14 @@ struct HeapEntry {
 /// K-way merge for V2 run record streams.
 ///
 /// Records are dequeued in sort order determined by the comparator `F`.
-/// Deduplication uses `same_identity_v2` (always the same 5 fields).
+/// Deduplication uses `same_identity_v2` (the five fact fields) unless
+/// [`Self::with_identity`] sets another — a pooled tree's merge must also
+/// tell graphs apart.
 pub struct KWayMerge<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> {
     heap: Vec<HeapEntry>,
     streams: Vec<T>,
     cmp: F,
+    identity: fn(&RunRecordV2, &RunRecordV2) -> bool,
 }
 
 impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T, F> {
@@ -39,7 +42,12 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
             }
         }
 
-        let mut merge = Self { heap, streams, cmp };
+        let mut merge = Self {
+            heap,
+            streams,
+            cmp,
+            identity: same_identity_v2,
+        };
 
         // Build heap from bottom up.
         if merge.heap.len() > 1 {
@@ -50,6 +58,12 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
         }
 
         Ok(merge)
+    }
+
+    /// Deduplicate with `identity` instead of [`same_identity_v2`].
+    pub fn with_identity(mut self, identity: fn(&RunRecordV2, &RunRecordV2) -> bool) -> Self {
+        self.identity = identity;
+        self
     }
 
     #[inline]
@@ -143,7 +157,7 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
         }
 
         while let Some(entry) = self.heap.first() {
-            if entry.op == 0 || !same_identity_v2(&winner, &entry.record) {
+            if entry.op == 0 || !(self.identity)(&winner, &entry.record) {
                 break;
             }
             let (dup, _) = self.next_record()?.unwrap();
@@ -172,7 +186,7 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
 
         // Consume consecutive duplicates.
         while let Some(peeked) = self.heap.first().map(|e| &e.record) {
-            if !same_identity_v2(&winner, peeked) {
+            if !(self.identity)(&winner, peeked) {
                 break;
             }
             let (dup, dup_op) = self.next_record()?.unwrap();
@@ -203,7 +217,7 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
 
         // Consume consecutive duplicates, keeping the highest-t as winner.
         while let Some(peeked) = self.heap.first().map(|e| &e.record) {
-            if !same_identity_v2(&winner, peeked) {
+            if !(self.identity)(&winner, peeked) {
                 break;
             }
             let (dup, dup_op) = self.next_record()?.unwrap();

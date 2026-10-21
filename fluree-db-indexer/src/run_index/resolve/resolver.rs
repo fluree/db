@@ -325,7 +325,7 @@ impl CommitResolver {
 
         // 2. g_id=1 (pre-reserved in GlobalDicts/SharedResolverState construction)
         //    The txn-meta IRI is always the first graph entry (dict_id=0, g_id=0+1=1).
-        let g_id: u16 = 1;
+        let g_id: fluree_db_core::GraphId = 1;
 
         let t = u32::try_from(envelope.t).map_err(|_| {
             ResolverError::Resolve(format!("commit t={} does not fit in u32", envelope.t))
@@ -498,7 +498,7 @@ impl CommitResolver {
     fn emit_txn_meta_entry<W: RecordSink>(
         &mut self,
         commit_s_id: u64,
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         t: u32,
         entry: &fluree_db_novelty::TxnMetaEntry,
         dicts: &mut GlobalDicts,
@@ -732,19 +732,17 @@ impl CommitResolver {
         ns_code: u16,
         name: &str,
         dicts: &mut GlobalDicts,
-    ) -> io::Result<u16> {
+    ) -> io::Result<fluree_db_core::GraphId> {
         if ns_code == 0 && name.is_empty() {
             return Ok(0); // default graph
         }
         let prefix = self.lookup_prefix(ns_code);
         // +1 to reserve 0 for default graph
-        let raw = dicts.graphs.get_or_insert_parts(prefix, name) + 1;
-        if raw > u16::MAX as u32 {
-            return Err(io::Error::other(format!(
-                "graph count {raw} exceeds u16::MAX"
-            )));
-        }
-        Ok(raw as u16)
+        dicts
+            .graphs
+            .get_or_insert_parts(prefix, name)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("graph count exceeds u32::MAX"))
     }
 
     /// Resolve subject IRI -> global sid64 using streaming xxh3_128.
@@ -1406,16 +1404,14 @@ impl SharedResolverState {
                     config.add_per_graph(1, p_id);
                 }
                 ConfiguredFulltextScope::NamedGraph(iri) => {
-                    let raw = self.graphs.get_or_insert(iri) + 1;
-                    if raw > u16::MAX as u32 {
+                    let Some(g_id) = self.graphs.get_or_insert(iri).checked_add(1) else {
                         tracing::warn!(
                             graph_iri = %iri,
-                            raw,
-                            "configure_fulltext_properties: graph count exceeds u16::MAX — skipping"
+                            "configure_fulltext_properties: graph count exceeds u32::MAX — skipping"
                         );
                         continue;
-                    }
-                    config.add_per_graph(raw as u16, p_id);
+                    };
+                    config.add_per_graph(g_id, p_id);
                 }
             }
         }
@@ -1712,7 +1708,7 @@ impl SharedResolverState {
 
     /// Resolve graph: default graph (ns=0, name="") -> g_id=0.
     /// Named graphs -> g_id = graphs.get_or_insert(full_iri) + 1.
-    fn resolve_graph(&mut self, ns_code: u16, name: &str) -> io::Result<u16> {
+    fn resolve_graph(&mut self, ns_code: u16, name: &str) -> io::Result<fluree_db_core::GraphId> {
         if ns_code == 0 && name.is_empty() {
             return Ok(0); // default graph
         }
@@ -1721,13 +1717,10 @@ impl SharedResolverState {
             .get(&ns_code)
             .map(std::string::String::as_str)
             .unwrap_or("");
-        let raw = self.graphs.get_or_insert_parts(prefix, name) + 1;
-        if raw > u16::MAX as u32 {
-            return Err(io::Error::other(format!(
-                "graph count {raw} exceeds u16::MAX"
-            )));
-        }
-        Ok(raw as u16)
+        self.graphs
+            .get_or_insert_parts(prefix, name)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("graph count exceeds u32::MAX"))
     }
 
     /// Resolve predicate IRI -> global p_id.
@@ -1977,7 +1970,7 @@ impl SharedResolverState {
     ) -> Result<u32, ResolverError> {
         // g_id=1 (pre-reserved in SharedResolverState construction)
         // The txn-meta IRI is always the first graph entry (dict_id=0, g_id=0+1=1).
-        let g_id: u16 = 1;
+        let g_id: fluree_db_core::GraphId = 1;
 
         let t = u32::try_from(envelope.t).map_err(|_| {
             ResolverError::Resolve(format!("commit t={} does not fit in u32", envelope.t))
@@ -2136,7 +2129,7 @@ impl SharedResolverState {
     fn emit_txn_meta_entry_chunk(
         &mut self,
         commit_s_id: u64,
-        g_id: u16,
+        g_id: fluree_db_core::GraphId,
         t: u32,
         entry: &fluree_db_novelty::TxnMetaEntry,
         chunk: &mut RebuildChunk,

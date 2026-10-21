@@ -76,7 +76,7 @@ use std::sync::Arc;
 
 /// Read-scoped handle to a flake inside the novelty overlay.
 ///
-/// Packs `(g_id, segment_index, local_index)` into a `u64`. A `FlakeId` is only
+/// Packs `(graph slot, segment_index, local_index)` into a `u64`. A `FlakeId` is only
 /// valid within the read scope that produced it ([`Novelty::slice_for_range`] /
 /// [`Novelty::iter_index`]) and only against the same [`Novelty`] — segment
 /// indices shift when `apply_commit` / `bulk_apply_commits` / `clear_up_to`
@@ -87,13 +87,18 @@ pub struct FlakeId(u64);
 
 impl FlakeId {
     const LOCAL_BITS: u32 = 24;
-    const SEG_BITS: u32 = 24;
-    // The remaining 16 high bits hold the g_id (GraphId = u16).
+    const SEG_BITS: u32 = 20;
+    // The remaining 20 high bits hold the graph's novelty slot (`GraphSlots`).
     const LOCAL_MASK: u64 = (1 << Self::LOCAL_BITS) - 1;
     const SEG_MASK: u64 = (1 << Self::SEG_BITS) - 1;
+    const SLOT_LIMIT: u64 = 1 << (64 - Self::SEG_BITS - Self::LOCAL_BITS);
 
     #[inline]
-    fn pack(g_id: GraphId, seg: usize, local: u32) -> Self {
+    fn pack(slot: u32, seg: usize, local: u32) -> Self {
+        debug_assert!(
+            u64::from(slot) < Self::SLOT_LIMIT,
+            "novelty graph slot overflow"
+        );
         debug_assert!(
             seg as u64 <= Self::SEG_MASK,
             "novelty segment index overflow"
@@ -103,7 +108,7 @@ impl FlakeId {
             "novelty local index overflow"
         );
         FlakeId(
-            ((g_id as u64) << (Self::SEG_BITS + Self::LOCAL_BITS))
+            (u64::from(slot) << (Self::SEG_BITS + Self::LOCAL_BITS))
                 | ((seg as u64) << Self::LOCAL_BITS)
                 | u64::from(local),
         )
@@ -142,6 +147,91 @@ pub const MAX_SEGMENT_FLAKES: usize = FlakeId::LOCAL_MASK as usize + 1;
 
 /// Maximum segments a single graph can hold before a reindex is required.
 pub const MAX_SEGMENTS: usize = FlakeId::SEG_MASK as usize + 1;
+
+/// Maximum distinct graphs novelty can hold before a reindex is required.
+pub const MAX_GRAPH_SLOTS: usize = FlakeId::SLOT_LIMIT as usize;
+
+/// Per-graph segment lists, by a dense slot per graph. Graph ids are 32-bit
+/// and sparse, so a vector indexed by id would grow with the largest id (and
+/// every copy-on-write clone with it); the slot is what a [`FlakeId`] packs.
+#[derive(Clone, Default)]
+struct GraphSlots {
+    slot_of: HashMap<GraphId, u32>,
+    slots: Vec<(GraphId, Option<Vec<Arc<Segment>>>)>,
+}
+
+impl GraphSlots {
+    #[inline]
+    fn slot(&self, g_id: GraphId) -> Option<u32> {
+        self.slot_of.get(&g_id).copied()
+    }
+
+    #[inline]
+    fn get(&self, g_id: GraphId) -> Option<&Option<Vec<Arc<Segment>>>> {
+        self.slot(g_id).map(|s| &self.slots[s as usize].1)
+    }
+
+    fn get_mut(&mut self, g_id: GraphId) -> Option<&mut Option<Vec<Arc<Segment>>>> {
+        let s = self.slot(g_id)?;
+        Some(&mut self.slots[s as usize].1)
+    }
+
+    /// The graph's entry, giving it a slot if it has none.
+    fn entry(&mut self, g_id: GraphId) -> &mut Option<Vec<Arc<Segment>>> {
+        let next = self.slots.len() as u32;
+        let s = *self.slot_of.entry(g_id).or_insert(next);
+        if s == next {
+            self.slots.push((g_id, None));
+        }
+        &mut self.slots[s as usize].1
+    }
+
+    #[inline]
+    fn by_slot(&self, slot: usize) -> &Option<Vec<Arc<Segment>>> {
+        &self.slots[slot].1
+    }
+
+    fn by_slot_mut(&mut self, slot: usize) -> Option<&mut Option<Vec<Arc<Segment>>>> {
+        self.slots.get_mut(slot).map(|(_, segs)| segs)
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn lists(&self) -> impl Iterator<Item = &Vec<Arc<Segment>>> {
+        self.slots.iter().filter_map(|(_, segs)| segs.as_ref())
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<Vec<Arc<Segment>>>> {
+        self.slots.iter_mut().map(|(_, segs)| segs)
+    }
+
+    /// Graphs holding at least one non-empty segment, ascending.
+    fn present(&self) -> Vec<GraphId> {
+        let mut graphs: Vec<GraphId> = self
+            .slots
+            .iter()
+            .filter(|(_, segs)| segs.as_ref().is_some_and(|s| !s.is_empty()))
+            .map(|(g, _)| *g)
+            .collect();
+        graphs.sort_unstable();
+        graphs
+    }
+
+    /// Drop the slots of graphs that hold nothing. Reassigns slots, so it runs
+    /// only where `FlakeId`s are already invalidated (a segment rebuild).
+    fn compact(&mut self) {
+        self.slots
+            .retain(|(_, segs)| segs.as_ref().is_some_and(|s| !s.is_empty()));
+        self.slot_of = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(i, (g, _))| (*g, i as u32))
+            .collect();
+    }
+}
 
 /// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
 /// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
@@ -400,7 +490,8 @@ impl Eq for MergeHead<'_> {}
 /// index order and range. Yields `(FlakeId, &Flake)` in fully `index`-sorted
 /// order — the single read primitive every novelty read builds on.
 struct GraphMergeIter<'a> {
-    g_id: GraphId,
+    /// The graph's novelty slot, which the ids it yields pack.
+    slot: u32,
     index: IndexType,
     streams: Vec<MergeStream<'a>>,
     heap: BinaryHeap<MergeHead<'a>>,
@@ -423,7 +514,7 @@ impl<'a> Iterator for GraphMergeIter<'a> {
             };
             (stream.seg_idx, local, advance)
         };
-        let id = FlakeId::pack(self.g_id, seg_idx, local);
+        let id = FlakeId::pack(self.slot, seg_idx, local);
         if let Some((flakes, next_local)) = advance {
             self.heap.push(MergeHead {
                 flake: &flakes[next_local as usize],
@@ -474,7 +565,7 @@ impl<'a> Iterator for FlakeRead<'a> {
 enum IdRead<'a> {
     Done,
     Single {
-        g_id: GraphId,
+        slot: u32,
         seg_idx: usize,
         order: std::slice::Iter<'a, u32>,
     },
@@ -488,12 +579,12 @@ impl Iterator for IdRead<'_> {
         match self {
             IdRead::Done => None,
             IdRead::Single {
-                g_id,
+                slot,
                 seg_idx,
                 order,
             } => order
                 .next()
-                .map(|&local| FlakeId::pack(*g_id, *seg_idx, local)),
+                .map(|&local| FlakeId::pack(*slot, *seg_idx, local)),
             IdRead::Merge(it) => it.next().map(|(id, _)| id),
         }
     }
@@ -507,12 +598,11 @@ impl Iterator for IdRead<'_> {
 /// write cost is `O(batch log batch)` instead of `O(total novelty)`. Reads k-way
 /// merge the segments on demand (see [`GraphMergeIter`]).
 ///
-/// GraphIds are dense small integers, so graphs are a `Vec<Option<...>>` indexed
-/// by `g_id as usize` instead of a HashMap.
+/// Graphs are held by dense slot ([`GraphSlots`]).
 #[derive(Clone, Default)]
 pub struct Novelty {
-    /// Per-graph append-only segment lists, indexed by g_id.
-    graphs: Vec<Option<Vec<Arc<Segment>>>>,
+    /// Per-graph append-only segment lists.
+    graphs: GraphSlots,
 
     /// Total live size in bytes (for backpressure)
     pub size: usize,
@@ -597,7 +687,7 @@ impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
         Self {
-            graphs: Vec::new(),
+            graphs: GraphSlots::default(),
             size: 0,
             flake_count: 0,
             t,
@@ -646,13 +736,10 @@ impl Novelty {
 
     /// Append a freshly built segment to a graph, growing the graphs vec.
     fn push_segment(&mut self, g_id: GraphId, seg: Segment) {
-        let idx = g_id as usize;
-        if idx >= self.graphs.len() {
-            self.graphs.resize_with(idx + 1, || None);
-        }
         self.size += seg.size;
         self.flake_count += seg.flakes.len();
-        self.graphs[idx]
+        self.graphs
+            .entry(g_id)
             .get_or_insert_with(Vec::new)
             .push(Arc::new(seg));
     }
@@ -664,9 +751,14 @@ impl Novelty {
     /// bounded by the `MAX_SEGMENT_FLAKES` check in `apply_commit` and by the
     /// chunking in `set_graph_segments`.
     fn check_segment_capacity(&self, g_id: GraphId) -> Result<()> {
+        if self.graphs.slot(g_id).is_none() && self.graphs.len() >= MAX_GRAPH_SLOTS {
+            return Err(NoveltyError::overflow(
+                "novelty graph count exceeds capacity, trigger reindex",
+            ));
+        }
         let existing = self
             .graphs
-            .get(g_id as usize)
+            .get(g_id)
             .and_then(Option::as_ref)
             .map_or(0, Vec::len);
         if existing + 1 > MAX_SEGMENTS {
@@ -680,12 +772,10 @@ impl Novelty {
     /// Replace a graph's segment list with `segs` (chunked so no segment exceeds
     /// the local-index width). Used by the whole-graph-rebuilding paths.
     fn set_graph_segments(&mut self, g_id: GraphId, mut flakes: Vec<Flake>, parallel: bool) {
-        let idx = g_id as usize;
-        if idx >= self.graphs.len() {
-            self.graphs.resize_with(idx + 1, || None);
-        }
         if flakes.is_empty() {
-            self.graphs[idx] = None;
+            if let Some(segs) = self.graphs.get_mut(g_id) {
+                *segs = None;
+            }
             return;
         }
         let mut segs: Vec<Arc<Segment>> = Vec::new();
@@ -695,7 +785,7 @@ impl Novelty {
             flakes = tail;
         }
         segs.push(Arc::new(Segment::build(flakes, parallel)));
-        self.graphs[idx] = Some(segs);
+        *self.graphs.entry(g_id) = Some(segs);
     }
 
     /// Recompute `size` / `flake_count` from the current segments. Used by the
@@ -703,7 +793,7 @@ impl Novelty {
     fn recompute_totals(&mut self) {
         let mut size = 0usize;
         let mut count = 0usize;
-        for segs in self.graphs.iter().flatten() {
+        for segs in self.graphs.lists() {
             for seg in segs {
                 size += seg.size;
                 count += seg.flakes.len();
@@ -716,19 +806,14 @@ impl Novelty {
     /// Segments currently held by graph `g_id` (0 if the graph is absent/empty).
     pub fn segment_count(&self, g_id: GraphId) -> usize {
         self.graphs
-            .get(g_id as usize)
+            .get(g_id)
             .and_then(Option::as_ref)
             .map_or(0, Vec::len)
     }
 
     /// Largest per-graph segment count across all graphs (the read-fan-out driver).
     pub fn max_segment_count(&self) -> usize {
-        self.graphs
-            .iter()
-            .flatten()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0)
+        self.graphs.lists().map(Vec::len).max().unwrap_or(0)
     }
 
     /// Whether any graph holds at least `tier_width` segments in one size class —
@@ -737,7 +822,7 @@ impl Novelty {
         if tier_width < 2 {
             return false;
         }
-        self.graphs.iter().flatten().any(|segs| {
+        self.graphs.lists().any(|segs| {
             segs.len() >= tier_width && {
                 let mut counts: HashMap<u32, usize> = HashMap::new();
                 for seg in segs {
@@ -767,8 +852,8 @@ impl Novelty {
             return 0;
         }
         let mut merges = 0;
-        for g in 0..self.graphs.len() {
-            merges += self.tier_compact_graph(g, tier_width);
+        for slot in 0..self.graphs.len() {
+            merges += self.tier_compact_graph(slot, tier_width);
         }
         if merges > 0 {
             self.recompute_totals();
@@ -785,10 +870,10 @@ impl Novelty {
     /// (`<= number_of_classes` merges of `tier_width` segments), so even the first
     /// read after a long insert-only burst can't stall on a huge class-0 backlog;
     /// any remaining backlog drains on subsequent reads.
-    fn tier_compact_graph(&mut self, g: usize, tier_width: usize) -> usize {
+    fn tier_compact_graph(&mut self, slot: usize, tier_width: usize) -> usize {
         let mut merges = 0;
         let mut min_class = 0u32;
-        while let Some(Some(segs)) = self.graphs.get_mut(g) {
+        while let Some(Some(segs)) = self.graphs.by_slot_mut(slot) {
             if segs.len() < tier_width {
                 break;
             }
@@ -1110,7 +1195,7 @@ impl Novelty {
             // Fold in any existing segments for this graph so the dedup pass sees
             // the full universe, then replace them with one consolidated segment.
             let mut combined: Vec<Flake> = Vec::new();
-            if let Some(slot) = self.graphs.get_mut(g_id as usize) {
+            if let Some(slot) = self.graphs.get_mut(g_id) {
                 if let Some(segs) = slot.take() {
                     for seg in segs {
                         match Arc::try_unwrap(seg) {
@@ -1225,7 +1310,7 @@ impl Novelty {
             return;
         }
 
-        for slot in &mut self.graphs {
+        for slot in self.graphs.iter_mut() {
             let Some(segs) = slot.as_mut() else { continue };
             let mut kept: Vec<Arc<Segment>> = Vec::with_capacity(segs.len());
             for seg in segs.drain(..) {
@@ -1254,13 +1339,12 @@ impl Novelty {
         // SPOT order (t-ascending within an identity) so the latest op wins.
         // slice_for_range returns an owned Vec, so the &self borrow ends before
         // the &mut fact_state writes.
+        self.graphs.compact();
         let mut fs = NoveltyFactState::new();
-        for g in 0..self.graphs.len() {
-            if self.graphs[g].as_ref().is_some_and(|s| !s.is_empty()) {
-                let ids = self.slice_for_range(g as GraphId, IndexType::Spot, None, None, true);
-                for id in ids {
-                    fs.record(g as GraphId, self.get_flake(id));
-                }
+        for g in self.graphs.present() {
+            let ids = self.slice_for_range(g, IndexType::Spot, None, None, true);
+            for id in ids {
+                fs.record(g, self.get_flake(id));
             }
         }
         self.fact_state = fs;
@@ -1283,12 +1367,12 @@ impl Novelty {
         // so size both up front to avoid reallocation churn on the K>1 read path.
         let cap = self
             .graphs
-            .get(g_id as usize)
+            .get(g_id)
             .and_then(Option::as_ref)
             .map_or(0, Vec::len);
         let mut streams: Vec<MergeStream<'_>> = Vec::with_capacity(cap);
         let mut heap: BinaryHeap<MergeHead<'_>> = BinaryHeap::with_capacity(cap);
-        if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
+        if let Some(Some(segs)) = self.graphs.get(g_id) {
             for (seg_idx, seg) in segs.iter().enumerate() {
                 // Zone-map prune: skip segments whose key range can't intersect
                 // (first, rhs] without paying for the binary search.
@@ -1315,7 +1399,7 @@ impl Novelty {
             }
         }
         GraphMergeIter {
-            g_id,
+            slot: self.graphs.slot(g_id).unwrap_or(0),
             index,
             streams,
             heap,
@@ -1324,10 +1408,7 @@ impl Novelty {
 
     /// Graph ids (ascending) that currently hold at least one non-empty segment.
     fn present_graphs(&self) -> Vec<GraphId> {
-        (0..self.graphs.len())
-            .filter(|&g| self.graphs[g].as_ref().is_some_and(|s| !s.is_empty()))
-            .map(|g| g as GraphId)
-            .collect()
+        self.graphs.present()
     }
 
     /// Range read over one graph yielding `&Flake`. K=1 takes the no-heap,
@@ -1341,7 +1422,7 @@ impl Novelty {
         rhs: Option<&Flake>,
         leftmost: bool,
     ) -> FlakeRead<'_> {
-        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+        match self.graphs.get(g_id).and_then(Option::as_ref) {
             Some(segs) if segs.len() == 1 => {
                 let seg = &segs[0];
                 if seg.may_overlap(index, first, rhs, leftmost) {
@@ -1370,12 +1451,15 @@ impl Novelty {
         rhs: Option<&Flake>,
         leftmost: bool,
     ) -> IdRead<'_> {
-        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+        match self.graphs.get(g_id).and_then(Option::as_ref) {
             Some(segs) if segs.len() == 1 => {
                 let seg = &segs[0];
                 if seg.may_overlap(index, first, rhs, leftmost) {
                     IdRead::Single {
-                        g_id,
+                        slot: self
+                            .graphs
+                            .slot(g_id)
+                            .expect("a graph with segments has a slot"),
                         seg_idx: 0,
                         order: seg.range(index, first, rhs, leftmost).iter(),
                     }
@@ -1447,7 +1531,9 @@ impl Novelty {
     /// readers use the borrow-safe [`Self::range_flakes`] / [`Self::iter_flakes`]
     /// / `for_each_overlay_flake` which yield `&Flake` directly.
     pub(crate) fn get_flake(&self, id: FlakeId) -> &Flake {
-        let segs = self.graphs[id.graph()]
+        let segs = self
+            .graphs
+            .by_slot(id.graph())
             .as_ref()
             .expect("FlakeId references a live graph");
         &segs[id.seg()].flakes[id.local()]
@@ -1487,13 +1573,10 @@ impl Novelty {
 
 impl std::fmt::Debug for Novelty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let segments: usize = self.graphs.iter().flatten().map(Vec::len).sum();
+        let segments: usize = self.graphs.lists().map(Vec::len).sum();
         f.debug_struct("Novelty")
             .field("flake_count", &self.flake_count)
-            .field(
-                "graphs",
-                &self.graphs.iter().filter(|s| s.is_some()).count(),
-            )
+            .field("graphs", &self.graphs.lists().count())
             .field("segments", &segments)
             .field("size", &self.size)
             .field("t", &self.t)
@@ -1539,7 +1622,7 @@ impl OverlayProvider for Novelty {
         // K=1 (the common steady state) takes a raw slice loop — no iterator/
         // enum dispatch per flake — recovering the old single-vector read speed
         // on this query hot path. K>1 k-way merges. Applies the to_t filter.
-        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+        match self.graphs.get(g_id).and_then(Option::as_ref) {
             Some(segs) if segs.len() == 1 => {
                 let seg = &segs[0];
                 if seg.may_overlap(index, first, rhs, leftmost) {
@@ -1566,14 +1649,25 @@ impl OverlayProvider for Novelty {
     fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
         Some(
             self.graphs
-                .get(g_id as usize)
+                .get(g_id)
                 .and_then(Option::as_ref)
                 .map_or(0, |segs| segs.iter().map(|s| s.flakes.len()).sum()),
         )
     }
 
+    fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
+        Some(
+            self.graphs
+                .slots
+                .iter()
+                .filter(|(_, segs)| segs.as_ref().is_some_and(|segs| !segs.is_empty()))
+                .map(|&(g_id, _)| g_id)
+                .collect(),
+        )
+    }
+
     fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {
-        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+        match self.graphs.get(g_id).and_then(Option::as_ref) {
             Some(segs) => segs
                 .iter()
                 .map(|s| fluree_db_core::OverlaySegmentMeta {
@@ -1601,7 +1695,7 @@ impl OverlayProvider for Novelty {
         // `seg_idx` is the position from `overlay_segments` (same immutable
         // snapshot the caller enumerated), so index directly — O(1) instead of a
         // linear `seg_id` scan per segment (avoids O(K²) over a K-segment graph).
-        if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
+        if let Some(Some(segs)) = self.graphs.get(g_id) {
             if let Some(seg) = segs.get(seg_idx) {
                 debug_assert_eq!(
                     seg.seg_id, seg_id,
@@ -2310,6 +2404,74 @@ mod tests {
         }
     }
 
+    /// Graph ids past 16 bits live in novelty by slot: reads, packed ids and
+    /// a clear that drops a graph's slot all keep each graph's flakes apart.
+    #[test]
+    fn graph_ids_past_16_bits_read_back_by_slot() {
+        let mut novelty = Novelty::new(0);
+        let (wide, wider) = (Sid::new(100, "wide"), Sid::new(100, "wider"));
+        let mut rg = HashMap::new();
+        rg.insert(wide.clone(), 70_000u32);
+        rg.insert(wider.clone(), 3_000_000u32);
+        novelty
+            .apply_commit(
+                vec![
+                    make_graph_flake(1, 1, 10, 1, wide.clone()),
+                    make_graph_flake(2, 1, 20, 1, wider.clone()),
+                    make_flake(3, 1, 30, 1, true),
+                ],
+                1,
+                &rg,
+            )
+            .unwrap();
+        novelty
+            .apply_commit(vec![make_graph_flake(4, 1, 40, 2, wider.clone())], 2, &rg)
+            .unwrap();
+
+        let objects = |n: &Novelty, g: GraphId| -> Vec<i64> {
+            n.slice_for_range(g, IndexType::Spot, None, None, true)
+                .into_iter()
+                .map(|id| match n.get_flake(id).o {
+                    FlakeValue::Long(v) => v,
+                    ref other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(objects(&novelty, 70_000), vec![10]);
+        assert_eq!(objects(&novelty, 3_000_000), vec![20, 40]);
+        assert_eq!(objects(&novelty, 0), vec![30]);
+        assert_eq!(novelty.present_graphs(), vec![0, 70_000, 3_000_000]);
+
+        // Graph 70,000 empties at t=1; its slot goes, the others shift.
+        novelty.clear_up_to(1);
+        assert_eq!(novelty.present_graphs(), vec![3_000_000]);
+        assert_eq!(objects(&novelty, 3_000_000), vec![40]);
+        assert!(objects(&novelty, 70_000).is_empty());
+    }
+
+    #[test]
+    fn overlay_graph_ids_lists_the_graphs_holding_flakes() {
+        let mut novelty = Novelty::new(0);
+        assert_eq!(novelty.overlay_graph_ids(), Some(vec![]));
+        let (g2, g5) = (Sid::new(100, "graph2"), Sid::new(100, "graph5"));
+        let rg: HashMap<Sid, GraphId> = [(g2.clone(), 2u32), (g5.clone(), 5u32)].into();
+        novelty
+            .apply_commit(
+                vec![
+                    make_graph_flake(10, 1, 300, 1, g5),
+                    make_graph_flake(11, 1, 400, 1, g2),
+                ],
+                1,
+                &rg,
+            )
+            .unwrap();
+        let mut graphs = novelty.overlay_graph_ids().unwrap();
+        graphs.sort_unstable();
+        assert_eq!(graphs, vec![2, 5]);
+        novelty.clear_up_to(1);
+        assert_eq!(novelty.overlay_graph_ids(), Some(vec![]));
+    }
+
     #[test]
     fn test_per_graph_isolation() {
         let mut novelty = Novelty::new(0);
@@ -2317,7 +2479,7 @@ mod tests {
         // Set up: graph 2 mapped to Sid("g", "graph2")
         let g2_sid = Sid::new(100, "graph2");
         let mut rg = HashMap::new();
-        rg.insert(g2_sid.clone(), 2u16);
+        rg.insert(g2_sid.clone(), 2u32);
 
         // Default graph flakes (flake.g = None)
         let default_flakes = vec![
@@ -2777,7 +2939,7 @@ mod tests {
         }
         let digest = |n: &Novelty| -> u64 {
             let mut h = DefaultHasher::new();
-            for g in 0u16..=2 {
+            for g in 0u32..=2 {
                 for idx in ORDERS {
                     let ids = n.slice_for_range(g, idx, None, None, true);
                     ids.len().hash(&mut h);
@@ -2832,8 +2994,8 @@ mod tests {
 
     fn eq_reverse_graph() -> HashMap<Sid, GraphId> {
         let mut m = HashMap::new();
-        m.insert(Sid::new(8, "g1"), 1u16);
-        m.insert(Sid::new(8, "g2"), 2u16);
+        m.insert(Sid::new(8, "g1"), 1u32);
+        m.insert(Sid::new(8, "g2"), 2u32);
         m
     }
 
@@ -2894,7 +3056,7 @@ mod tests {
             // Only routable graphs are used, so apply_commit cannot error here.
             n.apply_commit(batch, t, &rg).expect("apply_commit");
 
-            for g in 0u16..=2 {
+            for g in 0u32..=2 {
                 // Each order is sorted by its comparator.
                 for idx in ORDERS {
                     let ids = eq_full(&n, g, idx);

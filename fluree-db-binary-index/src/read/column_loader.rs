@@ -181,6 +181,18 @@ pub fn load_leaflet_columns(
         ColumnData::AbsentDefault
     };
 
+    // ── g_id ── (pooled-tree leaflets only; dedicated trees have no block)
+    let g_id = match find_ref(ColumnId::GId).filter(|_| eff.contains(ColumnId::GId)) {
+        Some(r) if r.elem_width == 4 => ColumnData::Block(Arc::from(decode_u32(ColumnId::GId)?)),
+        Some(_) => ColumnData::Block(
+            decode_u16_col(ColumnId::GId)?
+                .into_iter()
+                .map(u32::from)
+                .collect(),
+        ),
+        None => ColumnData::AbsentDefault,
+    };
+
     Ok(ColumnBatch {
         row_count,
         s_id,
@@ -189,6 +201,7 @@ pub fn load_leaflet_columns(
         o_type,
         o_i,
         t,
+        g_id,
     })
 }
 

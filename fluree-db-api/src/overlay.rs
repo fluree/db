@@ -63,6 +63,16 @@ impl OverlayProvider for CompositeOverlay {
             .try_fold(0usize, |acc, o| Some(acc + o.overlay_flake_count(g_id)?))
     }
 
+    fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
+        let mut graphs = Vec::new();
+        for overlay in &self.overlays {
+            graphs.extend(overlay.overlay_graph_ids()?);
+        }
+        graphs.sort_unstable();
+        graphs.dedup();
+        Some(graphs)
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

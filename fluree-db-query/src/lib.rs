@@ -83,6 +83,7 @@ pub mod policy;
 pub mod project;
 pub mod property_join;
 pub mod property_path;
+pub mod quad_block;
 pub mod r2rml;
 pub mod range_semijoin;
 pub mod reasoning;

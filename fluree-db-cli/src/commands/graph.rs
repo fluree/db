@@ -93,12 +93,13 @@ async fn run_list(
         config_graph_iri(resolved_ledger)
     };
 
-    let mut parsed: Vec<(&serde_json::Value, Option<u16>)> = Vec::with_capacity(graphs.len());
+    let mut parsed: Vec<(&serde_json::Value, Option<fluree_db_core::GraphId>)> =
+        Vec::with_capacity(graphs.len());
     for entry in graphs {
         let g_id = match entry.get("g-id").and_then(serde_json::Value::as_u64) {
-            Some(n) => Some(u16::try_from(n).map_err(|_| {
+            Some(n) => Some(fluree_db_core::GraphId::try_from(n).map_err(|_| {
                 CliError::Usage(format!(
-                    "info response contains out-of-range g-id {n}; GraphId is u16 (max 65535)"
+                    "info response contains out-of-range g-id {n}; GraphId is u32"
                 ))
             })?),
             None => None,
@@ -106,13 +107,13 @@ async fn run_list(
         parsed.push((entry, g_id));
     }
 
-    let entries: Vec<(&serde_json::Value, Option<u16>)> = parsed
+    let entries: Vec<(&serde_json::Value, Option<fluree_db_core::GraphId>)> = parsed
         .into_iter()
         .filter(|(entry, g_id)| {
             if include_system {
                 return true;
             }
-            let g_id = g_id.unwrap_or(u16::MAX);
+            let g_id = g_id.unwrap_or(fluree_db_core::GraphId::MAX);
             let iri = entry
                 .get("iri")
                 .and_then(serde_json::Value::as_str)
@@ -143,7 +144,7 @@ async fn run_list(
 
     let mut table = Table::new();
     table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec!["IRI", "Kind", "g-id", "Flakes", "Size"]);
+    table.set_header(vec!["IRI", "Kind", "g-id", "Flakes", "Size", "Placement"]);
     for (entry, g_id) in entries {
         let iri = entry
             .get("iri")
@@ -169,12 +170,17 @@ async fn run_list(
             .and_then(serde_json::Value::as_u64)
             .map(format_bytes)
             .unwrap_or_else(|| "-".to_string());
+        let placement = entry
+            .get("placement")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
         table.add_row(vec![
             iri.to_string(),
             kind.to_string(),
             g_id_label,
             flakes,
             size,
+            placement.to_string(),
         ]);
     }
     println!("{table}");
@@ -193,7 +199,7 @@ fn extract_named_graphs(payload: &serde_json::Value) -> Option<&Vec<serde_json::
         })
 }
 
-fn is_system_graph(g_id: u16, iri: &str, txn_meta: &str, config: &str) -> bool {
+fn is_system_graph(g_id: fluree_db_core::GraphId, iri: &str, txn_meta: &str, config: &str) -> bool {
     if matches!(g_id, DEFAULT_GRAPH_ID | TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) {
         return true;
     }

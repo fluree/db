@@ -190,9 +190,9 @@ pub struct IncrementalNovelty {
     /// Total retractions.
     pub delta_retracts: u64,
     /// Base vector arena counts per (g_id, p_id) for handle offsetting.
-    pub base_vector_counts: HashMap<(u16, u32), u32>,
+    pub base_vector_counts: HashMap<(fluree_db_core::GraphId, u32), u32>,
     /// Base numbig arena counts per (g_id, p_id).
-    pub base_numbig_counts: HashMap<(u16, u32), usize>,
+    pub base_numbig_counts: HashMap<(fluree_db_core::GraphId, u32), usize>,
     /// String text bytes for fulltext assertion entries.
     pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
     /// Triple terms first interned by this window as `(p_id, seq, key bytes)`,
@@ -305,7 +305,7 @@ pub async fn resolve_incremental_commits_v6(
     let (base_numbig_counts, base_vector_counts, vector_manifests, t_seed_arenas_ms) = {
         let t0 = Instant::now();
 
-        let mut base_numbig_counts: HashMap<(u16, u32), usize> = HashMap::new();
+        let mut base_numbig_counts: HashMap<(fluree_db_core::GraphId, u32), usize> = HashMap::new();
         for ga in &root.graph_arenas {
             if ga.numbig.is_empty() {
                 continue;
@@ -328,9 +328,9 @@ pub async fn resolve_incremental_commits_v6(
             }
         }
 
-        let mut base_vector_counts: HashMap<(u16, u32), u32> = HashMap::new();
+        let mut base_vector_counts: HashMap<(fluree_db_core::GraphId, u32), u32> = HashMap::new();
         let mut vector_manifests: Vec<(
-            u16,
+            fluree_db_core::GraphId,
             u32,
             fluree_db_binary_index::arena::vector::VectorManifest,
         )> = Vec::new();
@@ -673,7 +673,8 @@ pub async fn resolve_incremental_commits_v6(
     let prior_attachments = if attachments.is_empty() {
         HashMap::new()
     } else {
-        let mut keys: Vec<(u16, u64)> = attachments.iter().map(|a| (a.g_id, a.ann)).collect();
+        let mut keys: Vec<(fluree_db_core::GraphId, u64)> =
+            attachments.iter().map(|a| (a.g_id, a.ann)).collect();
         keys.sort_unstable();
         keys.dedup();
         base_attachment_states(
@@ -742,7 +743,7 @@ pub async fn resolve_incremental_commits_v6(
                 ))
             })?;
         }
-        let prior = |g_id: u16, ann: u64| {
+        let prior = |g_id: fluree_db_core::GraphId, ann: u64| {
             prior_attachments
                 .get(&(g_id, ann))
                 .copied()
@@ -1187,11 +1188,11 @@ async fn seed_vector_fact_handles(
     // Walk every graph that has vector arenas; for each, scan SPOT for
     // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
     // handle into the shared fact map.
-    let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
+    let graphs_with_vectors: Vec<fluree_db_core::GraphId> =
+        shared.vectors.keys().copied().collect();
     for g_id in graphs_with_vectors {
-        let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
-            Some(b) => Arc::clone(b),
-            None => continue,
+        let Some(tree) = store.graph_tree(g_id, RunSortOrder::Spot) else {
+            continue;
         };
         let arena_map = match shared.vectors.get(&g_id) {
             Some(m) => m,
@@ -1199,16 +1200,41 @@ async fn seed_vector_fact_handles(
         };
         let filter = BinaryFilter {
             o_type: Some(OType::VECTOR.as_u16()),
+            g_id: tree.g_filter,
             ..Default::default()
         };
-        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
-        let mut cursor = BinaryCursor::scan_all(
-            Arc::clone(&store),
-            RunSortOrder::Spot,
-            branch,
-            filter,
-            projection,
-        );
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, tree.order);
+        let mut cursor = match tree.g_filter {
+            // The graph's run of the pooled GSPO.
+            Some(g) => {
+                let bound =
+                    |low: bool| fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                        s_id: fluree_db_core::subject_id::SubjectId(if low { 0 } else { u64::MAX }),
+                        o_key: if low { 0 } else { u64::MAX },
+                        p_id: if low { 0 } else { u32::MAX },
+                        t: if low { 0 } else { u32::MAX },
+                        o_i: if low { 0 } else { u32::MAX },
+                        o_type: if low { 0 } else { u16::MAX },
+                        g_id: g,
+                    };
+                BinaryCursor::new(
+                    Arc::clone(&store),
+                    tree.order,
+                    tree.branch,
+                    &bound(true),
+                    &bound(false),
+                    filter,
+                    projection,
+                )
+            }
+            None => BinaryCursor::scan_all(
+                Arc::clone(&store),
+                tree.order,
+                tree.branch,
+                filter,
+                projection,
+            ),
+        };
         let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
         while let Some(batch) = cursor.next_batch()? {
             for i in 0..batch.row_count {
@@ -1272,9 +1298,9 @@ async fn base_attachment_states(
     root: &IndexRoot,
     predicates: &crate::run_index::resolve::global_dict::PredicateDict,
     slots: [Option<u32>; 3],
-    keys: &[(u16, u64)],
+    keys: &[(fluree_db_core::GraphId, u64)],
     strings: &mut WindowStrings<'_>,
-) -> io::Result<HashMap<(u16, u64), [Option<SlotValue>; 3]>> {
+) -> io::Result<HashMap<(fluree_db_core::GraphId, u64), [Option<SlotValue>; 3]>> {
     use crate::run_index::resolve::link_synth::ObjectId;
     use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
     use fluree_db_core::o_type::OType;

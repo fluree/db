@@ -79,6 +79,21 @@ pub struct BinaryCursor {
     /// Sorted lead keys a batched probe wants; leaflets whose directory key
     /// range holds none of them are skipped. See [`Self::set_wanted_keys`].
     wanted_keys: Option<Arc<[u64]>>,
+    /// A pooled secondary order's delta events, folded into the overlay ops
+    /// on the first `next_batch` (once the caller has set novelty and `to_t`).
+    pending_delta: Option<Arc<[OverlayOp]>>,
+}
+
+/// The delta a cursor over `order` of `store` merges: a pooled secondary
+/// order's events beyond its branch, if any.
+fn pending_delta(store: &BinaryIndexStore, order: RunSortOrder) -> Option<Arc<[OverlayOp]>> {
+    if !order.is_pooled() || order == RunSortOrder::Gspo {
+        return None;
+    }
+    store
+        .pool_delta(order)
+        .filter(|events| !events.is_empty())
+        .cloned()
 }
 
 /// State for a leaf that's been opened via `LeafHandle`.
@@ -99,7 +114,9 @@ impl BinaryCursor {
     ) -> Self {
         let cmp = cmp_v2_for_order(order);
         let leaf_range = branch.find_leaves_in_range(min_key, max_key, cmp);
+        let pending_delta = pending_delta(&store, order);
         Self {
+            pending_delta,
             store,
             order,
             branch,
@@ -133,7 +150,9 @@ impl BinaryCursor {
         projection: ColumnProjection,
     ) -> Self {
         let leaf_count = branch.leaves.len();
+        let pending_delta = pending_delta(&store, order);
         Self {
+            pending_delta,
             store,
             order,
             branch,
@@ -369,6 +388,9 @@ impl BinaryCursor {
     /// Returns `None` when all leaflets in all leaves are exhausted
     /// (and overlay-only ops have been emitted).
     pub fn next_batch(&mut self) -> io::Result<Option<ColumnBatch>> {
+        if self.pending_delta.is_some() {
+            self.fold_in_delta();
+        }
         loop {
             if self.exhausted {
                 return Ok(None);
@@ -640,6 +662,34 @@ impl BinaryCursor {
         }
     }
 
+    /// Fold the pooled delta's events in this cursor's range, resolved at
+    /// `to_t`, under the overlay ops the caller set (newer, so they win).
+    fn fold_in_delta(&mut self) {
+        let Some(delta) = self.pending_delta.take() else {
+            return;
+        };
+        let (start, end) = match (&self.range_min, &self.range_max) {
+            (Some(min), Some(max)) => {
+                crate::read::types::overlay_window_for_range(&delta, min, max, self.order)
+            }
+            _ => (0, delta.len()),
+        };
+        let mut resolved = crate::read::types::resolve_events_at(&delta[start..end], self.to_t);
+        resolved.retain(|op| self.filter.matches_graph(op.g_id));
+        if resolved.is_empty() {
+            return;
+        }
+        let combined = crate::read::types::merge_resolved_ops(
+            &resolved,
+            &self.overlay_ops[self.overlay_pos..self.overlay_end],
+            self.order,
+        );
+        self.overlay_end = combined.len();
+        self.overlay_ops = combined.into();
+        self.overlay_pos = 0;
+        self.leaf_overlay_end = self.overlay_end;
+    }
+
     // ========================================================================
     // Overlay merge
     // ========================================================================
@@ -655,13 +705,8 @@ impl BinaryCursor {
     ) -> ColumnBatch {
         let order = self.order;
         let to_t = self.to_t;
-
-        let mut out_s_id: Vec<u64> = Vec::new();
-        let mut out_o_key: Vec<u64> = Vec::new();
-        let mut out_p_id: Vec<u32> = Vec::new();
-        let mut out_o_type: Vec<u16> = Vec::new();
-        let mut out_o_i: Vec<u32> = Vec::new();
-        let mut out_t: Vec<u32> = Vec::new();
+        let pooled = order.is_pooled();
+        let mut out = OutRows::new(pooled);
 
         let mut ri = 0usize;
         let row_count = base.row_count;
@@ -684,15 +729,7 @@ impl BinaryCursor {
                 }
 
                 if ov.op && ov.t <= to_t && self.filter_overlay(ov) {
-                    push_overlay_row(
-                        ov,
-                        &mut out_s_id,
-                        &mut out_o_key,
-                        &mut out_p_id,
-                        &mut out_o_type,
-                        &mut out_o_i,
-                        &mut out_t,
-                    );
+                    out.push_overlay(ov);
                 }
                 self.overlay_pos += 1;
                 continue;
@@ -700,16 +737,7 @@ impl BinaryCursor {
 
             if self.overlay_pos >= ov_end {
                 // Overlay exhausted for this leaf — drain remaining rows.
-                push_batch_row(
-                    &base,
-                    ri,
-                    &mut out_s_id,
-                    &mut out_o_key,
-                    &mut out_p_id,
-                    &mut out_o_type,
-                    &mut out_o_i,
-                    &mut out_t,
-                );
+                out.push_row(&base, ri);
                 ri += 1;
                 continue;
             }
@@ -721,88 +749,49 @@ impl BinaryCursor {
             let r_ot = base.o_type.get_or(ri, 0);
             let r_ok = base.o_key.get(ri);
             let r_oi = base.o_i.get_or(ri, u32::MAX);
+            let r_g = base.g_id.get_or(ri, 0);
 
-            match cmp_row_vs_overlay(r_s, r_p, r_ot, r_ok, r_oi, ov, order) {
+            match cmp_row_vs_overlay(r_s, r_p, r_ot, r_ok, r_oi, r_g, ov, order) {
                 std::cmp::Ordering::Less => {
                     // Row sorts before overlay → emit row.
-                    push_batch_row(
-                        &base,
-                        ri,
-                        &mut out_s_id,
-                        &mut out_o_key,
-                        &mut out_p_id,
-                        &mut out_o_type,
-                        &mut out_o_i,
-                        &mut out_t,
-                    );
+                    out.push_row(&base, ri);
                     ri += 1;
                 }
                 std::cmp::Ordering::Greater => {
                     // Overlay sorts before row → emit assert, skip retract.
                     if ov.op && ov.t <= to_t && self.filter_overlay(ov) {
-                        push_overlay_row(
-                            ov,
-                            &mut out_s_id,
-                            &mut out_o_key,
-                            &mut out_p_id,
-                            &mut out_o_type,
-                            &mut out_o_i,
-                            &mut out_t,
-                        );
+                        out.push_overlay(ov);
                     }
                     self.overlay_pos += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    // Same sort position — check full identity (all 5 fields).
+                    // Same sort position — check full identity (the five fact
+                    // fields, plus the graph in the pooled tree).
                     let same_identity = r_s == ov.s_id
                         && r_p == ov.p_id
                         && r_ot == ov.o_type
                         && r_ok == ov.o_key
-                        && r_oi == ov.o_i;
+                        && r_oi == ov.o_i
+                        && (!pooled || r_g == ov.g_id);
 
                     if same_identity {
                         // Same fact: assert → overlay replaces row; retract → omit row.
                         if ov.op && ov.t <= to_t && self.filter_overlay(ov) {
-                            push_overlay_row(
-                                ov,
-                                &mut out_s_id,
-                                &mut out_o_key,
-                                &mut out_p_id,
-                                &mut out_o_type,
-                                &mut out_o_i,
-                                &mut out_t,
-                            );
+                            out.push_overlay(ov);
                         }
                         // Both consumed.
                         ri += 1;
                         self.overlay_pos += 1;
                     } else {
                         // Sort-position tie but different identity — emit row, retry overlay.
-                        push_batch_row(
-                            &base,
-                            ri,
-                            &mut out_s_id,
-                            &mut out_o_key,
-                            &mut out_p_id,
-                            &mut out_o_type,
-                            &mut out_o_i,
-                            &mut out_t,
-                        );
+                        out.push_row(&base, ri);
                         ri += 1;
                     }
                 }
             }
         }
 
-        ColumnBatch {
-            row_count: out_s_id.len(),
-            s_id: ColumnData::Block(out_s_id.into()),
-            o_key: ColumnData::Block(out_o_key.into()),
-            p_id: ColumnData::Block(out_p_id.into()),
-            o_type: ColumnData::Block(out_o_type.into()),
-            o_i: ColumnData::Block(out_o_i.into()),
-            t: ColumnData::Block(out_t.into()),
-        }
+        out.into_batch()
     }
 
     /// Emit remaining overlay ops as a batch (overlay-only path).
@@ -810,12 +799,7 @@ impl BinaryCursor {
     /// Called when all indexed leaves are exhausted but overlay ops remain.
     /// These represent facts that exist only in novelty (e.g., new subjects).
     fn emit_overlay_only(&mut self) -> ColumnBatch {
-        let mut out_s_id: Vec<u64> = Vec::new();
-        let mut out_o_key: Vec<u64> = Vec::new();
-        let mut out_p_id: Vec<u32> = Vec::new();
-        let mut out_o_type: Vec<u16> = Vec::new();
-        let mut out_o_i: Vec<u32> = Vec::new();
-        let mut out_t: Vec<u32> = Vec::new();
+        let mut out = OutRows::new(self.order.is_pooled());
 
         while self.overlay_pos < self.overlay_end {
             let ov = &self.overlay_ops[self.overlay_pos];
@@ -828,26 +812,10 @@ impl BinaryCursor {
                 continue;
             }
 
-            push_overlay_row(
-                ov,
-                &mut out_s_id,
-                &mut out_o_key,
-                &mut out_p_id,
-                &mut out_o_type,
-                &mut out_o_i,
-                &mut out_t,
-            );
+            out.push_overlay(ov);
         }
 
-        ColumnBatch {
-            row_count: out_s_id.len(),
-            s_id: ColumnData::Block(out_s_id.into()),
-            o_key: ColumnData::Block(out_o_key.into()),
-            p_id: ColumnData::Block(out_p_id.into()),
-            o_type: ColumnData::Block(out_o_type.into()),
-            o_i: ColumnData::Block(out_o_i.into()),
-            t: ColumnData::Block(out_t.into()),
-        }
+        out.into_batch()
     }
 
     /// Check if an overlay op passes the current filter.
@@ -855,6 +823,7 @@ impl BinaryCursor {
     fn filter_overlay(&self, ov: &OverlayOp) -> bool {
         self.filter
             .matches(ov.s_id, ov.p_id, ov.o_type, ov.o_key, ov.o_i)
+            && self.filter.matches_graph(ov.g_id)
     }
 }
 
@@ -862,43 +831,73 @@ impl BinaryCursor {
 // Helpers
 // ============================================================================
 
-#[allow(clippy::too_many_arguments)]
-fn push_batch_row(
-    batch: &ColumnBatch,
-    i: usize,
-    s_id: &mut Vec<u64>,
-    o_key: &mut Vec<u64>,
-    p_id: &mut Vec<u32>,
-    o_type: &mut Vec<u16>,
-    o_i: &mut Vec<u32>,
-    t: &mut Vec<u32>,
-) {
-    s_id.push(batch.s_id.get(i));
-    o_key.push(batch.o_key.get(i));
-    p_id.push(batch.p_id.get_or(i, 0));
-    o_type.push(batch.o_type.get_or(i, 0));
-    o_i.push(batch.o_i.get_or(i, u32::MAX));
-    t.push(batch.t.get_or(i, 0));
+/// Rows of a merged output batch, column by column. The graph column is kept
+/// only for pooled orders.
+struct OutRows {
+    s_id: Vec<u64>,
+    o_key: Vec<u64>,
+    p_id: Vec<u32>,
+    o_type: Vec<u16>,
+    o_i: Vec<u32>,
+    t: Vec<u32>,
+    g_id: Option<Vec<fluree_db_core::GraphId>>,
 }
 
-fn push_overlay_row(
-    ov: &OverlayOp,
-    s_id: &mut Vec<u64>,
-    o_key: &mut Vec<u64>,
-    p_id: &mut Vec<u32>,
-    o_type: &mut Vec<u16>,
-    o_i: &mut Vec<u32>,
-    t: &mut Vec<u32>,
-) {
-    s_id.push(ov.s_id);
-    o_key.push(ov.o_key);
-    p_id.push(ov.p_id);
-    o_type.push(ov.o_type);
-    o_i.push(ov.o_i);
-    t.push(u32::try_from(ov.t.max(0)).unwrap_or_else(|_| {
-        tracing::warn!(overlay_t = ov.t, "overlay t does not fit u32, clamping");
-        u32::MAX
-    }));
+impl OutRows {
+    fn new(pooled: bool) -> Self {
+        Self {
+            s_id: Vec::new(),
+            o_key: Vec::new(),
+            p_id: Vec::new(),
+            o_type: Vec::new(),
+            o_i: Vec::new(),
+            t: Vec::new(),
+            g_id: pooled.then(Vec::new),
+        }
+    }
+
+    fn push_row(&mut self, batch: &ColumnBatch, i: usize) {
+        self.s_id.push(batch.s_id.get(i));
+        self.o_key.push(batch.o_key.get(i));
+        self.p_id.push(batch.p_id.get_or(i, 0));
+        self.o_type.push(batch.o_type.get_or(i, 0));
+        self.o_i.push(batch.o_i.get_or(i, u32::MAX));
+        self.t.push(batch.t.get_or(i, 0));
+        if let Some(g) = &mut self.g_id {
+            g.push(batch.g_id.get_or(i, 0));
+        }
+    }
+
+    fn push_overlay(&mut self, ov: &OverlayOp) {
+        self.s_id.push(ov.s_id);
+        self.o_key.push(ov.o_key);
+        self.p_id.push(ov.p_id);
+        self.o_type.push(ov.o_type);
+        self.o_i.push(ov.o_i);
+        self.t.push(u32::try_from(ov.t.max(0)).unwrap_or_else(|_| {
+            tracing::warn!(overlay_t = ov.t, "overlay t does not fit u32, clamping");
+            u32::MAX
+        }));
+        if let Some(g) = &mut self.g_id {
+            g.push(ov.g_id);
+        }
+    }
+
+    fn into_batch(self) -> ColumnBatch {
+        ColumnBatch {
+            row_count: self.s_id.len(),
+            s_id: ColumnData::Block(self.s_id.into()),
+            o_key: ColumnData::Block(self.o_key.into()),
+            p_id: ColumnData::Block(self.p_id.into()),
+            o_type: ColumnData::Block(self.o_type.into()),
+            o_i: ColumnData::Block(self.o_i.into()),
+            t: ColumnData::Block(self.t.into()),
+            g_id: match self.g_id {
+                Some(g) => ColumnData::Block(g.into()),
+                None => ColumnData::AbsentDefault,
+            },
+        }
+    }
 }
 
 // ============================================================================
@@ -922,7 +921,9 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder)
         let p_id = batch.p_id.get_or(i, 0);
         let o_type = batch.o_type.get_or(i, 0);
         let o_i = batch.o_i.get_or(i, u32::MAX);
-        if filter.matches(s_id, p_id, o_type, o_key, o_i) {
+        if filter.matches(s_id, p_id, o_type, o_key, o_i)
+            && filter.matches_graph(batch.g_id.get_or(i, 0))
+        {
             matching.push(i);
         }
     }
@@ -952,25 +953,32 @@ fn leading_bound_range(
 ) -> (usize, usize) {
     let full = (0usize, batch.row_count);
     match order {
+        // GSPO: (g_id, s_id, p_id, o_type, o_key)
+        RunSortOrder::Gspo => cascade(full, &batch.g_id, filter.g_id)
+            .and_then(|r| cascade(r, &batch.s_id, filter.s_id))
+            .and_then(|r| cascade(r, &batch.p_id, filter.p_id))
+            .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
+            .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
+            .into_range(),
         // SPOT: (s_id, p_id, o_type, o_key)
-        RunSortOrder::Spot => cascade(full, &batch.s_id, filter.s_id)
+        RunSortOrder::Spot | RunSortOrder::SpotG => cascade(full, &batch.s_id, filter.s_id)
             .and_then(|r| cascade(r, &batch.p_id, filter.p_id))
             .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
             .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
             .into_range(),
         // PSOT: (p_id, s_id, o_type, o_key)
-        RunSortOrder::Psot => cascade(full, &batch.p_id, filter.p_id)
+        RunSortOrder::Psot | RunSortOrder::PsotG => cascade(full, &batch.p_id, filter.p_id)
             .and_then(|r| cascade(r, &batch.s_id, filter.s_id))
             .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
             .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
             .into_range(),
         // POST: (p_id, o_type, o_key, o_i, s_id)
-        RunSortOrder::Post => cascade(full, &batch.p_id, filter.p_id)
+        RunSortOrder::Post | RunSortOrder::PostG => cascade(full, &batch.p_id, filter.p_id)
             .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
             .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
             .into_range(),
         // OPST: (o_type, o_key, o_i, p_id, s_id)
-        RunSortOrder::Opst => cascade(full, &batch.o_type, filter.o_type)
+        RunSortOrder::Opst | RunSortOrder::OpstG => cascade(full, &batch.o_type, filter.o_type)
             .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
             .into_range(),
     }
@@ -1030,6 +1038,7 @@ fn gather_batch(src: &ColumnBatch, indices: &[usize]) -> ColumnBatch {
         o_type: gather_column(&src.o_type, indices),
         o_i: gather_column(&src.o_i, indices),
         t: gather_column(&src.t, indices),
+        g_id: gather_column(&src.g_id, indices),
     }
 }
 
@@ -1102,6 +1111,7 @@ mod tests {
             o_i: u32::MAX,
             t: 1,
             op: true,
+            g_id: 0,
         }
     }
 
@@ -1240,6 +1250,7 @@ mod tests {
             o_type: ColumnData::Block(vec![1, 1, 1, 1, 1, 2].into()),
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::AbsentDefault,
+            g_id: ColumnData::AbsentDefault,
         };
         let filter = BinaryFilter {
             o_type: Some(1),
@@ -1271,6 +1282,7 @@ mod tests {
             o_type: ColumnData::Const(1),
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::AbsentDefault,
+            g_id: ColumnData::AbsentDefault,
         };
         // PSOT: (p_id, s_id, ...) — p_id is Const(7) and matches; s_id then
         // narrows to the s_id=11 run.

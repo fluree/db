@@ -669,7 +669,7 @@ fn count_object_key_v6(
     cancellation: &QueryCancellation,
 ) -> Result<i64> {
     let branch = store
-        .branch_for_order(g_id, RunSortOrder::Post)
+        .dedicated_branch(g_id, RunSortOrder::Post)
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
     let cmp = cmp_v2_for_order(RunSortOrder::Post);
 
@@ -875,7 +875,7 @@ pub(crate) fn group_count_v6(
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
     let branch = store
-        .branch_for_order(g_id, RunSortOrder::Post)
+        .dedicated_branch(g_id, RunSortOrder::Post)
         .ok_or_else(|| QueryError::Internal("no POST branch for graph".to_string()))?;
     let cmp = cmp_v2_for_order(RunSortOrder::Post);
 

@@ -108,6 +108,84 @@ pub struct NamedGraphRouting {
     pub orders: Vec<(RunSortOrder, ContentId)>,
 }
 
+/// The tree a branch manifest belongs to (see [`IndexRoot::branches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchTree {
+    /// A named graph's own tree.
+    Graph(GraphId),
+    /// The pooled tree.
+    Pool,
+}
+
+/// A pooled graph and its size in the pool, which placement weighs: its live
+/// rows and its retained history entries (both saturating).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolMember {
+    pub g_id: GraphId,
+    pub rows: u32,
+    pub history: u32,
+}
+
+impl PoolMember {
+    pub fn new(g_id: GraphId) -> Self {
+        Self {
+            g_id,
+            rows: 0,
+            history: 0,
+        }
+    }
+}
+
+/// One delta run of a pooled secondary order (see
+/// [`crate::format::pool_delta`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolDeltaRun {
+    pub cid: ContentId,
+    pub events: u32,
+}
+
+/// The shared tree for small named graphs: one branch per pooled order, and
+/// the graphs it holds. A graph listed here has no `NamedGraphRouting` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolRouting {
+    /// Pooled graphs, sorted by id.
+    pub members: Vec<PoolMember>,
+    /// `(order, branch_cid)` pairs over [`RunSortOrder::pool_build_orders`]:
+    /// GSPO current, the secondary orders as of their last compaction.
+    pub orders: Vec<(RunSortOrder, ContentId)>,
+    /// Each secondary order's delta runs since its base, oldest first.
+    pub deltas: Vec<(RunSortOrder, Vec<PoolDeltaRun>)>,
+}
+
+impl PoolRouting {
+    /// Whether `g_id` lives in the pool.
+    #[inline]
+    pub fn contains(&self, g_id: GraphId) -> bool {
+        self.member(g_id).is_some()
+    }
+
+    #[inline]
+    pub fn member(&self, g_id: GraphId) -> Option<&PoolMember> {
+        self.members
+            .binary_search_by_key(&g_id, |m| m.g_id)
+            .ok()
+            .map(|i| &self.members[i])
+    }
+
+    /// Pooled graph ids, ascending.
+    pub fn graph_ids(&self) -> impl Iterator<Item = GraphId> + '_ {
+        self.members.iter().map(|m| m.g_id)
+    }
+
+    /// The delta runs of `order`, oldest first.
+    pub fn delta(&self, order: RunSortOrder) -> &[PoolDeltaRun] {
+        self.deltas
+            .iter()
+            .find(|(o, _)| *o == order)
+            .map_or(&[], |(_, runs)| runs.as_slice())
+    }
+}
+
 // ============================================================================
 // IndexRoot
 // ============================================================================
@@ -115,45 +193,22 @@ pub struct NamedGraphRouting {
 /// Magic bytes for the index root.
 pub const ROOT_V6_MAGIC: &[u8; 4] = b"FIR6";
 
-/// Format version.
+/// `main`'s root format version, which this build reads but never writes.
 ///
 /// Version 2 adds `lang_id: u16` to each `FulltextArenaRef` so arenas can
 /// be keyed by `(g_id, p_id, lang_id)` for multi-language full-text indexing.
 /// Pre-v2 roots are refused outright — operators upgrading must run a full
 /// reindex before queries resume.
-///
-/// Version 3 enables inline `xsd:decimal` encoding ([`DecimalEncoding`]): leaf
-/// data may carry [`OType::XSD_DECIMAL_INLINE`] rows. The root layout is
-/// byte-identical to v2; the version is the capability signal. Old binaries
-/// refuse a v3 root outright (the strict version check below) rather than
-/// misdecoding inline-decimal leaf rows, which is the required "upgrade code
-/// first" safety property.
 pub const ROOT_V6_VERSION: u8 = 2;
 
-/// Root format version that enables inline `xsd:decimal` encoding. Written only
-/// by a full reindex/import under [`DecimalEncoding::InlineWhenFits`]; see
-/// [`IndexRoot::decimal_encoding`].
-pub const ROOT_V6_VERSION_INLINE_DECIMAL: u8 = 3;
-
-/// Derive the decimal-encoding policy from a decoded root format version.
-#[inline]
-pub const fn decimal_encoding_for_version(version: u8) -> fluree_db_core::DecimalEncoding {
-    if version >= ROOT_V6_VERSION_INLINE_DECIMAL {
-        fluree_db_core::DecimalEncoding::InlineWhenFits
-    } else {
-        fluree_db_core::DecimalEncoding::ArenaOnly
-    }
-}
-
-/// The root format version that must be written for a given decimal-encoding
-/// policy. Inverse of [`decimal_encoding_for_version`].
-#[inline]
-pub const fn version_for_decimal_encoding(enc: fluree_db_core::DecimalEncoding) -> u8 {
-    match enc {
-        fluree_db_core::DecimalEncoding::InlineWhenFits => ROOT_V6_VERSION_INLINE_DECIMAL,
-        fluree_db_core::DecimalEncoding::ArenaOnly => ROOT_V6_VERSION,
-    }
-}
+/// The v5 (`next`) root format, `next`'s one version bump over `main`: inline
+/// `xsd:decimal` encoding, the triple-term dictionary, the pooled tree, the
+/// compressed body, graph-carrying history and 32-bit graph ids all ride on
+/// it. Every root this build writes is v5 — the first index of a `main`
+/// ledger upgrades it — and `main` refuses v5 outright rather than misreading
+/// it. The decimal policy is an extended flag, so an arena-only ledger stays
+/// arena-only until a reindex.
+pub const ROOT_V6_VERSION_V5: u8 = 3;
 
 /// What garbage collection needs from a retired annotation-arena root
 /// section: its two branch manifests. Decoding ignores the section's other
@@ -215,9 +270,8 @@ pub struct IndexRoot {
     /// this flag on the first post-import write.
     pub lex_sorted_string_ids: bool,
 
-    /// How this root encodes `xsd:decimal` values. Derived from the format
-    /// version on decode ([`decimal_encoding_for_version`]) and mapped back to
-    /// the version on encode ([`version_for_decimal_encoding`]). Sticky:
+    /// How this root encodes `xsd:decimal` values: arena-only for a `main` (v2)
+    /// root, otherwise the `FLAG_EXT_DECIMAL_ARENA_ONLY` flag. Sticky:
     /// incremental writes preserve it; only a full reindex changes it.
     pub decimal_encoding: fluree_db_core::DecimalEncoding,
 
@@ -243,6 +297,8 @@ pub struct IndexRoot {
     // ── V3-specific: named graph routing using V3 branch CIDs ────────
     /// Named graph routing: branch CIDs per sort order (FBR3 branches).
     pub named_graphs: Vec<NamedGraphRouting>,
+    /// The pooled tree for small named graphs, when any graph lives there.
+    pub pool: Option<PoolRouting>,
 
     // ── Optional sections ──────────────────────────────────────────────────
     pub stats: Option<IndexStats>,
@@ -627,6 +683,12 @@ impl IndexRoot {
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
     /// Root carries a triple-term dictionary section, the root's last.
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
+    /// Root carries a pool routing section after the named-graph routing.
+    const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
+    // Bit 5 marks a zstd-compressed body: `fluree_db_core::fir6_frame`.
+    /// v5 root whose decimals are arena-only (a `main` ledger not yet
+    /// reindexed); clear means inline-when-fits.
+    const FLAG_EXT_DECIMAL_ARENA_ONLY: u8 = 1 << 6;
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -636,18 +698,43 @@ impl IndexRoot {
         self.decimal_encoding
     }
 
-    /// Encode to the binary FIR6 wire format.
+    /// Encode to the binary FIR6 wire format. A v5 root's body after the
+    /// header is zstd-compressed (`fluree_db_core::fir6_frame`); a `main`-format
+    /// root stays byte-compatible with `main`.
     ///
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
     /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
     pub fn encode(&self) -> Vec<u8> {
+        fluree_db_core::fir6_frame::deflate(&self.encode_raw(true)).expect("root has its header")
+    }
+
+    /// `main`'s v2 layout (16-bit graph ids, no v5 sections), for tests of the
+    /// read path a `main` ledger's first v5 index takes.
+    #[cfg(test)]
+    pub(crate) fn encode_main_layout(&self) -> Vec<u8> {
+        assert!(self.pool.is_none() && self.stats.is_none());
+        self.encode_raw(false)
+    }
+
+    /// The uncompressed encoding; `wide` is the v5 layout, otherwise `main`'s.
+    fn encode_raw(&self, wide: bool) -> Vec<u8> {
+        let write_graph = |buf: &mut Vec<u8>, v: u32| {
+            if wide {
+                buf.extend_from_slice(&v.to_le_bytes());
+            } else {
+                let narrow = u16::try_from(v).expect("main's layout holds 16-bit graph ids");
+                buf.extend_from_slice(&narrow.to_le_bytes());
+            }
+        };
         let mut buf = Vec::with_capacity(8192);
 
         // ---- Header (24 bytes) ----
         buf.extend_from_slice(ROOT_V6_MAGIC);
-        // The version byte is the inline-decimal capability signal: a root that
-        // inlines decimals is written as v3 so old binaries refuse it.
-        buf.push(version_for_decimal_encoding(self.decimal_encoding));
+        buf.push(if wide {
+            ROOT_V6_VERSION_V5
+        } else {
+            ROOT_V6_VERSION
+        });
         let flags = (if self.stats.is_some() {
             Self::FLAG_HAS_STATS
         } else {
@@ -691,6 +778,12 @@ impl IndexRoot {
         if self.term_dict.is_some() {
             flags_ext |= Self::FLAG_EXT_HAS_TERM_DICT;
         }
+        if self.pool.is_some() {
+            flags_ext |= Self::FLAG_EXT_HAS_POOL;
+        }
+        if wide && self.decimal_encoding == fluree_db_core::DecimalEncoding::ArenaOnly {
+            flags_ext |= Self::FLAG_EXT_DECIMAL_ARENA_ONLY;
+        }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
         buf.extend_from_slice(&self.index_t.to_le_bytes());
@@ -727,7 +820,11 @@ impl IndexRoot {
         }
 
         // ---- Small dict inlines ----
-        write_string_array(&mut buf, &self.graph_iris);
+        // A graph per document outgrows a 16-bit count: v5 counts in 32 bits.
+        write_graph(&mut buf, self.graph_iris.len() as u32);
+        for iri in &self.graph_iris {
+            write_str(&mut buf, iri);
+        }
         write_string_array(&mut buf, &self.datatype_iris);
         write_string_array(&mut buf, &self.language_tags);
 
@@ -739,9 +836,9 @@ impl IndexRoot {
         // ---- Per-graph specialty arenas ----
         let mut sorted_arenas = self.graph_arenas.clone();
         sorted_arenas.sort_by_key(|ga| ga.g_id);
-        buf.extend_from_slice(&(sorted_arenas.len() as u16).to_le_bytes());
+        write_graph(&mut buf, sorted_arenas.len() as u32);
         for ga in &sorted_arenas {
-            buf.extend_from_slice(&ga.g_id.to_le_bytes());
+            write_graph(&mut buf, ga.g_id);
             write_graph_arenas_v5(&mut buf, ga);
         }
 
@@ -801,15 +898,49 @@ impl IndexRoot {
         // ---- Named graph routing (V3 branch CIDs) ----
         let mut sorted_named = self.named_graphs.clone();
         sorted_named.sort_by_key(|ng| ng.g_id);
-        buf.extend_from_slice(&(sorted_named.len() as u16).to_le_bytes());
+        write_graph(&mut buf, sorted_named.len() as u32);
         for ng in &sorted_named {
-            buf.extend_from_slice(&ng.g_id.to_le_bytes());
+            write_graph(&mut buf, ng.g_id);
             let mut sorted_orders = ng.orders.clone();
             sorted_orders.sort_by_key(|(order, _)| order.to_wire_id());
             buf.push(sorted_orders.len() as u8);
             for (order, branch_cid) in &sorted_orders {
                 buf.push(order.to_wire_id());
                 write_cid(&mut buf, branch_cid);
+            }
+        }
+
+        // ---- Optional: pool routing ----
+        if let Some(pool) = &self.pool {
+            let mut members = pool.members.clone();
+            members.sort_unstable_by_key(|m| m.g_id);
+            buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
+            for m in members {
+                buf.extend_from_slice(&m.g_id.to_le_bytes());
+                buf.extend_from_slice(&m.rows.to_le_bytes());
+                buf.extend_from_slice(&m.history.to_le_bytes());
+            }
+            let mut orders = pool.orders.clone();
+            orders.sort_by_key(|(order, _)| order.to_wire_id());
+            buf.push(orders.len() as u8);
+            for (order, branch_cid) in &orders {
+                buf.push(order.to_wire_id());
+                write_cid(&mut buf, branch_cid);
+            }
+            let mut deltas: Vec<&(RunSortOrder, Vec<PoolDeltaRun>)> = pool
+                .deltas
+                .iter()
+                .filter(|(_, runs)| !runs.is_empty())
+                .collect();
+            deltas.sort_by_key(|(order, _)| order.to_wire_id());
+            buf.push(deltas.len() as u8);
+            for (order, runs) in deltas {
+                buf.push(order.to_wire_id());
+                buf.extend_from_slice(&(runs.len() as u16).to_le_bytes());
+                for run in runs {
+                    write_cid(&mut buf, &run.cid);
+                    buf.extend_from_slice(&run.events.to_le_bytes());
+                }
             }
         }
 
@@ -882,11 +1013,14 @@ impl IndexRoot {
             has_annotations: self.has_annotations,
             needs_link_reindex: self.has_annotations && self.term_dict.is_none(),
             has_list_meta: self.has_list_meta,
+            prev_index: self.prev_index.as_ref().map(|prev| prev.id.clone()),
         })
     }
 
     /// Decode from FIR6 binary bytes.
     pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let inflated = fluree_db_core::fir6_frame::inflate(data)?;
+        let data: &[u8] = &inflated;
         if data.len() < Self::HEADER_LEN {
             return Err(io_err("root v6: too small for header"));
         }
@@ -897,13 +1031,12 @@ impl IndexRoot {
             )));
         }
         let version = data[4];
-        // Accept v2 (arena-only) and v3 (inline-decimal-capable); the layouts are
-        // byte-identical, the version only signals whether inline-decimal leaf
-        // rows may appear. Any other version is refused.
-        if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_INLINE_DECIMAL {
+        // `main`'s v2 roots hold 16-bit graph ids and counts; v5 roots 32-bit.
+        let wide = version == ROOT_V6_VERSION_V5;
+        // `main`'s v2 (read so its ledgers upgrade on their first index) or v5.
+        if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_V5 {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
         }
-        let decimal_encoding = decimal_encoding_for_version(version);
 
         let flags = data[5];
         // Extended-flags byte at data[6]; data[7] reserved.
@@ -911,6 +1044,12 @@ impl IndexRoot {
         // `0u16` here, so old roots decode to all extended flags
         // = false.
         let flags_ext = data[6];
+        let decimal_encoding =
+            if version == ROOT_V6_VERSION || flags_ext & Self::FLAG_EXT_DECIMAL_ARENA_ONLY != 0 {
+                fluree_db_core::DecimalEncoding::ArenaOnly
+            } else {
+                fluree_db_core::DecimalEncoding::InlineWhenFits
+            };
         let mut pos = 8; // skip past flags_ext + reserved
         let index_t = read_i64_at(data, &mut pos)?;
         let base_t = read_i64_at(data, &mut pos)?;
@@ -956,7 +1095,11 @@ impl IndexRoot {
         }
 
         // Small dict inlines
-        let graph_iris = read_string_array(data, &mut pos)?;
+        let graph_iri_count = read_graph_width(data, &mut pos, wide)? as usize;
+        let mut graph_iris = Vec::with_capacity(graph_iri_count.min(data.len()));
+        for _ in 0..graph_iri_count {
+            graph_iris.push(read_string(data, &mut pos)?);
+        }
         let datatype_iris = read_string_array(data, &mut pos)?;
         let language_tags = read_string_array(data, &mut pos)?;
 
@@ -971,10 +1114,10 @@ impl IndexRoot {
         };
 
         // Per-graph specialty arenas
-        let arena_count = read_u16_at(data, &mut pos)? as usize;
+        let arena_count = read_graph_width(data, &mut pos, wide)? as usize;
         let mut graph_arenas = Vec::with_capacity(arena_count);
         for _ in 0..arena_count {
-            graph_arenas.push(read_graph_arenas_v5(data, &mut pos)?);
+            graph_arenas.push(read_graph_arenas_v5(data, &mut pos, wide)?);
         }
 
         // Watermarks
@@ -1053,10 +1196,10 @@ impl IndexRoot {
         }
 
         // Named graph routing
-        let named_count = read_u16_at(data, &mut pos)? as usize;
+        let named_count = read_graph_width(data, &mut pos, wide)? as usize;
         let mut named_graphs = Vec::with_capacity(named_count);
         for _ in 0..named_count {
-            let g_id = read_u16_at(data, &mut pos)?;
+            let g_id = read_graph_width(data, &mut pos, wide)?;
             let ng_order_count = read_u8_at(data, &mut pos)? as usize;
             let mut orders = Vec::with_capacity(ng_order_count);
             for _ in 0..ng_order_count {
@@ -1070,11 +1213,63 @@ impl IndexRoot {
             named_graphs.push(NamedGraphRouting { g_id, orders });
         }
 
+        // Pool routing
+        let pool = if flags_ext & Self::FLAG_EXT_HAS_POOL != 0 {
+            let member_count = read_u32_at(data, &mut pos)? as usize;
+            ensure_bytes(data, pos, member_count * 12, "pool members")?;
+            let mut members = Vec::with_capacity(member_count);
+            for _ in 0..member_count {
+                members.push(PoolMember {
+                    g_id: read_u32_at(data, &mut pos)?,
+                    rows: read_u32_at(data, &mut pos)?,
+                    history: read_u32_at(data, &mut pos)?,
+                });
+            }
+            members.sort_unstable_by_key(|m| m.g_id);
+            let order_count = read_u8_at(data, &mut pos)? as usize;
+            let mut orders = Vec::with_capacity(order_count);
+            for _ in 0..order_count {
+                let oid = read_u8_at(data, &mut pos)?;
+                let order = RunSortOrder::from_wire_id(oid)
+                    .filter(|o| o.is_pooled())
+                    .ok_or_else(|| io_err(&format!("root v6: invalid pool order_id {oid}")))?;
+                orders.push((order, read_cid(data, &mut pos)?));
+            }
+            let delta_count = read_u8_at(data, &mut pos)? as usize;
+            let mut deltas = Vec::with_capacity(delta_count);
+            for _ in 0..delta_count {
+                let oid = read_u8_at(data, &mut pos)?;
+                let order = RunSortOrder::from_wire_id(oid)
+                    .filter(|o| o.is_pooled() && *o != RunSortOrder::Gspo)
+                    .ok_or_else(|| io_err(&format!("root v6: invalid delta order_id {oid}")))?;
+                let run_count = read_u16_at(data, &mut pos)? as usize;
+                let mut runs = Vec::with_capacity(run_count);
+                for _ in 0..run_count {
+                    let cid = read_cid(data, &mut pos)?;
+                    runs.push(PoolDeltaRun {
+                        cid,
+                        events: read_u32_at(data, &mut pos)?,
+                    });
+                }
+                deltas.push((order, runs));
+            }
+            Some(PoolRouting {
+                members,
+                orders,
+                deltas,
+            })
+        } else {
+            None
+        };
+
         // Optional sections
         let stats = if flags & Self::FLAG_HAS_STATS != 0 {
             let stats_len = read_u32_at(data, &mut pos)? as usize;
             ensure_bytes(data, pos, stats_len, "stats section")?;
-            let (stats, _) = stats_wire::decode_stats_with_len(&data[pos..pos + stats_len])?;
+            let (stats, _) = stats_wire::decode_stats_with_len(
+                &data[pos..pos + stats_len],
+                stats_wire::GraphWidth::for_root_version(version),
+            )?;
             pos += stats_len;
             Some(stats)
         } else {
@@ -1166,6 +1361,7 @@ impl IndexRoot {
             o_type_table,
             default_graph_orders,
             named_graphs,
+            pool,
             stats,
             schema,
             prev_index,
@@ -1191,11 +1387,39 @@ impl IndexRoot {
     ///
     /// Does NOT include the root's own CID or the garbage manifest CID.
     ///
-    /// Callers that need leaf CIDs sitting behind named-graph or legacy arena
-    /// branches must fetch + decode those branch manifests from storage. See
+    /// Callers that need leaf CIDs sitting behind branches (see
+    /// [`Self::branches`]) or legacy arena branches must fetch + decode those
+    /// manifests from storage. See
     /// [`crate::collect_root_cas_ids_expanded`] (strict) and
     /// [`crate::collect_root_cas_ids_expanded_tolerant`] (best-effort) for
     /// the shared expansion helpers.
+    /// Every branch manifest the root routes to — each named graph's own
+    /// orders and the pooled tree's — with the tree it belongs to. The one
+    /// enumeration every walk of the root's physical artifacts builds on
+    /// (reachability, GC, pack, drop). Default-graph orders are inline
+    /// leaves, not branches.
+    pub fn branches(&self) -> impl Iterator<Item = (BranchTree, RunSortOrder, &ContentId)> {
+        self.named_graphs
+            .iter()
+            .flat_map(|ng| {
+                ng.orders
+                    .iter()
+                    .map(move |(order, cid)| (BranchTree::Graph(ng.g_id), *order, cid))
+            })
+            .chain(self.pool.iter().flat_map(|pool| {
+                pool.orders
+                    .iter()
+                    .map(|(order, cid)| (BranchTree::Pool, *order, cid))
+            }))
+    }
+
+    /// Every delta run of the pooled tree's secondary orders.
+    pub fn pool_delta_runs(&self) -> impl Iterator<Item = &PoolDeltaRun> {
+        self.pool
+            .iter()
+            .flat_map(|pool| pool.deltas.iter().flat_map(|(_, runs)| runs))
+    }
+
     pub fn all_cas_ids(&self) -> Vec<ContentId> {
         let mut ids = Vec::new();
 
@@ -1248,12 +1472,8 @@ impl IndexRoot {
             }
         }
 
-        // Named graph branch CIDs
-        for ng in &self.named_graphs {
-            for (_, branch_cid) in &ng.orders {
-                ids.push(branch_cid.clone());
-            }
-        }
+        ids.extend(self.branches().map(|(_, _, cid)| cid.clone()));
+        ids.extend(self.pool_delta_runs().map(|run| run.cid.clone()));
 
         // Sketch
         if let Some(ref sketch) = self.sketch_ref {
@@ -1331,8 +1551,17 @@ fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs) {
     }
 }
 
-fn read_graph_arenas_v5(data: &[u8], pos: &mut usize) -> io::Result<GraphArenaRefs> {
-    let g_id = read_u16_at(data, pos)?;
+/// A graph id or graph count: 16-bit in `main`'s v2 roots, 32-bit in v5.
+fn read_graph_width(data: &[u8], pos: &mut usize, wide: bool) -> io::Result<u32> {
+    if wide {
+        read_u32_at(data, pos)
+    } else {
+        read_u16_at(data, pos).map(u32::from)
+    }
+}
+
+fn read_graph_arenas_v5(data: &[u8], pos: &mut usize, wide: bool) -> io::Result<GraphArenaRefs> {
+    let g_id = read_graph_width(data, pos, wide)?;
     // numbig
     let nb_count = read_u16_at(data, pos)? as usize;
     let mut numbig = Vec::with_capacity(nb_count);
@@ -1485,6 +1714,7 @@ mod tests {
             has_list_meta: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            pool: None,
         }
     }
 
@@ -1494,7 +1724,7 @@ mod tests {
         let bytes = root.encode();
 
         assert_eq!(&bytes[0..4], b"FIR6");
-        assert_eq!(bytes[4], ROOT_V6_VERSION);
+        assert_eq!(bytes[4], ROOT_V6_VERSION_V5);
         assert_eq!(bytes[5], 0); // no optional sections
 
         let decoded = IndexRoot::decode(&bytes).unwrap();
@@ -1588,7 +1818,7 @@ mod tests {
 
         let mut root = minimal_root_v6();
         root.has_annotations = true;
-        let section_at = root.encode().len();
+        let section_at = raw(&root.encode()).len();
         root.term_dict = Some(crate::format::wire_helpers::TermDictRefs {
             forward_packs: vec![],
             reverse: crate::format::wire_helpers::DictTreeRefs {
@@ -1599,7 +1829,7 @@ mod tests {
             term_count: 0,
             object_reverse: None,
         });
-        let current = root.encode();
+        let current = raw(&root.encode());
         let mut legacy = current[..section_at].to_vec();
         legacy[5] |= IndexRoot::FLAG_LEGACY_ANNOTATION_ARENA;
         legacy[6] |= 1 << 0; // the retired sticky bit legacy encoders set
@@ -1618,7 +1848,7 @@ mod tests {
         let ids = decoded.all_cas_ids();
         assert!(arena.branches().all(|branch| ids.contains(branch)));
 
-        let reencoded = decoded.encode();
+        let reencoded = raw(&decoded.encode());
         assert_eq!(reencoded, current, "re-encoding drops the legacy section");
     }
 
@@ -1658,6 +1888,10 @@ mod tests {
             t: 4,
             ..Default::default()
         });
+        root.prev_index = Some(BinaryPrevIndexRef {
+            t: 7,
+            id: ContentId::new(fluree_db_core::ContentKind::IndexRoot, b"replaced root"),
+        });
         let bytes = root.encode();
 
         let view = |s: &LedgerSnapshot| {
@@ -1687,6 +1921,11 @@ mod tests {
             LedgerSnapshot::new_meta(decoded.take_snapshot_metadata().unwrap()).unwrap();
         assert_eq!(view(&from_root), view(&from_bytes));
         assert!(from_root.stats.is_some() && from_root.schema.is_some());
+        let replaced = root.prev_index.map(|prev| prev.id);
+        assert_eq!(
+            (&from_root.prev_index, &from_bytes.prev_index),
+            (&replaced, &replaced)
+        );
         assert!(
             decoded.stats.is_none() && decoded.schema.is_none(),
             "stats and schema move into the snapshot rather than being copied"
@@ -1735,7 +1974,7 @@ mod tests {
         );
 
         // Legacy: a zeroed extended-flags byte decodes to untracked.
-        let mut bytes_legacy = bytes_true;
+        let mut bytes_legacy = raw(&bytes_true);
         bytes_legacy[6] = 0;
         assert_eq!(
             IndexRoot::decode(&bytes_legacy).unwrap().has_list_meta,
@@ -1749,49 +1988,84 @@ mod tests {
         );
     }
 
+    /// The uncompressed encoding, the layout roots had before compression.
+    fn raw(bytes: &[u8]) -> Vec<u8> {
+        fluree_db_core::fir6_frame::inflate(bytes)
+            .unwrap()
+            .into_owned()
+    }
+
     #[test]
     fn fir6_rejects_trailing_bytes() {
         // A future format extension that appended bytes after the
         // last section must not silently load on this build.
         // Both decode paths reject the stray byte explicitly.
         let bytes = minimal_root_v6().encode();
-        let mut tampered = bytes.clone();
+        let mut tampered = raw(&bytes);
         tampered.push(0xff);
         let err = IndexRoot::decode(&tampered).expect_err("trailing byte must be rejected");
         assert!(err.to_string().contains("trailing bytes"), "got: {err}");
         let err = fluree_db_core::LedgerSnapshot::from_root_bytes(&tampered)
             .expect_err("metadata path must reject trailing bytes too");
         assert!(err.to_string().contains("trailing bytes"), "got: {err}");
+
+        // After the compressed body, too.
+        let mut tampered = bytes;
+        tampered.push(0xff);
+        assert!(IndexRoot::decode(&tampered).is_err());
+        assert!(fluree_db_core::LedgerSnapshot::from_root_bytes(&tampered).is_err());
     }
 
     #[test]
     fn fir6_decimal_encoding_version_round_trip() {
         use fluree_db_core::DecimalEncoding;
 
-        // Arena-only root is written as v2 and decodes back to ArenaOnly.
-        let arena = minimal_root_v6();
-        let arena_bytes = arena.encode();
-        assert_eq!(arena_bytes[4], ROOT_V6_VERSION);
-        assert_eq!(
-            IndexRoot::decode(&arena_bytes).unwrap().decimal_encoding(),
-            DecimalEncoding::ArenaOnly
-        );
+        // Every root is written v5; the decimal policy is a flag on it.
+        for encoding in [DecimalEncoding::ArenaOnly, DecimalEncoding::InlineWhenFits] {
+            let mut root = minimal_root_v6();
+            root.decimal_encoding = encoding;
+            let bytes = root.encode();
+            assert_eq!(bytes[4], ROOT_V6_VERSION_V5);
+            assert_ne!(
+                bytes[6] & fluree_db_core::fir6_frame::FLAG_EXT_COMPRESSED,
+                0
+            );
+            assert_eq!(
+                IndexRoot::decode(&bytes).unwrap().decimal_encoding(),
+                encoding
+            );
+        }
+    }
 
-        // Inline-decimal root is written as v3 (the capability signal) and
-        // decodes back to InlineWhenFits.
-        let mut inline = minimal_root_v6();
-        inline.decimal_encoding = DecimalEncoding::InlineWhenFits;
-        let inline_bytes = inline.encode();
-        assert_eq!(inline_bytes[4], ROOT_V6_VERSION_INLINE_DECIMAL);
+    /// A `main` (v2) root decodes, arena-only, so a `main` ledger upgrades on
+    /// its first index.
+    #[test]
+    fn fir6_reads_a_main_root() {
+        let mut root = minimal_root_v6();
+        root.named_graphs = vec![NamedGraphRouting {
+            g_id: 7,
+            orders: vec![(
+                RunSortOrder::Spot,
+                ContentId::from_hex_digest(
+                    fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
+                    &fluree_db_core::sha256_hex(b"main-branch"),
+                )
+                .unwrap(),
+            )],
+        }];
+        let main_root = root.encode_main_layout();
+        assert_eq!(main_root[4], ROOT_V6_VERSION);
+        let decoded = IndexRoot::decode(&main_root).unwrap();
+        assert_eq!(decoded.named_graphs.len(), 1);
+        assert_eq!(decoded.named_graphs[0].g_id, 7);
+        assert_eq!(decoded.named_graphs[0].orders, root.named_graphs[0].orders);
+        fluree_db_core::LedgerSnapshot::from_root_bytes(&main_root)
+            .expect("core's metadata decode reads main's layout");
         assert_eq!(
-            IndexRoot::decode(&inline_bytes).unwrap().decimal_encoding(),
-            DecimalEncoding::InlineWhenFits
+            decoded.decimal_encoding(),
+            fluree_db_core::DecimalEncoding::ArenaOnly
         );
-
-        // The two roots are byte-identical except for the version byte: the v3
-        // capability is purely a header signal, not a layout change.
-        assert_eq!(arena_bytes[0..4], inline_bytes[0..4]); // magic
-        assert_eq!(arena_bytes[5..], inline_bytes[5..]); // everything after version
+        assert_eq!(decoded.index_t, minimal_root_v6().index_t);
     }
 
     #[test]
@@ -1869,6 +2143,76 @@ mod tests {
         assert!(decoded.default_graph_orders[0].leaves[0]
             .sidecar_cid
             .is_some());
+    }
+
+    /// The pool section round-trips, its branches are reachable for GC, and
+    /// core's metadata-only parser skips it to read the stats behind it.
+    #[test]
+    fn fir6_round_trip_with_pool() {
+        let cid = |tag: &[u8]| {
+            ContentId::from_hex_digest(
+                fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
+                &fluree_db_core::sha256_hex(tag),
+            )
+            .unwrap()
+        };
+        let mut root = minimal_root_v6();
+        root.decimal_encoding = fluree_db_core::DecimalEncoding::InlineWhenFits;
+        root.pool = Some(PoolRouting {
+            members: vec![
+                PoolMember::new(3),
+                PoolMember {
+                    g_id: 4,
+                    rows: 17,
+                    history: 9,
+                },
+                PoolMember::new(70),
+            ],
+            orders: RunSortOrder::pool_build_orders()
+                .iter()
+                .map(|&o| (o, cid(o.dir_name().as_bytes())))
+                .collect(),
+            deltas: vec![(
+                RunSortOrder::PostG,
+                vec![
+                    PoolDeltaRun {
+                        cid: cid(b"post-run-1"),
+                        events: 12,
+                    },
+                    PoolDeltaRun {
+                        cid: cid(b"post-run-2"),
+                        events: 3,
+                    },
+                ],
+            )],
+        });
+        root.stats = Some(IndexStats {
+            flakes: 42,
+            ..Default::default()
+        });
+
+        let bytes = root.encode();
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        let pool = decoded.pool.as_ref().expect("pool decodes");
+        assert_eq!(pool, root.pool.as_ref().unwrap());
+        assert!(pool.contains(70) && !pool.contains(5));
+        assert_eq!(pool.member(4).map(|m| (m.rows, m.history)), Some((17, 9)));
+        assert_eq!(pool.delta(RunSortOrder::PostG).len(), 2);
+        assert!(pool.delta(RunSortOrder::OpstG).is_empty());
+        assert_eq!(decoded.stats.as_ref().unwrap().flakes, 42);
+
+        let ids = root.all_cas_ids();
+        for &o in RunSortOrder::pool_build_orders() {
+            assert!(
+                ids.contains(&cid(o.dir_name().as_bytes())),
+                "{o:?} unreachable"
+            );
+        }
+        assert!(ids.contains(&cid(b"post-run-1")) && ids.contains(&cid(b"post-run-2")));
+
+        let snap =
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).expect("core metadata decode");
+        assert_eq!(snap.stats.as_ref().map(|s| s.flakes), Some(42));
     }
 
     #[test]
