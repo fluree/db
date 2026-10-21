@@ -17,6 +17,8 @@ mod it_delete_point_reads;
 mod it_delete_stored_facts;
 #[path = "it_enforce_unique_upsert_indexed.rs"]
 mod it_enforce_unique_upsert_indexed;
+#[path = "it_export_lists.rs"]
+mod it_export_lists;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
 #[path = "it_raw_txn_parallel_upload.rs"]
