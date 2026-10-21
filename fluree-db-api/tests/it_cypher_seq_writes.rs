@@ -1241,3 +1241,29 @@ async fn a_set_then_detach_delete_leaves_nothing() {
     ]);
     assert_twins("SET then DETACH DELETE", got, want, (0, 6));
 }
+
+/// A SET on a node the statement creates: the single `Txn` refuses it (no
+/// MATCH binds the target), and the driver stages it after the CREATE. Its
+/// lookup of the stored value must reach the created node alone.
+#[tokio::test]
+async fn a_set_on_a_node_the_statement_creates_writes_that_node_once() {
+    let got = twins(
+        r#"CREATE (n:P {name: "z"}) SET n.id = "c""#,
+        r#"INSERT DATA { _:c a <P> ; <name> "z" ; <id> "c" }"#,
+    )
+    .await;
+    let want = {
+        let mut rows = seeded_with(&[]);
+        rows.extend(
+            [
+                "new http://www.w3.org/1999/02/22-rdf-syntax-ns#type P",
+                "new id c",
+                "new name z",
+            ]
+            .map(String::from),
+        );
+        rows.sort();
+        rows
+    };
+    assert_twins("CREATE then SET of the created node", got, want, (3, 0));
+}

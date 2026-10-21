@@ -158,19 +158,41 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
 /// writes, an `OPTIONAL MATCH` before a `CREATE`, a bare or relationship
 /// `DELETE`, `FOREACH`).
 fn interacting_writes(u: &Update) -> Option<Update> {
-    if validate_members(u).is_err() {
-        return None;
+    // One clause meets itself only as a SET writing one key twice.
+    if let [only] = u.write_clauses.as_slice() {
+        if !matches!(only, WriteClause::Set(s) if set_repeats_a_key(s)) {
+            return None;
+        }
     }
-    let clauses = split_repeated_set_keys(&u.write_clauses);
-    let writes: Vec<ClauseWrites<'_>> = clauses.iter().map(ClauseWrites::of).collect();
+    let writes: Vec<ClauseWrites<'_>> = u.write_clauses.iter().map(ClauseWrites::of).collect();
     let meet = writes
         .iter()
         .enumerate()
-        .any(|(i, a)| writes[i + 1..].iter().any(|b| a.meets(b)));
-    meet.then(|| Update {
-        write_clauses: clauses,
+        .any(|(i, a)| writes[i + 1..].iter().any(|b| a.meets(b)))
+        || u.write_clauses
+            .iter()
+            .any(|c| matches!(c, WriteClause::Set(s) if set_repeats_a_key(s)));
+    if !meet || validate_members(u).is_err() {
+        return None;
+    }
+    Some(Update {
+        write_clauses: split_repeated_set_keys(&u.write_clauses),
         ..u.clone()
     })
+}
+
+/// Whether a SET's items write one property key twice.
+fn set_repeats_a_key(s: &SetClause) -> bool {
+    let mut seen = ClauseWrites::default();
+    for item in &s.items {
+        let mut writes = ClauseWrites::default();
+        writes.add_set_items(std::slice::from_ref(item));
+        if seen.shares_keys(&writes) {
+            return true;
+        }
+        seen.add_set_items(std::slice::from_ref(item));
+    }
+    false
 }
 
 /// Relationship variables the read clauses bind.
