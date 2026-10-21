@@ -137,6 +137,31 @@ fn collect(
     true
 }
 
+/// The search graph sources (full-text, vector) `patterns` read.
+pub(crate) fn search_sources(patterns: &[Pattern], out: &mut Vec<String>) {
+    for pattern in patterns {
+        match pattern {
+            Pattern::IndexSearch(p) => out.push(p.graph_source_id.clone()),
+            Pattern::VectorSearch(p) => out.push(p.graph_source_id.clone()),
+            Pattern::EdgeAnnotation { body: ps, .. }
+            | Pattern::Optional(ps)
+            | Pattern::Minus(ps)
+            | Pattern::Exists(ps)
+            | Pattern::NotExists(ps)
+            | Pattern::DefaultGraphSource { patterns: ps }
+            | Pattern::Graph { patterns: ps, .. } => search_sources(ps, out),
+            Pattern::Union(branches) => branches.iter().for_each(|b| search_sources(b, out)),
+            Pattern::Subquery(sub) => search_sources(&sub.patterns, out),
+            Pattern::Filter(expr)
+            | Pattern::Bind { expr, .. }
+            | Pattern::Unwind { list: expr, .. } => {
+                expr.for_each_embedded_patterns(&mut |ps| search_sources(ps, out));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A historical read of one ledger.
 pub(crate) struct HistoricalRead<'a> {
     /// As-of point (the end of a history range).
@@ -161,13 +186,18 @@ pub(crate) struct SuppressionCache {
 }
 
 impl Fluree {
-    /// The branch's suppression, or `None` when its journal is empty.
+    /// The branch's suppression, or `None` when its journal is empty. On a
+    /// cluster replica of an enabled branch, read once the replica has
+    /// confirmed it holds the current journal.
     pub(crate) async fn suppression_for(
         &self,
         ledger_id: &str,
     ) -> Result<Option<Arc<Suppression>>> {
         let ns = self.publisher()?;
-        let (_, registration) = registry::read(ns, ledger_id).await?;
+        let (_, mut registration) = registry::read(ns, ledger_id).await?;
+        if registration.is_some() && self.confirm_journal_current(ledger_id).await? {
+            registration = registry::read(ns, ledger_id).await?.1;
+        }
         let Some(journal) = registration.map(|r| r.journal).filter(|j| !j.is_empty()) else {
             return Ok(None);
         };
@@ -256,6 +286,65 @@ impl Fluree {
                 until_t: rule.until_t,
             })
             .collect())
+    }
+
+    /// Refuse a search of a graph source that may still hold what its
+    /// source ledger's retention suppressed: one built before a removal it
+    /// has not yet indexed, one lagging the head of a ledger with
+    /// `f:noHistory` (a value it holds may since have been superseded), or
+    /// any earlier snapshot of it (`historical`).
+    pub(crate) async fn refuse_stale_search_sources(
+        &self,
+        query: &Query,
+        historical: bool,
+    ) -> Result<()> {
+        let mut sources = Vec::new();
+        search_sources(&query.patterns, &mut sources);
+        if sources.is_empty() {
+            return Ok(());
+        }
+        sources.sort();
+        sources.dedup();
+        for id in sources {
+            let Some(record) = self.nameservice().lookup_graph_source(&id).await? else {
+                continue;
+            };
+            for ledger_id in &record.dependencies {
+                let Ok(ledger_id) = fluree_db_core::LedgerId::parse(ledger_id) else {
+                    continue;
+                };
+                let ledger_id = ledger_id.to_string();
+                let Some(suppression) = self.suppression_for(&ledger_id).await? else {
+                    continue;
+                };
+                if historical {
+                    return Err(ApiError::HistoryUnavailable(format!(
+                        "search index {id} is read as of an earlier point, and {ledger_id} \
+                         suppresses history; search it as of the current head"
+                    )));
+                }
+                let journal = &suppression.journal;
+                let removed_through = journal
+                    .removals
+                    .iter()
+                    .map(|r| r.until_t.unwrap_or(r.scope_t))
+                    .max();
+                let lagging_removal = removed_through.filter(|t| record.index_t < *t);
+                let lagging_rules = journal.history_rules.iter().any(|r| r.until_t.is_none())
+                    && match self.nameservice().lookup(&ledger_id).await? {
+                        Some(head) => record.index_t < head.commit_t,
+                        None => false,
+                    };
+                if lagging_removal.is_some() || lagging_rules {
+                    return Err(ApiError::HistoryUnavailable(format!(
+                        "search index {id} has indexed {ledger_id} through t={}, before \
+                         retention changes it must reflect; retry once it has synced",
+                        record.index_t
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Refuse `read` of `ledger_id` when it needs suppressed history.

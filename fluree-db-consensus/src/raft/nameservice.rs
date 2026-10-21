@@ -690,6 +690,7 @@ pub struct StagedCommit {
     pub receipt: AppliedReceipt,
 }
 
+pub mod read_index;
 mod wire;
 
 /// Outcome of a cross-node ApplyHead proposal.

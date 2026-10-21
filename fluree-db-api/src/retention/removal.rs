@@ -74,6 +74,10 @@ pub struct RemovalReceipt {
     pub retracted_t: Option<i64>,
     /// The journal generation that records the removal.
     pub generation: u64,
+    /// Cluster replicas that had not applied the removal when the request
+    /// returned; until they do, they serve the ledger as of before it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unacknowledged_replicas: Vec<String>,
 }
 
 /// An occurrence located in the commit log: its operation and span.
@@ -344,12 +348,16 @@ impl Fluree {
             })
             .await?
             .unwrap_or_default();
+            let unacknowledged_replicas = self
+                .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
+                .await;
             return Ok(RemovalReceipt {
                 request_id,
                 scope_t,
                 manifest: located.into_iter().map(|l| l.occurrence).collect(),
                 retracted_t,
                 generation: registration.journal.generation,
+                unacknowledged_replicas,
             });
         }
         Err(ApiError::commit_contention(

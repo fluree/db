@@ -198,6 +198,11 @@ impl EmbeddedRaftNode {
             .map(|rx| spawn_release_task(Arc::clone(&fluree), rx));
 
         let nameservice = integration.nameservice();
+        // Historical reads of retention-enabled ledgers confirm this
+        // replica's removal journal is current.
+        fluree.set_retention_replicas(Arc::new(
+            crate::raft::nameservice::read_index::RaftReplicaSync(Arc::clone(&nameservice)),
+        ));
         let commits: Arc<dyn CommitPublisher> = Arc::clone(&nameservice) as _;
         // Same Arc upcast again so a follower-owned worker can ferry a
         // deterministic poison to the leader rather than spin on

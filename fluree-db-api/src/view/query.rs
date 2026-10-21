@@ -1537,7 +1537,9 @@ impl Fluree {
         executable: &ExecutableQuery,
         history_range: Option<(i64, i64)>,
     ) -> Result<()> {
-        if history_range.is_none() && self.is_current_read(&db.ledger_id, db.t).await {
+        let current = history_range.is_none() && self.is_current_read(&db.ledger_id, db.t).await;
+        self.refuse_stale_search_sources(parsed, !current).await?;
+        if current {
             return Ok(());
         }
         let reads = if executable.reasoning.modes.has_any_enabled() {

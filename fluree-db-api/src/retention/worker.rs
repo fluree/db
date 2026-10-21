@@ -43,6 +43,8 @@ pub(crate) struct RetentionRuntime {
     pub(crate) suppressions: super::suppression::SuppressionCache,
     /// Branches whose history backfill (a rebuild) is running.
     backfills: parking_lot::Mutex<HashSet<String>>,
+    /// Set on a cluster node.
+    pub(crate) replicas: std::sync::OnceLock<Arc<dyn super::replicas::ReplicaSync>>,
 }
 
 impl RetentionRuntime {

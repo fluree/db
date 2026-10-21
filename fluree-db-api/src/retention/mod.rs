@@ -20,6 +20,7 @@ pub mod journal;
 mod policy;
 pub mod registry;
 pub mod removal;
+pub mod replicas;
 mod state;
 pub(crate) mod suppression;
 pub(crate) mod validate;

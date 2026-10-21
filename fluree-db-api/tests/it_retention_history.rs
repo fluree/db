@@ -603,3 +603,122 @@ async fn incremental_builds_leave_suppressed_history_out() {
         vec![json!(5)]
     );
 }
+
+/// A full-text index built before a removal could still match the removed
+/// value: searches of it are refused until it has indexed the removal, and
+/// searches of its earlier snapshots stay refused.
+#[tokio::test]
+async fn a_search_index_behind_a_removal_is_not_served() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-search").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Doc", "ex:email": "secret rust"},
+            {"@id": "ex:bob", "@type": "ex:Doc", "ex:email": "plain rust"}
+        ]}),
+    )
+    .await;
+    let index_query = json!({
+        "@context": ctx(),
+        "where": [{"@id": "?x", "@type": "ex:Doc", "ex:email": "?e"}],
+        "select": {"?x": ["@id", "ex:email"]}
+    });
+    let created = fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "removal-search",
+            &id,
+            index_query,
+        ))
+        .await
+        .expect("create index");
+    let search = |from: JsonValue| {
+        json!({
+            "@context": ctx(),
+            "from": from,
+            "where": [{
+                "f:graphSource": &created.graph_source_id,
+                "f:searchText": "secret",
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc"}
+            }],
+            "select": ["?doc"]
+        })
+    };
+    let hits = |result: fluree_db_api::QueryResult| -> usize {
+        result.batches.iter().map(fluree_db_api::Batch::len).sum()
+    };
+    assert_eq!(
+        hits(fluree.query_connection(&search(json!(id))).await.unwrap()),
+        1
+    );
+
+    let receipt = fluree
+        .remove_occurrences(&id, select("alice", Some(json!("secret rust"))))
+        .await
+        .expect("remove");
+    assert!(receipt.retracted_t.is_some());
+    assert!(matches!(
+        fluree.query_connection(&search(json!(id))).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+
+    fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .expect("sync");
+    assert_eq!(
+        hits(fluree.query_connection(&search(json!(id))).await.unwrap()),
+        0,
+        "the synced index no longer holds the removed value"
+    );
+    assert!(matches!(
+        fluree
+            .query_connection(&search(json!(format!("{id}@t:{t1}"))))
+            .await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+}
+
+/// The SPARQL twin of the removal refusal: a `FROM <ledger@t:N>` read that
+/// could see a removed occurrence is refused; another subject's is answered.
+#[tokio::test]
+async fn sparql_time_travel_honors_a_removal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-sparql").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@old"},
+            {"@id": "ex:bob", "ex:email": "b@old"}
+        ]}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    let sparql = |subject: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT ?e FROM <{id}@t:{t1}> WHERE {{ ex:{subject} ex:email ?e }}"
+        )
+    };
+    assert!(matches!(
+        fluree.query_connection_sparql(&sparql("alice")).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+    let bob = fluree
+        .query_connection_sparql(&sparql("bob"))
+        .await
+        .expect("another subject's history is served");
+    assert_eq!(
+        bob.batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .sum::<usize>(),
+        1
+    );
+}

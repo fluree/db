@@ -770,6 +770,19 @@ impl Fluree {
             }
         }
         cache.put(ledger_id, blob, schedule, persisted_at);
+        if journal_changed {
+            let pending = self
+                .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
+                .await;
+            if !pending.is_empty() {
+                tracing::warn!(
+                    ledger_id,
+                    ?pending,
+                    "replicas have not applied the history rules; they serve \
+                     history as of before the change until they do"
+                );
+            }
+        }
         if let Some(current) = registry::read(ns, ledger_id).await?.1 {
             self.backfill_history_if_needed(ledger_id, &current);
         }

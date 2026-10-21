@@ -2230,3 +2230,133 @@ async fn ttl_survives_leader_failover() {
     let status = cluster.retention_status(new_leader, ledger).await;
     assert_eq!(status["active"], json!(true), "{status}");
 }
+
+impl TestCluster {
+    /// Remove every occurrence of `subject ex:name name` through the chosen
+    /// node; the removal receipt.
+    async fn remove_name(
+        &self,
+        via_node: NodeId,
+        ledger: &str,
+        subject: &str,
+        name: &str,
+    ) -> serde_json::Value {
+        let url = format!("{}/v1/fluree/remove/{ledger}", self.public_url(via_node));
+        let body = json!({ "matching": [{
+            "subject": format!("http://example.org/{subject}"),
+            "predicate": "http://example.org/name",
+            "object": name,
+        }]});
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(30))
+            .json(&body)
+            .send()
+            .await
+            .expect("remove request");
+        assert!(resp.status().is_success(), "remove: {}", resp.status());
+        resp.json().await.expect("receipt json")
+    }
+
+    /// `subject`'s names as of `t`, read on the chosen node: the status and
+    /// body.
+    async fn names_as_of(
+        &self,
+        via_node: NodeId,
+        ledger: &str,
+        subject: &str,
+        t: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let url = format!("{}/v1/fluree/query", self.public_url(via_node));
+        let body = json!({
+            "@context": { "ex": "http://example.org/" },
+            "from": format!("{ledger}@t:{t}"),
+            "select": ["?name"],
+            "where": { "@id": format!("ex:{subject}"), "ex:name": "?name" }
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .expect("query request");
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or_default())
+    }
+}
+
+/// A removal returns once every replica has applied it, so each one then
+/// refuses the removed history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_replica_acknowledges_a_removal() {
+    init_test_tracing();
+    let cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:remove";
+    let follower = cluster.pick_follower().await;
+    cluster.create_ledger(follower, ledger).await;
+    cluster.insert_subject(follower, ledger, "a", "A1").await;
+    cluster.insert_subject(follower, ledger, "b", "B").await;
+
+    let receipt = cluster.remove_name(follower, ledger, "a", "A1").await;
+    assert!(receipt.get("unacknowledgedReplicas").is_none(), "{receipt}");
+    for node in &cluster.nodes {
+        let (status, body) = cluster.names_as_of(node.node_id, ledger, "a", 1).await;
+        assert_eq!(status, StatusCode::GONE, "node {}: {body}", node.node_id);
+        // Another subject's history is still served.
+        let (status, body) = cluster.names_as_of(node.node_id, ledger, "b", 2).await;
+        assert_eq!(status, StatusCode::OK, "node {}: {body}", node.node_id);
+    }
+}
+
+/// A replica that cannot reach a quorum cannot confirm its journal is
+/// current: it stops serving the enabled ledger's history (current reads
+/// continue), and a removal names the replicas that did not apply it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unconfirmed_replica_stops_serving_history() {
+    init_test_tracing();
+    let mut cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:remove-lag";
+    let leader = cluster.current_leader().await.expect("leader");
+    cluster.create_ledger(leader, ledger).await;
+    cluster.insert_subject(leader, ledger, "a", "A1").await;
+    cluster.insert_subject(leader, ledger, "b", "B").await;
+    cluster.insert_subject(leader, ledger, "c", "C").await;
+    cluster.remove_name(leader, ledger, "a", "A1").await;
+
+    let followers: Vec<NodeId> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.node_id)
+        .filter(|id| *id != leader)
+        .collect();
+    let (down, last) = (followers[0], followers[1]);
+    cluster
+        .wait_for_names(last, ledger, &["B", "C"], DEFAULT_TIMEOUT)
+        .await;
+    cluster.shutdown_node(down).await;
+    let receipt = cluster.remove_name(leader, ledger, "b", "B").await;
+    let pending = receipt["unacknowledgedReplicas"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{receipt}"));
+    assert_eq!(pending.len(), 1, "{receipt}");
+    assert!(
+        pending[0]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("node {down} ")),
+        "{receipt}"
+    );
+
+    // Without a quorum the last follower has no leader to confirm against.
+    cluster.shutdown_node(leader).await;
+    let (status, body) = cluster.names_as_of(last, ledger, "c", 3).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.to_string().contains("ReplicaNotCurrent"), "{body}");
+    assert_eq!(cluster.query_names(last, ledger).await, vec!["C"]);
+}
