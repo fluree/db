@@ -994,44 +994,42 @@ impl Operator for GroupAggregateOperator {
         if self.emit_iter.is_none()
             && !self.group_key_indices.is_empty()
             && !self.agg_specs.is_empty()
-        {
-            if self
+            && self
                 .agg_specs
                 .iter()
                 .all(|spec| matches!(spec.function, AggregateFn::CountAll | AggregateFn::Count(_)))
+        {
+            let bound_vars: SmallVec<[VarId; 4]> = self
+                .agg_specs
+                .iter()
+                .filter_map(|spec| match spec.function {
+                    AggregateFn::Count(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            let group_vars = &self.in_schema[..self.group_key_indices.len()];
+            if let Some(groups) = self
+                .child
+                .drain_grouped_count(ctx, group_vars, &bound_vars)
+                .await?
             {
-                let bound_vars: SmallVec<[VarId; 4]> = self
-                    .agg_specs
-                    .iter()
-                    .filter_map(|spec| match spec.function {
-                        AggregateFn::Count(v) => Some(v),
-                        _ => None,
-                    })
-                    .collect();
-                let group_vars = &self.in_schema[..self.group_key_indices.len()];
-                if let Some(groups) = self
-                    .child
-                    .drain_grouped_count(ctx, group_vars, &bound_vars)
-                    .await?
-                {
-                    let states = groups
-                        .into_iter()
-                        .map(|group| {
-                            i64::try_from(group.count).map_err(|_| {
-                                QueryError::execution("grouped COUNT(*) exceeds i64::MAX")
-                            })?;
-                            Ok(GroupState {
-                                key_bindings: group.keys,
-                                agg_states: self
-                                    .agg_specs
-                                    .iter()
-                                    .map(|_| AggState::Count { n: group.count })
-                                    .collect(),
-                            })
+                let states = groups
+                    .into_iter()
+                    .map(|group| {
+                        i64::try_from(group.count).map_err(|_| {
+                            QueryError::execution("grouped COUNT(*) exceeds i64::MAX")
+                        })?;
+                        Ok(GroupState {
+                            key_bindings: group.keys,
+                            agg_states: self
+                                .agg_specs
+                                .iter()
+                                .map(|_| AggState::Count { n: group.count })
+                                .collect(),
                         })
-                        .collect::<Result<Vec<_>>>()?;
-                    self.emit_iter = Some(GroupEmitIter::Vec(states.into_iter()));
-                }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.emit_iter = Some(GroupEmitIter::Vec(states.into_iter()));
             }
         }
 
