@@ -158,11 +158,18 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
 /// writes, an `OPTIONAL MATCH` before a `CREATE`, a bare or relationship
 /// `DELETE`, `FOREACH`).
 fn interacting_writes(u: &Update) -> Option<Update> {
-    // One clause meets itself only as a SET writing one key twice.
+    // One clause meets itself only as a SET writing one key twice, and two
+    // CREATEs never meet.
     if let [only] = u.write_clauses.as_slice() {
         if !matches!(only, WriteClause::Set(s) if set_repeats_a_key(s)) {
             return None;
         }
+    }
+    if u.write_clauses
+        .iter()
+        .all(|c| matches!(c, WriteClause::Create(_)))
+    {
+        return None;
     }
     let writes: Vec<ClauseWrites<'_>> = u.write_clauses.iter().map(ClauseWrites::of).collect();
     let meet = writes
