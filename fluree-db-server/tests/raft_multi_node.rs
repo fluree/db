@@ -2115,3 +2115,118 @@ async fn a_survivors_miss_applies_the_stopped_workers_log() {
         "the survivor's miss applied the stopped worker's log and restored every commit"
     );
 }
+
+impl TestCluster {
+    /// Insert `subject ex:name name` with a TTL of `ttl_secs` via the chosen
+    /// node.
+    async fn insert_expiring(
+        &self,
+        via_node: NodeId,
+        ledger: &str,
+        subject: &str,
+        name: &str,
+        ttl_secs: u64,
+    ) {
+        let url = format!("{}/v1/fluree/insert", self.public_url(via_node));
+        let body = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": format!("ex:{subject}"),
+            "ex:name": { "@value": name, "@ttl": ttl_secs },
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("fluree-ledger", ledger)
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("insert request");
+        assert!(
+            resp.status().is_success(),
+            "insert({subject}) via node {via_node} returned {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
+    async fn retention_status(&self, via_node: NodeId, ledger: &str) -> serde_json::Value {
+        let url = format!("{}/v1/fluree/retention/{ledger}", self.public_url(via_node));
+        let resp = self.client.get(&url).send().await.expect("status request");
+        assert!(resp.status().is_success(), "status: {}", resp.status());
+        resp.json().await.expect("status json")
+    }
+}
+
+fn retention_config() -> ServerConfig {
+    ServerConfig {
+        retention_interval_secs: 1,
+        indexer_catchup_interval_secs: 1,
+        ..Default::default()
+    }
+}
+
+/// A TTL write through a follower is committed by the queue, registered by
+/// the leader's indexer, and expired by the leader's retention worker through
+/// the cluster committer: every node sees the value go, and the value
+/// without a lifetime stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ttl_expires_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let follower = cluster.pick_follower().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let ledger = "raft:ttl";
+    cluster.create_ledger(follower, ledger).await;
+    cluster
+        .insert_subject(follower, ledger, "kept", "Kept")
+        .await;
+    cluster
+        .insert_expiring(follower, ledger, "temp", "Temp", 1)
+        .await;
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(node.node_id, ledger, &["Kept"], Duration::from_secs(30))
+            .await;
+    }
+    let status = cluster.retention_status(leader, ledger).await;
+    assert_eq!(status["active"], json!(true), "{status}");
+    assert_eq!(status["maintenanceRunning"], json!(true), "{status}");
+    // The registration is replicated: a follower reads it too.
+    let status = cluster.retention_status(follower, ledger).await;
+    assert_eq!(status["active"], json!(true), "{status}");
+}
+
+/// The schedule outlives its leader: a value written before the leader
+/// stops is expired by the next leader's worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ttl_survives_leader_failover() {
+    init_test_tracing();
+    let mut cluster =
+        TestCluster::spawn_with_config(3, LivenessConfig::default(), retention_config()).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:ttl-failover";
+    let first = cluster.nodes[0].node_id;
+    cluster.create_ledger(first, ledger).await;
+    cluster.insert_subject(first, ledger, "kept", "Kept").await;
+    cluster
+        .insert_expiring(first, ledger, "temp", "Temp", 4)
+        .await;
+    let old_leader = cluster.current_leader().await.expect("leader");
+    cluster
+        .wait_for_names(old_leader, ledger, &["Kept", "Temp"], DEFAULT_TIMEOUT)
+        .await;
+    cluster.shutdown_node(old_leader).await;
+    let new_leader = cluster
+        .wait_for_leader_change(old_leader, DEFAULT_TIMEOUT)
+        .await;
+    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+        cluster
+            .wait_for_names(node.node_id, ledger, &["Kept"], Duration::from_secs(30))
+            .await;
+    }
+    let status = cluster.retention_status(new_leader, ledger).await;
+    assert_eq!(status["active"], json!(true), "{status}");
+}
