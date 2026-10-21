@@ -89,16 +89,18 @@ fn collect(
                 }
                 None => false,
             },
+            // A path's steps past the first, and an inverse step, read
+            // subjects other than the constant one: its predicates count for
+            // every subject.
             Pattern::PropertyPath(path) => {
                 if path.wildcard || !path.sequence_steps.is_empty() {
                     false
                 } else {
-                    let subject = iri(&path.subject, snapshot);
                     path.predicates
                         .iter()
                         .all(|p| match snapshot.decode_sid(p) {
                             Some(p) => {
-                                out.push((subject.clone(), p));
+                                out.push((None, p));
                                 true
                             }
                             None => false,
@@ -172,11 +174,12 @@ pub(crate) struct HistoricalRead<'a> {
     pub(crate) snapshot: &'a LedgerSnapshot,
 }
 
-/// A journal with the subjects of its removals resolved from their commits.
+/// A journal with the subjects of its removals read from their commits.
 pub(crate) struct Suppression {
     pub(crate) journal: Journal,
-    /// Subject IRI of each removal, by index; `None` when unresolvable.
-    removal_subjects: Vec<Option<String>>,
+    /// Subject of each removal, by index, as its commit encodes it; `None`
+    /// when unresolvable. Decoded against the reading view's snapshot.
+    removal_subjects: Vec<Option<fluree_db_core::Sid>>,
 }
 
 /// Suppressions held between reads, by branch and journal generation.
@@ -219,15 +222,17 @@ impl Fluree {
         Ok(Some(suppression))
     }
 
-    /// The subject of each removed occurrence, read from its commit.
-    async fn removal_subjects(&self, ledger_id: &str, journal: &Journal) -> Vec<Option<String>> {
+    /// The subject of each removed occurrence, read from its commit. Reads
+    /// only storage and the nameservice, never the cached ledger, so a query
+    /// issued inside a transaction can ask.
+    async fn removal_subjects(
+        &self,
+        ledger_id: &str,
+        journal: &Journal,
+    ) -> Vec<Option<fluree_db_core::Sid>> {
         if journal.removals.is_empty() {
             return Vec::new();
         }
-        let Ok(state) = self.ledger_cached(ledger_id).await else {
-            return vec![None; journal.removals.len()];
-        };
-        let snapshot = state.snapshot().await;
         let Ok(publisher) = self.publisher() else {
             return vec![None; journal.removals.len()];
         };
@@ -259,12 +264,13 @@ impl Fluree {
             out.push(
                 commit
                     .and_then(|c| c.flakes.get(removal.slot as usize).cloned())
-                    .and_then(|f| snapshot.snapshot.decode_sid(&f.s)),
+                    .map(|f| f.s),
             );
         }
         out
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// The history an index build of `ledger_id` leaves out: its
     /// `f:noHistory` rules.
     pub(crate) async fn suppressed_history_for_index(
@@ -365,7 +371,6 @@ impl Fluree {
         }
         let (from, to) = (read.from_t.unwrap_or(read.to_t), read.to_t);
         let point = read.from_t.is_none();
-        let _ = read.snapshot;
         for rule in &suppression.journal.history_rules {
             let covered = if point {
                 rule.covers(to)
@@ -391,6 +396,7 @@ impl Fluree {
             } else {
                 removal.overlaps(from, to)
             };
+            let subject = subject.as_ref().and_then(|s| read.snapshot.decode_sid(s));
             if covered && read.reads.touches(subject.as_deref(), &removal.predicate) {
                 return Err(ApiError::HistoryUnavailable(format!(
                     "a removed occurrence of <{}> on {ledger_id} falls in the requested range",

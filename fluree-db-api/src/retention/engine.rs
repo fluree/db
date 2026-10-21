@@ -15,7 +15,7 @@ use fluree_db_ledger::LedgerState;
 use fluree_vocab::db;
 use fluree_vocab::namespaces::FLUREE_DB;
 
-use super::policy::{CompiledPolicy, IriCache};
+use super::policy::{CompiledPolicy, IriCache, NoHistoryRule};
 use super::registry::{self, Registration};
 use super::state::{Entry, FactKey, Retirement, Schedule, Source};
 use super::writer::{RetentionBatch, RetentionWriter, SubmitOutcome};
@@ -640,10 +640,16 @@ impl Fluree {
             iris: IriCache::default(),
         };
 
-        // Discovery.
+        // Discovery. Every valid `f:noHistory` policy is recorded at the
+        // commit that set it, so one enabled and disabled between passes
+        // still covers what it was in force for.
         let mut config_problems = Vec::new();
-        let mut final_policy = CompiledPolicy::default();
-        let mut last_config_t: Option<i64> = None;
+        let mut rule_transitions: Vec<(i64, Vec<NoHistoryRule>)> = Vec::new();
+        let mut record_rules = |t: i64, policy: &CompiledPolicy| {
+            if policy.problems.is_empty() {
+                rule_transitions.push((t, policy.no_history.clone()));
+            }
+        };
         if schedule.watermark_t < head_t {
             if let Some(head) = state.head_commit_id.clone() {
                 let mut cids =
@@ -653,6 +659,7 @@ impl Fluree {
                 let mut policy = self
                     .retention_policy_at(&state, schedule.watermark_t)
                     .await?;
+                record_rules(schedule.watermark_t, &policy);
                 for (t, cid) in cids {
                     let commit = load_commit_by_id(store.as_ref(), &cid).await?;
                     discover_commit(&mut schedule, &commit, &mut ctx, &policy).await?;
@@ -662,17 +669,17 @@ impl Fluree {
                     });
                     if writes_config {
                         policy = self.retention_policy_at(&state, t).await?;
-                        last_config_t = Some(t);
+                        record_rules(t, &policy);
                     }
                     schedule.watermark_t = t;
                     report.discovered_commits += 1;
                 }
                 config_problems = policy.problems.clone();
-                final_policy = policy;
             }
         } else {
-            final_policy = self.retention_policy_at(&state, head_t).await?;
-            config_problems = final_policy.problems.clone();
+            let policy = self.retention_policy_at(&state, head_t).await?;
+            record_rules(head_t, &policy);
+            config_problems = policy.problems.clone();
         }
 
         // Expiration, once discovery has caught up with the head it verifies
@@ -700,16 +707,16 @@ impl Fluree {
         report.problems = config_problems.clone();
         report.problems.extend(schedule.problems.iter().cloned());
 
-        // History rules follow the config once discovery reaches it; an
-        // invalid config changes none of them.
-        let rules_t = last_config_t.unwrap_or(schedule.watermark_t);
-        let desired = final_policy.no_history.clone();
-        let sync_rules = config_problems.is_empty() && schedule.watermark_t >= head_t;
-        let journal_changed = sync_rules
-            && registration
-                .journal
-                .clone()
-                .apply_history_rules(&desired, rules_t);
+        // History rules follow each policy discovered, in commit order and in
+        // the same write as the watermark that passed it.
+        let apply_rules = |journal: &mut super::journal::Journal| {
+            rule_transitions
+                .iter()
+                .fold(false, |changed, (t, desired)| {
+                    journal.apply_history_rules(desired, *t) | changed
+                })
+        };
+        let journal_changed = apply_rules(&mut registration.journal.clone());
 
         // Checkpoint. The schedule is rebuilt from the commits after the
         // persisted watermark, so persisting it is throttled; the journal,
@@ -752,9 +759,7 @@ impl Fluree {
                         // landed meanwhile), with the rules brought in line.
                         let mut updated = next.clone();
                         updated.journal = current.map(|c| c.journal.clone()).unwrap_or_default();
-                        if sync_rules {
-                            updated.journal.apply_history_rules(&desired, rules_t);
-                        }
+                        apply_rules(&mut updated.journal);
                         Some(updated)
                     }
                 }
@@ -783,6 +788,7 @@ impl Fluree {
                 );
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(current) = registry::read(ns, ledger_id).await?.1 {
             self.backfill_history_if_needed(ledger_id, &current);
         }

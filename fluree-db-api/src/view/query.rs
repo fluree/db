@@ -1537,7 +1537,7 @@ impl Fluree {
         executable: &ExecutableQuery,
         history_range: Option<(i64, i64)>,
     ) -> Result<()> {
-        let current = history_range.is_none() && self.is_current_read(&db.ledger_id, db.t).await;
+        let current = history_range.is_none() && self.is_current_read(&db.ledger_id, db.t);
         self.refuse_stale_search_sources(parsed, !current).await?;
         if current {
             return Ok(());
@@ -1564,15 +1564,17 @@ impl Fluree {
     }
 
     /// Whether a read as of `t` is at (or past) the cached head of
-    /// `ledger_id`, known without any I/O.
-    pub(crate) async fn is_current_read(&self, ledger_id: &str, t: i64) -> bool {
+    /// `ledger_id`, known without any I/O or waiting on the ledger's lock: a
+    /// query issued while a transaction holds it (a Cypher `MERGE` probe
+    /// during restaging) is answered `false`, and takes the full check.
+    pub(crate) fn is_current_read(&self, ledger_id: &str, t: i64) -> bool {
         let Ok(id) = fluree_db_core::LedgerId::parse(ledger_id) else {
             return false;
         };
         let Some(manager) = self.ledger_manager.as_ref() else {
             return false;
         };
-        let Some(cached_t) = manager.current_t(&id).await else {
+        let Some(cached_t) = manager.try_current_t(&id) else {
             return false;
         };
         let head = manager

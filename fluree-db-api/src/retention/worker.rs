@@ -8,11 +8,16 @@
 //! ([`BuildObserver`]): that check happens before the index can cover those
 //! commits, so a crash cannot lose an activation.
 
+// The worker loop and build observer run on native targets only; on wasm32
+// the runtime state they drive is unused.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_arch = "wasm32"))]
 use fluree_db_indexer::{BuildObserver, Housekeeping};
 use fluree_db_nameservice::NsRecord;
 use tokio::sync::Notify;
@@ -86,12 +91,14 @@ pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Worker {
     fluree: Weak<Fluree>,
     writer: Arc<dyn RetentionWriter>,
     options: RetentionOptions,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The [`Housekeeping`] that starts and wakes the retention worker. Dropping
 /// it (the owner losing catch-up, a Raft leader stepping down) stops the
 /// worker after its current pass.
@@ -100,6 +107,7 @@ struct RetentionHousekeeping {
     started: AtomicBool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl Housekeeping for RetentionHousekeeping {
     async fn tick(&self) {
@@ -114,6 +122,7 @@ impl Housekeeping for RetentionHousekeeping {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn drive(worker: Weak<Worker>, nudge: Arc<Notify>) {
     let mut last_rescan: Option<Instant> = None;
     loop {
@@ -150,10 +159,12 @@ async fn drive(worker: Weak<Worker>, nudge: Arc<Notify>) {
 
 /// Registers branches as the background indexer reaches commits that carry
 /// retention input.
+#[cfg(not(target_arch = "wasm32"))]
 struct RetentionBuildObserver {
     fluree: Weak<Fluree>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl BuildObserver for RetentionBuildObserver {
     async fn before_build(
@@ -188,6 +199,7 @@ impl RetentionWriter for BorrowedWriter<'_> {
 }
 
 impl Fluree {
+    #[cfg(not(target_arch = "wasm32"))]
     /// Rebuild `ledger_id`'s index once its journal has history rules the
     /// index was not yet rebuilt for: incremental builds drop suppressed
     /// history only from the leaves they touch, so existing history goes in
@@ -198,9 +210,11 @@ impl Fluree {
         ledger_id: &str,
         registration: &registry::Registration,
     ) {
+        // Closed rules count too: one enabled and disabled between passes
+        // still covers history the index holds.
         let journal = &registration.journal;
-        let open_rules = journal.history_rules.iter().any(|r| r.until_t.is_none());
-        if !open_rules || registration.history_backfilled >= journal.generation {
+        if journal.history_rules.is_empty() || registration.history_backfilled >= journal.generation
+        {
             return;
         }
         if !self
@@ -246,6 +260,7 @@ impl Fluree {
         });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Housekeeping that runs the retention worker, committing through
     /// `writer` (this instance directly when `None`). Install it on the
     /// worker that owns catch-up, composed with any other housekeeping (see
@@ -271,6 +286,7 @@ impl Fluree {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// The build observer that registers branches for retention before the
     /// background indexer covers commits carrying retention input.
     pub fn retention_build_observer(self: &Arc<Self>) -> Arc<dyn BuildObserver> {
@@ -304,6 +320,7 @@ impl Fluree {
         .await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// One pass over every active branch. Returns whether there is more
     /// work right away (a batch committed or was recomputed).
     async fn retention_sweep(&self, worker: &Worker) -> bool {
@@ -340,6 +357,7 @@ impl Fluree {
         busy
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Re-read every branch's registration, and register a branch whose
     /// source branch is registered.
     async fn rescan_retention_registrations(&self) -> Result<()> {
@@ -370,6 +388,7 @@ impl Fluree {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn observe_build_for_retention(&self, record: &NsRecord) -> Result<()> {
         let id = record.ledger_id.to_string();
         if self.retention.active.lock().contains(&id) {

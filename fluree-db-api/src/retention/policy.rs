@@ -6,6 +6,10 @@ use fluree_db_core::ledger_config::{LedgerConfig, RetentionDefaults};
 use fluree_db_core::{LedgerSnapshot, Sid};
 use fluree_vocab::config_iris;
 
+/// A predicate whose history is not served, with the graph it governs (`None`
+/// for every data graph) and the graphs a ledger-wide rule excepts.
+pub(crate) type NoHistoryRule = (String, Option<String>, Vec<String>);
+
 /// The duration policy of each governed predicate, ledger-wide and for each
 /// graph with its own retention entries. Resolved once per config version
 /// and looked up by the IRIs of a flake's graph and predicate.
@@ -22,7 +26,7 @@ pub(crate) struct CompiledPolicy {
     /// `f:noHistory` in force: predicate IRI, the graph it is limited to
     /// (`None`: every data graph), and graphs excepted from a ledger-wide
     /// rule by their own explicit `false`.
-    pub(crate) no_history: Vec<(String, Option<String>, Vec<String>)>,
+    pub(crate) no_history: Vec<NoHistoryRule>,
 }
 
 impl CompiledPolicy {
@@ -82,7 +86,7 @@ impl CompiledPolicy {
 }
 
 /// The `f:noHistory` rules a config puts in force, field-merged per graph.
-fn no_history_in_force(config: &LedgerConfig) -> Vec<(String, Option<String>, Vec<String>)> {
+fn no_history_in_force(config: &LedgerConfig) -> Vec<NoHistoryRule> {
     let graph_key = |target: &str| {
         if target == config_iris::DEFAULT_GRAPH {
             fluree_db_core::graph_registry::DEFAULT_GRAPH_IRI.to_string()

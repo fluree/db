@@ -768,3 +768,111 @@ async fn a_restored_archive_keeps_the_removal_journal() {
         vec![json!("b@old")]
     );
 }
+
+/// A transitive path reads past its starting subject: removing `bob knows
+/// secret` refuses an earlier `alice knows+ ?o`, in SPARQL and JSON-LD,
+/// though the path starts at alice.
+#[tokio::test]
+async fn a_property_path_through_a_removed_occurrence_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-path").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:knows": {"@id": "ex:secret"}}
+        ]}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(
+            &id,
+            fluree_db_api::retention::RemovalRequest {
+                occurrences: vec![],
+                matching: vec![fluree_db_api::retention::FactSelector {
+                    subject: "http://example.org/bob".into(),
+                    predicate: "http://example.org/knows".into(),
+                    graph: None,
+                    object: Some(json!({"@id": "http://example.org/secret"})),
+                }],
+            },
+        )
+        .await
+        .expect("remove");
+
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT ?o FROM <{id}@t:{t1}> WHERE {{ ex:alice ex:knows+ ?o }}"
+    );
+    assert!(matches!(
+        fluree.query_connection_sparql(&sparql).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+    let jsonld = json!({
+        "@context": {"ex": "http://example.org/", "knowsPlus": {"@path": "ex:knows+"}},
+        "from": format!("{id}@t:{t1}"),
+        "select": "?o",
+        "where": {"@id": "ex:alice", "knowsPlus": "?o"}
+    });
+    assert!(matches!(
+        fluree.query_connection(&jsonld).await,
+        Err(ApiError::HistoryUnavailable(_))
+    ));
+}
+
+/// A policy enabled and disabled between two worker passes still covers what
+/// it was in force for: the pass records each transition at its commit.
+#[tokio::test]
+async fn a_policy_enabled_and_disabled_between_passes_still_covers_its_interval() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/nohist-transient").await;
+    let t1 = upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
+    )
+    .await;
+    // The worker sees the ledger before the policy, so the policy arrives
+    // between passes.
+    fluree.run_retention(&id).await.ok();
+    let enabled_t = set_no_history(&fluree, &id, "ex:count", true).await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 2}),
+    )
+    .await;
+    let disabled_t = set_no_history(&fluree, &id, "ex:count", false).await;
+    fluree.run_retention(&id).await.expect("pass");
+
+    let journal = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registered")
+        .journal;
+    assert_eq!(journal.history_rules.len(), 1, "{journal:?}");
+    let rule = &journal.history_rules[0];
+    assert_eq!(rule.enabled_t, enabled_t);
+    assert_eq!(rule.until_t, Some(disabled_t));
+    // The value it superseded while in force is not served.
+    assert!(unavailable(
+        read(
+            &fluree,
+            &id,
+            json!(format!("{id}@t:{t1}")),
+            "ex:c",
+            "ex:count"
+        )
+        .await
+    ));
+    // Current state is.
+    assert_eq!(
+        read(&fluree, &id, json!(id), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        vec![json!(2)]
+    );
+}
