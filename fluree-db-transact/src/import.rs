@@ -26,8 +26,8 @@ mod inner {
     use fluree_db_core::ns_encoding::NsSplitMode;
     use fluree_db_core::CommitId;
     use fluree_db_core::{
-        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
-        TxnMetaEntry,
+        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, GraphPosition,
+        Sid, TargetLedger, TxnMetaEntry,
     };
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
@@ -44,13 +44,45 @@ mod inner {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// Refuse a named graph a bulk import may not write, by its literal IRI:
-    /// the default graph's own name, and the ledger's two system graphs,
-    /// mirroring the staged-write guard's shape. Bulk import bypasses staging,
-    /// so that guard never sees its graphs; `import_trig_commit` says why
-    /// they must not be written.
-    fn refuse_reserved_graph_iri(iri: &str, ledger_id: &str) -> Result<()> {
+    /// The graph a bulk import writes for the graph IRI `iri` (a TriG block's,
+    /// or a JSON-LD graph name's), read through the ledger's graph-position
+    /// table, as every graph position of a ledger reads it: the ledger's own
+    /// address is its default graph (`None`), `L#<g>` the graph `<g>`, and any
+    /// other IRI the graph of that IRI. `registered` is the import's own graph
+    /// table. `urn:default`, a name that is no graph of the ledger, and the
+    /// ledger's system graphs are refused.
+    fn import_graph_position<F>(
+        iri: &str,
+        ledger_id: &str,
+        registered: &F,
+    ) -> Result<Option<String>>
+    where
+        F: Fn(&str) -> Option<u16>,
+    {
         crate::stage::refuse_default_graph_name(iri)?;
+        let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
+            Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
+                GraphPosition::Default => return Ok(None),
+                GraphPosition::Registered { iri, .. } | GraphPosition::New(iri) => iri.into_owned(),
+                GraphPosition::NotAGraph => {
+                    return Err(TransactError::Parse(format!(
+                        "<{iri}> names no graph an import can write: an address of this \
+                         ledger names its default graph, or one of its graphs through '#', \
+                         and carries no time"
+                    )))
+                }
+            },
+            Err(_) => iri.to_string(),
+        };
+        refuse_reserved_graph_iri(&graph, ledger_id)?;
+        Ok(Some(graph))
+    }
+
+    /// Refuse a named graph a bulk import may not write, by its literal IRI:
+    /// the ledger's two system graphs, mirroring the staged-write guard's
+    /// shape. Bulk import bypasses staging, so that guard never sees its
+    /// graphs; `import_trig_commit` says why they must not be written.
+    fn refuse_reserved_graph_iri(iri: &str, ledger_id: &str) -> Result<()> {
         if iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id) {
             return Err(TransactError::ReservedGraphTarget {
                 graph_iri: iri.to_string(),
@@ -111,16 +143,21 @@ mod inner {
     }
 
     /// Where a graph name in a bulk-imported JSON-LD document writes: the
-    /// default graph (`None`), or a named graph by absolute IRI.
+    /// default graph (`None`), or a named graph by IRI.
     ///
     /// A selector resolves as a transaction's data resolves it
     /// ([`resolve_written_graph`], against the document's top-level
-    /// `@context`), and a named graph's `@id` must be an absolute IRI, as
-    /// there. The ledger's system graphs are then refused as a TriG import
-    /// refuses them, `config` included: a transaction may write the config
-    /// graph, a bulk import may not.
+    /// `@context`), and a named graph's `@id` as a transaction's does
+    /// ([`named_graph`]). The graph then goes through the ledger's
+    /// graph-position table, as a TriG block's does ([`import_graph_position`]):
+    /// the ledger's own address is its default graph, and the system graphs
+    /// are refused, `config` included (a transaction may write the config
+    /// graph, a bulk import may not). A parallel worker has no graph table of
+    /// the import's, so this reads it as empty: a graph is named here by the
+    /// IRI the table would hold it under.
     ///
     /// [`resolve_written_graph`]: crate::parse::jsonld::resolve_written_graph
+    /// [`named_graph`]: crate::parse::jsonld::named_graph
     fn import_graph_name(
         name: fluree_graph_json_ld::adapter::GraphNameRef<'_>,
         context: &fluree_graph_json_ld::ParsedContext,
@@ -138,18 +175,19 @@ mod inner {
                 crate::parse::jsonld::GraphRole::Data,
                 &mut fluree_db_query::VarRegistry::new(),
             )?,
-            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id)?,
+            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id, ledger_id)?,
         };
-        match graph {
-            GraphName::Default => Ok(None),
-            GraphName::Iri(iri) => {
-                refuse_reserved_graph_iri(iri.as_str(), ledger_id)?;
-                Ok(Some(iri.as_str().to_string()))
+        let iri = match &graph {
+            GraphName::Default => return Ok(None),
+            GraphName::Iri(iri) => iri.as_str(),
+            GraphName::Address(address) => address.as_str(),
+            GraphName::Var(_) => {
+                return Err(TransactError::Parse(
+                    "a bulk import has no \"where\" to bind a variable graph".to_string(),
+                ))
             }
-            GraphName::Var(_) => Err(TransactError::Parse(
-                "a bulk import has no \"where\" to bind a variable graph".to_string(),
-            )),
-        }
+        };
+        import_graph_position(iri, ledger_id, &|_: &str| None)
     }
 
     /// Mutable state carried across chunks during an import session.
@@ -680,36 +718,49 @@ mod inner {
         // supported: `parse_trig_phase1` routes it to `raw_meta`, so legitimate
         // commit metadata never reaches this loop.
         for block in &phase1.named_graphs {
-            refuse_reserved_graph_iri(&block.iri, ledger_id)?;
+            let lookup = |iri: &str| state.graph_ids.get(iri).copied();
+            let block_graph = import_graph_position(&block.iri, ledger_id, &lookup)?;
 
-            // Allocate or reuse g_id for this graph IRI.
-            //
-            // When spooling (index build) is active, allocate from the shared
-            // graph allocator so the commit's `graph_delta` and the index's
-            // `graphs.dict` / query graph registry agree on the same g_id
-            // (allocator convention: dict_id + 1 = g_id). Without spooling
-            // (commit-only paths), fall back to the session counter.
-            let g_id = if let Some(&existing) = state.graph_ids.get(&block.iri) {
-                existing
-            } else {
-                // New graph IRI in this session — allocate and record in delta.
-                let id = match spool_ctx.as_mut() {
-                    Some(sc) => sc.graph_g_id_for_iri(&block.iri),
-                    None => {
-                        let id = state.next_gid;
-                        state.next_gid += 1;
+            let graph: Option<(u16, Sid)> = match block_graph {
+                None => None,
+                Some(iri) => {
+                    // Allocate or reuse g_id for this graph IRI.
+                    //
+                    // When spooling (index build) is active, allocate from the
+                    // shared graph allocator so the commit's `graph_delta` and
+                    // the index's `graphs.dict` / query graph registry agree on
+                    // the same g_id (allocator convention: dict_id + 1 = g_id).
+                    // Without spooling (commit-only paths), fall back to the
+                    // session counter.
+                    let g_id = if let Some(&existing) = state.graph_ids.get(&iri) {
+                        existing
+                    } else {
+                        // New graph IRI in this session — allocate and record in delta.
+                        let id = match spool_ctx.as_mut() {
+                            Some(sc) => sc.graph_g_id_for_iri(&iri),
+                            None => {
+                                let id = state.next_gid;
+                                state.next_gid += 1;
+                                id
+                            }
+                        };
+                        state.graph_ids.insert(iri.clone(), id);
+                        graph_delta.insert(id, iri.clone());
                         id
-                    }
-                };
-                state.graph_ids.insert(block.iri.clone(), id);
-                graph_delta.insert(id, block.iri.clone());
-                id
+                    };
+
+                    refuse_reserved_g_id(&iri, g_id)?;
+
+                    // Create a graph Sid (using the graph IRI's namespace + local name)
+                    Some((g_id, worker_cache.sid_for_iri(&iri)))
+                }
             };
-
-            refuse_reserved_g_id(&block.iri, g_id)?;
-
-            // Create a graph Sid (using the graph IRI's namespace + local name)
-            let graph_sid = worker_cache.sid_for_iri(&block.iri);
+            // A block of the default graph spools under the default graph's id
+            // and encodes flakes with no graph.
+            let (g_id, graph_sid) = match graph {
+                Some((g_id, sid)) => (g_id, Some(sid)),
+                None => (fluree_db_core::graph_registry::DEFAULT_GRAPH_ID, None),
+            };
 
             // Process each triple in this named graph
             for triple in &block.triples {
@@ -747,16 +798,19 @@ mod inner {
                     }
 
                     let meta = lang.as_deref().map(FlakeMeta::with_lang);
-                    let flake = Flake::new_in_graph(
-                        graph_sid.clone(),
-                        s.clone(),
-                        p.clone(),
-                        o,
-                        dt,
-                        new_t,
-                        true,
-                        meta,
-                    );
+                    let flake = match &graph_sid {
+                        Some(graph_sid) => Flake::new_in_graph(
+                            graph_sid.clone(),
+                            s.clone(),
+                            p.clone(),
+                            o,
+                            dt,
+                            new_t,
+                            true,
+                            meta,
+                        ),
+                        None => Flake::new(s.clone(), p.clone(), o, dt, new_t, true, meta),
+                    };
 
                     writer.push_flake(&flake).map_err(|e| {
                         TransactError::Parse(format!("failed to encode named graph flake: {e}"))
@@ -784,7 +838,7 @@ mod inner {
                     None => fluree_db_core::DatatypeConstraint::Explicit(dt),
                 };
                 let bundle = crate::generate::flakes::reified_triple_bundle(
-                    Some(graph_sid.clone()),
+                    graph_sid.clone(),
                     s,
                     p,
                     o,

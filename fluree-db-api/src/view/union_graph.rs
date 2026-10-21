@@ -7,30 +7,37 @@
 //! `FROM` naming each of them would build, so it has that path's set
 //! semantics: a triple held by two graphs is one triple of the union.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
-use fluree_db_core::{GraphId, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI};
-use fluree_db_query::{DataSet, ExecutableQuery, GraphRef};
+use fluree_db_core::{GraphId, TargetLedger, DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI};
+use fluree_db_query::{DataSet, ExecutableQuery, GraphRef, MemberKind};
 
 use crate::view::{DataSetDb, GraphDb};
 use crate::{Fluree, Result};
 
-/// `view`'s user named graphs: every registered graph except the reserved
-/// `#txn-meta` / `#config` graphs and a graph registered under a name of the
-/// default graph (the ledger alias, `urn:default`). The set `GRAPH ?g` ranges
-/// over.
-fn user_graphs(view: &GraphDb) -> impl Iterator<Item = (GraphId, &str)> {
-    let alias = view.snapshot.ledger_id.as_str();
-    view.snapshot
-        .graph_registry
+/// `view`'s user named graphs, each under the name that reads it back
+/// ([`TargetLedger::enumeration_name`]): every registered graph a name
+/// reaches except the reserved `#txn-meta` / `#config` graphs, a graph an
+/// earlier version registered under the ledger's address listed as
+/// `L#<address>`. The set `GRAPH ?g` ranges over.
+fn user_graphs(view: &GraphDb) -> impl Iterator<Item = (GraphId, Cow<'_, str>)> {
+    let registry = &view.snapshot.graph_registry;
+    let ledger_id = &view.snapshot.ledger_id;
+    registry
         .iter_entries()
-        .filter(move |(g_id, iri)| {
-            *g_id >= FIRST_USER_GRAPH_ID && *iri != alias && *iri != DEFAULT_GRAPH_IRI
+        .filter(|(g_id, _)| *g_id >= FIRST_USER_GRAPH_ID)
+        .filter_map(move |(g_id, iri)| {
+            TargetLedger::new(ledger_id, registry)
+                .enumeration_name(iri, g_id)
+                .map(|name| (g_id, name))
         })
 }
 
-/// `view`'s graph `g_id` as a dataset member, under `view`'s policy.
+/// `view`'s graph `g_id` as a dataset member, under `view`'s policy. It reads
+/// the ledger's own index, so the executor never asks the graph-source
+/// registry about it.
 fn member(view: &GraphDb, g_id: GraphId) -> GraphRef<'_> {
     let mut graph = GraphRef::new(
         view.snapshot.as_ref(),
@@ -38,7 +45,8 @@ fn member(view: &GraphDb, g_id: GraphId) -> GraphRef<'_> {
         view.overlay.as_ref(),
         view.t,
         Arc::clone(&view.ledger_id),
-    );
+    )
+    .with_kind(MemberKind::Native);
     graph.policy_enforcer = view.policy_enforcer().cloned();
     graph
 }
