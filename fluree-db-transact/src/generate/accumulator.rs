@@ -274,11 +274,7 @@ fn mixed_graph<'a>(
 /// Subsequent pushes for the same fact are clone-free: a repeat of a side
 /// already held is dropped. A fact keyed by index key clones its subject and
 /// predicate `Sid`s instead.
-fn push_into_mixed(
-    identity: Option<&FactIdentity<'_>>,
-    graph: &mut MixedGraph,
-    flake: Flake,
-) {
+fn push_into_mixed(identity: Option<&FactIdentity<'_>>, graph: &mut MixedGraph, flake: Flake) {
     if let Some(ids) = identity {
         if let Some(key) = ids.key(graph.g_id, &flake) {
             let bucket = graph
