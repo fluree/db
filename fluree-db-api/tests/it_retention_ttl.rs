@@ -518,8 +518,8 @@ async fn retention_config_is_validated() {
     };
     for (bad, why) in [
         (
-            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:noHistory true ] .",
-            "not supported yet",
+            "f:property [ a f:RetentionProperty ; f:target ex:c ; f:noHistory \"yes\" ] .",
+            "invalid value",
         ),
         (
             "f:property [ a f:RetentionProperty ; f:target ex:c ; f:ttlSeconds -1 ] .",

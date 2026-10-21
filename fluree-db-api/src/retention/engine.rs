@@ -51,26 +51,60 @@ pub struct PassReport {
 /// was loaded from or saved as.
 #[derive(Default)]
 pub(crate) struct ScheduleCache {
-    schedules: parking_lot::Mutex<HashMap<String, (Option<String>, Schedule)>>,
+    schedules: parking_lot::Mutex<HashMap<String, CachedSchedule>>,
+}
+
+struct CachedSchedule {
+    /// The persisted blob the schedule extends (what the registration names).
+    blob: Option<String>,
+    schedule: Schedule,
+    /// When the schedule was last persisted (epoch ms).
+    persisted_ms: i64,
 }
 
 impl ScheduleCache {
-    fn take(&self, ledger_id: &str, blob: Option<&str>) -> Option<Schedule> {
+    fn take(&self, ledger_id: &str, blob: Option<&str>) -> Option<(Schedule, i64)> {
         let mut map = self.schedules.lock();
         match map.remove(ledger_id) {
-            Some((cached, schedule)) if cached.as_deref() == blob => Some(schedule),
+            Some(cached) if cached.blob.as_deref() == blob => {
+                Some((cached.schedule, cached.persisted_ms))
+            }
             _ => None,
         }
     }
 
-    fn put(&self, ledger_id: &str, blob: Option<String>, schedule: Schedule) {
-        self.schedules
-            .lock()
-            .insert(ledger_id.to_string(), (blob, schedule));
+    fn put(&self, ledger_id: &str, blob: Option<String>, schedule: Schedule, persisted_ms: i64) {
+        self.schedules.lock().insert(
+            ledger_id.to_string(),
+            CachedSchedule {
+                blob,
+                schedule,
+                persisted_ms,
+            },
+        );
+    }
+
+    /// The watermark and pending count of a schedule with nothing to do at
+    /// `now_ms`: discovered through `head_t`, nothing due, nothing to retire.
+    fn idle(
+        &self,
+        ledger_id: &str,
+        blob: Option<&str>,
+        head_t: i64,
+        now_ms: i64,
+    ) -> Option<(i64, usize)> {
+        let map = self.schedules.lock();
+        let cached = map.get(ledger_id)?;
+        let s = &cached.schedule;
+        (cached.blob.as_deref() == blob
+            && s.watermark_t >= head_t
+            && s.retire.is_empty()
+            && s.next_due_ms().is_none_or(|due| due > now_ms))
+        .then(|| (s.watermark_t, s.len()))
     }
 
     pub(crate) fn peek<T>(&self, ledger_id: &str, f: impl FnOnce(&Schedule) -> T) -> Option<T> {
-        self.schedules.lock().get(ledger_id).map(|(_, s)| f(s))
+        self.schedules.lock().get(ledger_id).map(|c| f(&c.schedule))
     }
 }
 
@@ -560,6 +594,26 @@ impl Fluree {
         let Some(record) = ns.lookup(ledger_id).await? else {
             return Err(ApiError::NotFound(ledger_id.to_string()));
         };
+        let heartbeat_due = registration
+            .last_pass_ms
+            .is_none_or(|last| now_ms - last >= limits.heartbeat_ms);
+        // Nothing committed, due or waiting since the last pass: done, with
+        // no ledger load.
+        if !heartbeat_due {
+            if let Some((watermark_t, pending)) = cache.idle(
+                ledger_id,
+                registration.schedule.as_deref(),
+                record.commit_t,
+                now_ms,
+            ) {
+                return Ok(PassReport {
+                    watermark_t,
+                    pending,
+                    problems: registration.problems.clone(),
+                    ..Default::default()
+                });
+            }
+        }
         let store = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await?;
@@ -571,10 +625,11 @@ impl Fluree {
             .to_ledger_state();
         let head_t = state.t();
 
-        let mut schedule = match cache.take(ledger_id, registration.schedule.as_deref()) {
-            Some(schedule) => schedule,
-            None => load_schedule(store.as_ref(), &registration).await,
-        };
+        let (mut schedule, persisted_ms) =
+            match cache.take(ledger_id, registration.schedule.as_deref()) {
+                Some(cached) => cached,
+                None => (load_schedule(store.as_ref(), &registration).await, now_ms),
+            };
         let loaded_blob = registration.schedule.clone();
         let before = schedule_fingerprint(&schedule);
         let mut report = PassReport::default();
@@ -656,23 +711,28 @@ impl Fluree {
                 .clone()
                 .apply_history_rules(&desired, rules_t);
 
-        // Checkpoint.
+        // Checkpoint. The schedule is rebuilt from the commits after the
+        // persisted watermark, so persisting it is throttled; the journal,
+        // which serving reads, is published at once.
         let changed = before != schedule_fingerprint(&schedule);
-        let heartbeat_due = registration
-            .last_pass_ms
-            .is_none_or(|last| now_ms - last >= limits.heartbeat_ms);
         let counters_changed = report.committed_t.is_some()
             || report.head_moved
             || registration.problems != report.problems;
+        let persist = changed
+            && (journal_changed || heartbeat_due || now_ms - persisted_ms >= limits.checkpoint_ms);
         let mut blob = loaded_blob.clone();
-        if changed {
+        let mut persisted_at = persisted_ms;
+        let mut watermark_t = registration.watermark_t;
+        if persist {
             let bytes = schedule.encode().map_err(ApiError::internal)?;
             let cid = store.put(ContentKind::RetentionState, &bytes).await?;
             blob = Some(cid.to_string());
+            persisted_at = now_ms;
+            watermark_t = schedule.watermark_t;
         }
-        if changed || heartbeat_due || counters_changed || journal_changed {
+        if persist || heartbeat_due || counters_changed || journal_changed {
             let next = Registration {
-                watermark_t: schedule.watermark_t,
+                watermark_t,
                 schedule: blob.clone(),
                 next_due_ms: schedule.next_due_ms(),
                 pending: schedule.len() as u64,
@@ -700,7 +760,7 @@ impl Fluree {
                 }
             })
             .await?;
-            if changed {
+            if persist {
                 if let Some(old) = loaded_blob
                     .as_deref()
                     .and_then(|s| s.parse::<ContentId>().ok())
@@ -709,7 +769,7 @@ impl Fluree {
                 }
             }
         }
-        cache.put(ledger_id, blob, schedule);
+        cache.put(ledger_id, blob, schedule, persisted_at);
         Ok(report)
     }
 

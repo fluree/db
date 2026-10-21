@@ -55,6 +55,9 @@ pub struct RetentionLimits {
     /// How long a due value left in place (shared by several relationships)
     /// waits before it is checked again (ms).
     pub conflict_backoff_ms: i64,
+    /// How often a changing schedule is persisted (ms). What it has not
+    /// persisted is rediscovered from the commits after a restart.
+    pub checkpoint_ms: i64,
 }
 
 impl Default for RetentionLimits {
@@ -65,6 +68,7 @@ impl Default for RetentionLimits {
             max_flakes_per_batch: 10_000,
             heartbeat_ms: 60_000,
             conflict_backoff_ms: 3_600_000,
+            checkpoint_ms: 30_000,
         }
     }
 }
