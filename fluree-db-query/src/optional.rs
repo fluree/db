@@ -510,7 +510,8 @@ impl PatternOptionalBuilder {
                 p_id,
                 &objects,
                 probe_ops.as_mut(),
-                |obj_idx, s_id| {
+                false,
+                |obj_idx, s_id, _| {
                     for &slot in slots_by_object[obj_idx] {
                         values[slot].push(Binding::encoded_sid(s_id));
                         matched += 1;
