@@ -185,6 +185,15 @@ pub use parse::{parse_query, parse_query_in_dataset};
 pub use var_registry::{VarId, VarRegistry};
 
 use execute::build_where_operators_seeded;
+
+/// The planner stats a transaction's WHERE plans `db` from (the
+/// novelty-merged estimates, cached per overlay content). See
+/// [`fluree_db_core::StatsView::estimates_only`] for planning a state these
+/// don't describe exactly.
+pub fn planner_stats_view(db: GraphDbRef<'_>) -> Option<Arc<fluree_db_core::StatsView>> {
+    let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+    stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
+}
 use fluree_db_core::GraphDbRef;
 use std::sync::Arc;
 

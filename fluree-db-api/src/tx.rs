@@ -132,6 +132,10 @@ pub(crate) struct SequentialStager {
     /// Staged as one operation of an enclosing request, which shares this
     /// governance and runs the config guard over its own merged result.
     nested: bool,
+    /// The planner stats every virtual state plans from: those of the state
+    /// the request began on, estimates only. Built at the first operation
+    /// that advances the state (`None` until then).
+    planner_stats: Option<Option<Arc<fluree_db_core::StatsView>>>,
 }
 
 /// Fact identity for the sequential fold: `(g, s, p)` and the object as
@@ -160,6 +164,7 @@ impl SequentialStager {
             nested: false,
             current: Some(ledger),
             scope: WriteScope::Subjects(FxHashSet::default()),
+            planner_stats: None,
         }
     }
 
@@ -305,6 +310,23 @@ impl SequentialStager {
             )?;
             if let Some(store) = store {
                 fluree_db_transact::attach_binary_provider(&mut state_i, store);
+            }
+            // The next operation, and any probe of this state, plans from the
+            // base state's stats rather than assembling them over the whole
+            // novelty window again: the state differs from the base only by
+            // this request's own flakes. Estimates only, so a licence the
+            // stats grant the base (a property's objects all refs) can't be
+            // read for this state.
+            if staged_count > 0 {
+                let original = &self.original;
+                let pinned = self.planner_stats.get_or_insert_with(|| {
+                    let base = crate::view::GraphDb::from_ledger_state(original);
+                    fluree_db_query::planner_stats_view(base.as_graph_db_ref())
+                        .map(|view| Arc::new((*view).clone().estimates_only()))
+                });
+                if let Some(stats) = pinned {
+                    state_i.pin_planner_stats(Arc::clone(stats));
+                }
             }
             self.current = Some(state_i);
         }

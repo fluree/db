@@ -836,6 +836,12 @@ impl LedgerState {
     /// The resulting state is a **transient staging view only**: it carries
     /// uncommitted data in novelty and must never be published, committed
     /// from, or cached as the ledger's live state.
+    /// Plan this state's queries from `stats` (see
+    /// [`fluree_db_novelty::Novelty::pin_planner_stats`]).
+    pub fn pin_planner_stats(&mut self, stats: Arc<fluree_db_core::StatsView>) {
+        Arc::make_mut(&mut self.novelty).pin_planner_stats(stats);
+    }
+
     pub fn apply_staged_flakes_for_sequential_staging(
         &mut self,
         flakes: Vec<Flake>,
