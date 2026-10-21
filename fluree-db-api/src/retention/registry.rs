@@ -60,6 +60,10 @@ pub struct Registration {
     /// (restored, cloned, branched) shares; keys the journal checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
+    /// The journal generation last published to the lineage's checkpoint;
+    /// a pass publishes a journal that has moved past it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub checkpointed: u64,
 }
 
 fn is_zero(n: &u64) -> bool {

@@ -348,7 +348,14 @@ impl Fluree {
             })
             .await?
             .unwrap_or_default();
-            self.checkpoint_journal(&ledger_id).await;
+            // A copy restored after this ledger is gone keeps the removal
+            // only through the checkpoint; a retry publishes it.
+            self.checkpoint_journal(&ledger_id).await.map_err(|e| {
+                ApiError::internal(format!(
+                    "the removal is recorded on {ledger_id}, but its lineage checkpoint \
+                     could not be published ({e}); retry the request"
+                ))
+            })?;
             let unacknowledged_replicas = self
                 .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
                 .await;
@@ -423,7 +430,10 @@ fn selector_terms(
 }
 
 /// The stored flakes stating `flake`'s fact at the head, as retractions.
-async fn stored_terms(state: &fluree_db_ledger::LedgerState, flake: &Flake) -> Result<Vec<Flake>> {
+pub(super) async fn stored_terms(
+    state: &fluree_db_ledger::LedgerState,
+    flake: &Flake,
+) -> Result<Vec<Flake>> {
     let reverse = state.snapshot.build_reverse_graph()?;
     let g_id = match &flake.g {
         None => 0,

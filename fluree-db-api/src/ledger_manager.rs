@@ -104,6 +104,10 @@ impl LedgerWriteGuard {
 
     /// Replace state with new state after successful commit
     pub fn replace(&mut self, new_state: LedgerState) {
+        self.ledger
+            .inner
+            .installed_t
+            .store(new_state.t(), Ordering::Release);
         *self.guard = new_state;
     }
 }
@@ -267,6 +271,9 @@ struct LedgerHandleInner {
     /// path, so the publish listener can tell its own commits from others'
     /// without touching the state lock.
     committed_t: std::sync::atomic::AtomicI64,
+    /// `t` of the state installed now, by any path: a view at an earlier
+    /// `t` reads history, which retention checks without the state lock.
+    installed_t: Arc<std::sync::atomic::AtomicI64>,
     write_paths: WritePathCounters,
     /// Test hook: the next optimistic stage on this handle parks here after
     /// staging and before taking the lock (see
@@ -405,6 +412,7 @@ impl LedgerHandle {
         state: LedgerState,
         binary_store: Option<Arc<BinaryIndexStore>>,
     ) -> Self {
+        let installed_t = Arc::new(std::sync::atomic::AtomicI64::new(state.t()));
         Self {
             inner: Arc::new(LedgerHandleInner {
                 state: Arc::new(RwLock::new(state)),
@@ -415,6 +423,7 @@ impl LedgerHandle {
                 config_cache: RwLock::new(ConfigCacheEntry::default()),
                 recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
                 committed_t: std::sync::atomic::AtomicI64::new(0),
+                installed_t,
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
             }),
@@ -1399,6 +1408,8 @@ pub struct LedgerManager {
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
+    /// Each cached handle's installed `t` (see [`Self::known_head`]).
+    installed_heads: std::sync::RwLock<HashMap<LedgerId, Arc<std::sync::atomic::AtomicI64>>>,
     /// The storage roots of ledgers graph-source queries have checked their
     /// indexes against, `None` for a name nothing holds; see
     /// [`Self::remembered_root`]. Cleared, by [`Self::forget_root`] and
@@ -1435,6 +1446,7 @@ impl LedgerManager {
             shutdown: AtomicBool::new(false),
             load_generation: AtomicU64::new(0),
             head_watermarks: std::sync::RwLock::new(HashMap::new()),
+            installed_heads: std::sync::RwLock::new(HashMap::new()),
             source_roots: std::sync::RwLock::new(SourceRoots::default()),
         }
     }
@@ -1563,6 +1575,19 @@ impl LedgerManager {
             .expect("head watermark lock never poisoned: no panics inside critical section")
             .get(ledger_id)
             .copied()
+    }
+
+    /// The newest head of `ledger_id` this instance knows: its cached
+    /// state's, or a newer one a head-advancing component reported. Reads
+    /// no ledger state lock.
+    pub(crate) fn known_head(&self, ledger_id: &LedgerId) -> Option<i64> {
+        let installed = self
+            .installed_heads
+            .read()
+            .expect("installed head lock never poisoned")
+            .get(ledger_id)
+            .map(|t| t.load(Ordering::Acquire));
+        installed.max(self.head_watermark(ledger_id))
     }
 
     /// Get the manager configuration
@@ -1785,6 +1810,13 @@ impl LedgerManager {
                 #[cfg(feature = "shacl")]
                 let loaded_config = warn_if_shapes_unenforced(&state).await;
                 let handle = LedgerHandle::new(canonical_alias.clone(), state, binary_store);
+                self.installed_heads
+                    .write()
+                    .expect("installed head lock never poisoned")
+                    .insert(
+                        canonical_alias.clone(),
+                        Arc::clone(&handle.inner.installed_t),
+                    );
                 #[cfg(feature = "shacl")]
                 if let Some((key, config)) = loaded_config {
                     handle.config_cache_put(key, config).await;
@@ -1902,6 +1934,10 @@ impl LedgerManager {
         self.head_watermarks
             .write()
             .expect("head watermark lock never poisoned: no panics inside critical section")
+            .remove(&canonical_alias);
+        self.installed_heads
+            .write()
+            .expect("installed head lock never poisoned")
             .remove(&canonical_alias);
         self.forget_root(&canonical_alias);
     }
@@ -3224,6 +3260,36 @@ mod tests {
         // flagged stale by a leftover high watermark.
         mgr.disconnect(&id("test:main")).await;
         assert!(!mgr.cached_handle_is_stale(&handle).await);
+    }
+
+    #[tokio::test]
+    async fn known_head_follows_installs_and_watermarks() {
+        use fluree_db_core::{LedgerSnapshot, MemoryStorage};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_nameservice::memory::MemoryNameService;
+        use fluree_db_novelty::Novelty;
+
+        let state = |t| LedgerState::new(LedgerSnapshot::genesis("test:main"), Novelty::new(t));
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new()));
+        let mgr = LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default());
+        let ledger = id("test:main");
+        assert_eq!(mgr.known_head(&ledger), None);
+
+        let handle = LedgerHandle::new(ledger.clone(), state(5), None);
+        mgr.installed_heads
+            .write()
+            .unwrap()
+            .insert(ledger.clone(), Arc::clone(&handle.inner.installed_t));
+        assert_eq!(mgr.known_head(&ledger), Some(5));
+        handle.lock_for_write().await.replace(state(7));
+        assert_eq!(mgr.known_head(&ledger), Some(7));
+        // A replicated head the cache has not loaded yet.
+        mgr.note_head_advance(&ledger, 12);
+        assert_eq!(mgr.known_head(&ledger), Some(12));
+
+        mgr.disconnect(&ledger).await;
+        assert_eq!(mgr.known_head(&ledger), None);
     }
 
     #[tokio::test]

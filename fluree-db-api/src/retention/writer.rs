@@ -167,7 +167,7 @@ impl Fluree {
         let store = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await?;
-        let (write_guard, mut state) = self.lock_or_load(&id, store.clone(), record).await?;
+        let (write_guard, state) = self.lock_or_load(&id, store.clone(), record).await?;
         if state.t() != batch.expected_t {
             return Err(ApiError::Transact(TransactError::CommitConflict {
                 expected_t: batch.expected_t,
@@ -178,15 +178,28 @@ impl Fluree {
         if max > 0 && state.novelty_size() as f64 >= max as f64 * NOVELTY_HEADROOM {
             return Err(ApiError::Transact(TransactError::NoveltyAtMax));
         }
+        let staged = self
+            .stage_retention_commit(state, batch.retractions, store.as_ref())
+            .await?;
+        Ok((write_guard, staged))
+    }
+
+    /// Stage `retractions` against `state` as a retention commit.
+    pub(crate) async fn stage_retention_commit(
+        &self,
+        mut state: fluree_db_ledger::LedgerState,
+        retractions: Vec<Flake>,
+        store: &dyn fluree_db_core::ContentStore,
+    ) -> Result<fluree_db_transact::StagedCommit> {
         if state.head_temporal.is_none() && state.head_commit_id.is_some() {
             state
-                .ensure_head_temporal(store.as_ref())
+                .ensure_head_temporal(store)
                 .await
                 .map_err(TransactError::from)?;
         }
         let reverse_graph: HashMap<Sid, fluree_db_core::GraphId> =
             state.snapshot.build_reverse_graph()?;
-        let view = StagedLedger::new(state, batch.retractions, &reverse_graph)?;
+        let view = StagedLedger::new(state, retractions, &reverse_graph)?;
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let commit_opts = CommitOpts::default()
             .identity(RETENTION_IDENTITY)
@@ -199,7 +212,7 @@ impl Fluree {
                     id: Some(cid.clone()),
                     t: view.base().t(),
                 });
-        let staged = fluree_db_transact::build_commit(
+        Ok(fluree_db_transact::build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -207,8 +220,7 @@ impl Fluree {
             &self.index_config,
             commit_opts.with_content_hash(self.content_hash()),
         )
-        .await?;
-        Ok((write_guard, staged))
+        .await?)
     }
 }
 

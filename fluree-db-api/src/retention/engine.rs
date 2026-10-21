@@ -597,9 +597,11 @@ impl Fluree {
         let heartbeat_due = registration
             .last_pass_ms
             .is_none_or(|last| now_ms - last >= limits.heartbeat_ms);
-        // Nothing committed, due or waiting since the last pass: done, with
-        // no ledger load.
-        if !heartbeat_due {
+        let published = registration.journal.is_empty()
+            || registration.checkpointed == registration.journal.generation;
+        // Nothing committed, due, waiting or unpublished since the last
+        // pass: done, with no ledger load.
+        if !heartbeat_due && published {
             if let Some((watermark_t, pending)) = cache.idle(
                 ledger_id,
                 registration.schedule.as_deref(),
@@ -775,8 +777,15 @@ impl Fluree {
             }
         }
         cache.put(ledger_id, blob, schedule, persisted_at);
+        let current = registry::read(ns, ledger_id).await?.1;
+        // Also a journal an earlier pass or removal could not publish.
+        if current
+            .as_ref()
+            .is_some_and(|c| !c.journal.is_empty() && c.checkpointed != c.journal.generation)
+        {
+            self.checkpoint_journal(ledger_id).await?;
+        }
         if journal_changed {
-            self.checkpoint_journal(ledger_id).await;
             let pending = self
                 .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
                 .await;
@@ -790,8 +799,8 @@ impl Fluree {
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(current) = registry::read(ns, ledger_id).await?.1 {
-            self.backfill_history_if_needed(ledger_id, &current);
+        if let Some(current) = &current {
+            self.backfill_history_if_needed(ledger_id, current);
         }
         Ok(report)
     }

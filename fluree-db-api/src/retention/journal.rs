@@ -156,11 +156,48 @@ impl Journal {
         changed
     }
 
+    /// What of this journal `base` lacks: the entries [`Self::merge`] would
+    /// add to it.
+    pub fn missing_from(&self, base: &Journal) -> Journal {
+        let held: std::collections::HashSet<(&str, u32)> = base
+            .removals
+            .iter()
+            .map(|r| (r.commit.as_str(), r.slot))
+            .collect();
+        Journal {
+            generation: self.generation,
+            removals: self
+                .removals
+                .iter()
+                .filter(|r| !held.contains(&(r.commit.as_str(), r.slot)))
+                .cloned()
+                .collect(),
+            history_rules: self
+                .history_rules
+                .iter()
+                .filter(|rule| {
+                    !base.history_rules.iter().any(|b| {
+                        b.predicate == rule.predicate
+                            && b.graph == rule.graph
+                            && b.enabled_t == rule.enabled_t
+                            && b.from_t == rule.from_t
+                            && (b.until_t.is_none() || rule.until_t.is_some())
+                    })
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Bring the history rules in force in line with `desired` (as compiled
     /// from the config), recording a change at config commit `t`: a rule no
     /// longer desired is closed at `t` (its history stays suppressed), a new
     /// one opens covering existing history. Returns whether anything changed;
     /// the generation is bumped when it did.
+    ///
+    /// A policy from before a rule was enabled leaves the rule alone: a
+    /// rediscovery replays earlier policies, and a rule merged from another
+    /// copy of the lineage was enabled in history this copy may not hold.
     pub fn apply_history_rules(
         &mut self,
         desired: &[(String, Option<String>, Vec<String>)],
@@ -170,7 +207,7 @@ impl Journal {
         for rule in self
             .history_rules
             .iter_mut()
-            .filter(|r| r.until_t.is_none())
+            .filter(|r| r.until_t.is_none() && r.enabled_t <= t)
         {
             let wanted = desired
                 .iter()
@@ -248,6 +285,59 @@ mod tests {
         assert_eq!(j.generation, 3);
         // The closed rule still covers what it suppressed.
         assert!(j.history_rules[0].covers(8));
+    }
+
+    #[test]
+    fn a_policy_from_before_a_rule_was_enabled_leaves_it_open() {
+        let mut j = Journal::default();
+        j.apply_history_rules(&[("ex:p".to_string(), None, vec![])], 5);
+        assert!(!j.apply_history_rules(&[], 0), "replayed earlier policy");
+        assert!(!j.apply_history_rules(&[], 4));
+        assert_eq!(j.history_rules[0].until_t, None);
+        assert!(j.apply_history_rules(&[], 7));
+        assert_eq!(j.history_rules[0].until_t, Some(7));
+    }
+
+    #[test]
+    fn what_a_base_lacks_is_what_merging_adds() {
+        let removal = |slot| Removal {
+            request_id: "r".into(),
+            commit: "bafy".into(),
+            slot,
+            predicate: "ex:q".into(),
+            from_t: 1,
+            until_t: Some(2),
+            scope_t: 1,
+        };
+        let ours = Journal {
+            generation: 4,
+            history_rules: vec![
+                rule(0, None),
+                HistoryRule {
+                    enabled_t: 9,
+                    ..rule(0, Some(12))
+                },
+            ],
+            removals: vec![removal(1), removal(2)],
+        };
+        let base = Journal {
+            generation: 1,
+            history_rules: vec![
+                rule(0, Some(7)),
+                HistoryRule {
+                    enabled_t: 9,
+                    ..rule(0, None)
+                },
+            ],
+            removals: vec![removal(2)],
+        };
+        let missing = ours.missing_from(&base);
+        assert_eq!(missing.removals, vec![removal(1)]);
+        // The open copy wins over the closed one; a closed copy adds nothing.
+        assert_eq!(missing.history_rules, vec![rule(0, None)]);
+        let mut merged = base.clone();
+        assert!(merged.merge(&missing));
+        assert!(ours.missing_from(&merged).is_empty());
     }
 
     #[test]

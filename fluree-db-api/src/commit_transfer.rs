@@ -106,7 +106,8 @@ pub struct RestoreResult {
     pub txn_blobs: usize,
     /// Index artifact blobs ingested (0 for a commits-only archive).
     pub index_artifacts: usize,
-    /// `t` the restored commit head was set to.
+    /// `t` of the restored commit head: the archive's, or the retraction
+    /// of values the lineage has since removed.
     pub commit_t: i64,
     /// `t` the restored index head was set to, when the archive carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2128,11 +2129,7 @@ impl Fluree {
         };
         if restored.is_err() {
             self.discard_restored(&pending).await;
-            return restored;
         }
-        // An archive from before a removal holds the removed value as current
-        // state; retract it as the removal did.
-        self.reapply_removals(new_ledger_id.as_str()).await?;
         restored
     }
 
@@ -2493,30 +2490,16 @@ impl Fluree {
             .get("retention")
             .map(crate::retention::registry::ArchivedRetention::parse)
             .transpose()?;
-        let checkpoint = match &lineage {
-            Some(lineage) => self.journal_checkpoint(lineage).await,
-            None => None,
-        };
-        let lineage = lineage.map(|l| l.to_string());
-        if crate::retention::registry::restore(
-            self.publisher()?,
-            record,
-            archived,
-            lineage.as_deref(),
-            checkpoint,
-        )
-        .await?
-        .is_some()
-        {
-            self.checkpoint_journal(new_ledger_id).await;
-        }
+        let retracted_t = self
+            .restore_retention(record, archived, lineage.as_ref())
+            .await?;
 
         Ok(RestoreResult {
             ledger_id: new_ledger_id.to_string(),
             commits,
             txn_blobs,
             index_artifacts,
-            commit_t,
+            commit_t: retracted_t.unwrap_or(commit_t),
             index_t: index_t_out,
         })
     }

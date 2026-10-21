@@ -924,13 +924,25 @@ async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_
         .await,
         Err(ApiError::ReplicaNotCurrent(_))
     ));
-    // Current state is still served.
+    // Current state is still served, and so is a view held past a commit:
+    // it is checked against the journal this replica holds.
     assert_eq!(
         read(&fluree, &id, json!(id), "ex:c", "ex:count")
             .await
             .unwrap(),
         vec![json!(2)]
     );
+    let held = fluree.db(&id).await.unwrap();
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 3}),
+    )
+    .await;
+    let count =
+        json!({"@context": ctx(), "select": "?o", "where": {"@id": "ex:c", "ex:count": "?o"}});
+    let rows = fluree.query(&held, &count).await.expect("held view");
+    assert_eq!(rows.to_jsonld(&held.snapshot).unwrap(), json!([2]));
 }
 
 /// An archive made before a removal, restored after its source is purged,
@@ -990,4 +1002,413 @@ async fn a_pre_removal_archive_restored_after_a_purge_keeps_the_removal() {
             .unwrap()
             .is_empty()
     );
+}
+
+fn email_query() -> JsonValue {
+    json!({"@context": ctx(), "select": "?o", "where": {"@id": "ex:alice", "ex:email": "?o"}})
+}
+
+/// A view opened before a removal, whether from the cache or from a ledger
+/// state the application holds, with or without a ledger cache, does not
+/// serve the removed value: it is behind the head the removal committed, so
+/// it reads history.
+#[tokio::test]
+async fn a_view_held_across_a_removal_refuses_the_removed_value() {
+    for fluree in [
+        FlureeBuilder::memory().build_memory(),
+        FlureeBuilder::memory()
+            .without_ledger_caching()
+            .build_memory(),
+    ] {
+        let id = ledger(&fluree, "it/removal-held-view").await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+        )
+        .await;
+        let view = fluree.db(&id).await.unwrap();
+        let state = fluree.ledger(&id).await.unwrap();
+        let held = fluree_db_api::GraphDb::from_ledger_state(&state);
+        fluree
+            .remove_occurrences(&id, select("alice", None))
+            .await
+            .expect("remove");
+        for view in [&view, &held] {
+            assert!(matches!(
+                fluree.query(view, &email_query()).await,
+                Err(ApiError::HistoryUnavailable(_))
+            ));
+        }
+        assert!(read(&fluree, &id, json!(id), "ex:alice", "ex:email")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Under `f:noHistory`, a held view's value superseded since is
+        // history too.
+        let counted = ledger(&fluree, "it/held-view-counter").await;
+        set_no_history(&fluree, &counted, "ex:count", true).await;
+        let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
+        upsert(&fluree, &counted, doc(1)).await;
+        fluree.run_retention(&counted).await.expect("pass");
+        let view = fluree.db(&counted).await.unwrap();
+        upsert(&fluree, &counted, doc(2)).await;
+        let count =
+            json!({"@context": ctx(), "select": "?o", "where": {"@id": "ex:c", "ex:count": "?o"}});
+        assert!(matches!(
+            fluree.query(&view, &count).await,
+            Err(ApiError::HistoryUnavailable(_))
+        ));
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // A view held across an ordinary commit of a ledger without retention
+    // still answers as of its point.
+    let plain = ledger(&fluree, "it/held-view-plain").await;
+    insert(
+        &fluree,
+        &plain,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@plain"}),
+    )
+    .await;
+    let view = fluree.db(&plain).await.unwrap();
+    insert(
+        &fluree,
+        &plain,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@plain"}),
+    )
+    .await;
+    let rows = fluree.query(&view, &email_query()).await.expect("query");
+    assert_eq!(rows.to_jsonld(&view.snapshot).unwrap(), json!(["a@plain"]));
+}
+
+/// A copy restored from an archive made before `f:noHistory` was enabled
+/// inherits the rule from the lineage's checkpoint, and keeps it when its
+/// own retention pass rediscovers the older policy its commits hold.
+#[tokio::test]
+async fn a_restored_copy_keeps_an_inherited_rule_through_rediscovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let id = ledger(&fluree, "it/inherited-rule").await;
+    let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
+    let t1 = upsert(&fluree, &id, doc(1)).await;
+    upsert(&fluree, &id, doc(2)).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    fluree.run_retention(&id).await.expect("pass");
+
+    let copy = fluree
+        .restore_ledger("it/inherited-rule-copy", &mut archive.as_slice())
+        .await
+        .expect("restore")
+        .ledger_id;
+    let at_t1 = json!(format!("{copy}@t:{t1}"));
+    assert!(unavailable(
+        read(&fluree, &copy, at_t1.clone(), "ex:c", "ex:count").await
+    ));
+    fluree.run_retention(&copy).await.expect("pass on the copy");
+    assert!(unavailable(
+        read(&fluree, &copy, at_t1, "ex:c", "ex:count").await
+    ));
+}
+
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// A checkpoint that cannot be read is not taken for an absent one: the
+/// restore that needs it fails rather than serving what it may suppress.
+#[tokio::test]
+async fn an_unreadable_checkpoint_fails_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let name = "it/corrupt-checkpoint";
+    let id = ledger(&fluree, name).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    fluree
+        .remove_occurrences(&id, select("alice", None))
+        .await
+        .expect("remove");
+    let objects = files_under(&dir.path().join("@retention/journal"));
+    assert!(!objects.is_empty());
+    for object in objects {
+        std::fs::write(object, b"not a journal").unwrap();
+    }
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("purge");
+    let copy = "it/corrupt-checkpoint-copy";
+    assert!(fluree
+        .restore_ledger(copy, &mut archive.as_slice())
+        .await
+        .is_err());
+    assert!(fluree.ledger(&format!("{copy}:main")).await.is_err());
+}
+
+/// A removal whose checkpoint cannot be published reports failure, and a
+/// retry publishes it: a removal reported complete survives its ledger.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_removal_is_not_complete_until_its_checkpoint_is_published() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let name = "it/unwritable-checkpoint";
+    let id = ledger(&fluree, name).await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    let journal_dir = dir.path().join("@retention/journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = fluree.remove_occurrences(&id, select("alice", None)).await;
+    std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err(), "reported complete without its checkpoint");
+    fluree
+        .remove_occurrences(&id, select("alice", None))
+        .await
+        .expect("retry");
+
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("purge");
+    let copy = fluree
+        .restore_ledger("it/unwritable-checkpoint-copy", &mut archive.as_slice())
+        .await
+        .expect("restore")
+        .ledger_id;
+    assert!(unavailable(
+        read(
+            &fluree,
+            &copy,
+            json!(format!("{copy}@t:{t1}")),
+            "ex:alice",
+            "ex:email"
+        )
+        .await
+    ));
+}
+
+/// Copies of one lineage removing at once each add to the checkpoint; none
+/// overwrites another's removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removals_on_copies_at_once_all_reach_the_checkpoint() {
+    const COPIES: usize = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = std::sync::Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .unwrap(),
+    );
+    let name = "it/concurrent-checkpoint";
+    let id = ledger(&fluree, name).await;
+    let people: Vec<JsonValue> = (0..COPIES)
+        .map(|i| json!({"@id": format!("ex:p{i}"), "ex:email": format!("p{i}@old")}))
+        .collect();
+    let t1 = insert(&fluree, &id, json!({"@context": ctx(), "@graph": people})).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    let mut copies = Vec::new();
+    for i in 0..COPIES {
+        let copy = format!("it/concurrent-checkpoint-{i}");
+        fluree
+            .restore_ledger(&copy, &mut archive.as_slice())
+            .await
+            .expect("restore");
+        copies.push(copy);
+    }
+    let removals = copies.iter().enumerate().map(|(i, copy)| {
+        let fluree = std::sync::Arc::clone(&fluree);
+        let copy = format!("{copy}:main");
+        tokio::spawn(async move {
+            fluree
+                .remove_occurrences(&copy, select(&format!("p{i}"), None))
+                .await
+        })
+    });
+    for removal in futures::future::join_all(removals).await {
+        removal.unwrap().expect("remove");
+    }
+    for copy in copies.iter().map(String::as_str).chain([name]) {
+        fluree
+            .drop_ledger(copy, fluree_db_api::DropMode::Hard)
+            .await
+            .expect("purge");
+    }
+
+    let restored = fluree
+        .restore_ledger("it/concurrent-checkpoint-last", &mut archive.as_slice())
+        .await
+        .expect("restore")
+        .ledger_id;
+    let at_t1 = json!(format!("{restored}@t:{t1}"));
+    for i in 0..COPIES {
+        assert!(
+            unavailable(
+                read(
+                    &fluree,
+                    &restored,
+                    at_t1.clone(),
+                    &format!("ex:p{i}"),
+                    "ex:email"
+                )
+                .await
+            ),
+            "copy {i}'s removal was lost"
+        );
+    }
+}
+
+/// A restore of an archive from before a removal is not served until the
+/// removed value it holds as current state is retracted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_serves_nothing_before_it_retracts_removed_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = std::sync::Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .unwrap(),
+    );
+    let id = ledger(&fluree, "it/restore-race").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    fluree
+        .remove_occurrences(&id, select("alice", None))
+        .await
+        .expect("remove");
+
+    let restoring = {
+        let fluree = std::sync::Arc::clone(&fluree);
+        tokio::spawn(async move {
+            fluree
+                .restore_ledger("it/restore-race-copy", &mut archive.as_slice())
+                .await
+        })
+    };
+    let copy = "it/restore-race-copy:main";
+    let mut leaked = false;
+    while !restoring.is_finished() {
+        if let Ok(rows) = read(&fluree, copy, json!(copy), "ex:alice", "ex:email").await {
+            leaked |= !rows.is_empty();
+        }
+        tokio::task::yield_now().await;
+    }
+    let restored = restoring.await.unwrap().expect("restore");
+    assert!(!leaked, "the removed value was served during the restore");
+    assert_eq!(restored.commit_t, t1 + 1, "the head is the retraction");
+    assert!(read(&fluree, copy, json!(copy), "ex:alice", "ex:email")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A pass whose checkpoint cannot be published fails, and a later pass
+/// publishes the journal it left unpublished.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_later_pass_publishes_a_journal_an_earlier_one_could_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let name = "it/unwritable-pass-checkpoint";
+    let id = ledger(&fluree, name).await;
+    let doc = |v: i64| json!({"@context": ctx(), "@id": "ex:c", "ex:count": v});
+    let t1 = upsert(&fluree, &id, doc(1)).await;
+    upsert(&fluree, &id, doc(2)).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive");
+    set_no_history(&fluree, &id, "ex:count", true).await;
+    let journal_dir = dir.path().join("@retention/journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = fluree.run_retention(&id).await;
+    std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        failed.is_err(),
+        "a pass reported complete without its checkpoint"
+    );
+    fluree.run_retention(&id).await.expect("later pass");
+
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("purge");
+    let copy = fluree
+        .restore_ledger(
+            "it/unwritable-pass-checkpoint-copy",
+            &mut archive.as_slice(),
+        )
+        .await
+        .expect("restore")
+        .ledger_id;
+    assert!(unavailable(
+        read(
+            &fluree,
+            &copy,
+            json!(format!("{copy}@t:{t1}")),
+            "ex:c",
+            "ex:count"
+        )
+        .await
+    ));
 }

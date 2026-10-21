@@ -37,7 +37,8 @@ Set `f:noHistory true` on a predicate's entry in the ledger's [retention default
 The current value of `ex:count` is always served. A read that might need one of its earlier values fails with `410` and `@type` `err:db/HistoryUnavailable` instead of answering from incomplete history. Two kinds of read can need them:
 
 - a query as of an earlier point (`ledger@t:5`, `@iso:`, `@commit:`);
-- a history range (`from` … `to`).
+- a history range (`from` … `to`);
+- a query of a view the application opened before a later commit: once the ledger has moved past it, the view is of an earlier point.
 
 A historical query that never touches the predicate is still answered. The check is per query, on the predicates its patterns name. A pattern with a variable predicate, a wildcard path, a graph crawl or hydration (`select {"?s": ["*"]}`), or reasoning counts as touching every predicate. So do shortest paths, geo searches and `SERVICE`.
 
@@ -92,6 +93,8 @@ A selector expands into every assertion of the fact up to the current head, plus
 
 `manifest` lists every occurrence removed. `retractedT` is the commit that retracted the current ones, if there were any. A repeated request does not add a second journal entry for an occurrence already removed.
 
+The removal is complete when the request returns: the journal records it and the lineage checkpoint (see [Limits](#limits)) holds it. If the checkpoint cannot be written, the request fails after the journal has recorded the removal; repeating it writes the checkpoint.
+
 After the removal:
 
 - Current queries no longer see the value, because it was retracted.
@@ -120,7 +123,9 @@ Ordinary read, history, export and storage scopes do not imply audit access. On 
 
 ## Clusters
 
-The journal is replicated with the rest of the cluster's nameservice state. A replica serves a ledger's history only after it confirms that its copy is current: it asks the leader for the cluster's committed position and applies through it. This covers every ledger, since a replica that has not yet applied a ledger's first retention registration cannot tell the ledger uses retention. A replica that cannot confirm answers `503` `err:db/ReplicaNotCurrent`, which is retryable; it has no leader, or cannot reach a quorum. Current-state reads on that replica continue, and are not checked. A historical read on a replica costs one round trip to the leader.
+The journal is replicated with the rest of the cluster's nameservice state. A replica serves a ledger's history only after it confirms that its copy is current: it asks the leader for the cluster's committed position and applies through it. This covers every ledger, since a replica that has not yet applied a ledger's first retention registration cannot tell the ledger uses retention. A replica that cannot confirm answers `503` `err:db/ReplicaNotCurrent`, which is retryable; it has no leader, or cannot reach a quorum. Current-state reads on that replica continue, and are not checked.
+
+This applies to every time-travel query and history range in a cluster, of any ledger, whether or not it uses retention. Before the query runs, the leader confirms its leadership with a round of heartbeats to a quorum, and a follower adds a round trip to the leader, so each such read needs a leader and a reachable quorum. Benchmarks of current-state queries do not measure this cost. A view held past a later commit is checked against the journal the node has applied, without the round trip.
 
 A removal returns after every replica has applied it, or after 10 seconds. The receipt's `unacknowledgedReplicas` lists any replica that had not:
 
@@ -171,5 +176,5 @@ A history rule that has been turned off carries `untilT`, the config commit that
 - **Not erasure.** The commit log, backups and copies of the ledger keep the original values.
 - **Activation delay.** `f:noHistory` takes effect at the retention worker's next pass. A ledger with no maintenance owner running records no rules.
 - **Removal is not undone** by retracting or re-asserting data, or by resetting a branch. The journal lives in the branch's nameservice record, outside ledger content.
-- **Archives and restores.** Every journal change is also merged into a checkpoint for the ledger's lineage (its genesis commit, which every copy shares), kept in storage at `@retention/journal/` outside any ledger's folder; drops, purges and the orphan sweep leave it. A ledger restored from a `.flpack` archive takes the archive's journal and that checkpoint, so a copy restored from an archive made before a removal, even after its source is purged, refuses the same history, and the restore retracts a removed occurrence the archive still held as current. The restored ledger rebuilds its expiry schedule from its commits.
+- **Archives and restores.** Every journal change is also written to a checkpoint for the ledger's lineage (its genesis commit, which every copy shares), kept in storage under `@retention/journal/` outside any ledger's folder; drops, purges and the orphan sweep leave it. A checkpoint is a set of immutable objects whose union is the lineage's journal, so copies changing their journals at once each add to it. A removal or `f:noHistory` change that cannot write the checkpoint reports failure; a retry, or the worker's next pass, writes it. A ledger restored from a `.flpack` archive takes the archive's journal and that checkpoint, so a copy restored from an archive made before a removal, even after its source is purged, refuses the same history. A removed occurrence the archive still held as current is retracted before the restored ledger becomes visible, and the restore's `commit_t` is that retraction. A restore fails, and leaves nothing behind, when the checkpoint cannot be read. The restored ledger rebuilds its expiry schedule from its commits, and keeps the history rules it inherits, even ones enabled after the archive was made.
 - **Clones and pulls** copy the raw commit log; on a ledger with a journal, they need audit access. The copy they make does not carry the journal.

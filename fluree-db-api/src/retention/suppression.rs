@@ -172,6 +172,10 @@ pub(crate) struct HistoricalRead<'a> {
     pub(crate) from_t: Option<i64>,
     pub(crate) reads: Reads,
     pub(crate) snapshot: &'a LedgerSnapshot,
+    /// Whether a cluster replica first confirms its journal is current: a
+    /// read as of an earlier point does, while a view merely behind a head
+    /// this replica has applied is checked against the journal it holds.
+    pub(crate) confirm_journal: bool,
 }
 
 /// A journal with the subjects of its removals read from their commits.
@@ -200,6 +204,32 @@ pub(crate) struct SuppressionCache {
 }
 
 impl Fluree {
+    /// Whether a read of `db` is of its ledger's current state: a view not
+    /// built as of an earlier point, and not overtaken since by a head this
+    /// instance knows of. Takes no ledger lock, so a query issued inside a
+    /// transaction can ask; with a ledger cache, it does no I/O either.
+    pub(crate) async fn reads_current_state(&self, db: &crate::GraphDb) -> Result<bool> {
+        if db.historical {
+            return Ok(false);
+        }
+        if db.graph_source_id.is_some() || db.over_graph_source {
+            return Ok(true);
+        }
+        let Ok(id) = fluree_db_core::LedgerId::parse(&db.ledger_id) else {
+            return Ok(true);
+        };
+        let head = match self.ledger_manager.as_ref() {
+            Some(manager) => manager.known_head(&id),
+            // Nothing in memory follows the heads; the nameservice has them.
+            None => self
+                .nameservice()
+                .lookup(id.as_str())
+                .await?
+                .map(|record| record.commit_t),
+        };
+        Ok(head.is_none_or(|head| db.t >= head))
+    }
+
     /// The branch's suppression, or `None` when its journal is empty. On a
     /// cluster replica, read once the replica has confirmed it holds the
     /// current journal.
@@ -207,12 +237,24 @@ impl Fluree {
         &self,
         ledger_id: &str,
     ) -> Result<Option<Arc<Suppression>>> {
+        self.suppression_with(ledger_id, true).await
+    }
+
+    /// [`Self::suppression_for`], confirming the journal is current first
+    /// only when `confirm`.
+    async fn suppression_with(
+        &self,
+        ledger_id: &str,
+        confirm: bool,
+    ) -> Result<Option<Arc<Suppression>>> {
         let ns = &self.nameservice_mode;
         // On a cluster replica, first confirm the local copy is current,
         // whether or not this replica has seen the ledger registered yet: one
         // that has not applied its first registration does not know it is
         // enabled. Outside a cluster this is a no-op.
-        self.confirm_journal_current(ledger_id).await?;
+        if confirm {
+            self.confirm_journal_current(ledger_id).await?;
+        }
         let (_, registration) = registry::read(ns, ledger_id).await?;
         let Some(journal) = registration.map(|r| r.journal).filter(|j| !j.is_empty()) else {
             return Ok(None);
@@ -378,7 +420,10 @@ impl Fluree {
         ledger_id: &str,
         read: HistoricalRead<'_>,
     ) -> Result<()> {
-        let Some(suppression) = self.suppression_for(ledger_id).await? else {
+        let Some(suppression) = self
+            .suppression_with(ledger_id, read.confirm_journal)
+            .await?
+        else {
             return Ok(());
         };
         let head_t = match self.nameservice().lookup(ledger_id).await? {
