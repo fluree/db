@@ -71,6 +71,13 @@ async fn jsonld_join_takes_batched_subject_probe_like_sparql() {
             ),
         ),
     ];
+    // The join's callsite is shared with sibling tests, which can pin its
+    // interest to "never" while the subscriber installs: run each query
+    // once, then recompute every registered callsite's interest.
+    for (label, query) in &cases {
+        fluree.query(&view, query.clone()).await.expect(label);
+    }
+    tracing::callsite::rebuild_interest_cache();
     for (label, query) in cases {
         let before = store.find_events("nested loop join runtime path").len();
         let result = fluree.query(&view, query).await.expect(label);
