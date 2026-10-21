@@ -1688,13 +1688,44 @@ async fn graph_objects(ledger: &LedgerState, iri: Option<&str>) -> Vec<String> {
     out
 }
 
-/// A ledger with a named graph registered under its own address, which a
-/// TriG block can create. `USING <address>` with `GRAPH <address>`
-/// templates: the templates write that graph, and a WHERE row witnesses a
-/// template only when the graph the WHERE read is the graph the template
-/// writes, compared as graph ids. The row's value is inserted into that
-/// graph whichever graph the WHERE reads for the address, and the default
-/// graph is left alone.
+/// Rebuild and publish a branch's index, reading its commits through the
+/// branch's ancestry (the commits before its branch point are its source's).
+async fn rebuild_and_publish_branch_index(fluree: &Fluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    let store = fluree
+        .branched_content_store(ledger_id)
+        .await
+        .expect("branched content store");
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        store,
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("index rebuild should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_fenced(ledger_id, record.fence, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
+/// A ledger branch with a named graph registered under its own address: the
+/// legacy layout, built the one way still open (`main` writes a graph named
+/// by the branch's address, which on `main` is just a graph IRI, and the
+/// branch inherits it). The update reads `USING <address>`, the default
+/// graph, and its templates write `GRAPH <address#address>`, the legacy
+/// graph. A WHERE row witnesses a template only when the graph the WHERE
+/// read is the graph the template writes, compared as graph ids, so the
+/// row's value is inserted into the legacy graph and the default graph is
+/// left alone.
 #[tokio::test]
 async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
     for indexed in [false, true] {
@@ -1702,16 +1733,21 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
             .build()
             .expect("file fluree");
-        let id = format!("legacyaddress{indexed}:main");
-        let ledger = fluree.create_ledger(&id).await.expect("create");
+        let name = format!("legacyaddress{indexed}");
+        let id = format!("{name}:dev");
+        let main = fluree
+            .create_ledger(&format!("{name}:main"))
+            .await
+            .expect("create");
         let trig = format!(
             "@prefix ex: <{EX}> .\nex:s ex:p \"d\" .\nGRAPH <{id}> {{ ex:s ex:p \"l\" . }}\n"
         );
-        let mut ledger = fluree
-            .insert_turtle(ledger, &trig)
+        fluree.insert_turtle(main, &trig).await.expect("seed");
+        fluree
+            .create_branch(&name, "dev", None, None)
             .await
-            .expect("seed")
-            .ledger;
+            .expect("create the branch");
+        let mut ledger = fluree.ledger(&id).await.expect("load the branch");
         assert!(
             ledger
                 .snapshot
@@ -1722,15 +1758,15 @@ async fn a_graph_named_by_the_ledger_address_gets_what_its_templates_write() {
         );
         if indexed {
             drop(ledger);
-            support::rebuild_and_publish_index(&fluree, &id).await;
+            rebuild_and_publish_branch_index(&fluree, &id).await;
             ledger = fluree.ledger(&id).await.expect("reload");
         }
         let r = sparql_update(
             &fluree,
             ledger,
             &format!(
-                "DELETE {{ GRAPH <{id}> {{ ?s ex:p ?o }} }} \
-                 INSERT {{ GRAPH <{id}> {{ ?s ex:p \"d\" }} }} \
+                "DELETE {{ GRAPH <{id}#{id}> {{ ?s ex:p ?o }} }} \
+                 INSERT {{ GRAPH <{id}#{id}> {{ ?s ex:p \"d\" }} }} \
                  USING <{id}> WHERE {{ ?s ex:p ?o }}"
             ),
         )

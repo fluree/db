@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod hooked_storage;
+pub mod recording_ns;
 pub mod span_capture;
 
 use fluree_db_api::LedgerState;

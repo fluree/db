@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use crate::view::{GraphDb, ReasoningModePrecedence};
 use crate::{
-    config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, LedgerView, Result,
-    TimeSpec,
+    config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, LedgerHandle, LedgerView,
+    Result, TimeSpec,
 };
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{
-    ContentId, ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
-    DEFAULT_GRAPH_IRI, TXN_META_GRAPH_ID,
+    ContentId, ContentStore, DictNovelty, GraphSel, IndexType, LedgerRef, TargetLedger,
+    DEFAULT_GRAPH_ID,
 };
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
@@ -23,19 +23,6 @@ use tracing::Instrument;
 // ============================================================================
 // View Loading
 // ============================================================================
-
-/// Reference to a named graph, parsed from a fragment but not yet resolved to g_id.
-#[derive(Debug)]
-enum GraphRef {
-    /// Default graph (g_id = 0)
-    Default,
-    /// Transaction metadata graph (g_id = 1)
-    TxnMeta,
-    /// Ledger config graph (g_id = 2)
-    Config,
-    /// User-defined named graph by exact IRI
-    Named(String),
-}
 
 /// A view of a cached handle's head, with its binary store attached.
 fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
@@ -49,79 +36,48 @@ fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
 }
 
 impl Fluree {
-    /// Split a graph reference like `ledger:main#txn-meta` into (ledger_id, graph_ref).
+    /// Parse a ledger-position string (`[urn:fluree:]name[:branch][#graph]`)
+    /// for a loader that takes the time as an argument, so a `@` pin in the
+    /// text is refused rather than silently read at head.
     ///
-    /// Accepts both alias form (`mydb:main#txn-meta`) and full IRI form
-    /// (`urn:fluree:mydb:main#txn-meta`). The `urn:fluree:` prefix is stripped
-    /// so the ledger_id always matches the nameservice alias.
-    ///
-    /// Supported fragments:
-    /// - *(none)* or `#urn:default` → default graph (g_id = 0)
-    /// - `#txn-meta` → txn metadata graph (g_id = 1)
-    /// - `#config` → ledger config graph (g_id = 2)
-    /// - `#<iri>` → user-defined named graph by exact IRI
-    fn parse_graph_ref(ledger_id: &str) -> Result<(&str, GraphRef)> {
-        // Strip urn:fluree: prefix so full IRIs resolve to the same ledger alias.
-        let ledger_id = ledger_id.strip_prefix("urn:fluree:").unwrap_or(ledger_id);
-
-        match ledger_id.split_once('#') {
-            None => Ok((ledger_id, GraphRef::Default)),
-            Some((ledger_id, frag)) => {
-                if ledger_id.is_empty() {
-                    return Err(ApiError::invalid_query("Missing ledger before '#'"));
-                }
-                if frag.is_empty() {
-                    return Err(ApiError::invalid_query("Missing named graph after '#'"));
-                }
-                match frag {
-                    DEFAULT_GRAPH_IRI => Ok((ledger_id, GraphRef::Default)),
-                    "txn-meta" => Ok((ledger_id, GraphRef::TxnMeta)),
-                    // The config graph is reserved and slot-addressed exactly
-                    // like `txn-meta`; the baseline gave `txn-meta` a fragment
-                    // arm and `config` none, so `#config` fell through to an
-                    // exact-IRI lookup for the bare fragment `"config"`, which
-                    // cannot match — the graph is registered under its full
-                    // `urn:fluree:<ledger>#config` IRI. Every documented
-                    // `--ledger mydb:main#config` and connection-path
-                    // `FROM <urn:fluree:mydb:main#config>` therefore failed
-                    // with "Unknown named graph '#config'".
-                    //
-                    // This is an ADDRESSING surface: the fragment is only
-                    // reachable once a ledger has already been named, so it is
-                    // explicit by construction. See the reserved-graph contract
-                    // table on `resolve_within_ledger_graph` in `view/query.rs`.
-                    "config" => Ok((ledger_id, GraphRef::Config)),
-                    // Any other fragment is treated as a graph IRI (exact match).
-                    other => Ok((ledger_id, GraphRef::Named(other.to_string()))),
-                }
-            }
+    /// The graph is a keyword (`txn-meta`, `config`, `default`) or an absolute
+    /// graph IRI ([`GraphSel`]).
+    fn parse_unpinned(ledger_id: &str) -> Result<LedgerRef> {
+        let address = LedgerRef::parse(ledger_id)?;
+        if address.at().is_some() {
+            return Err(ApiError::invalid_query(format!(
+                "'{ledger_id}' carries a time pin, which this call does not take; \
+                 pass the time separately (db_at / graph_at)"
+            )));
         }
+        Ok(address)
     }
 
-    /// Apply a graph selection to a loaded view.
+    /// Apply a graph selection to a loaded view: one graph of the view's
+    /// ledger.
     ///
-    /// Resolves the `GraphRef` to a concrete g_id, then re-scopes the view's
-    /// `Db.range_provider` and sets `view.graph_id` so both range queries
-    /// and binary scans use the same graph.
-    fn select_graph(mut view: GraphDb, graph_ref: GraphRef) -> Result<GraphDb> {
-        let g_id: GraphId = match graph_ref {
-            GraphRef::Default => DEFAULT_GRAPH_ID,
-            GraphRef::TxnMeta => TXN_META_GRAPH_ID,
-            GraphRef::Config => CONFIG_GRAPH_ID,
-            GraphRef::Named(iri) => view
-                .snapshot
-                .graph_registry
-                .graph_id_for_iri(&iri)
-                // Fallback for safety: if registry is missing an entry but a binary store
-                // has it (should not happen in a consistent ledger), use the store.
-                .or_else(|| {
-                    view.binary_store
-                        .as_ref()
-                        .and_then(|s| s.graph_id_for_iri(&iri))
-                })
-                .ok_or_else(|| ApiError::GraphNotFound(format!("<{iri}>")))?,
+    /// A keyword selects its reserved slot. An IRI selects the graph the
+    /// registry holds under exactly that IRI (reserved slots included: a
+    /// branch inherits its source's `urn:fluree:<source>#config` entry), else
+    /// this ledger's own `urn:fluree:<id>#config` / `#txn-meta`. Any other IRI
+    /// is a graph the ledger does not have: a 404, not an internal error.
+    ///
+    /// Re-scopes the view's `Db.range_provider` and sets `view.graph_id` so
+    /// both range queries and binary scans use the same graph.
+    fn select_graph(view: GraphDb, sel: &GraphSel) -> Result<GraphDb> {
+        let g_id: GraphId = {
+            let names =
+                HeadGraphNames::new(&view.snapshot.graph_registry, view.binary_store.as_deref());
+            TargetLedger::new(&view.snapshot.ledger_id, &names)
+                .graph(sel)
+                .map_err(ApiError::from)?
+                .g_id
         };
+        Self::select_graph_id(view, g_id)
+    }
 
+    /// Re-scope a view to a graph id already resolved against its ledger.
+    pub(crate) fn select_graph_id(mut view: GraphDb, g_id: GraphId) -> Result<GraphDb> {
         if g_id != DEFAULT_GRAPH_ID && view.binary_store.is_some() && view.dict_novelty.is_some() {
             let store = view.binary_store.clone().unwrap();
             let dict_novelty = view.dict_novelty.clone().unwrap();
@@ -248,6 +204,19 @@ impl Fluree {
         span: &tracing::Span,
     ) -> Result<GraphDb> {
         let handle = self.ledger_cached(ledger_id).await?;
+        self.graph_db_of_head(&handle, include_default_context, span)
+            .await
+    }
+
+    /// A view of `handle`'s head: the loaded state, with its binary index
+    /// store attached when the load did not attach it (a `Fluree` with no
+    /// ledger cache), and the ledger's default context when asked for.
+    async fn graph_db_of_head(
+        &self,
+        handle: &LedgerHandle,
+        include_default_context: bool,
+        span: &tracing::Span,
+    ) -> Result<GraphDb> {
         let mut snapshot = handle.snapshot().await;
 
         // If no binary store attached but nameservice has an index address,
@@ -564,30 +533,45 @@ impl Fluree {
         }
     }
 
+    /// Load the view a typed address names: its ledger at `spec`, re-scoped to
+    /// its graph, with that graph's config attached. The loader behind `db()`
+    /// and the lazy [`graph()`](Self::graph) handle. `spec` is the time to
+    /// read; the address's own pin is the caller's to fold into it.
+    pub(crate) async fn load_address_at(
+        &self,
+        address: &LedgerRef,
+        spec: TimeSpec,
+    ) -> Result<GraphDb> {
+        let view = self.load_graph_db_at(address.id(), spec).await?;
+        let view = Self::select_graph(view, address.graph())?;
+        self.resolve_and_attach_config(view).await
+    }
+
     /// Load the current snapshot from a ledger.
     ///
-    /// Returns a [`GraphDb`] — an immutable, point-in-time snapshot.
+    /// Returns a [`GraphDb`] — an immutable, point-in-time snapshot. The
+    /// address may name a graph (`mydb:main#txn-meta`, `mydb#<graph IRI>`)
+    /// and a time (`mydb@t:5`).
     /// For the lazy API, use [`graph()`](Self::graph) instead.
     pub async fn db(&self, ledger_id: &str) -> Result<GraphDb> {
-        let (ledger_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let view = self.load_graph_db(ledger_id).await?;
-        let view = Self::select_graph(view, graph_ref)?;
-        self.resolve_and_attach_config(view).await
+        let address = LedgerRef::parse(ledger_id)?;
+        let spec = address.at().cloned().unwrap_or(TimeSpec::Latest);
+        self.load_address_at(&address, spec).await
     }
 
     /// Load a historical snapshot at a specific transaction time.
     pub async fn db_at_t(&self, ledger_id: &str, target_t: i64) -> Result<GraphDb> {
-        let (ledger_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let view = self.load_graph_db_at_t(ledger_id, target_t).await?;
-        let view = Self::select_graph(view, graph_ref)?;
+        let address = Self::parse_unpinned(ledger_id)?;
+        let view = self.load_graph_db_at_t(address.id(), target_t).await?;
+        let view = Self::select_graph(view, address.graph())?;
         self.resolve_and_attach_config(view).await
     }
 
     /// Load a snapshot at a flexible time specification.
     pub async fn db_at(&self, ledger_id: &str, spec: TimeSpec) -> Result<GraphDb> {
-        let (ledger_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let view = self.load_graph_db_at(ledger_id, spec).await?;
-        let view = Self::select_graph(view, graph_ref)?;
+        let address = Self::parse_unpinned(ledger_id)?;
+        let view = self.load_graph_db_at(address.id(), spec).await?;
+        let view = Self::select_graph(view, address.graph())?;
         self.resolve_and_attach_config(view).await
     }
 
@@ -597,10 +581,85 @@ impl Fluree {
     /// that omit `@context` / `PREFIX` should still resolve prefixes from the
     /// ledger's stored default context.
     pub async fn db_with_default_context(&self, ledger_id: &str) -> Result<GraphDb> {
-        let (ledger_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let view = self.load_graph_db_with_default_context(ledger_id).await?;
-        let view = Self::select_graph(view, graph_ref)?;
+        let address = Self::parse_unpinned(ledger_id)?;
+        let view = self
+            .load_graph_db_with_default_context(address.id())
+            .await?;
+        let view = Self::select_graph(view, address.graph())?;
         self.resolve_and_attach_config(view).await
+    }
+
+    /// [`db_with_default_context`](Self::db_with_default_context) for the
+    /// ledger a handle from [`ledger_cached`](Self::ledger_cached) holds: the
+    /// view is built from that head, which is not loaded a second time. A
+    /// caller that reads the head before it decides how to query (the CLI
+    /// routes a query on its graph names) loads the ledger once, also on a
+    /// `Fluree` with no ledger cache, where every `ledger_cached` is a load.
+    pub async fn db_with_default_context_from_handle(
+        &self,
+        handle: &LedgerHandle,
+    ) -> Result<GraphDb> {
+        let span = tracing::debug_span!(
+            "ledger_view_load",
+            ledger_id = handle.id().as_str(),
+            cold_binary_store = tracing::field::Empty,
+        );
+        let view = async {
+            let span = tracing::Span::current();
+            self.graph_db_of_head(handle, true, &span).await
+        }
+        .instrument(span)
+        .await?;
+        self.resolve_and_attach_config(view).await
+    }
+
+    /// [`db_at_with_default_context`](Self::db_at_with_default_context) for
+    /// the ledger `handle` holds: the time resolves against that head, and a
+    /// time at the head reads it, without loading the ledger again (see
+    /// [`db_with_default_context_from_handle`](Self::db_with_default_context_from_handle)).
+    /// An earlier time loads that snapshot, as `db_at` does.
+    pub async fn db_at_with_default_context_from_handle(
+        &self,
+        handle: &LedgerHandle,
+        spec: TimeSpec,
+    ) -> Result<GraphDb> {
+        let ledger_id = handle.id().as_str();
+        let view = match spec {
+            TimeSpec::Latest => {
+                let span = tracing::debug_span!(
+                    "ledger_view_load",
+                    ledger_id = ledger_id,
+                    cold_binary_store = tracing::field::Empty,
+                );
+                async {
+                    let span = tracing::Span::current();
+                    self.graph_db_of_head(handle, false, &span).await
+                }
+                .instrument(span)
+                .await?
+            }
+            spec => {
+                let t = match spec {
+                    TimeSpec::AtT(t) => t,
+                    spec => {
+                        let head = handle.snapshot().await.to_ledger_state();
+                        time_resolve::resolve_time_spec(&head, &spec).await?
+                    }
+                };
+                let snapshot = handle.snapshot().await;
+                if t == snapshot.t {
+                    graph_db_from_cached_head(snapshot)
+                } else {
+                    self.load_graph_db_historical(ledger_id, t).await?
+                }
+            }
+        };
+        let view = self.resolve_and_attach_config(view).await?;
+        Ok(if view.default_context.is_none() {
+            view.with_default_context(self.get_default_context(ledger_id).await?)
+        } else {
+            view
+        })
     }
 
     /// Like [`db_at()`](Self::db_at) but includes the ledger's default context.
@@ -609,35 +668,22 @@ impl Fluree {
         ledger_id: &str,
         spec: TimeSpec,
     ) -> Result<GraphDb> {
-        let (parsed_id, _) = Self::parse_graph_ref(ledger_id)?;
+        let address = Self::parse_unpinned(ledger_id)?;
         let mut view = self.db_at(ledger_id, spec).await?;
         // Historical views don't load default_context through their own
         // load path. Fetch it explicitly via the branch-aware helper using
         // the cached current-head record.
         if view.default_context.is_none() {
-            view = view.with_default_context(self.get_default_context(parsed_id).await?);
+            view = view.with_default_context(self.get_default_context(address.id()).await?);
         }
         Ok(view)
     }
 
-    /// Apply a graph selector from a dataset GraphSource to a view.
-    ///
-    /// Converts the dataset-layer `GraphSelector` to the internal `GraphRef`
-    /// and applies graph selection to the view.
-    ///
-    /// This is called by `load_view_from_source` when a `GraphSource` has
-    /// an explicit `graph_selector` set.
-    pub(crate) fn apply_graph_selector(
-        view: GraphDb,
-        selector: &crate::dataset::GraphSelector,
-    ) -> Result<GraphDb> {
-        let graph_ref = match selector {
-            crate::dataset::GraphSelector::Default => GraphRef::Default,
-            crate::dataset::GraphSelector::TxnMeta => GraphRef::TxnMeta,
-            crate::dataset::GraphSelector::Config => GraphRef::Config,
-            crate::dataset::GraphSelector::Iri(iri) => GraphRef::Named(iri.clone()),
-        };
-        Self::select_graph(view, graph_ref)
+    /// Select one graph of a loaded view's ledger: the shared primitive behind
+    /// `db("ledger#graph")`, a dataset member's graph, and a within-ledger
+    /// `FROM`. See [`Self::select_graph`].
+    pub(crate) fn apply_graph_selector(view: GraphDb, selector: &GraphSel) -> Result<GraphDb> {
+        Self::select_graph(view, selector)
     }
 }
 
@@ -654,12 +700,36 @@ impl Fluree {
     /// result formatting after a `FROM <alias>` query. Native ledgers keep the
     /// full `db()` resolution (graph-ref selection + config attachment).
     pub async fn db_or_graph_source(&self, ledger_id: &str) -> Result<GraphDb> {
-        match self.db(ledger_id).await {
-            Ok(view) => Ok(view),
+        self.db_or_graph_source_address(&Self::parse_unpinned(ledger_id)?)
+            .await
+    }
+
+    /// [`Self::db_or_graph_source`] for a dataset member: its address, at head.
+    /// A member that names no ledger (a bare graph IRI or graph keyword) has
+    /// nothing to load here.
+    pub(crate) async fn db_or_graph_source_for(
+        &self,
+        source: &crate::dataset::GraphSource,
+    ) -> Result<GraphDb> {
+        let address = source.address().ok_or_else(|| {
+            ApiError::invalid_query(format!(
+                "'{}' names no ledger to format the result against",
+                source.written()
+            ))
+        })?;
+        self.db_or_graph_source_address(address).await
+    }
+
+    async fn db_or_graph_source_address(&self, address: &LedgerRef) -> Result<GraphDb> {
+        match self.load_graph_db(address.id()).await {
+            Ok(view) => {
+                let view = Self::select_graph(view, address.graph())?;
+                self.resolve_and_attach_config(view).await
+            }
             Err(ref e) if e.is_not_found() => self
-                .resolve_graph_source(ledger_id)
+                .resolve_graph_source_address(address, &TimeSpec::Latest)
                 .await?
-                .ok_or_else(|| ApiError::NotFound(ledger_id.to_string())),
+                .ok_or_else(|| ApiError::NotFound(address.id().to_string())),
             Err(e) => Err(e),
         }
     }
@@ -779,16 +849,20 @@ impl Fluree {
         spec: &TimeSpec,
     ) -> Result<Option<GraphDb>> {
         // A graph-source alias may carry a graph fragment (`{ds}#txn-meta`) or an
-        // explicit `:branch`. Split the fragment off BEFORE normalizing/looking up:
-        // the nameservice registers a graph source under its `name:branch` id, and
-        // `normalize_ledger_id` only understands `:` (not `#`), so a `#fragment`
-        // left on the alias would never match — a commit-history
-        // `from:{ds}#txn-meta` query would 500 with NotFound instead of returning
-        // []. Reuse `parse_graph_ref` so `#txn-meta` / `urn:fluree:` handling stays
-        // identical to the native `db()` path (this also fixes the rarer
-        // `{ds}:main#...` NotFound).
-        let (base_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let gs_id = fluree_db_core::LedgerId::parse(base_id)?;
+        // explicit `:branch`; the same address grammar as the native `db()` path.
+        let address = Self::parse_unpinned(ledger_id)?;
+        self.resolve_graph_source_address(&address, spec).await
+    }
+
+    /// [`Self::resolve_graph_source_at`] for an already-parsed address: the
+    /// graph source is looked up by the address's id, and the address's graph
+    /// selected on the genesis view.
+    pub(crate) async fn resolve_graph_source_address(
+        &self,
+        address: &LedgerRef,
+        spec: &TimeSpec,
+    ) -> Result<Option<GraphDb>> {
+        let gs_id = address.id().clone();
 
         // A drop leaves the record as a tombstone.
         let Some(record) = self
@@ -831,7 +905,8 @@ impl Fluree {
         db.resolved_config = Self::graph_source_model_config(&record);
         db.graph_source_id = Some(gs_id.to_string().into());
         db.graph_source_time = graph_source_time;
-        Self::select_graph(db, graph_ref).map(Some)
+        db.over_graph_source = true;
+        Self::select_graph(db, address.graph()).map(Some)
     }
 }
 

@@ -943,6 +943,8 @@ impl ApiError {
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                // Typed as `ApiError::NameService` is: the backend's fault.
+                QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
                 _ => errors::INVALID_QUERY,
             },
@@ -1073,6 +1075,9 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::NeedFetch(_)
         | QE::Policy(_)
         | QE::Internal(_) => 500,
+        // A nameservice lookup the query needed failed (a graph-source probe
+        // or lookup): a backend fault, as `ApiError::NameService` is.
+        QE::Nameservice(_) => 500,
         QE::Batch(_)
         | QE::R2rml(_)
         | QE::VariableNotFound(_)
@@ -1090,6 +1095,20 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::TimeRangeNotCovered { .. }
         | QE::Arithmetic(_)
         | QE::Comparison(_) => 400,
+    }
+}
+
+/// A reference that does not name a graph of the ledger a surface reads: a
+/// caller mistake, never an internal error. Another ledger's address is a 400
+/// that names the fix; a graph the ledger does not have is a 404.
+impl From<fluree_db_core::TargetError> for ApiError {
+    fn from(e: fluree_db_core::TargetError) -> Self {
+        match e {
+            fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
+            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
+                ApiError::invalid_query(cross.to_string())
+            }
+        }
     }
 }
 
@@ -1406,6 +1425,11 @@ mod tests {
                 CONNECTION,
             ),
             (ApiError::Query(QE::Internal("x".into())), 500, INTERNAL),
+            (
+                ApiError::Query(QE::Nameservice("x".into())),
+                500,
+                NAMESERVICE,
+            ),
             (ApiError::Ledger(LE::InvalidData("x".into())), 500, INTERNAL),
             (
                 ApiError::NameService(NSE::Storage("x".into())),
@@ -1657,6 +1681,15 @@ mod tests {
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
         );
+    }
+
+    /// A nameservice lookup that fails while a query runs is the backend's
+    /// fault: a 500 typed like `ApiError::NameService`, never the generic 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_500() {
+        let e = ApiError::Query(fluree_db_query::QueryError::Nameservice("down".into()));
+        assert_eq!(e.status_code(), 500);
+        assert_eq!(e.error_type(), fluree_vocab::errors::NAMESERVICE);
     }
 
     #[test]

@@ -9,8 +9,8 @@ use crate::graph_commit_builder::CommitBuilder;
 use crate::graph_query_builder::GraphQueryBuilder;
 use crate::graph_snapshot::GraphSnapshot;
 use crate::graph_transact_builder::GraphTransactBuilder;
-use crate::{Fluree, Result};
-use fluree_db_core::ContentId;
+use crate::{ApiError, Fluree, Result};
+use fluree_db_core::{ContentId, LedgerId, LedgerRef, RefError};
 
 /// A lazy, zero-cost handle to a ledger graph.
 ///
@@ -43,17 +43,51 @@ use fluree_db_core::ContentId;
 /// ```
 pub struct Graph<'a> {
     pub(crate) fluree: &'a Fluree,
+    /// The address as the caller wrote it, for messages.
     pub(crate) ledger_id: String,
-    pub(crate) time_spec: TimeSpec,
+    /// The address, parsed once: `[urn:fluree:]name[:branch][@pin][#graph]`.
+    /// Building a handle does no I/O and cannot fail, so a malformed address
+    /// is reported by the first terminal call.
+    address: std::result::Result<LedgerRef, RefError>,
+    /// The time `graph_at` was given; `Latest` for `graph`.
+    time_spec: TimeSpec,
 }
 
 impl<'a> Graph<'a> {
     /// Create a new lazy graph handle.
     pub(crate) fn new(fluree: &'a Fluree, ledger_id: String, time_spec: TimeSpec) -> Self {
+        let address = LedgerRef::parse(&ledger_id);
         Self {
             fluree,
             ledger_id,
+            address,
             time_spec,
+        }
+    }
+
+    /// The parsed address.
+    pub(crate) fn address(&self) -> Result<&LedgerRef> {
+        self.address
+            .as_ref()
+            .map_err(|e| ApiError::InvalidLedgerId(e.clone()))
+    }
+
+    /// The ledger (or graph source) the handle names.
+    pub(crate) fn id(&self) -> Result<&LedgerId> {
+        self.address().map(LedgerRef::id)
+    }
+
+    /// The time the handle reads: a pin written in the address, or the one
+    /// `graph_at` was given. Both at once must agree.
+    pub(crate) fn time_spec(&self) -> Result<TimeSpec> {
+        match (self.address()?.at(), &self.time_spec) {
+            (None, spec) => Ok(spec.clone()),
+            (Some(own), TimeSpec::Latest) => Ok(own.clone()),
+            (Some(own), spec) if own == spec => Ok(own.clone()),
+            (Some(_), _) => Err(ApiError::invalid_query(format!(
+                "'{}' pins a time and graph_at names a different one; drop one of them",
+                self.ledger_id
+            ))),
         }
     }
 
@@ -78,7 +112,7 @@ impl<'a> Graph<'a> {
     pub async fn load(&self) -> Result<GraphSnapshot<'a>> {
         let view = self
             .fluree
-            .load_graph_db_at(&self.ledger_id, self.time_spec.clone())
+            .load_address_at(self.address()?, self.time_spec()?)
             .await?;
         let view = self.fluree.wrap_policy_defaults(view).await?;
         Ok(GraphSnapshot::new(self.fluree, view))

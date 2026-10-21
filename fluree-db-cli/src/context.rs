@@ -112,14 +112,12 @@ pub async fn resolve_query_target(
 ) -> CliResult<QueryTarget> {
     let alias = resolve_ledger(explicit, dirs)?;
 
-    // Strip `#fragment` (e.g., `#txn-meta`) for ledger resolution.
-    // The fragment selects a named graph and is handled later by
-    // `fluree.view()` / `parse_graph_ref()`. Existence checks and
+    // Strip `#fragment` (e.g., `#txn-meta`) for ledger resolution, where the
+    // address grammar splits it ([`AddressText`](fluree_db_core::AddressText)).
+    // The fragment selects a named graph and is read later, when the view
+    // parses the alias as a typed address. Existence checks and
     // tracked-config lookups must use just the ledger portion.
-    let (ledger_part, _graph_fragment) = match alias.split_once('#') {
-        Some((base, _frag)) => (base, Some(_frag)),
-        None => (alias.as_str(), None),
-    };
+    let ledger_part = fluree_db_core::AddressText::split(&alias).before_graph();
 
     // Try compound remote/ledger syntax (e.g., "origin/mydb")
     if let Some(mode) = try_compound_remote_syntax(ledger_part, dirs).await? {

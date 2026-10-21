@@ -746,11 +746,12 @@ pub(crate) fn resolve_graph_selector(
     match selector {
         GraphSelector::Default => Ok(0),
         GraphSelector::ById(g_id) => Ok(*g_id),
-        GraphSelector::ByName(name) => match name.as_str() {
-            "default" | DEFAULT_GRAPH_IRI => Ok(0),
-            "txn-meta" => Ok(1),
-            "config" => Ok(2),
-            other => {
+        GraphSelector::ByName(name) => match fluree_db_core::GraphSel::keyword(name)
+            .and_then(|keyword| keyword.reserved_g_id())
+        {
+            Some(g_id) => Ok(g_id),
+            None => {
+                let other = name.as_str();
                 // Try as IRI
                 if let Some(store) = store {
                     store

@@ -569,6 +569,7 @@ fn raised_whatever_the_severity(e: &QueryError) -> bool {
         | QueryError::ResourceLimit(_)
         | QueryError::NeedFetch(_)
         | QueryError::StorageAccessDenied { .. }
+        | QueryError::Nameservice(_)
         | QueryError::CatalogCredentialsNotVended { .. }
         | QueryError::CatalogAccessDenied { .. }
         | QueryError::GraphSourceSuspended(_)
@@ -901,6 +902,7 @@ mod tests {
                     message: s(),
                 },
             ];
+            QueryError::Nameservice(_) => true, [QueryError::Nameservice(s())];
             QueryError::CatalogCredentialsNotVended { .. } => true, [
                 QueryError::CatalogCredentialsNotVended { catalog_uri: s() },
             ];
