@@ -37,6 +37,10 @@ pub struct StorageProxyPrincipal {
     /// fluree.storage.ledgers claim, parsed like data scopes (bare `mydb` is
     /// `mydb:main`).
     pub storage_ledgers: HashSet<fluree_db_api::LedgerId>,
+    /// fluree.ledger.audit.* claims: raw commits and transactions of a
+    /// ledger whose retention suppresses history.
+    pub audit_all: bool,
+    pub audit_ledgers: HashSet<fluree_db_api::LedgerId>,
 }
 
 impl StorageProxyPrincipal {
@@ -46,6 +50,11 @@ impl StorageProxyPrincipal {
     }
 
     /// Check if principal is authorized for a specific ledger alias
+    /// Audit-log access to `alias`; storage scopes do not imply it.
+    pub fn can_audit(&self, alias: &fluree_db_api::LedgerId) -> bool {
+        self.audit_all || self.audit_ledgers.contains(alias)
+    }
+
     pub fn is_authorized_for_ledger(&self, alias: &fluree_db_api::LedgerId) -> bool {
         self.storage_all || self.storage_ledgers.contains(alias)
     }
@@ -122,6 +131,8 @@ fn build_principal(
         identity: payload.resolve_identity(),
         storage_all: payload.storage_all.unwrap_or(false),
         storage_ledgers: super::data_bearer::parse_scopes(payload.storage_ledgers.as_ref()),
+        audit_all: payload.ledger_audit_all.unwrap_or(false),
+        audit_ledgers: super::data_bearer::parse_scopes(payload.ledger_audit_ledgers.as_ref()),
     })
 }
 

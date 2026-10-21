@@ -1053,6 +1053,27 @@ pub async fn info_ledger_tail(
     info(State(state), headers, bearer, axum::extract::Query(query)).await
 }
 
+/// Remove selected occurrences from what a ledger serves: current and
+/// historical application queries stop returning them, and raw commits that
+/// hold them become audit data. Admin-protected.
+///
+/// POST /fluree/remove/<ledger...>
+pub async fn remove_occurrences_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    Json(request): Json<fluree_db_api::retention::RemovalRequest>,
+) -> Result<Response> {
+    let cell = Arc::new(std::sync::OnceLock::new());
+    let _ = cell.set(Arc::clone(&state.committer));
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
+    let receipt = state
+        .fluree
+        .remove_occurrences_with(&writer, &ledger, request)
+        .await
+        .map_err(ServerError::Api)?;
+    Ok(Json(receipt).into_response())
+}
+
 /// A branch's retention status: whether it is registered for TTL
 /// processing, its activation boundary and watermark, scheduled and expired
 /// counts, the next due time, problems that block or degrade processing, and
@@ -2385,6 +2406,29 @@ pub async fn merge_preview(
         opts.changes_after_subject = params.changes_after_subject.clone();
         if let Some(b) = params.include_validation {
             opts.include_validation = b;
+        }
+
+        // Changes and conflict details are commit flakes: audit data on a
+        // branch that suppresses history.
+        if opts.include_changes || opts.include_conflict_details {
+            let name = fluree_db_api::LedgerName::parse(&ledger)?;
+            let source = name.with_branch(&params.source)?;
+            let target = match params.target.as_deref() {
+                Some(t) => Some(name.with_branch(t)?),
+                None => state
+                    .fluree
+                    .nameservice()
+                    .lookup(&source)
+                    .await?
+                    .and_then(|r| r.source_branch)
+                    .map(|b| name.with_branch(&b))
+                    .transpose()?,
+            };
+            for branch in std::iter::once(source).chain(target) {
+                let audit = bearer.0.as_ref().is_some_and(|p| p.can_audit(&branch));
+                crate::routes::audit::require_audit(&state, &headers.raw, branch.as_str(), audit)
+                    .await?;
+            }
         }
 
         let preview = state

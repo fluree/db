@@ -8,3 +8,5 @@ mod ledger_scope_auth;
 mod override_control_identity;
 #[path = "policy_integration.rs"]
 mod policy_integration;
+#[path = "retention_audit_integration.rs"]
+mod retention_audit_integration;

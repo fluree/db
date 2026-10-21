@@ -292,6 +292,14 @@ pub async fn get_vended_credentials(
     if !serving.blocks {
         return Err(ServerError::not_found("Ledger not found"));
     }
+    // The grant reaches the ledger's commits and transactions.
+    crate::routes::audit::require_audit(
+        &state,
+        &axum::http::HeaderMap::new(),
+        effective_ledger.as_str(),
+        principal.can_audit(&effective_ledger),
+    )
+    .await?;
 
     let grant = fluree_db_api::vended_credentials::mint_scoped_credentials_ambient(
         role_arn,
@@ -630,6 +638,15 @@ pub async fn get_block(
     if !serving.blocks {
         return Err(ServerError::not_found("Block not found"));
     }
+    if is_audit_kind(kind) {
+        crate::routes::audit::require_audit(
+            &state,
+            &axum::http::HeaderMap::new(),
+            effective_ledger.as_str(),
+            principal.can_audit(&effective_ledger),
+        )
+        .await?;
+    }
     let ledger_ctx = LedgerBlockContext {
         snapshot: &snapshot.snapshot,
         to_t,
@@ -838,6 +855,15 @@ pub async fn get_object_by_cid(
     if !serving.blocks {
         return Err(ServerError::not_found("Object not found"));
     }
+    if is_audit_kind(kind) {
+        crate::routes::audit::require_audit(
+            &state,
+            &axum::http::HeaderMap::new(),
+            effective_ledger.as_str(),
+            principal.can_audit(&effective_ledger),
+        )
+        .await?;
+    }
 
     // 3d. Conditional GET: the CID is the entity tag (content-addressed, so
     //     the representation can never change under it). Checked only after
@@ -968,4 +994,13 @@ mod tests {
             assert!(!is_allowed_object_kind(kind), "{kind:?} must NOT be served");
         }
     }
+}
+
+/// Content that holds what a ledger's history may no longer serve: commit
+/// and transaction blobs, and index history sidecars.
+fn is_audit_kind(kind: ContentKind) -> bool {
+    matches!(
+        kind,
+        ContentKind::Commit | ContentKind::Txn | ContentKind::HistorySidecar
+    )
 }

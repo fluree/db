@@ -215,6 +215,10 @@ pub struct WhoAmIScopes {
     pub ledger_write_ledgers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_ledgers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_audit_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_audit_ledgers: Option<Vec<String>>,
 }
 
 /// Extract scope fields from a verified payload into the response shape.
@@ -239,6 +243,8 @@ fn scopes_from_payload(p: &fluree_db_credential::jwt_claims::EventsTokenPayload)
         ledger_read_ledgers: effective(&p.ledger_read_ledgers),
         ledger_write_ledgers: effective(&p.ledger_write_ledgers),
         storage_ledgers: effective(&p.storage_ledgers),
+        ledger_audit_all: p.ledger_audit_all,
+        ledger_audit_ledgers: effective(&p.ledger_audit_ledgers),
     }
 }
 

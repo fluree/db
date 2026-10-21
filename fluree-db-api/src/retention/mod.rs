@@ -88,6 +88,15 @@ pub struct RetentionStatus {
 }
 
 impl Fluree {
+    /// Whether `ledger_id`'s retention suppresses any history (an
+    /// `f:noHistory` rule or a removal). Raw commits and transactions of such
+    /// a ledger hold what its history no longer serves, so reading them is
+    /// audit access.
+    pub async fn history_suppressed(&self, ledger_id: &str) -> Result<bool> {
+        let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
+        Ok(self.suppression_for(&ledger_id).await?.is_some())
+    }
+
     /// The retention status of `ledger_id`.
     pub async fn retention_status(&self, ledger_id: &str) -> Result<RetentionStatus> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();

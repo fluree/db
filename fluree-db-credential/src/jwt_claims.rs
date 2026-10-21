@@ -88,6 +88,14 @@ pub struct EventsTokenPayload {
     /// Grant transaction access to specific ledgers
     #[serde(rename = "fluree.ledger.write.ledgers")]
     pub ledger_write_ledgers: Option<Vec<String>>,
+    /// Grant raw commit/transaction (audit-log) access to all ledgers. On a
+    /// ledger whose retention suppresses history, raw commits and
+    /// transactions need this; read and storage claims do not imply it.
+    #[serde(default, rename = "fluree.ledger.audit.all")]
+    pub ledger_audit_all: Option<bool>,
+    /// Grant raw commit/transaction (audit-log) access to specific ledgers.
+    #[serde(default, rename = "fluree.ledger.audit.ledgers")]
+    pub ledger_audit_ledgers: Option<Vec<String>>,
 
     // Shared claims
     /// Identity for policy resolution
@@ -459,6 +467,8 @@ mod tests {
             ledger_read_ledgers: None,
             ledger_write_all: None,
             ledger_write_ledgers: None,
+            ledger_audit_all: None,
+            ledger_audit_ledgers: None,
             fluree_identity: None,
             fluree_policy: None,
         }

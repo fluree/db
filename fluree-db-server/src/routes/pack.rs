@@ -98,6 +98,15 @@ async fn pack_ledger_local(
     if !serving.blocks {
         return Err(ServerError::not_found("Ledger not found"));
     }
+    // Commit and transaction blobs are audit data on a ledger that
+    // suppresses history.
+    crate::routes::audit::require_audit(
+        &state,
+        &axum::http::HeaderMap::new(),
+        &ledger,
+        principal.can_audit(&crate::error::scope_id(&ledger)?),
+    )
+    .await?;
 
     debug!(
         ledger = %ledger,

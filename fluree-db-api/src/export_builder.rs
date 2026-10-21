@@ -264,6 +264,20 @@ impl<'a> ExportBuilder<'a> {
             Some(spec) => time_resolve::resolve_time_spec(&ledger, spec).await?,
             None => ledger.t(),
         };
+        // An export as of an earlier point reads every predicate.
+        if to_t < ledger.t() {
+            self.fluree
+                .refuse_suppressed_history(
+                    &ledger.snapshot.ledger_id,
+                    crate::retention::suppression::HistoricalRead {
+                        to_t,
+                        from_t: None,
+                        reads: crate::retention::suppression::Reads::Everything,
+                        snapshot: &ledger.snapshot,
+                    },
+                )
+                .await?;
+        }
 
         // Novelty overlay — always include so export sees committed-but-not-yet-indexed data
         let overlay: &dyn fluree_db_core::OverlayProvider = ledger.novelty.as_ref();

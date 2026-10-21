@@ -2,6 +2,7 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod audit;
 mod bm25;
 mod commits;
 mod context;
@@ -127,6 +128,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Deletes instance folders nothing references: storage-wide.
         .route("/dropped/sweep", post(ledger::sweep_orphans))
         .route("/reindex", post(ledger::reindex))
+        // Targeted query removal: retracts current occurrences through the
+        // ordered write path and publishes the removal journal, both
+        // leader-coordinated.
+        .route("/remove/*ledger", post(ledger::remove_occurrences_tail))
         // Reclaims index artifacts no index chain references. Deletes storage
         // and holds the ledger against indexing, so it is admin-gated and
         // runs where the indexer does.
