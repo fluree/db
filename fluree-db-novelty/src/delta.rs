@@ -118,6 +118,9 @@ impl NetChangeAccumulator {
     /// an undo of the range resolves these against it.
     pub fn finish_with_pairs(self) -> (Vec<Flake>, Vec<usize>) {
         let Self { map, paired } = self;
+        if paired.is_empty() {
+            return (map.into_values().collect(), Vec::new());
+        }
         let mut flakes = Vec::with_capacity(map.len());
         let mut pairs = Vec::with_capacity(paired.len());
         for (key, flake) in map {
