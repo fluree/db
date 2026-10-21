@@ -1221,3 +1221,23 @@ async fn an_optional_match_that_finds_nothing_before_two_sets_writes_nothing() {
         (0, 0),
     );
 }
+
+#[tokio::test]
+async fn a_set_then_detach_delete_leaves_nothing() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n.name = "y" DETACH DELETE n"#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n ?p ?o . ?s ?q ?n } WHERE { ?n a <P> ; <id> "a" { ?n ?p ?o } UNION { ?s ?q ?n } }"#,
+    )
+    .await;
+    let want = seeded_with(&[
+        ("a http://www.w3.org/1999/02/22-rdf-syntax-ns#type P", None),
+        ("a id a", None),
+        ("a name x", None),
+        ("a tags t1", None),
+        ("a tags t2", None),
+        ("b knows a", None),
+    ]);
+    assert_twins("SET then DETACH DELETE", got, want, (0, 6));
+}
