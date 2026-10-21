@@ -72,7 +72,7 @@ fn is_retention_config_term(flake: &Flake) -> bool {
 /// Whether `f:noHistory: true` may be activated. Index-history suppression
 /// is not implemented yet, so activating it is refused rather than accepted
 /// as a no-op.
-const NO_HISTORY_SUPPORTED: bool = false;
+const NO_HISTORY_SUPPORTED: bool = true;
 
 /// Validate what a staged write carries for retention and mark its commit.
 ///

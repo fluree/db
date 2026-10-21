@@ -16,15 +16,19 @@
 //! expired value disappears when its retraction commits.
 
 mod engine;
+pub mod journal;
 mod policy;
 pub mod registry;
+pub mod removal;
 mod state;
+pub(crate) mod suppression;
 pub(crate) mod validate;
 mod worker;
 pub mod writer;
 
 pub use engine::PassReport;
 pub use registry::Registration;
+pub use removal::{FactSelector, OccurrenceRef, RemovalReceipt, RemovalRequest};
 pub use worker::RetentionOptions;
 pub(crate) use worker::RetentionRuntime;
 pub use writer::{

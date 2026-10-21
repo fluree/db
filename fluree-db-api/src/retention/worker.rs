@@ -39,6 +39,8 @@ pub(crate) struct RetentionRuntime {
     last_sweep_ms: AtomicI64,
     /// Schedules held between passes.
     pub(crate) cache: ScheduleCache,
+    /// Removal journals held between reads.
+    pub(crate) suppressions: super::suppression::SuppressionCache,
 }
 
 impl RetentionRuntime {

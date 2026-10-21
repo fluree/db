@@ -587,6 +587,8 @@ impl Fluree {
 
         // Discovery.
         let mut config_problems = Vec::new();
+        let mut final_policy = CompiledPolicy::default();
+        let mut last_config_t: Option<i64> = None;
         if schedule.watermark_t < head_t {
             if let Some(head) = state.head_commit_id.clone() {
                 let mut cids =
@@ -605,14 +607,17 @@ impl Fluree {
                     });
                     if writes_config {
                         policy = self.retention_policy_at(&state, t).await?;
+                        last_config_t = Some(t);
                     }
                     schedule.watermark_t = t;
                     report.discovered_commits += 1;
                 }
                 config_problems = policy.problems.clone();
+                final_policy = policy;
             }
         } else {
-            config_problems = self.retention_policy_at(&state, head_t).await?.problems;
+            final_policy = self.retention_policy_at(&state, head_t).await?;
+            config_problems = final_policy.problems.clone();
         }
 
         // Expiration, once discovery has caught up with the head it verifies
@@ -640,6 +645,17 @@ impl Fluree {
         report.problems = config_problems.clone();
         report.problems.extend(schedule.problems.iter().cloned());
 
+        // History rules follow the config once discovery reaches it; an
+        // invalid config changes none of them.
+        let rules_t = last_config_t.unwrap_or(schedule.watermark_t);
+        let desired = final_policy.no_history.clone();
+        let sync_rules = config_problems.is_empty() && schedule.watermark_t >= head_t;
+        let journal_changed = sync_rules
+            && registration
+                .journal
+                .clone()
+                .apply_history_rules(&desired, rules_t);
+
         // Checkpoint.
         let changed = before != schedule_fingerprint(&schedule);
         let heartbeat_due = registration
@@ -654,7 +670,7 @@ impl Fluree {
             let cid = store.put(ContentKind::RetentionState, &bytes).await?;
             blob = Some(cid.to_string());
         }
-        if changed || heartbeat_due || counters_changed {
+        if changed || heartbeat_due || counters_changed || journal_changed {
             let next = Registration {
                 watermark_t: schedule.watermark_t,
                 schedule: blob.clone(),
@@ -671,7 +687,16 @@ impl Fluree {
                 match current {
                     Some(c) if c.watermark_t > next.watermark_t => None,
                     Some(c) if c.active_since_t < next.active_since_t => None,
-                    _ => Some(next.clone()),
+                    _ => {
+                        // The journal as it now stands (a removal may have
+                        // landed meanwhile), with the rules brought in line.
+                        let mut updated = next.clone();
+                        updated.journal = current.map(|c| c.journal.clone()).unwrap_or_default();
+                        if sync_rules {
+                            updated.journal.apply_history_rules(&desired, rules_t);
+                        }
+                        Some(updated)
+                    }
                 }
             })
             .await?;

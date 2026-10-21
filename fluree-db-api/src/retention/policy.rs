@@ -19,6 +19,10 @@ pub(crate) struct CompiledPolicy {
     graphs: HashMap<Option<String>, HashMap<String, u64>>,
     /// Problems the reader recorded: they block processing.
     pub(crate) problems: Vec<String>,
+    /// `f:noHistory` in force: predicate IRI, the graph it is limited to
+    /// (`None`: every data graph), and graphs excepted from a ledger-wide
+    /// rule by their own explicit `false`.
+    pub(crate) no_history: Vec<(String, Option<String>, Vec<String>)>,
 }
 
 impl CompiledPolicy {
@@ -57,6 +61,7 @@ impl CompiledPolicy {
             };
             policy.graphs.insert(key, durations(&merged));
         }
+        policy.no_history = no_history_in_force(config);
         policy
     }
 
@@ -74,6 +79,56 @@ impl CompiledPolicy {
         };
         seconds.filter(|s| *s > 0)
     }
+}
+
+/// The `f:noHistory` rules a config puts in force, field-merged per graph.
+fn no_history_in_force(config: &LedgerConfig) -> Vec<(String, Option<String>, Vec<String>)> {
+    let graph_key = |target: &str| {
+        if target == config_iris::DEFAULT_GRAPH {
+            fluree_db_core::graph_registry::DEFAULT_GRAPH_IRI.to_string()
+        } else {
+            target.to_string()
+        }
+    };
+    let mut rules = Vec::new();
+    let ledger_wide: Vec<&str> = config
+        .retention
+        .iter()
+        .flat_map(|g| g.properties.iter())
+        .filter(|p| p.no_history == Some(true))
+        .map(|p| p.target.as_str())
+        .collect();
+    for predicate in &ledger_wide {
+        let except: Vec<String> = config
+            .graph_overrides
+            .iter()
+            .filter(|gc| {
+                gc.retention
+                    .as_ref()
+                    .and_then(|r| r.property(predicate))
+                    .is_some_and(|e| e.no_history == Some(false))
+            })
+            .map(|gc| graph_key(&gc.target_graph))
+            .collect();
+        rules.push(((*predicate).to_string(), None, except));
+    }
+    for gc in &config.graph_overrides {
+        let Some(group) = &gc.retention else {
+            continue;
+        };
+        for entry in &group.properties {
+            if entry.no_history == Some(true) && !ledger_wide.contains(&entry.target.as_str()) {
+                rules.push((
+                    entry.target.clone(),
+                    Some(graph_key(&gc.target_graph)),
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+    rules.sort();
+    rules.dedup();
+    rules
 }
 
 /// Decodes the Sids a policy lookup needs, once each.

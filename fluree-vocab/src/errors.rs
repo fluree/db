@@ -128,6 +128,9 @@ pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
 /// A commit reference that names no commit of the ledger
 pub const COMMIT_NOT_FOUND: &str = "err:db/CommitNotFound";
 
+/// A read needs history the ledger's retention suppressed (HTTP 410)
+pub const HISTORY_UNAVAILABLE: &str = "err:db/HistoryUnavailable";
+
 /// Graph source index stale
 pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";
 

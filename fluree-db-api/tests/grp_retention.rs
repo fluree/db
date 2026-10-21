@@ -3,3 +3,6 @@ mod support;
 
 #[path = "it_retention_ttl.rs"]
 mod it_retention_ttl;
+
+#[path = "it_retention_history.rs"]
+mod it_retention_history;

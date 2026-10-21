@@ -1521,7 +1521,62 @@ impl Fluree {
                 .await?,
         );
 
+        self.refuse_suppressed_view_history(&db, parsed, &executable, None)
+            .await?;
+
         Ok(executable)
+    }
+
+    /// Refuse a read of `db` that needs history its ledger's retention
+    /// suppressed. A read at the cached head costs nothing; see
+    /// [`crate::retention::suppression`].
+    pub(crate) async fn refuse_suppressed_view_history(
+        &self,
+        db: &GraphDb,
+        parsed: &fluree_db_query::ir::Query,
+        executable: &ExecutableQuery,
+        history_range: Option<(i64, i64)>,
+    ) -> Result<()> {
+        if history_range.is_none() && self.is_current_read(&db.ledger_id, db.t).await {
+            return Ok(());
+        }
+        let reads = if executable.reasoning.modes.has_any_enabled() {
+            crate::retention::suppression::Reads::Everything
+        } else {
+            crate::retention::suppression::reads_of(parsed, &db.snapshot)
+        };
+        let (from_t, to_t) = match history_range {
+            Some((from, to)) => (Some(from), to),
+            None => (None, db.t),
+        };
+        self.refuse_suppressed_history(
+            &db.ledger_id,
+            crate::retention::suppression::HistoricalRead {
+                to_t,
+                from_t,
+                reads,
+                snapshot: &db.snapshot,
+            },
+        )
+        .await
+    }
+
+    /// Whether a read as of `t` is at (or past) the cached head of
+    /// `ledger_id`, known without any I/O.
+    pub(crate) async fn is_current_read(&self, ledger_id: &str, t: i64) -> bool {
+        let Ok(id) = fluree_db_core::LedgerId::parse(ledger_id) else {
+            return false;
+        };
+        let Some(manager) = self.ledger_manager.as_ref() else {
+            return false;
+        };
+        let Some(cached_t) = manager.current_t(&id).await else {
+            return false;
+        };
+        let head = manager
+            .head_watermark(&id)
+            .map_or(cached_t, |w| w.max(cached_t));
+        t >= head
     }
 
     /// Apply a view's reasoning configuration to an executable.

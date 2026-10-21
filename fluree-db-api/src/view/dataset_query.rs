@@ -638,6 +638,12 @@ impl Fluree {
             }
         }
 
+        let history_range = dataset.history_time_range();
+        for view in dataset.views() {
+            self.refuse_suppressed_view_history(view, parsed, &executable, history_range)
+                .await?;
+        }
+
         Ok(executable)
     }
 

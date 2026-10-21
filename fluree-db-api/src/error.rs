@@ -360,6 +360,12 @@ pub enum ApiError {
     #[error("{0}")]
     CommitNotFound(String),
 
+    /// A time-travel or history read needs history the ledger's retention
+    /// suppressed (`f:noHistory`, a targeted removal) — refused rather than
+    /// answered from incomplete history (410).
+    #[error("history unavailable: {0}")]
+    HistoryUnavailable(String),
+
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
@@ -735,6 +741,8 @@ impl ApiError {
             | ApiError::CommitNotFound(_)
             | ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
 
+            ApiError::HistoryUnavailable(_) => 410,
+
             ApiError::Parse(_)
             | ApiError::Batch(_)
             | ApiError::Config(_)
@@ -890,6 +898,7 @@ impl ApiError {
 
             ApiError::GraphNotFound(_) => errors::GRAPH_NOT_FOUND,
             ApiError::CommitNotFound(_) => errors::COMMIT_NOT_FOUND,
+            ApiError::HistoryUnavailable(_) => errors::HISTORY_UNAVAILABLE,
             ApiError::NotFound(msg) => {
                 if msg.contains("Graph source") || msg.contains("graph source") {
                     errors::GRAPH_SOURCE_NOT_FOUND
@@ -1331,6 +1340,11 @@ mod tests {
             ),
             (ApiError::GraphNotFound("g".into()), 404, GRAPH_NOT_FOUND),
             (ApiError::CommitNotFound("c".into()), 404, COMMIT_NOT_FOUND),
+            (
+                ApiError::HistoryUnavailable("h".into()),
+                410,
+                HISTORY_UNAVAILABLE,
+            ),
             (ApiError::http(404, "x"), 404, NOT_FOUND),
             (
                 ApiError::Indexer(IE::LedgerNotFound("db".into())),
@@ -1579,6 +1593,7 @@ mod tests {
                 | ApiError::NotFound(_)
                 | ApiError::GraphNotFound(_)
                 | ApiError::CommitNotFound(_)
+                | ApiError::HistoryUnavailable(_)
                 | ApiError::LedgerExists(_)
                 | ApiError::NoveltyDeferred { .. }
                 | ApiError::MaterializePartial { .. }

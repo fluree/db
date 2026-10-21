@@ -49,6 +49,9 @@ pub struct Registration {
     /// What blocks or degrades processing, for an operator.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+    /// The removal journal: what the branch's history no longer serves.
+    #[serde(default, skip_serializing_if = "super::journal::Journal::is_empty")]
+    pub journal: super::journal::Journal,
 }
 
 /// The branch's registration, if any, with the config value it was read from.
