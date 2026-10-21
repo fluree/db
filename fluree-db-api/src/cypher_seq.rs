@@ -37,7 +37,8 @@ use std::sync::Arc;
 
 use fluree_db_cypher::ast::{
     CypherAst, Expr, Literal, MatchClause, MergeClause, Pattern, PatternPart, ProjectionItem,
-    Query, ReadClause, ReturnClause, SetClause, Statement, Update, Variable, WriteClause,
+    Query, ReadClause, RemoveItem, ReturnClause, SetClause, SetItem, Statement, Update, Variable,
+    WriteClause,
 };
 use fluree_db_cypher::span::SourceSpan;
 use fluree_db_ledger::IndexConfig;
@@ -84,7 +85,9 @@ pub struct SequentialCypherWrite {
 /// - a node MERGE under a plain leading read (`MATCH … MERGE (n {…})`),
 ///   with or without `ON MATCH SET` / trailing SETs — the driver's per-row
 ///   partition creates once per distinct absent key and binds every row,
-///   which is exactly Cypher's semantics for that shape.
+///   which is exactly Cypher's semantics for that shape;
+/// - write clauses without a MERGE that can see or undo one another's
+///   writes ([`interacting_writes`]).
 pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
     let Statement::Update(u) = &ast.statement else {
         return None;
@@ -94,7 +97,10 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
         .iter()
         .any(|w| matches!(w, WriteClause::Merge(_)));
     if !has_merge {
-        return None;
+        return interacting_writes(u).map(|update| SequentialCypherWrite {
+            update,
+            span: ast.span,
+        });
     }
 
     let merge_set_shape = matches!(
@@ -130,6 +136,191 @@ pub fn detect_sequential(ast: &CypherAst) -> Option<SequentialCypherWrite> {
         });
     }
     None
+}
+
+/// `u` prepared for the driver when its write clauses can see or undo one
+/// another's writes.
+///
+/// The single-`Txn` lowering evaluates every clause against the state before
+/// the statement and stages them as one operation, so a later clause neither
+/// sees an earlier one's write nor replaces it: `SET n.p = 1 SET n.p = 2`
+/// asserts both values, `REMOVE n.p SET n.p = <stored value>` removes it. A
+/// clause whose lowering reads stored values (an `OPTIONAL` lookup) also adds
+/// rows that a `CREATE` in the same statement fires on, once per row. The
+/// driver stages each clause against the state the clauses before it leave,
+/// and the stager folds each fact to its last write (as for SPARQL's
+/// `;`-separated operations), so these statements route there. A SET clause
+/// writing one key twice is split at the repeat, since its items apply in
+/// order.
+///
+/// Statements whose clauses can't meet keep the single `Txn`, as do shapes
+/// the driver doesn't stage ([`validate_members`]: a `CALL` before the
+/// writes, an `OPTIONAL MATCH` before a `CREATE`, a bare or relationship
+/// `DELETE`, `FOREACH`).
+fn interacting_writes(u: &Update) -> Option<Update> {
+    if validate_members(u).is_err() {
+        return None;
+    }
+    let clauses = split_repeated_set_keys(&u.write_clauses);
+    let writes: Vec<ClauseWrites<'_>> = clauses.iter().map(ClauseWrites::of).collect();
+    let meet = writes
+        .iter()
+        .enumerate()
+        .any(|(i, a)| writes[i + 1..].iter().any(|b| a.meets(b)));
+    meet.then(|| Update {
+        write_clauses: clauses,
+        ..u.clone()
+    })
+}
+
+/// Relationship variables the read clauses bind.
+fn relationship_vars(clauses: &[ReadClause]) -> Vec<String> {
+    let mut vars = Vec::new();
+    for c in clauses {
+        if let ReadClause::Match(m) | ReadClause::OptionalMatch(m) = c {
+            for part in &m.pattern.parts {
+                vars.extend(
+                    part.tail
+                        .iter()
+                        .filter_map(|(rel, _)| rel.var.as_ref())
+                        .map(|v| v.name.clone()),
+                );
+            }
+        }
+    }
+    vars
+}
+
+/// `clauses` with each SET that writes one property key twice split into
+/// consecutive SETs at every repeat.
+fn split_repeated_set_keys(clauses: &[WriteClause]) -> Vec<WriteClause> {
+    let mut out = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let WriteClause::Set(s) = clause else {
+            out.push(clause.clone());
+            continue;
+        };
+        let mut run: Vec<SetItem> = Vec::new();
+        let mut run_writes = ClauseWrites::default();
+        for item in &s.items {
+            let mut item_writes = ClauseWrites::default();
+            item_writes.add_set_items(std::slice::from_ref(item));
+            if !run.is_empty() && run_writes.shares_keys(&item_writes) {
+                out.push(WriteClause::Set(SetClause {
+                    items: std::mem::take(&mut run),
+                    span: s.span,
+                }));
+                run_writes = ClauseWrites::default();
+            }
+            run.push(item.clone());
+            run_writes.add_set_items(std::slice::from_ref(item));
+        }
+        out.push(WriteClause::Set(SetClause {
+            items: run,
+            span: s.span,
+        }));
+    }
+    out
+}
+
+/// What one write clause writes, and whether its lowering reads stored values
+/// (an `OPTIONAL` lookup, which adds rows to the statement's solutions).
+#[derive(Default)]
+struct ClauseWrites<'a> {
+    keys: Vec<&'a str>,
+    /// `SET n = {…}`: every property key of `n`.
+    all_keys: bool,
+    labels: Vec<&'a str>,
+    reads: bool,
+    creates: bool,
+    detach: bool,
+}
+
+impl<'a> ClauseWrites<'a> {
+    fn of(clause: &'a WriteClause) -> Self {
+        let mut w = Self::default();
+        match clause {
+            WriteClause::Create(c) => {
+                w.creates = true;
+                for part in &c.pattern.parts {
+                    for node in std::iter::once(&part.head).chain(part.tail.iter().map(|(_, n)| n))
+                    {
+                        w.labels.extend(node.labels.iter().map(|l| l.name.as_str()));
+                        if let Some(props) = &node.props {
+                            w.keys.extend(props.entries.iter().map(|(k, _)| k.as_str()));
+                        }
+                    }
+                }
+            }
+            WriteClause::Set(s) => w.add_set_items(&s.items),
+            WriteClause::Remove(r) => {
+                for item in &r.items {
+                    match item {
+                        RemoveItem::Property { property, .. } => {
+                            w.keys.push(property);
+                            w.reads = true;
+                        }
+                        RemoveItem::Labels { labels, .. } => {
+                            w.labels.extend(labels.iter().map(String::as_str));
+                        }
+                    }
+                }
+            }
+            WriteClause::Delete(d) => {
+                w.detach = d.detach;
+                w.reads = d.detach;
+            }
+            WriteClause::Merge(_) | WriteClause::Foreach(_) => {}
+        }
+        w
+    }
+
+    fn add_set_items(&mut self, items: &'a [SetItem]) {
+        for item in items {
+            match item {
+                SetItem::Property { property, .. } => {
+                    self.keys.push(property);
+                    self.reads = true;
+                }
+                SetItem::MapMerge { map, .. } => {
+                    self.keys
+                        .extend(map.entries.iter().map(|(k, _)| k.as_str()));
+                    self.reads = true;
+                }
+                SetItem::MapReplace { map, .. } => {
+                    self.keys
+                        .extend(map.entries.iter().map(|(k, _)| k.as_str()));
+                    self.all_keys = true;
+                    self.reads = true;
+                }
+                SetItem::Labels { labels, .. } => {
+                    self.labels.extend(labels.iter().map(String::as_str));
+                }
+            }
+        }
+    }
+
+    /// Whether this and `other` write one property key, on any variables.
+    fn shares_keys(&self, other: &Self) -> bool {
+        (self.all_keys && (other.all_keys || !other.keys.is_empty()))
+            || (other.all_keys && !self.keys.is_empty())
+            || self.keys.iter().any(|k| other.keys.contains(k))
+    }
+
+    /// Whether this clause and `other` can see or undo each other's writes,
+    /// on any variables (two can bind one node). A CREATE writes only the
+    /// entities it creates, so two never meet.
+    fn meets(&self, other: &Self) -> bool {
+        if self.creates && other.creates {
+            return false;
+        }
+        self.detach
+            || other.detach
+            || (self.creates && other.reads)
+            || (other.creates && self.reads)
+            || self.shares_keys(other)
+            || self.labels.iter().any(|l| other.labels.contains(l))
+    }
 }
 
 /// Classify Cypher source for transports: whether the (param-substituted)
@@ -194,6 +385,47 @@ impl RowTable {
 
     fn is_seeded(&self) -> bool {
         !self.cols.is_empty()
+    }
+
+    /// The rows that bind every column in `vars`, when some row doesn't;
+    /// `None` when every row does.
+    fn bound_on(&self, vars: &[&str]) -> Option<Self> {
+        let cols: Vec<usize> = vars.iter().filter_map(|v| self.col_idx(v)).collect();
+        let binds = |row: &Vec<Binding>| cols.iter().all(|&c| !row[c].is_unbound_or_poisoned());
+        if self.rows.iter().all(binds) {
+            return None;
+        }
+        Some(Self {
+            cols: self.cols.clone(),
+            rows: self.rows.iter().filter(|r| binds(r)).cloned().collect(),
+        })
+    }
+}
+
+/// The variables a SET, REMOVE or DELETE clause writes to.
+fn clause_targets(clause: &WriteClause) -> Vec<&str> {
+    match clause {
+        WriteClause::Set(s) => s
+            .items
+            .iter()
+            .map(|item| match item {
+                SetItem::Property { target, .. }
+                | SetItem::MapMerge { target, .. }
+                | SetItem::MapReplace { target, .. }
+                | SetItem::Labels { target, .. } => target.name.as_str(),
+            })
+            .collect(),
+        WriteClause::Remove(r) => r
+            .items
+            .iter()
+            .map(|item| match item {
+                RemoveItem::Property { target, .. } | RemoveItem::Labels { target, .. } => {
+                    target.name.as_str()
+                }
+            })
+            .collect(),
+        WriteClause::Delete(d) => d.targets.iter().map(|t| t.name.as_str()).collect(),
+        WriteClause::Create(_) | WriteClause::Merge(_) | WriteClause::Foreach(_) => Vec::new(),
     }
 }
 
@@ -322,11 +554,19 @@ impl Fluree {
                     )
                     .await?;
                 }
-                WriteClause::Set(_) | WriteClause::Remove(_) => {
+                WriteClause::Set(_) | WriteClause::Remove(_) | WriteClause::Delete(_) => {
+                    // A row that leaves the clause's target unbound (an
+                    // OPTIONAL MATCH that found nothing) writes nothing. The
+                    // seeded `VALUES` would leave the target free for the
+                    // clause's own lookup of stored values to bind, so such
+                    // rows are not seeded.
+                    let targets = clause_targets(clause);
+                    let bound = table.bound_on(&targets);
+                    let table = bound.as_ref().unwrap_or(&table);
                     if !table.rows.is_empty() {
                         self.seq_stage_seeded(
                             &mut stager,
-                            &table,
+                            table,
                             vec![clause.clone()],
                             Some(clause_skolem),
                             ledger_id,
@@ -338,7 +578,7 @@ impl Fluree {
                         .await?;
                     }
                 }
-                WriteClause::Delete(_) | WriteClause::Foreach(_) => {
+                WriteClause::Foreach(_) => {
                     unreachable!("rejected by validate_members");
                 }
             }
@@ -1358,9 +1598,16 @@ fn set_items_need_hoist(items: &[fluree_db_cypher::ast::SetItem], cols: &[String
 
 /// Reject members the v1 driver defers, with clear errors.
 fn validate_members(u: &Update) -> Result<()> {
+    // A row an OPTIONAL MATCH leaves unbound is not seeded into a SET,
+    // REMOVE or DETACH DELETE (see the staging loop), but could assert part
+    // of a CREATE or MERGE pattern.
+    let creates = u
+        .write_clauses
+        .iter()
+        .any(|w| matches!(w, WriteClause::Create(_) | WriteClause::Merge(_)));
     for c in &u.read_clauses {
         match c {
-            ReadClause::OptionalMatch(_) => {
+            ReadClause::OptionalMatch(_) if creates => {
                 return Err(cypher_err(
                     "OPTIONAL MATCH before a multi-clause write is not supported — a \
                      partially-bound row could assert a partial pattern; bind the variables \
@@ -1375,12 +1622,18 @@ fn validate_members(u: &Update) -> Result<()> {
             _ => {}
         }
     }
+    let rel_vars = relationship_vars(&u.read_clauses);
     for w in &u.write_clauses {
         match w {
+            // A node's DETACH DELETE stages like a SET: a seeded `Txn` whose
+            // lowering finds the node's triples in the state it stages on.
+            WriteClause::Delete(d)
+                if d.detach && d.targets.iter().all(|t| !rel_vars.contains(&t.name)) => {}
             WriteClause::Delete(_) => {
                 return Err(cypher_err(
-                    "DELETE in a multi-clause write statement is deferred — run the DELETE \
-                     as its own statement",
+                    "a bare or relationship DELETE in a multi-clause write statement is \
+                     deferred — run the DELETE as its own statement (a node's DETACH DELETE \
+                     is supported)",
                 ));
             }
             WriteClause::Foreach(_) => {

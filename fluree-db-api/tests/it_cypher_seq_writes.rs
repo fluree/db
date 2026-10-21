@@ -879,3 +879,345 @@ async fn commit_without_tracking_reports_no_tally() {
     assert!(committed.tally.is_none(), "no tally without tracking");
     assert!(committed.receipt.flake_count > 0);
 }
+
+// ---- Clauses that write one fact: the last write holds -------------------
+//
+// Each case runs a Cypher statement and the SPARQL UPDATE that means the same
+// (one operation per clause, `;`-separated) on twin ledgers seeded alike, and
+// requires both to end in the same expected state with the same commit.
+
+const TWIN_SEED: &str = r#"INSERT DATA {
+  <a> a <P> ; <id> "a" ; <name> "x" ; <tags> "t1", "t2" .
+  <b> a <P> ; <id> "b" ; <knows> <a> .
+}"#;
+
+/// Every triple, with subjects the seed didn't name (created nodes) shown as
+/// `new`, sorted.
+async fn twin_state(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> Vec<String> {
+    let json = support::query_sparql(fluree, ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("state query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let mut rows: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| {
+            let term = |k: &str| {
+                let v = b[k]["value"].as_str().unwrap_or("?");
+                match b[k]["type"].as_str() {
+                    Some("bnode") => "new".to_string(),
+                    _ if k == "s" && !["a", "b"].contains(&v) => "new".to_string(),
+                    _ => v.to_string(),
+                }
+            };
+            format!("{} {} {}", term("s"), term("p"), term("o"))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Run `cypher` and `sparql` on twin seeded ledgers: each side's state and
+/// commit (asserts, retracts).
+async fn twins(cypher: &str, sparql: &str) -> [(Vec<String>, (usize, usize)); 2] {
+    let mut out = Vec::new();
+    for side in 0..2 {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let id = format!("it/cyseq-twin-{side}:main");
+        fluree.create_ledger(&id).await.expect("create");
+        fluree
+            .graph(&id)
+            .transact()
+            .sparql_update(TWIN_SEED)
+            .commit()
+            .await
+            .expect("seed");
+        let receipt = if side == 0 {
+            let l = fluree.ledger(&id).await.expect("ledger");
+            fluree
+                .transact_cypher(l, cypher)
+                .await
+                .expect("cypher")
+                .receipt
+        } else {
+            fluree
+                .graph(&id)
+                .transact()
+                .sparql_update(sparql)
+                .commit()
+                .await
+                .expect("sparql")
+                .receipt
+        };
+        let ledger = fluree.ledger(&id).await.expect("ledger");
+        let state = twin_state(&fluree, &ledger).await;
+        out.push((state, (receipt.assert_count, receipt.retract_count)));
+    }
+    let sparql_side = out.pop().expect("sparql");
+    let cypher_side = out.pop().expect("cypher");
+    [cypher_side, sparql_side]
+}
+
+fn seeded_with(changes: &[(&str, Option<&str>)]) -> Vec<String> {
+    let mut rows: Vec<String> = [
+        "a http://www.w3.org/1999/02/22-rdf-syntax-ns#type P",
+        "a id a",
+        "a name x",
+        "a tags t1",
+        "a tags t2",
+        "b http://www.w3.org/1999/02/22-rdf-syntax-ns#type P",
+        "b id b",
+        "b knows a",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    for (row, add) in changes {
+        match add {
+            None => rows.retain(|r| r != row),
+            Some(_) => rows.push((*row).to_string()),
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn assert_twins(
+    label: &str,
+    got: [(Vec<String>, (usize, usize)); 2],
+    want: Vec<String>,
+    commit: (usize, usize),
+) {
+    let [cypher, sparql] = got;
+    assert_eq!(sparql.0, want, "{label}: SPARQL state");
+    assert_eq!(
+        sparql.1, commit,
+        "{label}: SPARQL commit (asserts, retracts)"
+    );
+    assert_eq!(cypher.0, want, "{label}: Cypher state");
+    assert_eq!(
+        cypher.1, commit,
+        "{label}: Cypher commit (asserts, retracts)"
+    );
+}
+
+#[tokio::test]
+async fn remove_then_set_of_the_same_value_keeps_it() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) REMOVE n.name SET n.name = "x""#,
+        r#"DELETE { ?n <name> ?o } WHERE { ?n a <P> ; <id> "a" ; <name> ?o } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "x" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins("REMOVE then SET same", got, seeded_with(&[]), (0, 0));
+}
+
+#[tokio::test]
+async fn the_last_of_two_sets_holds() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n.name = "y" SET n.name = "w""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "w" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins(
+        "SET y then SET w",
+        got,
+        seeded_with(&[("a name x", None), ("a name w", Some(""))]),
+        (1, 1),
+    );
+}
+
+#[tokio::test]
+async fn a_set_back_to_the_stored_value_writes_nothing() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n.name = "y" SET n.name = "x""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "x" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins("SET y then SET x", got, seeded_with(&[]), (0, 0));
+}
+
+#[tokio::test]
+async fn a_set_to_the_stored_value_writes_nothing() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n.name = "x""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "x" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins("SET same", got, seeded_with(&[]), (0, 0));
+}
+
+#[tokio::test]
+async fn two_items_of_one_set_on_one_property_keep_the_last() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n.name = "y", n.name = "w""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "w" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins(
+        "SET y, w",
+        got,
+        seeded_with(&[("a name x", None), ("a name w", Some(""))]),
+        (1, 1),
+    );
+}
+
+#[tokio::test]
+async fn a_label_set_then_removed_is_gone() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n:P REMOVE n:P"#,
+        r#"INSERT { ?n a <P> } WHERE { ?n a <P> ; <id> "a" } ;
+           DELETE { ?n a <P> } WHERE { ?n <id> "a" }"#,
+    )
+    .await;
+    assert_twins(
+        "SET :P then REMOVE :P",
+        got,
+        seeded_with(&[("a http://www.w3.org/1999/02/22-rdf-syntax-ns#type P", None)]),
+        (0, 1),
+    );
+}
+
+#[tokio::test]
+async fn a_detach_delete_then_create_creates_once() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) DETACH DELETE n CREATE (:P {id: "a", name: "x"})"#,
+        r#"DELETE { ?n ?p ?o . ?s ?q ?n } WHERE { ?n a <P> ; <id> "a" { ?n ?p ?o } UNION { ?s ?q ?n } } ;
+           INSERT DATA { _:c a <P> ; <id> "a" ; <name> "x" }"#,
+    )
+    .await;
+    let want = {
+        let mut rows = seeded_with(&[
+            ("a http://www.w3.org/1999/02/22-rdf-syntax-ns#type P", None),
+            ("a id a", None),
+            ("a name x", None),
+            ("a tags t1", None),
+            ("a tags t2", None),
+            ("b knows a", None),
+        ]);
+        rows.extend(
+            [
+                "new http://www.w3.org/1999/02/22-rdf-syntax-ns#type P",
+                "new id a",
+                "new name x",
+            ]
+            .map(String::from),
+        );
+        rows.sort();
+        rows
+    };
+    assert_twins("DETACH DELETE then CREATE", got, want, (3, 6));
+}
+
+#[tokio::test]
+async fn a_set_over_a_multivalued_property_then_create_creates_once() {
+    let got = twins(
+        r#"MATCH (n:P {id: "a"}) SET n.tags = "t3" CREATE (:Q {id: "q"})"#,
+        r#"DELETE { ?n <tags> ?o } INSERT { ?n <tags> "t3" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <tags> ?o } } ;
+           INSERT DATA { _:q a <Q> ; <id> "q" }"#,
+    )
+    .await;
+    let want = {
+        let mut rows = seeded_with(&[
+            ("a tags t1", None),
+            ("a tags t2", None),
+            ("a tags t3", Some("")),
+        ]);
+        rows.extend(
+            [
+                "new http://www.w3.org/1999/02/22-rdf-syntax-ns#type Q",
+                "new id q",
+            ]
+            .map(String::from),
+        );
+        rows.sort();
+        rows
+    };
+    assert_twins("SET multi-valued then CREATE", got, want, (3, 2));
+}
+
+#[tokio::test]
+async fn two_variables_on_one_node_keep_the_last_write() {
+    let got = twins(
+        r#"MATCH (m:P {id: "a"}), (n:P {id: "a"}) SET m.name = "y" SET n.name = "w""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "w" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins(
+        "aliased SETs",
+        got,
+        seeded_with(&[("a name x", None), ("a name w", Some(""))]),
+        (1, 1),
+    );
+}
+
+/// A row OPTIONAL MATCH leaves unbound writes nothing: its SET must not
+/// reach another node through the SET's own lookup of the stored value.
+#[tokio::test]
+async fn an_optional_match_that_finds_nothing_writes_nothing() {
+    let got = twins(
+        r#"OPTIONAL MATCH (n:P {id: "zz"}) SET n.name = "w""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "w" }
+           WHERE { ?n a <P> ; <id> "zz" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins("OPTIONAL MATCH misses", got, seeded_with(&[]), (0, 0));
+}
+
+#[tokio::test]
+async fn an_optional_match_before_two_sets_keeps_the_last() {
+    let got = twins(
+        r#"OPTIONAL MATCH (n:P {id: "a"}) SET n.name = "y" SET n.name = "w""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "w" }
+           WHERE { ?n a <P> ; <id> "a" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins(
+        "OPTIONAL MATCH, SET y then SET w",
+        got,
+        seeded_with(&[("a name x", None), ("a name w", Some(""))]),
+        (1, 1),
+    );
+}
+
+/// The same with two clauses: a row the OPTIONAL MATCH leaves unbound is not
+/// seeded, so neither clause's lookup of the stored value can bind its target.
+#[tokio::test]
+async fn an_optional_match_that_finds_nothing_before_two_sets_writes_nothing() {
+    let got = twins(
+        r#"OPTIONAL MATCH (n:P {id: "zz"}) SET n.name = "y" SET n.name = "w""#,
+        r#"DELETE { ?n <name> ?o } INSERT { ?n <name> "y" }
+           WHERE { ?n a <P> ; <id> "zz" OPTIONAL { ?n <name> ?o } } ;
+           DELETE { ?n <name> ?o } INSERT { ?n <name> "w" }
+           WHERE { ?n a <P> ; <id> "zz" OPTIONAL { ?n <name> ?o } }"#,
+    )
+    .await;
+    assert_twins(
+        "OPTIONAL MATCH misses, two SETs",
+        got,
+        seeded_with(&[]),
+        (0, 0),
+    );
+}

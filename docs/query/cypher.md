@@ -546,8 +546,9 @@ error listing the supported set.
   the edge is inserted — idempotent in RDF, but redundant.
 - **Multi-clause write composition** — a statement may chain multiple write
   clauses (`MERGE` chains, `CREATE`+`MERGE` mixes, interleaved `SET` /
-  `REMOVE`), with each clause observing the writes of the clauses before it
-  and rows piping downstream — the standard Cypher loading idioms:
+  `REMOVE` / `DETACH DELETE`), with each clause observing the writes of the
+  clauses before it and rows piping downstream — the standard Cypher loading
+  idioms:
 
   ```cypher
   UNWIND $rows AS row
@@ -571,8 +572,17 @@ error listing the supported set.
   `ON MATCH SET`). Property accessors are valid `MERGE`-key and `SET` values
   (`MERGE (t:Team {name: p.team})`).
 
-  Deferred in a multi-clause statement (clear errors): `DELETE` / `FOREACH`
-  members, `OPTIONAL MATCH` / `CALL { … }` in the read prefix. See
+  The last write to a property or label holds, as in Cypher:
+  `SET n.name = "y" SET n.name = "w"` leaves `"w"`, `REMOVE n.name SET n.name =
+  "x"` leaves `"x"`, and `SET n.name = "y", n.name = "w"` (one clause) leaves
+  `"w"`. A write that ends where the stored value was commits nothing. A
+  `CREATE` after a `SET`, `REMOVE` or `DETACH DELETE` creates once per matched
+  row.
+
+  Deferred in a multi-clause statement (clear errors): a bare or relationship
+  `DELETE` and `FOREACH` members, `CALL { … }` in the read prefix, and
+  `OPTIONAL MATCH` in the read prefix of a statement with a `CREATE` or
+  `MERGE`. See
   `docs/design/cypher-sequential-writes.md` for the execution model.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline

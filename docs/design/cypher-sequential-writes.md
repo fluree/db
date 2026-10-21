@@ -70,9 +70,14 @@ decomposition:
      against the evolving virtual state; this lets each duplicate observe the
      preceding row's update. Simple literals and threaded row-column values
      remain batched.
-   - **SET / REMOVE**: one seeded Txn; row table unchanged.
-   - **DELETE** in a multi-clause chain: rejected (clear error) in v1 — its
-     relationship-existence / parallel-edge probes stay single-statement.
+   - **SET / REMOVE**: one seeded Txn; row table unchanged. A SET whose items
+     write one property key twice is split at the repeat into consecutive
+     SETs, since its items apply in order.
+   - **DETACH DELETE** of a node: one seeded Txn, like SET; its lowering finds
+     the node's triples in the state it stages on.
+   - A bare or relationship **DELETE** in a multi-clause chain: rejected
+     (clear error) in v1 — its relationship-existence / parallel-edge probes
+     stay single-statement.
 3. **Finish** — `SequentialStager::finish()` produces one `StageResult` over
    the original base: single commit at `t+1`, union namespace delta, folded
    flakes. Zero staged flakes → the ordinary no-op update path.
@@ -102,7 +107,19 @@ so seeded rows satisfy `SET`/`REMOVE` target checks.
    MERGE (MERGE chains, CREATE+MERGE mixes, interleaved SET/REMOVE), and the
    previously-rejected node MERGE under a plain leading MATCH (the driver's
    per-row partition makes it correct: one create per distinct absent key,
-   every row binds).
+   every row binds). It also takes statements without a MERGE whose write
+   clauses can see or undo one another's writes (`interacting_writes`): two
+   clauses writing one property key or one label (on any variables, since two
+   can bind one node), a DETACH DELETE with any other write, or a CREATE with
+   a clause whose lowering reads stored values (a SET or REMOVE of a property,
+   a map SET, DETACH DELETE — the `OPTIONAL` lookup adds rows the CREATE would
+   fire on), plus a SET writing one key twice. The single-`Txn` lowering
+   evaluates every clause against the state before the statement and stages
+   them as one operation, so for these it neither lets a later clause see an
+   earlier one nor lets the last write hold; the driver stages clause by
+   clause and the stager folds each fact to its last write, as for SPARQL `;`
+   updates. Clauses that can't meet (CREATE chains, SETs of different keys)
+   keep the single `Txn`.
 3. Single-Txn lowering — everything else, including its existing clear errors.
 
 `WritePlan` gains a `Sequential` variant. Call sites:
@@ -128,9 +145,10 @@ statements.
   fluree-db-transact is not modified.
 - `stage_transaction_from_txns` keeps its `len == 1` fast path; only its
   N ≥ 2 loop body moved into `SequentialStager`.
-- Single-clause Cypher writes keep their existing plans byte-for-byte
-  (`detect_conditional` runs first; `detect_sequential` fires only on shapes
-  that previously errored).
+- Single-clause Cypher writes keep their existing plans byte-for-byte, except
+  a SET that writes one property key twice. Multi-clause writes without a
+  MERGE keep the single `Txn` unless their clauses can meet (above): those
+  wrote the wrong facts there.
 
 ## Costs
 
