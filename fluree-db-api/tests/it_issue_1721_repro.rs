@@ -561,10 +561,10 @@ async fn subject_pairs(fluree: &fluree_db_api::Fluree, sparql: &str) -> Vec<serd
 }
 
 /// A transaction's reads plan from the stats of the state it began on
-/// (estimates only): an operation that gives an all-ref predicate its first
-/// literals must not leave the predicate licensed as ref-only, or
-/// `FILTER(?x = ?y)` folds into a join that unifies `"abc"` with
-/// `"abc"^^ex:custom`.
+/// (estimates only): an operation that gives a predicate the index licenses
+/// as ref-only its first literal must not leave that licence readable, or
+/// `FILTER(?x = ?y)` folds into a join, and the join unifies a `NaN` with
+/// itself where `=` holds it unequal.
 #[tokio::test]
 async fn a_transaction_read_after_a_predicate_gains_literals_keeps_value_equality() {
     use fluree_db_api::{TransactionOptions, TxnOperation};
@@ -582,6 +582,8 @@ async fn a_transaction_read_after_a_predicate_gains_literals_keeps_value_equalit
         .commit()
         .await
         .expect("seed refs");
+    // The index's stats license `ex:p` as ref-only.
+    support::build_and_publish_index(&fluree, id).await;
 
     let mut txn = fluree
         .begin_transaction(id, TransactionOptions::default())
@@ -589,12 +591,13 @@ async fn a_transaction_read_after_a_predicate_gains_literals_keeps_value_equalit
         .expect("begin");
     txn.stage(TxnOperation::SparqlUpdate(
         r#"PREFIX ex: <http://example.org/ns/>
-           INSERT DATA { ex:s1 ex:p "abc" . ex:s2 ex:p "abc"^^ex:custom }"#
+           PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+           INSERT DATA { ex:s1 ex:p "NaN"^^xsd:double }"#
             .to_string(),
         None,
     ))
     .await
-    .expect("stage literals");
+    .expect("stage a literal");
 
     let db = txn.db().await.expect("transaction view");
     let got = normalize_rows(
@@ -605,11 +608,6 @@ async fn a_transaction_read_after_a_predicate_gains_literals_keeps_value_equalit
             .to_jsonld(&db.snapshot)
             .expect("jsonld"),
     );
-    let want = normalize_rows(&json!([
-        ["ex:s1", "ex:s1"],
-        ["ex:s2", "ex:s2"],
-        ["ex:s3", "ex:s3"],
-        ["ex:s4", "ex:s4"]
-    ]));
+    let want = normalize_rows(&json!([["ex:s3", "ex:s3"], ["ex:s4", "ex:s4"]]));
     assert_eq!(got, want);
 }
