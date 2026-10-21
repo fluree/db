@@ -128,6 +128,14 @@ def test_insert_formats_and_commit_receipt(conn, tmp_path):
     assert total[0].total == 10
 
 
+@pytest.mark.parametrize("empty", [[], {"@graph": []}], ids=["list", "graph"])
+def test_an_empty_insert_has_nothing_to_add(conn, empty):
+    ledger = conn.create("empty")
+    for write in (ledger.insert, ledger.upsert):
+        with pytest.raises(fluree.InvalidRequestError, match="nothing to add"):
+            write(empty)
+
+
 def test_unknown_file_format_needs_format(conn, tmp_path):
     ledger = conn.create("formats")
     data = tmp_path / "data.txt"

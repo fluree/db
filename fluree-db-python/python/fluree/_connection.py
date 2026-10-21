@@ -487,7 +487,8 @@ class Ledger:
 
         A path is read as a file, its format taken from the extension unless
         ``format`` is given. ``message`` is recorded with the commit, and
-        :meth:`log` shows it.
+        :meth:`log` shows it. Data with nothing to add, such as ``[]``, is
+        refused.
         """
         return self._transact("insert", *_rdf_payload(data, format), message)
 

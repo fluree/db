@@ -305,7 +305,7 @@ pub fn parse_sync_transaction(
 /// Parsing is exactly insert parsing (same context handling, annotation
 /// lowering, txn-meta extraction) with `graph` as the root scope. Differences
 /// from insert:
-/// - an explicitly empty document (`"@graph": []`) parses to an empty
+/// - an empty document ([`is_empty_document`]) parses to an empty
 ///   transaction instead of an error;
 /// - a payload that addresses any other graph itself (a graph selector naming
 ///   another graph, or a named-graph object) is rejected: the scope is
@@ -317,18 +317,7 @@ pub fn parse_graph_insert(
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
 ) -> Result<Txn> {
-    // `{"@graph": []}`: an envelope with no nodes. (With an `@id` the same
-    // value is an empty JSON-LD named graph, which a graph write refuses.)
-    let explicitly_empty = json.as_object().is_some_and(|obj| {
-        matches!(
-            fluree_graph_json_ld::doc_shape(obj),
-            Ok(fluree_graph_json_ld::DocShape::Envelope)
-        ) && obj
-            .get("@graph")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    });
-    if explicitly_empty {
+    if is_empty_document(json) {
         let mut txn = Txn::insert().with_opts(opts);
         if let GraphName::Iri(iri) = request_graph_name(graph)? {
             txn.write_graphs.insert(iri.as_str().to_string());
@@ -345,6 +334,25 @@ pub fn parse_graph_insert(
         ledger_id,
         Some(graph),
     )
+}
+
+/// Whether a JSON-LD write document holds no nodes: `[]`, or an envelope
+/// whose `@graph` is `[]`. (With an `@id`, an empty `@graph` is an empty
+/// JSON-LD named graph, which a graph write refuses.)
+pub fn is_empty_document(json: &Value) -> bool {
+    match json {
+        Value::Array(nodes) => nodes.is_empty(),
+        Value::Object(obj) => {
+            matches!(
+                fluree_graph_json_ld::doc_shape(obj),
+                Ok(fluree_graph_json_ld::DocShape::Envelope)
+            ) && obj
+                .get("@graph")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        }
+        _ => false,
+    }
 }
 
 /// The graph a graph insert / sync request names, as a write-side name.
@@ -423,6 +431,11 @@ fn parse_data(
         }
     };
     if templates.is_empty() {
+        if is_empty_document(json) {
+            return Err(TransactError::Parse(
+                "the payload has no triples; there is nothing to add".to_string(),
+            ));
+        }
         let (verb, noun) = match txn_type {
             TxnType::Upsert => ("Upsert", "upsert"),
             _ => ("Insert", "insert"),

@@ -54,6 +54,48 @@ async fn staging_data_invalid_transactions() {
     );
 }
 
+/// An insert or upsert of a document with no nodes is refused as having
+/// nothing to add, not as an object with only `@id`, which it doesn't have.
+#[tokio::test]
+async fn an_empty_insert_or_upsert_has_nothing_to_add() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let empty_documents = [
+        json!([]),
+        json!({"@graph": []}),
+        json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": []}),
+    ];
+    for (i, doc) in empty_documents.iter().enumerate() {
+        for upsert in [false, true] {
+            let ledger = fluree
+                .create_ledger(&format!("tx/empty-{i}-{upsert}:main"))
+                .await
+                .unwrap();
+            let result = if upsert {
+                fluree.upsert(ledger, doc).await
+            } else {
+                fluree.insert(ledger, doc).await
+            };
+            let err = result
+                .expect_err("an empty document is refused")
+                .to_string();
+            assert!(
+                err.contains("nothing to add"),
+                "{doc} (upsert {upsert}): {err}"
+            );
+            assert!(!err.contains("only @id"), "{doc} (upsert {upsert}): {err}");
+        }
+    }
+
+    let ledger = fluree.create_ledger("tx/only-id:main").await.unwrap();
+    let only_id = json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:alice"});
+    let err = fluree
+        .insert(ledger, &only_id)
+        .await
+        .expect_err("an object with only @id is refused")
+        .to_string();
+    assert!(err.contains("only @id"), "{err}");
+}
+
 #[tokio::test]
 async fn staging_data_allow_false_values() {
     let fluree = FlureeBuilder::memory().build_memory();

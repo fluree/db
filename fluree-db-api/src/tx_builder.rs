@@ -61,16 +61,14 @@ impl GraphPayload<'_> {
         }
     }
 
-    /// Whether a JSON-LD payload is `"@graph": []`. RDF text has no such
-    /// spelling; its emptiness is only known once staging parses it. Only
-    /// `admin`'s sync entry point asks, and it is native-only.
+    /// Whether a JSON-LD payload holds no nodes (`[]` or `"@graph": []`).
+    /// RDF text has no such spelling; its emptiness is only known once
+    /// staging parses it. Only `admin`'s sync entry point asks, and it is
+    /// native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn is_explicitly_empty_jsonld(&self) -> bool {
         match self {
-            GraphPayload::JsonLd(data) => data
-                .get("@graph")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(Vec::is_empty),
+            GraphPayload::JsonLd(data) => fluree_db_transact::is_empty_document(data),
             GraphPayload::Rdf(_) => false,
         }
     }
