@@ -425,6 +425,37 @@ impl IdStatsHook {
         self.apply_record(rec, delta);
     }
 
+    /// Observe a record without counting it: the monotone accumulators (HLL
+    /// sketches, `last_modified_t`, historical datatype tags) see it, and
+    /// counts move only through [`Self::count_present`]. For a full rebuild,
+    /// whose event log can hold what an op's sign miscounts: a retraction
+    /// and an assertion of one fact at one `t` (which leave the fact
+    /// present), or a retraction of a fact never asserted.
+    pub fn observe_record(&mut self, rec: &StatsRecord) {
+        self.apply_record(rec, 0);
+    }
+
+    /// Count one fact the built index holds: its graph, property, datatype
+    /// and class counts each gain one. Only for an [`Self::new_hll_only`]
+    /// hook, whose per-subject maps are off; the monotone accumulators saw
+    /// the fact's records through [`Self::observe_record`].
+    pub fn count_present(&mut self, rec: &StatsRecord) {
+        debug_assert!(self.hll_only, "count_present is for HLL-only hooks");
+        *self.graph_flakes.entry(rec.g_id).or_insert(0) += 1;
+        let hll = self
+            .properties
+            .entry(GraphPropertyKey {
+                g_id: rec.g_id,
+                p_id: rec.p_id,
+            })
+            .or_insert_with(IdPropertyHll::new);
+        hll.count += 1;
+        *hll.datatypes.entry(rec.dt.as_u8()).or_insert(0) += 1;
+        if self.rdf_type_p_id == Some(rec.p_id) && rec.o_kind == 0x05 {
+            *self.class_counts.entry((rec.g_id, rec.o_key)).or_insert(0) += 1;
+        }
+    }
+
     fn apply_record(&mut self, rec: &StatsRecord, delta: i64) {
         self.flake_count += 1;
 
@@ -1103,5 +1134,25 @@ mod tests {
         hook.on_record(&record(true, 2));
         hook.on_record(&record(false, 3));
         assert_eq!(property_count(&hook), 1);
+    }
+
+    /// A rebuild observes every record for the sketches but counts only the
+    /// facts the index holds: a same-`t` retraction and assertion of a fact
+    /// absent before them count once, where their op signs net to zero.
+    #[test]
+    fn observed_records_count_nothing_and_present_facts_count_once() {
+        let mut hook = IdStatsHook::new_hll_only();
+        hook.observe_record(&record(false, 5));
+        hook.observe_record(&record(true, 5));
+        assert_eq!(property_count(&hook), 0, "observing counts nothing");
+        let key = GraphPropertyKey { g_id: 0, p_id: 1 };
+        assert_eq!(
+            hook.properties()[&key].last_modified_t,
+            5,
+            "but the sketch saw it"
+        );
+        hook.count_present(&record(true, 5));
+        assert_eq!(property_count(&hook), 1);
+        assert_eq!(hook.graph_flakes_mut()[&0], 1);
     }
 }
