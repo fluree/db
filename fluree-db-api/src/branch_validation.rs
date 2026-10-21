@@ -17,6 +17,7 @@
 //! requested validation mode, identity, inline shapes, or authoring context)
 //! and run the ledger's configured posture.
 
+use crate::commit_data::NetChange;
 use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
@@ -194,23 +195,23 @@ async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>
 }
 
 /// An undo's net change with each fact its deciding commit held as a
-/// same-`t` pair (`same_t_pairs`, positions in `inverted`) resolved by the
-/// fact's presence just before that commit. The pair left the fact present
+/// same-`t` pair (`NetChange::same_t_pairs`) resolved by the fact's
+/// presence just before that commit. The pair left the fact present
 /// whatever it was before, so undoing the commit restores that: absent,
 /// the fact is retracted; present, nothing is written for it. The commit
 /// alone can't tell the two apart. One read per pair, at the deciding
 /// commit's `t - 1`; only commits written before the staging fix hold pairs.
-async fn undo_same_t_pairs(
-    state: &LedgerState,
-    mut inverted: Vec<Flake>,
-    same_t_pairs: &[usize],
-) -> Result<Vec<Flake>> {
+async fn undo_same_t_pairs(state: &LedgerState, undo: NetChange) -> Result<Vec<Flake>> {
     use fluree_db_transact::{CurrentFacts, Slot};
+    let NetChange {
+        flakes: mut inverted,
+        same_t_pairs,
+    } = undo;
     if same_t_pairs.is_empty() {
         return Ok(inverted);
     }
     let mut by_t: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-    for &n in same_t_pairs {
+    for &n in &same_t_pairs {
         by_t.entry(inverted[n].t).or_default().push(n);
     }
     let mut present_before: Vec<(usize, bool)> = Vec::with_capacity(same_t_pairs.len());
@@ -335,14 +336,13 @@ impl crate::Fluree {
     pub(crate) async fn stage_revert(
         &self,
         target_state: LedgerState,
-        inverted: Vec<Flake>,
-        same_t_pairs: &[usize],
+        undo: NetChange,
         conflicts: &[ConflictKey],
         strategy: &ConflictStrategy,
         namespace_delta: &HashMap<u16, String>,
         graph_iris: &BTreeSet<String>,
     ) -> Result<Option<(StagedLedger, BranchOpValidation)>> {
-        let inverted = undo_same_t_pairs(&target_state, inverted, same_t_pairs).await?;
+        let inverted = undo_same_t_pairs(&target_state, undo).await?;
         let staged = self
             .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
             .await?;
@@ -415,7 +415,7 @@ impl crate::Fluree {
         let (_view, outcome) = self
             .stage_validated_with(
                 base.state,
-                data.flakes,
+                data.net.flakes,
                 &data.namespace_delta,
                 &data.graph_iris,
                 "merge",
@@ -656,7 +656,7 @@ fn carries_config_settings(
     .collect();
     let ledger_id = target.snapshot.ledger_id.to_string();
     let mut graphs_seen: std::collections::HashSet<&Sid> = std::collections::HashSet::new();
-    data.flakes.iter().any(|flake| {
+    data.net.flakes.iter().any(|flake| {
         crate::config_vocab::is_config_field(&flake.p)
             || flake.g.as_ref().is_some_and(|g| {
                 own_system_graphs.contains(g)
