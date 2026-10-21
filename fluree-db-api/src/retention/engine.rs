@@ -852,3 +852,48 @@ impl Fluree {
         Ok(found)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_lifetimes_start_at_the_commit_time() {
+        assert_eq!(Lifetime::Seconds(60).due(Some(1_000)), Ok(Some(61_000)));
+        assert_eq!(Lifetime::Seconds(0).due(Some(1_000)), Ok(None));
+        // No commit time: a relative lifetime has nothing to start from, and
+        // is not silently given the time of replay.
+        assert_eq!(Lifetime::Seconds(60).due(None), Err(()));
+        assert_eq!(Lifetime::At(5).due(None), Ok(Some(5)));
+        assert_eq!(
+            Lifetime::Seconds(u64::MAX).due(Some(1)),
+            Ok(Some(i64::MAX)),
+            "an overflowing deadline never comes"
+        );
+    }
+
+    #[test]
+    fn txn_meta_defaults_read_their_canonical_forms() {
+        let ttl = TxnMetaEntry::new(FLUREE_DB, db::TTL_SECONDS, TxnMetaValue::Long(30));
+        assert_eq!(Lifetime::of_txn_meta(&ttl), Some(Lifetime::Seconds(30)));
+        let at = TxnMetaEntry::new(
+            FLUREE_DB,
+            db::EXPIRES_AT,
+            TxnMetaValue::TypedLiteral {
+                value: "2030-01-01T00:00:00Z".into(),
+                dt_ns: fluree_vocab::namespaces::XSD,
+                dt_name: "dateTime".into(),
+            },
+        );
+        assert_eq!(
+            Lifetime::of_txn_meta(&at),
+            Some(Lifetime::At(1_893_456_000_000))
+        );
+        assert!(carries_retention_input(&[ttl]));
+        assert!(!carries_retention_input(&[TxnMetaEntry::new(
+            FLUREE_DB,
+            db::MESSAGE,
+            TxnMetaValue::String("hi".into())
+        )]));
+    }
+}

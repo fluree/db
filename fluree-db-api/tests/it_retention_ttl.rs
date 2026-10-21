@@ -901,3 +901,292 @@ async fn the_background_worker_expires_on_its_own() {
         vec![json!("kept")]
     );
 }
+
+#[tokio::test]
+async fn setting_a_lifetime_needs_permission_to_retract_the_value() {
+    use fluree_db_api::policy_builder::build_policy_context_from_opts;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-permission").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:victim", "ex:status": "online"}),
+    )
+    .await;
+    // A TTL instruction through `@reifies` does not restate the value, so
+    // the write itself never touches ex:status.
+    let claim = json!({
+        "@context": ctx(),
+        "@id": "ex:claim",
+        "f:ttlSeconds": 1,
+        "@reifies": {"@id": "ex:victim", "ex:status": "online"}
+    });
+    let state = fluree.ledger(&id).await.unwrap();
+    let policy = build_policy_context_from_opts(
+        &state.snapshot,
+        state.novelty.as_ref(),
+        Some(state.novelty.as_ref()),
+        state.t(),
+        &fluree_db_api::GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "http://example.org/denyStatus",
+                "f:required": true,
+                "f:onProperty": [{"@id": "http://example.org/status"}],
+                "f:action": "f:modify",
+                "f:allow": false
+            }])),
+            default_allow: Some(true),
+            ..Default::default()
+        },
+        &[0],
+    )
+    .await
+    .expect("policy");
+    let refused = fluree
+        .stage_owned(state)
+        .insert(&claim)
+        .policy(policy)
+        .execute()
+        .await;
+    assert!(
+        refused.is_err(),
+        "a TTL on a value the identity may not retract was accepted"
+    );
+    // An identity that may modify the value renews it.
+    insert(&fluree, &id, claim).await;
+    let report = fluree
+        .run_retention_at(&id, now_ms() + 2_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_batch_verified_at_an_older_head_is_not_committed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-race").await;
+    let t = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 60}}),
+    )
+    .await;
+    let state = fluree.ledger(&id).await.unwrap();
+    let stored = fluree_db_core::range_with_overlay(
+        &state.snapshot,
+        0,
+        state.novelty.as_ref(),
+        fluree_db_core::IndexType::Spot,
+        fluree_db_core::RangeTest::Eq,
+        fluree_db_core::RangeMatch::subject(
+            state.snapshot.encode_iri("http://example.org/s").unwrap(),
+        ),
+        fluree_db_core::RangeOptions::default(),
+    )
+    .await
+    .unwrap();
+    let retract = fluree_db_core::Flake {
+        op: false,
+        ..stored[0].clone()
+    };
+    let batch = fluree_db_api::retention::RetentionBatch {
+        expected_t: t,
+        retractions: vec![retract],
+        expired: 1,
+        retired: 0,
+    };
+    // A renewal lands first.
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 7200}}),
+    )
+    .await;
+    let raced = fluree.commit_retention_batch(&id, batch.clone()).await;
+    assert!(
+        raced
+            .as_ref()
+            .is_err_and(fluree_db_api::ApiError::is_commit_conflict),
+        "{raced:?}"
+    );
+    assert_eq!(
+        fluree_db_api::retention::outcome_of(raced).unwrap(),
+        fluree_db_api::retention::SubmitOutcome::HeadMoved
+    );
+    // The recomputed pass honors the renewal.
+    let report = fluree
+        .run_retention_at(&id, now_ms() + 61_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 0, "{report:?}");
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:s", "ex:v").await,
+        vec![json!("x")]
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_batch_does_not_commit_twice() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-duplicate").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 60}}),
+    )
+    .await;
+    let start = now_ms();
+    let first = fluree
+        .run_retention_at(&id, start + 61_000)
+        .await
+        .expect("pass");
+    let t = first.committed_t.expect("expired");
+    // Running again (a retry after a lost response) commits nothing more.
+    for _ in 0..2 {
+        let again = fluree
+            .run_retention_at(&id, start + 61_000)
+            .await
+            .expect("pass");
+        assert_eq!(again.committed_t, None, "{again:?}");
+    }
+    let ledger = fluree.ledger(&id).await.unwrap();
+    assert_eq!(ledger.t(), t);
+}
+
+#[tokio::test]
+async fn overdue_work_is_reported_when_no_worker_runs() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-no-worker").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@expiresAt": "2020-01-01T00:00:00Z"}}),
+    )
+    .await;
+    // A pass as of before the deadline schedules it without expiring it.
+    let report = fluree
+        .run_retention_at(&id, 1_500_000_000_000)
+        .await
+        .expect("pass");
+    assert_eq!((report.pending, report.expired), (1, 0));
+    let status = fluree.retention_status(&id).await.expect("status");
+    assert!(!status.maintenance_running, "{status:?}");
+    assert_eq!(status.overdue, Some(1), "{status:?}");
+}
+
+#[tokio::test]
+async fn policy_changes_apply_to_later_assertions_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-policy-change").await;
+    let config = |ttl: u64| {
+        format!(
+            "@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+             GRAPH <urn:fluree:{id}#config> {{
+               <urn:fluree:{id}:config:ledger> a f:LedgerConfig ;
+                 f:retentionDefaults <urn:cfg:retention> .
+               <urn:cfg:retention> a f:RetentionDefaults ; f:property <urn:cfg:p> .
+               <urn:cfg:p> a f:RetentionProperty ; f:target ex:reading ; f:ttlSeconds {ttl} .
+             }}"
+        )
+    };
+    let set = |ttl: u64| {
+        let fluree = &fluree;
+        let text = config(ttl);
+        let id = id.clone();
+        async move {
+            fluree
+                .graph(&id)
+                .transact()
+                .upsert_turtle(&text)
+                .commit()
+                .await
+                .expect("config");
+        }
+    };
+    set(60).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:a", "ex:reading": 1}),
+    )
+    .await;
+    // Turning the duration off does not cancel the existing schedule.
+    set(0).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:b", "ex:reading": 2}),
+    )
+    .await;
+    let report = fluree
+        .run_retention_at(&id, now_ms() + HOUR_MS)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 1, "{report:?}");
+    assert!(objects(&fluree, &id, &id, "ex:a", "ex:reading")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:b", "ex:reading").await,
+        vec![json!(2)]
+    );
+}
+
+#[tokio::test]
+async fn sharing_that_appears_after_scheduling_leaves_the_value_in_place() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-shared-later").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#>
+             INSERT DATA { ex:a ex:knows ex:b {| ex:since 2020 ; f:ttlSeconds 60 |} . }",
+        )
+        .commit()
+        .await
+        .expect("ttl on one relationship");
+    // A second relationship on the same triple, written without a TTL.
+    fluree
+        .graph(&id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>
+             INSERT DATA { ex:a ex:knows ex:b {| ex:since 2021 |} . }",
+        )
+        .commit()
+        .await
+        .expect("a parallel relationship");
+    let report = fluree
+        .run_retention_at(&id, now_ms() + 61_000)
+        .await
+        .expect("pass");
+    assert_eq!(report.expired, 0, "{report:?}");
+    assert!(
+        report.problems.iter().any(|p| p.contains("shared")),
+        "{report:?}"
+    );
+    assert_eq!(
+        objects(&fluree, &id, &id, "ex:a", "ex:knows").await.len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn expiry_keeps_the_commit_log() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/ttl-log").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:s", "ex:v": {"@value": "x", "@ttl": 60}}),
+    )
+    .await;
+    let report = fluree
+        .run_retention_at(&id, now_ms() + 61_000)
+        .await
+        .expect("pass");
+    let t = report.committed_t.expect("expired");
+    let log = fluree.commit_log(&id, None).await.expect("commit log");
+    assert_eq!(log.0.len() as i64, t, "every commit is still in the log");
+}
