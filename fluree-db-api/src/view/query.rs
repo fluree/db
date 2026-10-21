@@ -1528,8 +1528,8 @@ impl Fluree {
     }
 
     /// Refuse a read of `db` that needs history its ledger's retention
-    /// suppressed. A read at the cached head costs nothing; see
-    /// [`crate::retention::suppression`].
+    /// suppressed. A read of a head view costs nothing, without I/O or
+    /// waiting on the ledger; see [`crate::retention::suppression`].
     pub(crate) async fn refuse_suppressed_view_history(
         &self,
         db: &GraphDb,
@@ -1537,7 +1537,7 @@ impl Fluree {
         executable: &ExecutableQuery,
         history_range: Option<(i64, i64)>,
     ) -> Result<()> {
-        let current = history_range.is_none() && self.is_current_read(&db.ledger_id, db.t);
+        let current = history_range.is_none() && !db.historical;
         self.refuse_stale_search_sources(parsed, !current).await?;
         if current {
             return Ok(());
@@ -1561,26 +1561,6 @@ impl Fluree {
             },
         )
         .await
-    }
-
-    /// Whether a read as of `t` is at (or past) the cached head of
-    /// `ledger_id`, known without any I/O or waiting on the ledger's lock: a
-    /// query issued while a transaction holds it (a Cypher `MERGE` probe
-    /// during restaging) is answered `false`, and takes the full check.
-    pub(crate) fn is_current_read(&self, ledger_id: &str, t: i64) -> bool {
-        let Ok(id) = fluree_db_core::LedgerId::parse(ledger_id) else {
-            return false;
-        };
-        let Some(manager) = self.ledger_manager.as_ref() else {
-            return false;
-        };
-        let Some(cached_t) = manager.try_current_t(&id) else {
-            return false;
-        };
-        let head = manager
-            .head_watermark(&id)
-            .map_or(cached_t, |w| w.max(cached_t));
-        t >= head
     }
 
     /// Apply a view's reasoning configuration to an executable.

@@ -259,6 +259,10 @@ pub struct GraphDb {
     /// drops `graph_source_id`), because the view's own id still names the
     /// graph source: see [`Self::member_kind`].
     pub(crate) over_graph_source: bool,
+    /// A view of an earlier point than its ledger's head: built from a
+    /// historical snapshot, or moved back with [`Self::as_of`]. Retention
+    /// checks such reads; a head view is current state.
+    pub(crate) historical: bool,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -330,6 +334,7 @@ impl GraphDb {
             graph_source_id: None,
             graph_source_time: None,
             over_graph_source: false,
+            historical: false,
         }
     }
 
@@ -393,6 +398,7 @@ impl GraphDb {
         );
         gdb.instance_bits = view.instance_bits();
         gdb.runtime_small_dicts = view.runtime_small_dicts().cloned();
+        gdb.historical = true;
         gdb
     }
 }
@@ -552,6 +558,9 @@ impl GraphDb {
     pub fn as_of(mut self, t: i64) -> Self {
         if self.t != t {
             self.clear_config_resolution();
+        }
+        if t < self.t {
+            self.historical = true;
         }
         self.t = t;
         self

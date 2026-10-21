@@ -2734,20 +2734,6 @@ impl LedgerManager {
         let (t, _, _) = handle.state_metrics().await;
         Some(t)
     }
-
-    /// The cached ledger's current `t` when it can be read without waiting:
-    /// `None` when the ledger is not cached, or its state is locked (a
-    /// transaction holds it). Never blocks, so a caller already inside a
-    /// transaction can ask.
-    pub fn try_current_t(&self, ledger_id: &LedgerId) -> Option<i64> {
-        let handle = match self.entries.try_read().ok()?.get(ledger_id) {
-            Some(LoadState::Ready(handle)) => handle.clone(),
-            Some(LoadState::Reloading { handle, .. }) => handle.clone(),
-            _ => return None,
-        };
-        let t = handle.inner.state.try_read().ok()?.t();
-        Some(t)
-    }
 }
 
 // ============================================================================

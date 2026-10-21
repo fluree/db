@@ -116,7 +116,7 @@ impl Fluree {
     /// The retention status of `ledger_id`.
     pub async fn retention_status(&self, ledger_id: &str) -> Result<RetentionStatus> {
         let ledger_id = fluree_db_core::LedgerId::parse(ledger_id)?.to_string();
-        let (_, registration) = registry::read(self.publisher()?, &ledger_id).await?;
+        let (_, registration) = registry::read(&self.nameservice_mode, &ledger_id).await?;
         let now = worker::now_ms();
         Ok(RetentionStatus {
             active: registration.is_some(),

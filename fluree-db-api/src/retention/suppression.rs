@@ -207,7 +207,7 @@ impl Fluree {
         &self,
         ledger_id: &str,
     ) -> Result<Option<Arc<Suppression>>> {
-        let ns = self.publisher()?;
+        let ns = &self.nameservice_mode;
         // On a cluster replica, first confirm the local copy is current,
         // whether or not this replica has seen the ledger registered yet: one
         // that has not applied its first registration does not know it is
@@ -244,10 +244,7 @@ impl Fluree {
             return Vec::new();
         }
         let unknown = || vec![RemovalSubject::Unknown; journal.removals.len()];
-        let Ok(publisher) = self.publisher() else {
-            return unknown();
-        };
-        let Ok(Some(record)) = publisher.lookup(ledger_id).await else {
+        let Ok(Some(record)) = self.nameservice().lookup(ledger_id).await else {
             return unknown();
         };
         let Ok(store) = self
@@ -384,7 +381,7 @@ impl Fluree {
         let Some(suppression) = self.suppression_for(ledger_id).await? else {
             return Ok(());
         };
-        let head_t = match self.publisher()?.lookup(ledger_id).await? {
+        let head_t = match self.nameservice().lookup(ledger_id).await? {
             Some(record) => record.commit_t,
             None => return Ok(()),
         };
