@@ -11,6 +11,7 @@ use fluree_db_core::{
 };
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
 use fluree_vocab::namespaces::FLUREE_COMMIT;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -447,7 +448,7 @@ pub async fn assemble_full_stats_with(
     }
 
     let graphs = stats.graphs.get_or_insert_with(Vec::new);
-    let mut graph_index: HashMap<GraphId, usize> = graphs
+    let mut graph_index: FxHashMap<GraphId, usize> = graphs
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.g_id, idx))
@@ -549,7 +550,10 @@ fn assemble_fast_stats_inner(
     // query went quadratic in the group size exactly this way). Retraction
     // pairs net each entry to zero, so positive entries = live facts.
     // Predicates that already have indexed ndv skip this entirely.
-    let indexed_ndv: HashSet<(u16, &str)> = indexed
+    // These maps are keyed by the ledger's own terms, borrowed from novelty
+    // for the length of the pass, and are hashed for every novelty flake:
+    // FxHash, which needs no protection from adversarial keys here.
+    let indexed_ndv: FxHashSet<(u16, &str)> = indexed
         .properties
         .as_ref()
         .map(|props| {
@@ -560,8 +564,11 @@ fn assemble_fast_stats_inner(
                 .collect()
         })
         .unwrap_or_default();
-    type NdvAcc = (HashMap<(FlakeValue, Sid), i64>, HashMap<Sid, i64>);
-    let mut ndv_acc: HashMap<(u16, &str), NdvAcc> = HashMap::new();
+    type NdvAcc<'f> = (
+        FxHashMap<(&'f FlakeValue, &'f Sid), i64>,
+        FxHashMap<&'f Sid, i64>,
+    );
+    let mut ndv_acc: FxHashMap<(u16, &str), NdvAcc<'_>> = FxHashMap::default();
     let counts_only = class_detail == ClassDetail::CountsOnly;
     // With per-graph base stats the class table is re-derived by
     // `union_per_graph_classes` after the loop, so this accumulator is unused.
@@ -578,7 +585,7 @@ fn assemble_fast_stats_inner(
         ClassDetail::CountsOnly => graphs_without_classes(indexed),
     };
     let mut class_index = GraphClassIndex::default();
-    let mut graph_index: HashMap<GraphId, usize> = graphs
+    let mut graph_index: FxHashMap<GraphId, usize> = graphs
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.g_id, idx))
@@ -649,10 +656,8 @@ fn assemble_fast_stats_inner(
         let sid_key = (flake.p.namespace_code, &*flake.p.name);
         if !indexed_ndv.contains(&sid_key) {
             let acc = ndv_acc.entry(sid_key).or_default();
-            *acc.0
-                .entry((flake.o.clone(), flake.dt.clone()))
-                .or_insert(0) += delta;
-            *acc.1.entry(flake.s.clone()).or_insert(0) += delta;
+            *acc.0.entry((&flake.o, &flake.dt)).or_insert(0) += delta;
+            *acc.1.entry(&flake.s).or_insert(0) += delta;
         }
         let property = property_deltas.entry(sid_key).or_default();
         property.count += delta;
@@ -709,7 +714,7 @@ fn assemble_fast_stats_inner(
         }
     }
 
-    let novelty_ndv: HashMap<(u16, &str), (u64, u64)> = ndv_acc
+    let novelty_ndv: FxHashMap<(u16, &str), (u64, u64)> = ndv_acc
         .into_iter()
         .map(|(sid, (values, subjects))| {
             (
@@ -1234,7 +1239,7 @@ fn indexed_t(indexed: &IndexStats, snapshot: &LedgerSnapshot) -> i64 {
 
 fn get_or_insert_graph_entry<'a>(
     graphs: &'a mut Vec<GraphStatsEntry>,
-    graph_index: &mut HashMap<GraphId, usize>,
+    graph_index: &mut FxHashMap<GraphId, usize>,
     g_id: GraphId,
 ) -> &'a mut GraphStatsEntry {
     if let Some(idx) = graph_index.get(&g_id).copied() {
@@ -1465,10 +1470,10 @@ struct PropertyStatDelta {
     asserted_datatypes: HashSet<u8>,
 }
 
-type PropertyDeltaMap<'a> = HashMap<(u16, &'a str), PropertyStatDelta>;
+type PropertyDeltaMap<'a> = FxHashMap<(u16, &'a str), PropertyStatDelta>;
 
 fn build_property_deltas(indexed: &IndexStats) -> PropertyDeltaMap<'_> {
-    let mut deltas = PropertyDeltaMap::new();
+    let mut deltas = PropertyDeltaMap::default();
     if let Some(ref props) = indexed.properties {
         for entry in props {
             deltas.insert(
@@ -1566,7 +1571,7 @@ fn union_observed_datatypes(base: &[u8], asserted: &HashSet<u8>) -> Vec<u8> {
 fn finalize_properties(
     indexed: &IndexStats,
     property_deltas: PropertyDeltaMap<'_>,
-    novelty_ndv: &HashMap<(u16, &str), (u64, u64)>,
+    novelty_ndv: &FxHashMap<(u16, &str), (u64, u64)>,
 ) -> Option<Vec<PropertyStatEntry>> {
     if property_deltas.is_empty() {
         indexed.properties.clone()
