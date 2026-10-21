@@ -1992,6 +1992,14 @@ impl Fluree {
         // `lineage` page carries the commits its merges brought in
         // separately. Clone stores them like any other.
         let (line_ids, merged_ids) = response.ids()?;
+        let blob_ids = response
+            .blobs
+            .keys()
+            .filter_map(|cid| cid.parse::<ContentId>().ok())
+            .collect::<Vec<_>>();
+        for id in line_ids.iter().chain(&merged_ids).chain(&blob_ids) {
+            self.admit_content_id(id)?;
+        }
         let all = response.commits.iter().chain(&response.merged_commits);
         for (id, b64) in line_ids.iter().chain(&merged_ids).zip(all) {
             let bytes = &b64.0;
@@ -2054,6 +2062,7 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
+        self.admit_content_id(head_commit_id)?;
         let fence = handle.snapshot().await.fence();
         self.set_ref(
             handle.id(),
@@ -2076,6 +2085,7 @@ impl Fluree {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
+        self.admit_content_id(index_id)?;
         let fence = handle.snapshot().await.fence();
         self.set_ref(handle.id(), fence, RefKind::IndexHead, index_id, index_t)
             .await
@@ -2277,15 +2287,7 @@ impl Fluree {
                                             "invalid .flpack: Data frame before Header",
                                         ));
                                     }
-                                    if !self.admits_content_id(&cid) {
-                                        return Err(ApiError::http(
-                                            422,
-                                            format!(
-                                                "archived {cid} is not hashed with SHA2-256, \
-                                                 the only hash this cluster admits"
-                                            ),
-                                        ));
-                                    }
+                                    self.admit_content_id(&cid)?;
                                     // Count at dispatch: any write failure aborts the
                                     // whole restore (and rolls it back), so only the
                                     // success path ever returns these counts.

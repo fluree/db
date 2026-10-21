@@ -6,7 +6,7 @@
 //! it: a standalone instance is its own reader, while a cluster member's
 //! readers are its members, whose capabilities are not yet established, so
 //! a member mints SHA2-256 and refuses content hashed otherwise (a push, a
-//! pull, a restored archive). Verification never depends on this choice: it
+//! pull, a clone, a restored archive). Verification never depends on this choice: it
 //! follows the CID being verified.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +67,18 @@ impl Fluree {
             Some(HashAlgorithm::Sha2_256) => true,
             Some(_) => self.content_hash.confirmed(),
             None => false,
+        }
+    }
+
+    /// Refuse content under `id` this instance does not admit.
+    pub(crate) fn admit_content_id(&self, id: &ContentId) -> crate::Result<()> {
+        if self.admits_content_id(id) {
+            Ok(())
+        } else {
+            Err(crate::ApiError::http(
+                422,
+                format!("{id} is not hashed with SHA2-256, the only hash this cluster admits"),
+            ))
         }
     }
 

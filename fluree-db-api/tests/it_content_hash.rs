@@ -373,7 +373,7 @@ async fn unsupported_hashes_are_refused_by_the_store() {
 }
 
 /// An instance whose readers are not known to support SHA2-512 (a cluster
-/// member) admits none of it, by push, pull or restore.
+/// member) admits none of it, by push, pull, clone or restore.
 #[tokio::test]
 async fn unconfirmed_readers_refuse_other_hashes_on_every_transfer() {
     let dir = tempfile::tempdir().unwrap();
@@ -404,6 +404,24 @@ async fn unconfirmed_readers_refuse_other_hashes_on_every_transfer() {
         .import_commits_incremental(pulled, bundle(&source, LEDGER, true).await)
         .await;
     assert!(pull.is_err_and(refused), "pull admitted SHA2-512");
+
+    // Clone: pages written in bulk, then the head set.
+    let cloned = "it/content-hash-member-clone:main";
+    receiver.create_ledger(cloned).await.unwrap();
+    let handle = receiver.ledger_cached(cloned).await.unwrap();
+    let page = source
+        .export_commit_range(
+            &source.ledger_cached(LEDGER).await.unwrap(),
+            &ExportCommitsRequest::default(),
+        )
+        .await
+        .expect("export");
+    let bulk = receiver.import_commits_bulk(&handle, &page).await;
+    assert!(bulk.is_err_and(refused), "clone admitted SHA2-512");
+    let head = receiver
+        .set_commit_head(&handle, &page.head_commit_id, page.head_t)
+        .await;
+    assert!(head.is_err_and(refused), "clone finalized a SHA2-512 head");
 
     let mut archive = Vec::new();
     source
