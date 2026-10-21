@@ -133,7 +133,8 @@ def _iso(lexical: str) -> str:
     """`lexical` in the form every supported Python's `fromisoformat` accepts.
 
     Before 3.11 it takes no "Z" suffix and only a 3- or 6-digit fraction; the
-    engine writes up to 9 digits, cut here to microseconds as 3.11 does."""
+    engine writes at most six digits, without trailing zeros, so the fraction
+    is padded to six here."""
     if lexical.endswith("Z"):
         lexical = lexical[:-1] + "+00:00"
     return _FRACTION.sub(lambda m: "." + m[1][:6].ljust(6, "0"), lexical, count=1)
