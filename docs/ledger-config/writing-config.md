@@ -256,13 +256,14 @@ WHERE {
   } UNION {
     GRAPH <urn:fluree:mydb:main#config> { ?parent ?edge ?root }
     VALUES ?edge { f:policyDefaults f:shaclDefaults f:reasoningDefaults f:datalogDefaults
-                   f:transactDefaults f:fullTextDefaults f:servingDefaults f:queryDefaults
-                   f:graphOverrides f:overrideControl f:shapesSource f:policySource
+                   f:transactDefaults f:fullTextDefaults f:retentionDefaults
+                   f:servingDefaults f:queryDefaults f:graphOverrides f:overrideControl f:shapesSource f:policySource
                    f:schemaSource f:rulesSource f:constraintsSource f:graphSource
                    f:trustPolicy f:rollbackGuard f:ontologyImportMap f:graphRef f:property }
   }
   ?root (f:policyDefaults|f:shaclDefaults|f:reasoningDefaults|f:datalogDefaults|
-         f:transactDefaults|f:fullTextDefaults|f:servingDefaults|f:queryDefaults|
+         f:transactDefaults|f:fullTextDefaults|f:retentionDefaults|f:servingDefaults|
+         f:queryDefaults|
          f:graphOverrides|f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
          f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|
          f:ontologyImportMap|f:graphRef|f:property|f:reasoningModes|rdf:rest)* ?n .
@@ -283,7 +284,8 @@ INSERT { GRAPH <urn:fluree:mydb:main#config> { ?root a f:LedgerConfig . ?n ?p ?o
 WHERE {
   VALUES ?root { <urn:fluree:mydb:main:config:ledger> }
   ?root (f:policyDefaults|f:shaclDefaults|f:reasoningDefaults|f:datalogDefaults|
-         f:transactDefaults|f:fullTextDefaults|f:servingDefaults|f:queryDefaults|
+         f:transactDefaults|f:fullTextDefaults|f:retentionDefaults|f:servingDefaults|
+         f:queryDefaults|
          f:graphOverrides|f:overrideControl|f:shapesSource|f:policySource|f:schemaSource|
          f:rulesSource|f:constraintsSource|f:graphSource|f:trustPolicy|f:rollbackGuard|
          f:ontologyImportMap|f:graphRef|f:property|f:reasoningModes|rdf:rest)* ?n .

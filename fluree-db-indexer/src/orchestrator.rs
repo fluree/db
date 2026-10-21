@@ -1007,9 +1007,37 @@ pub trait Housekeeping: Send + Sync {
     async fn tick(&self);
 }
 
+/// Several housekeepings run as one, in order, each to completion.
+pub struct Housekeepings(pub Vec<Arc<dyn Housekeeping>>);
+
+#[async_trait::async_trait]
+impl Housekeeping for Housekeepings {
+    async fn tick(&self) {
+        for housekeeping in &self.0 {
+            housekeeping.tick().await;
+        }
+    }
+}
+
 /// The housekeeping a worker's catch-up tick runs, shared with its handle so
 /// it can be installed once the worker is running.
 type HousekeepingSlot = Arc<std::sync::RwLock<Option<Arc<dyn Housekeeping>>>>;
+
+/// Work the background worker runs before it builds a ledger's index, with
+/// the record it builds from: see [`IndexerHandle::set_build_observer`].
+///
+/// An error skips the build, which is retried, so what the observer must see
+/// before the index covers it is never indexed past unseen.
+#[async_trait::async_trait]
+pub trait BuildObserver: Send + Sync {
+    async fn before_build(
+        &self,
+        record: &fluree_db_nameservice::NsRecord,
+    ) -> std::result::Result<(), String>;
+}
+
+/// The build observer, shared with the worker's handle like housekeeping.
+type BuildObserverSlot = Arc<std::sync::RwLock<Option<Arc<dyn BuildObserver>>>>;
 
 async fn run_housekeeping(slot: &HousekeepingSlot) {
     let housekeeping = slot.read().ok().and_then(|h| h.clone());
@@ -1034,6 +1062,7 @@ async fn run_housekeeping(slot: &HousekeepingSlot) {
 pub struct IndexerHandle {
     trigger: TriggerHandle,
     housekeeping: HousekeepingSlot,
+    build_observer: BuildObserverSlot,
     /// Holding this Arc bumps the shutdown trigger's strong count;
     /// dropping the last clone fires the worker's `shutdown_rx`.
     _shutdown: Arc<ShutdownTrigger>,
@@ -1422,6 +1451,14 @@ impl TriggerHandle {
 impl IndexerHandle {
     /// Run `housekeeping` on this worker's catch-up ticks, replacing any
     /// installed before. A worker that does not own catch-up never runs it.
+    /// Run `observer` before each background build, replacing any observer
+    /// installed before.
+    pub fn set_build_observer(&self, observer: Arc<dyn BuildObserver>) {
+        if let Ok(mut slot) = self.build_observer.write() {
+            *slot = Some(observer);
+        }
+    }
+
     pub fn set_housekeeping(&self, housekeeping: Arc<dyn Housekeeping>) {
         if let Ok(mut slot) = self.housekeeping.write() {
             *slot = Some(housekeeping);
@@ -1596,6 +1633,7 @@ pub struct BackgroundIndexerWorker {
     branch_directory: Arc<BranchDirectory>,
     /// Shared with the handle; run on each catch-up tick.
     housekeeping: HousekeepingSlot,
+    build_observer: BuildObserverSlot,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
@@ -1653,6 +1691,7 @@ impl BackgroundIndexerWorker {
         let maintenance: MaintenanceHolds = Arc::default();
         let gc_locks: GcLocks = Arc::default();
         let housekeeping: HousekeepingSlot = Arc::default();
+        let build_observer: BuildObserverSlot = Arc::default();
 
         let trigger = TriggerHandle {
             states: Arc::clone(&states),
@@ -1664,6 +1703,7 @@ impl BackgroundIndexerWorker {
         let handle = IndexerHandle {
             trigger: trigger.clone(),
             housekeeping: Arc::clone(&housekeeping),
+            build_observer: Arc::clone(&build_observer),
             _shutdown: shutdown,
         };
 
@@ -1682,6 +1722,7 @@ impl BackgroundIndexerWorker {
             gc_locks,
             branch_directory: Arc::default(),
             housekeeping,
+            build_observer,
         };
 
         (worker, handle)
@@ -2382,6 +2423,14 @@ impl BackgroundIndexerWorker {
                 .unwrap_or(None)
         };
 
+        let observer = self.build_observer.read().ok().and_then(|o| o.clone());
+        if let Some(observer) = observer {
+            if let Err(e) = observer.before_build(&record).await {
+                warn!(ledger_id = %ledger_id, error = %e, "build observer failed; build deferred");
+                self.schedule_retry(ledger_id, &e).await;
+                return;
+            }
+        }
         let result = crate::build_index_for_record_with_tracker(
             content_store.clone(),
             build_tracker.clone(),

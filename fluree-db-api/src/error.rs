@@ -587,6 +587,19 @@ impl ApiError {
         )
     }
 
+    /// Whether a commit lost to another writer: the head moved under it.
+    pub fn is_commit_conflict(&self) -> bool {
+        use fluree_db_transact::TransactError as TE;
+        matches!(
+            self,
+            ApiError::Transact(
+                TE::CommitConflict { .. }
+                    | TE::CommitIdMismatch { .. }
+                    | TE::PublishLostRace { .. }
+            )
+        )
+    }
+
     /// Check if this error represents a "not found" condition.
     ///
     /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.

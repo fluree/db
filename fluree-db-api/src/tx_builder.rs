@@ -2018,6 +2018,8 @@ impl Fluree {
             graph_delta,
             sync_graph,
         } = stage;
+        let mut view = view;
+        let system_txn_meta = view.take_system_txn_meta();
         let (stale_base, mut flakes) = view.into_parts();
         drop(stale_base);
         let new_t = current.t() + 1;
@@ -2081,7 +2083,10 @@ impl Fluree {
         );
         // A bounded scope has no named-graph flakes (see `write_scope`), so
         // the graph routing map is empty.
-        let view = StagedLedger::new(guard.clone_state(), flakes, &HashMap::new()).ok()?;
+        let mut view = StagedLedger::new(guard.clone_state(), flakes, &HashMap::new()).ok()?;
+        for entry in system_txn_meta {
+            view.push_system_txn_meta(entry);
+        }
         Some(StageResult {
             view,
             ns_registry,

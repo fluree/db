@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::config_vocab::{
     conventional_config_subject, is_config_field, CONFIG_CLASSES, CONFIG_EDGES, SINGLE_VALUED,
 };
+use crate::retention::validate::RetentionSignals;
 use fluree_db_core::graph_registry::{config_graph_iri, CONFIG_GRAPH_ID};
 use fluree_db_core::{
     range_with_overlay, Flake, FlakeValue, GraphId, IndexType, RangeMatch, RangeOptions, RangeTest,
@@ -170,18 +171,23 @@ fn split_group_for_branch_op(
 /// `scope` picks the checks: a branch operation runs R1 and R3 only, and its
 /// messages name the target's config group and the repair. `ns` and
 /// `graph_delta` name terms and graphs in messages.
+///
+/// Returns what the write carries for retention, noticed in the same pass
+/// ([`crate::retention::validate::note`]), for the caller to validate.
 pub(crate) async fn validate_staged_config(
     view: &StagedLedger,
     ns: &NamespaceRegistry,
     graph_delta: &FxHashMap<u16, String>,
     scope: GuardScope,
-) -> Result<(), GuardError> {
+) -> Result<RetentionSignals, GuardError> {
     let authoring = scope == GuardScope::Authoring;
     let rdf_type = Sid::new(RDF, fluree_vocab::rdf_names::TYPE);
     let modes_p = fluree_sid(config_iris::REASONING_MODES);
     let (mut writes_config, mut types_config, mut asserts_modes) = (false, false, false);
     let mut writes_fields_elsewhere = false;
+    let mut retention = RetentionSignals::default();
     for (g_id, flake) in view.staged_flakes_by_graph() {
+        crate::retention::validate::note(&mut retention, g_id, flake);
         writes_config |= g_id == CONFIG_GRAPH_ID;
         types_config |= flake.op
             && flake.p == rdf_type
@@ -192,7 +198,7 @@ pub(crate) async fn validate_staged_config(
     }
     let (types_config, asserts_modes) = (authoring && types_config, authoring && asserts_modes);
     if !(writes_config || types_config || asserts_modes || writes_fields_elsewhere) {
-        return Ok(());
+        return Ok(retention);
     }
 
     let names = Names::new(view, ns, graph_delta);
@@ -212,7 +218,7 @@ pub(crate) async fn validate_staged_config(
     if asserts_modes {
         validate_reasoning_modes(view, &modes_p)?;
     }
-    Ok(())
+    Ok(retention)
 }
 
 /// The branch (and the graph's role, `config` or `txn-meta`) when `iri` is

@@ -27,8 +27,8 @@ use std::sync::Arc;
 use fluree_db_core::ledger_config::{
     DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
     OntologyImportBinding, OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults,
-    ResolvedConfig, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
-    TrustPolicy, ValidationMode,
+    ResolvedConfig, RetentionDefaults, RetentionProperty, RollbackGuard, ServingDefaults,
+    ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -106,6 +106,7 @@ pub async fn resolve_ledger_config(
     let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let retention = read_retention_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
@@ -118,6 +119,7 @@ pub async fn resolve_ledger_config(
         datalog,
         transact,
         full_text,
+        retention,
         serving,
         query,
         graph_overrides,
@@ -292,6 +294,11 @@ async fn group_is_empty(
         config_iris::FULL_TEXT_DEFAULTS => read_fulltext_fields(snapshot, overlay, to_t, group_sid)
             .await?
             .is_empty(),
+        config_iris::RETENTION_DEFAULTS => {
+            read_retention_fields(snapshot, overlay, to_t, group_sid)
+                .await?
+                .is_empty()
+        }
         config_iris::SERVING_DEFAULTS => read_serving_fields(snapshot, overlay, to_t, group_sid)
             .await?
             .is_empty(),
@@ -826,6 +833,25 @@ pub fn resolve_effective_config(config: &LedgerConfig, graph_iri: Option<&str>) 
             &config.full_text,
             graph_override.and_then(|gc| gc.full_text.as_ref()),
         ),
+        retention: merge_retention(
+            &config.retention,
+            graph_override.and_then(|gc| gc.retention.as_ref()),
+        ),
+    }
+}
+
+/// Merge a graph's retention entries over the ledger-wide ones. Unlike the
+/// other groups there is no override control: a graph's entries always
+/// apply, field by field (see [`RetentionDefaults::merge_over`]).
+fn merge_retention(
+    ledger_wide: &Option<RetentionDefaults>,
+    per_graph: Option<&RetentionDefaults>,
+) -> Option<RetentionDefaults> {
+    match (ledger_wide, per_graph) {
+        (None, None) => None,
+        (Some(lw), None) => Some(lw.clone()),
+        (None, Some(pg)) => Some(pg.clone()),
+        (Some(lw), Some(pg)) => Some(pg.merge_over(lw)),
     }
 }
 
@@ -2395,6 +2421,205 @@ async fn read_fulltext_fields(
     })
 }
 
+/// Read retention defaults from a parent subject (LedgerConfig or GraphConfig).
+///
+/// `f:retentionDefaults` points to a group whose `f:property` entries each
+/// carry one `f:target` and optional `f:noHistory` / `f:ttlSeconds`. Unlike
+/// the other readers, a malformed entry is not skipped silently: it lands in
+/// [`RetentionDefaults::problems`], which blocks retention processing for the
+/// ledger instead of reading as "no policy". Returns `None` when the parent
+/// has no group.
+async fn read_retention_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<RetentionDefaults>> {
+    let groups = read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::RETENTION_DEFAULTS,
+    )
+    .await?;
+    let several = groups.len() > 1;
+    for group_sid in groups {
+        let mut group = read_retention_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if several {
+            group
+                .problems
+                .push("several f:retentionDefaults groups on one config node".to_string());
+        }
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The entries of one `RetentionDefaults` group node.
+async fn read_retention_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<RetentionDefaults> {
+    let mut group = RetentionDefaults::default();
+    // Fields that belong elsewhere: retention has no override control, and
+    // its fields sit on entries, not on the group.
+    for (misplaced, problem) in [
+        (
+            config_iris::OVERRIDE_CONTROL,
+            "f:overrideControl does not apply to f:retentionDefaults",
+        ),
+        (
+            config_iris::NO_HISTORY,
+            "f:noHistory belongs on an f:RetentionProperty entry, not on the group",
+        ),
+        (
+            config_iris::TTL_SECONDS,
+            "f:ttlSeconds belongs on an f:RetentionProperty entry, not on the group",
+        ),
+    ] {
+        if let Some(pred) = try_encode(snapshot, misplaced) {
+            if !query_config_predicate(snapshot, overlay, to_t, group_sid, &pred)
+                .await?
+                .is_empty()
+            {
+                group.problems.push(problem.to_string());
+            }
+        }
+    }
+    let Some(pred_sid) = try_encode(snapshot, config_iris::FULL_TEXT_PROPERTY) else {
+        return Ok(group);
+    };
+    for binding in query_config_predicate(snapshot, overlay, to_t, group_sid, &pred_sid).await? {
+        let Some(entry_sid) = binding.as_sid() else {
+            group
+                .problems
+                .push("f:property on f:retentionDefaults is not a node".to_string());
+            continue;
+        };
+        let targets: Vec<String> = match try_encode(snapshot, config_iris::FULL_TEXT_TARGET) {
+            Some(target_sid) => {
+                query_config_predicate(snapshot, overlay, to_t, entry_sid, &target_sid)
+                    .await?
+                    .iter()
+                    .filter_map(|b| {
+                        // A namespace this same write introduces does not
+                        // decode against the base snapshot; the entry still
+                        // has its one target.
+                        b.as_sid().map(|sid| {
+                            snapshot
+                                .decode_sid(sid)
+                                .unwrap_or_else(|| format!("{}:{}", sid.namespace_code, sid.name))
+                        })
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let target = match targets.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                group
+                    .problems
+                    .push("f:RetentionProperty entry without an IRI f:target".to_string());
+                continue;
+            }
+            _ => {
+                group
+                    .problems
+                    .push("f:RetentionProperty entry with several f:target values".to_string());
+                continue;
+            }
+        };
+        let no_history = read_retention_scalar(
+            snapshot,
+            overlay,
+            to_t,
+            entry_sid,
+            config_iris::NO_HISTORY,
+            &target,
+            &mut group.problems,
+            |v| match v {
+                fluree_db_core::FlakeValue::Boolean(b) => Some(*b),
+                _ => None,
+            },
+        )
+        .await?;
+        let ttl_seconds = read_retention_scalar(
+            snapshot,
+            overlay,
+            to_t,
+            entry_sid,
+            config_iris::TTL_SECONDS,
+            &target,
+            &mut group.problems,
+            |v| match v {
+                fluree_db_core::FlakeValue::Long(n) => u64::try_from(*n).ok(),
+                _ => None,
+            },
+        )
+        .await?;
+        if target.starts_with(fluree_vocab::fluree::DB) || target == fluree_vocab::rdf::REIFIES {
+            group.problems.push(format!(
+                "retention may not govern the system predicate <{target}>"
+            ));
+            continue;
+        }
+        if group.properties.iter().any(|p| p.target == target) {
+            group.problems.push(format!(
+                "several f:RetentionProperty entries target <{target}>"
+            ));
+            continue;
+        }
+        group.properties.push(RetentionProperty {
+            target,
+            no_history,
+            ttl_seconds,
+        });
+    }
+    Ok(group)
+}
+
+/// One single-valued retention field, recording a wrong type, a value out of
+/// range or a second value as a problem rather than ignoring it.
+#[allow(clippy::too_many_arguments)]
+async fn read_retention_scalar<T>(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    entry_sid: &Sid,
+    pred_iri: &str,
+    target: &str,
+    problems: &mut Vec<String>,
+    accept: impl Fn(&fluree_db_core::FlakeValue) -> Option<T>,
+) -> Result<Option<T>> {
+    let Some(pred_sid) = try_encode(snapshot, pred_iri) else {
+        return Ok(None);
+    };
+    let bindings = query_config_predicate(snapshot, overlay, to_t, entry_sid, &pred_sid).await?;
+    let field = pred_iri
+        .strip_prefix(fluree_vocab::fluree::DB)
+        .unwrap_or(pred_iri);
+    if bindings.len() > 1 {
+        problems.push(format!("f:{field} on <{target}> has several values"));
+        return Ok(None);
+    }
+    let Some(binding) = bindings.first() else {
+        return Ok(None);
+    };
+    match binding.as_lit().and_then(|(v, _)| accept(v)) {
+        Some(value) => Ok(Some(value)),
+        None => {
+            problems.push(format!("f:{field} on <{target}> has an invalid value"));
+            Ok(None)
+        }
+    }
+}
+
 /// Read per-graph config overrides (`f:graphOverrides`).
 async fn read_graph_overrides(
     snapshot: &LedgerSnapshot,
@@ -2444,6 +2669,7 @@ async fn read_single_graph_config(
     let datalog = read_datalog_defaults(snapshot, overlay, to_t, gc_sid).await?;
     let transact = read_transact_defaults(snapshot, overlay, to_t, gc_sid).await?;
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let retention = read_retention_defaults(snapshot, overlay, to_t, gc_sid).await?;
 
     Ok(Some(GraphConfig {
         target_graph,
@@ -2453,6 +2679,7 @@ async fn read_single_graph_config(
         datalog,
         transact,
         full_text,
+        retention,
     }))
 }
 
@@ -2835,6 +3062,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -2864,6 +3092,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -2892,6 +3121,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -2921,6 +3151,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -2951,6 +3182,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -3066,6 +3298,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -3103,6 +3336,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -3130,6 +3364,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };
@@ -3156,6 +3391,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                retention: None,
             }],
             ..Default::default()
         };

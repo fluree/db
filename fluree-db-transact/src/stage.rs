@@ -1783,6 +1783,21 @@ async fn hidden_restatements(
 ///
 /// Returns `Ok(())` if all flakes pass policy, or an error if any flake is
 /// denied or a pre-state lookup fails.
+/// Enforce `policy`'s modify rules on `flakes` against `ledger`, as staging
+/// does for a transaction's own flakes. A root policy allows everything.
+pub async fn enforce_modify_policy(
+    flakes: &[Flake],
+    policy: &PolicyContext,
+    ledger: &LedgerState,
+    tracker: Option<&Tracker>,
+) -> Result<()> {
+    if policy.wrapper().is_root() {
+        return Ok(());
+    }
+    let reverse_graph = ledger.snapshot.build_reverse_graph()?;
+    enforce_modify_policies(flakes, policy, ledger, tracker, &reverse_graph).await
+}
+
 async fn enforce_modify_policies(
     flakes: &[Flake],
     policy: &PolicyContext,

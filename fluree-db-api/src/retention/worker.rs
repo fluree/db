@@ -1,0 +1,340 @@
+//! The retention worker, run by the maintenance owner.
+//!
+//! The indexer's catch-up tick ([`Housekeeping`]) starts it and wakes it; it
+//! then also runs on its own, shorter interval, because TTLs come due on
+//! quiet ledgers that have nothing to index. Each pass covers the branches
+//! registered as active. A branch becomes active when the background indexer
+//! is about to build commits that carry retention input
+//! ([`BuildObserver`]): that check happens before the index can cover those
+//! commits, so a crash cannot lose an activation.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use fluree_db_indexer::{BuildObserver, Housekeeping};
+use fluree_db_nameservice::NsRecord;
+use tokio::sync::Notify;
+
+use super::engine::{probe_activation, PassReport, ScheduleCache};
+use super::registry;
+use super::writer::{RetentionBatch, RetentionWriter, SubmitOutcome};
+use super::RetentionLimits;
+use crate::{Fluree, Result};
+
+/// The retention state one `Fluree` instance keeps in memory.
+#[derive(Default)]
+pub(crate) struct RetentionRuntime {
+    /// Branches known to be registered.
+    active: parking_lot::Mutex<HashSet<String>>,
+    /// Unregistered branches, with the commit `t` their chain was probed
+    /// through.
+    probed: parking_lot::Mutex<HashMap<String, i64>>,
+    /// Wakes the worker.
+    nudge: Arc<Notify>,
+    /// A worker runs in this process.
+    running: AtomicBool,
+    /// When the worker last finished a sweep (epoch ms).
+    last_sweep_ms: AtomicI64,
+    /// Schedules held between passes.
+    pub(crate) cache: ScheduleCache,
+}
+
+impl RetentionRuntime {
+    fn mark_active(&self, ledger_id: &str) {
+        self.active.lock().insert(ledger_id.to_string());
+        self.probed.lock().remove(ledger_id);
+        self.nudge.notify_one();
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+}
+
+/// Settings for the retention worker.
+#[derive(Clone, Debug)]
+pub struct RetentionOptions {
+    /// How often the worker runs a pass over active branches, besides the
+    /// catch-up ticks that wake it.
+    pub interval: Duration,
+    /// How often it re-reads every branch's registration, to pick up ones
+    /// another process registered.
+    pub rescan_interval: Duration,
+    /// Bounds on one pass.
+    pub limits: RetentionLimits,
+}
+
+impl Default for RetentionOptions {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(15),
+            rescan_interval: Duration::from_secs(600),
+            limits: RetentionLimits::default(),
+        }
+    }
+}
+
+pub(crate) fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+struct Worker {
+    fluree: Weak<Fluree>,
+    writer: Arc<dyn RetentionWriter>,
+    options: RetentionOptions,
+}
+
+/// The [`Housekeeping`] that starts and wakes the retention worker. Dropping
+/// it (the owner losing catch-up, a Raft leader stepping down) stops the
+/// worker after its current pass.
+struct RetentionHousekeeping {
+    worker: Arc<Worker>,
+    started: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Housekeeping for RetentionHousekeeping {
+    async fn tick(&self) {
+        let Some(fluree) = self.worker.fluree.upgrade() else {
+            return;
+        };
+        if !self.started.swap(true, Ordering::AcqRel) {
+            let nudge = Arc::clone(&fluree.retention.nudge);
+            tokio::spawn(drive(Arc::downgrade(&self.worker), nudge));
+        }
+        fluree.retention.nudge.notify_one();
+    }
+}
+
+async fn drive(worker: Weak<Worker>, nudge: Arc<Notify>) {
+    let mut last_rescan: Option<Instant> = None;
+    loop {
+        let interval = {
+            let Some(worker) = worker.upgrade() else {
+                break;
+            };
+            let Some(fluree) = worker.fluree.upgrade() else {
+                break;
+            };
+            fluree.retention.running.store(true, Ordering::Relaxed);
+            if last_rescan.is_none_or(|t| t.elapsed() >= worker.options.rescan_interval) {
+                if let Err(e) = fluree.rescan_retention_registrations().await {
+                    tracing::warn!(error = %e, "retention: cannot list registrations");
+                }
+                last_rescan = Some(Instant::now());
+            }
+            let busy = fluree.retention_sweep(&worker).await;
+            if busy {
+                Duration::from_millis(50)
+            } else {
+                worker.options.interval
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = nudge.notified() => {}
+        }
+    }
+    if let Some(fluree) = worker.upgrade().and_then(|w| w.fluree.upgrade()) {
+        fluree.retention.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Registers branches as the background indexer reaches commits that carry
+/// retention input.
+struct RetentionBuildObserver {
+    fluree: Weak<Fluree>,
+}
+
+#[async_trait::async_trait]
+impl BuildObserver for RetentionBuildObserver {
+    async fn before_build(&self, record: &NsRecord) -> std::result::Result<(), String> {
+        let Some(fluree) = self.fluree.upgrade() else {
+            return Ok(());
+        };
+        fluree
+            .observe_build_for_retention(record)
+            .await
+            .map_err(|e| format!("retention activation check: {e}"))
+    }
+}
+
+/// Commits through a borrowed `Fluree`, for explicit passes.
+struct BorrowedWriter<'a>(&'a Fluree);
+
+#[async_trait::async_trait]
+impl RetentionWriter for BorrowedWriter<'_> {
+    async fn submit(&self, ledger_id: &str, batch: RetentionBatch) -> Result<SubmitOutcome> {
+        self.0.commit_retention_batch(ledger_id, batch).await
+    }
+}
+
+impl Fluree {
+    /// Housekeeping that runs the retention worker, committing through
+    /// `writer` (this instance directly when `None`). Install it on the
+    /// worker that owns catch-up, composed with any other housekeeping (see
+    /// [`fluree_db_indexer::Housekeepings`]), together with
+    /// [`retention_build_observer`](Self::retention_build_observer).
+    pub fn retention_housekeeping(
+        self: &Arc<Self>,
+        writer: Option<Arc<dyn RetentionWriter>>,
+        options: RetentionOptions,
+    ) -> Arc<dyn Housekeeping> {
+        let writer = writer.unwrap_or_else(|| {
+            Arc::new(super::writer::DirectRetentionWriter {
+                fluree: Arc::downgrade(self),
+            })
+        });
+        Arc::new(RetentionHousekeeping {
+            worker: Arc::new(Worker {
+                fluree: Arc::downgrade(self),
+                writer,
+                options,
+            }),
+            started: AtomicBool::new(false),
+        })
+    }
+
+    /// The build observer that registers branches for retention before the
+    /// background indexer covers commits carrying retention input.
+    pub fn retention_build_observer(self: &Arc<Self>) -> Arc<dyn BuildObserver> {
+        Arc::new(RetentionBuildObserver {
+            fluree: Arc::downgrade(self),
+        })
+    }
+
+    /// Run one retention pass over `ledger_id` now, committing directly. A
+    /// branch not yet registered is activated first when its commits carry
+    /// retention input.
+    pub async fn run_retention(&self, ledger_id: &str) -> Result<PassReport> {
+        self.run_retention_at(ledger_id, now_ms()).await
+    }
+
+    /// [`run_retention`](Self::run_retention) as of `now_ms` (epoch ms): due
+    /// times are compared against it rather than the clock.
+    pub async fn run_retention_at(&self, ledger_id: &str, now_ms: i64) -> Result<PassReport> {
+        let ns = self.publisher()?;
+        if registry::read(ns, ledger_id).await?.1.is_none() {
+            self.probe_and_activate(ledger_id, 0).await?;
+        }
+        let limits = RetentionLimits::default();
+        self.retention_pass(
+            &BorrowedWriter(self),
+            &self.retention.cache,
+            ledger_id,
+            now_ms,
+            &limits,
+        )
+        .await
+    }
+
+    /// One pass over every active branch. Returns whether there is more
+    /// work right away (a batch committed or was recomputed).
+    async fn retention_sweep(&self, worker: &Worker) -> bool {
+        let ledgers: Vec<String> = self.retention.active.lock().iter().cloned().collect();
+        let mut busy = false;
+        for ledger_id in ledgers {
+            match self
+                .retention_pass(
+                    worker.writer.as_ref(),
+                    &self.retention.cache,
+                    &ledger_id,
+                    now_ms(),
+                    &worker.options.limits,
+                )
+                .await
+            {
+                Ok(report) if report.inactive => {
+                    self.retention.active.lock().remove(&ledger_id);
+                }
+                Ok(report) => {
+                    busy |= report.committed_t.is_some()
+                        || report.head_moved
+                        || report.discovered_commits >= worker.options.limits.max_commits_per_pass;
+                }
+                Err(e) if e.is_not_found() => {
+                    self.retention.active.lock().remove(&ledger_id);
+                }
+                Err(e) => tracing::warn!(ledger_id, error = %e, "retention pass failed"),
+            }
+        }
+        self.retention
+            .last_sweep_ms
+            .store(now_ms(), Ordering::Relaxed);
+        busy
+    }
+
+    /// Re-read every branch's registration, and register a branch whose
+    /// source branch is registered.
+    async fn rescan_retention_registrations(&self) -> Result<()> {
+        let ns = self.publisher()?;
+        let records = self.nameservice().all_records().await?;
+        let mut registered: HashMap<String, i64> = HashMap::new();
+        for record in records.iter().filter(|r| !r.retracted) {
+            let id = record.ledger_id.to_string();
+            if let Some(r) = registry::read(ns, &id).await?.1 {
+                registered.insert(id, r.active_since_t);
+            }
+        }
+        for record in records.iter().filter(|r| !r.retracted) {
+            let id = record.ledger_id.to_string();
+            if registered.contains_key(&id) {
+                self.retention.mark_active(&id);
+                continue;
+            }
+            let Some(source) = &record.source_branch else {
+                continue;
+            };
+            let source_id = format!("{}:{source}", record.name);
+            if let Some(since) = registered.get(&source_id) {
+                registry::activate(ns, &id, *since).await?;
+                self.retention.mark_active(&id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn observe_build_for_retention(&self, record: &NsRecord) -> Result<()> {
+        let id = record.ledger_id.to_string();
+        if self.retention.active.lock().contains(&id) {
+            return Ok(());
+        }
+        let ns = self.publisher()?;
+        if registry::read(ns, &id).await?.1.is_some() {
+            self.retention.mark_active(&id);
+            return Ok(());
+        }
+        let Some(head) = record.commit_head_id.clone() else {
+            return Ok(());
+        };
+        let from = record
+            .index_t
+            .max(self.retention.probed.lock().get(&id).copied().unwrap_or(0));
+        if record.commit_t <= from {
+            return Ok(());
+        }
+        if let Some(source) = &record.source_branch {
+            let source_id = format!("{}:{source}", record.name);
+            if let Some(r) = registry::read(ns, &source_id).await?.1 {
+                registry::activate(ns, &id, r.active_since_t).await?;
+                self.retention.mark_active(&id);
+                return Ok(());
+            }
+        }
+        let store = self
+            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
+            .await?;
+        match probe_activation(store.as_ref(), &head, from).await? {
+            Some(since) => {
+                registry::activate(ns, &id, since).await?;
+                self.retention.mark_active(&id);
+            }
+            None => {
+                self.retention.probed.lock().insert(id, record.commit_t);
+            }
+        }
+        Ok(())
+    }
+}

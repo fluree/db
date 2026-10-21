@@ -97,13 +97,14 @@ pub use parse::{
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{
-    generate_txn_id, stage, stage_flakes, stage_with_graph_delta, StageOptions,
-    DELETE_WITNESSED_SITE,
+    enforce_modify_policy, generate_txn_id, stage, stage_flakes, stage_with_graph_delta,
+    StageOptions, DELETE_WITNESSED_SITE,
 };
 pub use staged_dicts::{
     attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
 };
 pub use template_sink::{RdfTextParts, TemplateSink};
+pub mod ttl_input;
 
 #[cfg(feature = "shacl")]
 pub use stage::{validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome};

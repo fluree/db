@@ -64,9 +64,82 @@ const ANNOTATION_KEY: &str = "@annotation";
 const EDGE_KEY: &str = "@edge";
 const REIFIES_KEY: &str = "@reifies";
 
+/// `@ttl` / `@expiresAt`: a value's lifetime, shorthand for a TTL
+/// instruction in its annotation (`f:ttlSeconds` / `f:expiresAt`).
+const TTL_KEY: &str = "@ttl";
+const EXPIRES_AT_KEY: &str = "@expiresAt";
+
 /// True when `key` is an annotation/edge keyword on the *object* side.
 fn is_annotation_key(key: &str) -> bool {
     key == ANNOTATION_KEY || key == EDGE_KEY
+}
+
+/// True when `key` is TTL shorthand on the object side.
+fn is_ttl_key(key: &str) -> bool {
+    key == TTL_KEY || key == EXPIRES_AT_KEY
+}
+
+/// Move a value's `@ttl` / `@expiresAt` into its annotation as the TTL
+/// instruction it stands for (`f:ttlSeconds` with whole seconds, or
+/// `f:expiresAt` with a UTC `xsd:dateTime`), creating the annotation when
+/// the value has none.
+fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
+    let ttl = map.remove(TTL_KEY);
+    let expires = map.remove(EXPIRES_AT_KEY);
+    let instruction = match (ttl, expires) {
+        (None, None) => return Ok(()),
+        (Some(_), Some(_)) => {
+            return Err(TransactError::Parse(
+                "a value takes @ttl or @expiresAt, not both".to_string(),
+            ))
+        }
+        (Some(ttl), None) => {
+            let seconds = crate::ttl_input::ttl_seconds_from_json(&ttl)
+                .map_err(|e| TransactError::Parse(format!("@ttl: {e}")))?;
+            (fluree_vocab::retention_iris::TTL_SECONDS, json!(seconds))
+        }
+        (None, Some(expires)) => {
+            let Value::String(text) = &expires else {
+                return Err(TransactError::Parse(
+                    "@expiresAt: a deadline is an RFC 3339 timestamp string".to_string(),
+                ));
+            };
+            let instant = crate::ttl_input::expires_at(text)
+                .map_err(|e| TransactError::Parse(format!("@expiresAt: {e}")))?;
+            (
+                fluree_vocab::retention_iris::EXPIRES_AT,
+                json!({
+                    "@value": crate::ttl_input::expires_at_lexical(&instant),
+                    "@type": fluree_vocab::xsd::DATE_TIME,
+                }),
+            )
+        }
+    };
+    let key = if map.contains_key(EDGE_KEY) {
+        EDGE_KEY
+    } else {
+        ANNOTATION_KEY
+    };
+    let block = map.entry(key).or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(block) = block else {
+        return Err(TransactError::Parse(
+            "@ttl / @expiresAt need an @annotation that is an object".to_string(),
+        ));
+    };
+    for spelled in [
+        "f:ttlSeconds",
+        "f:expiresAt",
+        fluree_vocab::retention_iris::TTL_SECONDS,
+        fluree_vocab::retention_iris::EXPIRES_AT,
+    ] {
+        if block.contains_key(spelled) {
+            return Err(TransactError::Parse(format!(
+                "a value takes one TTL instruction: @ttl / @expiresAt or {spelled} in its                  @annotation, not both"
+            )));
+        }
+    }
+    block.insert(instruction.0.to_string(), instruction.1);
+    Ok(())
 }
 
 /// Classification of the object position on a reified base edge. Drives
@@ -570,7 +643,10 @@ pub fn document_has_annotation_keys(doc: &Value) -> bool {
                 if opaque && k == "@value" {
                     return false;
                 }
-                is_annotation_key(k) || k == REIFIES_KEY || document_has_annotation_keys(v)
+                is_annotation_key(k)
+                    || is_ttl_key(k)
+                    || k == REIFIES_KEY
+                    || document_has_annotation_keys(v)
             })
         }
         Value::Array(items) => items.iter().any(document_has_annotation_keys),
@@ -1064,6 +1140,13 @@ fn lift_annotations_under_predicate(
             Ok(())
         }
         Value::Object(map) => {
+            if map.contains_key(TTL_KEY) || map.contains_key(EXPIRES_AT_KEY) {
+                return Err(TransactError::Parse(
+                    "@ttl / @expiresAt set the lifetime of an inserted value; they do not \
+                     apply in a delete"
+                        .to_string(),
+                ));
+            }
             if !map.contains_key(ANNOTATION_KEY) && !map.contains_key(EDGE_KEY) {
                 return Ok(());
             }
@@ -2146,6 +2229,8 @@ fn value_subtree_carries_annotation(value: &Value) -> bool {
             if map.contains_key(ANNOTATION_KEY)
                 || map.contains_key(EDGE_KEY)
                 || map.contains_key(REIFIES_KEY)
+                || map.contains_key(TTL_KEY)
+                || map.contains_key(EXPIRES_AT_KEY)
             {
                 return true;
             }
@@ -2198,6 +2283,7 @@ fn intercept_annotations_for_edges(
                         .to_string(),
                 ));
             }
+            fold_ttl_shorthand(map)?;
             let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
             let Some(ann_block) = ann_block else {
                 return Ok(());

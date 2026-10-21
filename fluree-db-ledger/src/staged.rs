@@ -211,6 +211,9 @@ pub struct StagedLedger {
     /// dictionaries know nothing of subjects and strings this transaction is
     /// introducing.
     dicts_cover_staged: bool,
+    /// Txn-meta the system records on the commit built from this view, next
+    /// to the caller's (the retention-control marker).
+    system_txn_meta: Vec<fluree_db_core::TxnMetaEntry>,
 }
 
 impl StagedLedger {
@@ -249,8 +252,21 @@ impl StagedLedger {
             staged_epoch,
             content_version: fluree_db_core::overlay::next_overlay_content_version(),
             dicts_cover_staged: false,
+            system_txn_meta: Vec::new(),
             base,
         })
+    }
+
+    /// Record `entry` on the commit built from this view, once.
+    pub fn push_system_txn_meta(&mut self, entry: fluree_db_core::TxnMetaEntry) {
+        if !self.system_txn_meta.contains(&entry) {
+            self.system_txn_meta.push(entry);
+        }
+    }
+
+    /// Take the txn-meta the system records on the commit built from this view.
+    pub fn take_system_txn_meta(&mut self) -> Vec<fluree_db_core::TxnMetaEntry> {
+        std::mem::take(&mut self.system_txn_meta)
     }
 
     /// Whether the base snapshot's range provider dictionaries cover the

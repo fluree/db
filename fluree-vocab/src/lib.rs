@@ -1844,14 +1844,42 @@ pub mod db {
     /// reconstruct revert provenance from the txn-meta graph.
     pub const REVERTS: &str = "reverts";
 
+    /// db:ttlSeconds - relative lifetime in whole seconds, from the commit
+    /// time of the assertion it governs. A TTL instruction on an annotation,
+    /// a transaction default in txn-meta, and a retention property field.
+    pub const TTL_SECONDS: &str = "ttlSeconds";
+
+    /// db:expiresAt - absolute expiration instant (`xsd:dateTime` with a
+    /// known offset). A TTL instruction on an annotation, or a transaction
+    /// default in txn-meta.
+    pub const EXPIRES_AT: &str = "expiresAt";
+
+    /// db:retentionControl - system marker on a commit that carries
+    /// retention control input: TTL instructions on annotations or a write to
+    /// the retention config. Per-value TTL instructions are honored only in
+    /// commits that carry it, so annotations written before TTL support do
+    /// not become deletion instructions.
+    pub const RETENTION_CONTROL: &str = "retentionControl";
+
     /// The local names in this namespace that a user may set in a commit's
-    /// txn-meta: `f:message` and `f:author`.
-    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR];
+    /// txn-meta: `f:message`, `f:author`, and the transaction TTL default
+    /// (`f:ttlSeconds` or `f:expiresAt`).
+    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR, TTL_SECONDS, EXPIRES_AT];
 
     /// Every local name in this namespace a commit's txn-meta holds: the user
     /// claims ([`TXN_META_USER`]) and the entries the system writes
-    /// (`f:identity`, `db:receivedAt`, and `f:reverts` on a revert).
-    pub const TXN_META: &[&str] = &[MESSAGE, AUTHOR, IDENTITY, RECEIVED_AT, REVERTS];
+    /// (`f:identity`, `db:receivedAt`, `f:reverts` on a revert, and
+    /// `f:retentionControl`).
+    pub const TXN_META: &[&str] = &[
+        MESSAGE,
+        AUTHOR,
+        TTL_SECONDS,
+        EXPIRES_AT,
+        IDENTITY,
+        RECEIVED_AT,
+        REVERTS,
+        RETENTION_CONTROL,
+    ];
 
     /// db:txn - transaction address (optional)
     pub const TXN: &str = "txn";
@@ -1987,6 +2015,8 @@ pub mod txn_meta {
         fn users_set_only_their_claims_in_reserved_namespaces() {
             assert!(user_may_set(FLUREE_DB, db::MESSAGE));
             assert!(user_may_set(FLUREE_DB, db::AUTHOR));
+            assert!(user_may_set(FLUREE_DB, db::TTL_SECONDS));
+            assert!(user_may_set(FLUREE_DB, db::EXPIRES_AT));
             assert!(!user_may_set(FLUREE_DB, db::IDENTITY));
             assert!(!user_may_set(FLUREE_DB, db::REVERTS));
             assert!(!user_may_set(FLUREE_DB, db::T));
@@ -2034,6 +2064,15 @@ pub mod reifies_iris {
     pub const ALL: [&str; 7] = [
         GRAPH, SUBJECT, PREDICATE, OBJECT, DATATYPE, LANG, LIST_INDEX,
     ];
+}
+
+/// TTL instruction IRIs, as written on an annotation or in txn-meta.
+pub mod retention_iris {
+    /// `f:ttlSeconds` — relative lifetime in whole seconds.
+    pub const TTL_SECONDS: &str = "https://ns.flur.ee/db#ttlSeconds";
+
+    /// `f:expiresAt` — absolute expiration instant (`xsd:dateTime`).
+    pub const EXPIRES_AT: &str = "https://ns.flur.ee/db#expiresAt";
 }
 
 /// Fluree DB search query key local names (under `https://ns.flur.ee/db#`)
@@ -2463,6 +2502,28 @@ pub mod config_iris {
 
     /// `f:target` — property IRI that a `FullTextProperty` entry applies to.
     pub const FULL_TEXT_TARGET: &str = "https://ns.flur.ee/db#target";
+
+    // ---- Retention fields ----
+
+    /// `f:retentionDefaults` — retention policy group on LedgerConfig/GraphConfig.
+    /// Durable state policy: no request-time override and no override control.
+    pub const RETENTION_DEFAULTS: &str = "https://ns.flur.ee/db#retentionDefaults";
+
+    /// `f:RetentionDefaults` — class/type for the retention defaults resource.
+    pub const RETENTION_DEFAULTS_CLASS: &str = "https://ns.flur.ee/db#RetentionDefaults";
+
+    /// `f:RetentionProperty` — class/type for one retention property entry
+    /// (reached through `f:property`, keyed by its `f:target`).
+    pub const RETENTION_PROPERTY_CLASS: &str = "https://ns.flur.ee/db#RetentionProperty";
+
+    /// `f:noHistory` — boolean on a retention property entry: obsolete
+    /// assertions/retractions of the target are dropped from index history.
+    pub const NO_HISTORY: &str = "https://ns.flur.ee/db#noHistory";
+
+    /// `f:ttlSeconds` — non-negative integer on a retention property entry:
+    /// the lifetime of the target's assertions, from their commit time.
+    /// `0` disables an inherited duration for future assertions.
+    pub const TTL_SECONDS: &str = "https://ns.flur.ee/db#ttlSeconds";
 
     // ---- Serving defaults fields (ledger-scoped) ----
 

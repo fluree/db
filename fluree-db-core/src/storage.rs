@@ -1906,6 +1906,7 @@ fn content_path_from_prefixes(
         ContentKind::GraphSourceMapping => {
             format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/mapping/{hash_hex}.ttl")
         }
+        ContentKind::RetentionState => format!("{prefix}/retention/{hash_hex}.frs"),
         // Forward-compatibility: unknown kinds go to a generic blob directory
         #[allow(unreachable_patterns)]
         _ => format!("{prefix}/blob/{hash_hex}.bin"),

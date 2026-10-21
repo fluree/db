@@ -589,6 +589,8 @@ pub async fn build_commit(
     opts: CommitOpts,
 ) -> Result<StagedCommit> {
     // 1. Extract flakes from view
+    let mut view = view;
+    let system_txn_meta = view.take_system_txn_meta();
     let (mut base, flakes) = view.into_parts();
 
     // Move commit options into locals so we can pass ownership where useful
@@ -634,8 +636,10 @@ pub async fn build_commit(
     // (if the ledger dual-stamps) is injected below.
     txn_meta.retain(|entry| {
         !(entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
-            && entry.predicate_name == fluree_vocab::db::RECEIVED_AT)
+            && (entry.predicate_name == fluree_vocab::db::RECEIVED_AT
+                || entry.predicate_name == fluree_vocab::db::RETENTION_CONTROL))
     });
+    txn_meta.extend(system_txn_meta);
 
     // No wrapper span: the caller's ambient span (e.g. `txn_commit`
     // from `commit()`, or whatever the Raft path opens) carries the

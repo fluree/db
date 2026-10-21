@@ -311,6 +311,10 @@ path = "tests/grp_reasoning.rs"
 name = "grp_transact"
 path = "tests/grp_transact.rs"
 
+[[test]]
+name = "grp_retention"
+path = "tests/grp_retention.rs"
+
 # Own binary: installs a process-global tracing subscriber and asserts on every
 # `fluree::cow_probe` event the process emits, so it must not share a process
 # with other tests that commit.

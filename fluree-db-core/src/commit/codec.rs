@@ -37,6 +37,7 @@
 
 pub mod envelope;
 mod error;
+pub mod flake_batch;
 pub mod format;
 pub mod legacy_v3;
 pub mod op_codec;
@@ -49,6 +50,7 @@ mod writer;
 
 pub use envelope::CodecEnvelope;
 pub use error::CommitCodecError;
+pub use flake_batch::{decode_flake_batch, encode_flake_batch};
 pub use format::{CommitSignature, ALGO_ED25519, MAGIC, VERSION, VERSION_V3};
 pub use raw_reader::{CommitOps, RawObject, RawOp, RawTripleTerm};
 #[cfg(feature = "credential")]

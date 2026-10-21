@@ -822,7 +822,8 @@ fn is_cached_kind(kind: &ContentKind) -> bool {
         | ContentKind::Txn
         | ContentKind::LedgerConfig
         | ContentKind::GraphSourceSnapshot
-        | ContentKind::GraphSourceMapping => false,
+        | ContentKind::GraphSourceMapping
+        | ContentKind::RetentionState => false,
     }
 }
 

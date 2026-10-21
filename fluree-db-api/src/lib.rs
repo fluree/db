@@ -106,6 +106,7 @@ pub mod query;
 pub mod rdf;
 mod rebase;
 pub mod remote_service;
+pub mod retention;
 mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
@@ -3443,6 +3444,7 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             secret_resolver,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            retention: Arc::default(),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }
@@ -3804,6 +3806,9 @@ pub struct Fluree {
     secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
     /// The key-rotation sweep running in this process, if any.
     key_rotation: Arc<key_rotation::KeyRotationSlot>,
+    /// The retention worker's in-process state: the branches it knows are
+    /// active, and how to wake it.
+    retention: Arc<retention::RetentionRuntime>,
     /// What this instance holds of its file storage root.
     #[cfg(feature = "native")]
     root: RootHold,
@@ -3859,6 +3864,7 @@ impl Fluree {
             #[cfg(feature = "iceberg")]
             secret_resolver: None,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            retention: Arc::default(),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }

@@ -253,6 +253,7 @@ pub fn resolve_trig_meta(
     }
 
     validate_limits(&entries)?;
+    crate::ttl_input::normalize_txn_meta_ttl(&mut entries).map_err(TransactError::Parse)?;
     Ok(entries)
 }
 

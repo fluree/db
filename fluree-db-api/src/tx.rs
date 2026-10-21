@@ -449,9 +449,9 @@ impl SequentialStager {
         // graphs by IRI, so leaving one out renumbers nothing.
         graph_delta.retain(|_, iri| !netted_away.contains(&ns_registry.sid_for_iri(iri)));
 
-        let view = StagedLedger::new(self.original, self.folded, &reverse_graph)?;
+        let mut view = StagedLedger::new(self.original, self.folded, &reverse_graph)?;
         if !self.nested {
-            guard_request_view(&view, &ns_registry, &graph_delta).await?;
+            guard_request_view(&mut view, &ns_registry, &graph_delta, None).await?;
         }
         Ok(StageResult {
             view,
@@ -658,22 +658,27 @@ impl RequestGovernance {
 /// before the request, so a request is judged by its result rather than by
 /// the order of its operations.
 async fn guard_request_view(
-    view: &StagedLedger,
+    view: &mut StagedLedger,
     ns: &NamespaceRegistry,
     graph_delta: &FxHashMap<u16, String>,
+    policy: Option<&crate::PolicyContext>,
 ) -> Result<()> {
-    crate::config_guard::validate_staged_config(
+    let refused = |e| {
+        ApiError::from(fluree_db_transact::TransactError::from(
+            StagedWriteError::from(e),
+        ))
+    };
+    let retention = crate::config_guard::validate_staged_config(
         view,
         ns,
         graph_delta,
         crate::config_guard::GuardScope::Authoring,
     )
     .await
-    .map_err(|e| {
-        ApiError::from(fluree_db_transact::TransactError::from(
-            StagedWriteError::from(e),
-        ))
-    })
+    .map_err(refused)?;
+    crate::retention::validate::check_staged(view, retention, policy, None, true)
+        .await
+        .map_err(refused)
 }
 
 /// The user graphs (the default graph and named graphs; never `#config` or
@@ -2109,7 +2114,17 @@ pub(crate) async fn check_staged_write(
     // An operation of a multi-operation request is guarded with the rest of
     // the request, on its merged view (`SequentialStager::finish`).
     if checks.request.is_none() {
-        crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard).await?;
+        let retention =
+            crate::config_guard::validate_staged_config(view, ns, graph_delta, checks.guard)
+                .await?;
+        crate::retention::validate::check_staged(
+            view,
+            retention,
+            checks.policy,
+            checks.tracker,
+            checks.guard == crate::config_guard::GuardScope::Authoring,
+        )
+        .await?;
     }
     Ok(validated || unique_enforced)
 }
@@ -3621,11 +3636,11 @@ impl crate::Fluree {
         flakes.extend(flakes2);
 
         let reverse_graph: HashMap<fluree_db_core::Sid, GraphId> = HashMap::new();
-        let view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
+        let mut view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
             ApiError::internal(format!("merging staged Cypher MERGE branches: {e}"))
         })?;
         if enclosing.is_none() {
-            guard_request_view(&view, &ns_registry, &graph_delta).await?;
+            guard_request_view(&mut view, &ns_registry, &graph_delta, policy).await?;
         }
 
         Ok(StageResult {
