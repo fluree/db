@@ -90,16 +90,37 @@ async fn main() {
             .build()
             .expect("fluree"),
     );
+    // RETENTION_INTERVAL_MS overrides the worker's pass interval.
+    let interval_ms = std::env::var("RETENTION_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(250);
     fluree.start_maintenance(
         None,
         Some(RetentionOptions {
-            interval: Duration::from_millis(250),
+            interval: Duration::from_millis(interval_ms),
             ..Default::default()
         }),
     );
 
     let disabled = create(&fluree, "perf/disabled").await;
     run(&fluree, &disabled, commits, None, "disabled").await;
+
+    // Control: a config graph that sets nothing retention reads.
+    let config_only = create(&fluree, "perf/config-only").await;
+    fluree
+        .graph(&config_only)
+        .transact()
+        .upsert_turtle(&format!(
+            "@prefix f: <https://ns.flur.ee/db#> .
+             GRAPH <urn:fluree:{config_only}#config> {{
+               <urn:fluree:{config_only}:config:ledger> a f:LedgerConfig .
+             }}"
+        ))
+        .commit()
+        .await
+        .expect("config");
+    run(&fluree, &config_only, commits, None, "config-only").await;
 
     let idle = create(&fluree, "perf/enabled-idle").await;
     fluree
@@ -118,6 +139,11 @@ async fn main() {
         .await
         .expect("config");
     run(&fluree, &idle, commits, None, "enabled-idle").await;
+
+    // Control for order: a second disabled ledger, written while the
+    // indexer still works through the earlier ledgers' commits.
+    let disabled_2 = create(&fluree, "perf/disabled-2").await;
+    run(&fluree, &disabled_2, commits, None, "disabled-2").await;
 
     let tagged = create(&fluree, "perf/tagged").await;
     run(&fluree, &tagged, commits, Some(86_400), "tagged").await;
