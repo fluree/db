@@ -120,7 +120,7 @@ Ordinary read, history, export and storage scopes do not imply audit access. On 
 
 ## Clusters
 
-The journal is replicated with the rest of the cluster's nameservice state. A replica serves the history of an enabled ledger only after it confirms that its copy is current. It asks the leader for the cluster's committed position and applies through it. A replica that cannot confirm this answers `503` `err:db/ReplicaNotCurrent`, which is retryable; it has no leader, or cannot reach a quorum. Current-state reads on that replica continue.
+The journal is replicated with the rest of the cluster's nameservice state. A replica serves a ledger's history only after it confirms that its copy is current: it asks the leader for the cluster's committed position and applies through it. This covers every ledger, since a replica that has not yet applied a ledger's first retention registration cannot tell the ledger uses retention. A replica that cannot confirm answers `503` `err:db/ReplicaNotCurrent`, which is retryable; it has no leader, or cannot reach a quorum. Current-state reads on that replica continue, and are not checked. A historical read on a replica costs one round trip to the leader.
 
 A removal returns after every replica has applied it, or after 10 seconds. The receipt's `unacknowledgedReplicas` lists any replica that had not:
 
@@ -128,7 +128,7 @@ A removal returns after every replica has applied it, or after 10 seconds. The r
 { "unacknowledgedReplicas": ["node 3 (http://10.0.0.7:9090/raft)"] }
 ```
 
-Such a replica serves the removal as soon as it catches up. A replica that has never seen the ledger's first retention registration does not yet know the ledger is enabled, and serves it as it serves any write it has not replicated. Remove a replica that stays unacknowledged from serving.
+Such a replica refuses the ledger's history until it catches up.
 
 ## Status
 
@@ -171,4 +171,5 @@ A history rule that has been turned off carries `untilT`, the config commit that
 - **Not erasure.** The commit log, backups and copies of the ledger keep the original values.
 - **Activation delay.** `f:noHistory` takes effect at the retention worker's next pass. A ledger with no maintenance owner running records no rules.
 - **Removal is not undone** by retracting or re-asserting data, or by resetting a branch. The journal lives in the branch's nameservice record, outside ledger content.
-- **Archives and copies.** A `.flpack` archive carries the journal, and a ledger restored from it refuses the same history. The restored ledger rebuilds its expiry schedule from its commits. An archive made before a removal predates it. Clones and pulls copy the raw commit log; on a ledger with a journal, they need audit access.
+- **Archives and restores.** Every journal change is also merged into a checkpoint for the ledger's lineage (its genesis commit, which every copy shares), kept in storage at `@retention/journal/` outside any ledger's folder; drops, purges and the orphan sweep leave it. A ledger restored from a `.flpack` archive takes the archive's journal and that checkpoint, so a copy restored from an archive made before a removal, even after its source is purged, refuses the same history, and the restore retracts a removed occurrence the archive still held as current. The restored ledger rebuilds its expiry schedule from its commits.
+- **Clones and pulls** copy the raw commit log; on a ledger with a journal, they need audit access. The copy they make does not carry the journal.

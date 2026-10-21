@@ -1,17 +1,16 @@
 //! Replicas and the removal journal.
 //!
 //! A cluster replica answers a historical read from its own copy of the
-//! journal, which can lag the leader's. Before serving the history of a
-//! retention-enabled ledger it confirms it has applied every change the
-//! cluster had committed when the read arrived, and refuses the read when it
+//! journal, which can lag the leader's. Before serving a ledger's history it
+//! confirms it has applied every change the cluster had committed when the
+//! read arrived, and refuses the read when it
 //! cannot (it is partitioned, or no leader is known): an unconfirmed replica
 //! is out of serving for that history until it catches up. A journal change
 //! waits for every replica to apply it and reports the ones that did not.
 //!
-//! A replica that has not yet applied a ledger's first retention
-//! registration does not know the ledger is enabled; it serves the ledger as
-//! it serves any write it has not yet replicated. The removal receipt names
-//! such replicas.
+//! The confirmation covers every ledger, enabled or not: a replica that has
+//! not applied a ledger's first retention registration cannot tell it is
+//! enabled.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,8 +38,8 @@ impl Fluree {
         let _ = self.retention.replicas.set(sync);
     }
 
-    /// On a cluster replica, wait until the local copy of an enabled
-    /// ledger's journal is current. Whether there was anything to confirm.
+    /// On a cluster replica, wait until the local copy of `ledger_id`'s
+    /// journal is current. Whether there was anything to confirm.
     pub(crate) async fn confirm_journal_current(&self, ledger_id: &str) -> Result<bool> {
         let Some(replicas) = self.retention.replicas.get() else {
             return Ok(false);

@@ -113,6 +113,49 @@ impl Journal {
 }
 
 impl Journal {
+    /// Add what `other` suppresses that this journal does not: every removal
+    /// (by commit and slot) and every history rule (by predicate, graph and
+    /// the commit that enabled it), an open rule winning over its closed
+    /// copy since coverage only grows. Returns whether anything was added;
+    /// the generation then moves past both.
+    pub fn merge(&mut self, other: &Journal) -> bool {
+        let mut changed = false;
+        for removal in &other.removals {
+            if !self
+                .removals
+                .iter()
+                .any(|r| r.commit == removal.commit && r.slot == removal.slot)
+            {
+                self.removals.push(removal.clone());
+                changed = true;
+            }
+        }
+        for rule in &other.history_rules {
+            let same = |r: &&mut HistoryRule| {
+                r.predicate == rule.predicate
+                    && r.graph == rule.graph
+                    && r.enabled_t == rule.enabled_t
+                    && r.from_t == rule.from_t
+            };
+            match self.history_rules.iter_mut().find(same) {
+                Some(existing) => {
+                    if existing.until_t.is_some() && rule.until_t.is_none() {
+                        existing.until_t = None;
+                        changed = true;
+                    }
+                }
+                None => {
+                    self.history_rules.push(rule.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.generation = self.generation.max(other.generation) + 1;
+        }
+        changed
+    }
+
     /// Bring the history rules in force in line with `desired` (as compiled
     /// from the config), recording a change at config commit `t`: a rule no
     /// longer desired is closed at `t` (its history stays suppressed), a new

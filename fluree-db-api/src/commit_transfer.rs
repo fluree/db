@@ -2041,7 +2041,11 @@ impl Fluree {
         };
         if restored.is_err() {
             self.discard_restored(&pending).await;
+            return restored;
         }
+        // An archive from before a removal holds the removed value as current
+        // state; retract it as the removal did.
+        self.reapply_removals(new_ledger_id.as_str()).await?;
         restored
     }
 
@@ -2113,6 +2117,8 @@ impl Fluree {
         let mut txn_blobs = 0usize;
         let mut index_artifacts = 0usize;
         let mut ns_manifest: Option<serde_json::Value> = None;
+        // The genesis commit, which keys the lineage's journal checkpoint.
+        let mut lineage: Option<ContentId> = None;
 
         // Concurrent CAS writer pool. Each future owns its `(cid, payload)` and
         // returns the byte count it frees on completion; errors propagate (and
@@ -2156,7 +2162,15 @@ impl Fluree {
                                     // whole restore (and rolls it back), so only the
                                     // success path ever returns these counts.
                                     match cid.content_kind() {
-                                        Some(ContentKind::Commit) => commits += 1,
+                                        Some(ContentKind::Commit) => {
+                                            commits += 1;
+                                            if lineage.is_none()
+                                                && fluree_db_core::commit::codec::format::CommitHeader::read_from(&payload)
+                                                    .is_ok_and(|h| h.t == 1)
+                                            {
+                                                lineage = Some(cid.clone());
+                                            }
+                                        }
                                         Some(ContentKind::Txn) => txn_blobs += 1,
                                         _ => index_artifacts += 1,
                                     }
@@ -2384,8 +2398,27 @@ impl Fluree {
             // re-put of the (content-addressed) blob is idempotent.
             self.push_default_context(record, &ctx_json).await?;
         }
-        if let Some(retention) = manifest.get("retention") {
-            crate::retention::registry::restore(self.publisher()?, record, retention).await?;
+        // The archive's journal, and what the lineage has suppressed since.
+        let archived = manifest
+            .get("retention")
+            .map(crate::retention::registry::ArchivedRetention::parse)
+            .transpose()?;
+        let checkpoint = match &lineage {
+            Some(lineage) => self.journal_checkpoint(lineage).await,
+            None => None,
+        };
+        let lineage = lineage.map(|l| l.to_string());
+        if crate::retention::registry::restore(
+            self.publisher()?,
+            record,
+            archived,
+            lineage.as_deref(),
+            checkpoint,
+        )
+        .await?
+        .is_some()
+        {
+            self.checkpoint_journal(new_ledger_id).await;
         }
 
         Ok(RestoreResult {

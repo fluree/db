@@ -348,6 +348,7 @@ impl Fluree {
             })
             .await?
             .unwrap_or_default();
+            self.checkpoint_journal(&ledger_id).await;
             let unacknowledged_replicas = self
                 .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
                 .await;

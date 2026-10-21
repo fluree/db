@@ -177,9 +177,20 @@ pub(crate) struct HistoricalRead<'a> {
 /// A journal with the subjects of its removals read from their commits.
 pub(crate) struct Suppression {
     pub(crate) journal: Journal,
-    /// Subject of each removal, by index, as its commit encodes it; `None`
-    /// when unresolvable. Decoded against the reading view's snapshot.
-    removal_subjects: Vec<Option<fluree_db_core::Sid>>,
+    /// Subject of each removal, by index, as its commit encodes it. Decoded
+    /// against the reading view's snapshot.
+    removal_subjects: Vec<RemovalSubject>,
+}
+
+/// What a removed occurrence's commit says about its subject.
+#[derive(Clone)]
+enum RemovalSubject {
+    Known(fluree_db_core::Sid),
+    /// The commit could not be read: any subject may be the one.
+    Unknown,
+    /// The commit is not in this ledger, so neither is the occurrence (a
+    /// journal merged from another copy of the lineage).
+    Absent,
 }
 
 /// Suppressions held between reads, by branch and journal generation.
@@ -190,17 +201,19 @@ pub(crate) struct SuppressionCache {
 
 impl Fluree {
     /// The branch's suppression, or `None` when its journal is empty. On a
-    /// cluster replica of an enabled branch, read once the replica has
-    /// confirmed it holds the current journal.
+    /// cluster replica, read once the replica has confirmed it holds the
+    /// current journal.
     pub(crate) async fn suppression_for(
         &self,
         ledger_id: &str,
     ) -> Result<Option<Arc<Suppression>>> {
         let ns = self.publisher()?;
-        let (_, mut registration) = registry::read(ns, ledger_id).await?;
-        if registration.is_some() && self.confirm_journal_current(ledger_id).await? {
-            registration = registry::read(ns, ledger_id).await?.1;
-        }
+        // On a cluster replica, first confirm the local copy is current,
+        // whether or not this replica has seen the ledger registered yet: one
+        // that has not applied its first registration does not know it is
+        // enabled. Outside a cluster this is a no-op.
+        self.confirm_journal_current(ledger_id).await?;
+        let (_, registration) = registry::read(ns, ledger_id).await?;
         let Some(journal) = registration.map(|r| r.journal).filter(|j| !j.is_empty()) else {
             return Ok(None);
         };
@@ -225,47 +238,56 @@ impl Fluree {
     /// The subject of each removed occurrence, read from its commit. Reads
     /// only storage and the nameservice, never the cached ledger, so a query
     /// issued inside a transaction can ask.
-    async fn removal_subjects(
-        &self,
-        ledger_id: &str,
-        journal: &Journal,
-    ) -> Vec<Option<fluree_db_core::Sid>> {
+    async fn removal_subjects(&self, ledger_id: &str, journal: &Journal) -> Vec<RemovalSubject> {
+        use fluree_db_core::ContentStore as _;
         if journal.removals.is_empty() {
             return Vec::new();
         }
+        let unknown = || vec![RemovalSubject::Unknown; journal.removals.len()];
         let Ok(publisher) = self.publisher() else {
-            return vec![None; journal.removals.len()];
+            return unknown();
         };
         let Ok(Some(record)) = publisher.lookup(ledger_id).await else {
-            return vec![None; journal.removals.len()];
+            return unknown();
         };
         let Ok(store) = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await
         else {
-            return vec![None; journal.removals.len()];
+            return unknown();
         };
         let mut out = Vec::with_capacity(journal.removals.len());
-        let mut commits: HashMap<String, Option<fluree_db_core::Commit>> = HashMap::new();
+        let mut commits: HashMap<String, Option<Option<fluree_db_core::Commit>>> = HashMap::new();
         for removal in &journal.removals {
+            // `Some(None)`: not in this ledger; `None`: unreadable.
             let commit = match commits.get(&removal.commit) {
                 Some(c) => c.clone(),
                 None => {
                     let loaded = match removal.commit.parse::<ContentId>() {
-                        Ok(cid) => fluree_db_core::load_commit_by_id(store.as_ref(), &cid)
-                            .await
-                            .ok(),
+                        Ok(cid) => match store.has(&cid).await {
+                            Ok(false) => Some(None),
+                            Ok(true) => fluree_db_core::load_commit_by_id(store.as_ref(), &cid)
+                                .await
+                                .ok()
+                                .map(Some),
+                            Err(_) => None,
+                        },
                         Err(_) => None,
                     };
                     commits.insert(removal.commit.clone(), loaded.clone());
                     loaded
                 }
             };
-            out.push(
-                commit
-                    .and_then(|c| c.flakes.get(removal.slot as usize).cloned())
-                    .map(|f| f.s),
-            );
+            out.push(match commit {
+                Some(None) => RemovalSubject::Absent,
+                Some(Some(c)) => c
+                    .flakes
+                    .get(removal.slot as usize)
+                    .map_or(RemovalSubject::Unknown, |f| {
+                        RemovalSubject::Known(f.s.clone())
+                    }),
+                None => RemovalSubject::Unknown,
+            });
         }
         out
     }
@@ -396,7 +418,11 @@ impl Fluree {
             } else {
                 removal.overlaps(from, to)
             };
-            let subject = subject.as_ref().and_then(|s| read.snapshot.decode_sid(s));
+            let subject = match subject {
+                RemovalSubject::Absent => continue,
+                RemovalSubject::Unknown => None,
+                RemovalSubject::Known(s) => read.snapshot.decode_sid(s),
+            };
             if covered && read.reads.touches(subject.as_deref(), &removal.predicate) {
                 return Err(ApiError::HistoryUnavailable(format!(
                     "a removed occurrence of <{}> on {ledger_id} falls in the requested range",

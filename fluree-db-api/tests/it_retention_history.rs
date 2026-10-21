@@ -876,3 +876,118 @@ async fn a_policy_enabled_and_disabled_between_passes_still_covers_its_interval(
         vec![json!(2)]
     );
 }
+
+/// A cluster replica that cannot confirm its journal is current refuses a
+/// ledger's history even when it holds no retention registration for it: it
+/// may not have applied the first one yet.
+#[tokio::test]
+async fn an_unconfirmed_replica_refuses_history_of_a_ledger_it_does_not_know_is_enabled() {
+    struct Partitioned;
+    #[async_trait::async_trait]
+    impl fluree_db_api::retention::replicas::ReplicaSync for Partitioned {
+        async fn sync_reads(&self) -> Result<(), String> {
+            Err("no leader".into())
+        }
+        async fn await_replicas(&self, _: std::time::Duration) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/replica-unregistered").await;
+    let t1 = upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 1}),
+    )
+    .await;
+    upsert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:c", "ex:count": 2}),
+    )
+    .await;
+    fluree.set_retention_replicas(std::sync::Arc::new(Partitioned));
+    assert!(fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .is_none());
+    assert!(matches!(
+        read(
+            &fluree,
+            &id,
+            json!(format!("{id}@t:{t1}")),
+            "ex:c",
+            "ex:count"
+        )
+        .await,
+        Err(ApiError::ReplicaNotCurrent(_))
+    ));
+    // Current state is still served.
+    assert_eq!(
+        read(&fluree, &id, json!(id), "ex:c", "ex:count")
+            .await
+            .unwrap(),
+        vec![json!(2)]
+    );
+}
+
+/// An archive made before a removal, restored after its source is purged,
+/// still refuses the removed history: the lineage's journal checkpoint lives
+/// outside the ledger and the archive, and restore merges it in.
+#[tokio::test]
+async fn a_pre_removal_archive_restored_after_a_purge_keeps_the_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let name = "it/removal-old-archive";
+    let id = ledger(&fluree, name).await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@old"},
+            {"@id": "ex:bob", "ex:email": "b@old"}
+        ]}),
+    )
+    .await;
+
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .expect("archive before the removal");
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("purge");
+
+    let restored = fluree
+        .restore_ledger("it/removal-old-archive-restored", &mut archive.as_slice())
+        .await
+        .expect("restore")
+        .ledger_id;
+    let at_t1 = json!(format!("{restored}@t:{t1}"));
+    assert!(unavailable(
+        read(&fluree, &restored, at_t1.clone(), "ex:alice", "ex:email").await
+    ));
+    assert_eq!(
+        read(&fluree, &restored, at_t1, "ex:bob", "ex:email")
+            .await
+            .unwrap(),
+        vec![json!("b@old")]
+    );
+    // The value the archive still held as current is retracted.
+    assert!(
+        read(&fluree, &restored, json!(restored), "ex:alice", "ex:email")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -17,6 +17,7 @@
 
 mod engine;
 pub mod journal;
+mod lineage;
 mod policy;
 pub mod registry;
 pub mod removal;

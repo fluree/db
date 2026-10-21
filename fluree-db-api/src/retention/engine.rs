@@ -776,6 +776,7 @@ impl Fluree {
         }
         cache.put(ledger_id, blob, schedule, persisted_at);
         if journal_changed {
+            self.checkpoint_journal(ledger_id).await;
             let pending = self
                 .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
                 .await;

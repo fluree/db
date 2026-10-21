@@ -56,6 +56,10 @@ pub struct Registration {
     /// for (the backfill that drops existing history from the index).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub history_backfilled: u64,
+    /// The CID of the ledger's genesis commit, which every copy of it
+    /// (restored, cloned, branched) shares; keys the journal checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -162,6 +166,13 @@ pub(crate) struct ArchivedRetention {
     pub(crate) journal: super::journal::Journal,
 }
 
+impl ArchivedRetention {
+    pub(crate) fn parse(archived: &serde_json::Value) -> Result<Self> {
+        serde_json::from_value(archived.clone())
+            .map_err(|e| ApiError::http(400, format!(".flpack retention section: {e}")))
+    }
+}
+
 /// The archive's retention section for `ledger_id`, if it is registered.
 pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
     ns: &N,
@@ -179,24 +190,39 @@ pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
         .map_err(|e| ApiError::internal(format!("retention registration: {e}")))
 }
 
-/// Register a restored ledger from its archive's retention section. Its
+/// Register a restored ledger: its archive's retention section (if any),
+/// with the journal the lineage's checkpoint holds merged in, so a copy
+/// restored from an archive made before a removal still refuses it. Its
 /// expiry schedule is rebuilt from its commits, and its index history
-/// compacted again.
+/// compacted again. Nothing is registered when neither has anything.
 pub(crate) async fn restore(
     ns: &dyn NameServicePublisher,
     record: &fluree_db_nameservice::NsRecord,
-    archived: &serde_json::Value,
-) -> Result<()> {
-    let archived: ArchivedRetention = serde_json::from_value(archived.clone())
-        .map_err(|e| ApiError::http(400, format!(".flpack retention section: {e}")))?;
+    archived: Option<ArchivedRetention>,
+    lineage: Option<&str>,
+    checkpoint: Option<super::journal::Journal>,
+) -> Result<Option<Registration>> {
+    let mut journal = archived
+        .as_ref()
+        .map(|a| a.journal.clone())
+        .unwrap_or_default();
+    if let Some(checkpoint) = &checkpoint {
+        journal.merge(checkpoint);
+    }
+    if archived.is_none() && journal.is_empty() {
+        return Ok(None);
+    }
+    let active_since_t = archived.as_ref().map_or(1, |a| a.active_since_t);
+    let registration = Registration {
+        active_since_t,
+        watermark_t: active_since_t - 1,
+        journal,
+        lineage: lineage.map(str::to_string),
+        ..Default::default()
+    };
     update_fenced(ns, record.ledger_id.as_str(), record.fence, |_| {
-        Some(Registration {
-            active_since_t: archived.active_since_t,
-            watermark_t: archived.active_since_t - 1,
-            journal: archived.journal.clone(),
-            ..Default::default()
-        })
+        Some(registration.clone())
     })
     .await?;
-    Ok(())
+    Ok(Some(registration))
 }
