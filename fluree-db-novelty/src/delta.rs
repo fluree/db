@@ -76,6 +76,9 @@ impl FactKey {
 #[derive(Default)]
 pub struct NetChangeAccumulator {
     map: FxHashMap<FactKey, Flake>,
+    /// Facts whose deciding commit (the first to arrive) both retracted and
+    /// asserted them at one `t`: see [`Self::finish_with_pairs`].
+    paired: FxHashSet<FactKey>,
 }
 
 impl NetChangeAccumulator {
@@ -89,7 +92,13 @@ impl NetChangeAccumulator {
             }
             Entry::Occupied(mut e) => {
                 let cur = e.get();
-                if flake.t == cur.t && supersedes((flake.t, flake.op), (cur.t, cur.op)) {
+                if flake.t != cur.t {
+                    return;
+                }
+                if flake.op != cur.op {
+                    self.paired.insert(e.key().clone());
+                }
+                if supersedes((flake.t, flake.op), (cur.t, cur.op)) {
                     e.insert(flake.clone());
                 }
             }
@@ -100,6 +109,24 @@ impl NetChangeAccumulator {
     /// flake, so `op` is the fact's state at the range head. Unordered.
     pub fn finish(self) -> Vec<Flake> {
         self.map.into_values().collect()
+    }
+
+    /// [`Self::finish`], with the positions of the facts whose deciding
+    /// commit held a same-`t` retraction and assertion of them. Such a pair
+    /// resolves to its assertion, but what the commit changed depends on
+    /// whether the fact was present before it, which only the state can say:
+    /// an undo of the range resolves these against it.
+    pub fn finish_with_pairs(self) -> (Vec<Flake>, Vec<usize>) {
+        let Self { map, paired } = self;
+        let mut flakes = Vec::with_capacity(map.len());
+        let mut pairs = Vec::with_capacity(paired.len());
+        for (key, flake) in map {
+            if paired.contains(&key) {
+                pairs.push(flakes.len());
+            }
+            flakes.push(flake);
+        }
+        (flakes, pairs)
     }
 }
 
@@ -260,6 +287,32 @@ mod tests {
         // Retract old value + assert new value = two distinct facts, both net.
         let out = net(&[flake("a", "old", 2, false), flake("a", "new", 2, true)]);
         assert_eq!(out.len(), 2);
+    }
+
+    /// A fact both retracted and asserted by its deciding commit is reported
+    /// as paired; one changed at another `t` after that, or by one op, is not.
+    #[test]
+    fn a_same_t_pair_in_the_deciding_commit_is_reported() {
+        let mut acc = NetChangeAccumulator::default();
+        for f in [
+            flake("a", "v", 2, false),
+            flake("a", "v", 2, true),
+            flake("b", "w", 2, true),
+            flake("c", "x", 3, true),
+            flake("c", "x", 2, false),
+            flake("c", "x", 2, true),
+        ] {
+            acc.push_newest_first(&f);
+        }
+        let (flakes, pairs) = acc.finish_with_pairs();
+        let paired: Vec<String> = pairs
+            .iter()
+            .map(|&n| match &flakes[n].o {
+                FlakeValue::String(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(paired, vec!["v".to_string()], "{flakes:?}");
     }
 
     /// Both ops of one fact at the same `t` net to the assertion

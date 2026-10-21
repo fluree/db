@@ -22,7 +22,7 @@ use crate::rebase::ConflictStrategy;
 use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_transact::TransactError;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Outcome of validating a branch operation's staged view.
 ///
@@ -193,6 +193,59 @@ async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>
     Ok(flakes)
 }
 
+/// An undo's net change with each fact its deciding commit held as a
+/// same-`t` pair (`same_t_pairs`, positions in `inverted`) resolved by the
+/// fact's presence just before that commit. The pair left the fact present
+/// whatever it was before, so undoing the commit restores that: absent,
+/// the fact is retracted; present, nothing is written for it. The commit
+/// alone can't tell the two apart. One read per pair, at the deciding
+/// commit's `t - 1`; only commits written before the staging fix hold pairs.
+async fn undo_same_t_pairs(
+    state: &LedgerState,
+    mut inverted: Vec<Flake>,
+    same_t_pairs: &[usize],
+) -> Result<Vec<Flake>> {
+    use fluree_db_transact::{CurrentFacts, Slot};
+    if same_t_pairs.is_empty() {
+        return Ok(inverted);
+    }
+    let mut by_t: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for &n in same_t_pairs {
+        by_t.entry(inverted[n].t).or_default().push(n);
+    }
+    let mut present_before: Vec<(usize, bool)> = Vec::with_capacity(same_t_pairs.len());
+    for (t, positions) in by_t {
+        let mut asked: Vec<(usize, Slot)> = Vec::with_capacity(positions.len());
+        for n in positions {
+            let f = &inverted[n];
+            match Slot::in_ledger(state, &f.g, &f.s, &f.p) {
+                Some(slot) => asked.push((n, slot)),
+                // A graph the state doesn't have held nothing.
+                None => present_before.push((n, false)),
+            }
+        }
+        let items: Vec<(Slot, &Flake)> = asked
+            .iter()
+            .map(|(n, slot)| (slot.clone(), &inverted[*n]))
+            .collect();
+        let held = CurrentFacts::at(state, t - 1).named_by(&items).await?;
+        for ((n, _), held) in asked.iter().zip(held) {
+            present_before.push((*n, held.is_some()));
+        }
+    }
+    let mut keep = vec![true; inverted.len()];
+    for (n, present) in present_before {
+        if present {
+            keep[n] = false;
+        } else {
+            inverted[n].op = false;
+        }
+    }
+    let mut keep = keep.into_iter();
+    inverted.retain(|_| keep.next().unwrap_or(true));
+    Ok(inverted)
+}
+
 impl crate::Fluree {
     /// Stage `flakes` onto `state` and validate the result against the
     /// ledger's SHACL configuration and shapes.
@@ -283,11 +336,13 @@ impl crate::Fluree {
         &self,
         target_state: LedgerState,
         inverted: Vec<Flake>,
+        same_t_pairs: &[usize],
         conflicts: &[ConflictKey],
         strategy: &ConflictStrategy,
         namespace_delta: &HashMap<u16, String>,
         graph_iris: &BTreeSet<String>,
     ) -> Result<Option<(StagedLedger, BranchOpValidation)>> {
+        let inverted = undo_same_t_pairs(&target_state, inverted, same_t_pairs).await?;
         let staged = self
             .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
             .await?;

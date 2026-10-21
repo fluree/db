@@ -781,9 +781,15 @@ pub struct CurrentFacts<'l> {
 impl<'l> CurrentFacts<'l> {
     /// Current facts of `ledger` as of `ledger.t()`.
     pub fn new(ledger: &'l LedgerState) -> Self {
+        Self::at(ledger, ledger.t())
+    }
+
+    /// Current facts of `ledger` as of `to_t` (at most `ledger.t()`): the
+    /// index read as of `to_t`, and novelty up to it.
+    pub fn at(ledger: &'l LedgerState, to_t: i64) -> Self {
         Self {
             ledger,
-            to_t: ledger.t(),
+            to_t: to_t.min(ledger.t()),
             keys: IndexKeys::new(ledger),
         }
     }

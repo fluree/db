@@ -70,6 +70,12 @@ pub(crate) fn key_of(flake: &Flake) -> ConflictKey {
 pub(crate) struct CollectedCommitData {
     /// The range's net change, one flake per surviving fact. Unordered.
     pub(crate) flakes: Vec<Flake>,
+    /// For an undo, the positions in `flakes` of facts whose deciding commit
+    /// held a same-`t` retraction and assertion of them: what undoing that
+    /// commit leaves depends on the fact's presence before it
+    /// (`branch_validation::undo_same_t_pairs`). Empty for a replay, whose
+    /// pairs resolve to the assertion, the state at the range head.
+    pub(crate) same_t_pairs: Vec<usize>,
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
     /// Named graphs the range's commits list, by IRI. Unioned by IRI: each
@@ -117,7 +123,8 @@ where
     // oldest commit is applied last, so the oldest commit's inverse comes
     // first. Within one commit order does not matter: the accumulator
     // resolves a same-`t` retraction and assertion of one fact to the
-    // assertion, so undoing a commit that restated a fact keeps it.
+    // assertion and, for an undo, reports the pair, which the caller
+    // resolves by the fact's presence before that commit.
     let mut acc = NetChangeAccumulator::default();
     match fold {
         Fold::Replay => {
@@ -148,7 +155,10 @@ where
             }
         }
     }
-    data.flakes = acc.finish();
+    match fold {
+        Fold::Replay => data.flakes = acc.finish(),
+        Fold::Undo => (data.flakes, data.same_t_pairs) = acc.finish_with_pairs(),
+    }
     data
 }
 

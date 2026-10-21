@@ -637,6 +637,7 @@ impl crate::Fluree {
 
         let CollectedCommitData {
             flakes: source_flakes,
+            same_t_pairs: _,
             namespace_delta,
             graph_iris,
         } = source_data;
