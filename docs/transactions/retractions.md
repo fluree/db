@@ -313,6 +313,11 @@ t=2: DELETE DATA { ex:alice schema:age 30 }
      Result: nothing is committed; the ledger stays at t=1
 ```
 
+The same holds in a named graph the ledger does not have: a DELETE that
+names one (`DELETE DATA { GRAPH <g> { … } }`, `WITH <g>`, a `GRAPH ?g` bound
+to it) retracts nothing there and does not create the graph. An INSERT into
+a new graph, a sync, or `CREATE GRAPH` creates it.
+
 A DELETE names RDF terms exactly. The datatype must match the stored one
 (`30` is `xsd:integer`, so it does not retract `"30"^^xsd:int`); a language
 tag matches case-insensitively (`"a"@EN` retracts a stored `"a"@en`). A
@@ -333,10 +338,14 @@ however many solutions delete it, and a commit holds only the triples whose
 stored state changes.
 
 Once a fact is indexed, a DELETE is matched against what the index stores,
-which is less than was written for two kinds of value: an integer too large
-for 64 bits keeps no XSD subtype, and a `dateTime` or `time` keeps six
-fractional digits. A DELETE naming the same big integer under another integer
-datatype, or the same instant to the microsecond, retracts such a fact.
+which is less than was written for an integer too large for 64 bits: the index
+keeps no XSD subtype. A DELETE naming the same big integer under another
+integer datatype retracts such a fact. Storage holds such an integer as one
+fact per value, indexed yet or not, so when a transaction retracts one and
+inserts the same value, the two cancel whatever subtype the insert names:
+`DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as for any value
+that is present, and neither does a write that retracts it and inserts it
+under another subtype.
 
 ### No Cascading by Default
 

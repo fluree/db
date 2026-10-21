@@ -273,7 +273,14 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
             }
             Ordering::Greater => {
                 // Novelty comes first (not in existing data): base-absent.
-                gather_identity_events(input, &mut si, nov, op, &mut events);
+                gather_identity_events(
+                    input.superseded,
+                    input.superseded_ops,
+                    &mut si,
+                    nov,
+                    op,
+                    &mut events,
+                );
                 push_transition_entries(&mut events, false, &mut new_history);
                 if op == 1 {
                     out.push(*nov);
@@ -288,7 +295,14 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
                 // history entry, so replay can still find the fact's birth
                 // (and its exact `t`) after the row is removed or replaced.
                 new_history.push(batch_row_to_hist_entry(input.batch, ei, 1));
-                gather_identity_events(input, &mut si, nov, op, &mut events);
+                gather_identity_events(
+                    input.superseded,
+                    input.superseded_ops,
+                    &mut si,
+                    nov,
+                    op,
+                    &mut events,
+                );
                 let changed = push_transition_entries(&mut events, true, &mut new_history);
                 if op == 1 {
                     out.push(*nov);
@@ -323,7 +337,14 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     while ni < novelty_len {
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
-        gather_identity_events(input, &mut si, nov, op, &mut events);
+        gather_identity_events(
+            input.superseded,
+            input.superseded_ops,
+            &mut si,
+            nov,
+            op,
+            &mut events,
+        );
         push_transition_entries(&mut events, false, &mut new_history);
         if op == 1 {
             out.push(*nov);
@@ -353,16 +374,17 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
 /// advancing the superseded cursor past the consumed entries. Superseded
 /// events sort adjacent to their winner (same identity, same order), so a
 /// linear scan from the cursor suffices.
-fn gather_identity_events(
-    input: &MergeInput<'_>,
+pub(crate) fn gather_identity_events(
+    superseded: &[RunRecordV2],
+    superseded_ops: &[u8],
     si: &mut usize,
     nov: &RunRecordV2,
     op: u8,
     events: &mut Vec<(RunRecordV2, u8)>,
 ) {
     events.clear();
-    while *si < input.superseded.len() && same_identity_v2(&input.superseded[*si], nov) {
-        events.push((input.superseded[*si], input.superseded_ops[*si]));
+    while *si < superseded.len() && same_identity_v2(&superseded[*si], nov) {
+        events.push((superseded[*si], superseded_ops[*si]));
         *si += 1;
     }
     events.push((*nov, op));
