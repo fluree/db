@@ -722,7 +722,7 @@ fn slice_novelty_to_leaves<'a>(
 
 fn compute_branch_cid(bytes: &[u8]) -> ContentId {
     let hex_digest = fluree_db_core::sha256_hex(bytes);
-    ContentId::from_hex_digest(
+    ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
         &hex_digest,
     )

@@ -3,7 +3,7 @@
 //! A commit has two canonical spellings and they are not interchangeable.
 //! [`ContentId`] *displays* as a base32 CIDv1 — that is the JSON API wire
 //! format and the `db:address` flake value — but the indexed commit subject is
-//! minted from `ContentId::digest_hex()`, so both prefix resolvers scan hex.
+//! minted from `ContentId::address_digest()`, so both prefix resolvers scan hex.
 //!
 //! `ledger_view::normalize_commit_ref` is the single place that reconciles the
 //! two, and these tests pin it through the surfaces that reach it, not through
@@ -91,7 +91,7 @@ async fn every_spelling_of_a_commit_resolves_to_the_same_state() {
     let ledger_id = "it/commit-identity";
     let (ledger, commit_t1) = seed(&fluree, ledger_id).await;
 
-    let hex = commit_t1.digest_hex();
+    let hex = commit_t1.address_digest();
     let at_t1 = normalize_rows(&json!([["Alice"]]));
 
     for spelling in [

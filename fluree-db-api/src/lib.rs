@@ -51,6 +51,7 @@ pub mod commit_transfer;
 mod config_guard;
 pub mod config_resolver;
 mod config_vocab;
+mod content_hash;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
@@ -2528,6 +2529,14 @@ impl FlureeBuilder {
     ///
     /// No-op unless background indexing is enabled, since it configures the
     /// worker; call it after `with_indexing*`.
+    /// Mint new commit and transaction CIDs with `alg` (SHA2-256 by
+    /// default). Index and other content stays SHA2-256, and existing
+    /// objects keep the hash they were written with.
+    pub fn with_content_hash(mut self, alg: fluree_db_core::HashAlgorithm) -> Self {
+        self.config.content_hash = alg;
+        self
+    }
+
     pub fn with_indexer_catchup_interval(mut self, interval: std::time::Duration) -> Self {
         if let Some(cfg) = self.indexing_config.take() {
             self.indexing_config = Some(IndexingBuilderConfig {
@@ -3429,6 +3438,7 @@ impl FlureeBuilder {
             spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
         }
 
+        let config_content_hash = config.content_hash;
         Fluree {
             config,
             backend,
@@ -3445,6 +3455,7 @@ impl FlureeBuilder {
             secret_resolver,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             retention: Arc::default(),
+            content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }
@@ -3809,6 +3820,8 @@ pub struct Fluree {
     /// The retention worker's in-process state: the branches it knows are
     /// active, and how to wake it.
     retention: Arc<retention::RetentionRuntime>,
+    /// The hash new commit and transaction CIDs are minted with.
+    content_hash: Arc<content_hash::ContentHashPolicy>,
     /// What this instance holds of its file storage root.
     #[cfg(feature = "native")]
     root: RootHold,
@@ -3849,6 +3862,7 @@ impl Fluree {
         nameservice: NameServiceMode,
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config, &backend);
+        let config_content_hash = config.content_hash;
         Self {
             config,
             backend: with_artifact_cache(backend, None),
@@ -3865,6 +3879,7 @@ impl Fluree {
             secret_resolver: None,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
             retention: Arc::default(),
+            content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
             root: RootHold::default(),
         }

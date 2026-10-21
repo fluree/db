@@ -105,7 +105,7 @@ pub(crate) fn cid_and_addr_for(
         "memory",
         kind,
         &fluree_db_core::StorageNamespace::parse_legacy(ledger_id).unwrap(),
-        &cid.digest_hex(),
+        &cid.address_digest(),
     );
     (cid, addr)
 }

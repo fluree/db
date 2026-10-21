@@ -694,6 +694,10 @@ name = "transact_commit"
 harness = false
 
 [[bench]]
+name = "content_hash"
+harness = false
+
+[[bench]]
 name = "transact_filtered_delete"
 harness = false
 

@@ -136,3 +136,17 @@ pub fn verify_commit_blob(bytes: &[u8]) -> Result<ContentId, CommitCodecError> {
         CommitBlobVersion::V4 => reader::verify_commit_blob_v4(bytes),
     }
 }
+
+/// Whether `bytes` are the commit blob `id` names, by the blob's own rules:
+/// a v3 blob's embedded hash, a v4 blob's full-bytes hash under `id`'s
+/// algorithm. Use this, not [`verify_commit_blob`], wherever the expected
+/// CID is known: the derived CID is always SHA2-256.
+pub fn commit_blob_matches(id: &ContentId, bytes: &[u8]) -> bool {
+    match detect_version(bytes) {
+        Ok(CommitBlobVersion::V3) => legacy_v3::verify_commit_v3(bytes).is_ok_and(|d| d == *id),
+        Ok(CommitBlobVersion::V4) => {
+            reader::validate_commit_blob_v4(bytes).is_ok() && id.verify(bytes)
+        }
+        Err(_) => false,
+    }
+}

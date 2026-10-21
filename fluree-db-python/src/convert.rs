@@ -609,7 +609,7 @@ pub(crate) fn commit_summary<'py>(
     let commit = PyDict::new(py);
     commit.set_item("t", summary.t)?;
     commit.set_item("id", summary.commit_id.to_string())?;
-    commit.set_item("digest", summary.commit_id.digest_hex())?;
+    commit.set_item("digest", summary.commit_id.address_digest())?;
     commit.set_item("asserts", summary.asserts)?;
     commit.set_item("retracts", summary.retracts)?;
     commit.set_item("time", summary.time.as_deref())?;

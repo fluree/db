@@ -14,7 +14,7 @@ Fluree's storage-agnostic architecture separates **identity** (what something is
 
 1. **Version**: CIDv1
 2. **Multicodec**: identifies the *kind* of the bytes (e.g., Fluree commit, index root)
-3. **Multihash**: identifies the *hash function + digest* (SHA-256)
+3. **Multihash**: identifies the *hash function + digest* (SHA2-256, or SHA2-512 — see [Hash algorithms](#hash-algorithms))
 
 ### Multicodec assignments (private-use range)
 
@@ -48,13 +48,14 @@ The compact binary form (varint version + varint codec + multihash bytes) is use
 
 ### Creating a ContentId
 
-A ContentId is derived by hashing the **canonical bytes** of an artifact with SHA-256, then wrapping the digest as a CIDv1 with the appropriate multicodec:
+A ContentId is derived by hashing the **canonical bytes** of an artifact, then wrapping the digest as a CIDv1 with the appropriate multicodec:
 
 ```rust
-use fluree_db_core::content_id::{ContentId, ContentKind};
+use fluree_db_core::{ContentId, ContentKind, HashAlgorithm};
 
 let bytes: &[u8] = /* canonical commit bytes */;
-let cid = ContentId::from_bytes(ContentKind::Commit, bytes);
+let cid = ContentId::new(ContentKind::Commit, bytes); // SHA2-256
+let wide = ContentId::new_with(HashAlgorithm::Sha2_512, ContentKind::Commit, bytes);
 
 // String form for JSON/logs
 let s = cid.to_string(); // "bafybeig..."
@@ -63,6 +64,22 @@ let s = cid.to_string(); // "bafybeig..."
 let parsed = ContentId::from_str(&s)?;
 assert_eq!(cid, parsed);
 ```
+
+### Hash algorithms
+
+The multihash makes a CID self-describing: `ContentId::hash_algorithm()` reads the algorithm from the CID itself, and `verify` re-hashes with it. Verification therefore never depends on what the current writer mints. Two algorithms are supported, SHA2-256 (code `0x12`, 32 bytes, the default) and SHA2-512 (`0x13`, 64 bytes). Any other code, or a digest whose length does not match its code, does not verify and cannot be minted.
+
+An embedding chooses the algorithm new commit and transaction blobs are minted with through `FlureeBuilder::with_content_hash`; the commit pipeline carries it in `CommitOpts::content_hash`. Index artifacts and other internal content stay SHA2-256, as do the commits a bulk import writes. A Raft cluster node always mints SHA2-256: an alternative hash is safe in a cluster only once membership records the hashes every member must read and refuses a member that cannot, which is not built yet. The server exposes no setting.
+
+Adding an algorithm is one `HashAlgorithm` variant: its multihash code, digest length, multicodec name and hash function. Verification, storage addressing, transfer and commit subjects dispatch on the CID and need no change. A circuit-oriented hash such as Poseidon also needs a versioned, specified encoding of bytes into field elements; that encoding is part of the algorithm's definition, not something the dispatch can supply.
+
+Storage keys an object by its **address digest** (`ContentId::address_digest`): the bare hex digest for SHA2-256, unchanged from before, and `<algorithm>-<hex>` for anything else, so a path or key never loses the algorithm. `ContentId::from_address_digest` parses either spelling and rejects an unsupported tag or wrong length.
+
+Commit subjects in `#txn-meta` keep `fluree:commit:sha256:<hex>` for SHA2-256; another algorithm's commit is `urn:fluree:commit-<algorithm>-<hex>` (see `fluree_db_core::commit_subject`), a name with no `/`, `#` or `:` so the IRI splits back into the namespace it was minted in. Commit references (`@commit:`) take a full CID, a SHA2-256 hex prefix, or `<algorithm>:<hex>` for another algorithm.
+
+Commit bytes do not say which algorithm their CID uses, so transfer formats carry the CIDs: push requests and export pages name each commit (`commit_ids`, `merged_commit_ids`), and the receiver checks every named CID against its bytes. Without names, a commit's CID is the SHA2-256 of its bytes, which is all a sender predating them can have minted. `.flpack` frames and commit parent links already carry full CIDs.
+
+Commit signatures are unaffected: they sign a domain-separated SHA-256 digest of the commit body, whatever the CID's hash.
 
 ### ContentId in commit references
 

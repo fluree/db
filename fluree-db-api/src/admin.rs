@@ -2221,7 +2221,7 @@ impl crate::Fluree {
                             let path = fluree_db_core::content_path(
                                 fluree_db_core::ContentKind::GraphSourceMapping,
                                 &record.storage_namespace(),
-                                &cid.digest_hex(),
+                                &cid.address_digest(),
                             );
                             if let Some(storage) = self.admin_storage() {
                                 if let Err(e) = storage.delete(&path).await {

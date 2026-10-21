@@ -438,34 +438,13 @@ pub async fn ingest_pack_frame<S: ContentAddressedWrite>(
         )));
     }
 
-    // For commit-v2 blobs, derive the hash from the canonical sub-range.
-    // For everything else, the CID digest is the full-bytes hash.
-    let digest_hex = if kind == ContentKind::Commit {
-        // Commit CID digest was already verified by verify_object_integrity.
-        // Re-derive it via the same path for the write call.
-        derive_commit_digest_hex(bytes)?
-    } else {
-        cid.digest_hex()
-    };
-
+    // Verified against the CID, so the CID's digest is the object's address.
     storage
-        .content_write_bytes_with_hash(kind, namespace, &digest_hex, bytes)
+        .content_write_bytes_with_hash(kind, namespace, &cid.address_digest(), bytes)
         .await
         .map_err(|e| SyncError::PackProtocol(format!("failed to write {cid}: {e}")))?;
 
     Ok(())
-}
-
-/// Derive the canonical SHA-256 hex digest for a commit blob.
-///
-/// This must match the hash derivation in `verify_commit_blob`.
-fn derive_commit_digest_hex(bytes: &[u8]) -> Result<String> {
-    match fluree_db_core::commit::codec::verify_commit_blob(bytes) {
-        Ok(derived_id) => Ok(derived_id.digest_hex()),
-        Err(e) => Err(SyncError::PackProtocol(format!(
-            "failed to derive commit digest: {e}"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -511,9 +490,11 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_commit_digest_fails_on_non_commit() {
-        // Non-commit bytes should fail verification.
-        let result = derive_commit_digest_hex(b"not a commit");
-        assert!(result.is_err());
+    fn non_commit_bytes_fail_commit_verification() {
+        let id = fluree_db_core::ContentId::new(ContentKind::Commit, b"not a commit");
+        assert!(!fluree_db_core::commit::codec::commit_blob_matches(
+            &id,
+            b"not a commit"
+        ));
     }
 }

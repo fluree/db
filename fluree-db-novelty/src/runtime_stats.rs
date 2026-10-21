@@ -10,7 +10,6 @@ use fluree_db_core::{
     RangeMatch, RangeOptions, RangeTest, RuntimePredicateId, RuntimeSmallDicts, Sid, ValueTypeTag,
 };
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
-use fluree_vocab::namespaces::FLUREE_COMMIT;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1097,7 +1096,7 @@ impl<'a> NoveltyDeltaResolver<'a> {
         // ordering contract above: the subject namespace is an identity
         // component, so the skipped set is disjoint by identity from the
         // resolved set and no run is left half-consumed.
-        if flake.s.namespace_code == FLUREE_COMMIT {
+        if fluree_db_core::commit_subject::is_commit_sid(&flake.s) {
             return if flake.op { 1 } else { -1 };
         }
         // Contiguity is what lets per-identity state live in a per-run vec
@@ -1210,7 +1209,7 @@ fn include_in_runtime_stats(flake: &Flake, to_t: i64) -> bool {
     if flake.t > to_t {
         return false;
     }
-    if flake.s.namespace_code == FLUREE_COMMIT {
+    if fluree_db_core::commit_subject::is_commit_sid(&flake.s) {
         return false;
     }
     if let Some(g) = &flake.g {

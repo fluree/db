@@ -203,7 +203,7 @@ impl BrowserCasStorage {
             self.storage_method(),
             kind,
             namespace,
-            &cid.digest_hex(),
+            &cid.address_digest(),
         ))
     }
 
@@ -825,7 +825,7 @@ pub(crate) mod tests {
             "proxy",
             ContentKind::IndexLeaf,
             &ledger_namespace(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
         (id, address, bytes)
     }

@@ -1025,8 +1025,8 @@ impl Worker {
                 Ok::<_, WorkerError>(out)
             }
         };
-        let commits = read_commits(commit_cids).await?;
-        let merged_commits = read_commits(merged_commit_cids).await?;
+        let commits = read_commits(commit_cids.clone()).await?;
+        let merged_commits = read_commits(merged_commit_cids.clone()).await?;
         let payload = PushCommitsRequest {
             commits,
             blobs: blobs
@@ -1037,6 +1037,8 @@ impl Worker {
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
             merged_commits,
+            commit_ids: commit_cids,
+            merged_commit_ids: merged_commit_cids,
         };
         let StagedPush {
             accepted,

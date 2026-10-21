@@ -2902,6 +2902,8 @@ ex:alice ex:name "Alice" ."#;
             blobs: std::collections::HashMap::new(),
             merged_commits: Vec::new(),
             governance: GovernanceOptions::default(),
+            commit_ids: Vec::new(),
+            merged_commit_ids: Vec::new(),
         }
     }
 

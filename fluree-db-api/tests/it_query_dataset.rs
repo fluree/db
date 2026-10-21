@@ -1384,7 +1384,7 @@ async fn dataset_time_travel_at_commit() {
     let tx1 = fluree.insert(ledger0, &insert1).await.unwrap();
 
     // Extract the hex digest directly from the receipt's ContentId
-    let commit_prefix = tx1.receipt.commit_id.digest_hex();
+    let commit_prefix = tx1.receipt.commit_id.address_digest();
 
     // Commit 2: Bob
     let insert2 = json!({
@@ -1431,7 +1431,7 @@ async fn dataset_time_travel_at_commit_short_prefix() {
     let tx1 = fluree.insert(ledger0, &insert1).await.unwrap();
 
     // Extract the hex digest directly from the receipt's ContentId
-    let digest_full = tx1.receipt.commit_id.digest_hex();
+    let digest_full = tx1.receipt.commit_id.address_digest();
     // Use just the first 10 characters as a prefix
     let commit_prefix = &digest_full[..10.min(digest_full.len())];
 
@@ -1480,7 +1480,7 @@ async fn dataset_time_travel_alias_syntax_commit() {
     let tx1 = fluree.insert(ledger0, &insert1).await.unwrap();
 
     // Extract the hex digest directly from the receipt's ContentId
-    let commit_prefix = tx1.receipt.commit_id.digest_hex();
+    let commit_prefix = tx1.receipt.commit_id.address_digest();
 
     // Commit 2: Bob
     let insert2 = json!({

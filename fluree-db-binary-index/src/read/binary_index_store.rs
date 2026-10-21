@@ -3817,7 +3817,7 @@ async fn load_per_graph_arenas(
                 .chain(sp_ref.leaflets.iter())
             {
                 let bytes = cs.get(cid).await.map_err(storage_io_error)?;
-                blob_cache.insert(cid.digest_hex(), bytes.into_vec());
+                blob_cache.insert(cid.address_digest(), bytes.into_vec());
             }
             let blob_cache = Arc::new(blob_cache);
 

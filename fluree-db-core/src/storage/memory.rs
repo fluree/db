@@ -280,7 +280,17 @@ impl ContentStore for MemoryContentStore {
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
-        let id = ContentId::new(kind, bytes);
+        self.put_hashed(crate::HashAlgorithm::Sha2_256, kind, bytes)
+            .await
+    }
+
+    async fn put_hashed(
+        &self,
+        alg: crate::HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        let id = ContentId::new_with(alg, kind, bytes);
         self.data.write().insert(id.clone(), Arc::from(bytes));
         Ok(id)
     }

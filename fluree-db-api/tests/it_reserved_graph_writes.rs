@@ -253,7 +253,7 @@ async fn a_forged_commit_record_cannot_shadow_a_real_commit_prefix() {
         .expect("commit 3");
 
     // 12 hex characters is what `fluree show` / `--at` users actually type.
-    let prefix = target_id.digest_hex()[..12].to_string();
+    let prefix = target_id.address_digest()[..12].to_string();
     // A well-formed sibling digest: same 12-character prefix, then padding. It
     // is not a real commit — no blob exists for it — which is the point: only
     // the content store fails closed, resolution itself is steerable by data.
@@ -337,7 +337,7 @@ async fn commit_provenance_still_lands_in_the_txn_meta_graph() {
         .snapshot()
         .await;
     for id in &commit_ids {
-        let prefix = id.digest_hex()[..12].to_string();
+        let prefix = id.address_digest()[..12].to_string();
         let resolved = view
             .resolve_commit(CommitRef::Prefix(prefix.clone()))
             .await

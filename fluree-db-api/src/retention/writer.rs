@@ -205,7 +205,7 @@ impl Fluree {
             expected_head_ref,
             None,
             &self.index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await?;
         Ok((write_guard, staged))

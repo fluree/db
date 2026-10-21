@@ -160,7 +160,7 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
                 std::collections::HashSet::new();
             for root_cid in &roots {
                 let root = decode(&cs.get(root_cid).await.expect("root bytes"));
-                accounted.extend(root.all_cas_ids().iter().map(ContentId::digest_hex));
+                accounted.extend(root.all_cas_ids().iter().map(ContentId::address_digest));
                 let Some(garbage_ref) = root.garbage.as_ref() else {
                     continue;
                 };
@@ -169,7 +169,7 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
                     serde_json::from_slice(&bytes).expect("parse garbage record");
                 for entry in &record.garbage {
                     if let Ok(cid) = entry.parse::<ContentId>() {
-                        accounted.insert(cid.digest_hex());
+                        accounted.insert(cid.address_digest());
                     }
                 }
             }

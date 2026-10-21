@@ -27,7 +27,7 @@ impl Fluree {
         Some(format!(
             "fluree:{}://{CHECKPOINT_DIR}/{}.json",
             storage.storage_method(),
-            lineage.digest_hex()
+            lineage.address_digest()
         ))
     }
 

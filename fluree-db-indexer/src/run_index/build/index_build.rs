@@ -391,7 +391,7 @@ fn build_graph_index_result(
     // Write branch manifest (FBR3).
     let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
     let branch_hex = fluree_db_core::sha256_hex(&branch_bytes);
-    let branch_cid = ContentId::from_hex_digest(
+    let branch_cid = ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
         &branch_hex,
     )

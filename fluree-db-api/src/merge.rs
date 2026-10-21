@@ -721,7 +721,7 @@ impl crate::Fluree {
             expected_head_ref,
             None,
             &self.index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await?;
 
@@ -814,7 +814,7 @@ impl crate::Fluree {
                 .content_write_bytes_with_hash(
                     ContentKind::Commit,
                     target,
-                    &cid.digest_hex(),
+                    &cid.address_digest(),
                     &bytes,
                 )
                 .await?;
@@ -841,7 +841,7 @@ impl crate::Fluree {
                     .content_write_bytes_with_hash(
                         ContentKind::Txn,
                         target,
-                        &txn_cid.digest_hex(),
+                        &txn_cid.address_digest(),
                         &txn_bytes,
                     )
                     .await?;

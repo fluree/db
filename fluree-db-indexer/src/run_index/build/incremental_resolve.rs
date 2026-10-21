@@ -496,7 +496,7 @@ pub async fn resolve_incremental_commits_v6(
 
         for walked in &walked_commits {
             let resolved = shared
-                .resolve_commit_into_chunk(&walked.bytes, &walked.cid.digest_hex(), &mut chunk)
+                .resolve_commit_into_chunk(&walked.bytes, &walked.cid.address_digest(), &mut chunk)
                 .map_err(|e| {
                     IncrementalResolveError::Resolve(match e {
                         ResolverError::Unindexable(msg) => {

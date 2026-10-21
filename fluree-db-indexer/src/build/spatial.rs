@@ -111,15 +111,14 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
         // Construct ContentIds from the content hashes.
         let spatial_codec = ContentKind::SpatialIndex.to_codec();
         let manifest_cid =
-            ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address).ok_or_else(
-                || {
+            ContentId::from_address_digest(spatial_codec, &write_result.manifest_address)
+                .ok_or_else(|| {
                     IndexerError::Other(format!(
                         "invalid spatial manifest hash: {}",
                         write_result.manifest_address
                     ))
-                },
-            )?;
-        let arena_cid = ContentId::from_hex_digest(spatial_codec, &write_result.arena_address)
+                })?;
+        let arena_cid = ContentId::from_address_digest(spatial_codec, &write_result.arena_address)
             .ok_or_else(|| {
                 IndexerError::Other(format!(
                     "invalid spatial arena hash: {}",
@@ -130,7 +129,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
             .leaflet_addresses
             .iter()
             .map(|hash| {
-                ContentId::from_hex_digest(spatial_codec, hash).ok_or_else(|| {
+                ContentId::from_address_digest(spatial_codec, hash).ok_or_else(|| {
                     IndexerError::Other(format!("invalid spatial leaflet hash: {hash}"))
                 })
             })
@@ -143,7 +142,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
             .content_write_bytes(ContentKind::SpatialIndex, namespace, &root_json)
             .await
             .map_err(|e| IndexerError::StorageWrite(format!("spatial root CAS write: {e}")))?;
-        let root_cid = ContentId::from_hex_digest(spatial_codec, &root_cas.content_hash)
+        let root_cid = ContentId::from_address_digest(spatial_codec, &root_cas.content_hash)
             .ok_or_else(|| {
                 IndexerError::Other(format!(
                     "invalid spatial root hash: {}",

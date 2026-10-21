@@ -140,7 +140,7 @@ fn val_stat(root: &IndexRoot) -> GraphPropertyStatEntry {
 
 async fn sketch_address(storage: &Storage, root: &IndexRoot) -> String {
     let cid = root.sketch_ref.as_ref().expect("root has a sketch");
-    let suffix = format!("{}.hll", cid.digest_hex());
+    let suffix = format!("{}.hll", cid.address_digest());
     storage
         .list_prefix("")
         .await

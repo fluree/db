@@ -45,7 +45,7 @@
 use crate::error::Result;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::TransactError;
-use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, HashAlgorithm};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
@@ -64,10 +64,16 @@ impl PendingRawTxnUpload {
     ///
     /// Serialization of `txn_json` happens inside the task so it doesn't add
     /// latency on the caller's path.
-    pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
+    pub fn spawn(
+        content_store: Arc<dyn ContentStore>,
+        txn_json: serde_json::Value,
+        alg: HashAlgorithm,
+    ) -> Self {
         let handle = tokio::spawn(async move {
             let bytes = serde_json::to_vec(&txn_json)?;
-            let cid = content_store.put(ContentKind::Txn, &bytes).await?;
+            let cid = content_store
+                .put_hashed(alg, ContentKind::Txn, &bytes)
+                .await?;
             tracing::info!(raw_txn_bytes = bytes.len(), raw_txn_cid = %cid, "raw txn stored");
             Ok::<_, TransactError>(cid)
         });
@@ -118,26 +124,30 @@ impl std::fmt::Debug for PendingRawTxnUpload {
 /// stored before that, so `abort` and `Drop` have nothing to release.
 #[cfg(target_arch = "wasm32")]
 pub struct PendingRawTxnUpload {
-    deferred: Option<(Arc<dyn ContentStore>, serde_json::Value)>,
+    deferred: Option<(Arc<dyn ContentStore>, serde_json::Value, HashAlgorithm)>,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl PendingRawTxnUpload {
     /// Defer the upload (same signature as the native spawn; see type docs).
-    pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
+    pub fn spawn(
+        content_store: Arc<dyn ContentStore>,
+        txn_json: serde_json::Value,
+        alg: HashAlgorithm,
+    ) -> Self {
         Self {
-            deferred: Some((content_store, txn_json)),
+            deferred: Some((content_store, txn_json, alg)),
         }
     }
 
     /// Run the upload now and return the resulting ContentId.
     pub async fn finish(mut self) -> Result<ContentId> {
-        let (store, txn_json) = self
+        let (store, txn_json, alg) = self
             .deferred
             .take()
             .expect("deferred inputs present until finish/abort");
         let bytes = serde_json::to_vec(&txn_json)?;
-        let cid = store.put(ContentKind::Txn, &bytes).await?;
+        let cid = store.put_hashed(alg, ContentKind::Txn, &bytes).await?;
         tracing::info!(raw_txn_bytes = bytes.len(), "raw txn stored");
         Ok(cid)
     }

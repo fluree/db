@@ -382,6 +382,8 @@ impl Committer for LocalCommitter {
             commits,
             blobs,
             merged_commits,
+            commit_ids,
+            merged_commit_ids,
             governance,
         } = request;
 
@@ -395,6 +397,8 @@ impl Committer for LocalCommitter {
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
             merged_commits: merged_commits.into_iter().map(Base64Bytes).collect(),
+            commit_ids,
+            merged_commit_ids,
         };
 
         let response = self

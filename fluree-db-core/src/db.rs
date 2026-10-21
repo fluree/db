@@ -1015,7 +1015,7 @@ pub async fn load_ledger_snapshot(
         storage.storage_method(),
         ContentKind::IndexRoot,
         namespace,
-        &root_id.digest_hex(),
+        &root_id.address_digest(),
     );
     let bytes = storage.read_bytes(&root_address).await?;
     LedgerSnapshot::from_root_bytes(&bytes)

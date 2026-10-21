@@ -37,7 +37,7 @@ use fluree_db_novelty::{
     generate_commit_flakes, stamp_commit_flakes_dropping_forgeries,
     trace_first_parent_commits_by_id, warn_if_forged_commit_flakes_dropped, Novelty,
 };
-use fluree_vocab::namespaces::{FLUREE_COMMIT, JSON_LD, RDF, XSD};
+use fluree_vocab::namespaces::{JSON_LD, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -269,7 +269,7 @@ impl HistoricalLedgerView {
             // namespace_codes which aren't fully applied until after the walk.
             let deferred_txn_meta = if !commit.txn_meta.is_empty() {
                 commit.id.as_ref().map(|cid| DeferredTxnMeta {
-                    commit_subject: Sid::new(FLUREE_COMMIT, cid.digest_hex()),
+                    commit_subject: fluree_db_core::commit_subject::commit_sid(cid),
                     entries: commit.txn_meta.clone(),
                     t: commit.t,
                 })

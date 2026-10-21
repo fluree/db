@@ -1419,7 +1419,7 @@ mod tests {
     /// Build a minimal IndexRoot for testing.
     fn minimal_root_v6() -> IndexRoot {
         // Create a dummy CID for dict refs
-        let dummy_cid = ContentId::from_hex_digest(
+        let dummy_cid = ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
             &fluree_db_core::sha256_hex(b"dummy"),
         )
@@ -1807,12 +1807,12 @@ mod tests {
         let mut root = minimal_root_v6();
 
         // Create dummy leaf entries for the default graph
-        let dummy_cid = ContentId::from_hex_digest(
+        let dummy_cid = ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_INDEX_LEAF,
             &fluree_db_core::sha256_hex(b"leaf1"),
         )
         .unwrap();
-        let sidecar_cid = ContentId::from_hex_digest(
+        let sidecar_cid = ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_HISTORY_SIDECAR,
             &fluree_db_core::sha256_hex(b"sidecar1"),
         )
@@ -1875,7 +1875,7 @@ mod tests {
     fn fir6_round_trip_with_named_graphs() {
         let mut root = minimal_root_v6();
 
-        let branch_cid = ContentId::from_hex_digest(
+        let branch_cid = ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
             &fluree_db_core::sha256_hex(b"branch1"),
         )

@@ -4785,6 +4785,8 @@ async fn newest_commits(
         blobs: export.blobs,
         missing_blobs: Vec::new(),
         merged_commits: Vec::new(),
+        commit_ids: Vec::new(),
+        merged_commit_ids: Vec::new(),
     }
 }
 

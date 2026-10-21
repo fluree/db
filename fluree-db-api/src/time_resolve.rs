@@ -6,7 +6,7 @@
 //! # Background
 //!
 //! Commit metadata is stored as queryable flakes (8-10 per commit):
-//! - **Commit subject** (FLUREE_COMMIT + hex): ledger#time, ledger#t, ledger#size, ledger#flakes, etc.
+//! - **Commit subject** (`fluree_db_core::commit_subject`): ledger#time, ledger#t, ledger#size, ledger#flakes, etc.
 //!
 //! The `Flake.t` value on these flakes IS the commit transaction number,
 //! so we can resolve time travel efficiently using index queries.
@@ -20,7 +20,7 @@ use fluree_db_core::{
     ObjectBounds, RangeMatch, RangeOptions, RangeTest, Sid, TXN_META_GRAPH_ID,
 };
 use fluree_vocab::db::{RECEIVED_AT as LEDGER_RECEIVED_AT, TIME as LEDGER_TIME};
-use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
+use fluree_vocab::namespaces::FLUREE_DB;
 
 use crate::error::{ApiError, Result};
 
@@ -294,7 +294,7 @@ where
 ///    [`normalize_commit_ref`](crate::ledger_view::normalize_commit_ref) —
 ///    shared with `ledger_view::resolve_commit_prefix`, the other copy of this
 ///    scan, so the two surfaces accept exactly the same spellings
-/// 2. Bounded SPOT scan: `[Sid(FLUREE_COMMIT, prefix), Sid(FLUREE_COMMIT, prefix~))`
+/// 2. Bounded SPOT scan: `[Sid(ns, prefix), Sid(ns, prefix~))` over the commit subjects
 /// 3. Track unique commit subjects
 /// 4. Return `flake.t` from the single match (or error on 0 / >1)
 ///
@@ -322,15 +322,14 @@ where
     O: OverlayProvider + ?Sized,
 {
     // Step 1: Normalize the commit prefix to the hex digest the index is keyed on.
-    let normalized = crate::ledger_view::normalize_commit_ref(commit_prefix)?;
+    let start_sid = crate::ledger_view::normalize_commit_ref(commit_prefix)?;
+    let ns = start_sid.namespace_code;
+    let normalized = start_sid.name.to_string();
     let normalized = normalized.as_str();
 
-    // Step 2: Create bounded SPOT scan
-    // Commit subjects use the FLUREE_COMMIT namespace with hex hash as name
-    let start_sid = Sid::new(FLUREE_COMMIT, normalized);
+    // Step 2: Create bounded SPOT scan over the commit subjects.
     // Use tilde (~) as end bound since it sorts after all hex characters (0-9, a-f)
-    let end_prefix = format!("{normalized}~");
-    let end_sid = Sid::new(FLUREE_COMMIT, &end_prefix);
+    let end_sid = Sid::new(ns, format!("{normalized}~"));
 
     let start_bound = Flake::min_for_subject(start_sid);
     let end_bound = Flake::min_for_subject(end_sid);
@@ -372,8 +371,8 @@ where
     let mut seen_subjects: HashSet<&Sid> = HashSet::new();
 
     for flake in &flakes {
-        // Verify this subject is a commit in FLUREE_COMMIT and matches prefix
-        if flake.s.namespace_code != FLUREE_COMMIT {
+        // Verify this subject is a commit and matches the prefix
+        if flake.s.namespace_code != ns {
             continue;
         }
         if !flake.s.name.starts_with(normalized) {

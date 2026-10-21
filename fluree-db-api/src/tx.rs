@@ -3847,7 +3847,9 @@ impl crate::Fluree {
         // is preserved but serial latency is eliminated on fast paths.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, txn_json_for_commit)
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, txn_json_for_commit)
         } else {
             commit_opts
         };
@@ -3944,7 +3946,7 @@ impl crate::Fluree {
             &content_store,
             publisher,
             index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await?;
         Ok((receipt, ledger))
@@ -4044,7 +4046,9 @@ impl crate::Fluree {
         // Spawn raw_txn upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
             commit_opts
         };
@@ -4140,7 +4144,9 @@ impl crate::Fluree {
         // Spawn raw Turtle upload in parallel with staging when opted in.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {
             commit_opts
         };
@@ -4476,7 +4482,9 @@ impl crate::Fluree {
         // The raw transaction is the text, as for a Turtle insert.
         let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(&ledger.storage_namespace());
-            commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {
             commit_opts
         };
@@ -4681,6 +4689,7 @@ impl crate::Fluree {
         let content_store = self.content_store(&ledger.storage_namespace());
         let commit_opts = CommitOpts::default()
             .identity(verified.did.clone())
+            .with_content_hash(self.content_hash())
             .with_raw_txn_spawned(content_store, raw_credential)
             .with_txn_signature(fluree_db_novelty::TxnSignature {
                 signer: verified.did.clone(),
@@ -5139,6 +5148,8 @@ mod tests {
                             blobs: pushed.blobs.clone(),
                             missing_blobs: Vec::new(),
                             merged_commits: Vec::new(),
+                            commit_ids: Vec::new(),
+                            merged_commit_ids: Vec::new(),
                         },
                         &crate::GovernanceOptions::default(),
                         &fluree.default_index_config(),

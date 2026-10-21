@@ -68,7 +68,7 @@ pub fn build_incremental_string_packs(
         .map(|p| PackBranchEntry {
             first_id: p.first_id,
             last_id: p.last_id,
-            pack_cid: fluree_db_core::ContentId::from_hex_digest(
+            pack_cid: fluree_db_core::ContentId::from_address_digest(
                 fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
                 &fluree_db_core::sha256_hex(&p.bytes),
             )
@@ -138,7 +138,7 @@ pub fn build_incremental_packs_for_stream(
         .map(|p| PackBranchEntry {
             first_id: p.first_id,
             last_id: p.last_id,
-            pack_cid: fluree_db_core::ContentId::from_hex_digest(
+            pack_cid: fluree_db_core::ContentId::from_address_digest(
                 fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
                 &fluree_db_core::sha256_hex(&p.bytes),
             )
@@ -564,7 +564,7 @@ mod tests {
     }
 
     fn dummy_cid(index: u32) -> ContentId {
-        ContentId::from_hex_digest(
+        ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
             &fluree_db_core::sha256_hex(format!("pack-{index}").as_bytes()),
         )

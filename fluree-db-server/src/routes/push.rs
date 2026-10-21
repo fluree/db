@@ -161,6 +161,8 @@ async fn push_ledger_local(
         commits: parsed.commits.into_iter().map(|b| b.0).collect(),
         blobs: parsed.blobs.into_iter().map(|(k, v)| (k, v.0)).collect(),
         merged_commits: parsed.merged_commits.into_iter().map(|b| b.0).collect(),
+        commit_ids: parsed.commit_ids,
+        merged_commit_ids: parsed.merged_commit_ids,
         governance,
     };
 

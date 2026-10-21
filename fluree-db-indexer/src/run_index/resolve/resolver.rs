@@ -306,7 +306,7 @@ impl CommitResolver {
     /// - **User metadata**: any `txn_meta` entries from the envelope.
     ///
     /// The `commit_hash_hex` parameter is the 64-char SHA-256 hex digest identifying
-    /// the commit (typically from `ContentId::digest_hex()`).
+    /// the commit (typically from `ContentId::address_digest()`).
     ///
     /// Returns the number of records emitted.
     #[allow(clippy::too_many_arguments)]
@@ -331,11 +331,10 @@ impl CommitResolver {
             ResolverError::Resolve(format!("commit t={} does not fit in u32", envelope.t))
         })?;
 
-        // 3. Resolve commit subject: "fluree:commit:sha256:<hex>"
-        let commit_iri = format!("{}{}", fluree::COMMIT, hex);
-        let commit_s_id = dicts
-            .subjects
-            .get_or_insert(&commit_iri, fluree_vocab::namespaces::FLUREE_COMMIT)?;
+        // 3. Resolve commit subject (see `fluree_db_core::commit_subject`).
+        let (commit_ns, commit_name) = commit_subject_parts(hex);
+        let commit_iri = format!("{}{commit_name}", commit_namespace_iri(commit_ns));
+        let commit_s_id = dicts.subjects.get_or_insert(&commit_iri, commit_ns)?;
 
         // 4. Resolve predicate p_ids
         let p_address = dicts
@@ -445,11 +444,10 @@ impl CommitResolver {
 
         // ledger:previous (ID) -- ref to parent commit(s)
         for parent in &envelope.parents {
-            // Use CID digest hex as the subject name in FLUREE_COMMIT namespace
-            let prev_digest = parent.digest_hex();
+            let prev = fluree_db_core::commit_subject::commit_sid(parent);
             let prev_s_id = dicts
                 .subjects
-                .get_or_insert(&prev_digest, fluree_vocab::namespaces::FLUREE_COMMIT)?;
+                .get_or_insert(&prev.name, prev.namespace_code)?;
             push(
                 commit_s_id,
                 p_previous,
@@ -2021,10 +2019,10 @@ impl SharedResolverState {
         })?;
 
         // Resolve commit subject using chunk-local subject dict.
-        let commit_ns_code = fluree_vocab::namespaces::FLUREE_COMMIT;
+        let (commit_ns_code, commit_name) = commit_subject_parts(commit_hash_hex);
         let commit_s_id = chunk
             .subjects
-            .get_or_insert(commit_ns_code, commit_hash_hex.as_bytes());
+            .get_or_insert(commit_ns_code, commit_name.as_bytes());
 
         // Resolve predicate p_ids (global)
         let p_address = self.predicates.get_or_insert_parts(fluree::DB, db::ADDRESS);
@@ -2120,11 +2118,10 @@ impl SharedResolverState {
 
         // ledger:previous (ID) -- ref to parent commit(s) (chunk-local subject)
         for parent in &envelope.parents {
-            let prev_digest = parent.digest_hex();
-            let prev_s_id = chunk.subjects.get_or_insert(
-                fluree_vocab::namespaces::FLUREE_COMMIT,
-                prev_digest.as_bytes(),
-            );
+            let prev = fluree_db_core::commit_subject::commit_sid(parent);
+            let prev_s_id = chunk
+                .subjects
+                .get_or_insert(prev.namespace_code, prev.name.as_bytes());
             push(
                 commit_s_id,
                 p_previous,
@@ -2548,6 +2545,34 @@ mod term_remap_tests {
         }
         assert_eq!(remapped(ObjKind::REF_ID, 2), (11, 12));
         assert_eq!(remapped(ObjKind::NUM_INT, 7), (11, 7));
+    }
+}
+
+/// The namespace code and name of the commit subject for an address digest
+/// (see [`fluree_db_core::commit_subject`]); an undecodable digest keeps the
+/// SHA2-256 spelling.
+fn commit_subject_parts(address_digest: &str) -> (u16, String) {
+    match fluree_db_core::ContentId::from_address_digest(
+        fluree_db_core::CODEC_FLUREE_COMMIT,
+        address_digest,
+    ) {
+        Some(id) => {
+            let sid = fluree_db_core::commit_subject::commit_sid(&id);
+            (sid.namespace_code, sid.name.to_string())
+        }
+        None => (
+            fluree_vocab::namespaces::FLUREE_COMMIT,
+            address_digest.to_string(),
+        ),
+    }
+}
+
+/// The IRI prefix of a commit subject's namespace.
+fn commit_namespace_iri(ns_code: u16) -> &'static str {
+    if ns_code == fluree_vocab::namespaces::FLUREE_URN {
+        fluree::URN
+    } else {
+        fluree::COMMIT
     }
 }
 

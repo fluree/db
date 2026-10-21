@@ -210,12 +210,14 @@ impl ContentStore for IpfsStorage {
             )));
         }
 
-        // Use the codec from the CID itself
+        // Use the codec and hash from the CID itself (verified above, so the
+        // hash is supported).
         let codec = format!("0x{:x}", id.codec());
+        let mhtype = id.hash_algorithm().map_or("sha2-256", |alg| alg.name());
 
         let response = self
             .kubo
-            .block_put(bytes, Some(&codec), Some("sha2-256"))
+            .block_put(bytes, Some(&codec), Some(mhtype))
             .await
             .map_err(|e| fluree_db_core::error::Error::storage(e.to_string()))?;
 

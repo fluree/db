@@ -656,7 +656,7 @@ impl StorageMethod for Arc<dyn Storage> {
 // ContentStore Trait (CID-first storage abstraction)
 // ============================================================================
 
-use crate::content_id::ContentId;
+use crate::content_id::{ContentId, HashAlgorithm};
 
 /// Content-addressed store operating on `ContentId` (CIDv1).
 ///
@@ -683,8 +683,24 @@ pub trait ContentStore: Debug + Send + Sync {
     /// Implementations MUST call `id.verify(bytes)` and reject mismatches.
     ///
     /// V4 commit blobs can be stored with this method since their CID
-    /// is `SHA-256(full blob)`, matching `id.verify(bytes)`.
+    /// hashes the full blob, matching `id.verify(bytes)`.
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()>;
+
+    /// Store bytes under the CID `alg` mints for them. SHA2-256 is
+    /// [`Self::put`].
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        if alg == HashAlgorithm::Sha2_256 {
+            return self.put(kind, bytes).await;
+        }
+        let id = ContentId::new_with(alg, kind, bytes);
+        self.put_with_id(&id, bytes).await?;
+        Ok(id)
+    }
 
     /// The object's bytes when this machine already has them, without
     /// fetching: see [`StorageRead::get_local`] for the contract.
@@ -839,6 +855,15 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
         self.as_ref().put(kind, bytes).await
+    }
+
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        self.as_ref().put_hashed(alg, kind, bytes).await
     }
 
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
@@ -1010,7 +1035,7 @@ impl<S: Storage> StorageContentStore<S> {
             &self.method,
             kind,
             &self.namespace,
-            &id.digest_hex(),
+            &id.address_digest(),
         ))
     }
 
@@ -1041,7 +1066,7 @@ pub fn legacy_dict_address(
         return None;
     }
     let prefix = namespace.branch_prefix();
-    let hex = id.digest_hex();
+    let hex = id.address_digest();
     Some(format!(
         "fluree:{method}://{prefix}/index/objects/dicts/{hex}.dict"
     ))
@@ -1059,7 +1084,7 @@ fn legacy_index_root_address(
         return None;
     }
     let prefix = namespace.branch_prefix();
-    let hex = id.digest_hex();
+    let hex = id.address_digest();
     Some(format!("fluree:{method}://{prefix}/index/roots/{hex}.json"))
 }
 
@@ -1082,7 +1107,12 @@ pub fn candidate_addresses(
 ) -> Vec<String> {
     let mut addresses = Vec::new();
     if let Some(kind) = id.content_kind() {
-        addresses.push(content_address(method, kind, namespace, &id.digest_hex()));
+        addresses.push(content_address(
+            method,
+            kind,
+            namespace,
+            &id.address_digest(),
+        ));
     }
     addresses.extend(legacy_dict_address(method, namespace, id));
     addresses.extend(legacy_index_root_address(method, namespace, id));
@@ -1141,10 +1171,18 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
-        let id = ContentId::new(kind, bytes);
-        let hex_digest = id.digest_hex();
+        self.put_hashed(HashAlgorithm::Sha2_256, kind, bytes).await
+    }
+
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        let id = ContentId::new_with(alg, kind, bytes);
         self.storage
-            .content_write_bytes_with_hash(kind, &self.namespace, &hex_digest, bytes)
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
             .await?;
         Ok(id)
     }
@@ -1165,7 +1203,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // land on the same answer either way; a path that ingests index blobs
         // by CID would silently start fsyncing them.
         self.storage
-            .content_write_bytes_with_hash(kind, &self.namespace, &id.digest_hex(), bytes)
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
             .await?;
         Ok(())
     }
@@ -1705,6 +1743,15 @@ impl ContentStore for BranchedContentStore {
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
         self.branch_store.put(kind, bytes).await
+    }
+
+    async fn put_hashed(
+        &self,
+        alg: HashAlgorithm,
+        kind: ContentKind,
+        bytes: &[u8],
+    ) -> Result<ContentId> {
+        self.branch_store.put_hashed(alg, kind, bytes).await
     }
 
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
@@ -2453,7 +2500,7 @@ mod tests {
             storage.storage_method(),
             ContentKind::IndexLeaf,
             &ledger(),
-            &canonical_id.digest_hex(),
+            &canonical_id.address_digest(),
         );
         storage
             .write_bytes(&canonical, b"leaf bytes")
@@ -2500,7 +2547,7 @@ mod tests {
                     "memory",
                     ContentKind::IndexLeaf,
                     &ledger(),
-                    &id.digest_hex()
+                    &id.address_digest()
                 )
                 .as_str()
             )

@@ -1333,7 +1333,9 @@ impl Fluree {
     ) -> CommitOpts {
         if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(namespace);
-            commit_opts.with_raw_txn_spawned(content_store, txn_payload)
+            commit_opts
+                .with_content_hash(self.content_hash())
+                .with_raw_txn_spawned(content_store, txn_payload)
         } else {
             commit_opts
         }
@@ -2293,7 +2295,7 @@ impl Fluree {
             expected_head_ref,
             txn_id,
             &index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await
         .map_err(ApiError::from)?;

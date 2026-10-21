@@ -35,7 +35,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
         storage.storage_method(),
         fluree_db_core::ContentKind::IndexRoot,
         namespace,
-        &root_id.digest_hex(),
+        &root_id.address_digest(),
     );
     let bytes = storage
         .read_bytes(&root_address)

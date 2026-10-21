@@ -30,6 +30,7 @@ pub mod cancellation;
 pub mod clock;
 pub mod coerce;
 pub mod commit;
+pub mod commit_subject;
 pub mod comparator;
 pub mod conflict_key;
 pub mod content_id;
@@ -112,7 +113,7 @@ pub use commit::{
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
-pub use content_id::{CommitId, ContentId, IndexRootId, TxnId};
+pub use content_id::{CommitId, ContentId, HashAlgorithm, IndexRootId, TxnId};
 pub use content_kind::{
     ContentKind, DictKind, CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
     CODEC_FLUREE_ANNOTATION_FORWARD_LEAF, CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,

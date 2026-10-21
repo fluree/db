@@ -24,7 +24,9 @@ use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentId, ContentKind, ContentStore, DictNovelty, Flake, HashAlgorithm, TXN_META_GRAPH_ID,
+};
 use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{
@@ -200,6 +202,9 @@ pub struct CommitOpts {
     /// When `None` on a dual-stamp ledger, defaults to wall clock (clamped
     /// monotonic). Normal ledgers (no event-time use) never emit it.
     pub received_at: Option<String>,
+    /// The hash the commit's CID (and its raw transaction blob's) is minted
+    /// with. The caller applies the deployment's choice; SHA2-256 by default.
+    pub content_hash: HashAlgorithm,
 }
 
 impl std::fmt::Debug for CommitOpts {
@@ -226,6 +231,7 @@ impl std::fmt::Debug for CommitOpts {
             .field("merge_parents", &self.merge_parents.len())
             .field("timestamp", &self.timestamp)
             .field("received_at", &self.received_at)
+            .field("content_hash", &self.content_hash)
             .finish()
     }
 }
@@ -249,6 +255,7 @@ impl Clone for CommitOpts {
             merge_parents: self.merge_parents.clone(),
             timestamp: self.timestamp.clone(),
             received_at: self.received_at.clone(),
+            content_hash: self.content_hash,
         }
     }
 }
@@ -277,7 +284,18 @@ impl CommitOpts {
         content_store: Arc<dyn fluree_db_core::ContentStore>,
         txn: serde_json::Value,
     ) -> Self {
-        self.raw_txn_upload = Some(PendingRawTxnUpload::spawn(content_store, txn));
+        self.raw_txn_upload = Some(PendingRawTxnUpload::spawn(
+            content_store,
+            txn,
+            self.content_hash,
+        ));
+        self
+    }
+
+    /// Mint the commit's CID (and its raw transaction blob's) with `alg`.
+    /// Set it before [`Self::with_raw_txn_spawned`], which hashes the blob.
+    pub fn with_content_hash(mut self, alg: HashAlgorithm) -> Self {
+        self.content_hash = alg;
         self
     }
 
@@ -412,6 +430,7 @@ impl CommitOptsRequest {
             merge_parents: Vec::new(),
             timestamp: self.timestamp,
             received_at: self.received_at,
+            content_hash: HashAlgorithm::default(),
         }
     }
 }
@@ -606,6 +625,7 @@ pub async fn build_commit(
         merge_parents,
         timestamp: opt_timestamp,
         received_at: opt_received_at,
+        content_hash,
         ..
     } = opts;
 
@@ -858,7 +878,7 @@ pub async fn build_commit(
         let _g = span.enter();
         crate::commit_v2::write_commit(&commit_record, true, signing)?
     };
-    let commit_cid = ContentId::new(ContentKind::Commit, &signed.bytes);
+    let commit_cid = ContentId::new_with(content_hash, ContentKind::Commit, &signed.bytes);
     commit_record.id = Some(commit_cid.clone());
 
     Ok(StagedCommit {

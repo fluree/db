@@ -26,6 +26,114 @@ use std::str::FromStr;
 
 /// SHA2-256 multihash code (standard).
 const SHA2_256: u64 = 0x12;
+/// SHA2-512 multihash code (standard).
+const SHA2_512: u64 = 0x13;
+
+// ============================================================================
+// HashAlgorithm
+// ============================================================================
+
+/// The content hash a [`ContentId`] is minted with.
+///
+/// The CID's multihash names its algorithm, so verification follows the
+/// CID being checked, never the writer's current choice. SHA2-256 is the
+/// default; SHA2-512 is the one alternative. A new variant needs its code,
+/// digest length, multicodec name and hash; a circuit hash (Poseidon) also
+/// needs a specified encoding of bytes into field elements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HashAlgorithm {
+    #[default]
+    Sha2_256,
+    Sha2_512,
+}
+
+impl HashAlgorithm {
+    /// Every algorithm this build reads and writes.
+    pub const SUPPORTED: [Self; 2] = [Self::Sha2_256, Self::Sha2_512];
+
+    /// The multihash code.
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Sha2_256 => SHA2_256,
+            Self::Sha2_512 => SHA2_512,
+        }
+    }
+
+    /// The digest length in bytes.
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha2_256 => 32,
+            Self::Sha2_512 => 64,
+        }
+    }
+
+    /// The multicodec table name (`sha2-256`, `sha2-512`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sha2_256 => "sha2-256",
+            Self::Sha2_512 => "sha2-512",
+        }
+    }
+
+    /// The algorithm for a multihash code and digest length; `None` for an
+    /// unsupported code or a digest of the wrong length.
+    pub fn from_multihash(code: u64, digest_len: usize) -> Option<Self> {
+        let alg = match code {
+            SHA2_256 => Self::Sha2_256,
+            SHA2_512 => Self::Sha2_512,
+            _ => return None,
+        };
+        (alg.digest_len() == digest_len).then_some(alg)
+    }
+
+    fn multihash(self, bytes: &[u8]) -> Multihash<64> {
+        let wrapped = match self {
+            Self::Sha2_256 => Multihash::wrap(SHA2_256, &sha2::Sha256::digest(bytes)),
+            Self::Sha2_512 => Multihash::wrap(SHA2_512, &sha2::Sha512::digest(bytes)),
+        };
+        // Both digests fit in Multihash<64>.
+        wrapped.expect("digest fits in Multihash<64>")
+    }
+}
+
+impl fmt::Display for HashAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl serde::Serialize for HashAlgorithm {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HashAlgorithm {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for HashAlgorithm {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "sha2-256" | "sha256" => Ok(Self::Sha2_256),
+            "sha2-512" | "sha512" => Ok(Self::Sha2_512),
+            other => Err(Error::storage(format!(
+                "unsupported content hash algorithm {other:?} (supported: sha2-256, sha2-512)"
+            ))),
+        }
+    }
+}
 
 // ============================================================================
 // ContentId
@@ -60,12 +168,26 @@ impl ContentId {
     /// Create a new `ContentId` by hashing `bytes` with SHA2-256 and
     /// tagging with the multicodec for `kind`.
     pub fn new(kind: ContentKind, bytes: &[u8]) -> Self {
-        let digest = sha2::Sha256::digest(bytes);
-        // SHA2-256 produces 32 bytes, MH_SIZE=64 — wrap always succeeds.
-        let mh = Multihash::<64>::wrap(SHA2_256, &digest)
-            .expect("SHA2-256 digest fits in Multihash<64>");
-        let cid = Cid::new_v1(kind.to_codec(), mh);
-        Self(cid)
+        Self::new_with(HashAlgorithm::Sha2_256, kind, bytes)
+    }
+
+    /// Create a `ContentId` by hashing `bytes` with `alg`.
+    pub fn new_with(alg: HashAlgorithm, kind: ContentKind, bytes: &[u8]) -> Self {
+        Self(Cid::new_v1(kind.to_codec(), alg.multihash(bytes)))
+    }
+
+    /// The CID of `bytes` minted the way this one was: the same algorithm
+    /// and codec. `None` when this CID's hash is unsupported.
+    pub fn rehash(&self, bytes: &[u8]) -> Option<Self> {
+        let alg = self.hash_algorithm()?;
+        Some(Self(Cid::new_v1(self.codec(), alg.multihash(bytes))))
+    }
+
+    /// The algorithm this CID was minted with; `None` for an unsupported
+    /// multihash code or a digest of the wrong length.
+    pub fn hash_algorithm(&self) -> Option<HashAlgorithm> {
+        let mh = self.0.hash();
+        HashAlgorithm::from_multihash(mh.code(), mh.digest().len())
     }
 
     /// Wrap an existing `Cid` as a `ContentId`.
@@ -109,23 +231,28 @@ impl ContentId {
     /// Use this when accepting objects from untrusted sources (push,
     /// replication, `put_with_id`).
     ///
-    /// Computes `SHA-256(full_bytes)`, which is correct for all content
-    /// kinds including commit blobs (v4 format).
+    /// Hashes the full bytes with this CID's own algorithm, which is correct
+    /// for all content kinds including commit blobs (v4 format). An
+    /// unsupported algorithm or digest length never verifies.
     pub fn verify(&self, bytes: &[u8]) -> bool {
-        let mh = self.0.hash();
-        if mh.code() != SHA2_256 {
-            // We only support SHA2-256 verification currently.
-            return false;
+        match self.hash_algorithm() {
+            Some(alg) => alg.multihash(bytes) == *self.0.hash(),
+            None => false,
         }
-        let digest = sha2::Sha256::digest(bytes);
-        mh.digest() == digest.as_slice()
     }
 
-    /// The hex-encoded multihash digest (without the code/length prefix).
-    ///
-    /// Useful for filesystem layout where the path includes the digest.
-    pub fn digest_hex(&self) -> String {
-        hex::encode(self.0.hash().digest())
+    /// The digest as storage addresses spell it: bare hex for SHA2-256 (the
+    /// legacy layout), and `<algorithm>-<hex>` otherwise, so the algorithm
+    /// survives a round trip through a path or key.
+    /// [`Self::from_address_digest`] parses it back.
+    pub fn address_digest(&self) -> String {
+        let mh = self.0.hash();
+        let hex = hex::encode(mh.digest());
+        match self.hash_algorithm() {
+            Some(HashAlgorithm::Sha2_256) => hex,
+            Some(alg) => format!("{}-{hex}", alg.name()),
+            None => format!("mh{:x}-{hex}", mh.code()),
+        }
     }
 
     /// Parse a string as a CID, but only in the canonical spelling
@@ -170,13 +297,27 @@ impl ContentId {
         Self(Cid::new_v1(codec, mh))
     }
 
-    /// Construct a `ContentId` from a hex-encoded SHA-256 digest and multicodec.
+    /// Construct a `ContentId` from an [address digest](Self::address_digest)
+    /// and multicodec: 64 hex characters for SHA2-256, or
+    /// `<algorithm>-<hex>` for another supported algorithm.
     ///
-    /// Returns `None` if the hex string is not exactly 64 hex characters.
-    pub fn from_hex_digest(codec: u64, hex_digest: &str) -> Option<Self> {
-        let bytes = hex::decode(hex_digest).ok()?;
-        let digest: [u8; 32] = bytes.try_into().ok()?;
-        Some(Self::from_sha256_digest(codec, &digest))
+    /// Returns `None` for an unsupported algorithm, malformed hex, or a
+    /// digest of the wrong length for its algorithm.
+    pub fn from_address_digest(codec: u64, address_digest: &str) -> Option<Self> {
+        let (alg, hex_digest) = match address_digest.rsplit_once('-') {
+            Some((name, hex_digest)) => (name.parse::<HashAlgorithm>().ok()?, hex_digest),
+            None => (HashAlgorithm::Sha2_256, address_digest),
+        };
+        if alg == HashAlgorithm::Sha2_256 && address_digest.contains('-') {
+            // SHA2-256 addresses are bare: a tagged spelling names no object.
+            return None;
+        }
+        let digest = hex::decode(hex_digest).ok()?;
+        if digest.len() != alg.digest_len() {
+            return None;
+        }
+        let mh = Multihash::<64>::wrap(alg.code(), &digest).ok()?;
+        Some(Self(Cid::new_v1(codec, mh)))
     }
 }
 
@@ -434,17 +575,92 @@ mod tests {
     }
 
     #[test]
-    fn test_digest_hex() {
+    fn test_address_digest() {
         let data = b"digest hex test";
         let id = ContentId::new(ContentKind::Commit, data);
-        let hex_str = id.digest_hex();
+        let hex_str = id.address_digest();
 
-        // SHA2-256 produces 32 bytes → 64 hex chars
+        // SHA2-256 addresses stay bare hex: 32 bytes → 64 hex chars.
         assert_eq!(hex_str.len(), 64);
-
-        // Should match direct sha256
         let expected = hex::encode(sha2::Sha256::digest(data));
         assert_eq!(hex_str, expected);
+        assert_eq!(
+            ContentId::from_address_digest(id.codec(), &hex_str),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn the_default_is_byte_identical_to_sha2_256() {
+        let data = b"default";
+        let id = ContentId::new(ContentKind::Commit, data);
+        assert_eq!(
+            id,
+            ContentId::new_with(HashAlgorithm::Sha2_256, ContentKind::Commit, data)
+        );
+        let mh = Multihash::<64>::wrap(SHA2_256, &sha2::Sha256::digest(data)).unwrap();
+        assert_eq!(
+            id.to_bytes(),
+            Cid::new_v1(ContentKind::Commit.to_codec(), mh).to_bytes()
+        );
+        assert_eq!(id.hash_algorithm(), Some(HashAlgorithm::Sha2_256));
+    }
+
+    #[test]
+    fn sha2_512_mints_verifies_and_round_trips() {
+        let data = b"sha2-512 payload";
+        let id = ContentId::new_with(HashAlgorithm::Sha2_512, ContentKind::Commit, data);
+        assert_eq!(id.hash_algorithm(), Some(HashAlgorithm::Sha2_512));
+        assert_eq!(id.as_cid().hash().digest().len(), 64);
+        assert!(id.verify(data));
+        assert!(!id.verify(b"other"));
+        // Differs from the SHA2-256 CID of the same bytes.
+        assert_ne!(id, ContentId::new(ContentKind::Commit, data));
+        // Binary, string and serde forms keep the algorithm.
+        assert_eq!(ContentId::from_bytes(&id.to_bytes()).unwrap(), id);
+        assert_eq!(id.to_string().parse::<ContentId>().unwrap(), id);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<ContentId>(&json).unwrap(), id);
+        let bin = postcard::to_allocvec(&id).unwrap();
+        assert_eq!(postcard::from_bytes::<ContentId>(&bin).unwrap(), id);
+        // The address digest is tagged and parses back to the same CID.
+        let address = id.address_digest();
+        assert!(address.starts_with("sha2-512-"), "{address}");
+        assert_eq!(address.len(), "sha2-512-".len() + 128);
+        assert_eq!(
+            ContentId::from_address_digest(id.codec(), &address),
+            Some(id.clone())
+        );
+        // Rehashing follows the CID's own algorithm.
+        assert_eq!(id.rehash(data), Some(id));
+    }
+
+    #[test]
+    fn unsupported_algorithms_and_lengths_are_rejected() {
+        let codec = ContentKind::Commit.to_codec();
+        // An unknown multihash code (identity) never verifies.
+        let identity = Multihash::<64>::wrap(0x00, b"abc").unwrap();
+        let id = ContentId::from_cid(Cid::new_v1(codec, identity));
+        assert_eq!(id.hash_algorithm(), None);
+        assert!(!id.verify(b"abc"));
+        assert_eq!(id.rehash(b"abc"), None);
+        // A SHA2-256 code with a 64-byte digest is not SHA2-256.
+        let long = Multihash::<64>::wrap(SHA2_256, &[7u8; 64]).unwrap();
+        let id = ContentId::from_cid(Cid::new_v1(codec, long));
+        assert_eq!(id.hash_algorithm(), None);
+        assert!(!id.verify(&[7u8; 64]));
+        // Address digests of the wrong length or algorithm do not parse.
+        let short = "ab".repeat(31);
+        assert_eq!(ContentId::from_address_digest(codec, &short), None);
+        let sha512_as_bare = "ab".repeat(64);
+        assert_eq!(ContentId::from_address_digest(codec, &sha512_as_bare), None);
+        let sha256_tagged = format!("sha2-256-{}", "ab".repeat(32));
+        assert_eq!(ContentId::from_address_digest(codec, &sha256_tagged), None);
+        let truncated = format!("sha2-512-{}", "ab".repeat(32));
+        assert_eq!(ContentId::from_address_digest(codec, &truncated), None);
+        let unknown = format!("blake3-{}", "ab".repeat(32));
+        assert_eq!(ContentId::from_address_digest(codec, &unknown), None);
+        assert!("md5".parse::<HashAlgorithm>().is_err());
     }
 
     #[test]

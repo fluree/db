@@ -567,7 +567,7 @@ mod wire_count_tests {
     use super::*;
 
     fn entries(n: usize) -> Vec<PackBranchEntry> {
-        let cid = ContentId::from_hex_digest(
+        let cid = ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
             &fluree_db_core::sha256_hex(b"pack"),
         )

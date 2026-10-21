@@ -713,7 +713,7 @@ impl LeafWriter {
 
 pub fn compute_cid_leaf(bytes: &[u8]) -> ContentId {
     let hex_digest = fluree_db_core::sha256_hex(bytes);
-    ContentId::from_hex_digest(
+    ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_LEAF,
         &hex_digest,
     )
@@ -722,7 +722,7 @@ pub fn compute_cid_leaf(bytes: &[u8]) -> ContentId {
 
 pub fn compute_cid_sidecar(bytes: &[u8]) -> ContentId {
     let hex_digest = fluree_db_core::sha256_hex(bytes);
-    ContentId::from_hex_digest(
+    ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_HISTORY_SIDECAR,
         &hex_digest,
     )

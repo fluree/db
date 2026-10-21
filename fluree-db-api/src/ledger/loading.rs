@@ -420,7 +420,7 @@ impl Fluree {
 
         stream::iter(all_cids.into_iter().map(|cid| {
             let kind = cid.content_kind().expect("filtered above");
-            let hex = cid.digest_hex();
+            let hex = cid.address_digest();
             let storage = storage.clone();
             let source_store = source_store.clone();
             let cid_display = cid.to_string();

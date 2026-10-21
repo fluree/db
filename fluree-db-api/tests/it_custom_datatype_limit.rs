@@ -487,6 +487,8 @@ async fn push(
             .collect::<HashMap<_, _>>(),
         missing_blobs: Vec::new(),
         merged_commits: Vec::new(),
+        commit_ids: Vec::new(),
+        merged_commit_ids: Vec::new(),
     };
     let index_config = IndexConfig {
         reindex_min_bytes: 100_000,

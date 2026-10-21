@@ -387,7 +387,7 @@ impl Fluree {
             expected_head_ref,
             None,
             index_config,
-            commit_opts,
+            commit_opts.with_content_hash(self.content_hash()),
         )
         .await
         .map_err(ApiError::from)?;

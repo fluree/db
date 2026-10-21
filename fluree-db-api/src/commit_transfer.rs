@@ -128,17 +128,13 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
     bytes: &[u8],
     namespace: &StorageNamespace,
 ) -> Result<()> {
-    use fluree_db_core::commit::codec::verify_commit_blob;
-
     let kind = cid
         .content_kind()
         .ok_or_else(|| ApiError::http(400, format!("unknown content kind for CID {cid}")))?;
 
     let is_commit_v2 = cid.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(b"FCV2");
     let integrity_ok = if is_commit_v2 {
-        verify_commit_blob(bytes)
-            .map(|d| d == *cid)
-            .unwrap_or(false)
+        fluree_db_core::commit::codec::commit_blob_matches(cid, bytes)
     } else {
         cid.verify(bytes)
     };
@@ -149,20 +145,9 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
         ));
     }
 
-    // Commit-v2 blobs persist under their canonical (sub-range) digest; all
-    // other kinds use the CID digest directly.
-    let digest_hex = if kind == ContentKind::Commit {
-        verify_commit_blob(bytes)
-            .map(|d| d.digest_hex())
-            .map_err(|e| {
-                ApiError::internal(format!("failed to derive commit digest for {cid}: {e}"))
-            })?
-    } else {
-        cid.digest_hex()
-    };
-
+    // Verified against the CID, so the CID's digest is the object's address.
     storage
-        .content_write_bytes_with_hash(kind, namespace, &digest_hex, bytes)
+        .content_write_bytes_with_hash(kind, namespace, &cid.address_digest(), bytes)
         .await
         .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
     Ok(())
@@ -223,6 +208,15 @@ pub struct PushCommitsRequest {
     /// every such walk.
     #[serde(default)]
     pub merged_commits: Vec<Base64Bytes>,
+    /// The CIDs of `commits`, in order. Naming them keeps the identity of a
+    /// commit minted with a hash other than SHA2-256, which its bytes alone
+    /// do not say; without them each commit's CID is the SHA2-256 of its
+    /// bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_ids: Vec<ContentId>,
+    /// The CIDs of `merged_commits`, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_commit_ids: Vec<ContentId>,
 }
 
 /// Response body for a successful push.
@@ -771,9 +765,40 @@ impl Fluree {
 struct PushCommitDecoded {
     commit: fluree_db_novelty::Commit,
     bytes: Vec<u8>,
-    /// SHA-256 hex digest used for content addressing. For v4 blobs this is
-    /// the hash of the full blob; for v3 it is the embedded trailing hash.
+    /// The commit's address digest (its CID's, algorithm included).
     digest_hex: String,
+}
+
+/// The CID of a pushed commit: the one the sender names, checked against the
+/// bytes, or else the SHA2-256 of the bytes, all a sender that names none
+/// can have minted.
+fn pushed_commit_id(
+    named: Option<&ContentId>,
+    bytes: &[u8],
+    what: &str,
+) -> std::result::Result<ContentId, PushError> {
+    match named {
+        Some(id) if fluree_db_core::commit::codec::commit_blob_matches(id, bytes) => Ok(id.clone()),
+        Some(id) => Err(PushError::Invalid(format!(
+            "{what}: the bytes do not match the named CID {id}"
+        ))),
+        None => Ok(ContentId::new(ContentKind::Commit, bytes)),
+    }
+}
+
+/// The CIDs named for `count` pushed commits, if the sender named them.
+fn named_ids<'a>(
+    ids: &'a [ContentId],
+    count: usize,
+    what: &str,
+) -> std::result::Result<Option<&'a [ContentId]>, PushError> {
+    match ids.len() {
+        0 => Ok(None),
+        n if n == count => Ok(Some(ids)),
+        n => Err(PushError::Invalid(format!(
+            "{what} names {n} CIDs for {count} commits"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -897,6 +922,7 @@ fn decode_and_validate_commit_chain(
 
     let mut prev_t: Option<i64> = None;
     let mut prev_hash: Option<String> = None;
+    let ids = named_ids(&request.commit_ids, request.commits.len(), "commit_ids")?;
 
     for (idx, b64) in request.commits.iter().enumerate() {
         let bytes = b64.0.clone();
@@ -913,9 +939,9 @@ fn decode_and_validate_commit_chain(
             )));
         }
 
-        // Derive the content digest hex for addressing.
-        // V4: CID = SHA-256(full blob). No embedded hash to verify.
-        let digest_hex = fluree_db_core::sha256_hex(&bytes);
+        let digest_hex =
+            pushed_commit_id(ids.map(|ids| &ids[idx]), &bytes, &format!("commit[{idx}]"))?
+                .address_digest();
 
         // Note: commit blobs are applied to the server-selected `ledger_id` via CAS.
         // We do not currently enforce a ledger identity embedded inside the commit bytes.
@@ -941,7 +967,7 @@ fn decode_and_validate_commit_chain(
             let ok = commit
                 .parents
                 .first()
-                .is_some_and(|r| r.digest_hex() == *prev_hash_hex);
+                .is_some_and(|r| r.address_digest() == *prev_hash_hex);
             if !ok {
                 return Err(PushError::Invalid(format!(
                     "commit chain previous mismatch at commit[{idx}]: expected previous digest '{prev_hash_hex}'"
@@ -971,6 +997,11 @@ fn decode_and_validate_commit_chain(
 fn decode_merged_commits(
     request: &PushCommitsRequest,
 ) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
+    let ids = named_ids(
+        &request.merged_commit_ids,
+        request.merged_commits.len(),
+        "merged_commit_ids",
+    )?;
     request
         .merged_commits
         .iter()
@@ -979,7 +1010,12 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
-            let digest_hex = fluree_db_core::sha256_hex(&bytes);
+            let digest_hex = pushed_commit_id(
+                ids.map(|ids| &ids[idx]),
+                &bytes,
+                &format!("merged_commits[{idx}]"),
+            )?
+            .address_digest();
             Ok(PushCommitDecoded {
                 commit,
                 bytes,
@@ -1006,14 +1042,14 @@ fn validate_merged_reachable(
     let mut stack: Vec<String> = chain
         .iter()
         .flat_map(|c| c.commit.parents.iter().skip(1))
-        .map(ContentId::digest_hex)
+        .map(ContentId::address_digest)
         .collect();
     while let Some(digest) = stack.pop() {
         let Some(c) = by_digest.get(digest.as_str()) else {
             continue;
         };
         if reached.insert(c.digest_hex.as_str()) {
-            stack.extend(c.commit.parents.iter().map(ContentId::digest_hex));
+            stack.extend(c.commit.parents.iter().map(ContentId::address_digest));
         }
     }
 
@@ -1051,7 +1087,7 @@ async fn validate_ancestry_present<S: fluree_db_core::ContentStore + ?Sized>(
 
     for c in chain.iter().chain(merged) {
         for parent in &c.commit.parents {
-            if bundled.contains(parent.digest_hex().as_str()) {
+            if bundled.contains(parent.address_digest().as_str()) {
                 continue;
             }
             let present = store
@@ -1309,7 +1345,7 @@ where
 
         // Write using the CID digest to ensure deterministic placement.
         // (digest hex matches the legacy CAS hash during the transition period)
-        let expected_hash = txn_id.digest_hex();
+        let expected_hash = txn_id.address_digest();
         let _res = storage
             .content_write_bytes_with_hash(ContentKind::Txn, namespace, &expected_hash, &bytes)
             .await
@@ -1327,7 +1363,7 @@ async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + 
     let mut stored = Vec::with_capacity(decoded.len());
     for (idx, c) in decoded.iter().enumerate() {
         let res = storage
-            .content_write_bytes(ContentKind::Commit, namespace, &c.bytes)
+            .content_write_bytes_with_hash(ContentKind::Commit, namespace, &c.digest_hex, &c.bytes)
             .await
             .map_err(|e| PushError::Internal(e.to_string()))?;
         if res.content_hash != c.digest_hex {
@@ -1336,8 +1372,8 @@ async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + 
                 idx, c.digest_hex, res.content_hash
             )));
         }
-        let commit_id =
-            ContentId::from_hex_digest(CODEC_FLUREE_COMMIT, &c.digest_hex).ok_or_else(|| {
+        let commit_id = ContentId::from_address_digest(CODEC_FLUREE_COMMIT, &c.digest_hex)
+            .ok_or_else(|| {
                 PushError::Internal(format!(
                     "commit[{}]: invalid content hash hex '{}'",
                     idx, c.digest_hex
@@ -1562,6 +1598,41 @@ pub struct ExportCommitsResponse {
     /// [`PushCommitsRequest::merged_commits`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_commits: Vec<Base64Bytes>,
+    /// The CIDs of `commits`, in order (see
+    /// [`PushCommitsRequest::commit_ids`]). A server predating them leaves
+    /// them empty, and each commit's CID is then the SHA2-256 of its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_ids: Vec<ContentId>,
+    /// The CIDs of `merged_commits`, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_commit_ids: Vec<ContentId>,
+}
+
+impl ExportCommitsResponse {
+    /// The CIDs of `commits` and of `merged_commits`, each checked against
+    /// its bytes: the ones the page names, or the SHA2-256 of the bytes on a
+    /// page from a server that names none.
+    pub fn ids(&self) -> Result<(Vec<ContentId>, Vec<ContentId>)> {
+        let resolve = |blobs: &[Base64Bytes], ids: &[ContentId], what: &str| {
+            let ids = named_ids(ids, blobs.len(), what).map_err(PushError::into_api_error)?;
+            blobs
+                .iter()
+                .enumerate()
+                .map(|(idx, b64)| {
+                    pushed_commit_id(ids.map(|ids| &ids[idx]), &b64.0, &format!("{what}[{idx}]"))
+                        .map_err(PushError::into_api_error)
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        Ok((
+            resolve(&self.commits, &self.commit_ids, "commit_ids")?,
+            resolve(
+                &self.merged_commits,
+                &self.merged_commit_ids,
+                "merged_commit_ids",
+            )?,
+        ))
+    }
 }
 
 /// Export a paginated range of commits from a ledger.
@@ -1635,6 +1706,7 @@ impl Fluree {
         }
 
         let mut commits = Vec::with_capacity(effective_limit);
+        let mut commit_ids = Vec::with_capacity(effective_limit);
         let mut blobs: HashMap<String, Base64Bytes> = HashMap::new();
         let mut missing_blobs: Vec<String> = Vec::new();
         let mut newest_t: Option<i64> = None;
@@ -1680,6 +1752,7 @@ impl Fluree {
             oldest_t = Some(t);
 
             commits.push(Base64Bytes(raw_bytes.into_vec()));
+            commit_ids.push(current_cid.clone());
 
             // Collect referenced txn blob via ContentStore. A missing blob is
             // a provenance gap, not a chain break: report it and keep going.
@@ -1733,6 +1806,8 @@ impl Fluree {
             effective_limit,
             lineage: false,
             merged_commits: Vec::new(),
+            commit_ids,
+            merged_commit_ids: Vec::new(),
         })
     }
 }
@@ -1745,7 +1820,7 @@ async fn read_export_commits(
     cids: &[ContentId],
     blobs: &mut HashMap<String, Base64Bytes>,
     missing_blobs: &mut Vec<String>,
-) -> Result<Vec<(i64, Base64Bytes)>> {
+) -> Result<Vec<(i64, ContentId, Base64Bytes)>> {
     let mut out = Vec::with_capacity(cids.len());
     for cid in cids {
         let bytes = store
@@ -1777,7 +1852,7 @@ async fn read_export_commits(
                 }
             }
         }
-        out.push((envelope.t, Base64Bytes(bytes.into_vec())));
+        out.push((envelope.t, cid.clone(), Base64Bytes(bytes.into_vec())));
     }
     Ok(out)
 }
@@ -1815,16 +1890,21 @@ async fn export_lineage_page(
         ledger: ledger_id.to_string(),
         head_commit_id,
         head_t,
-        newest_t: commits.first().map_or(0, |(t, _)| *t),
-        oldest_t: commits.last().map_or(0, |(t, _)| *t),
+        newest_t: commits.first().map_or(0, |(t, _, _)| *t),
+        oldest_t: commits.last().map_or(0, |(t, _, _)| *t),
         count: commits.len(),
-        commits: commits.into_iter().map(|(_, bytes)| bytes).collect(),
+        commit_ids: commits.iter().map(|(_, id, _)| id.clone()).collect(),
+        commits: commits.into_iter().map(|(_, _, bytes)| bytes).collect(),
         blobs,
         missing_blobs,
         next_cursor_id: page.next,
         effective_limit: limit,
         lineage: true,
-        merged_commits: merged_commits.into_iter().map(|(_, bytes)| bytes).collect(),
+        merged_commit_ids: merged_commits.iter().map(|(_, id, _)| id.clone()).collect(),
+        merged_commits: merged_commits
+            .into_iter()
+            .map(|(_, _, bytes)| bytes)
+            .collect(),
     })
 }
 
@@ -1872,13 +1952,20 @@ impl Fluree {
         let mut stored = 0usize;
         let mut blobs_stored = 0usize;
 
-        // Write commit blobs to local CAS (v4: CID = SHA-256 of full blob).
-        // A `lineage` page carries the commits its merges brought in
+        // Write commit blobs to local CAS, each under its CID's address. A
+        // `lineage` page carries the commits its merges brought in
         // separately. Clone stores them like any other.
-        for b64 in response.commits.iter().chain(&response.merged_commits) {
+        let (line_ids, merged_ids) = response.ids()?;
+        let all = response.commits.iter().chain(&response.merged_commits);
+        for (id, b64) in line_ids.iter().chain(&merged_ids).zip(all) {
             let bytes = &b64.0;
             storage
-                .content_write_bytes(ContentKind::Commit, &namespace, bytes)
+                .content_write_bytes_with_hash(
+                    ContentKind::Commit,
+                    &namespace,
+                    &id.address_digest(),
+                    bytes,
+                )
                 .await
                 .map_err(|e| ApiError::internal(format!("failed to write commit blob: {e}")))?;
             stored += 1;
@@ -1907,7 +1994,7 @@ impl Fluree {
                     format!("txn CID does not match provided bytes: {cid_str}"),
                 ));
             }
-            let expected_hash = txn_id.digest_hex();
+            let expected_hash = txn_id.address_digest();
             storage
                 .content_write_bytes_with_hash(ContentKind::Txn, &namespace, &expected_hash, bytes)
                 .await
@@ -2352,13 +2439,16 @@ impl Fluree {
                                 "failed to write re-stamped index root: {e}"
                             ))
                         })?;
-                    ContentId::from_hex_digest(ContentKind::IndexRoot.to_codec(), &res.content_hash)
-                        .ok_or_else(|| {
-                            ApiError::internal(format!(
-                                "re-stamped index root produced an invalid content hash '{}'",
-                                res.content_hash
-                            ))
-                        })?
+                    ContentId::from_address_digest(
+                        ContentKind::IndexRoot.to_codec(),
+                        &res.content_hash,
+                    )
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "re-stamped index root produced an invalid content hash '{}'",
+                            res.content_hash
+                        ))
+                    })?
                 }
             };
 
@@ -2436,16 +2526,22 @@ impl Fluree {
     /// Validates the commit chain, verifies ancestry against the local head,
     /// writes blobs to CAS, advances `CommitHead`, and updates in-memory novelty.
     ///
-    /// `commits` must be ordered oldest → newest. `merged_commits` carries
-    /// the commits that merges in `commits` brought in, parents before
-    /// children. See [`PushCommitsRequest::merged_commits`].
+    /// `bundle.commits` must be ordered oldest → newest. `merged_commits`
+    /// carries the commits that merges in `commits` brought in, parents
+    /// before children. See [`PushCommitsRequest::merged_commits`].
     pub async fn import_commits_incremental(
         &self,
         ledger_id: &str,
-        commits: Vec<Base64Bytes>,
-        merged_commits: Vec<Base64Bytes>,
-        blobs: HashMap<String, Base64Bytes>,
+        bundle: PushCommitsRequest,
     ) -> Result<CommitImportResult> {
+        let PushCommitsRequest {
+            commits,
+            blobs,
+            merged_commits,
+            commit_ids,
+            merged_commit_ids,
+            missing_blobs: _,
+        } = bundle;
         if commits.is_empty() {
             return Err(ApiError::http(400, "no commits to import"));
         }
@@ -2475,6 +2571,8 @@ impl Fluree {
             blobs: blobs.clone(),
             missing_blobs: Vec::new(),
             merged_commits,
+            commit_ids,
+            merged_commit_ids,
         };
 
         // 3) Decode and validate chain.

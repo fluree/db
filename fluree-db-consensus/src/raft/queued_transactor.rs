@@ -781,6 +781,8 @@ impl Committer for QueuedTransactor {
             commits,
             blobs,
             merged_commits,
+            commit_ids,
+            merged_commit_ids,
             governance,
         } = request;
 
@@ -803,25 +805,55 @@ impl Committer for QueuedTransactor {
         // the worker reads the bytes back when staging.
         let namespace = self.namespace_of(&ledger_id).await?;
         let content_store = self.fluree.content_store(&namespace);
-        let upload = |blobs: Vec<Vec<u8>>| {
+        // A commit the sender named is stored under that CID, checked
+        // against its bytes; one it did not is the SHA2-256 of its bytes.
+        let upload = |blobs: Vec<Vec<u8>>, named: Vec<ContentId>| {
             let content_store = content_store.clone();
             async move {
+                if !named.is_empty() && named.len() != blobs.len() {
+                    return Err(SubmissionError::Execution {
+                        status: 400,
+                        message: format!(
+                            "push names {} CIDs for {} commits",
+                            named.len(),
+                            blobs.len()
+                        ),
+                    });
+                }
+                let write_failed = |e: fluree_db_core::Error| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("push commit CAS write failed: {e}"),
+                };
                 let mut cids = Vec::with_capacity(blobs.len());
-                for bytes in &blobs {
-                    let cid = content_store
-                        .put(ContentKind::Commit, bytes)
-                        .await
-                        .map_err(|e| SubmissionError::Execution {
-                            status: 500,
-                            message: format!("push commit CAS write failed: {e}"),
-                        })?;
+                for (idx, bytes) in blobs.iter().enumerate() {
+                    let cid = match named.get(idx) {
+                        // `put_with_id` checks the digest, hashing once; a
+                        // failure is re-checked to tell a mismatch from a
+                        // write error.
+                        Some(id) => match content_store.put_with_id(id, bytes).await {
+                            Ok(()) => id.clone(),
+                            Err(_) if !id.verify(bytes) => {
+                                return Err(SubmissionError::Execution {
+                                    status: 422,
+                                    message: format!(
+                                        "pushed commit {idx}: the bytes do not match the named CID {id}"
+                                    ),
+                                })
+                            }
+                            Err(e) => return Err(write_failed(e)),
+                        },
+                        None => content_store
+                            .put(ContentKind::Commit, bytes)
+                            .await
+                            .map_err(write_failed)?,
+                    };
                     cids.push(cid);
                 }
                 Ok::<_, SubmissionError>(cids)
             }
         };
-        let commit_cids = upload(commits).await?;
-        let merged_commit_cids = upload(merged_commits).await?;
+        let commit_cids = upload(commits, commit_ids).await?;
+        let merged_commit_cids = upload(merged_commits, merged_commit_ids).await?;
 
         let envelope = QueuedRequest::for_push(
             QueuedPush {

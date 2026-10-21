@@ -2012,7 +2012,7 @@ pub async fn incremental_index(
                                 "spatial blob fetch",
                             )
                             .await?;
-                            blob_cache.insert(cid.digest_hex(), bytes);
+                            blob_cache.insert(cid.address_digest(), bytes);
                         }
                         for leaflet_cid in &sp_ref.leaflets {
                             let bytes = fetch_cached_index_bytes(
@@ -2021,7 +2021,7 @@ pub async fn incremental_index(
                                 "spatial leaflet fetch",
                             )
                             .await?;
-                            blob_cache.insert(leaflet_cid.digest_hex(), bytes);
+                            blob_cache.insert(leaflet_cid.address_digest(), bytes);
                         }
 
                         let cache_arc = std::sync::Arc::new(blob_cache);
@@ -2110,16 +2110,18 @@ pub async fn incremental_index(
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                     cache_artifact_bytes(&*content_store, &root_cid, &root_json, "spatial_root");
-                    let manifest_cid =
-                        ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address)
-                            .ok_or_else(|| {
-                            IndexerError::StorageWrite(format!(
-                                "invalid spatial manifest hash for g_id={g_id}, p_id={p_id}: {}",
-                                write_result.manifest_address
-                            ))
-                        })?;
+                    let manifest_cid = ContentId::from_address_digest(
+                        spatial_codec,
+                        &write_result.manifest_address,
+                    )
+                    .ok_or_else(|| {
+                        IndexerError::StorageWrite(format!(
+                            "invalid spatial manifest hash for g_id={g_id}, p_id={p_id}: {}",
+                            write_result.manifest_address
+                        ))
+                    })?;
                     let arena_cid =
-                        ContentId::from_hex_digest(spatial_codec, &write_result.arena_address)
+                        ContentId::from_address_digest(spatial_codec, &write_result.arena_address)
                             .ok_or_else(|| {
                                 IndexerError::StorageWrite(format!(
                                     "invalid spatial arena hash for g_id={g_id}, p_id={p_id}: {}",
@@ -2131,7 +2133,7 @@ pub async fn incremental_index(
                         .iter()
                         .enumerate()
                         .map(|(i, h)| {
-                            ContentId::from_hex_digest(spatial_codec, h).ok_or_else(|| {
+                            ContentId::from_address_digest(spatial_codec, h).ok_or_else(|| {
                                 IndexerError::StorageWrite(format!(
                                     "invalid spatial leaflet hash [{i}] for \
                                      g_id={g_id}, p_id={p_id}: {h}"
@@ -5009,7 +5011,7 @@ fn build_fresh_branch_v3(
 
     let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
-    let branch_cid = ContentId::from_hex_digest(
+    let branch_cid = ContentId::from_address_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
         &branch_hash,
     )

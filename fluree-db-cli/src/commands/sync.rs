@@ -5,7 +5,7 @@ use crate::context;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_core::commit::codec::{read_commit_envelope, verify_commit_blob};
+use fluree_db_core::commit::codec::{commit_blob_matches, read_commit_envelope};
 use fluree_db_core::pack::{PackRequest, LARGE_TRANSFER_THRESHOLD};
 use fluree_db_core::storage::ContentAddressedWrite;
 use fluree_db_core::ContentKind;
@@ -592,8 +592,20 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     let count = to_import.len();
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
+    let (commit_ids, commits) = to_import.into_iter().unzip();
+    let (merged_commit_ids, merged_commits) = merged_commits.into_iter().unzip();
     let result = fluree
-        .import_commits_incremental(&ledger_id, to_import, merged_commits, all_blobs)
+        .import_commits_incremental(
+            &ledger_id,
+            fluree_db_api::PushCommitsRequest {
+                commits,
+                blobs: all_blobs,
+                missing_blobs: Vec::new(),
+                merged_commits,
+                commit_ids,
+                merged_commit_ids,
+            },
+        )
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
@@ -619,38 +631,48 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 fn pull_import_set(
     pages: &[fluree_db_api::ExportCommitsResponse],
     local_t: i64,
-) -> CliResult<(
-    Vec<fluree_db_api::Base64Bytes>,
-    Vec<fluree_db_api::Base64Bytes>,
-)> {
+) -> CliResult<(PulledCommits, PulledCommits)> {
     use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
 
     let lineage = pages.iter().all(|page| page.lineage);
     let mut to_import = Vec::new();
-    for commit in pages.iter().flat_map(|page| &page.commits) {
-        if commit.0.len() < HEADER_LEN {
-            continue;
+    let mut merged_pages = Vec::with_capacity(pages.len());
+    for page in pages {
+        let (line_ids, merged_ids) = page
+            .ids()
+            .map_err(|e| CliError::Config(format!("invalid pull response: {e}")))?;
+        for (id, commit) in line_ids.into_iter().zip(&page.commits) {
+            if commit.0.len() < HEADER_LEN {
+                continue;
+            }
+            let header = CommitHeader::read_from(&commit.0)
+                .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
+            if lineage || header.t > local_t {
+                to_import.push((id, commit.clone()));
+            }
         }
-        let header = CommitHeader::read_from(&commit.0)
-            .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
-        if lineage || header.t > local_t {
-            to_import.push(commit.clone());
-        }
+        merged_pages.push(
+            merged_ids
+                .into_iter()
+                .zip(page.merged_commits.iter().cloned()),
+        );
     }
     to_import.reverse(); // oldest→newest
 
     // Older pages first, so parents stay ahead of children. A commit that
     // merges on two pages brought in arrives twice and is kept once.
     let mut seen = std::collections::HashSet::new();
-    let merged = pages
-        .iter()
+    let merged = merged_pages
+        .into_iter()
         .rev()
-        .flat_map(|page| &page.merged_commits)
-        .filter(|commit| seen.insert(fluree_db_core::sha256_hex(&commit.0)))
-        .cloned()
+        .flatten()
+        .filter(|(id, _)| seen.insert(id.clone()))
         .collect();
     Ok((to_import, merged))
 }
+
+/// Pulled commits with their CIDs, in import order.
+type PulledCommits = Vec<(fluree_db_core::ContentId, fluree_db_api::Base64Bytes)>;
 
 /// The remote head a push plans from, or `None` when the remote has no
 /// commits.
@@ -712,6 +734,8 @@ async fn build_push_request(
         blobs,
         missing_blobs,
         merged_commits,
+        commit_ids: plan.lineage.clone(),
+        merged_commit_ids: plan.merged.clone(),
     })
 }
 
@@ -1635,19 +1659,20 @@ pub async fn run_clone_origin(
                     .await
                     .map_err(|e| CliError::Config(format!("clone failed (fetch commit): {e}")))?;
 
-                // Verify integrity + derive CID from the commit blob.
-                let derived_id = verify_commit_blob(&bytes).map_err(|e| {
-                    CliError::Config(format!("clone failed (commit integrity): {e}"))
-                })?;
-                if derived_id != cid {
+                if !commit_blob_matches(&cid, &bytes) {
                     return Err(CliError::Config(format!(
-                        "clone failed: commit CID mismatch (expected {cid}, got {derived_id})"
+                        "clone failed: commit {cid} does not match its bytes"
                     )));
                 }
 
-                // Store commit blob locally.
+                // Store commit blob locally, under its CID's own address.
                 storage
-                    .content_write_bytes(ContentKind::Commit, &namespace, &bytes)
+                    .content_write_bytes_with_hash(
+                        ContentKind::Commit,
+                        &namespace,
+                        &cid.address_digest(),
+                        &bytes,
+                    )
                     .await
                     .map_err(|e| CliError::Config(format!("clone failed (store commit): {e}")))?;
 
@@ -2035,6 +2060,7 @@ async fn run_pull_via_origins(
 
     // Walk chain from remote head toward local head.
     struct FetchedCommit {
+        id: fluree_db_core::ContentId,
         bytes: Vec<u8>,
         txn: Option<fluree_db_core::ContentId>,
     }
@@ -2074,12 +2100,9 @@ async fn run_pull_via_origins(
             .await
             .map_err(|e| CliError::Config(format!("pull failed (fetch commit): {e}")))?;
 
-        // Verify integrity.
-        let derived_id = verify_commit_blob(&commit_bytes)
-            .map_err(|e| CliError::Config(format!("pull failed (commit integrity): {e}")))?;
-        if derived_id != cid {
+        if !commit_blob_matches(&cid, &commit_bytes) {
             return Err(CliError::Config(format!(
-                "pull failed: commit CID mismatch (expected {cid}, got {derived_id})"
+                "pull failed: commit {cid} does not match its bytes"
             )));
         }
 
@@ -2095,6 +2118,7 @@ async fn run_pull_via_origins(
             frontier.push(parent_id.clone());
         }
         fetched.push(FetchedCommit {
+            id: cid.clone(),
             bytes: commit_bytes,
             txn: envelope.txn,
         });
@@ -2109,7 +2133,12 @@ async fn run_pull_via_origins(
     fetched.reverse();
     for fc in &fetched {
         storage
-            .content_write_bytes(ContentKind::Commit, &namespace, &fc.bytes)
+            .content_write_bytes_with_hash(
+                ContentKind::Commit,
+                &namespace,
+                &fc.id.address_digest(),
+                &fc.bytes,
+            )
             .await
             .map_err(|e| CliError::Config(format!("pull failed (store commit): {e}")))?;
 
@@ -2164,6 +2193,10 @@ mod tests {
         Base64Bytes(written.bytes)
     }
 
+    fn bytes_of(commits: PulledCommits) -> Vec<Base64Bytes> {
+        commits.into_iter().map(|(_, bytes)| bytes).collect()
+    }
+
     fn page(
         commits: Vec<Base64Bytes>,
         merged_commits: Vec<Base64Bytes>,
@@ -2183,6 +2216,8 @@ mod tests {
             effective_limit: 100,
             lineage,
             merged_commits,
+            commit_ids: Vec::new(),
+            merged_commit_ids: Vec::new(),
         }
     }
 
@@ -2197,9 +2232,9 @@ mod tests {
         ];
 
         let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
-        assert_eq!(to_import, [c2, c3, c4]);
+        assert_eq!(bytes_of(to_import), [c2, c3, c4]);
         // The older page's commits come first, and `b` is kept once.
-        assert_eq!(merged, [a, b]);
+        assert_eq!(bytes_of(merged), [a, b]);
     }
 
     #[test]
@@ -2208,7 +2243,7 @@ mod tests {
         let pages = [page(vec![c3.clone(), c2.clone(), c1], Vec::new(), false)];
 
         let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
-        assert_eq!(to_import, [c2, c3]);
+        assert_eq!(bytes_of(to_import), [c2, c3]);
         assert!(merged.is_empty());
     }
 }

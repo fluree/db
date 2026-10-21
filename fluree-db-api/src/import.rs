@@ -4287,7 +4287,7 @@ where
 
                 // Collect txn-meta for this commit (no I/O, just captures data already in scope).
                 commit_metas.push(CommitMeta {
-                    commit_hash_hex: result.commit_id.digest_hex(),
+                    commit_hash_hex: result.commit_id.address_digest(),
                     t: result.t,
                     blob_bytes: result.blob_bytes,
                     flake_count: result.flake_count,
@@ -5182,7 +5182,7 @@ where
             {
                 let previous_commit_hex = commit_metas.last().map(|m| m.commit_hash_hex.clone());
                 commit_metas.push(CommitMeta {
-                    commit_hash_hex: result.commit_id.digest_hex(),
+                    commit_hash_hex: result.commit_id.address_digest(),
                     t: result.t,
                     blob_bytes: result.blob_bytes,
                     flake_count: result.flake_count,
@@ -5443,7 +5443,7 @@ where
                     let previous_commit_hex =
                         commit_metas.last().map(|m| m.commit_hash_hex.clone());
                     commit_metas.push(CommitMeta {
-                        commit_hash_hex: result.commit_id.digest_hex(),
+                        commit_hash_hex: result.commit_id.address_digest(),
                         t: result.t,
                         blob_bytes: result.blob_bytes,
                         flake_count: result.flake_count,
@@ -7079,7 +7079,7 @@ where
         // Encode and upload FIR6 root.
         let root_bytes = root_v6.encode();
         let root_digest = fluree_db_core::sha256_hex(&root_bytes);
-        let root_cid = fluree_db_core::ContentId::from_hex_digest(
+        let root_cid = fluree_db_core::ContentId::from_address_digest(
             fluree_db_core::content_kind::CODEC_FLUREE_INDEX_ROOT,
             &root_digest,
         )
@@ -7428,7 +7428,7 @@ where
                 storage.storage_method(),
                 kind,
                 namespace,
-                &old_cid.digest_hex(),
+                &old_cid.address_digest(),
             );
             if let Err(e) = storage.delete(&addr).await {
                 tracing::debug!(%e, old_addr = %addr, "could not GC old default context blob");

@@ -474,7 +474,7 @@ pub async fn fetch_and_decode_block<S: Storage + Clone + 'static>(
 
     // 3. Derive storage address internally
     let method = storage.storage_method();
-    let address = content_address(method, kind, namespace, &cid.digest_hex());
+    let address = content_address(method, kind, namespace, &cid.address_digest());
 
     // 4. Read raw bytes from storage
     let bytes = storage.read_bytes(&address).await.map_err(|e| {

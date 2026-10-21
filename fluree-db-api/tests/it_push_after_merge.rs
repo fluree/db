@@ -108,6 +108,8 @@ async fn build_bundle_from(
         blobs,
         missing_blobs: Vec::new(),
         merged_commits,
+        commit_ids: Vec::new(),
+        merged_commit_ids: Vec::new(),
     }
 }
 
@@ -399,7 +401,17 @@ async fn lineage_export_pulls_a_merge() {
     assert_eq!(page.next_cursor_id, None);
 
     let result = fluree
-        .import_commits_incremental(target, page.commits, page.merged_commits, page.blobs)
+        .import_commits_incremental(
+            target,
+            fluree_db_api::PushCommitsRequest {
+                commits: page.commits,
+                blobs: page.blobs,
+                missing_blobs: Vec::new(),
+                merged_commits: page.merged_commits,
+                commit_ids: page.commit_ids,
+                merged_commit_ids: page.merged_commit_ids,
+            },
+        )
         .await
         .expect("import should be accepted");
     assert_eq!(result.head_t, 3);

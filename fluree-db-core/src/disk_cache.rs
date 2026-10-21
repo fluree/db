@@ -1030,6 +1030,15 @@ impl ContentStore for CachedContentStore {
         self.inner.put(kind, bytes).await
     }
 
+    async fn put_hashed(
+        &self,
+        alg: crate::HashAlgorithm,
+        kind: crate::ContentKind,
+        bytes: &[u8],
+    ) -> crate::error::Result<ContentId> {
+        self.inner.put_hashed(alg, kind, bytes).await
+    }
+
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> crate::error::Result<()> {
         self.inner.put_with_id(id, bytes).await
     }

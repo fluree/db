@@ -792,6 +792,11 @@ pub struct PushRequest {
     /// Commit blobs that merges in `commits` brought in, parents before
     /// children. See [`fluree_db_api::PushCommitsRequest::merged_commits`].
     pub merged_commits: Vec<Vec<u8>>,
+    /// The CIDs of `commits` and `merged_commits`, when the sender named
+    /// them (see [`fluree_db_api::PushCommitsRequest::commit_ids`]); empty
+    /// means each is the SHA2-256 of its bytes.
+    pub commit_ids: Vec<fluree_db_core::ContentId>,
+    pub merged_commit_ids: Vec<fluree_db_core::ContentId>,
     pub governance: GovernanceOptions,
 }
 

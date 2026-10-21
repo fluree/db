@@ -201,7 +201,7 @@ pub fn cid_and_ledger_from_address(address: &str) -> Option<(ContentId, String)>
     let ledger_id = format_ledger_id(&name, branch);
 
     // Build CID from codec + hex digest
-    let cid = ContentId::from_hex_digest(codec, hash_hex)?;
+    let cid = ContentId::from_address_digest(codec, hash_hex)?;
     Some((cid, ledger_id))
 }
 
@@ -759,7 +759,7 @@ mod tests {
             "file",
             ContentKind::Txn,
             &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
 
         let transport = CannedTransport::new(StatusCode::OK, payload.clone());
@@ -797,7 +797,7 @@ mod tests {
             "file",
             ContentKind::Txn,
             &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
 
         let transport = CannedTransport::new(StatusCode::OK, b"tampered bytes".to_vec());
@@ -827,7 +827,7 @@ mod tests {
             "file",
             ContentKind::Txn,
             &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
 
         let transport = CannedTransport::new(StatusCode::FORBIDDEN, Vec::new());
@@ -897,7 +897,7 @@ mod tests {
             "file",
             kind,
             &fluree_db_core::StorageNamespace::parse_legacy(alias).unwrap(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
         let (cid, ledger) = cid_and_ledger_from_address(&address).expect("should parse address");
         assert_eq!(cid, id, "CID mismatch for {address}");
@@ -1031,7 +1031,7 @@ mod tests {
                 "file",
                 kind,
                 &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
-                &id.digest_hex(),
+                &id.address_digest(),
             );
             let (cid, ledger) = cid_and_ledger_from_address(&address)
                 .unwrap_or_else(|| panic!("no round-trip for {kind:?} at {address}"));
@@ -1053,7 +1053,7 @@ mod tests {
                 "file",
                 kind,
                 &fluree_db_core::StorageNamespace::parse_legacy("mydb:main").unwrap(),
-                &id.digest_hex(),
+                &id.address_digest(),
             );
             assert!(
                 cid_and_ledger_from_address(&address).is_none(),
@@ -1093,7 +1093,7 @@ mod tests {
                 "file",
                 kind,
                 &root.namespace("dev"),
-                &id.digest_hex(),
+                &id.address_digest(),
             );
             let (cid, ledger) = cid_and_ledger_from_address(&address)
                 .unwrap_or_else(|| panic!("no round-trip for {kind:?} at {address}"));
@@ -1106,7 +1106,7 @@ mod tests {
         }
 
         // `@` is reserved in names, so any other `@` segment is no root.
-        let hash = ContentId::new(ContentKind::Commit, b"x").digest_hex();
+        let hash = ContentId::new(ContentKind::Commit, b"x").address_digest();
         for path in [
             "acme/@nope/main".to_string(),
             format!("@{instance}/main"),
@@ -1128,7 +1128,7 @@ mod tests {
             "s3",
             ContentKind::Commit,
             &fluree_db_core::StorageNamespace::parse_legacy("prod:main").unwrap(),
-            &id.digest_hex(),
+            &id.address_digest(),
         );
         let (cid, ledger) = cid_and_ledger_from_address(&address).expect("should parse s3 address");
         assert_eq!(cid, id);

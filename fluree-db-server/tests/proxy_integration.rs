@@ -1817,7 +1817,7 @@ async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
             .storage_namespace("rawmode:test")
             .await
             .unwrap(),
-        &reindex_result.root_id.digest_hex(),
+        &reindex_result.root_id.address_digest(),
     );
     let direct_root_bytes = admin_storage
         .read_bytes(&root_address)
@@ -2562,7 +2562,7 @@ async fn leaf_address_from_cid(cid_str: &str, state: &AppState, ledger_id: &str)
         "file",
         ContentKind::IndexLeaf,
         &state.fluree.storage_namespace(ledger_id).await.unwrap(),
-        &cid.digest_hex(),
+        &cid.address_digest(),
     )
 }
 
@@ -2689,7 +2689,7 @@ async fn test_policy_filtered_flkb_has_fewer_flakes_than_raw() {
         .expect("reindex should succeed");
 
     assert!(
-        reindex_result.root_id.digest_hex().len() == 64,
+        reindex_result.root_id.address_digest().len() == 64,
         "Reindex should produce a valid root CID"
     );
     assert!(
@@ -2985,7 +2985,7 @@ async fn test_object_endpoint_serves_ledger_scoped_advanced_kinds() {
             .unwrap_or_else(|e| panic!("seed {kind:?}: {e}"));
         assert_eq!(
             written.content_hash,
-            id.digest_hex(),
+            id.address_digest(),
             "seed hash must match the CID digest for {kind:?}"
         );
 

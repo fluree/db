@@ -65,7 +65,7 @@ pub struct PackStreamResult {
 /// Walk backward from each `want` CID until hitting a `have` CID or genesis.
 ///
 /// Returns commit CIDs in oldest-first (topo) order, deduplicated. When
-/// multiple `want` heads are provided, they are sorted by `digest_hex()`
+/// multiple `want` heads are provided, they are sorted by `address_digest()`
 /// before walking for deterministic output.
 pub async fn compute_missing_commits<C: ContentStore>(
     store: &C,
@@ -74,7 +74,7 @@ pub async fn compute_missing_commits<C: ContentStore>(
 ) -> Result<Vec<ContentId>> {
     // Sort want heads by digest for deterministic ordering.
     let mut sorted_wants: Vec<&ContentId> = want.iter().collect();
-    sorted_wants.sort_by_key(|a| a.digest_hex());
+    sorted_wants.sort_by_key(|a| a.address_digest());
 
     let mut result = Vec::new();
     let mut seen = HashSet::new();

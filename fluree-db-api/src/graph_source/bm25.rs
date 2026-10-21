@@ -218,7 +218,7 @@ async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids
             method,
             ContentKind::GraphSourceSnapshot,
             &namespace,
-            &cid.digest_hex(),
+            &cid.address_digest(),
         );
         if let Err(e) = storage.delete(&addr).await {
             warn!(address = %addr, error = %e, "failed to delete old BM25 snapshot");
@@ -1812,7 +1812,7 @@ where {
                 &method,
                 fluree_db_core::ContentKind::GraphSourceSnapshot,
                 &namespace,
-                &cid.digest_hex(),
+                &cid.address_digest(),
             );
             match storage.delete(&addr).await {
                 Ok(()) => deleted += 1,
