@@ -1999,6 +1999,32 @@ async fn values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
     values
 }
 
+/// [`values_of`] through a JSON-LD query, which sees a list's entries as
+/// values.
+async fn stored_values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
+    let fluree = FlureeBuilder::file(path.to_string())
+        .without_indexing()
+        .build()
+        .expect("reload");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let query = json!({
+        "@context": {"ex": EX},
+        "select": ["?o"],
+        "where": {"@id": "ex:s", pred: "?o"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("json");
+    let mut values: Vec<String> = support::normalize_rows(&rows)
+        .iter()
+        .map(JsonValue::to_string)
+        .collect();
+    values.sort();
+    values
+}
+
 /// An integer too large for 64 bits is one stored fact per value, whatever
 /// XSD subtype it is written with: the index keys it by value. So a write
 /// that retracts it under one subtype and asserts it under another commits
@@ -2116,15 +2142,15 @@ async fn changing_a_big_integers_subtype_keeps_it() {
 /// something else retracts both entries, before and after an index build.
 #[tokio::test]
 async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
-    const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
-                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
     const TTL_PFX: &str = "@prefix ex: <http://example.org/ns/> .\n\
                            @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
     const BIG: &str = "\"123456789012345678901234567890\"^^xsd:integer";
     let mut failures = Vec::new();
     for (list, v) in [
-        ("( 1.5E0 1.5E0 2.5E0 )".to_string(), "1.5E0"),
-        (format!("( {BIG} {BIG} 7 )"), BIG),
+        ("( 1.5E0 1.5E0 2.5E0 )".to_string(), "(= ?o 1.5)"),
+        // The big value's two entries, picked out without spelling a big
+        // integer in a filter.
+        (format!("( {BIG} {BIG} 7 )"), "(!= ?o 7)"),
     ] {
         for indexed in [false, true] {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -2144,28 +2170,35 @@ async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
                     support::rebuild_and_publish_index(&fluree, id).await;
                 }
             }
-            let before = values_of(&path, id, "ex:l").await;
+            // The list's entries are the values of `ex:l` in JSON-LD's view;
+            // SPARQL reads the list as its head and cells.
+            let before = stored_values_of(&path, id, "ex:l").await;
             let receipt = {
                 let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
-                let update = format!(
-                    "{PFX}DELETE {{ ex:s ex:l ?o }} INSERT {{ ex:s ex:q \"done\" }} \
-                     WHERE {{ ex:s ex:l ?o FILTER(?o = {v}) }}"
-                );
+                let update = json!({
+                    "@context": {
+                        "ex": "http://example.org/ns/",
+                        "xsd": "http://www.w3.org/2001/XMLSchema#"
+                    },
+                    "where": [{"@id": "ex:s", "ex:l": "?o"}, ["filter", v]],
+                    "delete": {"@id": "ex:s", "ex:l": "?o"},
+                    "insert": {"@id": "ex:s", "ex:q": "done"}
+                });
                 fluree
                     .graph(id)
                     .transact()
-                    .sparql_update(&update)
+                    .update(&update)
                     .commit()
                     .await
                     .expect("write")
                     .receipt
             };
-            let after = values_of(&path, id, "ex:l").await;
+            let after = stored_values_of(&path, id, "ex:l").await;
             {
                 let fluree = FlureeBuilder::file(path.clone()).build().expect("reload");
                 support::rebuild_and_publish_index(&fluree, id).await;
             }
-            let reindexed = values_of(&path, id, "ex:l").await;
+            let reindexed = stored_values_of(&path, id, "ex:l").await;
             let got = (receipt.flake_count, receipt.retract_count);
             if before.len() != 3 || got != (3, 2) || after.len() != 1 || reindexed != after {
                 failures.push(format!(

@@ -66,10 +66,16 @@ async fn crawl(fluree: &fluree_db_api::Fluree, ledger_id: &str, subject: &str) -
         .expect("to_jsonld")
 }
 
-/// Every default-graph triple, sorted: what a list's items are, in any order.
+/// Every default-graph value, sorted: what a list's items are, in any order.
+/// A JSON-LD query, which sees a list's members as values; SPARQL sees its
+/// cells, whose labels a ledger names in its own order.
 async fn triples(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> Vec<JsonValue> {
     let ledger = fluree.ledger(ledger_id).await.expect("load");
-    let rows = support::query_sparql(fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+    let query = json!({
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let rows = support::query_jsonld(fluree, &ledger, &query)
         .await
         .expect("query")
         .to_jsonld(&ledger.snapshot)

@@ -202,6 +202,11 @@ pub struct BinaryScanOperator {
     /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
     /// debug/inspection callers can see Fluree-system facts directly.
     include_system_facts: bool,
+    /// Skip rows that are members of a compactly stored RDF list — rows with
+    /// a list position. In SPARQL's view of lists (see
+    /// [`crate::list_view`]) a member is not a value of its predicate; the
+    /// list's owner edge and cells come from [`crate::list_view`] instead.
+    hide_list_members: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -739,6 +744,7 @@ impl BinaryScanOperator {
             p_sids_ephemeral: HashMap::new(),
             p_is_var,
             include_system_facts: false,
+            hide_list_members: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -753,6 +759,12 @@ impl BinaryScanOperator {
             unresolved_bound_subject_iri: None,
             mode,
         }
+    }
+
+    /// Skip list members (see [`Self::hide_list_members`]).
+    pub fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -820,6 +832,9 @@ impl BinaryScanOperator {
                 && !self.include_system_facts
                 && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
             {
+                continue;
+            }
+            if self.hide_list_members && flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
                 continue;
             }
 
@@ -1409,6 +1424,9 @@ impl BinaryScanOperator {
 
             // Skip internal db: predicates on wildcard scans.
             if self.is_internal_predicate(p_id) {
+                continue;
+            }
+            if self.hide_list_members && o_i != u32::MAX {
                 continue;
             }
 
@@ -3055,7 +3073,8 @@ impl Operator for BinaryScanOperator {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
-        if !self.count_only_eligible() {
+        // Counting rows undecoded would count the list members it hides.
+        if !self.count_only_eligible() || self.hide_list_members {
             return Ok(None);
         }
 

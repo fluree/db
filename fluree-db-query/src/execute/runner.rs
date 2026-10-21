@@ -485,6 +485,14 @@ pub async fn prepare_execution_with_config(
                 geo_index_covers,
             );
 
+            // SPARQL's view of RDF lists (`crate::list_view`), for a ledger
+            // that may hold list members. History reads keep the stored rows.
+            let rewritten_patterns = if query.query.rdf_list_view && !planning.is_history() {
+                crate::list_view::apply(rewritten_patterns, db.snapshot, db.overlay, binary_store)?
+            } else {
+                rewritten_patterns
+            };
+
             let before_dedup = rewritten_patterns.len();
             let rewritten_patterns = dedup_exact_triples(rewritten_patterns);
             if rewritten_patterns.len() != before_dedup {

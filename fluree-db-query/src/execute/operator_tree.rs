@@ -2446,6 +2446,11 @@ fn build_operator_tree_inner(
     // below alike.
     let fast_paths_globally_disabled = fast_paths_disabled();
     let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // A pattern answered in SPARQL's view of RDF lists counts list triples
+    // that no stored row is (`crate::list_view`); every fast path reads the
+    // stored rows, members included, so none applies.
+    let list_view = crate::list_view::has_list_view(&query.patterns);
+    let enable_fused_fast_paths = enable_fused_fast_paths && !list_view;
     // A trailing VALUES clause (`query.post_values`) joins after the WHERE
     // tree, below grouping. Every fast path reads `query.patterns` alone, so
     // one would answer as if the VALUES were absent (`COUNT(*) … VALUES ?a
@@ -3077,7 +3082,7 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values && !list_view {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
@@ -3115,7 +3120,7 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values {
+    if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values && !list_view {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
@@ -3171,6 +3176,7 @@ fn build_operator_tree_inner(
     // multi-ledger.
     if !planning.is_history()
         && !fast_paths_globally_disabled
+        && !list_view
         && !trailing_values
         && stats.is_some()
     {
@@ -4492,6 +4498,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         }
     }
 
@@ -4694,6 +4701,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -4773,6 +4781,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let spec =
@@ -4806,6 +4815,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(
@@ -4839,6 +4849,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let kept = bindable_sort_keys(
@@ -4958,6 +4969,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -4986,6 +4998,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -5025,6 +5038,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -5102,6 +5116,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -5162,6 +5177,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -5214,6 +5230,7 @@ mod tests {
             union_default_graph: None,
             cypher_vocab: None,
             unmatched_optional: Default::default(),
+            rdf_list_view: false,
             grouping: None,
             ordering,
             order_binds: Vec::new(),

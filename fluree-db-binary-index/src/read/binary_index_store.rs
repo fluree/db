@@ -416,6 +416,9 @@ pub struct BinaryIndexStore {
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// The predicates with list rows, built on first use. See
+    /// [`Self::list_predicate_ids`].
+    list_predicate_ids: OnceLock<Arc<std::collections::HashSet<u32>>>,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -486,6 +489,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: OnceLock::new(),
         }
     }
 
@@ -671,6 +675,7 @@ impl BinaryIndexStore {
             pred_subject_ids: std::sync::OnceLock::new(),
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            list_predicate_ids: OnceLock::new(),
         })
     }
 
@@ -2496,6 +2501,56 @@ impl BinaryIndexStore {
             .write()
             .insert((g_id, p_id), proven);
         Some(proven)
+    }
+
+    /// The predicates with list rows (`o_i`, an RDF-list position) in any
+    /// graph, read from POST leaflet directories once per store: the index is
+    /// immutable, so the set holds for the store's lifetime. A leaflet that
+    /// spans several predicates has its predicate and position columns read.
+    pub fn list_predicate_ids(&self) -> io::Result<Arc<std::collections::HashSet<u32>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(ids) = self.list_predicate_ids.get() {
+            return Ok(Arc::clone(ids));
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::PId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        for g_id in self.graph_ids() {
+            let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Post) else {
+                continue;
+            };
+            for leaf in &branch.leaves {
+                let handle =
+                    self.open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)?;
+                for (idx, entry) in handle.dir().entries.iter().enumerate() {
+                    if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                        continue;
+                    }
+                    if let Some(p_id) = entry.p_const {
+                        ids.insert(p_id);
+                        continue;
+                    }
+                    let batch = handle.load_columns(idx, &projection, RunSortOrder::Post)?;
+                    for row in 0..batch.row_count {
+                        if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                            ids.insert(batch.p_id.get_or(row, 0));
+                        }
+                    }
+                }
+            }
+        }
+        let ids = Arc::new(ids);
+        let _ = self.list_predicate_ids.set(Arc::clone(&ids));
+        Ok(ids)
     }
 
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {

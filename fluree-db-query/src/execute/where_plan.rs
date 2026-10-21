@@ -103,6 +103,7 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
         Pattern::Subquery(sq) => pattern_tree_has_edge_annotation(&sq.patterns),
         Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
         Pattern::Triple(_)
+        | Pattern::ListView(_)
         | Pattern::PropertyPath(_)
         | Pattern::ShortestPath(_)
         | Pattern::Filter(_)
@@ -3156,6 +3157,19 @@ pub fn build_where_operators_seeded_with_needed(
                     stats.clone(),
                     *planning,
                 ));
+                i += 1;
+            }
+
+            Pattern::ListView(lv) => {
+                // A triple pattern in SPARQL's view of RDF lists: its stored
+                // triples that are not list members, and the list triples
+                // that match it (`crate::list_view`).
+                let child = get_or_empty_seed(operator.take());
+                operator = Some(Box::new(crate::list_view::ListViewOperator::new(
+                    child,
+                    lv.clone(),
+                    planning.mode(),
+                )));
                 i += 1;
             }
 

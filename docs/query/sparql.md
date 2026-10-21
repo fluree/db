@@ -111,7 +111,7 @@ PREFIX ex: <http://example.org/ns/>
 DESCRIBE ex:alice
 ```
 
-Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`).
+Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a [list](#rdf-lists) it points to.
 
 ## Basic Graph Patterns
 
@@ -274,6 +274,24 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 #### Not Yet Supported
 
 A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
+
+### RDF Lists
+
+A list — Turtle `( … )`, JSON-LD `{"@list": [...]}` — is, as RDF, its owner's edge to a head cell and a chain of cells, each with an `rdf:first` (the member) and an `rdf:rest` (the next cell, or `rdf:nil`). SPARQL sees that graph, however the list was written:
+
+```sparql
+# data: ex:s ex:items (ex:a ex:b ex:c) .
+
+SELECT ?x WHERE { ex:s ex:items/rdf:rest*/rdf:first ?x }  # ex:a, ex:b, ex:c
+SELECT ?x WHERE { ex:s ex:items/rdf:rest/rdf:first ?x }   # ex:b
+SELECT ?x ?y ?z WHERE { ex:s ex:items (?x ?y ?z) }        # one solution
+```
+
+- `ex:s ex:items ?o` binds `?o` to the head cell, a blank node, not to the members; `?s ?p ?o` and `COUNT(*)` count the owner edge and two triples per member.
+- A cell's blank node (`_:l0-0`, …) names it only within the result that returned it.
+- CONSTRUCT, DESCRIBE and a Graph Store `GET` write a list as `( … )` in Turtle and as `{"@list": [...]}` in JSON-LD, so a graph read and written back is unchanged.
+- JSON-LD queries keep Fluree's view, where the members are the values of their property: `{"@id": "ex:s", "ex:items": "?x"}` binds each member.
+- A query over a dataset spanning several ledgers, and a history query, see the members as values.
 
 ## Query Modifiers
 
