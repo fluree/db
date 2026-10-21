@@ -651,7 +651,11 @@ impl<'l> FactIdentity<'l> {
         if !(may_merge(true) && may_merge(false)) {
             return;
         }
-        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), &'f Flake> = FxHashMap::default();
+        // Every retraction of a key pairs with an assertion of it: one fact
+        // can be retracted under several terms (novelty holding a big integer
+        // under two subtypes), and a retraction left over would still pair.
+        let mut retracted: FxHashMap<(&Option<Sid>, MergeKey), Vec<&'f Flake>> =
+            FxHashMap::default();
         for &f in slot
             .iter()
             .filter(|f| !f.op && f.o.index_key_may_merge_terms())
@@ -660,7 +664,7 @@ impl<'l> FactIdentity<'l> {
                 continue;
             }
             if let Some(key) = self.key(self.graph_id(&f.g), f) {
-                retracted.entry((&f.g, key)).or_insert(f);
+                retracted.entry((&f.g, key)).or_default().push(f);
             }
         }
         if retracted.is_empty() {
@@ -673,7 +677,7 @@ impl<'l> FactIdentity<'l> {
             let Some(key) = self.key(self.graph_id(&a.g), a) else {
                 continue;
             };
-            if let Some(r) = retracted.remove(&(&a.g, key)) {
+            for r in retracted.remove(&(&a.g, key)).into_iter().flatten() {
                 pairs.push(SameTPair {
                     retraction: r,
                     assertion: a,
@@ -2864,5 +2868,38 @@ mod tests {
                 want => assert_eq!(got.as_deref(), *want, "{what}"),
             }
         }
+    }
+
+    /// Two retractions of one big integer, under two subtypes, and an
+    /// assertion of it at one `t`: novelty held the value under both
+    /// subtypes when the commit was written. Both retractions pair with the
+    /// assertion, so resolving the pairs drops both and keeps the assertion.
+    #[test]
+    fn every_retraction_of_a_key_pairs_with_its_assertion() {
+        let ledger = ledger(Vec::new(), &HashMap::new());
+        let ids = FactIdentity::new(&ledger);
+        let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
+        let big = |dt: &str, op: bool| {
+            Flake::new(
+                sid("s"),
+                sid("p"),
+                FlakeValue::BigInt(Box::new(v.clone())),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                2,
+                op,
+                None,
+            )
+        };
+        let flakes = vec![
+            big("integer", false),
+            big("nonNegativeInteger", false),
+            big("positiveInteger", true),
+        ];
+        let mut spot: Vec<&Flake> = flakes.iter().collect();
+        spot.sort_by(|a, b| IndexType::Spot.compare(a, b));
+        assert_eq!(ids.same_t_pairs(spot).len(), 2);
+        let resolved = resolve_same_t_pairs(&ledger, flakes);
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert!(resolved[0].op);
     }
 }
