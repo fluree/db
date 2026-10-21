@@ -550,9 +550,9 @@ impl crate::Fluree {
                 .find(|g_id| matches!(*g_id, CONFIG_GRAPH_ID | TXN_META_GRAPH_ID));
             if let Some(g_id) = own {
                 let role = if g_id == CONFIG_GRAPH_ID {
-                    "config"
+                    fluree_db_core::GraphSel::Config
                 } else {
-                    "txn-meta"
+                    fluree_db_core::GraphSel::TxnMeta
                 };
                 return Ok(Some(format!(
                     "the merge would change this branch's {role} graph <{}> with what the \

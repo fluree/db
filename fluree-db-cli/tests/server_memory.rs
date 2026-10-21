@@ -322,3 +322,229 @@ async fn restart_refuses_memory_without_stopping_the_daemon() {
         assert!(healthy().await, "{args:?} stopped the daemon");
     }
 }
+
+/// Run the `fluree` CLI in `dir` with `home` as HOME.
+fn cli(dir: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fluree"));
+    cmd.args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null());
+    for (var, _) in std::env::vars_os() {
+        let name = var.to_string_lossy();
+        if name.starts_with("FLUREE_") || name.starts_with("XDG_") {
+            cmd.env_remove(&var);
+        }
+    }
+    cmd.output().unwrap()
+}
+
+/// `fluree query --remote … --at` reads the ledger at that time through the
+/// server's path pin and sends the query as written. A `GRAPH` with no dataset
+/// clause reads the ledger's named graph (an injected FROM used to hide it), a
+/// JSON-LD `from` naming a graph keeps it (it used to be overwritten with the
+/// ledger's address), and a SPARQL query may carry its own FROM (it used to be
+/// refused).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_at_pins_the_path_and_keeps_the_querys_dataset() {
+    let outside = TempDir::new().unwrap();
+    let serve_dir = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = MemoryServer::start(serve_dir.path(), outside.path()).await;
+    let client = reqwest::Client::new();
+
+    let post = |path: &str, content_type: &str, body: String| {
+        client
+            .post(server.url(path))
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+    };
+    let resp = post(
+        "/create",
+        "application/json",
+        json!({"ledger": "pin:main"}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(resp.status().is_success(), "create: {}", resp.status());
+    for (default, graph) in [("A", "GA"), ("B", "GB")] {
+        let trig = format!(
+            "<http://ex.org/d{default}> <http://ex.org/name> \"{default}\" .\n\
+             GRAPH <http://ex.org/g> {{ <http://ex.org/g{graph}> <http://ex.org/name> \"{graph}\" . }}\n"
+        );
+        let resp = post("/upsert/pin:main", "application/trig", trig)
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "upsert: {}", resp.status());
+    }
+
+    let home = outside.path();
+    assert!(cli(project.path(), home, &["init"]).status.success());
+    assert!(cli(
+        project.path(),
+        home,
+        &["remote", "add", "origin", &server.base]
+    )
+    .status
+    .success());
+    let query = |args: &[&str]| {
+        let mut all = vec![
+            "query", "--remote", "origin", "-l", "pin:main", "--at", "1", "--format", "json",
+        ];
+        all.extend_from_slice(args);
+        let out = cli(project.path(), home, &all);
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // No dataset: the default graph at t=1.
+    let (ok, stdout, stderr) = query(&[
+        "--sparql",
+        "-e",
+        "SELECT ?n WHERE { ?s <http://ex.org/name> ?n }",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("\"A\"") && !stdout.contains("\"B\""),
+        "{stdout}"
+    );
+
+    // No dataset and a GRAPH: the ledger's named graph at t=1 (the injected
+    // FROM of the older rewrite left GRAPH nothing to match).
+    let (ok, stdout, stderr) = query(&[
+        "--sparql",
+        "-e",
+        "SELECT ?n WHERE { GRAPH <http://ex.org/g> { ?s <http://ex.org/name> ?n } }",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("\"GA\"") && !stdout.contains("\"GB\""),
+        "{stdout}"
+    );
+
+    // A JSON-LD `from` naming a graph keeps it, at t=1.
+    let (ok, stdout, stderr) = query(&[
+        "-e",
+        r#"{"from": {"@id": "pin:main", "graph": "http://ex.org/g"}, "select": "?n",
+            "where": {"@id": "?s", "http://ex.org/name": "?n"}}"#,
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("\"GA\"") && !stdout.contains("\"GB\"") && !stdout.contains("\"A\""),
+        "{stdout}"
+    );
+
+    // A SPARQL query with its own FROM NAMED, at t=1.
+    let (ok, stdout, stderr) = query(&[
+        "--sparql",
+        "-e",
+        "SELECT ?n FROM NAMED <http://ex.org/g> \
+         WHERE { GRAPH <http://ex.org/g> { ?s <http://ex.org/name> ?n } }",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("\"GA\"") && !stdout.contains("\"GB\""),
+        "{stdout}"
+    );
+
+    server.stop().await;
+}
+
+/// A server that predates path pins (before v4.2.2) parses the pinned path as a
+/// ledger id and answers a 500 naming it. Against such a server `--remote --at`
+/// falls back to the older rewrite: the same query with the time in an
+/// injected FROM, on the unpinned path. The stand-in replies as v4.1.6 and
+/// v4.2.1 do, verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_at_falls_back_on_a_server_without_path_pins() {
+    use axum::http::{StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let recorder = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: Uri, body: String| {
+        let recorder = Arc::clone(&recorder);
+        async move {
+            let path = uri.path().replace("%40", "@").replace("%3A", ":");
+            recorder.lock().unwrap().push((path.clone(), body));
+            match path.strip_prefix("/v1/fluree/query/") {
+                Some(ledger) if ledger.contains('@') => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({
+                        "error": format!(
+                            "Ledger error: Nameservice error: Invalid ID format: Invalid ledger \
+                             ID format '{ledger}': expected 'name' or 'name:branch'"
+                        ),
+                        "status": 500,
+                        "@type": "err:system/InternalError"
+                    })),
+                )
+                    .into_response(),
+                Some(_) => axum::Json(json!({
+                    "head": {"vars": ["n"]},
+                    "results": {"bindings": [{"n": {"type": "literal", "value": "A"}}]}
+                }))
+                .into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}/v1/fluree", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let outside = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let home = outside.path();
+    assert!(cli(project.path(), home, &["init"]).status.success());
+    assert!(cli(
+        project.path(),
+        home,
+        &["remote", "add", "origin", &api_base]
+    )
+    .status
+    .success());
+    let out = cli(
+        project.path(),
+        home,
+        &[
+            "query",
+            "--remote",
+            "origin",
+            "-l",
+            "pin:main",
+            "--at",
+            "1",
+            "--format",
+            "json",
+            "--sparql",
+            "-e",
+            "SELECT ?n WHERE { ?s <http://ex.org/name> ?n }",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("\"A\""), "{stdout}");
+
+    let queries: Vec<(String, String)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.starts_with("/v1/fluree/query/"))
+        .cloned()
+        .collect();
+    assert_eq!(queries.len(), 2, "{queries:?}");
+    assert_eq!(queries[0].0, "/v1/fluree/query/pin:main@t:1");
+    assert_eq!(queries[1].0, "/v1/fluree/query/pin:main");
+    assert!(queries[1].1.contains("FROM <pin:main@t:1>"), "{queries:?}");
+}

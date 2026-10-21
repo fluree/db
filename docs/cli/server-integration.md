@@ -277,16 +277,22 @@ CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
 
 **Remote time travel (`--at`)** routes through the **ledger-scoped** endpoints
-(`POST /query/{ledger}`, etc.): the URL path drives the bearer's
-`can_read` check (so a token scoped to `mydb:main` matches), and the
-time-travel suffix rides in the body's `from` (`mydb:main@t:N` for JSON-LD)
-or in an injected `FROM <mydb:main@t:N>` clause (for SPARQL). Posting to
-the connection-level endpoint instead would force auth to derive the
-ledger ID from `from` and reject scoped tokens.
+with the time in the path (`POST /query/{ledger}@t:N`,
+`POST /explain/{ledger}@t:N`): the URL path drives the bearer's `can_read`
+check (so a token scoped to `mydb:main` matches), and the query is sent as
+written, so its own `FROM` / `from` keeps what it names and is read at that
+time, and a query with no dataset clause reads the ledger's named graphs too.
+A server that predates path pins (before v4.2.2) refuses the pinned path as an
+invalid ledger id (v4.1 and v4.2.1 answer with a 500 that names it); the CLI
+then falls back to the older form, which rides the time in
+the body's `from` (`mydb:main@t:N` for JSON-LD) or in an injected
+`FROM <mydb:main@t:N>` clause (for SPARQL). NDJSON (`--format ndjson`) and
+TSV/CSV still use that older form. Posting to the connection-level endpoint
+instead would force auth to derive the ledger ID from `from` and reject scoped
+tokens.
 
-**Remote `--at --explain` flows through the same ledger-scoped path.** The
-CLI injects the time-travel suffix into `from` (JSON-LD) or as a `FROM
-<ledger@t:N>` clause (SPARQL), then POSTs to `POST /explain/{ledger}`.
+**Remote `--at --explain` flows through the same ledger-scoped path**, as
+`POST /explain/{ledger}@t:N`.
 The server's explain handlers route those requests through a
 dataset-aware path so the request is processed against a view at the
 requested `t`. Note that Fluree maintains one set of index stats

@@ -1402,9 +1402,11 @@ POST /query/{ledger}
 
 **Other ledgers:**
 
-- A `from` object (`{"@id": …}`, or `{"id": …}`) must name `{ledger}`, in any spelling of its id. One that names another ledger is a `400 Bad Request` "Ledger mismatch" error.
-- A `from` string names a graph of `{ledger}` when it is a graph keyword, an IRI (`urn:…`, `scheme://…`), or a bare name with no `:`, `@` or `#`. Any other `from` string is a ledger address: it must name `{ledger}` as the path spells it, or it is a "Ledger mismatch".
-- A SPARQL `FROM` / `FROM NAMED` written as `name:branch` that names another ledger is a "Ledger mismatch".
+- A `from` string or object (`{"@id": …}`, or `{"id": …}`), and a SPARQL `FROM` / `FROM NAMED`, are read in `{ledger}`, in this order:
+  - `{ledger}`'s own address, in any spelling (`mydb`, `mydb:main`, `urn:fluree:mydb:main`), reads `{ledger}`.
+  - A graph keyword, or the IRI of one of `{ledger}`'s graphs, selects that graph.
+  - A reference that names another ledger is a `400 Bad Request` "Ledger mismatch" error.
+  - An IRI that names none of `{ledger}`'s graphs is a `404` "Graph not found".
 - A JSON-LD array `from`, or a `fromNamed`, may name other ledgers. It is the multi-ledger (union) form, the same as on `POST /query`, and each ledger it names is read under the caller's access rights.
 - `/stream/query/{ledger}` and `/explain/{ledger}` read `from` and `fromNamed` the same way.
 

@@ -246,7 +246,34 @@ pub fn resolve_dataset_clause(ast: &SparqlAst) -> Result<Option<ResolvedDatasetC
 
     let (prefixes, base) = prologue_environment(&ast.prologue);
     let expand = |iri: &crate::ast::term::Iri| -> Result<Arc<str>> {
-        term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
+        match &iri.value {
+            // A dataset IRI written in full is taken as written (BASE-resolved
+            // when relative). `FROM <mydb:main>` names a ledger even when the
+            // query also declares a `mydb:` prefix, so the misused-prefix check
+            // that pattern IRIs get does not apply to a dataset clause. A
+            // ledger address that names its branch or a time (`my_db:main`,
+            // `mydb@t:3`) is no relative reference, so BASE leaves it as
+            // written too; a bare name is one, and BASE resolves it.
+            crate::ast::term::IriValue::Full(s) => Ok(match base.as_deref() {
+                Some(base)
+                    if !fluree_vocab::iri::is_absolute_iri(s)
+                        && !fluree_db_core::DatasetRef::is_address_with_branch_or_time(s) =>
+                {
+                    Arc::from(fluree_vocab::iri::resolve_iri(base, s))
+                }
+                _ => Arc::clone(s),
+            }),
+            // `FROM ledger:main` with no `ledger:` prefix declared names the
+            // ledger address as written; a declared prefix expands.
+            crate::ast::term::IriValue::Prefixed { prefix, local }
+                if !prefixes.contains_key(prefix) =>
+            {
+                Ok(Arc::from(format!("{prefix}:{local}")))
+            }
+            crate::ast::term::IriValue::Prefixed { .. } => {
+                term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
+            }
+        }
     };
 
     Ok(Some(ResolvedDatasetClause {
@@ -5304,6 +5331,38 @@ mod base_resolution_tests {
             vec!["http://example.org/graphs/g2"]
         );
         assert_eq!(resolved.to_graph, None);
+    }
+
+    /// Under a `BASE`, a ledger address that names its branch or a time is
+    /// no relative reference, so it is taken as written; a bare name is one,
+    /// and BASE resolves it, as it resolves `data-g1.ttl`.
+    #[test]
+    fn base_leaves_an_address_with_a_branch_or_time_as_written() {
+        let clause = |from: &str| {
+            let output = parse_sparql(&format!(
+                "BASE <http://example.org/tests/> SELECT * FROM <{from}> WHERE {{ ?s ?p ?o }}"
+            ));
+            let ast = output.ast.expect("parse");
+            let resolved = resolve_dataset_clause(&ast).unwrap().expect("clause");
+            resolved.default_graphs[0].to_string()
+        };
+        for as_written in [
+            "my_db:main",
+            "mydb@t:3",
+            "my_db:main@t:3",
+            "tenant/db@t:3",
+            "my_db:main#config",
+            "mydb@t:abc",
+        ] {
+            assert_eq!(clause(as_written), as_written, "{as_written}");
+        }
+        for (relative, resolved) in [
+            ("mydb", "http://example.org/tests/mydb"),
+            ("data-g1.ttl", "http://example.org/tests/data-g1.ttl"),
+            ("#g", "http://example.org/tests/#g"),
+        ] {
+            assert_eq!(clause(relative), resolved, "{relative}");
+        }
     }
 
     #[test]
