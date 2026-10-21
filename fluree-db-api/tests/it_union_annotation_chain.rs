@@ -9,7 +9,13 @@
 //! ledgers, with fast paths on and off, and is checked against a ledger whose
 //! default graph holds the union's facts once (the floor).
 //!
+//! Over the indexed ledgers, the chain's joins take the nested-loop join's
+//! batched probes over the union (`nested-loop-batched-union`).
+//!
 //! Fast paths are switched off process-wide, so this is its own `[[test]]`.
+
+#[path = "support/span_capture.rs"]
+mod span_capture;
 
 use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
 use serde_json::{json, Value as JsonValue};
@@ -252,6 +258,27 @@ async fn an_annotated_edge_two_graphs_hold_is_one_solution_of_their_union() {
         )
         .await;
         assert_eq!(floor, want_rows, "{state}: the floor");
+        if indexed {
+            // The chain's joins answer through the union probe.
+            let (store, guard) = span_capture::init_test_tracing();
+            sparql(
+                &fluree,
+                LEDGER,
+                &format!(
+                    "PREFIX ex: <{EX}>\nSELECT ?s ?role FROM <{G1}> FROM <{G2}> WHERE {{ {BODY} }}"
+                ),
+            )
+            .await;
+            drop(guard);
+            let proceeded = store.all_events().iter().any(|e| {
+                e.message() == "fast-path outcome"
+                    && e.fields.get("site").map(String::as_str) == Some("nested-loop-batched-union")
+                    && e.fields.get("outcome").map(String::as_str) == Some("proceed")
+            });
+            if !proceeded {
+                failures.push(format!("{state}: the union probe did not answer the chain"));
+            }
+        }
         for disabled in [false, true] {
             set_fast_paths_disabled(disabled);
             let lane = if disabled {

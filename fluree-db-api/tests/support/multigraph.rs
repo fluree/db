@@ -1163,7 +1163,9 @@ pub struct Run {
     pub fell_back: Vec<(String, String)>,
 }
 
-fn switch() -> &'static tokio::sync::Mutex<()> {
+/// The lock every on/off pair in this binary holds while it flips the
+/// process-wide fast-path switch.
+pub fn switch() -> &'static tokio::sync::Mutex<()> {
     static SWITCH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     SWITCH.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -1203,7 +1205,7 @@ pub async fn run(fx: &Fixture, scope: Scope, shape: Shape, surface: Surface) -> 
     }
 }
 
-fn outcomes(store: &SpanStore) -> Vec<(String, String)> {
+pub fn outcomes(store: &SpanStore) -> Vec<(String, String)> {
     store
         .all_events()
         .iter()
