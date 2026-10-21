@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod hooked_storage;
+pub mod recording_ns;
 pub mod span_capture;
 
 use fluree_db_api::{LedgerState, Novelty};
@@ -344,7 +345,9 @@ pub async fn seed_user_with_ssn(
 /// Rebuild and publish a binary index for the ledger's current commit head.
 ///
 /// Use this in regression tests that need to exercise the FIR6/binary-only
-/// reload path rather than the purely in-memory novelty path.
+/// reload path rather than the purely in-memory novelty path. The rebuild
+/// replaces an index already published at the same `t`, so a test that asks
+/// for a full rebuild reads one ([`publish_built_index`]).
 pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let record = fluree
         .nameservice()
@@ -360,12 +363,7 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
     )
     .await
     .expect("index rebuild should succeed");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish index");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
 }
 
 /// Like `rebuild_and_publish_index`, but uses `build_index_for_record` which
@@ -386,12 +384,7 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
     )
     .await
     .expect("index build should succeed");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish index");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
 }
 
 /// Build the index incrementally over the published one and publish it, with
@@ -419,12 +412,46 @@ pub async fn build_incrementally_and_publish_index(
     )
     .await
     .expect("incremental index build should succeed");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
+}
+
+/// Publish the index a test built, and fail closed if it didn't take.
+///
+/// `publish_index` declines, silently, an index whose `t` is not newer than
+/// the one already published. So a second build at one `t` (a full rebuild
+/// after an incremental build, a repeat rebuild, or a build that a background
+/// indexer beat to that `t`) left the test reading the index it meant to
+/// replace. This publishes the way `Fluree::reindex` does, replacing an index
+/// of the same `t`, so the test reads the build it asked for. A newer
+/// published index can't be replaced, and that panics: the test's reads would
+/// not see its build. Build the `Fluree` with `without_indexing()` so no
+/// background indexer publishes ahead of the test.
+pub async fn publish_built_index(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    index_t: i64,
+    root_id: &fluree_db_core::ContentId,
+) {
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal(ledger_id, index_t, root_id)
         .await
         .expect("publish index");
+    let published = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    assert_eq!(
+        published.index_head_id.as_ref(),
+        Some(root_id),
+        "{ledger_id}: the index built at t={index_t} was not published; the \
+         nameservice holds one at t={}. The test would read that index instead. \
+         Is a background indexer running? Build the Fluree `without_indexing()`.",
+        published.index_t
+    );
 }
 
 // =============================================================================

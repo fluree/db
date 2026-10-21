@@ -1,16 +1,16 @@
-//! Multi-query envelope snapshot resolution and per-sub-query application.
+//! Multi-query envelope snapshot resolution.
 //!
-//! Two pieces:
+//! [`resolve_envelope_snapshot`] runs once per envelope, before sub-query
+//! dispatch. It walks the distinct ledger set (provided by validation) and
+//! produces an [`EnvelopeSnapshot`] mapping each ledger to a concrete `t`,
+//! honoring the envelope `asOf` (integer, ISO timestamp, or omitted).
 //!
-//! - [`resolve_envelope_snapshot`] runs once per envelope, before sub-query
-//!   dispatch. It walks the distinct ledger set (provided by validation) and
-//!   produces an [`EnvelopeSnapshot`] mapping each ledger to a concrete `t`,
-//!   honoring the envelope `asOf` (integer, ISO timestamp, or omitted).
-//! - [`apply_snapshot_to_jsonld`] / [`apply_snapshot_to_sparql`] rewrite each
-//!   sub-query in place so its `from` clauses carry the resolved `t`. The
-//!   collision-check in validation already ensures no sub-query carries its
-//!   own temporal pin when the envelope sets `asOf`, so application is
-//!   non-conflicting.
+//! Sub-queries run as written: the dispatcher hands the snapshot to execution
+//! ([`EnvelopeSnapshot::ledger_times`]), and the connection path reads each
+//! dataset member that names no time of its own at its ledger's `t`. A member
+//! keeps the name the query wrote it by. The collision check in validation
+//! already ensures no sub-query names a time of its own when the envelope sets
+//! `asOf`.
 //!
 //! The snapshot moment is recorded once at envelope-entry — the "shared time
 //! resolution" the envelope contract promises. It is **not** distributed
@@ -20,18 +20,17 @@
 use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
-use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::dataset::LedgerTimes;
 use crate::query::multi::AsOf;
 use crate::{time_resolve, ApiError, Fluree, Result};
-use fluree_db_core::ledger_id::TIME_TRAVEL_TAGS;
 use fluree_db_query::QueryError;
 
 /// Resolved per-ledger `t` map for an envelope, plus the wall-clock moment it
 /// represents (echoed back to the client).
 ///
-/// Built by [`resolve_envelope_snapshot`] before dispatch and consumed by the
-/// per-sub-query appliers to inject the right pin into each sub-query body.
+/// Built by [`resolve_envelope_snapshot`] before dispatch; execution reads
+/// each sub-query's ledgers at its [`EnvelopeSnapshot::ledger_times`].
 #[derive(Debug, Clone)]
 pub struct EnvelopeSnapshot {
     /// ISO 8601 wall-clock moment that produced the per-ledger map. Echoed in
@@ -40,9 +39,29 @@ pub struct EnvelopeSnapshot {
     /// single-ledger and has no shared wall-clock interpretation).
     pub as_of: Option<String>,
     /// Per-ledger numeric `t`. For each ledger referenced by the envelope,
-    /// this is the value every unpinned sub-query gets pinned to during
-    /// application.
+    /// this is the time every member of that ledger that names no time of its
+    /// own is read at.
     pub ledgers: HashMap<String, i64>,
+}
+
+impl EnvelopeSnapshot {
+    /// The snapshot as execution reads it: each ledger's `t`, by ledger id.
+    /// The keys are the canonical ids validation produced, so each parses; one
+    /// that did not would be an error here rather than a ledger read at its
+    /// head.
+    pub(crate) fn ledger_times(&self) -> Result<LedgerTimes> {
+        self.ledgers
+            .iter()
+            .map(|(ledger, t)| {
+                let id = fluree_db_core::LedgerId::parse(ledger).map_err(|e| {
+                    ApiError::internal(format!(
+                        "snapshot ledger '{ledger}' is not a ledger id: {e}"
+                    ))
+                })?;
+                Ok((id, *t))
+            })
+            .collect()
+    }
 }
 
 /// Failure modes specific to snapshot resolution. The caller's mistakes keep
@@ -191,561 +210,31 @@ async fn resolve_iso_to_t(fluree: &Fluree, ledger_id: &str, iso: &str) -> Result
     Ok(resolved)
 }
 
-// =============================================================================
-// Per-sub-query application
-// =============================================================================
-
-/// Apply the envelope snapshot to a JSON-LD sub-query body in place.
-///
-/// Rewrites the sub-query's `from` so every ledger reference is tagged with
-/// the resolved `t`. Validation has already established that no sub-query
-/// carries an explicit temporal pin while the envelope sets `asOf`, so this
-/// is a non-conflicting in-place edit:
-///
-/// - String entry `"ledgerA"` → object `{"@id": "ledgerA", "t": N}` if
-///   ledgerA appears in the snapshot map.
-/// - Object entry with `@id`/`id` matching a snapshot ledger: an explicit
-///   `"t": N` field is inserted. Any pre-existing `t` or `at` would have
-///   tripped the collision check at validation time, so encountering one
-///   here is silently overwritten only when validation was bypassed (e.g.,
-///   in tests building the request directly).
-/// - Ledger references not in the snapshot map are left untouched —
-///   typically the case when the envelope omitted `asOf` and validation
-///   produced no per-ledger pin (the snapshot map then represents current
-///   `t` of each ledger at envelope-entry, and the application path below
-///   still pins them so the bundle is atomic).
-pub fn apply_snapshot_to_jsonld(query: &mut JsonValue, snapshot: &EnvelopeSnapshot) {
-    let Some(body) = query.as_object_mut() else {
-        return;
-    };
-    let Some(from) = body.get_mut("from") else {
-        return;
-    };
-    apply_jsonld_from(from, &snapshot.ledgers);
-}
-
-fn apply_jsonld_from(from: &mut JsonValue, ledgers: &HashMap<String, i64>) {
-    match from {
-        JsonValue::String(_) => {
-            // Take ownership of the string and rebuild as an object node.
-            if let JsonValue::String(s) = std::mem::replace(from, JsonValue::Null) {
-                *from = pin_string_entry(s, ledgers);
-            }
-        }
-        JsonValue::Object(obj) => {
-            pin_object_entry(obj, ledgers);
-        }
-        JsonValue::Array(items) => {
-            for item in items.iter_mut() {
-                apply_jsonld_from(item, ledgers);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn pin_string_entry(s: String, ledgers: &HashMap<String, i64>) -> JsonValue {
-    // If the identifier already carries an explicit temporal pin (e.g.
-    // `ledgerA@t:42`), leave it alone — the user-specified pin wins. Without
-    // this check we'd rewrite to `{ "@id": "ledgerA@t:42", "t": current }`
-    // which the dataset parser interprets as `t` overriding the suffix.
-    if string_has_explicit_pin(&s) {
-        return JsonValue::String(s);
-    }
-    let bare = bare_ledger_id(&s);
-    if let Some(t) = ledgers.get(&bare) {
-        let mut obj = JsonMap::new();
-        obj.insert("@id".to_string(), JsonValue::String(s));
-        obj.insert("t".to_string(), JsonValue::Number((*t).into()));
-        JsonValue::Object(obj)
-    } else {
-        JsonValue::String(s)
-    }
-}
-
-fn pin_object_entry(obj: &mut JsonMap<String, JsonValue>, ledgers: &HashMap<String, i64>) {
-    // Explicit object-level pin wins over envelope snapshot — same rule as
-    // string-form, applied to `t` / `at` fields and to a marker-bearing
-    // `@id`/`id`.
-    if obj.contains_key("t") || obj.contains_key("at") {
-        return;
-    }
-    let id = obj
-        .get("@id")
-        .or_else(|| obj.get("id"))
-        .and_then(JsonValue::as_str)
-        .map(str::to_string);
-    let Some(id) = id else { return };
-    if string_has_explicit_pin(&id) {
-        return;
-    }
-    let bare = bare_ledger_id(&id);
-    let Some(t) = ledgers.get(&bare).copied() else {
-        return;
-    };
-    obj.insert("t".to_string(), JsonValue::Number(t.into()));
-}
-
-/// Where a Fluree temporal marker (`@` + one of the shared grammar's tags,
-/// [`TIME_TRAVEL_TAGS`]) starts in `s`, if it carries one. One source of truth
-/// with the parser, so a tag added there is recognised here and by the
-/// envelope validator in `mod.rs`.
-pub(super) fn explicit_pin_at(s: &str) -> Option<usize> {
-    s.match_indices('@').map(|(idx, _)| idx).find(|&idx| {
-        TIME_TRAVEL_TAGS
-            .iter()
-            .any(|tag| s[idx + 1..].starts_with(tag))
-    })
-}
-
-/// Does this identifier string carry a Fluree temporal marker? Used to skip
-/// snapshot rewrite on already-pinned IRIs. Fragment suffixes (`#named-graph`)
-/// are not temporal and do not match.
-pub(super) fn string_has_explicit_pin(s: &str) -> bool {
-    explicit_pin_at(s).is_some()
-}
-
-/// Canonical ledger id (no temporal suffix, no named-graph fragment, default
-/// branch applied): what distinct-ledger counting and snapshot resolution key
-/// on, so `mydb` and `mydb:main` are one ledger. An id that does not parse
-/// keys on its bare spelling and fails later, at load.
-pub(super) fn bare_ledger_id(s: &str) -> String {
-    let bare = s.split('#').next().unwrap_or(s);
-    let bare = match explicit_pin_at(bare) {
-        Some(idx) => &bare[..idx],
-        None => bare,
-    };
-    fluree_db_core::LedgerId::parse(bare).map_or_else(|_| bare.to_string(), String::from)
-}
-
-/// Apply the envelope snapshot to a SPARQL sub-query, returning a new query
-/// string with `FROM <iri>` / `FROM NAMED <iri>` rewritten as
-/// `FROM <iri@t:N>` for each ledger present in the snapshot map.
-///
-/// Uses the SPARQL parser's IRI spans to do precise byte-level splicing; this
-/// avoids ever touching IRIs that appear inside comments or string literals.
-/// Replacements are applied right-to-left so earlier spans aren't shifted.
-///
-/// When the SPARQL has any parse error, even one the parser recovers from,
-/// the original is returned unchanged.
-pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> String {
-    use fluree_db_sparql::ast::QueryBody;
-
-    let parsed = fluree_db_sparql::parse_sparql(sparql);
-    if parsed.has_errors() {
-        return sparql.to_string();
-    }
-    let Some(ast) = parsed.ast.as_ref() else {
-        return sparql.to_string();
-    };
-    let dataset = match &ast.body {
-        QueryBody::Select(q) => q.dataset.as_ref(),
-        QueryBody::Construct(q) => q.dataset.as_ref(),
-        QueryBody::Ask(q) => q.dataset.as_ref(),
-        QueryBody::Describe(q) => q.dataset.as_ref(),
-        QueryBody::Update(_) => return sparql.to_string(),
-    };
-    let Some(ds) = dataset else {
-        return sparql.to_string();
-    };
-
-    // Collect (span, replacement) pairs. A member is read as written (a full
-    // IRI as is, a prefixed name as `prefix:local`); the replacement is a full
-    // IRI naming the same ledger.
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
-        let written = crate::dataset::iri_value_to_string(&iri.value);
-        let bare = bare_ledger_id(&written);
-        if let Some(t) = snapshot.ledgers.get(&bare) {
-            // Defensive: skip IRIs that already carry an explicit
-            // temporal pin. Validation rejects collisions when
-            // envelope asOf is set, so this only fires in the
-            // no-asOf path where an inner pin should win.
-            if string_has_explicit_pin(&written) {
-                continue;
-            }
-            // Splice `@t:N` BEFORE any `#fragment` so named-graph
-            // selectors (e.g. `<ledger#txn-meta>`) are pinned
-            // correctly: `<ledger@t:42#txn-meta>`. The dataset parser
-            // reattaches the fragment after temporal parsing.
-            let replacement = match written.split_once('#') {
-                Some((base, fragment)) => format!("<{base}@t:{t}#{fragment}>"),
-                None => format!("<{written}@t:{t}>"),
-            };
-            edits.push((iri.span.start, iri.span.end, replacement));
-        }
-    }
-
-    if edits.is_empty() {
-        return sparql.to_string();
-    }
-
-    edits.sort_by_key(|edit| edit.0);
-    // Apply right-to-left.
-    let mut out = sparql.to_string();
-    for (start, end, replacement) in edits.into_iter().rev() {
-        if start <= out.len() && end <= out.len() && start <= end {
-            out.replace_range(start..end, &replacement);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn snapshot(pairs: &[(&str, i64)]) -> EnvelopeSnapshot {
-        let mut ledgers = HashMap::new();
-        // Keys as production builds them: from the canonical distinct set.
-        for (k, v) in pairs {
-            ledgers.insert(bare_ledger_id(k), *v);
-        }
-        EnvelopeSnapshot {
-            as_of: Some("2024-01-01T00:00:00.000Z".into()),
-            ledgers,
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // JSON-LD application
-    // -------------------------------------------------------------------------
-
+    /// Each snapshot id reads back as the ledger id it came from; one that
+    /// does not is an error for the envelope, never a ledger left out of the
+    /// times (and so read at its head).
     #[test]
-    fn jsonld_string_from_becomes_object_with_t() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let mut query = json!({
-            "from": "ledgerA",
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        let from = &query["from"];
-        assert_eq!(from["@id"], "ledgerA");
-        assert_eq!(from["t"], 42);
-    }
-
-    #[test]
-    fn jsonld_object_from_gets_t_inserted() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let mut query = json!({
-            "from": { "@id": "ledgerA", "alias": "primary" },
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"]["t"], 42);
-        assert_eq!(query["from"]["alias"], "primary");
-    }
-
-    #[test]
-    fn jsonld_object_from_with_id_alias_works() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let mut query = json!({
-            "from": { "id": "ledgerA" },
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"]["t"], 42);
-    }
-
-    #[test]
-    fn jsonld_array_from_each_entry_gets_pinned() {
-        let snap = snapshot(&[("ledgerA", 42), ("ledgerB", 99)]);
-        let mut query = json!({
-            "from": ["ledgerA", { "@id": "ledgerB", "alias": "b" }],
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"][0]["@id"], "ledgerA");
-        assert_eq!(query["from"][0]["t"], 42);
-        assert_eq!(query["from"][1]["t"], 99);
-    }
-
-    #[test]
-    fn jsonld_ledger_not_in_snapshot_is_left_alone() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let mut query = json!({
-            "from": "ledgerB",
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        // ledgerB stays a bare string when not in the snapshot.
-        assert_eq!(query["from"], "ledgerB");
-    }
-
-    /// `#config` twin of `jsonld_named_graph_fragment_preserved`.
-    #[test]
-    fn jsonld_config_graph_fragment_preserved() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let mut query = json!({
-            "from": "ledgerA#config",
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"]["@id"], "ledgerA#config");
-        assert_eq!(query["from"]["t"], 42);
-    }
-
-    #[test]
-    fn jsonld_named_graph_fragment_preserved() {
-        // Fragment suffix is part of the identifier; the bare ledger id is
-        // matched against the snapshot map, but the full identifier
-        // (including fragment) is preserved in the rewritten @id.
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let mut query = json!({
-            "from": "ledgerA#txn-meta",
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"]["@id"], "ledgerA#txn-meta");
-        assert_eq!(query["from"]["t"], 42);
-    }
-
-    // -------------------------------------------------------------------------
-    // SPARQL application
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn sparql_from_clause_gets_t_suffix_appended() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "SELECT ?x FROM <ledgerA> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert!(out.contains("FROM <ledgerA@t:42>"), "got: {out}");
-    }
-
-    #[test]
-    fn sparql_from_named_clause_gets_t_suffix_appended() {
-        let snap = snapshot(&[("ledgerA", 42), ("ledgerB", 99)]);
-        let sparql = "SELECT ?x FROM <ledgerA> FROM NAMED <ledgerB> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert!(out.contains("FROM <ledgerA@t:42>"));
-        assert!(out.contains("FROM NAMED <ledgerB@t:99>"));
-    }
-
-    /// A prefixed name in `FROM` (`mq:p2`) is pinned like the bracketed IRI of
-    /// the same ledger.
-    #[test]
-    fn sparql_prefixed_from_is_pinned_as_the_ledger_it_names() {
-        let snap = snapshot(&[("mq:p1", 3), ("mq:p2", 7)]);
-        let sparql = "SELECT ?s FROM <mq:p1> FROM mq:p2 FROM NAMED mq:p2 WHERE { ?s ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
+    fn a_snapshot_id_that_is_no_ledger_id_fails_the_envelope() {
+        let mut ledgers = HashMap::from([("mq:a".to_string(), 3)]);
+        let snapshot = EnvelopeSnapshot {
+            as_of: None,
+            ledgers: ledgers.clone(),
+        };
+        let times = snapshot.ledger_times().expect("canonical ids parse");
         assert_eq!(
-            out,
-            "SELECT ?s FROM <mq:p1@t:3> FROM <mq:p2@t:7> FROM NAMED <mq:p2@t:7> WHERE { ?s ?p ?o }"
+            times.get(&fluree_db_core::LedgerId::parse("mq:a").unwrap()),
+            Some(&3)
         );
-    }
 
-    #[test]
-    fn sparql_iri_in_string_literal_is_not_rewritten() {
-        // Span-based rewrite only touches the parsed FROM <iri> — markers
-        // inside string literals or other IRI positions are untouched.
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql =
-            r#"SELECT ?x FROM <ledgerA> WHERE { ?x <http://example.org/p> "note: <ledgerA>" }"#;
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        // The literal occurrence inside the string literal stays bare.
-        assert!(out.contains(r#""note: <ledgerA>""#), "got: {out}");
-        // The FROM clause is rewritten.
-        assert!(out.contains("FROM <ledgerA@t:42>"), "got: {out}");
-    }
-
-    /// Text with a parse error is returned as written, even when the parser
-    /// recovers its `FROM` clause and that ledger is in the snapshot.
-    #[test]
-    fn sparql_with_a_recovered_parse_error_is_returned_unchanged() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "SELECT ?x FROM <ledgerA> WHERE { ?x ?p ?o . ?x }";
-        let parsed = fluree_db_sparql::parse_sparql(sparql);
-        assert!(
-            parsed.has_errors() && parsed.ast.is_some(),
-            "the fixture must parse with an error and still yield an AST"
-        );
-        assert_eq!(apply_snapshot_to_sparql(sparql, &snap), sparql);
-    }
-
-    #[test]
-    fn sparql_unparseable_returns_original_unchanged() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "not a SPARQL query at all";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert_eq!(out, sparql);
-    }
-
-    #[test]
-    fn sparql_ledger_not_in_snapshot_is_left_alone() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "SELECT ?x FROM <ledgerB> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert_eq!(out, sparql);
-    }
-
-    #[test]
-    fn sparql_existing_temporal_suffix_left_untouched() {
-        // Validation would have rejected this if envelope asOf is set, but
-        // the applier is defensive: it skips IRIs that already carry a pin
-        // rather than double-pinning.
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "SELECT ?x FROM <ledgerA@t:99> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert_eq!(out, sparql);
-    }
-
-    #[test]
-    fn sparql_fragment_iri_gets_t_spliced_before_fragment() {
-        // FROM <ledger#txn-meta> must be rewritten to
-        // FROM <ledger@t:42#txn-meta> — @t goes BEFORE the fragment
-        // because the dataset parser separates fragment from temporal
-        // suffix and reattaches the fragment after the time-spec.
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "SELECT ?x FROM <ledgerA#txn-meta> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert!(
-            out.contains("FROM <ledgerA@t:42#txn-meta>"),
-            "expected fragment preserved with t spliced before, got: {out}"
-        );
-    }
-
-    /// `#config` twin of the `#txn-meta` case above. Both reserved fragments
-    /// travel the same splice path, and the snapshot applier must not treat
-    /// either as part of the ledger id it looks up.
-    #[test]
-    fn sparql_config_fragment_iri_gets_t_spliced_before_fragment() {
-        let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = "SELECT ?x FROM <ledgerA#config> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert!(
-            out.contains("FROM <ledgerA@t:42#config>"),
-            "expected fragment preserved with t spliced before, got: {out}"
-        );
-    }
-
-    #[test]
-    fn sparql_fragment_iri_from_named_clause_gets_t_spliced_before_fragment() {
-        let snap = snapshot(&[("ledgerA", 42), ("ledgerB", 99)]);
-        let sparql =
-            "SELECT ?x FROM <ledgerA#txn-meta> FROM NAMED <ledgerB#extras> WHERE { ?x ?p ?o }";
-        let out = apply_snapshot_to_sparql(sparql, &snap);
-        assert!(out.contains("FROM <ledgerA@t:42#txn-meta>"), "got: {out}");
-        assert!(
-            out.contains("FROM NAMED <ledgerB@t:99#extras>"),
-            "got: {out}"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Inner pin preserved when envelope omits asOf (review fix High #1)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn jsonld_string_from_with_suffix_left_untouched() {
-        // Inner explicit pin (`@t:42`) wins — applier must leave the string
-        // alone. Otherwise we'd rewrite to {"@id":"ledgerA@t:42","t":99}
-        // and the object `t` would silently override the suffix.
-        let snap = snapshot(&[("ledgerA", 99)]);
-        let mut query = json!({
-            "from": "ledgerA@t:42",
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"], "ledgerA@t:42");
-    }
-
-    #[test]
-    fn jsonld_string_from_with_iso_suffix_left_untouched() {
-        let snap = snapshot(&[("ledgerA", 99)]);
-        let mut query = json!({
-            "from": "ledgerA@iso:2024-01-01T00:00:00Z",
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"], "ledgerA@iso:2024-01-01T00:00:00Z");
-    }
-
-    /// Every tag of the shared grammar is a pin, not just the three the old
-    /// hand-kept list named (`@recorded:` was silently re-pinned to `@t:`).
-    #[test]
-    fn jsonld_string_from_with_any_grammar_tag_left_untouched() {
-        let snap = snapshot(&[("ledgerA", 99)]);
-        for pinned in [
-            "ledgerA@time:2024-01-01T00:00:00Z",
-            "ledgerA@recorded:2024-01-01T00:00:00Z",
-            "ledgerA@snapshot:42",
-            "ledgerA@time:2024-01-01T00:00:00Z#txn-meta",
-        ] {
-            let mut query = json!({
-                "from": pinned,
-                "select": {"?s": ["*"]},
-                "where": []
-            });
-            apply_snapshot_to_jsonld(&mut query, &snap);
-            assert_eq!(query["from"], pinned);
-            assert_eq!(bare_ledger_id(pinned), "ledgerA:main");
-        }
-    }
-
-    #[test]
-    fn jsonld_object_from_with_explicit_t_field_left_untouched() {
-        let snap = snapshot(&[("ledgerA", 99)]);
-        let mut query = json!({
-            "from": { "@id": "ledgerA", "t": 42 },
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        // Original t survives — applier doesn't overwrite when a pin exists.
-        assert_eq!(query["from"]["t"], 42);
-    }
-
-    #[test]
-    fn jsonld_object_from_with_explicit_at_field_left_untouched() {
-        let snap = snapshot(&[("ledgerA", 99)]);
-        let mut query = json!({
-            "from": { "@id": "ledgerA", "at": "commit:abc123" },
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"]["at"], "commit:abc123");
-        // No `t` added — `at` is the active pin.
-        assert!(query["from"].as_object().unwrap().get("t").is_none());
-    }
-
-    #[test]
-    fn jsonld_object_from_with_id_suffix_left_untouched() {
-        let snap = snapshot(&[("ledgerA", 99)]);
-        let mut query = json!({
-            "from": { "@id": "ledgerA@t:42" },
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        // No `t` field added — the suffix in @id is the pin.
-        assert_eq!(query["from"]["@id"], "ledgerA@t:42");
-        assert!(query["from"].as_object().unwrap().get("t").is_none());
-    }
-
-    #[test]
-    fn jsonld_mixed_array_preserves_pinned_entries_only() {
-        // Two entries for the same ledger: one with an explicit pin, one bare.
-        // The pinned entry stays; the bare entry gets the envelope's t.
-        let snap = snapshot(&[("ledgerA", 99), ("ledgerB", 42)]);
-        let mut query = json!({
-            "from": ["ledgerA@t:1", "ledgerB"],
-            "select": {"?s": ["*"]},
-            "where": []
-        });
-        apply_snapshot_to_jsonld(&mut query, &snap);
-        assert_eq!(query["from"][0], "ledgerA@t:1");
-        assert_eq!(query["from"][1]["@id"], "ledgerB");
-        assert_eq!(query["from"][1]["t"], 42);
+        ledgers.insert("http://ex.org/g".to_string(), 4);
+        let snapshot = EnvelopeSnapshot {
+            as_of: None,
+            ledgers,
+        };
+        assert!(snapshot.ledger_times().is_err());
     }
 }

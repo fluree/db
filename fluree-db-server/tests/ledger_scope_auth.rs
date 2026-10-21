@@ -364,6 +364,71 @@ async fn urn_spelling_in_a_dataset_is_read_checked() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
+/// A token that may not read a ledger gets the same answer from the ledger's
+/// JSON-LD query, stream and explain routes whatever graph the body names:
+/// the read check comes before anything is looked up in the ledger.
+#[tokio::test]
+async fn ledger_routes_check_read_access_before_resolving_the_dataset() {
+    let (_tmp, state) = data_auth_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "closed").await;
+    let writer = write_scoped_token(&["closed"], 83);
+    insert_one(&app, "closed", "ex:a", "A", &writer).await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/fluree/update/closed:main",
+        &writer,
+        &[],
+        "application/sparql-update",
+        "INSERT DATA { GRAPH <urn:held> { <http://example.org/b> <http://example.org/name> \"B\" } }"
+            .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed a named graph: {body}");
+    let outsider = read_scoped_token(&["elsewhere"], 84);
+
+    for route in ["query", "stream/query", "explain"] {
+        let mut answers = Vec::new();
+        for from in [
+            json!("urn:held"),
+            json!("urn:absent"),
+            json!({ "@id": "closed:main", "graph": "txn-meta" }),
+            json!({ "@id": "closed:main", "graph": "http://example.org/no-such-graph" }),
+        ] {
+            let body = json!({
+                "select": ["?s"],
+                "where": { "@id": "?s" },
+                "from": from
+            });
+            answers.push(
+                send(
+                    &app,
+                    "POST",
+                    &format!("/v1/fluree/{route}/closed:main"),
+                    &outsider,
+                    &[],
+                    "application/json",
+                    body.to_string(),
+                )
+                .await,
+            );
+        }
+        assert_eq!(
+            answers[0].0,
+            StatusCode::NOT_FOUND,
+            "{route}: {:?}",
+            answers[0]
+        );
+        for answer in &answers[1..] {
+            assert_eq!(
+                &answers[0], answer,
+                "{route}: the answer must not depend on the graph named"
+            );
+        }
+    }
+}
+
 /// Unauthenticated listing is refused when data auth is required, and a token
 /// sees only the ledgers it can read.
 #[tokio::test]

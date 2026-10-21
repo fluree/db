@@ -284,6 +284,71 @@ impl FlakeValue {
         }
     }
 
+    /// Whether two different terms whose values are of this kind can share a
+    /// persisted index key, so that storage, which merges ops by key, holds
+    /// them as one fact. A big integer is keyed by its value alone, whatever
+    /// XSD subtype it was written with, and every null shares one key. For
+    /// every other kind the key is a function of the term that no two terms
+    /// share: a `dateTime` or `time` is keyed to the microsecond, which is
+    /// all it holds.
+    ///
+    /// A double is listed although no two double terms share a key: its key
+    /// is its value under its datatype, with every NaN as one and -0.0 as
+    /// 0.0, which is how this type's equality compares doubles too. Listing
+    /// it keys doubles the way storage does without depending on that.
+    ///
+    /// Exhaustive on purpose: a new kind of value has to say which it is.
+    /// The key encoding is `value_to_otype_okey` in `fluree-db-query`.
+    pub fn index_key_may_merge_terms(&self) -> bool {
+        match self {
+            FlakeValue::Null | FlakeValue::Double(_) | FlakeValue::BigInt(_) => true,
+            FlakeValue::Ref(_)
+            | FlakeValue::DateTime(_)
+            | FlakeValue::Time(_)
+            | FlakeValue::Boolean(_)
+            | FlakeValue::Long(_)
+            | FlakeValue::Decimal(_)
+            | FlakeValue::Date(_)
+            | FlakeValue::GYear(_)
+            | FlakeValue::GYearMonth(_)
+            | FlakeValue::GMonth(_)
+            | FlakeValue::GDay(_)
+            | FlakeValue::GMonthDay(_)
+            | FlakeValue::YearMonthDuration(_)
+            | FlakeValue::DayTimeDuration(_)
+            | FlakeValue::Duration(_)
+            | FlakeValue::String(_)
+            | FlakeValue::Vector(_)
+            | FlakeValue::Json(_)
+            | FlakeValue::GeoPoint(_) => false,
+        }
+    }
+
+    /// Whether the index keys this value by the value alone, whatever XSD
+    /// datatype it is written with: an integer too large for 64 bits, which
+    /// its `(graph, predicate)` arena keys by value, so every subtype it is
+    /// written under is one stored fact. Decided without an index, unlike
+    /// the other kinds of [`Self::index_key_may_merge_terms`].
+    pub fn index_keys_by_value(&self) -> bool {
+        matches!(self, FlakeValue::BigInt(v) if v.to_i64().is_none())
+    }
+
+    /// Whether this value, written with datatype `dt`, keeps less in its
+    /// persisted index key than the term holds, so the key decodes to a
+    /// different term: an integer too large for 64 bits written with an XSD
+    /// subtype (the key keeps no subtype), or a null (every null shares one
+    /// key). A query that reads such a term through its key gets the other
+    /// term. No double does, `±INF` and NaN included: its key decodes to a
+    /// value equal to the one written.
+    /// See [`Self::index_key_may_merge_terms`] for the kinds.
+    pub fn index_key_loses_detail(&self, dt: &Sid) -> bool {
+        match self {
+            FlakeValue::BigInt(v) => v.to_i64().is_none() && *dt != Sid::xsd_integer(),
+            FlakeValue::Null => true,
+            _ => false,
+        }
+    }
+
     /// Check if this is any temporal type (DateTime, Date, Time, g-types)
     pub fn is_temporal(&self) -> bool {
         matches!(
@@ -1344,6 +1409,55 @@ mod tests {
             // And it parses back to the same point.
             let (lat, lng) = crate::geo::try_extract_point(&shown).expect("wkt");
             assert_eq!(GeoPointBits::new(lat, lng), Some(point));
+        }
+    }
+
+    /// The terms whose index key keeps less than the term: a big integer
+    /// written with an XSD subtype. The same value written as `xsd:integer`
+    /// does not, and neither does a `dateTime` or `time` written past the
+    /// microsecond, which holds no more than its key from the moment it is
+    /// built.
+    #[test]
+    fn index_key_loses_detail_of_the_terms_its_key_keeps_less_of() {
+        let xsd = |name: &str| Sid::new(fluree_vocab::namespaces::XSD, name);
+        let big =
+            || FlakeValue::BigInt(Box::new("123456789012345678901234567890".parse().unwrap()));
+        let at = |v: &str| FlakeValue::DateTime(Box::new(DateTime::parse(v).unwrap()));
+        let time = |v: &str| FlakeValue::Time(Box::new(Time::parse(v).unwrap()));
+
+        assert!(big().index_key_loses_detail(&xsd("nonNegativeInteger")));
+        assert!(!big().index_key_loses_detail(&Sid::xsd_integer()));
+        assert!(!at("2020-01-01T00:00:00.123456789Z").index_key_loses_detail(&xsd("dateTime")));
+        assert!(!time("12:00:00.123456789").index_key_loses_detail(&xsd("time")));
+        assert!(!FlakeValue::Long(5).index_key_loses_detail(&xsd("nonNegativeInteger")));
+        assert!(!FlakeValue::String("x".into()).index_key_loses_detail(&xsd("string")));
+
+        // A term that loses detail is of a kind whose key can merge terms;
+        // a temporal's key is all it holds.
+        assert!(big().index_key_may_merge_terms());
+        assert!(!at("2020-01-01T00:00:00.1234567Z").index_key_may_merge_terms());
+        assert!(!time("12:00:00.1234567").index_key_may_merge_terms());
+    }
+
+    /// No double loses detail to its index key, `±INF` and NaN included:
+    /// every double's key decodes to a value equal to the one written. What
+    /// the key drops, a NaN's payload and a zero's sign, equality drops too.
+    #[test]
+    fn no_double_loses_detail_to_its_index_key() {
+        use crate::value_id::ObjKey;
+        let xsd = |name: &str| Sid::new(fluree_vocab::namespaces::XSD, name);
+        for bits in special_double_bits() {
+            let written = FlakeValue::Double(f64::from_bits(bits));
+            let decoded = FlakeValue::Double(ObjKey::encode_f64(f64::from_bits(bits)).decode_f64());
+            assert_eq!(decoded, written, "{bits:#018x}");
+            for dt in ["double", "float"] {
+                assert!(
+                    !written.index_key_loses_detail(&xsd(dt)),
+                    "{bits:#018x} {dt}"
+                );
+            }
+            // Listed all the same; see `index_key_may_merge_terms`.
+            assert!(written.index_key_may_merge_terms(), "{bits:#018x}");
         }
     }
 
