@@ -197,7 +197,7 @@ impl From<fluree_db_api::LedgerIdParseError> for ServerError {
 /// returns the id the API will resolve it to, so a scope check and the
 /// operation it guards cannot disagree about which ledger that is.
 pub(crate) fn scope_id(raw: &str) -> std::result::Result<fluree_db_api::LedgerId, ServerError> {
-    Ok(fluree_db_api::LedgerRef::parse(raw)?.id)
+    Ok(fluree_db_api::LedgerRef::parse(raw)?.into_id())
 }
 
 impl From<NameServiceError> for ServerError {
@@ -461,6 +461,18 @@ mod tests {
             assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
             assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
         }
+    }
+
+    /// A nameservice lookup that fails inside a query (a graph-source probe)
+    /// is the backend's fault: typed and answered as the nameservice failure
+    /// it is, a 500, not the generic query 400.
+    #[test]
+    fn a_failed_nameservice_lookup_in_a_query_is_a_500() {
+        let se = ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Nameservice(
+            "storage unavailable".into(),
+        )));
+        assert_eq!(se.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(se.error_type(), errors::NAMESERVICE);
     }
 
     #[test]

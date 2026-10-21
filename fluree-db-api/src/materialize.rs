@@ -3014,8 +3014,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_query::r2rml::R2rmlProvider for MockBuildProvider {
-        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,

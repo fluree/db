@@ -1,7 +1,7 @@
 //! Per-sub-query execution helpers used by the multi-query dispatcher.
 //!
 //! Each helper takes a pre-merged sub-query body (envelope `@context` /
-//! `opts` already folded in, snapshot already applied) and dispatches it
+//! `opts` already folded in) and dispatches it
 //! through the connection-scoped query path
 //! ([`Fluree::query_from`](crate::Fluree::query_from)) which both
 //! single-query and multi-query share.
@@ -42,8 +42,6 @@ pub struct SubqueryOutput {
 /// - Have already merged envelope-level `@context` and `opts` into
 ///   `query_json` (multi-query dispatcher path) or to have processed
 ///   headers / policy into `opts` (single-query HTTP handler path).
-/// - Have applied any envelope-level snapshot pin to the sub-query's
-///   `from` (multi-query dispatcher path).
 /// - Be inside whichever tracing span the caller chose to attribute this
 ///   execution to — this function does not create its own span.
 ///

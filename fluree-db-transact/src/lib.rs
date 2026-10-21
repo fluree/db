@@ -75,8 +75,8 @@ pub use error::{ReportResult, Result, ShaclViolations, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::FlakeGenerator;
 pub use ir::{
-    GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues, TemplateGraph,
-    TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
+    AddressName, GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues,
+    TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType, WriteGraphs,
 };
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,

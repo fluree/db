@@ -2,8 +2,9 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 use crate::query::helpers::{
-    charge_query_floor, extract_sparql_dataset_spec, parse_and_validate_sparql, parse_dataset_spec,
-    parse_dataset_spec_as, tracked_query_tracker,
+    charge_query_floor, connection_dataset_spec, connection_sparql_dataset_spec,
+    extract_sparql_dataset_spec, parse_and_validate_sparql, parse_dataset_spec_as,
+    tracked_query_tracker,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -127,10 +128,10 @@ impl Fluree {
         query_json: &JsonValue,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -139,7 +140,9 @@ impl Fluree {
             .prepare_single_view_for_connection(&spec, &qc_opts)
             .await?
         {
-            return self.query_with_options(&view, query_json, options).await;
+            return self
+                .query_with_options(&view, query_json, options.on_the_datasets_view())
+                .await;
         }
 
         // Multi-ledger: use DataSetDb
@@ -164,10 +167,10 @@ impl Fluree {
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
         options: QueryExecutionOptions,
     ) -> Result<(QueryResult, FormatTarget)> {
-        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -186,10 +189,19 @@ impl Fluree {
         if let Some(view) = single {
             let result = match r2rml {
                 Some((rp, rtp)) => {
-                    self.query_view_with_r2rml_options(&view, query_json, rp, rtp, options)
+                    self.query_view_with_r2rml_options(
+                        &view,
+                        query_json,
+                        rp,
+                        rtp,
+                        options.on_the_datasets_view(),
+                    )
+                    .await?
+                }
+                None => {
+                    self.query_with_options(&view, query_json, options.on_the_datasets_view())
                         .await?
                 }
-                None => self.query_with_options(&view, query_json, options).await?,
             };
             return Ok((result, FormatTarget::Single(Box::new(view))));
         }
@@ -225,10 +237,10 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -243,7 +255,7 @@ impl Fluree {
                     query_json,
                     r2rml_provider,
                     r2rml_table_provider,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -270,10 +282,10 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql, None)?;
-        let spec = extract_sparql_dataset_spec(&ast)?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }
@@ -309,9 +321,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) =
-            parse_dataset_spec_as(query_json, options.server_identity.as_ref())
-                .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -335,7 +346,7 @@ impl Fluree {
                 query_json,
                 format_config,
                 tracking_override,
-                options,
+                options.on_the_datasets_view(),
             ))
             .await;
         }
@@ -377,10 +388,10 @@ impl Fluree {
         policy: &PolicyContext,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, _qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -389,7 +400,9 @@ impl Fluree {
             .prepare_single_view_for_connection_with_policy(&spec, policy)
             .await?
         {
-            return self.query_with_options(&view, query_json, options).await;
+            return self
+                .query_with_options(&view, query_json, options.on_the_datasets_view())
+                .await;
         }
 
         // Multi-ledger: use DataSetDb and apply explicit policy to each view
@@ -407,10 +420,10 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, _qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection query",
             ));
         }
@@ -425,7 +438,7 @@ impl Fluree {
                     query_json,
                     r2rml_provider,
                     r2rml_table_provider,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -457,9 +470,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) =
-            parse_dataset_spec_as(query_json, options.server_identity.as_ref())
-                .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
+        let (spec, qc_opts) = connection_dataset_spec(query_json, &options)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -483,7 +495,7 @@ impl Fluree {
                         provider: r2rml_provider,
                         table_provider: r2rml_table_provider,
                     },
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -521,7 +533,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, _qc_opts) = parse_dataset_spec(query_json)
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -546,7 +558,7 @@ impl Fluree {
                     format_config,
                     tracking_override,
                     r2rml,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -584,7 +596,7 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, _qc_opts) = parse_dataset_spec(query_json)
+        let (spec, _qc_opts) = connection_dataset_spec(query_json, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -609,7 +621,7 @@ impl Fluree {
                     query_json,
                     format_config,
                     tracking_override,
-                    options,
+                    options.on_the_datasets_view(),
                 )
                 .await;
         }
@@ -666,7 +678,7 @@ impl Fluree {
         let (spec, qc_opts) = parse_dataset_spec_as(query_json, server_identity)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing ledger specification in connection explain",
             ));
         }
@@ -675,7 +687,7 @@ impl Fluree {
             .prepare_single_view_for_connection(&spec, &qc_opts)
             .await?
         else {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Multi-ledger datasets are not supported for explain; \
                  specify a single `from` ledger (with optional time-travel suffix).",
             ));
@@ -703,13 +715,13 @@ impl Fluree {
         let spec = extract_sparql_dataset_spec(&ast)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL explain (no FROM)",
             ));
         }
 
         let Some(view) = self.prepare_single_view_for_connection(&spec, opts).await? else {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Multi-ledger / FROM NAMED datasets are not supported for SPARQL explain; \
                  use a single `FROM <ledger:branch>` (with optional time-travel suffix).",
             ));
@@ -733,10 +745,10 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql, None)?;
-        let spec = extract_sparql_dataset_spec(&ast)?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }
@@ -753,10 +765,10 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql, None)?;
-        let spec = extract_sparql_dataset_spec(&ast)?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }
@@ -786,10 +798,10 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql, None)?;
-        let spec = extract_sparql_dataset_spec(&ast)?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }
@@ -822,10 +834,10 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql, None)?;
-        let spec = extract_sparql_dataset_spec(&ast)?;
+        let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
-            return Err(ApiError::query(
+            return Err(ApiError::invalid_query(
                 "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
             ));
         }
@@ -878,7 +890,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let ast = parse_and_validate_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
-        let spec = extract_sparql_dataset_spec(&ast)
+        let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -941,7 +953,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let ast = parse_and_validate_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
-        let spec = extract_sparql_dataset_spec(&ast)
+        let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -987,7 +999,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let ast = parse_and_validate_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
-        let spec = extract_sparql_dataset_spec(&ast)
+        let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -1035,7 +1047,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let ast = parse_and_validate_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
-        let spec = extract_sparql_dataset_spec(&ast)
+        let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -1092,7 +1104,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
         let ast = parse_and_validate_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
-        let spec = extract_sparql_dataset_spec(&ast)
+        let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
 
         if spec.is_empty() {
@@ -1131,7 +1143,7 @@ impl Fluree {
         global_opts: &crate::GovernanceOptions,
     ) -> Result<crate::view::GraphDb> {
         // Per-source policy takes precedence
-        if let Some(policy_override) = &source.policy_override {
+        if let Some(policy_override) = source.policy_override() {
             if policy_override.has_policy() {
                 let mut opts = policy_override.to_query_connection_options();
                 // The override comes from the request body; the verified

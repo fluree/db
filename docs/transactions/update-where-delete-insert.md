@@ -114,7 +114,7 @@ There are two ways to target graphs in `insert` / `delete` templates:
 
 Notes:
 - `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`), a compact IRI your `@context` expands, or a `fromNamed` alias. Relative graph names are refused. Two keywords name built-in graphs: `"default"` (the default graph) and `"config"` (the ledger's config graph).
-- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in a top-level `graph` and in `from`: the update reads and writes the default graph and never creates a named graph called by the address. A per-node `@graph` or a `["graph", …]` template resolves the address like any other graph IRI. `urn:fluree:mydb:main#config` is the config graph, not the address.
+- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in every graph position: a top-level `graph`, `from`, `fromNamed`, a per-node `@graph` and a `["graph", …]` template. The update reads and writes the default graph and never creates a named graph called by the address, and `mydb:main#<graph IRI>` names that graph. A `graph` or `@graph` spelled as the address is accepted even when the `@context` defines no `mydb` prefix, as `from` is. See [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position). `urn:fluree:mydb:main#config` is the config graph, not the address.
 - `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `where` graph pattern (`["graph", "urn:default", …]`, or a node's `"@graph": "urn:default"`). In a template, a node's `@graph` or a `["graph", …]` naming `urn:default` is refused with a `400`, since the default graph is not a named graph. A `fromNamed` alias spelled `urn:default` that names another graph is refused with a `400` too: the name already means the default graph (listing `urn:default` itself is fine).
 - A node's graph covers the nodes nested in it: every template a node and its nested nodes produce goes to the node's `@graph`, or the enclosing scope's graph when it has none. A nested node's own `@graph` wins for its subtree, so `"@graph": "default"` on a nested node sends that subtree to the default graph.
 - A graph name can be a WHERE variable, as with SPARQL `GRAPH ?g`: `"@graph": "?g"` (or `["graph", "?g", ...]`) writes into the graph `?g` is bound to for each solution. Variables are accepted only in update templates.
@@ -137,6 +137,15 @@ JSON-LD update reuses the **same dataset keys as JSON-LD query** to control wher
 
 - **`from`**: scopes the default graph used for `where` evaluation (equivalent to SPARQL UPDATE `USING <iri>`)
 - **`fromNamed`**: restricts which named graphs are visible to `where` `["graph", ...]` patterns (equivalent to SPARQL UPDATE `USING NAMED <iri>`)
+
+Their values resolve in the ledger being updated, as SPARQL `USING` does: the
+ledger's own address (`"mydb:main"`, `"urn:fluree:mydb:main"`) names its default
+graph, `"mydb:main#config"` the config graph, and a registered graph IRI (a
+prefix the `@context` defines expands) that graph. A graph the ledger does not
+have contributes nothing, so the `where` binds nothing, including an IRI that
+also reads as another ledger's address (`"urn:g1"`, `"other:main"`). An address
+that can only name another ledger (`"other"`), or an address with a time pin,
+is refused with a 400.
 
 This is why JSON-LD update uses `from` rather than introducing new keywords: it matches the existing JSON-LD query language vocabulary and keeps dataset configuration consistent across read-only queries and updates.
 
