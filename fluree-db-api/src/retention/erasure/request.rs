@@ -11,6 +11,8 @@ use fluree_vocab::{db, namespaces::FLUREE_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use fluree_db_nameservice::NsRecord;
+
 use super::{CommitErasure, ErasureJob, ErasureStage, SignatureMode};
 use crate::retention::registry;
 use crate::retention::removal::{
@@ -123,36 +125,41 @@ impl Fluree {
             occurrences: request.occurrences.clone(),
             matching: request.matching.clone(),
         };
-        // (commit, slot) -> (t, branches)
-        let mut found: BTreeMap<(String, u32), (i64, Vec<String>)> = BTreeMap::new();
+        let mut found = Found::new();
         let mut removals = Vec::new();
-        for (i, branch) in branches.iter().enumerate() {
-            let requested = i == 0;
-            let widening = Widening {
-                pair_spans: true,
-                skip_foreign: !requested,
+        self.remove_on(
+            writer,
+            &branches,
+            &removal_request,
+            true,
+            &mut found,
+            &mut removals,
+        )
+        .await?;
+        // Other ledgers holding the same commits, such as copies restored
+        // from an archive, read the replacements too: the occurrences found
+        // are removed there as well, with what ends their spans there.
+        let commits: Vec<&str> = found.keys().map(|(commit, _)| commit.as_str()).collect();
+        let copies: Vec<String> = self
+            .copies_holding(&ledger_id, &commits)
+            .await?
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        if !copies.is_empty() {
+            let named = RemovalRequest {
+                occurrences: found
+                    .keys()
+                    .map(|(commit, slot)| OccurrenceRef {
+                        commit: commit.clone(),
+                        slot: *slot,
+                    })
+                    .collect(),
+                matching: Vec::new(),
             };
-            let removed = match self
-                .remove_widened(writer, branch, &removal_request, widening)
-                .await
-            {
-                Ok(removed) => removed,
-                // Nothing of the request on this other branch.
-                Err(e) if !requested && (e.is_not_found() || e.status_code() == 404) => continue,
-                Err(e) => return Err(e),
-            };
-            for (occ, t) in removed.receipt.manifest.iter().zip(&removed.manifest_t) {
-                let entry = found
-                    .entry((occ.commit.clone(), occ.slot))
-                    .or_insert((*t, Vec::new()));
-                if !entry.1.contains(branch) {
-                    entry.1.push(branch.clone());
-                }
-            }
-            removals.push(BranchRemoval {
-                ledger_id: branch.clone(),
-                removal: removed.receipt,
-            });
+            self.remove_on(writer, &copies, &named, false, &mut found, &mut removals)
+                .await?;
+            branches.extend(copies);
         }
 
         let manifest: Vec<OccurrenceRef> = found
@@ -217,6 +224,84 @@ impl Fluree {
         Ok(receipt_of(&job, manifest, removals))
     }
 
+    /// Remove `request` on each of `branches`, the first of them the
+    /// requested one when `requested`, recording what each removed.
+    async fn remove_on(
+        &self,
+        writer: &dyn RetentionWriter,
+        branches: &[String],
+        request: &RemovalRequest,
+        requested: bool,
+        found: &mut Found,
+        removals: &mut Vec<BranchRemoval>,
+    ) -> Result<()> {
+        for (i, branch) in branches.iter().enumerate() {
+            let requested = requested && i == 0;
+            let widening = Widening {
+                pair_spans: true,
+                skip_foreign: !requested,
+            };
+            let removed = match self.remove_widened(writer, branch, request, widening).await {
+                Ok(removed) => removed,
+                // Nothing of the request on this other branch.
+                Err(e) if !requested && (e.is_not_found() || e.status_code() == 404) => continue,
+                Err(e) => return Err(e),
+            };
+            for (occ, t) in removed.receipt.manifest.iter().zip(&removed.manifest_t) {
+                let entry = found
+                    .entry((occ.commit.clone(), occ.slot))
+                    .or_insert((*t, Vec::new()));
+                if !entry.1.contains(branch) {
+                    entry.1.push(branch.clone());
+                }
+            }
+            removals.push(BranchRemoval {
+                ledger_id: branch.clone(),
+                removal: removed.receipt,
+            });
+        }
+        Ok(())
+    }
+
+    /// The branches of ledgers other than `ledger_id`'s, one of whose
+    /// branches holds the original of one of `commits` in its own folder.
+    pub(crate) async fn copies_holding(
+        &self,
+        ledger_id: &LedgerId,
+        commits: &[&str],
+    ) -> Result<Vec<NsRecord>> {
+        let runtime = self.erasure_runtime()?;
+        let mut cids: Vec<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
+        cids.sort();
+        cids.dedup();
+        let mut ledgers: BTreeMap<String, Vec<NsRecord>> = BTreeMap::new();
+        for record in self.nameservice().all_records().await? {
+            if !record.retracted && record.ledger_id.name() != ledger_id.name() {
+                ledgers
+                    .entry(record.ledger_id.name().to_string())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        let mut copies = Vec::new();
+        for records in ledgers.into_values() {
+            'ledger: for record in &records {
+                for cid in &cids {
+                    if runtime
+                        .index
+                        .holds_original(&record.storage_namespace(), cid)
+                        .await?
+                    {
+                        copies.extend(records.iter().cloned());
+                        break 'ledger;
+                    }
+                }
+            }
+        }
+        copies.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
+        Ok(copies)
+    }
+
     pub(crate) fn erasure_runtime(&self) -> Result<&std::sync::Arc<super::ErasureRuntime>> {
         self.retention
             .erasure
@@ -229,7 +314,7 @@ impl Fluree {
     async fn commits_to_erase(
         &self,
         ledger_id: &LedgerId,
-        found: &BTreeMap<(String, u32), (i64, Vec<String>)>,
+        found: &Found,
         branches: &[String],
     ) -> Result<Vec<CommitErasure>> {
         let mut by_commit: BTreeMap<&str, CommitErasure> = BTreeMap::new();
@@ -364,6 +449,9 @@ fn unsupported_commit(commit: &str, why: &str) -> ApiError {
 /// (the first, for an unsigned commit), checked by running the transform
 /// as the prover will, verifying signatures whichever mode proves them.
 /// Its error is why the commit cannot be erased.
+/// (commit, slot) -> (t, the branches holding it)
+type Found = BTreeMap<(String, u32), (i64, Vec<String>)>;
+
 fn signing_ledger(
     bytes: &[u8],
     slots: &[u32],

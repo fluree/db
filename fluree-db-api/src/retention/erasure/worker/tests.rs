@@ -75,10 +75,10 @@ async fn commit_at(fluree: &Fluree, ledger_id: &str, t: i64) -> ContentId {
         .1
 }
 
-/// Publication and branch creation exclude each other: neither proceeds
-/// while the other holds admission.
+/// Publication, branch creation and restores exclude each other: none
+/// proceeds while another holds admission.
 #[tokio::test]
-async fn publication_and_branch_creation_wait_for_admission() {
+async fn publication_branch_creation_and_restores_wait_for_admission() {
     let dir = tempfile::tempdir().unwrap();
     let fluree = Arc::new(erasing(&dir));
     fluree.create_ledger("t/admission").await.unwrap();
@@ -96,6 +96,9 @@ async fn publication_and_branch_creation_wait_for_admission() {
         .unwrap();
     reindex(&fluree, id).await;
 
+    // With its index, so the copy does not hold publication back.
+    let mut archive = Vec::new();
+    fluree.archive_ledger(id, true, &mut archive).await.unwrap();
     let runtime = fluree.erasure_runtime().unwrap().clone();
     let held = runtime.admission.lock().await;
     let pass = {
@@ -111,6 +114,15 @@ async fn publication_and_branch_creation_wait_for_admission() {
                 .map(|_| ())
         })
     };
+    let restore = {
+        let fluree = fluree.clone();
+        tokio::spawn(async move {
+            fluree
+                .restore_ledger("t/admission-copy", &mut archive.as_slice())
+                .await
+                .map(|_| ())
+        })
+    };
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         runtime.index.erased(&asserted).await.unwrap().is_none(),
@@ -120,9 +132,14 @@ async fn publication_and_branch_creation_wait_for_admission() {
         !branch.is_finished(),
         "a branch was made while admission was held"
     );
+    assert!(
+        !restore.is_finished(),
+        "a copy was restored while admission was held"
+    );
     drop(held);
     assert_eq!(pass.await.unwrap().unwrap().published, 1);
     branch.await.unwrap().unwrap();
+    restore.await.unwrap().unwrap();
 }
 
 /// A later request's step proved on the original, before the earlier

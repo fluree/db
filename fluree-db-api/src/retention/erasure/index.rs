@@ -250,6 +250,21 @@ impl ErasureIndex {
         Ok(self.entries.read().contains_key(digest))
     }
 
+    /// Whether `namespace` holds `original`'s own file, whatever its erasure.
+    pub(crate) async fn holds_original(
+        &self,
+        namespace: &StorageNamespace,
+        original: &ContentId,
+    ) -> Result<bool> {
+        let address = content_address(
+            self.storage.storage_method(),
+            ContentKind::Commit,
+            namespace,
+            &original.address_digest(),
+        );
+        Ok(self.storage.exists(&address).await?)
+    }
+
     /// `original`'s published erasure, if it has one.
     pub(crate) async fn erased(&self, original: &ContentId) -> Result<Option<ErasedCommit>> {
         self.load().await?;

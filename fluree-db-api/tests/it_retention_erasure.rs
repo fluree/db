@@ -1131,3 +1131,66 @@ async fn the_real_prover_erases_under_a_pinned_image() {
     assert!(is_replacement(&raw) && !contains(&raw, "p0@secret.example"));
     assert!(contains(&raw, "p1@secret.example"));
 }
+
+/// A copy of the ledger in the same storage, restored from an archive,
+/// holds the erased commits too and reads their replacements: the request
+/// removes the value there, and publication waits for the copy's index, or
+/// the copy would go on serving the value it indexed.
+#[tokio::test]
+async fn an_erasure_reaches_a_copy_restored_from_an_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-copied").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&fluree, &copy).await;
+
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(
+        report.published, 0,
+        "the copy is not indexed yet: {report:?}"
+    );
+    reindex(&fluree, &copy).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    let past = restarted
+        .query_connection(&json!({
+            "@context": ctx(),
+            "from": format!("{copy}@t:{t1}"),
+            "select": "?o",
+            "where": {"@id": "ex:alice", "ex:email": "?o"}
+        }))
+        .await;
+    assert!(
+        matches!(past, Err(ApiError::HistoryUnavailable(_))),
+        "{past:?}"
+    );
+}

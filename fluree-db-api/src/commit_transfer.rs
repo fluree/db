@@ -2160,6 +2160,13 @@ impl Fluree {
         // in the wrong namespace.
         let new_ledger_id = LedgerId::parse(new_ledger_id)?;
 
+        // An erasure accepted or published meanwhile would miss the copy.
+        #[cfg(feature = "native")]
+        let _admission = match self.retention.erasure.get() {
+            Some(erasure) => Some(erasure.admission.lock().await),
+            None => None,
+        };
+
         // A restore brings in a whole ledger, so it claims the whole name,
         // and nobody sees the ledger until its heads are in place.
         let mut pending = self.claim_name(&new_ledger_id).await?;

@@ -548,16 +548,17 @@ impl Fluree {
     }
 
     /// Branches, as they are now, whose history holds one of `job`'s
-    /// commits above their index, with the `t` each must index to. A branch
-    /// made after the request holds them too. `None` when `branch`'s ledger
-    /// is dropped, which hides its branches.
+    /// commits above their index, with the `t` each must index to: the
+    /// ledger's branches and its copies'. A branch made after the request
+    /// holds them too. `None` when `branch`'s ledger is dropped, which hides
+    /// its branches.
     async fn lagging_branches(
         &self,
         branch: &str,
         job: &ErasureJob,
     ) -> Result<Option<Vec<(String, i64)>>> {
         let name = LedgerId::parse(branch)?;
-        let records: Vec<_> = self
+        let mut records: Vec<_> = self
             .nameservice()
             .list_branches(name.name())
             .await?
@@ -567,6 +568,8 @@ impl Fluree {
         if !records.iter().any(|r| r.ledger_id == name) {
             return Ok(None);
         }
+        let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
+        records.extend(self.copies_holding(&name, &commits).await?);
         let mut lagging = Vec::new();
         for record in records {
             let above: Vec<&CommitErasure> = job

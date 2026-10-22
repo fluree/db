@@ -1014,6 +1014,12 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Dropped ledger not found: {instance}")))?
             .value;
+        // An erasure accepted or published meanwhile would miss the ledger.
+        #[cfg(feature = "native")]
+        let _admission = match self.retention.erasure.get() {
+            Some(erasure) => Some(erasure.admission.lock().await),
+            None => None,
+        };
         let records = lifecycle::restore_dropped_with(store, &instance, |entry, records| {
             self.prepare_restore(entry, records)
         })
