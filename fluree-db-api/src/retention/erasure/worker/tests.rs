@@ -305,3 +305,71 @@ async fn a_publication_whose_job_update_was_lost_completes() {
     assert_eq!(job.stage, ErasureStage::Published);
     assert!(is_replacement(&read.get(&asserted).await.unwrap()));
 }
+
+/// Panics on its first step, then proves as `NativeProver` does.
+#[derive(Debug, Default)]
+struct PanicsOnce {
+    panicked: std::sync::atomic::AtomicBool,
+    inner: NativeProver,
+}
+
+#[async_trait::async_trait]
+impl fluree_db_erasure::Prover for PanicsOnce {
+    async fn prove(
+        &self,
+        request: &fluree_db_erasure::ProveRequest,
+    ) -> std::result::Result<fluree_db_erasure::ProveResponse, fluree_db_erasure::ProverError> {
+        if !self
+            .panicked
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("the prover panicked");
+        }
+        self.inner.prove(request).await
+    }
+}
+
+/// A background step that panics is retried like a failed one; it does not
+/// leave background proving stopped until a restart.
+#[tokio::test]
+async fn a_panicking_background_step_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(PanicsOnce::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build()
+            .unwrap(),
+    );
+    fluree.create_ledger("t/panic").await.unwrap();
+    let id = "t/panic:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+
+    let weak = Arc::downgrade(&fluree);
+    let ledgers = [id.to_string()];
+    let mut proved = 0;
+    for _ in 0..200 {
+        fluree.erasure_sweep(&weak, &ledgers).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let job = fluree.job(id, &receipt.request_id).await.unwrap();
+        proved = job.commits.iter().filter(|c| c.proved.is_some()).count();
+        if proved == job.commits.len() {
+            break;
+        }
+    }
+    let job = fluree.job(id, &receipt.request_id).await.unwrap();
+    assert_eq!(proved, job.commits.len(), "{job:?}");
+}

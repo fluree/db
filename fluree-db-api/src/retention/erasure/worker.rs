@@ -3,12 +3,14 @@
 //! proved and indexed.
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Weak;
 use std::time::Instant;
 
 use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, LedgerId};
 use fluree_db_erasure::{ProveRequest, ProverError};
+use futures::FutureExt;
 
 use super::index::{Artifact, ErasedCommit, ErasureStep, REFRESH};
 use super::{CommitErasure, ErasureJob, ErasureStage, ProvedStep};
@@ -18,6 +20,15 @@ use crate::{ApiError, Fluree, IndexingMode, Result};
 
 /// The longest wait before a failed step is tried again (ms).
 const MAX_RETRY_MS: i64 = 3_600_000;
+
+/// Clears the in-flight flag however the step ends.
+struct InFlight<'a>(&'a AtomicBool);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// A pending job and the branch whose registration holds it.
 struct Held {
@@ -198,12 +209,13 @@ impl Fluree {
             let Some(fluree) = fluree.upgrade() else {
                 return;
             };
+            let Some(runtime) = fluree.retention.erasure.get() else {
+                return;
+            };
+            let _clear = InFlight(&runtime.in_flight);
             fluree
                 .step_and_record(&branch, &request_id, &commit, retry_ms)
                 .await;
-            if let Some(runtime) = fluree.retention.erasure.get() {
-                runtime.in_flight.store(false, Ordering::Release);
-            }
             fluree.retention.nudge.notify_one();
         });
     }
@@ -281,7 +293,10 @@ impl Fluree {
         commit: &str,
         retry_ms: i64,
     ) -> Stepped {
-        let outcome = self.prove_step(branch, request_id, commit).await;
+        let outcome = AssertUnwindSafe(self.prove_step(branch, request_id, commit))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(StepError::Retry(ApiError::internal("the step panicked"))));
         let stepped = match &outcome {
             Ok(Some(_)) => Stepped::Proved,
             Ok(None) => Stepped::Nothing,
