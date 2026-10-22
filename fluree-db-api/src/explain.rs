@@ -792,8 +792,7 @@ pub(crate) fn explain_sparql_for_view(
 ) -> Result<JsonValue> {
     let (vars, mut parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params)?;
     if parsed.rdf_list_view {
-        parsed.patterns =
-            fluree_db_query::list_view::apply(parsed.patterns, snapshot, overlay, None)?;
+        fluree_db_query::list_view::apply(&mut parsed, snapshot, overlay, None)?;
     }
 
     explain_from_parsed(

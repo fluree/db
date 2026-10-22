@@ -1378,6 +1378,7 @@ WHERE  { ex:s ex:items ?l }
   WHERE  { ex:s ex:items ?l . ?l rdf:rest* ?c . ?c ?p ?o }
   ```
 - After `ADD` or `COPY`, a list is in both graphs as the same list, with the same cells.
+- Under a policy, a change to a list's cells is judged as a change to its owner's property, however the list is stored.
 - A list whose cells something else names, or that carries other triples, is stored as its triples; it reads the same. So is a second list on one subject and property, and a list `ADD` or `COPY` leaves in two graphs.
 
 ### Typed Literals

@@ -33,6 +33,20 @@ async fn rows(fluree: &fluree_db_api::Fluree, ledger: &LedgerState, body: &str) 
     support::normalize_rows(&result)
 }
 
+/// [`rows`] in the order the query gives them.
+async fn ordered_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    body: &str,
+) -> Vec<JsonValue> {
+    let result = support::query_sparql(fluree, ledger, &format!("{PREFIXES}{body}"))
+        .await
+        .unwrap_or_else(|e| panic!("query: {e}\n{body}"))
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    result.as_array().cloned().unwrap_or_default()
+}
+
 fn is_blank(row: &JsonValue) -> bool {
     row[0].as_str().is_some_and(|s| s.starts_with("_:"))
 }
@@ -633,4 +647,216 @@ async fn a_limit_stops_a_list_view_scan() {
         fuel.push(tracked.fuel.expect("fuel"));
     }
     assert!(fuel[0] < fuel[1] / 3.0, "LIMIT 1 vs all: {fuel:?}");
+}
+
+/// The `EXISTS` of a grouped projection, a HAVING and an ORDER BY read the
+/// same graph as the WHERE: `ex:s ex:items 1` is no triple of the list.
+#[tokio::test]
+async fn solution_modifiers_read_lists_as_rdf() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "modifiers", "ex:s ex:items (1 2) ; ex:name 1 .").await;
+    let grouped = rows(
+        &fluree,
+        &ledger,
+        "SELECT (EXISTS { ex:s ex:items 1 } AS ?ok) WHERE { ex:s ex:name ?v } GROUP BY ?v",
+    )
+    .await;
+    assert_eq!(grouped, [json!([false])]);
+    let having = rows(
+        &fluree,
+        &ledger,
+        "SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:name ?v } HAVING (EXISTS { ex:s ex:items 1 })",
+    )
+    .await;
+    assert!(having.is_empty(), "{having:?}");
+
+    let ledger = ledger_with(
+        &fluree,
+        "ordered",
+        "ex:a ex:items (1 2) . ex:z ex:items 1 .",
+    )
+    .await;
+    let ordered = ordered_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { VALUES ?s { ex:a ex:z } } ORDER BY DESC(EXISTS { ?s ex:items 1 }) ?s",
+    )
+    .await;
+    assert_eq!(
+        ordered,
+        [json!(["ex:z"]), json!(["ex:a"])],
+        "only ex:z holds 1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Policy judges a list's changes as its owner's.
+// ---------------------------------------------------------------------------
+
+async fn update_as(
+    fluree: &fluree_db_api::Fluree,
+    ledger: LedgerState,
+    body: &str,
+    policy: fluree_db_policy::PolicyContext,
+) -> Result<fluree_db_api::TransactResult, fluree_db_api::ApiError> {
+    let text = format!("{PREFIXES}{body}");
+    let parsed = fluree_db_sparql::parse_sparql(&text);
+    assert!(!parsed.has_errors(), "{text}: {:?}", parsed.diagnostics);
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &parsed.ast.expect("ast"),
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower");
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .policy(policy)
+        .execute()
+        .await
+}
+
+fn assert_refused(r: &Result<fluree_db_api::TransactResult, fluree_db_api::ApiError>, what: &str) {
+    match r {
+        Err(e) => assert!(
+            e.to_string()
+                .contains("Policy enforcement prevents modification"),
+            "{what}: refused for another reason: {e}"
+        ),
+        Ok(_) => panic!("{what}: permitted"),
+    }
+}
+
+/// Everything allowed but what `rule` denies or conditions.
+async fn allowing_all_but(
+    ledger: &LedgerState,
+    rule: JsonValue,
+) -> fluree_db_policy::PolicyContext {
+    let opts = fluree_db_api::GovernanceOptions {
+        policy: Some(json!([rule])),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    fluree_db_api::policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+        &[0],
+    )
+    .await
+    .expect("policy")
+}
+
+/// A change to a list's cells is a change to its owner's property, whether
+/// the list is stored compactly or as triples, and however the change is
+/// spelled.
+#[tokio::test]
+async fn a_list_change_is_judged_as_its_owners() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(&fluree, "owner-deny", "ex:s ex:items (1 2) .").await;
+    let policy = allowing_all_but(
+        &ledger,
+        json!({
+            "@id": "http://example.org/denyItems",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/items"}],
+            "f:action": "f:modify",
+            "f:allow": false
+        }),
+    )
+    .await;
+    for edit in [
+        "DELETE { ?h rdf:first 1 } INSERT { ?h rdf:first 99 } WHERE { ex:s ex:items ?h }",
+        "INSERT { ?h rdf:first 99 } WHERE { ex:s ex:items ?h }",
+        "INSERT { ?h ex:note \"x\" } WHERE { ex:s ex:items ?h }",
+    ] {
+        let r = update_as(&fluree, ledger.clone(), edit, policy.clone()).await;
+        assert_refused(&r, edit);
+    }
+    // Naming a cell from elsewhere changes no triple of the list, and stores
+    // it as triples; its cells are still the owner's.
+    let shared = update_as(
+        &fluree,
+        ledger,
+        "INSERT { ex:t ex:tail ?h } WHERE { ex:s ex:items ?h }",
+        policy.clone(),
+    )
+    .await
+    .expect("ex:t may be written");
+    let ledger = shared.ledger;
+    assert_eq!(
+        values(&fluree, &ledger, "ex:s").await.len(),
+        1,
+        "stored as triples"
+    );
+    for edit in [
+        "DELETE { ?h rdf:first 1 } INSERT { ?h rdf:first 99 } WHERE { ex:s ex:items ?h }",
+        "DELETE { ?h rdf:first 1 } WHERE { ex:s ex:items ?h }",
+    ] {
+        let r = update_as(&fluree, ledger.clone(), edit, policy.clone()).await;
+        assert_refused(&r, &format!("on the stored cells: {edit}"));
+    }
+    assert_eq!(lists(&ledger, "s").await, [vec![1, 2]]);
+}
+
+/// A post-state condition reads everything the write stores, a list stored
+/// again as triples included.
+#[tokio::test]
+async fn a_post_state_condition_reads_a_list_stored_again() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with(
+        &fluree,
+        "post-state",
+        "ex:s ex:items (1 2) . ex:t ex:name 1 .",
+    )
+    .await;
+    let policy = allowing_all_but(
+        &ledger,
+        json!({
+            "@id": "http://example.org/noTailToOne",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/tail"}],
+            "f:action": "f:modify",
+            "f:queryState": {"@id": "f:postState"},
+            "f:query": {
+                "@type": "f:sparql",
+                "@value": "ASK { FILTER NOT EXISTS { $value <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 1 } }"
+            }
+        }),
+    )
+    .await;
+    let stated = update_as(
+        &fluree,
+        ledger.clone(),
+        "INSERT DATA { ex:t ex:tail _:c . _:c rdf:first 1 ; rdf:rest rdf:nil ; ex:tag 1 }",
+        policy.clone(),
+    )
+    .await;
+    assert_refused(&stated, "a tail to a cell holding 1");
+    let restated = update_as(
+        &fluree,
+        ledger.clone(),
+        "INSERT { ex:t ex:tail ?h } WHERE { ex:s ex:items ?h }",
+        policy.clone(),
+    )
+    .await;
+    assert_refused(
+        &restated,
+        "a tail to the head, which holds 1 once stored again",
+    );
+    let allowed = update_as(
+        &fluree,
+        ledger,
+        "INSERT DATA { ex:t ex:tail _:c . _:c rdf:first 2 ; rdf:rest rdf:nil ; ex:tag 1 }",
+        policy,
+    )
+    .await;
+    assert!(
+        allowed.is_ok(),
+        "a tail to a cell holding 2: {:?}",
+        allowed.err()
+    );
 }

@@ -205,18 +205,77 @@ pub fn rewrite_patterns(
         .collect()
 }
 
-/// `patterns` as a query of `snapshot` with `overlay` runs them: in SPARQL's
-/// view of lists, unless the ledger provably holds no list members.
+/// `query` as it runs over `snapshot` with `overlay`: in SPARQL's view of
+/// lists, unless the ledger provably holds no list members.
 pub fn apply(
-    patterns: Vec<Pattern>,
+    query: &mut crate::ir::Query,
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     store: Option<&Arc<BinaryIndexStore>>,
-) -> Result<Vec<Pattern>> {
-    Ok(match view_for(snapshot, overlay, store)? {
-        Some(view) => rewrite_patterns(patterns, &view, &|iri| snapshot.encode_iri(iri)),
-        None => patterns,
-    })
+) -> Result<()> {
+    if let Some(view) = view_for(snapshot, overlay, store)? {
+        rewrite_query(query, &view, &|iri| snapshot.encode_iri(iri));
+    }
+    Ok(())
+}
+
+/// [`rewrite_patterns`] for every pattern of `query`: its WHERE and the
+/// `EXISTS` its grouping and ordering expressions hold.
+pub fn rewrite_query(
+    query: &mut crate::ir::Query,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    query.patterns = rewrite_patterns(std::mem::take(&mut query.patterns), view, encode);
+    rewrite_modifiers_of(query, view, encode);
+}
+
+/// [`rewrite_query`] for the `EXISTS` of `query`'s grouping and ordering
+/// expressions alone.
+pub fn rewrite_modifiers_of(
+    query: &mut crate::ir::Query,
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    rewrite_modifiers(&mut query.grouping, &mut query.order_binds, view, encode);
+}
+
+fn rewrite_modifiers(
+    grouping: &mut Option<crate::ir::Grouping>,
+    order_binds: &mut [(VarId, crate::ir::Expression)],
+    view: &Arc<ListView>,
+    encode: &dyn Fn(&str) -> Option<Sid>,
+) {
+    if let Some(grouping) = grouping {
+        grouping.for_each_expression_mut(&mut |expr| rewrite_expression(expr, view, encode));
+    }
+    for (_, expr) in order_binds {
+        rewrite_expression(expr, view, encode);
+    }
+}
+
+/// Whether `query` holds a [`ListViewPattern`] anywhere: in its WHERE, or
+/// in an `EXISTS` of its grouping or ordering.
+pub fn query_has_list_view(query: &crate::ir::Query) -> bool {
+    has_list_view(&query.patterns) || modifiers_have_list_view(&query.grouping, &query.order_binds)
+}
+
+fn modifiers_have_list_view(
+    grouping: &Option<crate::ir::Grouping>,
+    order_binds: &[(VarId, crate::ir::Expression)],
+) -> bool {
+    let mut exprs: Vec<&crate::ir::Expression> = order_binds.iter().map(|(_, e)| e).collect();
+    if let Some(grouping) = grouping {
+        exprs.extend(grouping.having());
+        exprs.extend(grouping.binds().map(|(_, e)| e));
+    }
+    exprs.into_iter().any(expression_has_list_view)
+}
+
+fn expression_has_list_view(expr: &crate::ir::Expression) -> bool {
+    let mut found = false;
+    expr.for_each_embedded_patterns(&mut |patterns| found |= has_list_view(patterns));
+    found
 }
 
 /// [`ListView::for_db`], reading the snapshot's own index store when `store`
@@ -278,6 +337,11 @@ fn rewrite_pattern(
             rewrite_expression(&mut list, view, encode);
             Pattern::Unwind { var, list }
         }
+        Pattern::Subquery(mut sq) => {
+            sq.patterns = rewrite_patterns(std::mem::take(&mut sq.patterns), view, encode);
+            rewrite_modifiers(&mut sq.grouping, &mut sq.order_binds, view, encode);
+            Pattern::Subquery(sq)
+        }
         // A remote endpoint answers its own patterns.
         Pattern::Service(_) => pattern,
         other => other.map_subpatterns(&mut |xs| rewrite_patterns(xs, view, encode)),
@@ -311,9 +375,7 @@ pub fn has_list_view(patterns: &[Pattern]) -> bool {
     patterns.iter().any(|p| match p {
         Pattern::ListView(_) => true,
         Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
-            let mut found = false;
-            expr.for_each_embedded_patterns(&mut |patterns| found |= has_list_view(patterns));
-            found
+            expression_has_list_view(expr)
         }
         Pattern::Optional(xs)
         | Pattern::Minus(xs)
@@ -322,7 +384,9 @@ pub fn has_list_view(patterns: &[Pattern]) -> bool {
         | Pattern::Graph { patterns: xs, .. }
         | Pattern::DefaultGraphSource { patterns: xs } => has_list_view(xs),
         Pattern::Union(branches) => branches.iter().any(|b| has_list_view(b)),
-        Pattern::Subquery(sq) => has_list_view(&sq.patterns),
+        Pattern::Subquery(sq) => {
+            has_list_view(&sq.patterns) || modifiers_have_list_view(&sq.grouping, &sq.order_binds)
+        }
         Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
             has_list_view(body)
         }

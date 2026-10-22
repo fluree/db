@@ -2449,7 +2449,7 @@ fn build_operator_tree_inner(
     // A pattern answered in SPARQL's view of RDF lists counts list triples
     // that no stored row is (`crate::list_view`); every fast path reads the
     // stored rows, members included, so none applies.
-    let list_view = crate::list_view::has_list_view(&query.patterns);
+    let list_view = crate::list_view::query_has_list_view(query);
     let enable_fused_fast_paths = enable_fused_fast_paths && !list_view;
     // A trailing VALUES clause (`query.post_values`) joins after the WHERE
     // tree, below grouping. Every fast path reads `query.patterns` alone, so

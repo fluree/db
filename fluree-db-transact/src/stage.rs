@@ -1161,26 +1161,21 @@ pub async fn stage_with_graph_delta(
                 let hidden =
                     hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
                         .await?;
-                let judged: std::borrow::Cow<'_, [Flake]> =
-                    if stream_stats.unmatched_intents.is_empty()
-                        && hidden.is_empty()
-                        && unjudged.is_empty()
-                    {
+                let all: std::borrow::Cow<'_, [Flake]> =
+                    if stream_stats.unmatched_intents.is_empty() && hidden.is_empty() {
                         std::borrow::Cow::Borrowed(&flakes)
                     } else {
-                        let mut all: Vec<Flake> = flakes
-                            .iter()
-                            .filter(|f| !unjudged.contains(&(f.g.clone(), f.op, (*f).clone())))
-                            .cloned()
-                            .collect();
+                        let mut all = flakes.clone();
                         all.extend(stream_stats.unmatched_intents.iter().cloned());
                         all.extend(hidden);
                         std::borrow::Cow::Owned(all)
                     };
+                let judged = without_unjudged(&all, &unjudged);
                 let policy_span = tracing::debug_span!("policy_enforce");
                 async {
                     enforce_modify_policies(
                         &judged,
+                        &all,
                         policy,
                         &ledger,
                         options.tracker,
@@ -2105,20 +2100,23 @@ async fn stage_graph_mgmt(
                 let hidden =
                     hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
                         .await?;
-                let judged: std::borrow::Cow<'_, [Flake]> =
-                    if hidden.is_empty() && unjudged.is_empty() {
-                        std::borrow::Cow::Borrowed(&flakes)
-                    } else {
-                        let mut all: Vec<Flake> = flakes
-                            .iter()
-                            .filter(|f| !unjudged.contains(&(f.g.clone(), f.op, (*f).clone())))
-                            .cloned()
-                            .collect();
-                        all.extend(hidden);
-                        std::borrow::Cow::Owned(all)
-                    };
-                enforce_modify_policies(&judged, policy, &ledger, options.tracker, &reverse_graph)
-                    .await?;
+                let all: std::borrow::Cow<'_, [Flake]> = if hidden.is_empty() {
+                    std::borrow::Cow::Borrowed(&flakes)
+                } else {
+                    let mut all = flakes.clone();
+                    all.extend(hidden);
+                    std::borrow::Cow::Owned(all)
+                };
+                let judged = without_unjudged(&all, &unjudged);
+                enforce_modify_policies(
+                    &judged,
+                    &all,
+                    policy,
+                    &ledger,
+                    options.tracker,
+                    &reverse_graph,
+                )
+                .await?;
             }
         }
 
@@ -2504,8 +2502,15 @@ pub async fn stage_flakes(
         if let Some(policy) = options.policy_ctx {
             if !policy.wrapper().is_root() {
                 tracing::debug!("enforcing modify policies on pre-built flakes");
-                enforce_modify_policies(&flakes, policy, &ledger, options.tracker, &reverse_graph)
-                    .await?;
+                enforce_modify_policies(
+                    &flakes,
+                    &flakes,
+                    policy,
+                    &ledger,
+                    options.tracker,
+                    &reverse_graph,
+                )
+                .await?;
             }
         }
 
@@ -2605,13 +2610,123 @@ async fn hidden_restatements(
 ///
 /// Returns `Ok(())` if all flakes pass policy, or an error if any flake is
 /// denied or a pre-state lookup fails.
+/// `all` without the facts a write stages but leaves unchanged as RDF.
+fn without_unjudged<'a>(
+    all: &'a [Flake],
+    unjudged: &HashSet<(Option<Sid>, bool, Flake)>,
+) -> std::borrow::Cow<'a, [Flake]> {
+    if unjudged.is_empty() {
+        return std::borrow::Cow::Borrowed(all);
+    }
+    std::borrow::Cow::Owned(
+        all.iter()
+            .filter(|f| !unjudged.contains(&(f.g.clone(), f.op, (*f).clone())))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// A list's cells hold its owner's members, so a change to a stored cell's
+/// `rdf:first` or `rdf:rest` among `flakes` is judged also as a change to
+/// the owner's edge to the list, `owner p head`, as the pre-state holds it:
+/// one assertion of that edge per owner. A cell the pre-state holds no edge
+/// into adds nothing; a compact list's edits are its owner's members already
+/// (`crate::list_edits`).
+async fn list_owner_checks(
+    ledger: &LedgerState,
+    flakes: &[Flake],
+    reverse_graph: &HashMap<Sid, GraphId>,
+) -> Result<Vec<Flake>> {
+    use fluree_db_core::{IndexType, RangeMatch};
+    use fluree_vocab::namespaces::{BLANK_NODE, RDF};
+    use fluree_vocab::predicates::{RDF_FIRST, RDF_REST};
+    let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
+    let mut cells: Vec<(GraphId, &Flake)> = Vec::new();
+    let mut seen: HashSet<(GraphId, Sid)> = HashSet::new();
+    for f in flakes {
+        if f.s.namespace_code == BLANK_NODE && (f.p == first || f.p == rest) {
+            let g_id = resolve_flake_graph_id(f, reverse_graph)?;
+            if seen.insert((g_id, f.s.clone())) {
+                cells.push((g_id, f));
+            }
+        }
+    }
+    if cells.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read = |g_id: GraphId, index: IndexType, rm: RangeMatch| async move {
+        let flakes = fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.as_graph_db_ref(g_id).overlay,
+            index,
+            fluree_db_core::RangeTest::Eq,
+            rm,
+            fluree_db_core::RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await?;
+        Ok::<_, TransactError>(flakes.into_iter().filter(|f| f.op))
+    };
+    let mut head_of: HashMap<(GraphId, Sid), Sid> = HashMap::new();
+    let mut heads: HashSet<(GraphId, Sid)> = HashSet::new();
+    let mut checks = Vec::new();
+    for (g_id, cell) in cells {
+        // Back along `rdf:rest` to the head, each cell walked once.
+        let mut at = cell.s.clone();
+        let mut walked: Vec<Sid> = Vec::new();
+        let head = loop {
+            if let Some(head) = head_of.get(&(g_id, at.clone())) {
+                break head.clone();
+            }
+            walked.push(at.clone());
+            let by_rest = RangeMatch::new()
+                .with_predicate(rest.clone())
+                .with_object(FlakeValue::Ref(at.clone()));
+            match read(g_id, IndexType::Post, by_rest).await?.next() {
+                Some(previous) if !walked.contains(&previous.s) => at = previous.s,
+                _ => break at.clone(),
+            }
+        };
+        for walked in walked {
+            head_of.insert((g_id, walked), head.clone());
+        }
+        if !heads.insert((g_id, head.clone())) {
+            continue;
+        }
+        let into_head = RangeMatch::new().with_object(FlakeValue::Ref(head));
+        for edge in read(g_id, IndexType::Opst, into_head).await? {
+            if edge.p != first && edge.p != rest {
+                checks.push(Flake {
+                    g: cell.g.clone(),
+                    t: cell.t,
+                    op: true,
+                    m: None,
+                    ..edge
+                });
+            }
+        }
+    }
+    Ok(checks)
+}
+
+/// Judge `flakes` under `policy`, where `staged` is everything the write
+/// stages: the post-state a condition reads. A change to a stored list cell
+/// is judged also as a change to the list's owner ([`list_owner_checks`]).
 async fn enforce_modify_policies(
     flakes: &[Flake],
+    staged: &[Flake],
     policy: &PolicyContext,
     ledger: &LedgerState,
     tracker: Option<&Tracker>,
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> Result<()> {
+    let owner_checks = list_owner_checks(ledger, flakes, reverse_graph).await?;
+    let flakes: std::borrow::Cow<'_, [Flake]> = if owner_checks.is_empty() {
+        std::borrow::Cow::Borrowed(flakes)
+    } else {
+        std::borrow::Cow::Owned(flakes.iter().cloned().chain(owner_checks).collect())
+    };
+    let flakes: &[Flake] = &flakes;
     let needs_classes = policy.wrapper().has_class_policies();
     let needs_lifecycle = policy.wrapper().has_write_verb_policies();
 
@@ -2691,7 +2806,7 @@ async fn enforce_modify_policies(
     // StagedLedger overlay (the same view SHACL validates against) provides
     // it. Built only when such a condition is loaded.
     let staged_view = if policy.wrapper().has_post_state_conditions() {
-        let mut view = StagedLedger::new(ledger.clone(), flakes.to_vec(), reverse_graph)?;
+        let mut view = StagedLedger::new(ledger.clone(), staged.to_vec(), reverse_graph)?;
         crate::staged_dicts::attach_staged_dicts(&mut view)?;
         Some(view)
     } else {

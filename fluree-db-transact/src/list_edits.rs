@@ -210,8 +210,9 @@ impl ListEdits {
                 of_list.extend(std::iter::repeat_n(i, graph.len() - start));
             }
         }
-        // The lists the write deletes a triple of; the triples left of the
-        // rest are restated as they are.
+        // The lists the write changes: it deletes one of their triples, or
+        // states a new one about a cell. A changed list's members are judged
+        // as its owner's facts; the triples left of each list are restated.
         let mut edited: HashSet<usize> = HashSet::new();
         let mut restated: HashSet<Triple> = HashSet::new();
         for (triple, &list) in graph.iter().zip(&of_list) {
@@ -219,6 +220,11 @@ impl ListEdits {
                 edited.insert(list);
             } else {
                 restated.insert(triple.clone());
+            }
+        }
+        for t in asserts.iter().filter(|t| !restated.contains(*t)) {
+            if let Some((owner, _)) = self.view_cell(&t.s) {
+                edited.extend(owners.iter().position(|o| *o == owner));
             }
         }
         graph.retain(|t| !retracts.contains(t));

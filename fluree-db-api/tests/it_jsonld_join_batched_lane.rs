@@ -75,7 +75,7 @@ async fn jsonld_join_takes_batched_subject_probe_like_sparql() {
     // interest to "never" while the subscriber installs: run each query
     // once, then recompute every registered callsite's interest.
     for (label, query) in &cases {
-        fluree.query(&view, query.clone()).await.expect(label);
+        fluree.query(&view, *query).await.expect(label);
     }
     tracing::callsite::rebuild_interest_cache();
     for (label, query) in cases {
