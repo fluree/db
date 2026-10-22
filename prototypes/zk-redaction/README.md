@@ -9,8 +9,8 @@ It proves four separate claims, each one a separate guest program or mode:
 | Claim | Program | Public result |
 |---|---|---|
 | A commit was redacted correctly | `methods/guest` (`main.rs`) | `Statement` |
-| A commit is what its CID names, with a Merkle root over its operations | `authenticate` | `CommitClaim` |
-| One operation is in a commit | none; checked against a `CommitClaim` | a leaf and its Merkle path |
+| A commit is what its CID names, with a Merkle root over its salted operations | `authenticate` | `CommitClaim` |
+| One operation is in a commit | none; checked against a `CommitClaim` | a leaf, its salt and its Merkle path |
 | A commit descends from another along first parents | `chain` | `ChainClaim` |
 
 A claim that a fact held at a given `t` is not built. It would need a proof that no commit
@@ -49,8 +49,20 @@ one of two modes:
 - **`Signatures::Expose`**: the guest commits the signatures and `SHA256(body)`. The proof binds
   both to the original CID, and the verifier checks the signatures natively, in microseconds.
 
-The exposed body hash reveals no more about removed values than the original CID already does:
-both are SHA-256 over content that includes them.
+The two modes differ in what they reveal, not only in cost:
+
+- **Signed commits.** The CID covers the signatures as well as the body. A verifier without the
+  signatures cannot reproduce the CID, so it cannot test guesses at the removed values against
+  it. `Expose` hands over the signatures and the body hash. Anyone who can then rebuild every
+  other byte of the body can test candidate values for what was removed. That matters when a
+  removed value has few possible values, such as a flag or a small enumeration.
+- **Rebuilding the body.** It means reproducing the compressed operations byte for byte, which
+  takes the same encoder. That makes guessing harder but does not prevent it.
+- **Choosing the mode.** `Expose` is a choice made per proof, trading this for cost, and nothing
+  selects it by default.
+- **Unsigned commits.** The two modes coincide. The original CID, which every verifier holds,
+  already allows the same test. `DATA_ERASURE.md` records this as a limit of the approach: ZK
+  "does not remove information already exposed by an original digest".
 
 A verifier (`host/src/bin/verify.rs`) needs none of the original bytes. It needs:
 
@@ -70,23 +82,45 @@ step's output must be the replacement's hash.
 
 - its CID, `t` and parent CIDs, read from the envelope;
 - its signers, verified or exposed as above;
-- an RFC 9162 Merkle tree hash over one leaf per operation, in slot order.
+- an RFC 9162 Merkle tree hash over one salted leaf per operation, in slot order.
 
 A leaf is the slot number, the operation's encoded bytes and every dictionary entry it refers
 to, so a disclosed leaf reads on its own; resolving namespace codes to IRIs needs the ledger's
 namespace table.
 
+How a leaf is hashed:
+
+- The hash is RFC 9162's over the salt and the leaf: `SHA256(0x00 ‖ salt ‖ leaf)`, with 32 bytes
+  of salt per leaf.
+- The holder derives the salts from a secret seed it keeps, `SHA256("fluree/leaf-salt" ‖ seed ‖
+  slot)`, and passes them to the guest.
+- The guest does not check how the salts were made. They only hide the leaves; the hash is what
+  binds the root to the commit's operations.
+
 One proof per commit then serves any number of disclosures. The holder of the commit hands over
-the receipt, one leaf and its audit path. The verifier (`verify_disclosure`, or
+the receipt, one leaf, its salt and its audit path. The verifier (`verify_disclosure`, or
 `verify disclose`) checks:
 
 - the receipt is the `authenticate` program's;
 - the claim names the CID the verifier anchors;
 - the leaf is for the slot it says;
-- the path leads to the claim's root.
+- the salted leaf's path leads to the claim's root.
 
-Nothing else of the commit is revealed. A disclosure, once handed over, remains evidence after
-a later erasure of that operation: erasure cannot revoke a proof package someone already holds.
+What a disclosure reveals:
+
+- **Other leaves stay hidden.** The path's hashes cover leaves whose salts the recipient does not
+  hold, so it cannot test guesses at them. Without salts, a recipient could hash each candidate
+  for a predictable neighbor and find the match on the path. Salts serve the same purpose in
+  SD-JWT (RFC 9901).
+- **What is still revealed.** The leaf's position, and, through the claim, the operation count,
+  `t`, parents and signers.
+- **The CID is not salted.** It is a hash over the whole commit, and so is the body hash under
+  `Expose`. Anyone who knows every other byte of the commit can test guesses against it, as
+  under redaction.
+- **The seed must stay secret.** A leaked seed makes the leaves as guessable as unsalted ones.
+
+A disclosure, once handed over, remains evidence after a later erasure of that operation:
+erasure cannot revoke a proof package someone already holds.
 
 ### Ancestry
 
@@ -115,6 +149,7 @@ target/release/host prove second          # both erasures of one commit
 target/release/verify second              # the chain, back to the original CID
 target/release/host authenticate medium 1 # claim, and a disclosure of slot 1
 target/release/verify disclose medium
+target/release/host execute-chain         # a chain link's cycle counts, by commit size
 target/release/host chain 4 1000          # four linked 1,000-operation commits
 ```
 
@@ -154,12 +189,15 @@ and language-tagged strings, numbers, references, list indexes, a named graph, a
 - invalid slots are refused;
 - the replacement is deterministic.
 
-`core/tests/authenticate.rs` (4 tests):
+`core/tests/authenticate.rs` (5 tests):
 
 - a claim names the commit's CID and parents as Fluree reads them, including merge parents and
   transaction metadata;
-- every operation's leaf reaches the root by its path, and a changed leaf, another position or
-  another leaf's path does not;
+- every operation's salted leaf reaches the root by its path, and a changed leaf, another
+  position, another leaf's path or another salt does not;
+- each leaf has its own salt: a disclosed salt opens no other leaf, a leaf without its salt
+  matches nothing, the root changes with the seed, and anything but one salt per operation is
+  refused;
 - every position of every tree size from 1 to 33 has a path to the root;
 - a chain link follows only its previous head and its own program.
 
@@ -173,7 +211,8 @@ and language-tagged strings, numbers, references, list indexes, a named graph, a
   missing, the steps reordered, a first proof of another original or of other slots, other
   authorized slots, or another final replacement.
 - A disclosure verifies only against its commit: not against another program or CID, with a
-  changed operation, an operation claimed for another slot, or another slot's path.
+  changed operation, an operation claimed for another slot, another slot's path, another slot's
+  salt, or a salt from another seed.
 - A chain proof covers its whole ancestry and nothing else: not another program or other end
   commits, and a commit that does not follow the chain cannot be linked onto it.
 
@@ -207,6 +246,9 @@ User cycles by phase, from markers the guest writes. These are execution counts,
 | `second` | 29,257 | 683,355 | 1 | 0 | 0 | 360,289 | 32,973 | 217,780 | 32,895 |
 | `large_10k` | 95,343 | 16,569,293 | 19 | 747 | 10,768,297 | 3,099,043 | 104,960 | 2,139,960 | 335,794 |
 | `large_import` | 499,656 | 82,123,710 | 90 | 747 | 53,262,173 | 15,559,043 | 545,500 | 10,553,688 | 1,725,022 |
+
+`medium_signed`, with the guest verifying the signature, proved in 5.7 minutes (3 segments),
+against 3.8 minutes (2 segments) for `medium`; `medium_signed_exposed` has `medium`'s 2 segments.
 
 `large_import` proved in 2.9 hours: 90 segments at 117 s each, 9.2 GiB peak, and 25 MB of disk
 writes, its replacement included. Its receipt verified in 16 ms in a fresh process. The
@@ -242,20 +284,37 @@ time:
 
 | Scenario | User cycles | Segments | Decompress | Parse | Leaf hashes | Tree |
 |---|---:|---:|---:|---:|---:|---:|
-| `small` | 81,218 | 1 | 478 | 6,766 | 22,965 | 13,428 |
-| `merge` | 299,963 | 1 | 92,932 | 21,034 | 92,170 | 55,860 |
-| `medium` | 3,807,696 | 5 | 1,118,669 | 306,213 | 1,451,760 | 883,284 |
-| `large_10k` | 37,745,786 | 42 | 10,768,667 | 3,098,925 | 14,889,091 | 8,839,284 |
-| `large_import` | 188,257,331 | 206 | 53,262,543 | 15,558,925 | 74,609,138 | 44,199,284 |
+| `small` | 82,659 | 1 | 480 | 6,768 | 25,847 | 13,431 |
+| `merge` | 310,172 | 1 | 92,933 | 21,037 | 103,692 | 55,863 |
+| `medium` | 3,988,907 | 5 | 1,118,670 | 306,216 | 1,631,513 | 883,287 |
+| `large_10k` | 39,346,626 | 43 | 10,768,668 | 3,098,928 | 16,462,043 | 8,839,287 |
+| `large_import` | 195,957,562 | 215 | 53,262,544 | 15,558,928 | 82,163,950 | 44,199,287 |
 
-- **Authentication:** proving `medium` took 9.6 minutes (5 segments), and the 16-operation commit
-  33 s. Both were measured just before the C decoder, which leaves `medium` at 5 segments.
-- **Disclosure:** a 1,000-operation commit's disclosure is a 58-byte leaf and a 10-hash path. It
-  verifies, with the receipt, in 15 ms.
-- **Ancestry:** a chain link proved in 15–21 s for its first commit and about 30 s for each
-  later one, resolving the previous link's receipt included. That held the same for
-  16-operation and 1,000-operation commits, since a link decodes no operations. Four links took
-  under 2 minutes; the final receipt is 224 KB and verifies in 15 ms.
+Salting the leaves added 180 cycles per leaf: `medium` rose from 3.81 M to 3.99 M cycles and
+stayed at 5 segments; `large_10k` went from 42 segments to 43, `large_import` from 206 to 215.
+
+- **Authentication**, with salted leaves: proving `medium` took 8.7 minutes (5 segments), and
+  the 16-operation commit 33 s.
+- **Disclosure:** a 1,000-operation commit's disclosure is a 58-byte leaf, its 32-byte salt and
+  a 10-hash path. It verifies, with the receipt, in 15 ms.
+- **Ancestry:** a link decodes no operations, but it hashes its whole commit. Its cost is about
+  22,000 cycles plus 1.2 per commit byte:
+
+| Commit | Bytes | User cycles | Padded cycles |
+|---|---:|---:|---:|
+| 16 operations | 387 | 22,416 | 65,536 |
+| 1,000 operations | 8,957 | 32,555 | 131,072 |
+| 10,000 operations | 95,303 | 134,541 | 262,144 |
+| 50,000 operations | 499,616 | 612,081 | 1,048,576 |
+
+Proved link times:
+
+- **16 and 1,000 operations:** 15–21 s for the first commit and about 30 s for each later one,
+  resolving the previous link's receipt included. Four links took under 2 minutes.
+- **50,000 operations (500 KB):** two links took 109 s and 118 s, a full segment each. A larger
+  commit needs more segments.
+
+Every final chain receipt is 224 KB and verifies in 15 ms.
 
 ### Concurrent proving
 
@@ -299,19 +358,24 @@ per-operation copies, and decompressed with `ruzstd`.
   cycles, which exclude the padding and continuation overhead in proved cycles. They are not a
   measured comparison with a Poseidon design, but they say that in this implementation codec
   work, not the hash, is where the cost is.
-- **Signatures need not be in the proof.** Exposing them leaves a signed commit as cheap as an
-  unsigned one, at the price of a statement that carries the signatures and the body hash.
+- **Signatures need not be in the proof, at a price in privacy.** Exposing them leaves a signed
+  1,000-operation commit at an unsigned one's 2 segments, against 3 segments (5.7 minutes) with
+  the guest verifying them. The statement then carries the signatures and the body hash, which
+  let anyone able to rebuild the rest of the body test guesses at removed values (see
+  Redaction).
 - **A second erasure is cheaper.** A replacement is stored uncompressed, so redacting it again
   skips decompression. The price is size: 29 KB against the original's 9 KB.
 - **Authentication costs more than redaction** for the same commit, because of the Merkle tree:
-  about 1,450 cycles per leaf and 880 per tree node, mostly the SHA-256 precompile's per-call
-  cost. Leaves of several operations, or a wider tree, would cut the calls at the cost of
+  about 1,630 cycles per salted leaf and 880 per tree node, mostly the SHA-256 precompile's
+  per-call cost. Leaves of several operations, or a wider tree, would cut the calls at the cost of
   larger disclosures; not measured.
 - **Shared work:** authentication and redaction both decompress and parse the commit. Proving
   them in one run, or making a redaction proof start from an authenticated commit, would share
   that work; not built.
-- **Chains cost per link, not per byte.** About 30 s a link on CPU, so long histories would want
-  periodic checkpoints rather than one chain from genesis; not built.
+- **A chain link's cost grows with its commit's size.** A link hashes the whole commit, at about
+  1.2 cycles per byte over a fixed 22,000. A link took about 30 s for commits up to 9 KB and
+  just under 2 minutes for 500 KB. Long histories would want periodic checkpoints rather than
+  one chain from genesis; not built.
 - **Not measured:** GPU proving, resource-limited proving next to a transactor.
 
 ## Gate assessment
@@ -323,17 +387,22 @@ the numbers can be checked against any target, these are the service times of on
 
 | Proof | Service time | Per prover-day |
 |---|---:|---:|
-| Redaction, 1,000 operations (signed with signatures exposed, or unsigned) | 3.8 min | about 380 |
+| Redaction, 1,000 operations, unsigned, or signed with signatures exposed | 3.8 min | about 380 |
+| Redaction, 1,000 operations, signed, signatures verified in the proof | 5.7 min | about 250 |
 | Redaction, 10,000 operations | about 35 min (19 segments; not proved in this build) | about 40 |
 | Redaction, 50,000 operations | 2.9 h | about 8 |
-| Authentication, 1,000 operations | 9.6 min | about 150 |
-| Ancestry, per link | about 30 s | about 2,900 |
+| Authentication, 1,000 operations, salted leaves | 8.7 min | about 165 |
+| Ancestry, per link, commits up to 9 KB | about 30 s | about 2,900 |
+| Ancestry, per link, 500 KB commit | about 2 min | about 750 |
 
 These are service times, not completion guarantees. A removal needs one proof per commit
 holding an occurrence; a fact asserted once and retracted once is two. Proofs of different
-commits are independent, so capacity scales with provers. With removals in 1,000-operation
-commits at two commits each, one prover's theoretical ceiling is about 190 removals a day, at
-which it is fully busy. How long a removal waits then depends on bursts, backlog, retries and how
+commits are independent, so capacity scales with provers.
+
+With removals in 1,000-operation commits at two commits each, one prover's theoretical ceiling
+is about 190 removals a day, at which it is fully busy. It is about 125 when the commits are
+signed and the proof verifies their signatures. Both figures count redaction proofs only:
+authentication and ancestry proofs are separate and optional. How long a removal waits then depends on bursts, backlog, retries and how
 many commits each request touches, none of which this prototype models.
 
 Verdict: proving per erasure request with SHA-256, batching each commit's removals into one

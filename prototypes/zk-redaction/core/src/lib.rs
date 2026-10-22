@@ -398,6 +398,9 @@ pub struct SignatureEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signatures {
     Verify,
+    /// Cheaper, but a signed commit's CID covers signatures a verifier does
+    /// not otherwise hold: with them and the body hash, anyone able to
+    /// rebuild the rest of the body can test guesses at what was removed.
     Expose,
 }
 
@@ -929,12 +932,17 @@ pub fn view_replacement(blob: &[u8]) -> Result<ReplacementView> {
 // ---------------------------------------------------------------------------
 
 /// Version of [`CommitClaim`] and of its leaf encoding.
-pub const CLAIM_VERSION: u32 = 1;
+pub const CLAIM_VERSION: u32 = 2;
+
+/// Bytes of a leaf's salt.
+pub const SALT_LEN: usize = 32;
+
+const SALT_DOMAIN: &[u8] = b"fluree/leaf-salt";
 
 /// What a commit authentication proof makes public: a commit, by the CID
 /// the ledger's history anchors, its place in that history, and a Merkle
-/// root over its operations, so any one operation can be disclosed later
-/// with a path of hashes and nothing else of the commit.
+/// root over its operations' salted leaves, so any one operation can be
+/// disclosed later with its salt and a path of hashes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitClaim {
     pub claim_version: u32,
@@ -943,8 +951,8 @@ pub struct CommitClaim {
     /// Parent CIDs (binary), from the envelope.
     pub parents: Vec<Vec<u8>>,
     pub op_count: u32,
-    /// RFC 9162 Merkle tree hash over the operations' leaves, in slot order
-    /// (see [`leaves`]).
+    /// RFC 9162 Merkle tree hash over the operations' salted leaves, in
+    /// slot order (see [`leaves`] and [`leaf_hash`]).
     pub ops_root: Vec<u8>,
     /// Verified signers, or the signatures exposed for the verifier to check
     /// (see [`Signatures`]).
@@ -1066,10 +1074,29 @@ pub fn leaves(blob: &[u8]) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 
-/// The RFC 9162 leaf hash.
-pub fn leaf_hash<H: Sha256>(leaf: &[u8]) -> [u8; 32] {
-    let mut data = Vec::with_capacity(leaf.len() + 1);
+/// Leaf `slot`'s salt, from the commit holder's secret `seed`. Only a
+/// disclosure of that leaf reveals it, so the hashes on a path cannot be
+/// tested against guesses at the leaves they cover.
+pub fn leaf_salt<H: Sha256>(seed: &[u8; 32], slot: u32) -> [u8; SALT_LEN] {
+    let mut data = [0u8; SALT_DOMAIN.len() + 32 + 4];
+    data[..SALT_DOMAIN.len()].copy_from_slice(SALT_DOMAIN);
+    data[SALT_DOMAIN.len()..SALT_DOMAIN.len() + 32].copy_from_slice(seed);
+    data[SALT_DOMAIN.len() + 32..].copy_from_slice(&slot.to_le_bytes());
+    H::sha256(&data)
+}
+
+/// The salts of `n` leaves, concatenated: what [`authenticate`] reads.
+pub fn leaf_salts<H: Sha256>(seed: &[u8; 32], n: usize) -> Vec<u8> {
+    (0..n as u32)
+        .flat_map(|i| leaf_salt::<H>(seed, i))
+        .collect()
+}
+
+/// The RFC 9162 leaf hash of a salted leaf: `SHA256(0x00 || salt || leaf)`.
+pub fn leaf_hash<H: Sha256>(salt: &[u8; SALT_LEN], leaf: &[u8]) -> [u8; 32] {
+    let mut data = Vec::with_capacity(1 + SALT_LEN + leaf.len());
     data.push(0);
+    data.extend_from_slice(salt);
     data.extend_from_slice(leaf);
     H::sha256(&data)
 }
@@ -1151,11 +1178,13 @@ pub fn root_from_path<H: Sha256>(
 }
 
 /// Authenticate an original V4 commit: its CID, parents, signers and the
-/// Merkle root over its operations' leaves.
+/// Merkle root over its operations' leaves, each salted with its
+/// `SALT_LEN` bytes of `salts` (see [`leaf_salts`]).
 pub fn authenticate<H: Sha256, P: Probe>(
     input: &[u8],
     ledger_id: &str,
     mode: Signatures,
+    salts: &[u8],
     probe: &mut P,
 ) -> Result<CommitClaim> {
     let cid = commit_cid(&H::sha256(input));
@@ -1175,12 +1204,16 @@ pub fn authenticate<H: Sha256, P: Probe>(
     probe.mark("decompress");
     let (c, _) = slot_original(input, &o, ops, Vec::new(), Vec::new(), &[])?;
     probe.mark("parse");
-    // Each leaf hashed as RFC 9162 does, `0x00 || leaf`, in one buffer.
+    if salts.len() != SALT_LEN * c.slots.len() {
+        return Err(Error::Malformed("not one salt per operation"));
+    }
+    // Each leaf hashed as [`leaf_hash`] does, in one buffer.
     let mut buf = Vec::with_capacity(256);
     let mut hashes = Vec::with_capacity(c.slots.len());
-    for (slot, op) in c.slots.iter().enumerate() {
+    for ((slot, op), salt) in c.slots.iter().enumerate().zip(salts.chunks_exact(SALT_LEN)) {
         buf.clear();
         buf.push(0);
+        buf.extend_from_slice(salt);
         write_leaf(&mut buf, slot as u32, op.unwrap_or_default(), &c.dicts)?;
         hashes.push(H::sha256(&buf));
     }
@@ -1208,6 +1241,9 @@ pub fn authenticate<H: Sha256, P: Probe>(
 // ---------------------------------------------------------------------------
 // Ancestry
 // ---------------------------------------------------------------------------
+
+/// Version of [`ChainClaim`].
+pub const CHAIN_VERSION: u32 = 1;
 
 /// What a chain proof makes public: commit `head_cid` descends, along first
 /// parents, from `base_cid`, `length` commits in all. Each link proves one
@@ -1249,7 +1285,7 @@ pub fn chain_link<H: Sha256>(
         }
     };
     Ok(ChainClaim {
-        claim_version: CLAIM_VERSION,
+        claim_version: CHAIN_VERSION,
         image_id,
         base_cid,
         head_cid: cid,

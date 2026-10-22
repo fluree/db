@@ -87,14 +87,15 @@ fn a_chain_verifies_only_back_to_its_anchored_original() {
 
 #[test]
 fn a_disclosure_verifies_only_against_its_commit() {
-    use host::{authenticate_image_id, disclose, prove_authenticate, verify_disclosure};
+    use host::{authenticate_image_id, disclose, new_seed, prove_authenticate, verify_disclosure};
     use zk_redaction_core::Signatures;
     let input = commit_blob(16, true, false, false);
+    let seed = new_seed();
     let (receipt, claim, ..) =
-        prove_authenticate(&input, LEDGER, Signatures::Verify).expect("prove");
+        prove_authenticate(&input, &seed, LEDGER, Signatures::Verify).expect("prove");
     let anchored = commit_cid(&HostSha::sha256(&input));
     assert_eq!(claim.cid, anchored);
-    let disclosure = disclose(&input, 3).unwrap();
+    let disclosure = disclose(&input, &seed, 3).unwrap();
     let check = |receipt, image, cid: &[u8], d: &host::Disclosure| {
         verify_disclosure(receipt, image, cid, d)
     };
@@ -113,8 +114,14 @@ fn a_disclosure_verifies_only_against_its_commit() {
     moved.slot = 4;
     assert!(check(&receipt, authenticate_image_id(), &anchored, &moved).is_err());
     let mut wrong_path = disclosure.clone();
-    wrong_path.path = disclose(&input, 4).unwrap().path;
+    wrong_path.path = disclose(&input, &seed, 4).unwrap().path;
     assert!(check(&receipt, authenticate_image_id(), &anchored, &wrong_path).is_err());
+    // Another salt: another slot's, or the same leaf under another seed.
+    let mut resalted = disclosure.clone();
+    resalted.salt = disclose(&input, &seed, 4).unwrap().salt;
+    assert!(check(&receipt, authenticate_image_id(), &anchored, &resalted).is_err());
+    let other_seed = disclose(&input, &new_seed(), 3).unwrap();
+    assert!(check(&receipt, authenticate_image_id(), &anchored, &other_seed).is_err());
 }
 
 #[test]

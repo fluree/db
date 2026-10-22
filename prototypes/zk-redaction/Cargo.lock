@@ -1470,6 +1470,7 @@ dependencies = [
  "bincode",
  "fluree-db-core",
  "fluree-db-credential",
+ "getrandom 0.2.17",
  "hex",
  "libc",
  "methods",

@@ -9,9 +9,9 @@ use methods::{AUTHENTICATE_ELF, AUTHENTICATE_ID, CHAIN_ELF, CHAIN_ID, REDACT_ELF
 use risc0_zkvm::{default_executor, default_prover, ExecutorEnv, ProverOpts, Receipt};
 use serde::{Deserialize, Serialize};
 use zk_redaction_core::{
-    audit_path, check_exposed, commit_cid, leaf_hash, leaves, root_from_path,
-    verify_exposed_signatures, ChainClaim, CommitClaim, HostSha, Sha256, Signatures, Statement,
-    CLAIM_VERSION, TRANSFORM_VERSION,
+    audit_path, check_exposed, commit_cid, leaf_hash, leaf_salt, leaf_salts, leaves,
+    root_from_path, verify_exposed_signatures, ChainClaim, CommitClaim, HostSha, Sha256,
+    Signatures, Statement, CLAIM_VERSION, SALT_LEN, TRANSFORM_VERSION,
 };
 
 pub const LEDGER: &str = "acme/people:main";
@@ -319,14 +319,25 @@ pub fn peak_rss_kib() -> (i64, i64) {
 // Commit authentication and selective disclosure
 // ---------------------------------------------------------------------------
 
+/// A fresh secret seed for a commit's leaf salts. Its holder keeps it to
+/// disclose operations later; it is never handed over.
+pub fn new_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).expect("system randomness");
+    seed
+}
+
 fn auth_env<'a>(
     input: &[u8],
+    seed: &[u8; 32],
     ledger: &str,
     signatures: Signatures,
     stdout: &'a mut Vec<u8>,
 ) -> anyhow::Result<ExecutorEnv<'a>> {
+    let n = leaves(input).map_err(|e| anyhow::anyhow!("{e}"))?.len();
     let mut builder = ExecutorEnv::builder();
     builder.write_frame(input);
+    builder.write_frame(&leaf_salts::<HostSha>(seed, n));
     builder.write(&(ledger.to_string(), signatures))?;
     builder.stdout(stdout);
     builder.build()
@@ -344,11 +355,12 @@ pub struct AuthExecution {
 /// Run the authentication guest without proving: cycle counts by phase.
 pub fn execute_authenticate(
     input: &[u8],
+    seed: &[u8; 32],
     ledger: &str,
     signatures: Signatures,
 ) -> Result<AuthExecution, String> {
     let mut stdout = Vec::new();
-    let env = auth_env(input, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
+    let env = auth_env(input, seed, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
     let session = default_executor()
         .execute(env, AUTHENTICATE_ELF)
         .map_err(|e| e.to_string())?;
@@ -362,14 +374,16 @@ pub fn execute_authenticate(
     })
 }
 
-/// Prove a commit's claim, compressed to a succinct receipt.
+/// Prove a commit's claim, its leaves salted from `seed`, compressed to a
+/// succinct receipt.
 pub fn prove_authenticate(
     input: &[u8],
+    seed: &[u8; 32],
     ledger: &str,
     signatures: Signatures,
 ) -> Result<(Receipt, CommitClaim, Duration, u64, usize), String> {
     let mut stdout = Vec::new();
-    let env = auth_env(input, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
+    let env = auth_env(input, seed, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let info = default_prover()
         .prove_with_opts(env, AUTHENTICATE_ELF, &ProverOpts::succinct())
@@ -385,25 +399,32 @@ pub fn prove_authenticate(
     ))
 }
 
-/// One operation of an authenticated commit, disclosed: its leaf and the
-/// path of hashes to the claim's root.
+/// One operation of an authenticated commit, disclosed: its leaf, its salt
+/// and the path of hashes to the claim's root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Disclosure {
     pub slot: u32,
+    pub salt: [u8; SALT_LEN],
     pub leaf: Vec<u8>,
     pub path: Vec<[u8; 32]>,
 }
 
-/// Disclose operation `slot` of `original`: what its holder hands over.
-pub fn disclose(original: &[u8], slot: u32) -> Result<Disclosure, String> {
+/// Disclose operation `slot` of `original`, authenticated with `seed`: what
+/// its holder hands over.
+pub fn disclose(original: &[u8], seed: &[u8; 32], slot: u32) -> Result<Disclosure, String> {
     let leaves = leaves(original).map_err(|e| e.to_string())?;
-    let hashes: Vec<[u8; 32]> = leaves.iter().map(|l| leaf_hash::<HostSha>(l)).collect();
+    let hashes: Vec<[u8; 32]> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, l)| leaf_hash::<HostSha>(&leaf_salt::<HostSha>(seed, i as u32), l))
+        .collect();
     let leaf = leaves
         .get(slot as usize)
         .ok_or("no such operation")?
         .clone();
     Ok(Disclosure {
         slot,
+        salt: leaf_salt::<HostSha>(seed, slot),
         leaf,
         path: audit_path::<HostSha>(slot as usize, &hashes),
     })
@@ -439,7 +460,7 @@ pub fn verify_disclosure(
     let root = root_from_path::<HostSha>(
         disclosure.slot as usize,
         claim.op_count as usize,
-        leaf_hash::<HostSha>(&disclosure.leaf),
+        leaf_hash::<HostSha>(&disclosure.salt, &disclosure.leaf),
         &disclosure.path,
     );
     if root.as_ref().map(|r| r.as_slice()) != Some(claim.ops_root.as_slice()) {
@@ -474,6 +495,25 @@ pub fn commit_chain(count: usize, ops: usize) -> Vec<Vec<u8>> {
         out.push(write_commit(&commit, true, None).unwrap().bytes);
     }
     out
+}
+
+/// Run a chain's first link without proving: user cycles, padded cycles and
+/// segments. A later link adds only the previous receipt's verification.
+pub fn execute_chain_link(commit: &[u8]) -> Result<(u64, u64, usize), String> {
+    let mut builder = ExecutorEnv::builder();
+    builder.write_frame(commit);
+    builder
+        .write(&(None::<ChainClaim>, CHAIN_ID))
+        .map_err(|e| e.to_string())?;
+    let env = builder.build().map_err(|e| e.to_string())?;
+    let session = default_executor()
+        .execute(env, CHAIN_ELF)
+        .map_err(|e| e.to_string())?;
+    Ok((
+        session.cycles(),
+        session.segments.iter().map(|s| 1u64 << s.po2).sum(),
+        session.segments.len(),
+    ))
 }
 
 /// One proved link: its receipt, claim and proving time.

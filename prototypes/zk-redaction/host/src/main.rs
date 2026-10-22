@@ -1,8 +1,12 @@
-//! Benchmarks the redaction proof.
+//! Benchmarks the redaction, authentication and ancestry proofs.
 //!
 //! ```text
-//! host execute            # every scenario, executor only: cycles per phase
-//! host prove <scenario>   # one scenario, proved: time, memory, proof size
+//! host execute                        # every scenario, executor only: cycles per phase
+//! host prove <scenario>               # one scenario, proved: time, memory, proof size
+//! host execute-auth                   # authentication cycles, every scenario
+//! host authenticate <scenario> [slot] # proved, with a disclosure of one slot
+//! host execute-chain                  # a chain link's cycles, by commit size
+//! host chain [links] [ops]            # a proved chain
 //! ```
 //!
 //! `prove` writes `<scenario>.receipt`, `<scenario>.replacement` and
@@ -13,8 +17,8 @@
 use std::time::Instant;
 
 use host::{
-    authenticate_image_id, commit_blob, disclose, execute_authenticate, execute_with, peak_rss_kib,
-    prove_authenticate, prove_with, verify_chain, verify_disclosure, LEDGER,
+    authenticate_image_id, commit_blob, disclose, execute_authenticate, execute_with, new_seed,
+    peak_rss_kib, prove_authenticate, prove_with, verify_chain, verify_disclosure, LEDGER,
 };
 use serde_json::json;
 use zk_redaction_core::{commit_cid, redact, redact_with, HostSha, Sha256, Signatures};
@@ -206,7 +210,8 @@ fn main() {
         Some("execute-auth") => {
             for name in ALL.iter().filter(|n| **n != "second") {
                 let s = scenario(name);
-                let run = execute_authenticate(&s.input, LEDGER, s.signatures).expect("execute");
+                let run = execute_authenticate(&s.input, &new_seed(), LEDGER, s.signatures)
+                    .expect("execute");
                 println!(
                     "{}",
                     json!({
@@ -218,6 +223,23 @@ fn main() {
                         "total_cycles": run.total_cycles,
                         "segments": run.segments,
                         "phases": run.phases,
+                    })
+                );
+            }
+        }
+        Some("execute-chain") => {
+            for ops in [16, 1_000, 10_000, 50_000] {
+                let commit = host::commit_chain(1, ops).remove(0);
+                let (user, total, segments) = host::execute_chain_link(&commit).expect("execute");
+                println!(
+                    "{}",
+                    json!({
+                        "mode": "execute-chain",
+                        "ops": ops,
+                        "commit_bytes": commit.len(),
+                        "user_cycles": user,
+                        "total_cycles": total,
+                        "segments": segments,
                     })
                 );
             }
@@ -256,9 +278,10 @@ fn main() {
             let name = args.get(2).expect("scenario");
             let slot: u32 = args.get(3).map_or(1, |s| s.parse().unwrap());
             let s = scenario(name);
+            let seed = new_seed();
             let (receipt, claim, prove, total_cycles, segments) =
-                prove_authenticate(&s.input, LEDGER, s.signatures).expect("prove");
-            let disclosure = disclose(&s.input, slot).expect("disclose");
+                prove_authenticate(&s.input, &seed, LEDGER, s.signatures).expect("prove");
+            let disclosure = disclose(&s.input, &seed, slot).expect("disclose");
             let anchored = commit_cid(&HostSha::sha256(&s.input));
             let started = Instant::now();
             verify_disclosure(&receipt, authenticate_image_id(), &anchored, &disclosure)
@@ -297,7 +320,8 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: host execute | host prove <scenario> | host execute-auth \
-                 | host authenticate <scenario> [slot]"
+                 | host authenticate <scenario> [slot] | host execute-chain \
+                 | host chain [links] [ops]"
             );
             std::process::exit(2);
         }
