@@ -1,0 +1,28 @@
+[package]
+name = "fluree-db-erasure"
+description = "Proof-verified commit erasure: the redaction verifier and the prover runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluree-db-redaction = { path = "../fluree-db-redaction", default-features = false, features = ["host-sha"] }
+# The verifier only: no prover, no guest build, no RISC Zero toolchain.
+risc0-zkvm = { version = "=3.0.6", default-features = false, features = ["std"] }
+bincode = "1.3"
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+libc = "0.2"
+
+[features]
+# Fake receipts from a native prover, for tests of the erasure workflow
+# where no zkVM prover runs. Never enabled outside dev-dependencies.
+testing = ["fluree-db-redaction/rust-zstd"]
+
+[dev-dependencies]
+tempfile = "3"
+fluree-db-core = { path = "../fluree-db-core", features = ["credential"] }
+fluree-db-credential = { path = "../fluree-db-credential" }

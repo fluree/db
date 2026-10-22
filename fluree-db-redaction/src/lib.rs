@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod protocol;
+
 /// Version of the transform and of the `FCR1` encoding.
 pub const TRANSFORM_VERSION: u32 = 1;
 
@@ -123,14 +125,6 @@ pub struct Statement {
     pub ledger_id: String,
     /// Dictionary strings this step removed (no survivor used them).
     pub removed_terms: u32,
-}
-
-/// The guest's input.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProveInput {
-    pub input: Vec<u8>,
-    pub removed_slots: Vec<u32>,
-    pub ledger_id: String,
 }
 
 // ---------------------------------------------------------------------------
