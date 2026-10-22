@@ -365,7 +365,8 @@ fn int_pushdown_literal(
 /// failure it exists to prevent.
 pub struct MaterializeScan {
     /// The source's current snapshot — the new watermark to persist. `None` when
-    /// the table has no snapshots at all (nothing to materialize).
+    /// the table has no snapshots at all (nothing to materialize). A pinned read
+    /// reports its pin.
     pub to_snapshot_id: Option<i64>,
     /// Whether an added-files scan was used, rather than a full read.
     pub incremental: bool,
@@ -375,7 +376,8 @@ pub struct MaterializeScan {
     /// both of which mean "persist regardless".
     pub window_age_ms: Option<i64>,
     /// The highest source COMMIT SEQUENCE this pass covers, when the pass was cut
-    /// short by the row budget — and `None` when it covers the whole plan.
+    /// short by the row budget — and `None` when it covers the whole plan, which
+    /// a pinned read always does.
     ///
     /// That distinction is the point of the field, and inverting it is silent data
     /// loss. `Some(s)` means the target will hold only a PREFIX of the window, so
@@ -1954,14 +1956,17 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// **never** a fall-forward: the from-side fall-forward below is a
     /// deliberate freshness/correctness trade a sync-to-head consumer wants,
     /// but silently moving a caller's `to` pin would change what the caller
-    /// asked to read.
+    /// asked to read. For the same reason a pinned read is never cut by the
+    /// per-pass row budget: that budget paces the tracking worker's unpinned
+    /// passes, and a prefix of a pin is a state the caller did not ask for.
     ///
-    /// Returns `(to_snapshot_id, incremental, batches)`:
+    /// Returns a [`MaterializeScan`]:
     /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
     ///   watermark to persist), or `None` if the table has no snapshots yet
     ///   (nothing to materialize; only possible when the caller didn't pin).
     /// - `incremental` — whether an added-files-only scan was used (vs a full
     ///   read of the live table state).
+    /// - `to_sequence` — set only when an unpinned pass was cut short.
     ///
     /// An incremental scan is used when `from_snapshot_id` is set **and** the
     /// window `(from, to]` is incremental-safe — only `append`/`replace`
@@ -2069,7 +2074,10 @@ impl<'a> FlureeR2rmlProvider<'a> {
             ),
         }
 
-        let budget_rows = self.pass_row_budget();
+        // A pinned read is read whole, on every path. `0` is the disabled budget:
+        // neither full-read cut below takes a prefix under it, and the
+        // incremental cap is skipped for a pin outright.
+        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
 
         // An UNPINNED incremental window is read in bounded steps.
         //
