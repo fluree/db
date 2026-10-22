@@ -6,7 +6,7 @@ mod common;
 
 use common::{read_frame, Cycles, ZkSha};
 use risc0_zkvm::guest::env;
-use zk_redaction_core::{redact_with, Signatures};
+use fluree_db_redaction::{redact_with, Signatures};
 
 fn main() {
     let input = read_frame();

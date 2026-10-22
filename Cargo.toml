@@ -25,6 +25,7 @@ members = [
     "fluree-db-shacl",
     "fluree-db-reasoner",
     "fluree-db-credential",
+    "fluree-db-redaction",
     "fluree-db-api",
     "fluree-db-storage-aws",
     "fluree-db-storage-ipfs",

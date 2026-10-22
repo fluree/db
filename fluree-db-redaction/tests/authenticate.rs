@@ -6,7 +6,7 @@ use fluree_db_core::commit::codec::write_commit;
 use fluree_db_core::{
     Commit, ContentId, ContentKind, Flake, FlakeValue, Sid, TxnMetaEntry, TxnMetaValue,
 };
-use zk_redaction_core::{
+use fluree_db_redaction::{
     audit_path, authenticate, commit_cid, leaf_hash, leaf_salt, leaf_salts, leaves, merkle_root,
     root_from_path, CommitClaim, HostSha, Sha256, Signatures, SALT_LEN,
 };
@@ -176,7 +176,7 @@ fn every_position_of_every_tree_size_has_a_path_to_the_root() {
 
 #[test]
 fn a_chain_link_follows_only_its_previous_head() {
-    use zk_redaction_core::chain_link;
+    use fluree_db_redaction::chain_link;
     let image = [7u32; 8];
     let first = write_commit(&Commit::new(1, flakes(2)), false, None)
         .unwrap()

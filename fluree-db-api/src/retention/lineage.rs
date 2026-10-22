@@ -253,7 +253,7 @@ impl Fluree {
         let state = self
             .load_queryable_state_with_store(store.clone(), record.clone())
             .await?;
-        let mut commits: HashMap<ContentId, Vec<Flake>> = HashMap::new();
+        let mut commits: HashMap<ContentId, fluree_db_core::Commit> = HashMap::new();
         let mut current: Vec<(Flake, &Removal)> = Vec::new();
         for removal in removals {
             let Ok(cid) = removal.commit.parse::<ContentId>() else {
@@ -264,9 +264,9 @@ impl Fluree {
                     continue;
                 }
                 let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                commits.insert(cid.clone(), commit.flakes);
+                commits.insert(cid.clone(), commit);
             }
-            let Some(flake) = commits[&cid].get(removal.slot as usize).filter(|f| f.op) else {
+            let Some(flake) = commits[&cid].at_slot(removal.slot).filter(|f| f.op) else {
                 continue;
             };
             // Current as this occurrence, not as a later reassertion.
@@ -291,9 +291,7 @@ impl Fluree {
         let cid = receipt.commit_id;
         let commit = load_commit_by_id(store.as_ref(), &cid).await?;
         let entries = commit
-            .flakes
-            .iter()
-            .enumerate()
+            .occurrences()
             .filter_map(|(slot, flake)| {
                 let key = super::state::FactKey::of(flake);
                 let (asserted, removal) = current
@@ -302,7 +300,7 @@ impl Fluree {
                 Some(Removal {
                     request_id: removal.request_id.clone(),
                     commit: cid.to_string(),
-                    slot: slot as u32,
+                    slot,
                     predicate: removal.predicate.clone(),
                     from_t: asserted.t,
                     until_t: Some(receipt.t),

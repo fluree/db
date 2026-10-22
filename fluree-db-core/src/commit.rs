@@ -222,9 +222,45 @@ pub struct Commit {
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<crate::ns_encoding::NsSplitMode>,
+
+    /// Set when the commit was read from a redacted replacement: `flakes`
+    /// are then only its surviving operations.
+    pub redaction: Option<Redaction>,
+}
+
+/// What a commit read from a redacted replacement no longer holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redaction {
+    /// The original slot of each flake in [`Commit::flakes`], ascending.
+    pub slots: Vec<u32>,
+    /// Operations in the original commit.
+    pub op_count: u32,
+    /// Signers of the original commit, as the redaction proof verified them.
+    pub signers: Vec<String>,
 }
 
 impl Commit {
+    /// Each flake with its operation slot in the original commit. Use this,
+    /// not the flake's position, wherever a slot names an occurrence: the
+    /// two differ once a commit has been redacted.
+    pub fn occurrences(&self) -> impl Iterator<Item = (u32, &Flake)> {
+        self.flakes.iter().enumerate().map(|(i, flake)| {
+            let slot = match &self.redaction {
+                Some(r) => r.slots[i],
+                None => i as u32,
+            };
+            (slot, flake)
+        })
+    }
+
+    /// The flake at original slot `slot`, if the commit still holds it.
+    pub fn at_slot(&self, slot: u32) -> Option<&Flake> {
+        match &self.redaction {
+            Some(r) => r.slots.binary_search(&slot).ok().map(|i| &self.flakes[i]),
+            None => self.flakes.get(slot as usize),
+        }
+    }
+
     /// Create a new commit (id is set to `None` until serialized and hashed)
     pub fn new(t: i64, flakes: Vec<Flake>) -> Self {
         Self {
@@ -240,6 +276,7 @@ impl Commit {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            redaction: None,
         }
     }
 

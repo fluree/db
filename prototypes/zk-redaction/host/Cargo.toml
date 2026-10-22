@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 methods = { path = "../methods" }
 risc0-zkvm = { version = "^3.0.6" }
-zk-redaction-core = { path = "../core", features = ["host-sha"] }
+fluree-db-redaction = { path = "../../../fluree-db-redaction", features = ["host-sha"] }
 fluree-db-core = { path = "../../../fluree-db-core", features = ["credential"] }
 fluree-db-credential = { path = "../../../fluree-db-credential" }
 serde = { version = "1", features = ["derive"] }

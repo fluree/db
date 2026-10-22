@@ -7,7 +7,7 @@ mod common;
 
 use common::{read_frame, ZkSha};
 use risc0_zkvm::guest::env;
-use zk_redaction_core::{chain_link, ChainClaim};
+use fluree_db_redaction::{chain_link, ChainClaim};
 
 fn main() {
     let commit = read_frame();

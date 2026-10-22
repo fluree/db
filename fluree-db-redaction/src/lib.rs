@@ -585,7 +585,12 @@ fn original_signers<H: Sha256>(
     }
 }
 
-#[cfg(not(feature = "c-zstd"))]
+#[cfg(not(any(feature = "c-zstd", feature = "rust-zstd")))]
+fn decompress(_: &[u8]) -> Result<Vec<u8>> {
+    Err(Error::Malformed("this build decompresses no commits"))
+}
+
+#[cfg(all(feature = "rust-zstd", not(feature = "c-zstd")))]
 fn decompress(section: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(section)
         .map_err(|_| Error::Malformed("ops section is not zstd"))?;
@@ -901,30 +906,6 @@ pub fn redact_with<H: Sha256, P: Probe>(
         removed_terms,
     };
     Ok((replacement, statement))
-}
-
-/// A replacement's surviving operations by slot, and its dictionaries, for
-/// inspection.
-pub struct ReplacementView {
-    pub original_cid: Vec<u8>,
-    pub envelope: Vec<u8>,
-    pub slots: Vec<Option<Vec<u8>>>,
-    pub dicts: Vec<Vec<Option<Vec<u8>>>>,
-    pub signers: Vec<String>,
-}
-
-pub fn view_replacement(blob: &[u8]) -> Result<ReplacementView> {
-    let c = read_replacement(blob)?;
-    let owned = |entries: &[Option<&[u8]>]| -> Vec<Option<Vec<u8>>> {
-        entries.iter().map(|e| e.map(<[u8]>::to_vec)).collect()
-    };
-    Ok(ReplacementView {
-        original_cid: c.original_cid,
-        envelope: c.envelope.to_vec(),
-        slots: owned(&c.slots),
-        dicts: c.dicts.iter().map(|d| owned(d)).collect(),
-        signers: c.signers,
-    })
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,33 @@
+[package]
+name = "fluree-db-redaction"
+description = "The v4 commit redaction transform, shared by the zkVM guest that proves it and the verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Plain dependencies, not workspace ones: the zkVM guest builds this crate
+# from its own workspace.
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+ruzstd = { version = "0.8", optional = true }
+ed25519-dalek = { version = "2.1", default-features = false }
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", optional = true }
+zstd-safe = { version = "7.2", default-features = false, features = ["std"], optional = true }
+
+[features]
+default = ["rust-zstd"]
+# Hash with the `sha2` crate (host side); the guest supplies the zkVM's
+# accelerated SHA-256 instead.
+host-sha = ["dep:sha2"]
+# Decompress original commits with `ruzstd`, or with the reference C zstd
+# decoder. Without either, only uncompressed commits and replacements are
+# read.
+rust-zstd = ["dep:ruzstd"]
+c-zstd = ["dep:zstd-safe"]
+
+[dev-dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["credential"] }
+fluree-db-credential = { path = "../fluree-db-credential" }
+sha2 = "0.10"

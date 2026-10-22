@@ -375,7 +375,7 @@ async fn discover_commit(
     }
 
     let mut asserted: HashSet<FactKey> = HashSet::new();
-    for (slot, flake) in commit.flakes.iter().enumerate() {
+    for (slot, flake) in commit.occurrences() {
         let Some(g_id) = ctx.g_id(&flake.g) else {
             continue;
         };
@@ -435,7 +435,7 @@ async fn discover_commit(
                 Entry {
                     due_ms,
                     occurrence_t: t,
-                    occurrence_slot: slot as u32,
+                    occurrence_slot: slot,
                     source,
                     generation_t: t,
                     reifier: instruction.map(|i| i.reifier),

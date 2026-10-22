@@ -147,10 +147,11 @@ impl Fluree {
             // Every commit up to the head, oldest first, with its flakes.
             let mut cids = collect_first_parent_cids(store.as_ref(), &head, 0).await?;
             cids.reverse();
-            let mut commits: Vec<(i64, ContentId, Vec<Flake>)> = Vec::with_capacity(cids.len());
+            let mut commits: Vec<(i64, ContentId, fluree_db_core::Commit)> =
+                Vec::with_capacity(cids.len());
             for (t, cid) in cids {
                 let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                commits.push((t, cid, commit.flakes));
+                commits.push((t, cid, commit));
             }
 
             let selectors: Vec<(Option<Sid>, Sid, Sid, Option<FlakeValue>)> = request
@@ -164,13 +165,13 @@ impl Fluree {
                     .commit
                     .parse()
                     .map_err(|_| ApiError::http(400, format!("not a commit id: {}", occ.commit)))?;
-                let Some((_, _, flakes)) = commits.iter().find(|(_, c, _)| *c == cid) else {
+                let Some((_, _, commit)) = commits.iter().find(|(_, c, _)| *c == cid) else {
                     return Err(ApiError::CommitNotFound(format!(
                         "commit {} is not in {ledger_id}'s history",
                         occ.commit
                     )));
                 };
-                let Some(flake) = flakes.get(occ.slot as usize) else {
+                let Some(flake) = commit.at_slot(occ.slot) else {
                     return Err(ApiError::http(
                         400,
                         format!("commit {} has no operation {}", occ.commit, occ.slot),
@@ -181,9 +182,8 @@ impl Fluree {
                     flake: flake.clone(),
                 });
             }
-            for (t_index, (_, cid, flakes)) in commits.iter().enumerate() {
-                let _ = t_index;
-                for (slot, flake) in flakes.iter().enumerate() {
+            for (_, cid, commit) in &commits {
+                for (slot, flake) in commit.occurrences() {
                     if selectors.iter().any(|(g, s, p, o)| {
                         flake.g == *g
                             && flake.s == *s
@@ -193,7 +193,7 @@ impl Fluree {
                         located.push(Located {
                             occurrence: OccurrenceRef {
                                 commit: cid.to_string(),
-                                slot: slot as u32,
+                                slot,
                             },
                             flake: flake.clone(),
                         });
@@ -279,7 +279,7 @@ impl Fluree {
                             .and_then(|r| r.commit_head_id.clone());
                         if let Some(cid) = retraction {
                             let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                            for (slot, flake) in commit.flakes.iter().enumerate() {
+                            for (slot, flake) in commit.occurrences() {
                                 if !flake.op
                                     && current.iter().any(|c| FactKey::of(c) == FactKey::of(flake))
                                 {
@@ -290,7 +290,7 @@ impl Fluree {
                                     located.push(Located {
                                         occurrence: OccurrenceRef {
                                             commit: cid.to_string(),
-                                            slot: slot as u32,
+                                            slot,
                                         },
                                         flake: flake.clone(),
                                     });
@@ -377,10 +377,12 @@ impl Fluree {
 }
 
 /// Each fact's assertions and retractions, in commit order.
-fn fact_events(commits: &[(i64, ContentId, Vec<Flake>)]) -> HashMap<FactKey, Vec<(i64, bool)>> {
+fn fact_events(
+    commits: &[(i64, ContentId, fluree_db_core::Commit)],
+) -> HashMap<FactKey, Vec<(i64, bool)>> {
     let mut events: HashMap<FactKey, Vec<(i64, bool)>> = HashMap::new();
-    for (t, _, flakes) in commits {
-        for flake in flakes {
+    for (t, _, commit) in commits {
+        for flake in &commit.flakes {
             events
                 .entry(FactKey::of(flake))
                 .or_default()

@@ -8,7 +8,7 @@ use fluree_db_core::{Commit, ContentId, ContentKind, Flake, FlakeMeta, FlakeValu
 use methods::{AUTHENTICATE_ELF, AUTHENTICATE_ID, CHAIN_ELF, CHAIN_ID, REDACT_ELF, REDACT_ID};
 use risc0_zkvm::{default_executor, default_prover, ExecutorEnv, ProverOpts, Receipt};
 use serde::{Deserialize, Serialize};
-use zk_redaction_core::{
+use fluree_db_redaction::{
     audit_path, check_exposed, commit_cid, leaf_hash, leaf_salt, leaf_salts, leaves,
     root_from_path, verify_exposed_signatures, ChainClaim, CommitClaim, HostSha, Sha256,
     Signatures, Statement, CLAIM_VERSION, SALT_LEN, TRANSFORM_VERSION,

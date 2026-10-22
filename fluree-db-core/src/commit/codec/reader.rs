@@ -170,6 +170,7 @@ pub(crate) fn read_commit_v4(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         txn_meta: envelope.txn_meta,
         graph_delta: envelope.graph_delta,
         ns_split_mode: envelope.ns_split_mode,
+        redaction: None,
     })
 }
 

@@ -9,11 +9,11 @@ edition = "2021"
 # Decompress with the reference C zstd decoder (see the core's `c-zstd`):
 # about 30% fewer cycles than `ruzstd` in the guest.
 default = ["c-zstd"]
-c-zstd = ["zk-redaction-core/c-zstd"]
+c-zstd = ["fluree-db-redaction/c-zstd"]
 
 [dependencies]
 risc0-zkvm = { version = "^3.0.6", default-features = false, features = ["std"] }
-zk-redaction-core = { path = "../../core" }
+fluree-db-redaction = { path = "../../../../fluree-db-redaction", default-features = false }
 
 # The zkVM's accelerated curve25519 arithmetic for Ed25519 verification,
 # over its accelerated big-integer arithmetic.

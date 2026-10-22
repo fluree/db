@@ -2,7 +2,7 @@
 # workspace so RISC Zero never enters normal runtime dependencies.
 [workspace]
 resolver = "2"
-members = ["core", "host", "methods"]
+members = ["host", "methods"]
 
 [profile.dev]
 opt-level = 3

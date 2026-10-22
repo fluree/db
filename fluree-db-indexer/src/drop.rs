@@ -274,6 +274,7 @@ mod tests {
             namespace_delta: std::collections::HashMap::new(),
             txn_signature: None,
             commit_signatures: Vec::new(),
+            redaction: None,
             txn_meta: Vec::new(),
             graph_delta: std::collections::HashMap::new(),
             ns_split_mode: None,

@@ -3,7 +3,7 @@
 
 use risc0_zkvm::guest::env;
 use risc0_zkvm::sha::{Impl, Sha256 as _};
-use zk_redaction_core::{Probe, Sha256};
+use fluree_db_redaction::{Probe, Sha256};
 
 pub struct ZkSha;
 

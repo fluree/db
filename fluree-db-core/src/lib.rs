@@ -108,8 +108,8 @@ pub use commit::{
     load_commit_by_id, load_commit_envelope_by_id, plan_commit_transfer, plan_commit_transfer_page,
     trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id,
     walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitSummary, CommitTransferPage,
-    CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry, TxnMetaValue,
-    TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, Redaction, TxnMetaEntry,
+    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;

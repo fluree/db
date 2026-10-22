@@ -21,7 +21,7 @@ use host::{
     peak_rss_kib, prove_authenticate, prove_with, verify_chain, verify_disclosure, LEDGER,
 };
 use serde_json::json;
-use zk_redaction_core::{commit_cid, redact, redact_with, HostSha, Sha256, Signatures};
+use fluree_db_redaction::{commit_cid, redact, redact_with, HostSha, Sha256, Signatures};
 
 struct Scenario {
     name: &'static str,

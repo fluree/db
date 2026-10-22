@@ -3,7 +3,7 @@
 //! it cannot vouch for.
 
 use host::{commit_blob, execute, image_id, prove, verify_chain, verify_step, Expectation, LEDGER};
-use zk_redaction_core::{commit_cid, redact, HostSha, Sha256};
+use fluree_db_redaction::{commit_cid, redact, HostSha, Sha256};
 
 #[test]
 fn the_guest_refuses_a_tampered_or_misattributed_signed_commit() {
@@ -88,7 +88,7 @@ fn a_chain_verifies_only_back_to_its_anchored_original() {
 #[test]
 fn a_disclosure_verifies_only_against_its_commit() {
     use host::{authenticate_image_id, disclose, new_seed, prove_authenticate, verify_disclosure};
-    use zk_redaction_core::Signatures;
+    use fluree_db_redaction::Signatures;
     let input = commit_blob(16, true, false, false);
     let seed = new_seed();
     let (receipt, claim, ..) =

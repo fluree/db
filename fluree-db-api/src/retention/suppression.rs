@@ -364,8 +364,7 @@ impl Fluree {
             out.push(match commit {
                 Some(None) => RemovalSubject::Absent,
                 Some(Some(c)) => c
-                    .flakes
-                    .get(removal.slot as usize)
+                    .at_slot(removal.slot)
                     .map_or(RemovalSubject::Unknown, |f| {
                         RemovalSubject::Known(f.s.clone())
                     }),

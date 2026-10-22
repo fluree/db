@@ -22,7 +22,8 @@ trustworthy time anchor: a timestamp inside a commit proves only what was record
 ### Redaction
 
 The guest reads a commit blob, either an original V4 commit or a previous replacement, and the
-slots to remove. It runs the transform in `core` and commits a `Statement`:
+slots to remove. It runs the transform in `fluree-db-redaction` (a workspace crate since PR 5A;
+the prototype began with it as `core`) and commits a `Statement`:
 
 | Field | Meaning |
 |---|---|
@@ -140,8 +141,8 @@ covers the whole chain.
 
 ```sh
 # Core tests, against Fluree's own commit writer and reader (any machine):
-cargo test -p zk-redaction-core --features host-sha
-cargo test -p zk-redaction-core --features host-sha,c-zstd
+cargo test -p fluree-db-redaction --features host-sha          # from the repository root
+cargo test -p fluree-db-redaction --features host-sha,c-zstd
 
 # Guests, host and proofs (Linux x86-64; installs risc0 3.0.6):
 curl -L https://risczero.com/install | bash && rzup install
@@ -161,9 +162,9 @@ target/release/host chain 4 1000          # four linked 1,000-operation commits
 
 `RISC0_SKIP_BUILD=1 cargo check -p host` checks the host without building the guests.
 
-The guests decompress with the reference C zstd decoder (the core's `c-zstd` feature, on by
-default in `methods/guest`), linked against a C allocator over the guest's own. The host
-predicts every statement with `ruzstd`, and `host prove` checks that the two agree.
+The guests decompress with the reference C zstd decoder (`fluree-db-redaction`'s `c-zstd`
+feature, on by default in `methods/guest`), linked against a C allocator over the guest's own.
+The host predicts every statement with `ruzstd`, and `host prove` checks that the two agree.
 
 Scenarios (`host/src/main.rs`) build commits with Fluree's `write_commit`. Operations mix plain
 and language-tagged strings, numbers, references, list indexes, a named graph, and retractions.
@@ -182,7 +183,7 @@ and language-tagged strings, numbers, references, list indexes, a named graph, a
 
 ## Coverage
 
-`core/tests/redact.rs` (8 tests) decodes every replacement back through `fluree-db-core`'s
+`fluree-db-redaction/tests/redact.rs` (8 tests) decodes every replacement back through `fluree-db-core`'s
 `read_commit` and compares it with the original minus the removed slots. The tests cover:
 
 - compressed and uncompressed commits;
@@ -195,7 +196,7 @@ and language-tagged strings, numbers, references, list indexes, a named graph, a
 - invalid slots are refused;
 - the replacement is deterministic.
 
-`core/tests/authenticate.rs` (5 tests):
+`fluree-db-redaction/tests/authenticate.rs` (5 tests):
 
 - a claim names the commit's CID and parents as Fluree reads them, including merge parents and
   transaction metadata;
