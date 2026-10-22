@@ -359,6 +359,33 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
     source_branch: &str,
     at_commit: Option<(ContentId, i64)>,
 ) -> Result<NsRecord> {
+    create_branch_with(
+        store,
+        name,
+        new_branch,
+        source_branch,
+        at_commit,
+        |_| async { Ok(()) },
+    )
+    .await
+}
+
+/// [`create_branch`], running `prepare` with the new record's fence once the
+/// record is in and before the listing is confirmed: what nothing may read
+/// the branch without. A `prepare` that fails rolls the create back.
+pub async fn create_branch_with<S, F, Fut>(
+    store: &S,
+    name: &LedgerName,
+    new_branch: &str,
+    source_branch: &str,
+    at_commit: Option<(ContentId, i64)>,
+    prepare: F,
+) -> Result<NsRecord>
+where
+    S: LifecycleStore + ?Sized,
+    F: FnOnce(Fence) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let new_id = name.with_branch(new_branch)?;
     let source_id = name.with_branch(source_branch)?;
 
@@ -418,7 +445,10 @@ pub async fn create_branch<S: LifecycleStore + ?Sized>(
         None => (source.commit_head_id.clone(), source.commit_t),
     };
     let confirmed = match insert_fenced(store, &record).await {
-        Ok(()) => confirm_branch(store, name, new_branch, fence).await,
+        Ok(()) => match prepare(fence).await {
+            Ok(()) => confirm_branch(store, name, new_branch, fence).await,
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     if let Err(e) = confirmed {
@@ -1746,6 +1776,42 @@ mod tests {
         assert_eq!(report.quarantined, refused);
         let mydb = store.get_binding("mydb").await.unwrap().unwrap().value;
         assert!(mydb.listing("main").is_some() && mydb.listing("feature#1").is_none());
+    }
+
+    /// What a branch must hold is in before anything reads it: `prepare`
+    /// runs while the branch is not shown, and one that fails rolls the
+    /// create back.
+    #[tokio::test]
+    async fn a_branch_is_prepared_before_it_shows() {
+        let store = MemoryNameService::new();
+        let name = LedgerName::parse("mydb").unwrap();
+        create_ledger(&store, &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
+        create_branch_with(&store, &name, "dev", "main", None, |fence| {
+            let store = &store;
+            async move {
+                let binding = store.get_binding("mydb").await?.unwrap().value;
+                assert!(!binding.shows("dev"), "shown before it was prepared");
+                let record = store.raw_record("mydb:dev").await?.unwrap();
+                assert_eq!(record.fence, Some(fence));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.shows("dev"));
+
+        let err = create_branch_with(&store, &name, "feature", "main", None, |_| async {
+            Err(NameServiceError::storage("not prepared"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not prepared"), "{err}");
+        let binding = store.get_binding("mydb").await.unwrap().unwrap().value;
+        assert!(binding.listing("feature").is_none());
+        assert!(store.raw_record("mydb:feature").await.unwrap().is_none());
     }
 
     /// A drop or restore whose dropped-ledger entry the store cannot hold is

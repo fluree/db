@@ -293,12 +293,24 @@ impl Fluree {
 
         // The binding lists the branch with its own fence.
         let name = fluree_db_core::LedgerName::parse(ledger_name)?;
-        let new_fence = fluree_db_nameservice::lifecycle::create_branch(
-            self.publisher()?,
+        let publisher = self.publisher()?;
+        let (from, to) = (source_id.as_ref(), new_id.as_ref());
+        let new_fence = fluree_db_nameservice::lifecycle::create_branch_with(
+            publisher,
             &name,
             new_branch,
             source,
             at_commit,
+            // The branch holds the source's history, so it serves it as the
+            // source does: without what the source's journal removed. Copied
+            // before the branch is listed, so nothing reads it without.
+            |fence| async move {
+                crate::retention::registry::inherit(publisher, from, to, Some(fence))
+                    .await
+                    .map_err(|e| {
+                        NameServiceError::Storage(format!("the source's removal journal: {e}"))
+                    })
+            },
         )
         .await
         .map(|record| record.fence)
@@ -306,15 +318,6 @@ impl Fluree {
             NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
             other => other.into(),
         })?;
-        // The branch holds the source's history, so it serves it as the
-        // source does: without what the source's journal removed.
-        crate::retention::registry::inherit(
-            self.publisher()?,
-            source_id.as_ref(),
-            new_id.as_ref(),
-            new_fence,
-        )
-        .await?;
 
         // Historical branches replay from genesis — skip the index copy.
         // The source's current index reflects HEAD, which is too fresh.
@@ -731,6 +734,49 @@ mod tests {
 
     async fn version(store: &MemoryNameService) -> Option<u64> {
         store.get_binding("slow").await.unwrap().map(|v| v.version)
+    }
+
+    /// A branch is never shown without its source's removal journal: one
+    /// whose journal cannot be copied is not made.
+    #[tokio::test]
+    async fn a_branch_whose_journal_cannot_be_copied_is_not_made() {
+        use fluree_db_nameservice::ConfigValue;
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        fluree.create_ledger("t/journal").await.unwrap();
+        fluree
+            .graph("t/journal:main")
+            .transact()
+            .insert(
+                &serde_json::json!({"@id": "http://example.org/a", "http://example.org/p": "v"}),
+            )
+            .commit()
+            .await
+            .unwrap();
+        // The source's registration, unreadable.
+        let ns = fluree.publisher().unwrap();
+        let record = ns.lookup("t/journal:main").await.unwrap().unwrap();
+        let current = ns.get_config("t/journal:main").await.unwrap();
+        let mut payload = current
+            .as_ref()
+            .and_then(|c| c.payload.clone())
+            .unwrap_or_default();
+        payload.extra.insert(
+            crate::retention::registry::EXTRA_KEY.to_string(),
+            serde_json::json!("unreadable"),
+        );
+        let next = ConfigValue::new(current.as_ref().map_or(0, |c| c.v) + 1, Some(payload));
+        ns.push_config_fenced("t/journal:main", record.fence, current.as_ref(), &next)
+            .await
+            .unwrap();
+
+        let made = fluree.create_branch("t/journal", "dev", None, None).await;
+        assert!(made.is_err(), "{made:?}");
+        assert!(fluree
+            .nameservice()
+            .lookup("t/journal:dev")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// The claim moves while the work runs, and the create can activate
