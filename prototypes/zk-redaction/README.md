@@ -194,14 +194,17 @@ the numbers can be checked against any target, here is the arithmetic for one is
 | 10,000 operations, unsigned | 81 min | 17 |
 | 50,000 operations, unsigned (extrapolated) | ~7 h | ~3 |
 
-A removal needs one proof per commit holding an occurrence; a fact asserted once and retracted
-once is two. Proofs of different commits are independent, so capacity scales with provers.
-Assume a 30-day completion target, removals of facts in signed 1,000-operation commits at two
-commits each, and one prover. That handles about 47 removals a day; below that rate a removal
-completes in hours, not days. A removal touching a 50,000-operation import commit costs about
-7 prover-hours by itself.
+These are service times, not completion guarantees. A removal needs one proof per commit
+holding an occurrence; a fact asserted once and retracted once is two. Proofs of different
+commits are independent, so capacity scales with provers. With removals in signed
+1,000-operation commits at two commits each, one prover's theoretical ceiling is about 47
+removals a day, at which it is fully busy. How long a removal waits then depends on bursts,
+backlog, retries and how many commits each request touches, none of which this prototype
+models. A removal touching a 50,000-operation import commit occupies a prover for about 7 hours
+by itself.
 
-Verdict: proving per erasure request with SHA-256, as the plan proposes, is feasible at low
-request rates (tens a day per prover), provided proving runs apart from transactions. The
-gate is not passed: it needs recorded targets, and a transaction-isolation measurement under
-those targets. PR 5 is not started.
+Verdict: proving per erasure request with SHA-256, batching each commit's removals into one
+proof, is feasible as a background operation, provided proving runs apart from transactions.
+The gate is not passed. It needs recorded targets — the commit-size and signature mix, commits
+touched per request, arrival bursts, a completion percentile and a resource budget — and a
+measurement of the isolated deployment against them. PR 5 is not started.
