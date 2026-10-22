@@ -2715,8 +2715,12 @@ impl crate::Fluree {
             ..Default::default()
         });
         crate::warn_if_staging_plaintext(&self.backend, &indexer_config);
+        // Branch-aware: a branch's history runs through its source's commits.
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+            .await?;
         let index_result = rebuild_index_from_commits_with_tracker(
-            self.content_store(&record.storage_namespace()),
+            store,
             reindex_tracker,
             &ledger_id,
             &record,
