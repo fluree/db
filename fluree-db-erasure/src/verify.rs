@@ -9,11 +9,10 @@ use risc0_zkvm::{InnerReceipt, Receipt, VerifierContext};
 /// guest adds its id here; an id is removed only when no stored proof uses
 /// it. See `fluree-prover/README.md` for the build each one records.
 pub const REDACT_IMAGE_IDS: &[[u32; 8]] = &[
-    // Transform version 1: risc0 3.0.6 (rzup toolchain), Ubuntu 24.04
-    // x86-64, built in /home/ubuntu/ab/cur/fluree-prover.
+    // Transform version 1: risc0 3.0.6, guest builder r0.1.97.0 (by digest).
     [
-        0xb65d483f, 0x663c0c70, 0x5295b1af, 0x0174d2ca, 0x0cb2c76c, 0x42b2fe01, 0x7f3e400d,
-        0x6ab7446d,
+        0x3d5e870e, 0x231cd031, 0xcbd6b000, 0xd7217a70, 0x2b332819, 0x64bcc77a, 0xa9964401,
+        0xeb16df1b,
     ],
 ];
 
