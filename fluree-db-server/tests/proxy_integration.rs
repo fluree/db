@@ -4167,3 +4167,105 @@ async fn test_proxy_peer_forwards_a_write() {
     assert_eq!(ledger.t(), 1);
     server_handle.abort();
 }
+
+/// A peer forwards removal and erasure requests to the transaction server,
+/// which writes them. Run on the peer, a removal would have no writer and an
+/// erasure no file storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_forwards_removal_and_erasure() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        // Never run: acceptance does not wait for a proof.
+        erasure_prover: Some(tmp.path().join("no-prover")),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "peerrm:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let insert = client
+        .post(format!("{server_url}/v1/fluree/insert/peerrm:main"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({"@graph": [
+                {"@id": "http://example.org/alice", "http://example.org/email": "a@x"},
+                {"@id": "http://example.org/bob", "http://example.org/email": "b@x"}
+            ]})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("insert");
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+    for (route, subject) in [("remove", "alice"), ("erase", "bob")] {
+        let body = serde_json::json!({"matching": [{
+            "subject": format!("http://example.org/{subject}"),
+            "predicate": "http://example.org/email"
+        }]});
+        let resp = peer_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/{route}/peerrm:main"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+    }
+
+    let registration = state
+        .fluree
+        .retention_status("peerrm:main")
+        .await
+        .expect("status")
+        .registration
+        .expect("registration");
+    let requests: std::collections::BTreeSet<&str> = registration
+        .journal
+        .removals
+        .iter()
+        .map(|r| r.request_id.as_str())
+        .collect();
+    assert_eq!(requests.len(), 2, "{registration:?}");
+    assert_eq!(registration.erasures.len(), 1, "{registration:?}");
+    server_handle.abort();
+}

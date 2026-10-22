@@ -1055,14 +1055,19 @@ pub async fn info_ledger_tail(
 
 /// Remove selected occurrences from what a ledger serves: current and
 /// historical application queries stop returning them, and raw commits that
-/// hold them become audit data. Admin-protected.
+/// hold them become audit data. Admin-protected; a peer forwards it to the
+/// transaction server.
 ///
 /// POST /fluree/remove/<ledger...>
 pub async fn remove_occurrences_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Json(request): Json<fluree_db_api::retention::RemovalRequest>,
+    request: Request,
 ) -> Result<Response> {
+    if state.config.server_role == ServerRole::Peer {
+        return Ok(forward_write_request(&state, request).await);
+    }
+    let request: fluree_db_api::retention::RemovalRequest = json_body(request).await?;
     let cell = Arc::new(std::sync::OnceLock::new());
     let _ = cell.set(Arc::clone(&state.committer));
     let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
@@ -1078,15 +1083,20 @@ pub async fn remove_occurrences_tail(
 /// branch holding them serves at once, the request's authorization is
 /// committed, and the affected commits are replaced by proved redactions in
 /// the background (see the retention status). Admin-protected; the admin
-/// token's identity is recorded as the requester.
+/// token's identity is recorded as the requester. A peer forwards it to the
+/// transaction server.
 ///
 /// POST /fluree/erase/<ledger...>
 pub async fn erase_occurrences_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
     principal: Option<axum::Extension<crate::routes::admin_auth::AdminPrincipal>>,
-    Json(request): Json<fluree_db_api::retention::erasure::ErasureRequest>,
+    request: Request,
 ) -> Result<Response> {
+    if state.config.server_role == ServerRole::Peer {
+        return Ok(forward_write_request(&state, request).await);
+    }
+    let request: fluree_db_api::retention::erasure::ErasureRequest = json_body(request).await?;
     let cell = Arc::new(std::sync::OnceLock::new());
     let _ = cell.set(Arc::clone(&state.committer));
     let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
@@ -2645,6 +2655,15 @@ pub async fn revert_preview(
 }
 
 /// Forward a transaction request to the transaction server (peer mode)
+/// The JSON body of `request`.
+async fn json_body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T> {
+    let bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))
+}
+
 pub(super) async fn forward_write_request(state: &AppState, request: Request) -> Response {
     let client = match state.forwarding_client.as_ref() {
         Some(c) => c,
