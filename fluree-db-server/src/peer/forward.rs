@@ -4,7 +4,7 @@
 //! preserving headers (except hop-by-hop) and returning the response.
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{OriginalUri, Request};
 use axum::response::{IntoResponse, Response};
 use fluree_db_consensus::http::is_hop_by_hop;
 use http::{header::HeaderMap, Method, StatusCode};
@@ -40,7 +40,11 @@ impl ForwardingClient {
     /// The `Authorization` header IS forwarded to support downstream auth.
     pub async fn forward(&self, request: Request) -> Result<Response, ForwardingError> {
         let method = request.method().clone();
-        let uri = request.uri().clone();
+        // A nested router strips its prefix (`/v1/fluree`) from the URI.
+        let uri = request
+            .extensions()
+            .get::<OriginalUri>()
+            .map_or_else(|| request.uri().clone(), |original| original.0.clone());
         let headers = request.headers().clone();
 
         // Build target URL
