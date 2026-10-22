@@ -583,6 +583,17 @@ impl crate::BranchRecordStore for CompositeNameService {
         self.local.freeze_record(ledger_id, fence).await
     }
 
+    async fn thaw_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        if let Some(err) = self.reject_mounted_write(ledger_id) {
+            return Err(err);
+        }
+        self.local.thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(
         &self,
         ledger_id: &str,

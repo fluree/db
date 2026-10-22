@@ -220,19 +220,26 @@ impl Fluree {
         Ok(retraction.map(|(t, _)| t))
     }
 
-    /// Ready a branch restored from a drop whose entry kept no configs (made
-    /// before drops kept them), not yet visible: its removal journal comes
-    /// back from its lineage's checkpoint, as for an archive restored with
-    /// no retention. What else its registration held is gone.
-    pub(crate) async fn restore_dropped_retention(&self, record: &NsRecord) -> Result<()> {
-        let Some(lineage) = self
-            .ledger_lineage(record, &Registration::default())
-            .await?
-        else {
-            return Ok(());
-        };
-        self.restore_retention(record, None, Some(&lineage)).await?;
-        Ok(())
+    /// The lineage of a ledger restored from a drop, not yet visible: the
+    /// one a restored branch's registration records, or its root branch's
+    /// genesis commit.
+    pub(crate) async fn restored_lineage(
+        &self,
+        records: &[NsRecord],
+        root_branch: &str,
+    ) -> Result<Option<ContentId>> {
+        let ns = self.publisher()?;
+        for record in records {
+            if let Some(registration) = registry::read(ns, record.ledger_id.as_str()).await?.1 {
+                if registration.lineage.is_some() {
+                    return self.ledger_lineage(record, &registration).await;
+                }
+            }
+        }
+        match records.iter().find(|r| r.branch == root_branch) {
+            Some(root) => self.ledger_lineage(root, &Registration::default()).await,
+            None => Ok(None),
+        }
     }
 
     /// The record of `pending`, a ledger not yet visible, as the restore has

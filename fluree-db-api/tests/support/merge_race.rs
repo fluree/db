@@ -376,6 +376,14 @@ impl fluree_db_nameservice::BranchRecordStore for PausingNameService {
         self.inner.freeze_record(ledger_id, fence).await
     }
 
+    async fn thaw_record(
+        &self,
+        ledger_id: &str,
+        fence: fluree_db_nameservice::Fence,
+    ) -> Result<fluree_db_nameservice::FenceOutcome> {
+        self.inner.thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(
         &self,
         ledger_id: &str,

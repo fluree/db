@@ -945,6 +945,20 @@ where
         .await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let (main, index) = (self.ns_key(&name, &branch), self.index_key(&name, &branch));
+        ns_cas::thaw_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let (name, branch) = split_ledger_id(ledger_id)?;
         ns_cas::delete_record(&self.storage, &self.ns_key(&name, &branch), fence).await

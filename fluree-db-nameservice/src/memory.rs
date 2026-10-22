@@ -303,6 +303,18 @@ impl BranchRecordStore for MemoryNameService {
         })
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let key = LedgerId::parse(ledger_id)?;
+        Ok(match self.records.write().get_mut(&key) {
+            None => FenceOutcome::Missing,
+            Some(record) if record.fence != Some(fence) => FenceOutcome::Mismatch,
+            Some(record) => {
+                record.frozen = false;
+                FenceOutcome::Applied
+            }
+        })
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let key = LedgerId::parse(ledger_id)?;
         let mut records = self.records.write();

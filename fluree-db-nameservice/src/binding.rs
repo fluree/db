@@ -431,6 +431,10 @@ pub trait BranchRecordStore: Debug + Send + Sync {
     /// Mark the record frozen, if it carries `fence`.
     async fn freeze_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
 
+    /// Clear the record's frozen mark, if it carries `fence`: a drop that
+    /// froze it and wrote nothing else is undone.
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;
+
     /// Delete the record and everything stored with it, if it carries
     /// `fence`.
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome>;

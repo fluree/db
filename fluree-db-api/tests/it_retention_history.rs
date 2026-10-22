@@ -1812,3 +1812,54 @@ async fn a_restore_of_an_entry_without_configs_takes_the_journal_from_the_checkp
         read(&fluree, &id, at_t1, "ex:alice", "ex:email").await
     ));
 }
+
+/// A soft-dropped ledger, restored, refuses what another copy of it
+/// removed while it was dropped: the lineage's checkpoint is merged into
+/// the configs its drop kept, and the value retracted where still current.
+#[tokio::test]
+async fn a_restored_ledger_takes_removals_made_on_another_copy_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let source = ledger(&fluree, "it/restore-copy-source").await;
+    let t1 = insert(
+        &fluree,
+        &source,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&source, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/restore-copy-other", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let instance = fluree
+        .drop_ledger("it/restore-copy-source", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    fluree
+        .remove_occurrences(&copy, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+
+    fluree.restore_dropped(instance.as_str()).await.unwrap();
+    let at_t1 = json!(format!("{source}@t:{t1}"));
+    assert!(unavailable(
+        read(&fluree, &source, at_t1, "ex:alice", "ex:email").await
+    ));
+    assert!(
+        read(&fluree, &source, json!(source), "ex:alice", "ex:email")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

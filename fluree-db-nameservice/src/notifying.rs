@@ -607,6 +607,14 @@ where
         Ok(outcome)
     }
 
+    async fn thaw_record(
+        &self,
+        ledger_id: &str,
+        fence: crate::Fence,
+    ) -> Result<crate::FenceOutcome> {
+        self.inner.thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(
         &self,
         ledger_id: &str,

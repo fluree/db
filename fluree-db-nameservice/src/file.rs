@@ -951,6 +951,19 @@ impl BranchRecordStore for FileNameService {
         .await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let (main, index) = Self::record_keys(ledger_id)?;
+        ns_cas::thaw_record(
+            &self.storage,
+            RecordKeys {
+                main: &main,
+                index: &index,
+            },
+            fence,
+        )
+        .await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let (main, _) = Self::record_keys(ledger_id)?;
         ns_cas::delete_record(&self.storage, &main, fence).await

@@ -228,7 +228,9 @@ pub(crate) async fn archived<N: fluree_db_nameservice::ConfigLookup + ?Sized>(
 /// with the journal the lineage's checkpoint holds merged in, so a copy
 /// restored from an archive made before a removal still refuses it. Its
 /// expiry schedule is rebuilt from its commits, and its index history
-/// compacted again. Nothing is registered when neither has anything.
+/// compacted again. Nothing is registered when neither has anything. A
+/// registration the restore already reinstated (a soft-dropped ledger's)
+/// is kept, and takes what the journal adds to its own.
 pub(crate) async fn restore(
     ns: &dyn NameServicePublisher,
     record: &fluree_db_nameservice::NsRecord,
@@ -243,20 +245,30 @@ pub(crate) async fn restore(
     if let Some(checkpoint) = &checkpoint {
         journal.merge(checkpoint);
     }
-    if archived.is_none() && journal.is_empty() {
-        return Ok(None);
-    }
     let active_since_t = archived.as_ref().map_or(1, |a| a.active_since_t);
-    let registration = Registration {
+    let fresh = (archived.is_some() || !journal.is_empty()).then(|| Registration {
         active_since_t,
         watermark_t: active_since_t - 1,
-        journal,
+        journal: journal.clone(),
         lineage: lineage.map(str::to_string),
         ..Default::default()
-    };
-    update_fenced(ns, record.ledger_id.as_str(), record.fence, |_| {
-        Some(registration.clone())
-    })
-    .await?;
-    Ok(Some(registration))
+    });
+    update_fenced(
+        ns,
+        record.ledger_id.as_str(),
+        record.fence,
+        |current| match current {
+            Some(current) => {
+                let mut next = current.clone();
+                let merged = next.journal.merge(&journal);
+                let adopted = next.lineage.is_none() && lineage.is_some();
+                if adopted {
+                    next.lineage = lineage.map(str::to_string);
+                }
+                (merged || adopted).then_some(next)
+            }
+            None => fresh.clone(),
+        },
+    )
+    .await
 }

@@ -130,6 +130,10 @@ impl<S: LifecycleStore> BranchRecordStore for PausedBeforeInsert<'_, S> {
         self.inner.freeze_record(ledger_id, fence).await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        self.inner.thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         self.inner.delete_record(ledger_id, fence).await
     }
@@ -379,6 +383,35 @@ pub async fn an_entry_without_configs_restores_with_none<S: LifecycleStore>(stor
         .unwrap();
     let restored = store.get_config("mydb:main").await.unwrap();
     assert!(restored.is_none_or(|c| c.payload.is_none()));
+}
+
+/// Thawing a frozen record admits its writes again, and only under its
+/// fence.
+pub async fn a_thawed_record_takes_writes_again<S: LifecycleStore>(store: &S) {
+    let created = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let fence = created.fence.unwrap();
+    assert_eq!(
+        store.freeze_record("mydb:main", fence).await.unwrap(),
+        FenceOutcome::Applied
+    );
+    assert!(store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+    assert_eq!(
+        store
+            .thaw_record("mydb:main", Fence::generate())
+            .await
+            .unwrap(),
+        FenceOutcome::Mismatch
+    );
+    assert_eq!(
+        store.thaw_record("mydb:other", fence).await.unwrap(),
+        FenceOutcome::Missing
+    );
+    assert_eq!(
+        store.thaw_record("mydb:main", fence).await.unwrap(),
+        FenceOutcome::Applied
+    );
+    assert!(!store.raw_record("mydb:main").await.unwrap().unwrap().frozen);
+    set_config(store, "mydb:main", 6).await;
 }
 
 /// Restoring into a name another ledger now holds is refused, and the dropped
@@ -2072,6 +2105,7 @@ where
     restore_keeps_branch_configs(&make().await).await;
     an_interrupted_restore_shows_no_branch_without_its_config(&make().await).await;
     an_entry_without_configs_restores_with_none(&make().await).await;
+    a_thawed_record_takes_writes_again(&make().await).await;
     restore_into_a_taken_name_is_refused(&make().await).await;
     a_restore_an_older_records_blocks_is_undone(&make().await).await;
     hard_drop_purges(&make().await).await;
@@ -2130,6 +2164,7 @@ macro_rules! lifecycle_conformance_tests {
             restore_keeps_branch_configs,
             an_interrupted_restore_shows_no_branch_without_its_config,
             an_entry_without_configs_restores_with_none,
+            a_thawed_record_takes_writes_again,
             restore_into_a_taken_name_is_refused,
             a_restore_an_older_records_blocks_is_undone,
             hard_drop_purges,

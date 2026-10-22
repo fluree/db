@@ -859,6 +859,10 @@ pub enum Command {
     /// again under its name can publish from `t` 0. A no-op on a live or
     /// missing record.
     ResetGraphSourceIndex { name: String, branch: String },
+    /// Clear a branch's frozen mark if it carries `fence`: a drop that froze
+    /// it and wrote nothing else is undone. (Appended: variants are
+    /// positional in the log.)
+    ThawBranch { key: RefKey, fence: u64 },
 }
 
 /// Postcard-safe JSON value tree with deterministic encoding:
@@ -1706,6 +1710,15 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
             applied_at_millis,
         } => delete_branch(state, key, fence, applied_at_millis),
         Command::AdoptBranch { key, fence } => adopt_branch(state, key, fence),
+        Command::ThawBranch { key, fence } => {
+            if let Some(refused) = check_fence(state, &key, fence) {
+                return refused;
+            }
+            if let Some(f) = state.fences.get_mut(&key) {
+                f.frozen = false;
+            }
+            Response::FenceApplied
+        }
         Command::ResetGraphSourceIndex { name, branch } => {
             match state
                 .graph_sources

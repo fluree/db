@@ -24,6 +24,8 @@ mod policy;
 pub mod registry;
 pub mod removal;
 pub mod replicas;
+#[cfg(all(test, feature = "native"))]
+mod restore_tests;
 mod state;
 pub(crate) mod suppression;
 pub(crate) mod validate;

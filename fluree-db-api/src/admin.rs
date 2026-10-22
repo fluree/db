@@ -1031,23 +1031,30 @@ impl crate::Fluree {
     }
 
     /// What a restored ledger must hold before it serves beyond the configs
-    /// its drop kept: for an entry from before drops kept them, the removal
-    /// journal its lineage's checkpoint holds.
+    /// its drop kept: what its lineage's checkpoint has removed, including
+    /// on other copies since the drop, merged into each branch's journal and
+    /// retracted where still current. An entry from before drops kept
+    /// configs has only this.
     pub(crate) async fn prepare_restore(
         &self,
         entry: fluree_db_nameservice::DroppedLedger,
         records: Vec<fluree_db_nameservice::NsRecord>,
     ) -> std::result::Result<(), NameServiceError> {
-        if entry.configs.is_some() {
+        let failed = |e: ApiError| {
+            NameServiceError::storage(format!("restoring {}'s removal journal: {e}", entry.name))
+        };
+        let live: Vec<_> = records.into_iter().filter(|r| !r.frozen).collect();
+        let Some(lineage) = self
+            .restored_lineage(&live, &entry.root_branch)
+            .await
+            .map_err(failed)?
+        else {
             return Ok(());
-        }
-        for record in records.iter().filter(|r| !r.frozen) {
-            self.restore_dropped_retention(record).await.map_err(|e| {
-                NameServiceError::storage(format!(
-                    "restoring {}'s removal journal: {e}",
-                    record.ledger_id
-                ))
-            })?;
+        };
+        for record in &live {
+            self.restore_retention(record, None, Some(&lineage))
+                .await
+                .map_err(failed)?;
         }
         Ok(())
     }

@@ -854,6 +854,34 @@ impl BranchRecordStore for DynamoDbNameService {
         Ok(FenceOutcome::Applied)
     }
 
+    /// Thaws the record's items conditionally on the fence, meta last, so a
+    /// crash part way leaves a record that still reads frozen.
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let pk = Self::normalize(ledger_id)?;
+        match self.meta_fence(&pk).await? {
+            None => return Ok(FenceOutcome::Missing),
+            Some(f) if f != Some(fence) => return Ok(FenceOutcome::Mismatch),
+            Some(_) => {}
+        }
+        let thawed = [(":frozen", AttributeValue::Bool(false))];
+        for item in self.record_items(&pk).await? {
+            match Self::sk_of(&item) {
+                Some(sk) if sk != SK_META => {
+                    self.update_item_fenced(&pk, sk, fence, "SET #frozen = :frozen", &thawed)
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+        if !self
+            .update_item_fenced(&pk, SK_META, fence, "SET #frozen = :frozen", &thawed)
+            .await?
+        {
+            return Ok(FenceOutcome::Mismatch);
+        }
+        Ok(FenceOutcome::Applied)
+    }
+
     /// Deletes the record's items conditionally on the fence, meta last, so a
     /// crash part way leaves a record the drop can find and finish. The
     /// commit index carries no fence and goes once the record's fence is

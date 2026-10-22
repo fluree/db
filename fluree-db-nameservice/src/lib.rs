@@ -1553,6 +1553,10 @@ where
         (**self).freeze_record(ledger_id, fence).await
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        (**self).thaw_record(ledger_id, fence).await
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         (**self).delete_record(ledger_id, fence).await
     }

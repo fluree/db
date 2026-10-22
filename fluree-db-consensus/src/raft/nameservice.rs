@@ -1793,6 +1793,14 @@ impl BranchRecordStore for RaftNameService {
         fence_outcome_from_response(self.submit_lifecycle(cmd).await?)
     }
 
+    async fn thaw_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
+        let cmd = SmCommand::ThawBranch {
+            key: ref_key_of(ledger_id)?,
+            fence: fence.as_u64(),
+        };
+        fence_outcome_from_response(self.submit_lifecycle(cmd).await?)
+    }
+
     async fn delete_record(&self, ledger_id: &str, fence: Fence) -> Result<FenceOutcome> {
         let cmd = SmCommand::DeleteBranch {
             key: ref_key_of(ledger_id)?,
