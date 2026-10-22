@@ -245,6 +245,13 @@ impl Fluree {
 
         info!(ledger_name, new_branch, source, "Creating branch");
 
+        // An erasure accepted or published meanwhile would miss the branch.
+        #[cfg(feature = "native")]
+        let _admission = match self.retention.erasure.get() {
+            Some(erasure) => Some(erasure.admission.lock().await),
+            None => None,
+        };
+
         // Look up the source branch to capture its commit state
         let source_record = self
             .nameservice()

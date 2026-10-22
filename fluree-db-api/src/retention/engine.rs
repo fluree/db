@@ -693,7 +693,7 @@ impl Fluree {
             if !batch.retractions.is_empty() {
                 let (expired, retired) = (batch.expired, batch.retired);
                 match writer.submit(ledger_id, batch).await? {
-                    SubmitOutcome::Committed { t } => {
+                    SubmitOutcome::Committed { t, .. } => {
                         report.committed_t = Some(t);
                         report.expired = expired;
                         report.retired = retired;

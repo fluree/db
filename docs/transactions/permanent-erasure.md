@@ -84,13 +84,21 @@ The retention worker advances jobs in the background, one proving step at a time
 - **Publishing.** Once every affected commit is proved and every branch that holds them has indexed
   them, the erasure is published. Publishing waits for the index for a reason: an erased commit is
   then never replayed as unindexed data, so an indexed assertion cannot lose the retraction that ended
-  it.
+  it. The branches checked are those that exist when it publishes, including branches made after the
+  request. Creating a branch waits while a request is being accepted or published.
+- **Overlapping requests.** A request that shares commits with an earlier one still in progress waits
+  for it, and proves only what the earlier one's published erasure leaves. A request is complete once
+  the published erasure of each affected commit removes every occurrence it asked for. If the earlier
+  request fails, the later one proves those occurrences itself.
 
 Once published, every read of an affected commit reads its replacement. That includes ledger loads,
 replays, reindexing, time travel, commit display and raw storage retrieval, across restarts. A
 replacement keeps the original's CID as its identity, its parents, its `t`, its envelope and its
 surviving operations under their original slot numbers. Its proofs are verified again once per process
 before it is first read, and if they do not verify, the read fails rather than return the original.
+
+Another Fluree instance reading the same storage, such as a query peer, reads the replacements within a
+second of publication. A job reports `published` only after that second has passed.
 
 A later request for the same commit adds a step: the prover redacts the current replacement, and the
 proofs chain back to the original commit.
@@ -105,7 +113,7 @@ is outside every ledger's folder, so ledger drops and backup restores do not tou
 | Field | Meaning |
 |---|---|
 | `stage` | `proving`, `indexing` (proved, waiting for an index of its commits), `published`, or `failed` |
-| `commits[].proved` | Per commit, once proved: the replacement, the receipt hash, input and replacement sizes, cycles, segments, proving time |
+| `commits[].proved` | Per commit, once this request proved it: the slots it removed, the replacement it redacted further (`base`, absent for the original), the replacement, the receipt hash, input and replacement sizes, cycles, segments, proving time. Absent when an earlier request's erasure already removes the commit's requested occurrences. |
 | `retries`, `retryAtMs`, `lastError` | Failed steps and when the next try runs |
 | `acceptedMs`, `publishedMs` | When the request was accepted and published |
 

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Weak;
 
 use fluree_db_core::commit::codec::{decode_flake_batch, encode_flake_batch};
-use fluree_db_core::{Flake, LedgerId, Sid, TxnMetaEntry};
+use fluree_db_core::{ContentId, Flake, LedgerId, Sid, TxnMetaEntry};
 use fluree_db_ledger::StagedLedger;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, TransactError};
 
@@ -81,10 +81,10 @@ impl RetentionBatch {
 }
 
 /// What submitting a batch did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmitOutcome {
-    /// Committed at `t`.
-    Committed { t: i64 },
+    /// Committed at `t` as `commit_id`.
+    Committed { t: i64, commit_id: ContentId },
     /// The head is no longer the one the batch was verified against.
     HeadMoved,
     /// Not submitted: the ledger's novelty is near its limit, and ordinary
@@ -118,7 +118,10 @@ impl RetentionWriter for DirectRetentionWriter {
 /// backpressure are outcomes, not failures.
 pub fn outcome_of(result: Result<crate::CommitReceipt>) -> Result<SubmitOutcome> {
     match result {
-        Ok(receipt) => Ok(SubmitOutcome::Committed { t: receipt.t }),
+        Ok(receipt) => Ok(SubmitOutcome::Committed {
+            t: receipt.t,
+            commit_id: receipt.commit_id,
+        }),
         Err(e) if e.is_commit_conflict() => Ok(SubmitOutcome::HeadMoved),
         Err(ApiError::Transact(TransactError::NoveltyAtMax)) => Ok(SubmitOutcome::Deferred),
         Err(e) => Err(e),

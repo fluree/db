@@ -6,10 +6,16 @@
 //! commit's address then reads, through [`ErasureStorage`], as its verified
 //! replacement on every path: loading, replay, indexing, history, raw
 //! retrieval. Nothing reads the original once its erasure is published.
+//!
+//! Another instance on the same storage (a query peer) publishes nothing
+//! and is told nothing: it lists the map objects again on a commit read once
+//! its last listing is [`REFRESH`] old, and a publication is reported only
+//! after that.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fluree_db_core::storage::{ContentAddressedWrite, ReadHint, RemoteObject, StorageMethod};
@@ -27,6 +33,10 @@ const DIR: &str = "@retention/erasure";
 
 /// Map objects a publish finds before it replaces them with their union.
 const COMPACT_AT: usize = 64;
+
+/// How long a listing of the map objects stands before a commit read lists
+/// them again.
+pub(crate) const REFRESH: Duration = Duration::from_secs(1);
 
 /// One redaction step of an erased commit, as published.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,8 +98,11 @@ struct Entry {
 pub(crate) struct ErasureIndex {
     storage: Arc<dyn Storage>,
     verifier: Arc<Verifier>,
-    loaded: tokio::sync::OnceCell<()>,
-    /// Some commit is erased (valid once loaded).
+    /// When the last complete listing of the map objects started.
+    listed_at: parking_lot::RwLock<Option<Instant>>,
+    /// The map objects read, as of that listing; held while listing.
+    read: tokio::sync::Mutex<HashSet<String>>,
+    /// Some commit is erased.
     any: AtomicBool,
     entries: parking_lot::RwLock<HashMap<String, Arc<Entry>>>,
 }
@@ -97,7 +110,7 @@ pub(crate) struct ErasureIndex {
 impl std::fmt::Debug for ErasureIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ErasureIndex")
-            .field("loaded", &self.loaded.initialized())
+            .field("listed_at", &*self.listed_at.read())
             .field("erased", &self.entries.read().len())
             .finish()
     }
@@ -140,7 +153,8 @@ impl ErasureIndex {
         ErasureIndex {
             storage,
             verifier,
-            loaded: tokio::sync::OnceCell::new(),
+            listed_at: parking_lot::RwLock::new(None),
+            read: tokio::sync::Mutex::new(HashSet::new()),
             any: AtomicBool::new(false),
             entries: parking_lot::RwLock::new(HashMap::new()),
         }
@@ -150,26 +164,56 @@ impl ErasureIndex {
         format!("fluree:{}://{DIR}/{path}", self.storage.storage_method())
     }
 
-    /// Read every map object, once. An object that cannot be read or parsed
-    /// is an error: what it holds may be an erasure.
+    /// Whether the last listing of the map objects still stands.
+    fn fresh(&self) -> bool {
+        self.listed_at
+            .read()
+            .is_some_and(|at| at.elapsed() < REFRESH)
+    }
+
+    /// Read the map objects not read yet, unless the last listing still
+    /// stands. An object that cannot be read or parsed is an error: what it
+    /// holds may be an erasure.
     async fn load(&self) -> Result<()> {
-        self.loaded
-            .get_or_try_init(|| async {
-                let objects = self.storage.list_prefix(&self.address("map/")).await?;
-                let mut held: HashMap<String, ErasedCommit> = HashMap::new();
-                for object in objects {
-                    let bytes = self.storage.read_bytes(&object).await?;
-                    let published: Vec<ErasedCommit> = serde_json::from_slice(&bytes)
-                        .map_err(|e| ApiError::internal(format!("erasure map {object}: {e}")))?;
-                    for erased in published {
-                        merge(&mut held, erased);
+        if self.fresh() {
+            return Ok(());
+        }
+        let mut read = self.read.lock().await;
+        if self.fresh() {
+            return Ok(());
+        }
+        // An object compacted away between listing and reading is in the
+        // union, which a listing after that holds.
+        for _ in 0..3 {
+            let started = Instant::now();
+            let objects = self.storage.list_prefix(&self.address("map/")).await?;
+            let mut held: HashMap<String, ErasedCommit> = HashMap::new();
+            let mut gone = false;
+            for object in objects.iter().filter(|o| !read.contains(*o)) {
+                let bytes = match self.storage.read_bytes(object).await {
+                    Ok(bytes) => bytes,
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        gone = true;
+                        break;
                     }
+                    Err(e) => return Err(e.into()),
+                };
+                let published: Vec<ErasedCommit> = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::internal(format!("erasure map {object}: {e}")))?;
+                for erased in published {
+                    merge(&mut held, erased);
                 }
-                self.install(held.into_values());
-                Ok::<_, ApiError>(())
-            })
-            .await?;
-        Ok(())
+            }
+            self.install(held.into_values());
+            if !gone {
+                *read = objects.into_iter().collect();
+                *self.listed_at.write() = Some(started);
+                return Ok(());
+            }
+        }
+        Err(ApiError::internal(
+            "the erasure maps kept changing while being read",
+        ))
     }
 
     fn install(&self, erased: impl IntoIterator<Item = ErasedCommit>) {
@@ -193,16 +237,10 @@ impl ErasureIndex {
         self.any.store(!entries.is_empty(), Ordering::Release);
     }
 
-    /// Whether any commit may be erased, without waiting: true until the
-    /// index has loaded. The common answer, no, costs one atomic load.
-    fn may_hold_any(&self) -> bool {
-        !self.loaded.initialized() || self.any.load(Ordering::Acquire)
-    }
-
     /// Whether the commit at `digest` may be erased, without waiting: true
-    /// until the index has loaded.
+    /// while the map objects are to be listed again.
     fn may_be_erased(&self, digest: &str) -> bool {
-        !self.loaded.initialized()
+        !self.fresh()
             || (self.any.load(Ordering::Acquire) && self.entries.read().contains_key(digest))
     }
 
@@ -317,10 +355,12 @@ impl ErasureIndex {
     }
 
     /// Publish erasures: one immutable map object, then the index. From
-    /// here on, the originals read as their replacements.
+    /// here on, this instance reads the originals as their replacements,
+    /// and another on the same storage does within [`REFRESH`].
     pub(crate) async fn publish(&self, erased: Vec<ErasedCommit>) -> Result<()> {
         self.load().await?;
-        self.write_map(&erased).await?;
+        let mut read = self.read.lock().await;
+        read.insert(self.write_map(&erased).await?);
         self.install(erased);
         // Past a bound, one object holding everything replaces the objects
         // listed: what they hold is in the index, which loaded them all.
@@ -333,6 +373,7 @@ impl ErasureIndex {
                 .map(|e| e.erased.clone())
                 .collect();
             let union = self.write_map(&all).await?;
+            read.insert(union.clone());
             let stale: Vec<String> = objects.into_iter().filter(|o| *o != union).collect();
             for (address, e) in self.storage.delete_many(&stale).await {
                 tracing::warn!(%address, error = %e, "erasure: compacted map object not deleted");
@@ -364,9 +405,6 @@ impl ErasureStorage {
     }
 
     async fn substitute(&self, address: &str) -> Option<fluree_db_core::Result<Arc<[u8]>>> {
-        if !self.index.may_hold_any() {
-            return None;
-        }
         let digest = commit_digest(address)?;
         if !self.index.may_be_erased(digest) {
             return None;
@@ -380,9 +418,6 @@ impl ErasureStorage {
     /// Whether `address` is an erased commit's, whose original may not be
     /// written back.
     async fn erased_address(&self, address: &str) -> fluree_db_core::Result<bool> {
-        if !self.index.may_hold_any() {
-            return Ok(false);
-        }
         match commit_digest(address) {
             Some(digest) if self.index.may_be_erased(digest) => self
                 .index
@@ -396,8 +431,7 @@ impl ErasureStorage {
     /// Whether a sync read of `address` must go the async way, through
     /// [`Self::substitute`].
     fn defer_sync(&self, address: &str) -> bool {
-        self.index.may_hold_any()
-            && commit_digest(address).is_some_and(|digest| self.index.may_be_erased(digest))
+        commit_digest(address).is_some_and(|digest| self.index.may_be_erased(digest))
     }
 }
 
@@ -488,8 +522,7 @@ impl StorageRead for ErasureStorage {
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
-        if self.index.may_hold_any()
-            && id.content_kind() == Some(ContentKind::Commit)
+        if id.content_kind() == Some(ContentKind::Commit)
             && self.index.may_be_erased(&id.address_digest())
         {
             return None;

@@ -534,6 +534,313 @@ async fn a_named_occurrence_takes_the_one_bounding_its_span() {
     );
 }
 
+/// A branch made while an erasure is proved holds its commits above that
+/// branch's index: publication waits for the branch's index too, or its
+/// indexed assertion would replay without the erased retraction.
+#[tokio::test]
+async fn a_branch_made_while_proving_is_indexed_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-late-branch").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    fluree
+        .create_branch("it/erase-late-branch", "late", None, None)
+        .await
+        .expect("branch");
+    let late = "it/erase-late-branch:late";
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(
+        (report.proved, report.published),
+        (2, 0),
+        "late is not indexed yet: {report:?}"
+    );
+    reindex(&fluree, late).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    assert!(objects(&fluree, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A branch made while a request is accepted is made after it, holding its
+/// removal; made before the removal, the request would miss it.
+#[tokio::test]
+async fn a_branch_made_during_acceptance_holds_the_removal() {
+    use fluree_db_api::retention::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
+    type Branching = tokio::task::JoinHandle<fluree_db_api::Result<()>>;
+    /// Starts making a branch as the removal commits.
+    struct Brancher(Arc<Fluree>, std::sync::Mutex<Option<Branching>>);
+    #[async_trait::async_trait]
+    impl RetentionWriter for Brancher {
+        async fn submit(
+            &self,
+            ledger_id: &str,
+            batch: RetentionBatch,
+        ) -> fluree_db_api::Result<SubmitOutcome> {
+            if !batch.retractions.is_empty() {
+                let fluree = self.0.clone();
+                let mut branching = tokio::spawn(async move {
+                    fluree
+                        .create_branch("it/erase-admission", "late", None, None)
+                        .await
+                        .map(|_| ())
+                });
+                // Made now unless it waits for the request.
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(300), &mut branching)
+                    .await;
+                *self.1.lock().unwrap() = Some(branching);
+            }
+            outcome_of(self.0.commit_retention_batch(ledger_id, batch).await)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(erasing(&dir, Arc::new(NativeProver::default())));
+    let id = ledger(&fluree, "it/erase-admission").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    reindex(&fluree, &id).await;
+    let writer = Brancher(fluree.clone(), std::sync::Mutex::new(None));
+    fluree
+        .erase_occurrences_with(&writer, &id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    let branching = writer.1.lock().unwrap().take().expect("branching");
+    branching.await.unwrap().expect("branch");
+    let late = "it/erase-admission:late";
+    assert!(objects(&fluree, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, late).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    drop(writer);
+    let fluree = Arc::into_inner(fluree).expect("sole owner");
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, late, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// The removal's own retraction carries the value: it is erased however
+/// far the head has moved by the time the removal looks for it.
+#[tokio::test]
+async fn the_removals_retraction_is_erased_after_the_head_moves_on() {
+    use fluree_db_api::retention::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
+    /// Commits another transaction right after each retraction.
+    struct Busy<'a>(&'a Fluree);
+    #[async_trait::async_trait]
+    impl RetentionWriter for Busy<'_> {
+        async fn submit(
+            &self,
+            ledger_id: &str,
+            batch: RetentionBatch,
+        ) -> fluree_db_api::Result<SubmitOutcome> {
+            let retracting = !batch.retractions.is_empty();
+            let outcome = outcome_of(self.0.commit_retention_batch(ledger_id, batch).await);
+            if retracting && outcome.is_ok() {
+                insert(
+                    self.0,
+                    ledger_id,
+                    json!({"@context": ctx(), "@id": "ex:other", "ex:name": "Other"}),
+                )
+                .await;
+            }
+            outcome
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-busy").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let receipt = fluree
+        .erase_occurrences_with(&Busy(&fluree), &id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    let retraction = commit_at(&fluree, &id, t1 + 1).await;
+    assert_eq!(receipt.commits, 2, "{receipt:?}");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&retraction)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw) && !contains(&raw, "a@secret"));
+}
+
+/// Another instance open on the same storage, a query peer, reads the
+/// replacement once the erasure reports published.
+#[tokio::test]
+async fn a_reader_open_before_publication_reads_the_replacement() {
+    use fluree_db_api::NameServiceMode;
+    use fluree_db_nameservice::file::FileNameService;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-reader").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let cid = commit_at(&fluree, &id, t1).await;
+    let reader = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build_client_with_nameservice(NameServiceMode::ReadOnly(Arc::new(FileNameService::new(
+            dir.path(),
+        ))))
+        .await
+        .unwrap();
+    let record = fluree.nameservice().lookup(&id).await.unwrap().unwrap();
+    let store = reader.content_store(&record.storage_namespace());
+    assert!(!is_replacement(&store.get(&cid).await.unwrap()));
+
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store.get(&cid).await.unwrap().into_vec();
+    assert!(is_replacement(&raw) && !contains(&raw, "a@secret"));
+}
+
+/// A request overlapping one still in progress completes only once the
+/// published erasures remove all it asks for.
+#[tokio::test]
+async fn an_overlapping_request_completes_with_the_one_ahead_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let id = ledger(&fluree, "it/erase-overlap").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"}
+        ]}),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, t1).await;
+    let mut both = email("alice", "a@secret");
+    both.matching.extend(email("carol", "c@secret").matching);
+    fluree
+        .erase_occurrences(&id, both, None)
+        .await
+        .expect("erase");
+    let second = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert_eq!(
+        (second.stage, second.commits),
+        (ErasureStage::Proving, 2),
+        "{second:?}"
+    );
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    // The first request's steps remove what the second asks for.
+    assert_eq!((report.proved, report.published), (2, 2), "{report:?}");
+    let status = fluree.retention_status(&id).await.unwrap();
+    let jobs = status.registration.unwrap().erasures;
+    assert!(jobs.iter().all(|j| j.stage == ErasureStage::Published));
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(!contains(&raw, "a@secret") && !contains(&raw, "c@secret"));
+}
+
+/// When the request ahead of it fails, an overlapping request proves what
+/// it asks for itself.
+#[tokio::test]
+async fn an_overlapping_request_proves_what_a_failed_one_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let prover = Arc::new(NativeProver::default());
+    let fluree = erasing(&dir, prover.clone());
+    let id = ledger(&fluree, "it/erase-overlap-failed").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"}
+        ]}),
+    )
+    .await;
+    let original = commit_at(&fluree, &id, t1).await;
+    let mut both = email("alice", "a@secret");
+    both.matching.extend(email("carol", "c@secret").matching);
+    let first = fluree
+        .erase_occurrences(&id, both, None)
+        .await
+        .expect("erase");
+    let second = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+
+    prover.refuse_next(1);
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(
+        (report.failed, report.proved, report.published),
+        (1, 2, 1),
+        "{report:?}"
+    );
+    let status = fluree.retention_status(&id).await.unwrap();
+    let jobs = status.registration.unwrap().erasures;
+    let stage = |id: &str| jobs.iter().find(|j| j.request_id == id).unwrap().stage;
+    assert_eq!(stage(&first.request_id), ErasureStage::Failed);
+    assert_eq!(stage(&second.request_id), ErasureStage::Published);
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&original)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(!contains(&raw, "a@secret") && contains(&raw, "c@secret"));
+}
+
 /// The whole workflow with the real prover and the production verifier: run
 /// with `FLUREE_TEST_PROVER` naming a built `fluree-prover` whose image id
 /// `fluree-db-erasure` pins.

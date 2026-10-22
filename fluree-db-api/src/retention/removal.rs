@@ -345,35 +345,26 @@ impl Fluree {
                     control: Vec::new(),
                 };
                 match writer.submit(&ledger_id, batch).await? {
-                    SubmitOutcome::Committed { t } => {
+                    SubmitOutcome::Committed { t, commit_id } => {
                         retracted_t = Some(t);
                         // The retractions just made are occurrences of the
                         // removed facts too.
-                        let record = ns.lookup(&ledger_id).await?;
-                        let retraction = record
-                            .as_ref()
-                            .filter(|r| r.commit_t == t)
-                            .and_then(|r| r.commit_head_id.clone());
-                        if let Some(cid) = retraction {
-                            let commit = load_commit_by_id(store.as_ref(), &cid).await?;
-                            for (slot, flake) in commit.occurrences() {
-                                if !flake.op
-                                    && current.iter().any(|c| FactKey::of(c) == FactKey::of(flake))
-                                {
-                                    let from = current
-                                        .iter()
-                                        .find(|c| FactKey::of(c) == FactKey::of(flake))
-                                        .map_or(0, |c| c.t);
-                                    located.push(Located {
-                                        occurrence: OccurrenceRef {
-                                            commit: cid.to_string(),
-                                            slot,
-                                        },
-                                        flake: flake.clone(),
-                                        t,
-                                    });
-                                    spans.push((from, Some(t)));
-                                }
+                        let commit = load_commit_by_id(store.as_ref(), &commit_id).await?;
+                        for (slot, flake) in commit.occurrences() {
+                            if let Some(from) = current
+                                .iter()
+                                .find(|c| !flake.op && FactKey::of(c) == FactKey::of(flake))
+                                .map(|c| c.t)
+                            {
+                                located.push(Located {
+                                    occurrence: OccurrenceRef {
+                                        commit: commit_id.to_string(),
+                                        slot,
+                                    },
+                                    flake: flake.clone(),
+                                    t,
+                                });
+                                spans.push((from, Some(t)));
                             }
                         }
                     }

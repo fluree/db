@@ -2,16 +2,16 @@
 //! verified and stored as it lands; publishing once a job's commits are
 //! proved and indexed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Weak;
 use std::time::Instant;
 
-use fluree_db_core::{ContentId, ContentKind};
+use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, LedgerId};
 use fluree_db_erasure::{ProveRequest, ProverError};
 
-use super::index::{Artifact, ErasedCommit, ErasureStep};
-use super::{ErasureJob, ErasureStage, ProvedStep};
+use super::index::{Artifact, ErasedCommit, ErasureStep, REFRESH};
+use super::{CommitErasure, ErasureJob, ErasureStage, ProvedStep};
 use crate::retention::registry;
 use crate::retention::worker::now_ms;
 use crate::{ApiError, Fluree, IndexingMode, Result};
@@ -30,6 +30,46 @@ struct Held {
 struct Work {
     prove: Option<(String, String, String)>,
     publish: Vec<Held>,
+}
+
+/// What a job's commit still needs, given the commit's published erasure.
+#[derive(Debug, PartialEq, Eq)]
+enum Need {
+    /// The published erasure removes every slot the request asks for.
+    Covered,
+    /// This request's step, proved on the published erasure, to publish.
+    Publish,
+    /// To prove: the requested slots the published erasure still holds.
+    Prove(Vec<u32>),
+}
+
+fn need(task: &CommitErasure, held: Option<&ErasedCommit>) -> Need {
+    let done = held.map(ErasedCommit::redacted_slots).unwrap_or_default();
+    let slots: Vec<u32> = task
+        .slots
+        .iter()
+        .copied()
+        .filter(|s| !done.contains(s))
+        .collect();
+    if slots.is_empty() {
+        return Need::Covered;
+    }
+    let base = held.and_then(|h| h.steps.last()).map(|s| &s.replacement);
+    match &task.proved {
+        Some(p) if p.base.as_ref() == base && p.slots == slots => Need::Publish,
+        _ => Need::Prove(slots),
+    }
+}
+
+/// How a proving step ended.
+enum Stepped {
+    Proved,
+    /// Nothing was left to prove.
+    Nothing,
+    /// The job failed: the prover refused the step.
+    Refused,
+    /// To be tried again.
+    Failed,
 }
 
 /// What [`Fluree::run_erasure_pass`] did.
@@ -80,27 +120,50 @@ impl Fluree {
             if blocked {
                 continue;
             }
-            if job.stage == ErasureStage::Proving && job.commits.iter().all(|c| c.proved.is_some())
-            {
-                job.stage = ErasureStage::Indexing;
+            let needs = match self.needs(&job).await {
+                Ok(needs) => needs,
+                Err(e) => {
+                    tracing::warn!(request = %job.request_id, error = %e, "erasure: not advanced");
+                    continue;
+                }
+            };
+            let next = job
+                .commits
+                .iter()
+                .zip(&needs)
+                .find(|(_, n)| matches!(n, Need::Prove(_)))
+                .map(|(c, _)| c.commit.clone());
+            let stage = match next {
+                Some(_) => ErasureStage::Proving,
+                None => ErasureStage::Indexing,
+            };
+            if job.stage != stage {
+                job.stage = stage;
                 let _ = self
-                    .update_job(&branch, &job.request_id, |j| {
-                        j.stage = ErasureStage::Indexing;
-                    })
+                    .update_job(&branch, &job.request_id, |j| j.stage = stage)
                     .await;
             }
-            if job.stage == ErasureStage::Indexing {
-                work.publish.push(Held { branch, job });
-                continue;
-            }
-            if work.prove.is_some() || job.retry_at_ms.is_some_and(|at| at > now) {
-                continue;
-            }
-            if let Some(task) = job.commits.iter().find(|c| c.proved.is_none()) {
-                work.prove = Some((branch, job.request_id.clone(), task.commit.clone()));
+            match next {
+                None => work.publish.push(Held { branch, job }),
+                Some(commit) => {
+                    if work.prove.is_none() && !job.retry_at_ms.is_some_and(|at| at > now) {
+                        work.prove = Some((branch, job.request_id.clone(), commit));
+                    }
+                }
             }
         }
         work
+    }
+
+    /// What each of `job`'s commits still needs.
+    async fn needs(&self, job: &ErasureJob) -> Result<Vec<Need>> {
+        let runtime = self.erasure_runtime()?;
+        let mut needs = Vec::with_capacity(job.commits.len());
+        for task in &job.commits {
+            let held = runtime.index.erased(&commit_id(&task.commit)?).await?;
+            needs.push(need(task, held.as_ref()));
+        }
+        Ok(needs)
     }
 
     /// Advance the erasure jobs of `ledgers`: publish what is proved and
@@ -185,15 +248,21 @@ impl Fluree {
                 {
                     break;
                 }
-                let landed = self
+                let stepped = self
                     .step_and_record(&branch, &request_id, &commit, config.retry_ms)
                     .await;
                 runtime.in_flight.store(false, Ordering::Release);
-                if landed {
-                    report.proved += 1;
-                    progressed = true;
-                } else {
-                    report.failed += 1;
+                match stepped {
+                    Stepped::Proved => {
+                        report.proved += 1;
+                        progressed = true;
+                    }
+                    Stepped::Nothing => progressed = true,
+                    Stepped::Refused => {
+                        report.failed += 1;
+                        progressed = true;
+                    }
+                    Stepped::Failed => report.failed += 1,
                 }
             }
             if !progressed {
@@ -204,33 +273,39 @@ impl Fluree {
         Ok(report)
     }
 
-    /// Prove one step and record its outcome; whether it landed.
+    /// Prove one step and record its outcome.
     async fn step_and_record(
         &self,
         branch: &str,
         request_id: &str,
         commit: &str,
         retry_ms: i64,
-    ) -> bool {
+    ) -> Stepped {
         let outcome = self.prove_step(branch, request_id, commit).await;
-        let landed = outcome.is_ok();
+        let stepped = match &outcome {
+            Ok(Some(_)) => Stepped::Proved,
+            Ok(None) => Stepped::Nothing,
+            Err(StepError::Refused(_)) => Stepped::Refused,
+            Err(StepError::Retry(_)) => Stepped::Failed,
+        };
         if let Err(e) = self
             .record_step(branch, request_id, commit, outcome, retry_ms)
             .await
         {
             tracing::warn!(request = %request_id, error = %e, "erasure: step not recorded");
         }
-        landed
+        stepped
     }
 
-    /// Prove the step of `request_id` on `commit`, verify it with every
-    /// earlier step of that commit, and store its artifacts.
+    /// Prove the step of `request_id` on `commit` over its published
+    /// erasure, verify it with every earlier step, and store its artifacts.
+    /// `None` when the published erasure leaves nothing to prove.
     async fn prove_step(
         &self,
         branch: &str,
         request_id: &str,
         commit: &str,
-    ) -> std::result::Result<ProvedStep, StepError> {
+    ) -> std::result::Result<Option<ProvedStep>, StepError> {
         let runtime = self.erasure_runtime().map_err(StepError::Retry)?;
         let config = runtime
             .config
@@ -249,13 +324,20 @@ impl Fluree {
             .parse()
             .map_err(|_| StepError::Refused("not a commit id".into()))?;
         let prior = runtime.index.erased(&cid).await.map_err(StepError::Retry)?;
+        let Need::Prove(slots) = need(task, prior.as_ref()) else {
+            return Ok(None);
+        };
+        let base = prior
+            .as_ref()
+            .and_then(|p| p.steps.last())
+            .map(|s| s.replacement.clone());
         let input = self
             .commit_bytes(&task.branches[0], &cid)
             .await
             .map_err(StepError::Retry)?;
         let request = ProveRequest {
             input,
-            removed_slots: task.slots.clone(),
+            removed_slots: slots.clone(),
             ledger_id: task.ledger_id.clone(),
             signatures: job.signatures.into(),
         };
@@ -279,7 +361,7 @@ impl Fluree {
             authorized.push(step.slots.clone());
         }
         receipts.push(response.receipt.clone());
-        authorized.push(task.slots.clone());
+        authorized.push(slots.clone());
         let verifier = config.verifier.clone();
         let (original, ledger_id, replacement) = (
             cid.to_bytes(),
@@ -308,7 +390,9 @@ impl Fluree {
             .put_artifact(Artifact::Proof, &response.receipt)
             .await
             .map_err(StepError::Retry)?;
-        Ok(ProvedStep {
+        Ok(Some(ProvedStep {
+            slots,
+            base,
             replacement: replacement_id.to_string(),
             proof,
             input_bytes: request.input.len() as u64,
@@ -316,7 +400,7 @@ impl Fluree {
             user_cycles: response.user_cycles,
             segments: response.segments,
             prove_ms,
-        })
+        }))
     }
 
     /// Record a step's outcome on its job.
@@ -325,19 +409,18 @@ impl Fluree {
         branch: &str,
         request_id: &str,
         commit: &str,
-        outcome: std::result::Result<ProvedStep, StepError>,
+        outcome: std::result::Result<Option<ProvedStep>, StepError>,
         retry_ms: i64,
     ) -> Result<()> {
         self.update_job(branch, request_id, |job| match &outcome {
             Ok(step) => {
-                if let Some(task) = job.commits.iter_mut().find(|c| c.commit == commit) {
-                    task.proved = Some(step.clone());
+                if let Some(step) = step {
+                    if let Some(task) = job.commits.iter_mut().find(|c| c.commit == commit) {
+                        task.proved = Some(step.clone());
+                    }
                 }
                 job.last_error = None;
                 job.retry_at_ms = None;
-                if job.commits.iter().all(|c| c.proved.is_some()) {
-                    job.stage = ErasureStage::Indexing;
-                }
             }
             Err(StepError::Refused(why)) => {
                 job.stage = ErasureStage::Failed;
@@ -356,23 +439,15 @@ impl Fluree {
     }
 
     /// Publish `job` once every branch holding its commits has indexed them;
-    /// until then, ask for the index builds.
+    /// until then, ask for the index builds. Complete once the published
+    /// erasure of each commit removes every slot the job asks for.
     async fn publish_when_indexed(&self, branch: &str, job: &ErasureJob) -> Result<()> {
-        let mut needed: HashMap<&str, i64> = HashMap::new();
-        for task in &job.commits {
-            for b in &task.branches {
-                let t = needed.entry(b.as_str()).or_insert(0);
-                *t = (*t).max(task.t);
-            }
-        }
-        let mut lagging = Vec::new();
-        for (b, t) in &needed {
-            let record = self.nameservice().lookup(b).await?;
-            if record.is_some_and(|r| r.index_t < *t) {
-                lagging.push((b.to_string(), *t));
-            }
-        }
+        let runtime = self.erasure_runtime()?;
+        // No branch is made between the check and the publication.
+        let admission = runtime.admission.lock().await;
+        let lagging = self.lagging_branches(branch, job).await?;
         if !lagging.is_empty() {
+            drop(admission);
             match &self.indexing_mode {
                 IndexingMode::Background(handle) => {
                     for (b, t) in &lagging {
@@ -392,40 +467,60 @@ impl Fluree {
             }
             return Ok(());
         }
-        let runtime = self.erasure_runtime()?;
         let mut published = Vec::with_capacity(job.commits.len());
+        let mut stale = Vec::new();
         for task in &job.commits {
-            let proved = task
-                .proved
-                .as_ref()
-                .ok_or_else(|| ApiError::internal("publishing an unproved step"))?;
-            let cid: ContentId = task
-                .commit
-                .parse()
-                .map_err(|_| ApiError::internal("not a commit id"))?;
-            let mut erased = runtime
-                .index
-                .erased(&cid)
-                .await?
-                .unwrap_or_else(|| ErasedCommit {
-                    commit: task.commit.clone(),
-                    ledger_id: task.ledger_id.clone(),
-                    steps: Vec::new(),
-                });
-            // Published already, before a crash lost the job's update.
-            if erased.steps.iter().any(|s| s.request_id == job.request_id) {
-                continue;
+            let held = runtime.index.erased(&commit_id(&task.commit)?).await?;
+            match (need(task, held.as_ref()), &task.proved) {
+                // Published already, by an earlier request or by this one
+                // before a crash lost the job's update.
+                (Need::Covered, _) => {}
+                (Need::Publish, Some(proved)) => {
+                    let mut erased = held.unwrap_or_else(|| ErasedCommit {
+                        commit: task.commit.clone(),
+                        ledger_id: task.ledger_id.clone(),
+                        steps: Vec::new(),
+                    });
+                    erased.steps.push(ErasureStep {
+                        request_id: job.request_id.clone(),
+                        slots: proved.slots.clone(),
+                        replacement: proved.replacement.clone(),
+                        proof: proved.proof.clone(),
+                    });
+                    published.push(erased);
+                }
+                // Proved on an erasure published since: prove it again.
+                _ => stale.push(task.commit.clone()),
             }
-            erased.steps.push(ErasureStep {
-                request_id: job.request_id.clone(),
-                slots: task.slots.clone(),
-                replacement: proved.replacement.clone(),
-                proof: proved.proof.clone(),
-            });
-            published.push(erased);
         }
-        if !published.is_empty() {
+        if !stale.is_empty() {
+            drop(admission);
+            return self
+                .update_job(branch, &job.request_id, |j| {
+                    j.stage = ErasureStage::Proving;
+                    for task in &mut j.commits {
+                        if stale.contains(&task.commit) {
+                            task.proved = None;
+                        }
+                    }
+                })
+                .await;
+        }
+        let wrote = !published.is_empty();
+        if wrote {
             runtime.index.publish(published).await?;
+        }
+        drop(admission);
+        if self.needs(job).await?.iter().any(|n| *n != Need::Covered) {
+            return Err(ApiError::internal(format!(
+                "erasure {} published without removing every requested slot",
+                job.request_id
+            )));
+        }
+        if wrote {
+            // Another instance on this storage reads the replacements once
+            // it lists the maps again; it has by the time this reports.
+            tokio::time::sleep(REFRESH * 2).await;
         }
         self.update_job(branch, &job.request_id, |j| {
             j.stage = ErasureStage::Published;
@@ -433,6 +528,48 @@ impl Fluree {
             j.last_error = None;
         })
         .await
+    }
+
+    /// Branches, as they are now, whose history holds one of `job`'s
+    /// commits above their index, with the `t` each must index to. A branch
+    /// made after the request holds them too.
+    async fn lagging_branches(&self, branch: &str, job: &ErasureJob) -> Result<Vec<(String, i64)>> {
+        let name = LedgerId::parse(branch)?;
+        let mut lagging = Vec::new();
+        for record in self.nameservice().list_branches(name.name()).await? {
+            if record.retracted {
+                continue;
+            }
+            let above: Vec<&CommitErasure> = job
+                .commits
+                .iter()
+                .filter(|c| record.index_t < c.t && c.t <= record.commit_t)
+                .collect();
+            let (Some(head), Some(lowest)) = (
+                record.commit_head_id.as_ref(),
+                above.iter().map(|c| c.t).min(),
+            ) else {
+                continue;
+            };
+            // Bounded by the branch's unindexed commits.
+            let store = self
+                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                .await?;
+            let held: HashSet<String> = collect_first_parent_cids(store.as_ref(), head, lowest - 1)
+                .await?
+                .into_iter()
+                .map(|(_, cid)| cid.to_string())
+                .collect();
+            if let Some(t) = above
+                .iter()
+                .filter(|c| held.contains(&c.commit))
+                .map(|c| c.t)
+                .max()
+            {
+                lagging.push((record.ledger_id.to_string(), t));
+            }
+        }
+        Ok(lagging)
     }
 
     async fn job(&self, branch: &str, request_id: &str) -> Result<ErasureJob> {
@@ -461,6 +598,12 @@ impl Fluree {
         .await?;
         Ok(())
     }
+}
+
+fn commit_id(commit: &str) -> Result<ContentId> {
+    commit
+        .parse()
+        .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))
 }
 
 /// Why a step did not land.

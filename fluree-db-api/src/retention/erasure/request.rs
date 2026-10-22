@@ -49,7 +49,7 @@ pub struct ErasureReceipt {
     pub request_id: String,
     /// Every occurrence erased, across branches.
     pub manifest: Vec<OccurrenceRef>,
-    /// Commits to prove.
+    /// Affected commits.
     pub commits: usize,
     /// The control commit recording the authorization.
     pub authorized_t: i64,
@@ -106,6 +106,9 @@ impl Fluree {
         }
         let ledger_id = LedgerId::parse(ledger_id)?;
         let ns = self.publisher()?;
+        // No branch is made while a request is accepted: one made before is
+        // removed from, one made after inherits the removal.
+        let _admission = runtime.admission.lock().await;
         let mut branches: Vec<String> = ns
             .list_branches(ledger_id.name())
             .await?
@@ -168,16 +171,7 @@ impl Fluree {
             return Ok(receipt_of(job, manifest, removals));
         }
 
-        let mut commits = self.commits_to_erase(&ledger_id, &found, &branches).await?;
-        // Slots another request already erases are its to prove.
-        let claimed = self.claimed_slots(&branches).await?;
-        for task in &mut commits {
-            if let Some(taken) = claimed.get(&task.commit) {
-                task.slots.retain(|s| !taken.contains(s));
-            }
-        }
-        commits.retain(|c| !c.slots.is_empty());
-
+        let commits = self.commits_to_erase(&ledger_id, &found, &branches).await?;
         let authorized_t = self
             .authorize_erasure(
                 writer,
@@ -193,11 +187,7 @@ impl Fluree {
             accepted_ms: crate::retention::worker::now_ms(),
             authorized_t,
             signatures: request.signatures,
-            stage: if commits.is_empty() {
-                ErasureStage::Published
-            } else {
-                ErasureStage::Proving
-            },
+            stage: ErasureStage::Proving,
             commits,
             retries: 0,
             retry_at_ms: None,
@@ -272,9 +262,7 @@ impl Fluree {
             task.slots.dedup();
             if let Some(erased) = runtime.index.erased(&cid).await? {
                 // A later step reads the replacement and keeps its ledger.
-                let done = erased.redacted_slots();
                 task.ledger_id = erased.ledger_id;
-                task.slots.retain(|s| !done.contains(s));
                 out.push(task);
                 continue;
             }
@@ -297,27 +285,6 @@ impl Fluree {
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
             .await?;
         Ok(store.get(cid).await?.into_vec())
-    }
-
-    /// Slots each commit's pending erasures already remove.
-    async fn claimed_slots(&self, branches: &[String]) -> Result<BTreeMap<String, Vec<u32>>> {
-        let ns = self.publisher()?;
-        let mut claimed: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        for branch in branches {
-            let (_, registration) = registry::read(ns, branch).await?;
-            for job in registration.iter().flat_map(|r| &r.erasures) {
-                if !job.pending() {
-                    continue;
-                }
-                for task in &job.commits {
-                    claimed
-                        .entry(task.commit.clone())
-                        .or_default()
-                        .extend(&task.slots);
-                }
-            }
-        }
-        Ok(claimed)
     }
 
     /// Commit the request's authorization on `ledger_id`: its id, its
@@ -363,7 +330,7 @@ impl Fluree {
                 control: control.clone(),
             };
             match writer.submit(ledger_id.as_str(), batch).await? {
-                SubmitOutcome::Committed { t } => return Ok(t),
+                SubmitOutcome::Committed { t, .. } => return Ok(t),
                 SubmitOutcome::HeadMoved => continue,
                 SubmitOutcome::Deferred => {
                     return Err(ApiError::Transact(

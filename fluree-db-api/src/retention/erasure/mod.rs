@@ -13,7 +13,14 @@
 //! every affected commit is proved and indexed, the erasure is published:
 //! from then on each original reads as its replacement (see [`index`]).
 //! Publishing waits for the index so that no erased commit is ever replayed
-//! as novelty: an assertion in the index must not lose its retraction.
+//! as novelty: an assertion in the index must not lose its retraction. That
+//! holds for every branch holding the commit as branches are when it is
+//! published, since branch creation waits for acceptance and publication.
+//!
+//! A request is complete once the published erasure of each affected commit
+//! removes every slot it asked for, whichever request proved them: an
+//! overlapping request waits for the one ahead of it, and proves what that
+//! one does not publish.
 //!
 //! Originals are retained in this release; purging them is the next step.
 //! Supported: a single node with file storage, v4 commits with SHA2-256
@@ -62,6 +69,9 @@ pub(crate) struct ErasureRuntime {
     pub(crate) config: Option<ErasureConfig>,
     /// A step is being proved.
     in_flight: AtomicBool,
+    /// Held to accept or publish an erasure, and to create a branch: the
+    /// branches an erasure reaches are the branches as they are then.
+    pub(crate) admission: tokio::sync::Mutex<()>,
 }
 
 impl ErasureRuntime {
@@ -70,6 +80,7 @@ impl ErasureRuntime {
             index,
             config,
             in_flight: AtomicBool::new(false),
+            admission: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -118,8 +129,10 @@ pub struct CommitErasure {
     pub slots: Vec<u32>,
     /// The ledger its signatures were made for.
     pub ledger_id: String,
-    /// Branches whose history holds it.
+    /// Branches whose history held it when the request was accepted.
     pub branches: Vec<String>,
+    /// This request's step, once proved; none when an earlier request's
+    /// published step removes every slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proved: Option<ProvedStep>,
 }
@@ -128,6 +141,11 @@ pub struct CommitErasure {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProvedStep {
+    /// Original slots it removes: the requested ones its base still held.
+    pub slots: Vec<u32>,
+    /// The replacement it redacted further; none for the original commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     pub replacement: String,
     /// SHA-256 (hex) of the receipt.
     pub proof: String,

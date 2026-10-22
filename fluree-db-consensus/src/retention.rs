@@ -66,6 +66,7 @@ impl RetentionWriter for CommitterRetentionWriter {
         match committer.transact(request).await {
             Ok(receipt) => Ok(SubmitOutcome::Committed {
                 t: receipt.commit.t,
+                commit_id: receipt.commit.commit_id,
             }),
             Err(SubmissionError::Execution { status, message })
                 if status == 409 || message.contains(HEAD_MOVED) =>

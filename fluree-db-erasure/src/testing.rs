@@ -16,10 +16,12 @@ use crate::{Prover, ProverError};
 /// The image id fake receipts claim; no real guest has it.
 pub const TEST_IMAGE_ID: [u32; 8] = [0x7e57_0001; 8];
 
-/// Proves natively. Can be told to fail its next steps, to exercise retries.
+/// Proves natively. Can be told to fail or refuse its next steps, to
+/// exercise retries and failed jobs.
 #[derive(Debug, Default)]
 pub struct NativeProver {
     failures: AtomicUsize,
+    refusals: AtomicUsize,
     proved: Mutex<Vec<ProveRequest>>,
 }
 
@@ -27,6 +29,12 @@ impl NativeProver {
     /// Fail the next `n` steps as an unavailable prover would.
     pub fn fail_next(&self, n: usize) {
         self.failures.store(n, Ordering::SeqCst);
+    }
+
+    /// Refuse the next `n` steps as a prover refuses a commit it cannot
+    /// prove.
+    pub fn refuse_next(&self, n: usize) {
+        self.refusals.store(n, Ordering::SeqCst);
     }
 
     /// Every request proved so far, in order.
@@ -53,6 +61,13 @@ impl Prover for NativeProver {
             .is_ok()
         {
             return Err(ProverError::Unavailable("told to fail".into()));
+        }
+        if self
+            .refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ProverError::Refused("told to refuse".into()));
         }
         let (replacement, statement) = redact_with::<HostSha, _>(
             &request.input,
