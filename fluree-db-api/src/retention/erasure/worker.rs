@@ -445,7 +445,11 @@ impl Fluree {
         let runtime = self.erasure_runtime()?;
         // No branch is made between the check and the publication.
         let admission = runtime.admission.lock().await;
-        let lagging = self.lagging_branches(branch, job).await?;
+        let Some(lagging) = self.lagging_branches(branch, job).await? else {
+            // Dropped: its branches, and what their indexes hold, can be
+            // restored, so the gate waits until they are.
+            return Ok(());
+        };
         if !lagging.is_empty() {
             drop(admission);
             match &self.indexing_mode {
@@ -506,8 +510,7 @@ impl Fluree {
                 })
                 .await;
         }
-        let wrote = !published.is_empty();
-        if wrote {
+        if !published.is_empty() {
             runtime.index.publish(published).await?;
         }
         drop(admission);
@@ -517,11 +520,10 @@ impl Fluree {
                 job.request_id
             )));
         }
-        if wrote {
-            // Another instance on this storage reads the replacements once
-            // it lists the maps again; it has by the time this reports.
-            tokio::time::sleep(REFRESH * 2).await;
-        }
+        // Another instance on this storage reads the replacements once it
+        // lists the maps again; it has by the time this reports, whether
+        // the maps were written now or before a restart.
+        tokio::time::sleep(REFRESH * 2).await;
         self.update_job(branch, &job.request_id, |j| {
             j.stage = ErasureStage::Published;
             j.published_ms = Some(now_ms());
@@ -532,14 +534,26 @@ impl Fluree {
 
     /// Branches, as they are now, whose history holds one of `job`'s
     /// commits above their index, with the `t` each must index to. A branch
-    /// made after the request holds them too.
-    async fn lagging_branches(&self, branch: &str, job: &ErasureJob) -> Result<Vec<(String, i64)>> {
+    /// made after the request holds them too. `None` when `branch`'s ledger
+    /// is dropped, which hides its branches.
+    async fn lagging_branches(
+        &self,
+        branch: &str,
+        job: &ErasureJob,
+    ) -> Result<Option<Vec<(String, i64)>>> {
         let name = LedgerId::parse(branch)?;
+        let records: Vec<_> = self
+            .nameservice()
+            .list_branches(name.name())
+            .await?
+            .into_iter()
+            .filter(|r| !r.retracted)
+            .collect();
+        if !records.iter().any(|r| r.ledger_id == name) {
+            return Ok(None);
+        }
         let mut lagging = Vec::new();
-        for record in self.nameservice().list_branches(name.name()).await? {
-            if record.retracted {
-                continue;
-            }
+        for record in records {
             let above: Vec<&CommitErasure> = job
                 .commits
                 .iter()
@@ -569,7 +583,7 @@ impl Fluree {
                 lagging.push((record.ledger_id.to_string(), t));
             }
         }
-        Ok(lagging)
+        Ok(Some(lagging))
     }
 
     async fn job(&self, branch: &str, request_id: &str) -> Result<ErasureJob> {

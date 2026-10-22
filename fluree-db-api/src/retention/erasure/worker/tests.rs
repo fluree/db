@@ -10,6 +10,7 @@ use fluree_db_erasure::testing::NativeProver;
 use serde_json::{json, Value as JsonValue};
 
 use super::Stepped;
+use crate::retention::erasure::index::{ErasedCommit, ErasureStep};
 use crate::retention::erasure::{ErasureConfig, ErasureRequest, ErasureStage, Verifier};
 use crate::retention::FactSelector;
 use crate::{Fluree, FlureeBuilder, ReindexOptions};
@@ -200,4 +201,107 @@ async fn a_step_proved_on_a_superseded_erasure_is_proved_again() {
         .into_vec();
     let contains = |needle: &str| raw.windows(needle.len()).any(|w| w == needle.as_bytes());
     assert!(is_replacement(&raw) && !contains("a@secret") && !contains("c@secret"));
+}
+
+/// A ledger dropped while its erasure waits for an index hides its
+/// branches; publishing then would skip their indexes, which a restore
+/// brings back. Nothing is published while it is dropped.
+#[tokio::test]
+async fn nothing_is_published_while_the_ledger_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/dropped").await.unwrap();
+    let id = "t/dropped:main";
+    let t1 = insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    let asserted = commit_at(&fluree, id, t1).await;
+    let receipt = fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    let report = fluree.run_erasure_pass(id).await.unwrap();
+    assert_eq!((report.proved, report.published), (2, 0), "{report:?}");
+    let job = fluree.job(id, &receipt.request_id).await.unwrap();
+
+    fluree
+        .drop_ledger("t/dropped", crate::DropMode::Soft)
+        .await
+        .unwrap();
+    // As a background pass holding the job would.
+    fluree.publish_when_indexed(id, &job).await.unwrap();
+    let runtime = fluree.erasure_runtime().unwrap();
+    assert!(runtime.index.erased(&asserted).await.unwrap().is_none());
+}
+
+/// Published before a crash lost the job's update: the next pass finds the
+/// erasure published and completes the job without proving it again, and
+/// reports it only once another instance on the storage reads it.
+#[tokio::test]
+async fn a_publication_whose_job_update_was_lost_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/lost-update").await.unwrap();
+    let id = "t/lost-update:main";
+    let t1 = insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    let asserted = commit_at(&fluree, id, t1).await;
+    let receipt = fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .unwrap();
+    fluree.run_erasure_pass(id).await.unwrap();
+    reindex(&fluree, id).await;
+    let reader = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build_client_with_nameservice(crate::NameServiceMode::ReadOnly(Arc::new(
+            fluree_db_nameservice::file::FileNameService::new(dir.path()),
+        )))
+        .await
+        .unwrap();
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let read = reader.content_store(&record.storage_namespace());
+    assert!(!is_replacement(&read.get(&asserted).await.unwrap()));
+
+    // The maps written as publication writes them; the job left as it was.
+    let job = fluree.job(id, &receipt.request_id).await.unwrap();
+    let published = job
+        .commits
+        .iter()
+        .map(|task| {
+            let proved = task.proved.as_ref().unwrap();
+            ErasedCommit {
+                commit: task.commit.clone(),
+                ledger_id: task.ledger_id.clone(),
+                steps: vec![ErasureStep {
+                    request_id: job.request_id.clone(),
+                    slots: proved.slots.clone(),
+                    replacement: proved.replacement.clone(),
+                    proof: proved.proof.clone(),
+                }],
+            }
+        })
+        .collect();
+    let runtime = fluree.erasure_runtime().unwrap();
+    runtime.index.publish(published).await.unwrap();
+    drop(fluree);
+
+    let restarted = erasing(&dir);
+    let report = restarted.run_erasure_pass(id).await.unwrap();
+    assert_eq!((report.proved, report.published), (0, 1), "{report:?}");
+    let job = restarted.job(id, &receipt.request_id).await.unwrap();
+    assert_eq!(job.stage, ErasureStage::Published);
+    assert!(is_replacement(&read.get(&asserted).await.unwrap()));
 }
