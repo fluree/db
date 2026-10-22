@@ -33,6 +33,12 @@ builder image: building this directory at a release's commit gives the id that r
 Any change to `fluree-db-redaction` that reaches the guest changes the id: add the new id to
 `REDACT_IMAGE_IDS`, and remove an old one only when no stored proof uses it.
 
+`cargo run --release -p fluree-prover-methods --example image_id` prints the id without
+building the prover. CI (`.github/workflows/prover.yml`) rebuilds the guest whenever a change
+reaches it, and fails unless `REDACT_IMAGE_IDS` pins the id (`check-image-id.py`). On a release
+tag, CI builds the prover, checks it the same way, and keeps the binary and its id as a
+workflow artifact.
+
 ## Running
 
 Fluree's configuration names the binary, its scratch directory, thread count and priority. One

@@ -1,0 +1,68 @@
+name: Prover
+
+# The redaction prover's guest builds in RISC Zero's container, pinned by
+# digest, so its image id depends only on its sources. Fluree accepts proofs
+# only from the ids `fluree-db-erasure` pins (REDACT_IMAGE_IDS): a change that
+# reaches the guest without a new pin would fail every proof's verification.
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - "fluree-db-redaction/src/**"
+      - "fluree-db-redaction/Cargo.toml"
+      - "fluree-prover/**"
+      - "fluree-db-erasure/src/verify.rs"
+      - ".github/workflows/prover.yml"
+  push:
+    branches: [main, next]
+    paths:
+      - "fluree-db-redaction/src/**"
+      - "fluree-db-redaction/Cargo.toml"
+      - "fluree-prover/**"
+      - "fluree-db-erasure/src/verify.rs"
+      - ".github/workflows/prover.yml"
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Rebuild the guest alone and check that its id is pinned.
+  image-id:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Build the guest in the pinned container
+        working-directory: fluree-prover
+        run: cargo run --locked --release -p fluree-prover-methods --example image_id > "$RUNNER_TEMP/image_id"
+      - name: Check that fluree-db-erasure pins it
+        run: python3 fluree-prover/check-image-id.py < "$RUNNER_TEMP/image_id"
+
+  # A release's prover: built, checked against the release's pins, and kept
+  # with its image id.
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Build the prover
+        working-directory: fluree-prover
+        run: cargo build --locked --release -p fluree-prover
+      - name: Check that fluree-db-erasure pins its guest
+        run: |
+          fluree-prover/target/release/fluree-prover --image-id > "$RUNNER_TEMP/image_id"
+          python3 fluree-prover/check-image-id.py < "$RUNNER_TEMP/image_id"
+          mkdir -p "$RUNNER_TEMP/out"
+          cp fluree-prover/target/release/fluree-prover "$RUNNER_TEMP/image_id" "$RUNNER_TEMP/out/"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fluree-prover-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/out/
