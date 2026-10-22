@@ -219,6 +219,7 @@ impl Fluree {
                 return None;
             }
             next.erasures.push(recorded.clone());
+            keep_recent_finished(&mut next.erasures);
             Some(next)
         })
         .await?;
@@ -413,6 +414,23 @@ fn signing_ledger(
     Err(last)
 }
 
+/// Finished jobs a registration keeps; older ones are dropped (the erasure
+/// map, not the job, is what reads rely on).
+const KEEP_FINISHED: usize = 100;
+
+fn keep_recent_finished(jobs: &mut Vec<ErasureJob>) {
+    let finished = jobs.iter().filter(|j| !j.pending()).count();
+    let mut drop = finished.saturating_sub(KEEP_FINISHED);
+    jobs.retain(|j| {
+        if drop > 0 && !j.pending() {
+            drop -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 fn manifest_hash(manifest: &[OccurrenceRef]) -> String {
     let mut hasher = Sha256::new();
     for occ in manifest {
@@ -443,5 +461,44 @@ fn receipt_of(
         authorized_t: job.authorized_t,
         stage: job.stage,
         removals,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(n: usize, stage: ErasureStage) -> ErasureJob {
+        ErasureJob {
+            request_id: format!("erasure-{n}"),
+            requester: None,
+            accepted_ms: n as i64,
+            authorized_t: 1,
+            signatures: SignatureMode::Verify,
+            stage,
+            commits: Vec::new(),
+            retries: 0,
+            retry_at_ms: None,
+            last_error: None,
+            published_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_registration_keeps_every_pending_job_and_the_recent_finished_ones() {
+        let mut jobs: Vec<ErasureJob> = (0..KEEP_FINISHED + 10)
+            .map(|n| job(n, ErasureStage::Published))
+            .collect();
+        jobs.insert(3, job(9_999, ErasureStage::Proving));
+        keep_recent_finished(&mut jobs);
+        assert_eq!(jobs.len(), KEEP_FINISHED + 1);
+        assert!(jobs.iter().any(|j| j.request_id == "erasure-9999"));
+        assert!(
+            jobs.iter().all(|j| j.request_id != "erasure-0"),
+            "oldest dropped"
+        );
+        assert!(jobs
+            .iter()
+            .any(|j| j.request_id == format!("erasure-{}", KEEP_FINISHED + 9)));
     }
 }

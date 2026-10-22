@@ -85,7 +85,7 @@ impl Fluree {
                 job.stage = ErasureStage::Indexing;
                 let _ = self
                     .update_job(&branch, &job.request_id, |j| {
-                        j.stage = ErasureStage::Indexing
+                        j.stage = ErasureStage::Indexing;
                     })
                     .await;
             }

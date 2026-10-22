@@ -25,6 +25,9 @@ use crate::{ApiError, Result};
 
 const DIR: &str = "@retention/erasure";
 
+/// Map objects a publish finds before it replaces them with their union.
+const COMPACT_AT: usize = 64;
+
 /// One redaction step of an erased commit, as published.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -317,13 +320,33 @@ impl ErasureIndex {
     /// here on, the originals read as their replacements.
     pub(crate) async fn publish(&self, erased: Vec<ErasedCommit>) -> Result<()> {
         self.load().await?;
-        let bytes = serde_json::to_vec(&erased).map_err(|e| ApiError::internal(e.to_string()))?;
-        let path = format!("map/{}.json", sha256_hex(&bytes));
-        self.storage
-            .write_bytes(&self.address(&path), &bytes)
-            .await?;
+        self.write_map(&erased).await?;
         self.install(erased);
+        // Past a bound, one object holding everything replaces the objects
+        // listed: what they hold is in the index, which loaded them all.
+        let objects = self.storage.list_prefix(&self.address("map/")).await?;
+        if objects.len() >= COMPACT_AT {
+            let all: Vec<ErasedCommit> = self
+                .entries
+                .read()
+                .values()
+                .map(|e| e.erased.clone())
+                .collect();
+            let union = self.write_map(&all).await?;
+            let stale: Vec<String> = objects.into_iter().filter(|o| *o != union).collect();
+            for (address, e) in self.storage.delete_many(&stale).await {
+                tracing::warn!(%address, error = %e, "erasure: compacted map object not deleted");
+            }
+        }
         Ok(())
+    }
+
+    /// Write a map object named by its hash; returns its address.
+    async fn write_map(&self, erased: &[ErasedCommit]) -> Result<String> {
+        let bytes = serde_json::to_vec(erased).map_err(|e| ApiError::internal(e.to_string()))?;
+        let address = self.address(&format!("map/{}.json", sha256_hex(&bytes)));
+        self.storage.write_bytes(&address, &bytes).await?;
+        Ok(address)
     }
 }
 
@@ -569,6 +592,31 @@ mod tests {
             slots: vec![1],
             replacement: format!("r-{id}"),
             proof: format!("p-{id}"),
+        }
+    }
+
+    fn erased(n: usize) -> ErasedCommit {
+        ErasedCommit {
+            commit: ContentId::new(ContentKind::Commit, format!("commit {n}").as_bytes())
+                .to_string(),
+            ledger_id: "l:main".into(),
+            steps: vec![step(&format!("r{n}"))],
+        }
+    }
+
+    #[tokio::test]
+    async fn published_maps_compact_and_load_whole() {
+        let storage: Arc<dyn Storage> = Arc::new(fluree_db_core::MemoryStorage::new());
+        let index = ErasureIndex::new(storage.clone(), Arc::new(Verifier::default()));
+        for n in 0..COMPACT_AT + 5 {
+            index.publish(vec![erased(n)]).await.unwrap();
+        }
+        let objects = storage.list_prefix(&index.address("map/")).await.unwrap();
+        assert!(objects.len() < COMPACT_AT, "{} objects", objects.len());
+        let fresh = ErasureIndex::new(storage, Arc::new(Verifier::default()));
+        for n in 0..COMPACT_AT + 5 {
+            let cid: ContentId = erased(n).commit.parse().unwrap();
+            assert_eq!(fresh.erased(&cid).await.unwrap(), Some(erased(n)));
         }
     }
 
