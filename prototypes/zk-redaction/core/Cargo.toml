@@ -10,11 +10,14 @@ ruzstd = "0.8"
 ed25519-dalek = { version = "2.1", default-features = false }
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", optional = true }
+zstd-safe = { version = "7.2", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Hash with the `sha2` crate (host side); the guest supplies the zkVM's
 # accelerated SHA-256 instead.
 host-sha = ["dep:sha2"]
+# Decompress with the reference C zstd decoder instead of `ruzstd`.
+c-zstd = ["dep:zstd-safe"]
 
 [dev-dependencies]
 fluree-db-core = { path = "../../../fluree-db-core", features = ["credential"] }

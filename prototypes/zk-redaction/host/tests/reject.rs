@@ -69,8 +69,8 @@ fn a_chain_verifies_only_back_to_its_anchored_original() {
     assert_eq!(chain(&both, &slots).expect("verifies").len(), 2);
 
     // The first proof missing, as a chain of one or of two.
-    assert!(chain(&[step2.clone()], &[vec![2]]).is_err());
-    assert!(chain(&[step2.clone()], &slots).is_err());
+    assert!(chain(std::slice::from_ref(&step2), &[vec![2]]).is_err());
+    assert!(chain(std::slice::from_ref(&step2), &slots).is_err());
     // The steps reordered.
     assert!(chain(&[step2.clone(), step1.clone()], &slots).is_err());
     // A first proof of another original, or of other slots.
@@ -83,4 +83,54 @@ fn a_chain_verifies_only_back_to_its_anchored_original() {
     assert!(chain(&both, &[vec![1], vec![3]]).is_err());
     // Another final replacement.
     assert!(verify_chain(&both, image_id(), &first, &original_cid, &slots).is_err());
+}
+
+#[test]
+fn a_disclosure_verifies_only_against_its_commit() {
+    use host::{authenticate_image_id, disclose, prove_authenticate, verify_disclosure};
+    use zk_redaction_core::Signatures;
+    let input = commit_blob(16, true, false, false);
+    let (receipt, claim, ..) =
+        prove_authenticate(&input, LEDGER, Signatures::Verify).expect("prove");
+    let anchored = commit_cid(&HostSha::sha256(&input));
+    assert_eq!(claim.cid, anchored);
+    let disclosure = disclose(&input, 3).unwrap();
+    let check = |receipt, image, cid: &[u8], d: &host::Disclosure| {
+        verify_disclosure(receipt, image, cid, d)
+    };
+    check(&receipt, authenticate_image_id(), &anchored, &disclosure).expect("verifies");
+
+    // Another program, or another commit.
+    assert!(check(&receipt, image_id(), &anchored, &disclosure).is_err());
+    let other = commit_cid(&HostSha::sha256(b"another commit"));
+    assert!(check(&receipt, authenticate_image_id(), &other, &disclosure).is_err());
+    // A changed operation.
+    let mut changed = disclosure.clone();
+    *changed.leaf.last_mut().unwrap() ^= 1;
+    assert!(check(&receipt, authenticate_image_id(), &anchored, &changed).is_err());
+    // The operation claimed for another slot, or another slot's path.
+    let mut moved = disclosure.clone();
+    moved.slot = 4;
+    assert!(check(&receipt, authenticate_image_id(), &anchored, &moved).is_err());
+    let mut wrong_path = disclosure.clone();
+    wrong_path.path = disclose(&input, 4).unwrap().path;
+    assert!(check(&receipt, authenticate_image_id(), &anchored, &wrong_path).is_err());
+}
+
+#[test]
+fn a_chain_proof_covers_its_whole_ancestry_and_nothing_else() {
+    use host::{chain_image_id, commit_chain, prove_chain, verify_chain_claim};
+    let commits = commit_chain(3, 8);
+    let cid = |c: &[u8]| commit_cid(&HostSha::sha256(c));
+    let links = prove_chain(&commits).expect("prove");
+    let last = &links[2].receipt;
+    let (base, head) = (cid(&commits[0]), cid(&commits[2]));
+    let claim = verify_chain_claim(last, chain_image_id(), &base, &head).expect("verifies");
+    assert_eq!(claim.length, 3);
+    // Another program, or other ends.
+    assert!(verify_chain_claim(last, image_id(), &base, &head).is_err());
+    assert!(verify_chain_claim(last, chain_image_id(), &cid(&commits[1]), &head).is_err());
+    // A commit that does not follow the chain cannot be linked onto it.
+    let stray = commit_chain(1, 8);
+    assert!(prove_chain(&[commits[0].clone(), stray[0].clone()]).is_err());
 }

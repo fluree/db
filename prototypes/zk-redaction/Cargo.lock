@@ -4156,6 +4156,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "sha2",
+ "zstd-safe",
 ]
 
 [[package]]

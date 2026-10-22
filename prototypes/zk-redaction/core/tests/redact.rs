@@ -246,3 +246,38 @@ fn the_replacement_is_deterministic() {
     let b = redact::<HostSha, _>(&bytes, &[5, 6], LEDGER, &mut ()).unwrap();
     assert_eq!(a, b);
 }
+
+#[test]
+fn exposed_signatures_verify_outside_the_transform_and_bind_their_body() {
+    use zk_redaction_core::{redact_with, verify_exposed_signatures, Signatures};
+    let key = fluree_db_credential::SigningKey::from_bytes(&[7u8; 32]);
+    let commit = Commit::new(3, people(5, 3)).with_parent(parent());
+    let bytes = write_commit(&commit, true, Some((&key, LEDGER)))
+        .unwrap()
+        .bytes;
+    let (replacement, statement) =
+        redact_with::<HostSha, _>(&bytes, &[2], LEDGER, Signatures::Expose, &mut ()).unwrap();
+    // The same replacement as when the transform verifies them.
+    assert_eq!(
+        replacement,
+        redact::<HostSha, _>(&bytes, &[2], LEDGER, &mut ())
+            .unwrap()
+            .0
+    );
+    assert!(statement.signers.is_empty());
+    let did = fluree_db_credential::did_from_pubkey(&key.verifying_key().to_bytes());
+    assert_eq!(
+        verify_exposed_signatures::<HostSha>(&statement).unwrap(),
+        vec![did]
+    );
+
+    let mut forged = statement.clone();
+    forged.signatures[0].signature[0] ^= 1;
+    assert!(verify_exposed_signatures::<HostSha>(&forged).is_err());
+    let mut rebound = statement.clone();
+    rebound.body_hash[0] ^= 1;
+    assert!(verify_exposed_signatures::<HostSha>(&rebound).is_err());
+    let mut misattributed = statement;
+    misattributed.ledger_id = "other:main".into();
+    assert!(verify_exposed_signatures::<HostSha>(&misattributed).is_err());
+}

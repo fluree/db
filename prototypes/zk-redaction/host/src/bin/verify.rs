@@ -15,8 +15,37 @@ fn receipt(path: &str) -> risc0_zkvm::Receipt {
     bincode::deserialize(&std::fs::read(path).unwrap()).unwrap()
 }
 
+/// `verify disclose <scenario>`: one disclosed operation, against the
+/// authentication receipt and the anchored commit CID.
+fn verify_disclosed(name: &str) {
+    let receipt = receipt(&format!("{name}.auth.receipt"));
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(format!("{name}.disclosure.json")).unwrap()).unwrap();
+    let anchored = hex::decode(file["anchored_cid"].as_str().unwrap()).unwrap();
+    let disclosure: host::Disclosure = serde_json::from_value(file["disclosure"].clone()).unwrap();
+    let started = Instant::now();
+    match host::verify_disclosure(&receipt, host::authenticate_image_id(), &anchored, &disclosure) {
+        Ok((claim, signers)) => println!(
+            "{{\"scenario\":\"{name}\",\"disclosed\":true,\"slot\":{},\"verify_ms\":{},\"parents\":{},\"signers\":{}}}",
+            disclosure.slot,
+            started.elapsed().as_secs_f64() * 1e3,
+            claim.parents.len(),
+            signers.len()
+        ),
+        Err(e) => {
+            println!("{{\"scenario\":\"{name}\",\"disclosed\":false,\"error\":{e:?}}}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
-    let name = std::env::args().nth(1).expect("scenario");
+    let mut args = std::env::args().skip(1);
+    let first = args.next().expect("scenario");
+    if first == "disclose" {
+        return verify_disclosed(&args.next().expect("scenario"));
+    }
+    let name = first;
     let replacement = std::fs::read(format!("{name}.replacement")).unwrap();
     let expect: serde_json::Value =
         serde_json::from_slice(&std::fs::read(format!("{name}.expect.json")).unwrap()).unwrap();
@@ -41,7 +70,8 @@ fn main() {
                 statements.len(),
                 started.elapsed().as_secs_f64() * 1e3,
                 last.redacted_slots.len(),
-                statements[0].signers.len()
+                // Verified in the guest, or exposed and verified here.
+                statements[0].signers.len().max(statements[0].signatures.len())
             )
         }
         Err(e) => {

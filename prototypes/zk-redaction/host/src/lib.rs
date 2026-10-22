@@ -5,10 +5,14 @@ use std::time::{Duration, Instant};
 
 use fluree_db_core::commit::codec::write_commit;
 use fluree_db_core::{Commit, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
-use methods::{REDACT_ELF, REDACT_ID};
+use methods::{AUTHENTICATE_ELF, AUTHENTICATE_ID, CHAIN_ELF, CHAIN_ID, REDACT_ELF, REDACT_ID};
 use risc0_zkvm::{default_executor, default_prover, ExecutorEnv, ProverOpts, Receipt};
 use serde::{Deserialize, Serialize};
-use zk_redaction_core::{commit_cid, HostSha, Sha256, Statement, TRANSFORM_VERSION};
+use zk_redaction_core::{
+    audit_path, check_exposed, commit_cid, leaf_hash, leaves, root_from_path,
+    verify_exposed_signatures, ChainClaim, CommitClaim, HostSha, Sha256, Signatures, Statement,
+    CLAIM_VERSION, TRANSFORM_VERSION,
+};
 
 pub const LEDGER: &str = "acme/people:main";
 
@@ -18,7 +22,7 @@ pub fn flakes(n: usize, t: i64) -> Vec<Flake> {
     let mut out = Vec::with_capacity(n);
     let graph = Sid::new(15, "audit");
     for i in 0..n {
-        let s = Sid::new(13, &format!("person-{}", i / 4));
+        let s = Sid::new(13, format!("person-{}", i / 4));
         let flake = match i % 4 {
             0 => Flake::new(
                 s,
@@ -41,7 +45,7 @@ pub fn flakes(n: usize, t: i64) -> Vec<Flake> {
             2 => Flake::new(
                 s,
                 Sid::new(14, "knows"),
-                FlakeValue::Ref(Sid::new(13, &format!("person-{}", (i * 7) % (n / 4 + 1)))),
+                FlakeValue::Ref(Sid::new(13, format!("person-{}", (i * 7) % (n / 4 + 1)))),
                 Sid::new(1, "id"),
                 t,
                 true,
@@ -80,11 +84,12 @@ fn env<'a>(
     input: &[u8],
     removed: &[u32],
     ledger: &str,
+    signatures: Signatures,
     stdout: &'a mut Vec<u8>,
 ) -> anyhow::Result<ExecutorEnv<'a>> {
     let mut builder = ExecutorEnv::builder();
     builder.write_frame(input);
-    builder.write(&(removed.to_vec(), ledger.to_string()))?;
+    builder.write(&(removed.to_vec(), ledger.to_string(), signatures))?;
     builder.stdout(stdout);
     builder.build()
 }
@@ -119,8 +124,18 @@ pub struct Execution {
 /// Run the guest without proving: cycle counts and the statement it would
 /// commit.
 pub fn execute(input: &[u8], removed: &[u32], ledger: &str) -> Result<Execution, String> {
+    execute_with(input, removed, ledger, Signatures::Verify)
+}
+
+/// [`execute`], with the original's signatures verified or exposed.
+pub fn execute_with(
+    input: &[u8],
+    removed: &[u32],
+    ledger: &str,
+    signatures: Signatures,
+) -> Result<Execution, String> {
     let mut stdout = Vec::new();
-    let env = env(input, removed, ledger, &mut stdout).map_err(|e| e.to_string())?;
+    let env = env(input, removed, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let session = default_executor()
         .execute(env, REDACT_ELF)
@@ -147,8 +162,18 @@ pub struct Proof {
 
 /// Prove the guest, compressed to a succinct receipt.
 pub fn prove(input: &[u8], removed: &[u32], ledger: &str) -> Result<Proof, String> {
+    prove_with(input, removed, ledger, Signatures::Verify)
+}
+
+/// [`prove`], with the original's signatures verified or exposed.
+pub fn prove_with(
+    input: &[u8],
+    removed: &[u32],
+    ledger: &str,
+    signatures: Signatures,
+) -> Result<Proof, String> {
     let mut stdout = Vec::new();
-    let env = env(input, removed, ledger, &mut stdout).map_err(|e| e.to_string())?;
+    let env = env(input, removed, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let info = default_prover()
         .prove_with_opts(env, REDACT_ELF, &ProverOpts::succinct())
@@ -268,6 +293,9 @@ fn checked_statement(
     if statement.removed_slots != removed_slots {
         return Err("the proof removed other slots than authorized".into());
     }
+    // Signatures the proof exposed instead of verifying are verified here.
+    verify_exposed_signatures::<HostSha>(&statement)
+        .map_err(|e| format!("an exposed signature: {e}"))?;
     Ok(statement)
 }
 
@@ -285,4 +313,232 @@ pub fn peak_rss_kib() -> (i64, i64) {
         libc::getrusage(libc::RUSAGE_CHILDREN, &mut children);
     }
     (own.ru_maxrss, children.ru_maxrss)
+}
+
+// ---------------------------------------------------------------------------
+// Commit authentication and selective disclosure
+// ---------------------------------------------------------------------------
+
+fn auth_env<'a>(
+    input: &[u8],
+    ledger: &str,
+    signatures: Signatures,
+    stdout: &'a mut Vec<u8>,
+) -> anyhow::Result<ExecutorEnv<'a>> {
+    let mut builder = ExecutorEnv::builder();
+    builder.write_frame(input);
+    builder.write(&(ledger.to_string(), signatures))?;
+    builder.stdout(stdout);
+    builder.build()
+}
+
+/// An authentication run's claim and cycle counts.
+pub struct AuthExecution {
+    pub claim: CommitClaim,
+    pub user_cycles: u64,
+    pub total_cycles: u64,
+    pub segments: usize,
+    pub phases: Vec<(String, u64)>,
+}
+
+/// Run the authentication guest without proving: cycle counts by phase.
+pub fn execute_authenticate(
+    input: &[u8],
+    ledger: &str,
+    signatures: Signatures,
+) -> Result<AuthExecution, String> {
+    let mut stdout = Vec::new();
+    let env = auth_env(input, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
+    let session = default_executor()
+        .execute(env, AUTHENTICATE_ELF)
+        .map_err(|e| e.to_string())?;
+    let claim: CommitClaim = session.journal.decode().map_err(|e| e.to_string())?;
+    Ok(AuthExecution {
+        claim,
+        user_cycles: session.cycles(),
+        total_cycles: session.segments.iter().map(|s| 1u64 << s.po2).sum(),
+        segments: session.segments.len(),
+        phases: phases(&stdout),
+    })
+}
+
+/// Prove a commit's claim, compressed to a succinct receipt.
+pub fn prove_authenticate(
+    input: &[u8],
+    ledger: &str,
+    signatures: Signatures,
+) -> Result<(Receipt, CommitClaim, Duration, u64, usize), String> {
+    let mut stdout = Vec::new();
+    let env = auth_env(input, ledger, signatures, &mut stdout).map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let info = default_prover()
+        .prove_with_opts(env, AUTHENTICATE_ELF, &ProverOpts::succinct())
+        .map_err(|e| e.to_string())?;
+    let prove = started.elapsed();
+    let claim: CommitClaim = info.receipt.journal.decode().map_err(|e| e.to_string())?;
+    Ok((
+        info.receipt,
+        claim,
+        prove,
+        info.stats.total_cycles,
+        info.stats.segments,
+    ))
+}
+
+/// One operation of an authenticated commit, disclosed: its leaf and the
+/// path of hashes to the claim's root.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Disclosure {
+    pub slot: u32,
+    pub leaf: Vec<u8>,
+    pub path: Vec<[u8; 32]>,
+}
+
+/// Disclose operation `slot` of `original`: what its holder hands over.
+pub fn disclose(original: &[u8], slot: u32) -> Result<Disclosure, String> {
+    let leaves = leaves(original).map_err(|e| e.to_string())?;
+    let hashes: Vec<[u8; 32]> = leaves.iter().map(|l| leaf_hash::<HostSha>(l)).collect();
+    let leaf = leaves
+        .get(slot as usize)
+        .ok_or("no such operation")?
+        .clone();
+    Ok(Disclosure {
+        slot,
+        leaf,
+        path: audit_path::<HostSha>(slot as usize, &hashes),
+    })
+}
+
+/// Verify a disclosed operation against an authentication receipt and the
+/// commit CID the ledger's history anchors: the receipt is this program's,
+/// its claim names that commit, the leaf is for the slot it says, and its
+/// path leads to the claim's root. Returns the claim and the signers,
+/// verified in the proof or here.
+pub fn verify_disclosure(
+    receipt: &Receipt,
+    image_id: [u32; 8],
+    anchored_cid: &[u8],
+    disclosure: &Disclosure,
+) -> Result<(CommitClaim, Vec<String>), String> {
+    receipt
+        .verify(image_id)
+        .map_err(|e| format!("receipt does not verify for this program: {e}"))?;
+    let claim: CommitClaim = receipt
+        .journal
+        .decode()
+        .map_err(|e| format!("journal is not a claim: {e}"))?;
+    if claim.claim_version != CLAIM_VERSION {
+        return Err(format!("claim version {}", claim.claim_version));
+    }
+    if claim.cid != anchored_cid {
+        return Err("the claim is for another commit".into());
+    }
+    if disclosure.leaf.get(..4) != Some(&disclosure.slot.to_le_bytes()[..]) {
+        return Err("the leaf is for another slot".into());
+    }
+    let root = root_from_path::<HostSha>(
+        disclosure.slot as usize,
+        claim.op_count as usize,
+        leaf_hash::<HostSha>(&disclosure.leaf),
+        &disclosure.path,
+    );
+    if root.as_ref().map(|r| r.as_slice()) != Some(claim.ops_root.as_slice()) {
+        return Err("the operation is not in the commit".into());
+    }
+    let mut signers = claim.signers.clone();
+    signers.extend(
+        check_exposed::<HostSha>(&claim.ledger_id, &claim.body_hash, &claim.signatures)
+            .map_err(|e| format!("an exposed signature: {e}"))?,
+    );
+    Ok((claim, signers))
+}
+
+/// The authentication guest's image id.
+pub fn authenticate_image_id() -> [u32; 8] {
+    AUTHENTICATE_ID
+}
+
+// ---------------------------------------------------------------------------
+// Ancestry
+// ---------------------------------------------------------------------------
+
+/// `count` commits, each the first parent of the next, of `ops` operations.
+pub fn commit_chain(count: usize, ops: usize) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(count);
+    for i in 0..count {
+        let t = i as i64 + 1;
+        let mut commit = Commit::new(t, flakes(ops, t));
+        if let Some(prev) = out.last() {
+            commit = commit.with_parent(ContentId::new(ContentKind::Commit, prev));
+        }
+        out.push(write_commit(&commit, true, None).unwrap().bytes);
+    }
+    out
+}
+
+/// One proved link: its receipt, claim and proving time.
+pub struct Link {
+    pub receipt: Receipt,
+    pub claim: ChainClaim,
+    pub prove: Duration,
+}
+
+/// Prove `commits`' ancestry link by link, oldest first: each link proves
+/// its commit and resolves the previous link's receipt as an assumption, so
+/// the last receipt alone covers the whole chain.
+pub fn prove_chain(commits: &[Vec<u8>]) -> Result<Vec<Link>, String> {
+    let mut links: Vec<Link> = Vec::with_capacity(commits.len());
+    for commit in commits {
+        let prev = links.last();
+        let mut builder = ExecutorEnv::builder();
+        builder.write_frame(commit);
+        builder
+            .write(&(prev.map(|l| l.claim.clone()), CHAIN_ID))
+            .map_err(|e| e.to_string())?;
+        if let Some(prev) = prev {
+            builder.add_assumption(prev.receipt.clone());
+        }
+        let env = builder.build().map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let info = default_prover()
+            .prove_with_opts(env, CHAIN_ELF, &ProverOpts::succinct())
+            .map_err(|e| e.to_string())?;
+        let prove = started.elapsed();
+        let claim: ChainClaim = info.receipt.journal.decode().map_err(|e| e.to_string())?;
+        links.push(Link {
+            receipt: info.receipt,
+            claim,
+            prove,
+        });
+    }
+    Ok(links)
+}
+
+/// Verify a chain receipt: this program's, from `base` to `head` (the CIDs
+/// the verifier holds), `length` commits.
+pub fn verify_chain_claim(
+    receipt: &Receipt,
+    image_id: [u32; 8],
+    base: &[u8],
+    head: &[u8],
+) -> Result<ChainClaim, String> {
+    receipt
+        .verify(image_id)
+        .map_err(|e| format!("receipt does not verify for this program: {e}"))?;
+    let claim: ChainClaim = receipt
+        .journal
+        .decode()
+        .map_err(|e| format!("journal is not a chain claim: {e}"))?;
+    if claim.image_id != image_id {
+        return Err("the chain was linked by another program".into());
+    }
+    if claim.base_cid != base || claim.head_cid != head {
+        return Err("the chain runs between other commits".into());
+    }
+    Ok(claim)
+}
+
+/// The chain guest's image id.
+pub fn chain_image_id() -> [u32; 8] {
+    CHAIN_ID
 }
