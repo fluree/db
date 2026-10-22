@@ -613,3 +613,6 @@ enum StepError {
     /// Anything else: tried again later.
     Retry(ApiError),
 }
+
+#[cfg(test)]
+mod tests;

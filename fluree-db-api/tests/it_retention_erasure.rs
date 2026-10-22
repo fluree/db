@@ -841,9 +841,93 @@ async fn an_overlapping_request_proves_what_a_failed_one_does_not() {
     assert!(!contains(&raw, "a@secret") && contains(&raw, "c@secret"));
 }
 
-/// The whole workflow with the real prover and the production verifier: run
-/// with `FLUREE_TEST_PROVER` naming a built `fluree-prover` whose image id
-/// `fluree-db-erasure` pins.
+/// A signed commit, through the whole workflow in either signature mode:
+/// the proof verifies the original's signatures, or exposes them for the
+/// verifier, and the replacement reads, replays and reindexes like any
+/// other.
+#[tokio::test]
+async fn a_signed_commit_is_erased_in_either_signature_mode() {
+    use fluree_db_api::retention::erasure::SignatureMode;
+    for (n, mode) in [SignatureMode::Verify, SignatureMode::Expose]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let prover = Arc::new(NativeProver::default());
+        let fluree = erasing(&dir, prover.clone());
+        let id = ledger(&fluree, &format!("it/erase-signed-{n}")).await;
+        let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let t1 = fluree
+            .graph(&id)
+            .transact()
+            .insert(&json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:email": "a@secret"},
+                {"@id": "ex:bob", "ex:email": "b@kept"}
+            ]}))
+            .commit_opts(fluree_db_api::CommitOpts::default().with_signing_key(key))
+            .commit()
+            .await
+            .unwrap()
+            .receipt
+            .t;
+        let original = commit_at(&fluree, &id, t1).await;
+        let store = store_of(&fluree, &id).await;
+        let signed = load_commit_by_id(store.as_ref(), &original).await.unwrap();
+        assert_eq!(signed.commit_signatures.len(), 1);
+
+        fluree
+            .erase_occurrences(
+                &id,
+                ErasureRequest {
+                    signatures: mode,
+                    ..email("alice", "a@secret")
+                },
+                None,
+            )
+            .await
+            .expect("erase");
+        reindex(&fluree, &id).await;
+        let report = fluree.run_erasure_pass(&id).await.unwrap();
+        assert_eq!(
+            (report.proved, report.published),
+            (2, 1),
+            "{mode:?}: {report:?}"
+        );
+        let proved = prover.proved();
+        let step = proved
+            .iter()
+            .find(|r| commit_signed(&r.input))
+            .expect("the signed commit's step");
+        assert_eq!(step.signatures, mode.into());
+
+        drop(fluree);
+        let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+        let raw = store_of(&restarted, &id)
+            .await
+            .get(&original)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(is_replacement(&raw) && !contains(&raw, "a@secret") && contains(&raw, "b@kept"));
+        reindex(&restarted, &id).await;
+        assert!(objects(&restarted, &id, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        assert_eq!(
+            objects(&restarted, &id, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+    }
+}
+
+/// Whether a commit blob carries a commit signature.
+fn commit_signed(bytes: &[u8]) -> bool {
+    fluree_db_core::commit::codec::read_commit(bytes).is_ok_and(|c| !c.commit_signatures.is_empty())
+}
+
+/// The whole workflow with the real prover and the production verifier, on a
+/// signed commit of 1,000 operations whose signature the proof verifies: run
+/// with `FLUREE_TEST_PROVER` naming a `fluree-prover` built from this tree.
 #[tokio::test]
 #[ignore = "needs a built fluree-prover (FLUREE_TEST_PROVER)"]
 async fn the_real_prover_erases_under_a_pinned_image() {
@@ -865,18 +949,23 @@ async fn the_real_prover_erases_under_a_pinned_image() {
         .build()
         .unwrap();
     let id = ledger(&fluree, "it/erase-real").await;
-    let t1 = insert(
-        &fluree,
-        &id,
-        json!({"@context": ctx(), "@graph": [
-            {"@id": "ex:alice", "ex:email": "alice@secret.example"},
-            {"@id": "ex:bob", "ex:email": "bob@kept.example"}
-        ]}),
-    )
-    .await;
+    let people: Vec<JsonValue> = (0..500)
+        .map(|i| json!({"@id": format!("ex:p{i}"), "ex:email": format!("p{i}@secret.example"), "ex:name": format!("Person {i}")}))
+        .collect();
+    let key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+    let t1 = fluree
+        .graph(&id)
+        .transact()
+        .insert(&json!({"@context": ctx(), "@graph": people}))
+        .commit_opts(fluree_db_api::CommitOpts::default().with_signing_key(key))
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
     let original = commit_at(&fluree, &id, t1).await;
     fluree
-        .erase_occurrences(&id, email("alice", "alice@secret.example"), None)
+        .erase_occurrences(&id, email("p0", "p0@secret.example"), None)
         .await
         .expect("erase");
     reindex(&fluree, &id).await;
@@ -904,5 +993,6 @@ async fn the_real_prover_erases_under_a_pinned_image() {
         .await
         .unwrap()
         .into_vec();
-    assert!(is_replacement(&raw) && !contains(&raw, "alice@secret.example"));
+    assert!(is_replacement(&raw) && !contains(&raw, "p0@secret.example"));
+    assert!(contains(&raw, "p1@secret.example"));
 }
