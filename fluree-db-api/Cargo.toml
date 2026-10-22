@@ -843,9 +843,15 @@ required-features = ["native"]
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Test hooks: halting a ledger, and building incrementally without fallback.
 fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }
+# A native prover with fake receipts, for erasure workflow tests.
+fluree-db-erasure = { path = "../fluree-db-erasure", features = ["testing"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 moka = { workspace = true }
+# Permanent erasure: the redaction transform (to check a request against
+# what the prover will do) and the proof verifier.
+fluree-db-redaction = { path = "../fluree-db-redaction", default-features = false, features = ["host-sha", "c-zstd"] }
+fluree-db-erasure = { path = "../fluree-db-erasure" }
 fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-spatial = { path = "../fluree-db-spatial" }

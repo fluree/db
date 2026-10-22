@@ -994,6 +994,7 @@ async fn a_batch_verified_at_an_older_head_is_not_committed() {
         retractions: vec![retract],
         expired: 1,
         retired: 0,
+        control: Vec::new(),
     };
     // A renewal lands first.
     insert(

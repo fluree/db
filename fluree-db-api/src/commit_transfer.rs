@@ -1763,6 +1763,7 @@ impl Fluree {
             let raw_bytes = content_store.get(&current_cid).await.map_err(|e| {
                 ApiError::internal(format!("failed to read commit {current_cid}: {e}"))
             })?;
+            refuse_erased(&current_cid, &raw_bytes)?;
 
             // Lightweight decode: header + envelope only (skip ops decompression).
             let header = CommitHeader::read_from(&raw_bytes).map_err(|e| {
@@ -1863,6 +1864,7 @@ async fn read_export_commits(
             .get(cid)
             .await
             .map_err(|e| ApiError::internal(format!("failed to read commit {cid}: {e}")))?;
+        refuse_erased(cid, &bytes)?;
         let envelope = fluree_db_core::commit::codec::read_commit_envelope(&bytes)
             .map_err(|e| ApiError::internal(format!("invalid commit {cid}: {e}")))?;
         if let Some(txn_cid) = &envelope.txn {
@@ -2746,4 +2748,19 @@ impl Fluree {
             indexing: indexing_status,
         })
     }
+}
+
+/// Transfers carry commits as stored, and an erased commit is stored as its
+/// replacement, which no receiver accepts yet: refuse it by name.
+pub(crate) fn refuse_erased(cid: &ContentId, bytes: &[u8]) -> Result<()> {
+    if fluree_db_core::commit::codec::replacement::is_replacement(bytes) {
+        return Err(ApiError::http(
+            501,
+            format!(
+                "commit {cid} is permanently erased; transferring erased commits is not \
+                 supported yet"
+            ),
+        ));
+    }
+    Ok(())
 }

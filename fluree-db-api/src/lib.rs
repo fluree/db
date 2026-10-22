@@ -1615,6 +1615,9 @@ pub struct FlureeBuilder {
     storage_unlocked: bool,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
     encryption_key: Option<ConfiguredKey>,
+    /// How a file-backed instance proves permanent erasures.
+    #[cfg(feature = "native")]
+    erasure: Option<retention::erasure::ErasureConfig>,
     /// Optional ledger cache configuration (enables LedgerManager)
     ledger_cache_config: Option<LedgerManagerConfig>,
     /// Optional background indexing configuration.
@@ -1913,6 +1916,8 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_wal_owner: None,
             #[cfg(feature = "native")]
+            erasure: None,
+            #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
@@ -1937,6 +1942,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            erasure: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2018,6 +2025,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            erasure: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2127,6 +2136,14 @@ impl FlureeBuilder {
     ///     .with_encryption_key(key)
     ///     .build()?;
     /// ```
+    /// Prove permanent erasures with `config` (file storage only; other
+    /// builds refuse erasure requests).
+    #[cfg(feature = "native")]
+    pub fn with_erasure(mut self, config: retention::erasure::ErasureConfig) -> Self {
+        self.erasure = Some(config);
+        self
+    }
+
     pub fn with_encryption_key(mut self, key: [u8; 32]) -> Self {
         self.encryption_key = Some(ConfiguredKey::from_bytes(key));
         self
@@ -2251,6 +2268,8 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            erasure: None,
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
@@ -2794,11 +2813,13 @@ impl FlureeBuilder {
     /// Assembles a file-backed instance over `storage`, whose WAL is already
     /// recovered, and its `nameservice`, already in the current format.
     #[cfg(feature = "native")]
-    fn build_file(self, storage: FileStorage, nameservice: FileNameService) -> Fluree {
+    fn build_file(mut self, storage: FileStorage, nameservice: FileNameService) -> Fluree {
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
+        let stored = self.encrypt_if_configured(Arc::new(storage));
+        let (stored, erasure) = self.erasure_storage(stored);
+        let backend = StorageBackend::Managed(stored);
         let index_config = self.derive_indexing();
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let ledger_manager_cell = Self::new_ledger_manager_cell();
@@ -2822,7 +2843,34 @@ impl FlureeBuilder {
         );
         // The storage root's lock keeps every other process out.
         fluree.retention.watch.set_sole_writer();
+        let _ = fluree.retention.erasure.set(erasure);
         fluree
+    }
+
+    /// Front file storage with erasure: every read of an erased commit
+    /// reads its verified replacement, whether or not this instance proves
+    /// erasures itself.
+    #[cfg(feature = "native")]
+    fn erasure_storage(
+        &mut self,
+        stored: Arc<dyn Storage>,
+    ) -> (Arc<dyn Storage>, Arc<retention::erasure::ErasureRuntime>) {
+        let config = self.erasure.take();
+        let verifier = config
+            .as_ref()
+            .map_or_else(Default::default, |c| c.verifier.clone());
+        let index = Arc::new(retention::erasure::index::ErasureIndex::new(
+            stored.clone(),
+            verifier,
+        ));
+        let storage: Arc<dyn Storage> = Arc::new(retention::erasure::index::ErasureStorage::new(
+            stored,
+            index.clone(),
+        ));
+        (
+            storage,
+            Arc::new(retention::erasure::ErasureRuntime::new(index, config)),
+        )
     }
 
     /// Build a Fluree instance with custom storage and nameservice.
@@ -3587,7 +3635,10 @@ impl FlureeBuilder {
     /// is `Some`, it replaces the default `FileNameService` (and
     /// the notifying wrapper + background indexer that ride along
     /// with it).
-    async fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
+    async fn build_client_file(
+        #[cfg_attr(not(feature = "native"), allow(unused_mut))] mut self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
         #[cfg(not(feature = "native"))]
         {
             let _ = nameservice;
@@ -3633,6 +3684,7 @@ impl FlureeBuilder {
             let storage = self
                 .wrap_address_identifiers(base_storage, &self.config)
                 .await?;
+            let (storage, erasure) = self.erasure_storage(storage);
             let backend = StorageBackend::Managed(storage);
             let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
@@ -3653,7 +3705,7 @@ impl FlureeBuilder {
                     )
                 }
             };
-            Ok(Self::finalize_with_backend(
+            let fluree = Self::finalize_with_backend(
                 self.ledger_cache_config,
                 self.config,
                 RuntimeParts {
@@ -3668,8 +3720,9 @@ impl FlureeBuilder {
                 self.remote_mounts,
                 #[cfg(feature = "iceberg")]
                 self.secret_resolver,
-            )
-            .holding(root_lock))
+            );
+            let _ = fluree.retention.erasure.set(erasure);
+            Ok(fluree.holding(root_lock))
         }
     }
 

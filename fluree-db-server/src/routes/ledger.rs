@@ -1074,6 +1074,31 @@ pub async fn remove_occurrences_tail(
     Ok(Json(receipt).into_response())
 }
 
+/// Erase selected occurrences permanently: they are removed from what every
+/// branch holding them serves at once, the request's authorization is
+/// committed, and the affected commits are replaced by proved redactions in
+/// the background (see the retention status). Admin-protected; the admin
+/// token's identity is recorded as the requester.
+///
+/// POST /fluree/erase/<ledger...>
+pub async fn erase_occurrences_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    principal: Option<axum::Extension<crate::routes::admin_auth::AdminPrincipal>>,
+    Json(request): Json<fluree_db_api::retention::erasure::ErasureRequest>,
+) -> Result<Response> {
+    let cell = Arc::new(std::sync::OnceLock::new());
+    let _ = cell.set(Arc::clone(&state.committer));
+    let writer = fluree_db_consensus::retention::CommitterRetentionWriter::new(cell);
+    let requester = principal.map(|axum::Extension(p)| p.identity.unwrap_or(p.issuer));
+    let receipt = state
+        .fluree
+        .erase_occurrences_with(&writer, &ledger, request, requester)
+        .await
+        .map_err(ServerError::Api)?;
+    Ok(Json(receipt).into_response())
+}
+
 /// A branch's retention status: whether it is registered for TTL
 /// processing, its activation boundary and watermark, scheduled and expired
 /// counts, the next due time, problems that block or degrade processing, and

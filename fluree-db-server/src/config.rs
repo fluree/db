@@ -558,6 +558,33 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_RETENTION_INTERVAL_SECS", default_value_t = 15)]
     pub retention_interval_secs: u64,
 
+    /// The `fluree-prover` binary that proves permanent erasures
+    ///
+    /// A single node with file storage (`--storage-path`) only. Without it,
+    /// erasure requests are refused.
+    #[arg(long, env = "FLUREE_ERASURE_PROVER")]
+    pub erasure_prover: Option<PathBuf>,
+
+    /// Directory for the prover's temporary files, which hold the plaintext
+    /// of commits being erased (default: a `fluree-erasure` directory under
+    /// the system temp directory)
+    #[arg(long, env = "FLUREE_ERASURE_SCRATCH_DIR")]
+    pub erasure_scratch_dir: Option<PathBuf>,
+
+    /// Threads the prover uses (default: every core); fewer leave the
+    /// transaction path its cores
+    #[arg(long, env = "FLUREE_ERASURE_PROVER_THREADS")]
+    pub erasure_prover_threads: Option<usize>,
+
+    /// A proving step still running after this long is killed and retried
+    /// (seconds)
+    #[arg(
+        long,
+        env = "FLUREE_ERASURE_PROVER_TIMEOUT_SECS",
+        default_value_t = 14_400
+    )]
+    pub erasure_prover_timeout_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 35% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -992,6 +1019,10 @@ impl Default for ServerConfig {
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             orphan_sweep_interval_secs: 0,
             retention_interval_secs: 15,
+            erasure_prover: None,
+            erasure_scratch_dir: None,
+            erasure_prover_threads: None,
+            erasure_prover_timeout_secs: 14_400,
             cache_max_mb: None,
             cache_dictionary_max_mb: None,
             disk_cache_max_mb: None,
@@ -1084,6 +1115,26 @@ impl ServerConfig {
             interval: std::time::Duration::from_secs(self.retention_interval_secs.max(1)),
             ..Default::default()
         }
+    }
+
+    /// How this server proves permanent erasures (`--erasure-prover`), if it
+    /// does.
+    pub fn erasure_config(&self) -> Option<fluree_db_api::retention::erasure::ErasureConfig> {
+        let command = self.erasure_prover.clone()?;
+        Some(
+            fluree_db_api::retention::erasure::ErasureConfig::subprocess(
+                fluree_db_api::retention::erasure::ProverConfig {
+                    command,
+                    scratch_dir: self
+                        .erasure_scratch_dir
+                        .clone()
+                        .unwrap_or_else(|| std::env::temp_dir().join("fluree-erasure")),
+                    threads: self.erasure_prover_threads,
+                    niceness: 10,
+                    timeout: std::time::Duration::from_secs(self.erasure_prover_timeout_secs),
+                },
+            ),
+        )
     }
 
     /// `--orphan-sweep-interval-secs`, `None` when off.
@@ -1289,6 +1340,22 @@ impl ServerConfig {
                  reads the transaction server's storage"
                     .to_string(),
             );
+        }
+
+        // Permanent erasure: a single node over its own file storage.
+        if self.erasure_prover.is_some() {
+            #[cfg(feature = "raft")]
+            if self.raft_enabled {
+                return Err("--erasure-prover is not available in a Raft cluster".to_string());
+            }
+            if self.memory || self.connection_config.is_some() || self.is_proxy_storage_mode() {
+                return Err(
+                    "--erasure-prover needs file storage named by --storage-path".to_string(),
+                );
+            }
+            if self.server_role == ServerRole::Peer {
+                return Err("--erasure-prover is not available on a query peer".to_string());
+            }
         }
 
         // Warn if both connection_config and storage_path are set

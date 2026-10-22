@@ -132,6 +132,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // ordered write path and publishes the removal journal, both
         // leader-coordinated.
         .route("/remove/*ledger", post(ledger::remove_occurrences_tail))
+        // Permanent erasure: the removal on every branch holding the
+        // occurrences, then proofs in the background.
+        .route("/erase/*ledger", post(ledger::erase_occurrences_tail))
         // Reclaims index artifacts no index chain references. Deletes storage
         // and holds the ledger against indexing, so it is admin-gated and
         // runs where the indexer does.

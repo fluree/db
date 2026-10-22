@@ -170,3 +170,77 @@ async fn removal_makes_raw_commits_audit_data() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+#[tokio::test]
+async fn erasure_needs_a_prover_and_file_storage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = std::sync::Arc::new(AppState::new(cfg, telemetry).await.unwrap());
+    let app = build_router(state);
+    let ledger = "erase:main";
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/fluree/create",
+        None,
+        Some(json!({"ledger": ledger})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/fluree/insert/{ledger}"),
+        None,
+        Some(json!({"@context": {"ex": "http://example.org/"},
+                    "insert": {"@id": "ex:alice", "ex:email": "a@x"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // No prover configured: refused, and nothing removed.
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/v1/fluree/erase/{ledger}"),
+        None,
+        Some(json!({"matching": [{"subject": "http://example.org/alice",
+                                  "predicate": "http://example.org/email"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    let (status, results) = call(
+        &app,
+        "POST",
+        &format!("/v1/fluree/query/{ledger}"),
+        None,
+        Some(
+            json!({"@context": {"ex": "http://example.org/"}, "select": "?o",
+                    "where": {"@id": "ex:alice", "ex:email": "?o"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(results, json!(["a@x"]));
+
+    // A prover is configured only over a single node's own file storage.
+    let prover = Some(std::path::PathBuf::from("/usr/local/bin/fluree-prover"));
+    let memory = ServerConfig {
+        memory: true,
+        storage_path: None,
+        erasure_prover: prover.clone(),
+        ..Default::default()
+    };
+    assert!(memory.validate().is_err());
+    let file = ServerConfig {
+        storage_path: Some(tmp.path().to_path_buf()),
+        erasure_prover: prover,
+        ..Default::default()
+    };
+    assert!(file.validate().is_ok(), "{:?}", file.validate());
+}

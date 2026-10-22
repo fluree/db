@@ -80,10 +80,40 @@ pub struct RemovalReceipt {
     pub unacknowledged_replicas: Vec<String>,
 }
 
-/// An occurrence located in the commit log: its operation and span.
+/// An occurrence located in the commit log: its operation and commit `t`.
 struct Located {
     occurrence: OccurrenceRef,
     flake: Flake,
+    t: i64,
+}
+
+/// How a permanent erasure widens a removal.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Widening {
+    /// A named occurrence also takes the one bounding its span: an assertion
+    /// the retraction that ends it, a retraction the assertion it ends. Both
+    /// carry the value, and erasing one alone would change what replaying
+    /// the other states.
+    pub pair_spans: bool,
+    /// Named occurrences outside this branch's history are skipped rather
+    /// than refused: the request is another branch's.
+    pub skip_foreign: bool,
+}
+
+/// A removal and the `t` of each manifest occurrence's commit.
+pub(crate) struct Removed {
+    pub receipt: RemovalReceipt,
+    pub manifest_t: Vec<i64>,
+}
+
+/// One assertion or retraction of a fact: its commit `t`, whether it
+/// asserts, and where it is (commit index, slot).
+#[derive(Clone, Copy)]
+struct Event {
+    t: i64,
+    op: bool,
+    commit: usize,
+    slot: u32,
 }
 
 /// How many times a removal recomputes after a concurrent write.
@@ -120,6 +150,19 @@ impl Fluree {
         ledger_id: &str,
         request: RemovalRequest,
     ) -> Result<RemovalReceipt> {
+        self.remove_widened(writer, ledger_id, &request, Widening::default())
+            .await
+            .map(|r| r.receipt)
+    }
+
+    /// [`Self::remove_occurrences_with`], widened as `widening` says.
+    pub(crate) async fn remove_widened(
+        &self,
+        writer: &dyn RetentionWriter,
+        ledger_id: &str,
+        request: &RemovalRequest,
+        widening: Widening,
+    ) -> Result<Removed> {
         if request.occurrences.is_empty() && request.matching.is_empty() {
             return Err(ApiError::http(
                 400,
@@ -165,7 +208,10 @@ impl Fluree {
                     .commit
                     .parse()
                     .map_err(|_| ApiError::http(400, format!("not a commit id: {}", occ.commit)))?;
-                let Some((_, _, commit)) = commits.iter().find(|(_, c, _)| *c == cid) else {
+                let Some((t, _, commit)) = commits.iter().find(|(_, c, _)| *c == cid) else {
+                    if widening.skip_foreign {
+                        continue;
+                    }
                     return Err(ApiError::CommitNotFound(format!(
                         "commit {} is not in {ledger_id}'s history",
                         occ.commit
@@ -180,9 +226,10 @@ impl Fluree {
                 located.push(Located {
                     occurrence: occ.clone(),
                     flake: flake.clone(),
+                    t: *t,
                 });
             }
-            for (_, cid, commit) in &commits {
+            for (t, cid, commit) in &commits {
                 for (slot, flake) in commit.occurrences() {
                     if selectors.iter().any(|(g, s, p, o)| {
                         flake.g == *g
@@ -196,9 +243,39 @@ impl Fluree {
                                 slot,
                             },
                             flake: flake.clone(),
+                            t: *t,
                         });
                     }
                 }
+            }
+            let events = fact_events(&commits);
+            if widening.pair_spans {
+                let mut pairs = Vec::new();
+                for loc in &located {
+                    let timeline = events
+                        .get(&FactKey::of(&loc.flake))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let pair = if loc.flake.op {
+                        timeline.iter().find(|e| e.t > loc.t && !e.op)
+                    } else {
+                        timeline.iter().rev().find(|e| e.t < loc.t && e.op)
+                    };
+                    if let Some(e) = pair {
+                        let (t, cid, commit) = &commits[e.commit];
+                        if let Some(flake) = commit.at_slot(e.slot) {
+                            pairs.push(Located {
+                                occurrence: OccurrenceRef {
+                                    commit: cid.to_string(),
+                                    slot: e.slot,
+                                },
+                                flake: flake.clone(),
+                                t: *t,
+                            });
+                        }
+                    }
+                }
+                located.extend(pairs);
             }
             located.sort_by(|a, b| {
                 a.occurrence
@@ -216,7 +293,6 @@ impl Fluree {
 
             // The span of each occurrence: an assertion runs to the fact's
             // next retraction; a retraction ends the assertion before it.
-            let events = fact_events(&commits);
             let mut spans: Vec<(i64, Option<i64>)> = Vec::with_capacity(located.len());
             let mut current: Vec<Flake> = Vec::new();
             for loc in &located {
@@ -225,8 +301,8 @@ impl Fluree {
                 if loc.flake.op {
                     let until = timeline
                         .iter()
-                        .find(|(t, op)| *t > loc.flake.t && !op)
-                        .map(|(t, _)| *t);
+                        .find(|e| e.t > loc.flake.t && !e.op)
+                        .map(|e| e.t);
                     if until.is_none() {
                         current.push(loc.flake.clone());
                     }
@@ -235,8 +311,8 @@ impl Fluree {
                     let from = timeline
                         .iter()
                         .rev()
-                        .find(|(t, op)| *t < loc.flake.t && *op)
-                        .map_or(0, |(t, _)| *t);
+                        .find(|e| e.t < loc.flake.t && e.op)
+                        .map_or(0, |e| e.t);
                     spans.push((from, Some(loc.flake.t)));
                 }
             }
@@ -266,6 +342,7 @@ impl Fluree {
                     },
                     expired: current.len(),
                     retired: 0,
+                    control: Vec::new(),
                 };
                 match writer.submit(&ledger_id, batch).await? {
                     SubmitOutcome::Committed { t } => {
@@ -293,6 +370,7 @@ impl Fluree {
                                             slot,
                                         },
                                         flake: flake.clone(),
+                                        t,
                                     });
                                     spans.push((from, Some(t)));
                                 }
@@ -360,13 +438,17 @@ impl Fluree {
             let unacknowledged_replicas = self
                 .unacknowledged_replicas(super::replicas::ACK_TIMEOUT)
                 .await;
-            return Ok(RemovalReceipt {
-                request_id,
-                scope_t,
-                manifest: located.into_iter().map(|l| l.occurrence).collect(),
-                retracted_t,
-                generation: registration.journal.generation,
-                unacknowledged_replicas,
+            let manifest_t = located.iter().map(|l| l.t).collect();
+            return Ok(Removed {
+                receipt: RemovalReceipt {
+                    request_id,
+                    scope_t,
+                    manifest: located.into_iter().map(|l| l.occurrence).collect(),
+                    retracted_t,
+                    generation: registration.journal.generation,
+                    unacknowledged_replicas,
+                },
+                manifest_t,
             });
         }
         Err(ApiError::commit_contention(
@@ -379,14 +461,16 @@ impl Fluree {
 /// Each fact's assertions and retractions, in commit order.
 fn fact_events(
     commits: &[(i64, ContentId, fluree_db_core::Commit)],
-) -> HashMap<FactKey, Vec<(i64, bool)>> {
-    let mut events: HashMap<FactKey, Vec<(i64, bool)>> = HashMap::new();
-    for (t, _, commit) in commits {
-        for flake in &commit.flakes {
-            events
-                .entry(FactKey::of(flake))
-                .or_default()
-                .push((*t, flake.op));
+) -> HashMap<FactKey, Vec<Event>> {
+    let mut events: HashMap<FactKey, Vec<Event>> = HashMap::new();
+    for (index, (t, _, commit)) in commits.iter().enumerate() {
+        for (slot, flake) in commit.occurrences() {
+            events.entry(FactKey::of(flake)).or_default().push(Event {
+                t: *t,
+                op: flake.op,
+                commit: index,
+                slot,
+            });
         }
     }
     events

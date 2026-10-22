@@ -86,9 +86,19 @@ async fn a_refusal_a_timeout_and_a_missing_binary_are_errors() {
     );
     let runner = SubprocessProver::new(config(dir.path(), refuses, Duration::from_secs(30)));
     match runner.prove(&request()).await {
-        Err(ProverError::Failed(m)) => assert!(m.contains("invalid slots"), "{m}"),
+        Err(ProverError::Refused(m)) => assert!(m.contains("invalid slots"), "{m}"),
         other => panic!("{other:?}"),
     }
+    let crashes = script(
+        dir.path(),
+        "crashes",
+        "cat > /dev/null\necho 'proving: out of memory' >&2\nexit 1",
+    );
+    let runner = SubprocessProver::new(config(dir.path(), crashes, Duration::from_secs(30)));
+    assert!(matches!(
+        runner.prove(&request()).await,
+        Err(ProverError::Failed(_))
+    ));
     // It hangs with a child of its own; both are gone after the timeout.
     let d = dir.path().display();
     let hangs = script(

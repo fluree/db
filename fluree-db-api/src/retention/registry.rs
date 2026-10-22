@@ -64,6 +64,10 @@ pub struct Registration {
     /// a pass publishes a journal that has moved past it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub checkpointed: u64,
+    /// Permanent-erasure requests made on this branch, and their progress.
+    #[cfg(feature = "native")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub erasures: Vec<super::erasure::ErasureJob>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -132,6 +136,32 @@ pub(crate) async fn update_fenced(
     Err(ApiError::internal(format!(
         "retention registration for {ledger_id}: compare-and-set kept losing"
     )))
+}
+
+/// Give a new branch its source's retention: its activation boundary and its
+/// journal, which the history the branch shares still needs. Nothing when
+/// the source has no registration.
+pub(crate) async fn inherit(
+    ns: &dyn NameServicePublisher,
+    source_id: &str,
+    branch_id: &str,
+    fence: Option<fluree_db_nameservice::Fence>,
+) -> Result<()> {
+    let Some(source) = read(ns, source_id).await?.1 else {
+        return Ok(());
+    };
+    update_fenced(ns, branch_id, fence, |current| {
+        let mut next = current.cloned().unwrap_or_else(|| Registration {
+            active_since_t: source.active_since_t,
+            watermark_t: source.active_since_t - 1,
+            ..Default::default()
+        });
+        next.journal.merge(&source.journal);
+        next.lineage = next.lineage.clone().or_else(|| source.lineage.clone());
+        Some(next)
+    })
+    .await
+    .map(|_| ())
 }
 
 /// Register the branch as active from `since_t`, keeping an earlier boundary

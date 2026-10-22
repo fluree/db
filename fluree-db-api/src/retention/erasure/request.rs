@@ -1,0 +1,447 @@
+//! Accepting an erasure request: its scope, the removal on every branch
+//! that holds an occurrence, the control commit that authorizes it, and the
+//! job that tracks it.
+
+use std::collections::BTreeMap;
+
+use fluree_db_core::{
+    ContentId, ContentStore, HashAlgorithm, LedgerId, TxnMetaEntry, TxnMetaValue,
+};
+use fluree_vocab::{db, namespaces::FLUREE_DB};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::{CommitErasure, ErasureJob, ErasureStage, SignatureMode};
+use crate::retention::registry;
+use crate::retention::removal::{
+    FactSelector, OccurrenceRef, RemovalReceipt, RemovalRequest, Widening,
+};
+use crate::retention::writer::{outcome_of, RetentionBatch, RetentionWriter, SubmitOutcome};
+use crate::{ApiError, Fluree, Result};
+
+/// A permanent-erasure request: occurrences named by commit and slot, or
+/// facts whose every occurrence is erased.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErasureRequest {
+    #[serde(default)]
+    pub occurrences: Vec<OccurrenceRef>,
+    #[serde(default)]
+    pub matching: Vec<FactSelector>,
+    /// `expose` proves a signed commit as fast as an unsigned one, but its
+    /// proof reveals the signed body's hash.
+    #[serde(default)]
+    pub signatures: SignatureMode,
+}
+
+/// The removal an erasure made on one branch.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchRemoval {
+    pub ledger_id: String,
+    pub removal: RemovalReceipt,
+}
+
+/// What accepting an erasure request did.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErasureReceipt {
+    pub request_id: String,
+    /// Every occurrence erased, across branches.
+    pub manifest: Vec<OccurrenceRef>,
+    /// Commits to prove.
+    pub commits: usize,
+    /// The control commit recording the authorization.
+    pub authorized_t: i64,
+    pub stage: ErasureStage,
+    /// The removal on each branch holding an occurrence.
+    pub removals: Vec<BranchRemoval>,
+}
+
+/// How many times the authorizing commit is retried against a moving head.
+const ATTEMPTS: usize = 5;
+
+impl Fluree {
+    /// Erase the selected occurrences permanently, committing directly. See
+    /// [`Self::erase_occurrences_with`].
+    pub async fn erase_occurrences(
+        &self,
+        ledger_id: &str,
+        request: ErasureRequest,
+        requester: Option<String>,
+    ) -> Result<ErasureReceipt> {
+        struct Direct<'a>(&'a Fluree);
+        #[async_trait::async_trait]
+        impl RetentionWriter for Direct<'_> {
+            async fn submit(
+                &self,
+                ledger_id: &str,
+                batch: RetentionBatch,
+            ) -> Result<SubmitOutcome> {
+                outcome_of(self.0.commit_retention_batch(ledger_id, batch).await)
+            }
+        }
+        self.erase_occurrences_with(&Direct(self), ledger_id, request, requester)
+            .await
+    }
+
+    /// Accept a permanent-erasure request, committing through `writer`:
+    /// remove the occurrences from every branch that holds them, record the
+    /// authorization, and queue the proofs. The receipt returns once the
+    /// request is durable; proving and publishing follow in the background
+    /// (see [`Self::retention_status`]).
+    pub async fn erase_occurrences_with(
+        &self,
+        writer: &dyn RetentionWriter,
+        ledger_id: &str,
+        request: ErasureRequest,
+        requester: Option<String>,
+    ) -> Result<ErasureReceipt> {
+        let runtime = self.erasure_runtime()?;
+        if runtime.config.is_none() {
+            return Err(unsupported("no prover is configured"));
+        }
+        if self.retention.replicas.get().is_some() {
+            return Err(unsupported("a cluster cannot erase permanently yet"));
+        }
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        let ns = self.publisher()?;
+        let mut branches: Vec<String> = ns
+            .list_branches(ledger_id.name())
+            .await?
+            .into_iter()
+            .filter(|r| !r.retracted && r.ledger_id != ledger_id)
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        branches.sort();
+        branches.insert(0, ledger_id.to_string());
+
+        let removal_request = RemovalRequest {
+            occurrences: request.occurrences.clone(),
+            matching: request.matching.clone(),
+        };
+        // (commit, slot) -> (t, branches)
+        let mut found: BTreeMap<(String, u32), (i64, Vec<String>)> = BTreeMap::new();
+        let mut removals = Vec::new();
+        for (i, branch) in branches.iter().enumerate() {
+            let requested = i == 0;
+            let widening = Widening {
+                pair_spans: true,
+                skip_foreign: !requested,
+            };
+            let removed = match self
+                .remove_widened(writer, branch, &removal_request, widening)
+                .await
+            {
+                Ok(removed) => removed,
+                // Nothing of the request on this other branch.
+                Err(e) if !requested && (e.is_not_found() || e.status_code() == 404) => continue,
+                Err(e) => return Err(e),
+            };
+            for (occ, t) in removed.receipt.manifest.iter().zip(&removed.manifest_t) {
+                let entry = found
+                    .entry((occ.commit.clone(), occ.slot))
+                    .or_insert((*t, Vec::new()));
+                if !entry.1.contains(branch) {
+                    entry.1.push(branch.clone());
+                }
+            }
+            removals.push(BranchRemoval {
+                ledger_id: branch.clone(),
+                removal: removed.receipt,
+            });
+        }
+
+        let manifest: Vec<OccurrenceRef> = found
+            .keys()
+            .map(|(commit, slot)| OccurrenceRef {
+                commit: commit.clone(),
+                slot: *slot,
+            })
+            .collect();
+        let request_id = request_id(&ledger_id, &manifest);
+        let (_, registration) = registry::read(ns, ledger_id.as_str()).await?;
+        if let Some(job) = registration
+            .as_ref()
+            .and_then(|r| r.erasures.iter().find(|j| j.request_id == request_id))
+        {
+            return Ok(receipt_of(job, manifest, removals));
+        }
+
+        let mut commits = self.commits_to_erase(&ledger_id, &found, &branches).await?;
+        // Slots another request already erases are its to prove.
+        let claimed = self.claimed_slots(&branches).await?;
+        for task in &mut commits {
+            if let Some(taken) = claimed.get(&task.commit) {
+                task.slots.retain(|s| !taken.contains(s));
+            }
+        }
+        commits.retain(|c| !c.slots.is_empty());
+
+        let authorized_t = self
+            .authorize_erasure(
+                writer,
+                &ledger_id,
+                &request_id,
+                requester.as_deref(),
+                &manifest,
+            )
+            .await?;
+        let job = ErasureJob {
+            request_id: request_id.clone(),
+            requester,
+            accepted_ms: crate::retention::worker::now_ms(),
+            authorized_t,
+            signatures: request.signatures,
+            stage: if commits.is_empty() {
+                ErasureStage::Published
+            } else {
+                ErasureStage::Proving
+            },
+            commits,
+            retries: 0,
+            retry_at_ms: None,
+            last_error: None,
+            published_ms: None,
+        };
+        let recorded = job.clone();
+        registry::update(ns, ledger_id.as_str(), |current| {
+            let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
+                active_since_t: authorized_t,
+                watermark_t: authorized_t - 1,
+                ..Default::default()
+            });
+            if next
+                .erasures
+                .iter()
+                .any(|j| j.request_id == recorded.request_id)
+            {
+                return None;
+            }
+            next.erasures.push(recorded.clone());
+            Some(next)
+        })
+        .await?;
+        self.retention.mark_active(ledger_id.as_str());
+        Ok(receipt_of(&job, manifest, removals))
+    }
+
+    pub(crate) fn erasure_runtime(&self) -> Result<&std::sync::Arc<super::ErasureRuntime>> {
+        self.retention
+            .erasure
+            .get()
+            .ok_or_else(|| unsupported("permanent erasure needs a single node with file storage"))
+    }
+
+    /// Each affected commit, checked for what the transform supports, with
+    /// the ledger id its signatures verify for.
+    async fn commits_to_erase(
+        &self,
+        ledger_id: &LedgerId,
+        found: &BTreeMap<(String, u32), (i64, Vec<String>)>,
+        branches: &[String],
+    ) -> Result<Vec<CommitErasure>> {
+        let mut by_commit: BTreeMap<&str, CommitErasure> = BTreeMap::new();
+        for ((commit, slot), (t, holders)) in found {
+            let task = by_commit.entry(commit).or_insert_with(|| CommitErasure {
+                commit: commit.clone(),
+                t: *t,
+                slots: Vec::new(),
+                ledger_id: ledger_id.to_string(),
+                branches: Vec::new(),
+                proved: None,
+            });
+            task.slots.push(*slot);
+            for b in holders {
+                if !task.branches.contains(b) {
+                    task.branches.push(b.clone());
+                }
+            }
+        }
+        let runtime = self.erasure_runtime()?;
+        let mut out = Vec::with_capacity(by_commit.len());
+        for (commit, mut task) in by_commit {
+            let cid: ContentId = commit
+                .parse()
+                .map_err(|_| ApiError::http(400, format!("not a commit id: {commit}")))?;
+            if cid.hash_algorithm() != Some(HashAlgorithm::Sha2_256) {
+                return Err(unsupported_commit(commit, "its CID is not SHA2-256"));
+            }
+            task.slots.sort_unstable();
+            task.slots.dedup();
+            if let Some(erased) = runtime.index.erased(&cid).await? {
+                // A later step reads the replacement and keeps its ledger.
+                let done = erased.redacted_slots();
+                task.ledger_id = erased.ledger_id;
+                task.slots.retain(|s| !done.contains(s));
+                out.push(task);
+                continue;
+            }
+            let bytes = self.commit_bytes(&task.branches[0], &cid).await?;
+            task.ledger_id = signing_ledger(&bytes, &task.slots, branches)
+                .map_err(|why| unsupported_commit(commit, &why))?;
+            out.push(task);
+        }
+        Ok(out)
+    }
+
+    /// A commit's bytes as stored: its original, or its replacement.
+    pub(crate) async fn commit_bytes(&self, branch: &str, cid: &ContentId) -> Result<Vec<u8>> {
+        let record = self
+            .nameservice()
+            .lookup(branch)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(branch.to_string()))?;
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+            .await?;
+        Ok(store.get(cid).await?.into_vec())
+    }
+
+    /// Slots each commit's pending erasures already remove.
+    async fn claimed_slots(&self, branches: &[String]) -> Result<BTreeMap<String, Vec<u32>>> {
+        let ns = self.publisher()?;
+        let mut claimed: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for branch in branches {
+            let (_, registration) = registry::read(ns, branch).await?;
+            for job in registration.iter().flat_map(|r| &r.erasures) {
+                if !job.pending() {
+                    continue;
+                }
+                for task in &job.commits {
+                    claimed
+                        .entry(task.commit.clone())
+                        .or_default()
+                        .extend(&task.slots);
+                }
+            }
+        }
+        Ok(claimed)
+    }
+
+    /// Commit the request's authorization on `ledger_id`: its id, its
+    /// requester and its manifest's hash, and no value. Returns its `t`.
+    async fn authorize_erasure(
+        &self,
+        writer: &dyn RetentionWriter,
+        ledger_id: &LedgerId,
+        request_id: &str,
+        requester: Option<&str>,
+        manifest: &[OccurrenceRef],
+    ) -> Result<i64> {
+        let mut control = vec![
+            TxnMetaEntry::new(
+                FLUREE_DB,
+                db::ERASURE_REQUEST,
+                TxnMetaValue::String(request_id.to_string()),
+            ),
+            TxnMetaEntry::new(
+                FLUREE_DB,
+                db::ERASURE_MANIFEST,
+                TxnMetaValue::String(manifest_hash(manifest)),
+            ),
+        ];
+        if let Some(requester) = requester {
+            control.push(TxnMetaEntry::new(
+                FLUREE_DB,
+                db::ERASURE_REQUESTER,
+                TxnMetaValue::String(requester.to_string()),
+            ));
+        }
+        for _ in 0..ATTEMPTS {
+            let record = self
+                .nameservice()
+                .lookup(ledger_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+            let batch = RetentionBatch {
+                expected_t: record.commit_t,
+                retractions: Vec::new(),
+                expired: 0,
+                retired: 0,
+                control: control.clone(),
+            };
+            match writer.submit(ledger_id.as_str(), batch).await? {
+                SubmitOutcome::Committed { t } => return Ok(t),
+                SubmitOutcome::HeadMoved => continue,
+                SubmitOutcome::Deferred => {
+                    return Err(ApiError::Transact(
+                        fluree_db_transact::TransactError::NoveltyAtMax,
+                    ))
+                }
+            }
+        }
+        Err(ApiError::commit_contention(
+            ATTEMPTS,
+            ApiError::internal("the head kept moving while authorizing the erasure"),
+        ))
+    }
+}
+
+fn unsupported(why: &str) -> ApiError {
+    ApiError::http(501, format!("permanent erasure is unsupported here: {why}"))
+}
+
+fn unsupported_commit(commit: &str, why: &str) -> ApiError {
+    ApiError::http(
+        422,
+        format!(
+            "the occurrences are removed from what the ledger serves, but commit {commit} \
+             cannot be erased permanently: {why}"
+        ),
+    )
+}
+
+/// The ledger id among `candidates` that `bytes`' signatures verify for
+/// (the first, for an unsigned commit), checked by running the transform
+/// as the prover will, verifying signatures whichever mode proves them.
+/// Its error is why the commit cannot be erased.
+fn signing_ledger(
+    bytes: &[u8],
+    slots: &[u32],
+    candidates: &[String],
+) -> std::result::Result<String, String> {
+    use fluree_db_redaction::{redact_with, Error, HostSha, Signatures};
+    let mut last = String::new();
+    for candidate in candidates {
+        match redact_with::<HostSha, _>(bytes, slots, candidate, Signatures::Verify, &mut ()) {
+            Ok(_) => return Ok(candidate.clone()),
+            Err(Error::Signature(why)) => last = format!("its signature does not verify ({why})"),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(last)
+}
+
+fn manifest_hash(manifest: &[OccurrenceRef]) -> String {
+    let mut hasher = Sha256::new();
+    for occ in manifest {
+        hasher.update(occ.commit.as_bytes());
+        hasher.update(occ.slot.to_le_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// A deterministic id: the ledger and the manifest, so a retried request
+/// finds its job.
+fn request_id(ledger_id: &LedgerId, manifest: &[OccurrenceRef]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ledger_id.as_str().as_bytes());
+    hasher.update(manifest_hash(manifest).as_bytes());
+    format!("erasure-{}", hex::encode(&hasher.finalize()[..12]))
+}
+
+fn receipt_of(
+    job: &ErasureJob,
+    manifest: Vec<OccurrenceRef>,
+    removals: Vec<BranchRemoval>,
+) -> ErasureReceipt {
+    ErasureReceipt {
+        request_id: job.request_id.clone(),
+        manifest,
+        commits: job.commits.len(),
+        authorized_t: job.authorized_t,
+        stage: job.stage,
+        removals,
+    }
+}

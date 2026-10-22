@@ -26,6 +26,7 @@ fn reject(why: impl Into<String>) -> VerifyError {
 }
 
 /// Checks receipts against the pinned guest images.
+#[derive(Debug)]
 pub struct Verifier {
     image_ids: Vec<[u32; 8]>,
     dev_receipts: bool,

@@ -66,7 +66,7 @@ fn len_prefixed<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], CommitC
 }
 
 /// Whether `bytes` are a replacement rather than a commit.
-pub(crate) fn is_replacement(bytes: &[u8]) -> bool {
+pub fn is_replacement(bytes: &[u8]) -> bool {
     bytes.get(..4) == Some(&REPLACEMENT_MAGIC[..])
 }
 

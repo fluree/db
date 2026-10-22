@@ -6,3 +6,6 @@ mod it_retention_ttl;
 
 #[path = "it_retention_history.rs"]
 mod it_retention_history;
+
+#[path = "it_retention_erasure.rs"]
+mod it_retention_erasure;

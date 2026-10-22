@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Weak;
 
 use fluree_db_core::commit::codec::{decode_flake_batch, encode_flake_batch};
-use fluree_db_core::{Flake, LedgerId, Sid};
+use fluree_db_core::{Flake, LedgerId, Sid, TxnMetaEntry};
 use fluree_db_ledger::StagedLedger;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, TransactError};
 
@@ -38,33 +38,44 @@ pub struct RetentionBatch {
     pub expired: usize,
     /// Superseded TTL annotations the batch retires.
     pub retired: usize,
+    /// Control txn-meta the commit records: an erasure's authorization. A
+    /// batch with control entries commits even with no retractions.
+    pub control: Vec<TxnMetaEntry>,
 }
 
 impl RetentionBatch {
     /// An exact encoding, for a batch that crosses a process boundary.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        let internal = |e: &dyn std::fmt::Display| ApiError::internal(e.to_string());
+        let flakes = encode_flake_batch(&self.retractions).map_err(|e| internal(&e))?;
         let mut out = Vec::new();
         out.extend_from_slice(&self.expected_t.to_le_bytes());
         out.extend_from_slice(&(self.expired as u64).to_le_bytes());
         out.extend_from_slice(&(self.retired as u64).to_le_bytes());
-        out.extend(
-            encode_flake_batch(&self.retractions).map_err(|e| ApiError::internal(e.to_string()))?,
-        );
+        out.extend_from_slice(&(flakes.len() as u64).to_le_bytes());
+        out.extend(flakes);
+        out.extend(serde_json::to_vec(&self.control).map_err(|e| internal(&e))?);
         Ok(out)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let bad = || ApiError::internal("malformed retention batch");
-        if bytes.len() < 24 {
+        if bytes.len() < 32 {
             return Err(bad());
         }
         let word = |i: usize| -> [u8; 8] { bytes[i * 8..i * 8 + 8].try_into().unwrap() };
+        let flakes_end = usize::try_from(u64::from_le_bytes(word(3)))
+            .ok()
+            .and_then(|len| len.checked_add(32))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(bad)?;
         Ok(Self {
             expected_t: i64::from_le_bytes(word(0)),
             expired: u64::from_le_bytes(word(1)) as usize,
             retired: u64::from_le_bytes(word(2)) as usize,
-            retractions: decode_flake_batch(&bytes[24..])
+            retractions: decode_flake_batch(&bytes[32..flakes_end])
                 .map_err(|e| ApiError::internal(e.to_string()))?,
+            control: serde_json::from_slice(&bytes[flakes_end..]).map_err(|_| bad())?,
         })
     }
 }
@@ -179,16 +190,18 @@ impl Fluree {
             return Err(ApiError::Transact(TransactError::NoveltyAtMax));
         }
         let staged = self
-            .stage_retention_commit(state, batch.retractions, store.as_ref())
+            .stage_retention_commit(state, batch.retractions, batch.control, store.as_ref())
             .await?;
         Ok((write_guard, staged))
     }
 
-    /// Stage `retractions` against `state` as a retention commit.
+    /// Stage `retractions` against `state` as a retention commit, recording
+    /// `control` in its txn-meta.
     pub(crate) async fn stage_retention_commit(
         &self,
         mut state: fluree_db_ledger::LedgerState,
         retractions: Vec<Flake>,
+        control: Vec<TxnMetaEntry>,
         store: &dyn fluree_db_core::ContentStore,
     ) -> Result<fluree_db_transact::StagedCommit> {
         if state.head_temporal.is_none() && state.head_commit_id.is_some() {
@@ -199,11 +212,17 @@ impl Fluree {
         }
         let reverse_graph: HashMap<Sid, fluree_db_core::GraphId> =
             state.snapshot.build_reverse_graph()?;
+        let control_only = retractions.is_empty() && !control.is_empty();
         let view = StagedLedger::new(state, retractions, &reverse_graph)?;
         let ns_registry = NamespaceRegistry::from_db(view.db());
-        let commit_opts = CommitOpts::default()
+        let mut txn_meta = vec![super::retention_control_marker()];
+        txn_meta.extend(control);
+        let mut commit_opts = CommitOpts::default()
             .identity(RETENTION_IDENTITY)
-            .with_txn_meta(vec![super::retention_control_marker()]);
+            .with_txn_meta(txn_meta);
+        if control_only {
+            commit_opts = commit_opts.as_control();
+        }
         let expected_head_ref =
             view.base()
                 .head_commit_id
@@ -244,11 +263,19 @@ mod tests {
             )],
             expired: 1,
             retired: 0,
+            control: vec![TxnMetaEntry::new(
+                7,
+                "erasureRequest",
+                fluree_db_core::TxnMetaValue::String("erasure-1".into()),
+            )],
         };
         let back = RetentionBatch::decode(&batch.encode().unwrap()).unwrap();
         assert_eq!(back.expected_t, 42);
         assert_eq!(back.expired, 1);
         assert_eq!(back.retractions.len(), 1);
         assert!(matches!(back.retractions[0].o, FlakeValue::Double(_)));
+        assert_eq!(back.control, batch.control);
+        let encoded = batch.encode().unwrap();
+        assert!(RetentionBatch::decode(&encoded[..encoded.len() - 1]).is_err());
     }
 }

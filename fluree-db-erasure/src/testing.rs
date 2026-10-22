@@ -61,7 +61,7 @@ impl Prover for NativeProver {
             request.signatures,
             &mut (),
         )
-        .map_err(|e| ProverError::Failed(format!("redaction refused: {e}")))?;
+        .map_err(|e| ProverError::Refused(format!("redaction: {e}")))?;
         self.proved.lock().unwrap().push(request.clone());
         Ok(ProveResponse {
             replacement,

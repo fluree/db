@@ -1861,6 +1861,17 @@ pub mod db {
     /// not become deletion instructions.
     pub const RETENTION_CONTROL: &str = "retentionControl";
 
+    /// db:erasureRequest - on the control commit that authorizes a permanent
+    /// erasure: the request's id.
+    pub const ERASURE_REQUEST: &str = "erasureRequest";
+
+    /// db:erasureRequester - the identity that requested the erasure.
+    pub const ERASURE_REQUESTER: &str = "erasureRequester";
+
+    /// db:erasureManifest - SHA-256 (hex) of the erasure's manifest: the
+    /// occurrences it removes, by commit and slot. It names no value.
+    pub const ERASURE_MANIFEST: &str = "erasureManifest";
+
     /// The local names in this namespace that a user may set in a commit's
     /// txn-meta: `f:message`, `f:author`, and the transaction TTL default
     /// (`f:ttlSeconds` or `f:expiresAt`).
@@ -1868,8 +1879,8 @@ pub mod db {
 
     /// Every local name in this namespace a commit's txn-meta holds: the user
     /// claims ([`TXN_META_USER`]) and the entries the system writes
-    /// (`f:identity`, `db:receivedAt`, `f:reverts` on a revert, and
-    /// `f:retentionControl`).
+    /// (`f:identity`, `db:receivedAt`, `f:reverts` on a revert,
+    /// `f:retentionControl`, and an erasure's authorization).
     pub const TXN_META: &[&str] = &[
         MESSAGE,
         AUTHOR,
@@ -1879,6 +1890,9 @@ pub mod db {
         RECEIVED_AT,
         REVERTS,
         RETENTION_CONTROL,
+        ERASURE_REQUEST,
+        ERASURE_REQUESTER,
+        ERASURE_MANIFEST,
     ];
 
     /// db:txn - transaction address (optional)

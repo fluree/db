@@ -94,6 +94,7 @@ pub async fn compute_missing_commits<C: ContentStore>(
             let raw_bytes = store.get(&current_id).await.map_err(|e| {
                 ApiError::internal(format!("failed to read commit {current_id}: {e}"))
             })?;
+            crate::commit_transfer::refuse_erased(&current_id, &raw_bytes)?;
 
             let header = CommitHeader::read_from(&raw_bytes).map_err(|e| {
                 ApiError::internal(format!("invalid commit header for {current_id}: {e}"))
@@ -464,6 +465,7 @@ async fn stream_pack_inner(
             .get(commit_cid)
             .await
             .map_err(|e| format!("failed to read commit {commit_cid}: {e}"))?;
+        crate::commit_transfer::refuse_erased(commit_cid, &raw_bytes).map_err(|e| e.to_string())?;
 
         // Encode and send commit data frame.
         let mut buf = Vec::with_capacity(raw_bytes.len() + 64);

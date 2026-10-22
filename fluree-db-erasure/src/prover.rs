@@ -13,7 +13,11 @@ pub enum ProverError {
     /// The prover could not be run, or did not finish in time.
     #[error("prover unavailable: {0}")]
     Unavailable(String),
-    /// The prover ran and refused or failed the step.
+    /// The prover refused the step (malformed input, invalid slots, a
+    /// signature that does not verify): it will not prove on a retry.
+    #[error("prover refused the step: {0}")]
+    Refused(String),
+    /// The prover ran and failed.
     #[error("prover failed: {0}")]
     Failed(String),
 }
@@ -166,11 +170,18 @@ async fn run(
         .map_err(unavailable)?;
     if !status.success() {
         let message = String::from_utf8_lossy(&err);
-        let last = message.lines().rev().find(|l| !l.trim().is_empty());
-        return Err(ProverError::Failed(format!(
-            "{status}: {}",
-            last.unwrap_or("no message")
-        )));
+        let last = message
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no message")
+            .to_string();
+        // The prover's exit status 2 is a refusal (see `fluree-prover`).
+        return Err(if status.code() == Some(2) {
+            ProverError::Refused(last)
+        } else {
+            ProverError::Failed(format!("{status}: {last}"))
+        });
     }
     ProveResponse::decode(&out).map_err(|e| ProverError::Failed(format!("its response: {e}")))
 }

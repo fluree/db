@@ -37,7 +37,7 @@ pub(crate) struct RetentionRuntime {
     /// through.
     probed: parking_lot::Mutex<HashMap<String, i64>>,
     /// Wakes the worker.
-    nudge: Arc<Notify>,
+    pub(crate) nudge: Arc<Notify>,
     /// A worker runs in this process.
     running: AtomicBool,
     /// When the worker last finished a sweep (epoch ms).
@@ -52,10 +52,13 @@ pub(crate) struct RetentionRuntime {
     backfills: parking_lot::Mutex<HashSet<String>>,
     /// Set on a cluster node.
     pub(crate) replicas: std::sync::OnceLock<Arc<dyn super::replicas::ReplicaSync>>,
+    /// Set on a file-backed instance.
+    #[cfg(feature = "native")]
+    pub(crate) erasure: std::sync::OnceLock<Arc<super::erasure::ErasureRuntime>>,
 }
 
 impl RetentionRuntime {
-    fn mark_active(&self, ledger_id: &str) {
+    pub(crate) fn mark_active(&self, ledger_id: &str) {
         self.active.lock().insert(ledger_id.to_string());
         self.probed.lock().remove(ledger_id);
         self.nudge.notify_one();
@@ -352,6 +355,11 @@ impl Fluree {
                 }
                 Err(e) => tracing::warn!(ledger_id, error = %e, "retention pass failed"),
             }
+        }
+        #[cfg(feature = "native")]
+        {
+            let ledgers: Vec<String> = self.retention.active.lock().iter().cloned().collect();
+            self.erasure_sweep(&worker.fluree, &ledgers).await;
         }
         self.retention
             .last_sweep_ms

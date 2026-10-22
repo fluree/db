@@ -281,7 +281,7 @@ impl Fluree {
         }
         let retractions = current.iter().map(|(f, _)| f.clone()).collect();
         let staged = self
-            .stage_retention_commit(state, retractions, store.as_ref())
+            .stage_retention_commit(state, retractions, Vec::new(), store.as_ref())
             .await?;
         let content_store = self.content_store(&record.storage_namespace());
         let (receipt, _) = staged

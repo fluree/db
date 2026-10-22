@@ -299,6 +299,15 @@ impl Fluree {
             NameServiceError::LedgerAlreadyExists(a) => ApiError::ledger_exists(a),
             other => other.into(),
         })?;
+        // The branch holds the source's history, so it serves it as the
+        // source does: without what the source's journal removed.
+        crate::retention::registry::inherit(
+            self.publisher()?,
+            source_id.as_ref(),
+            new_id.as_ref(),
+            new_fence,
+        )
+        .await?;
 
         // Historical branches replay from genesis — skip the index copy.
         // The source's current index reflects HEAD, which is too fresh.

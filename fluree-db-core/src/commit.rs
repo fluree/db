@@ -469,6 +469,18 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
         )));
     }
 
+    // An erased commit reads as its replacement, whose envelope sits after
+    // the original's CID and header: decode it whole.
+    if codec::replacement::is_replacement(&probe) {
+        let data = store
+            .get(id)
+            .await
+            .map_err(|e| Error::storage(format!("Failed to read commit envelope {id}: {e}")))?;
+        let envelope =
+            codec::read_commit_envelope(&data).map_err(|e| Error::invalid_commit(e.to_string()))?;
+        return Ok((envelope, codec::format::VERSION));
+    }
+
     // Header byte 4 is the codec version; capture it before the envelope
     // decode dispatches on it. Re-validated against `CommitHeader::read_from`
     // (which rejects unknown versions) below.

@@ -1684,3 +1684,36 @@ async fn a_view_behind_the_head_is_checked_again_after_a_removal() {
         Err(ApiError::HistoryUnavailable(_))
     ));
 }
+
+/// A branch holds its source's history, so it refuses what its source's
+/// journal removed from the moment it exists.
+#[tokio::test]
+async fn a_branch_made_after_a_removal_refuses_the_same_history() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/removal-branch-after").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    fluree
+        .create_branch("it/removal-branch-after", "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = "it/removal-branch-after:dev";
+    assert!(unavailable(
+        read(
+            &fluree,
+            dev,
+            json!(format!("{dev}@t:{t1}")),
+            "ex:alice",
+            "ex:email"
+        )
+        .await
+    ));
+}

@@ -764,6 +764,11 @@ impl Fluree {
                         // landed meanwhile), with the rules brought in line.
                         let mut updated = next.clone();
                         updated.journal = current.map(|c| c.journal.clone()).unwrap_or_default();
+                        #[cfg(feature = "native")]
+                        {
+                            updated.erasures =
+                                current.map(|c| c.erasures.clone()).unwrap_or_default();
+                        }
                         apply_rules(&mut updated.journal);
                         Some(updated)
                     }
@@ -895,6 +900,7 @@ impl Fluree {
             retractions,
             expired,
             retired,
+            control: Vec::new(),
         })
     }
 }

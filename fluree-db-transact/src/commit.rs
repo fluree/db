@@ -205,6 +205,9 @@ pub struct CommitOpts {
     /// The hash the commit's CID (and its raw transaction blob's) is minted
     /// with. The caller applies the deployment's choice; SHA2-256 by default.
     pub content_hash: HashAlgorithm,
+    /// A system control commit, whose txn-meta is its content: it commits
+    /// with no flakes.
+    pub control: bool,
 }
 
 impl std::fmt::Debug for CommitOpts {
@@ -232,6 +235,7 @@ impl std::fmt::Debug for CommitOpts {
             .field("timestamp", &self.timestamp)
             .field("received_at", &self.received_at)
             .field("content_hash", &self.content_hash)
+            .field("control", &self.control)
             .finish()
     }
 }
@@ -256,6 +260,7 @@ impl Clone for CommitOpts {
             timestamp: self.timestamp.clone(),
             received_at: self.received_at.clone(),
             content_hash: self.content_hash,
+            control: self.control,
         }
     }
 }
@@ -347,6 +352,12 @@ impl CommitOpts {
         self
     }
 
+    /// A system control commit: it commits even with no flakes.
+    pub fn as_control(mut self) -> Self {
+        self.control = true;
+        self
+    }
+
     /// Set additional parent commit IDs for merge commits.
     pub fn with_merge_parents(mut self, parents: Vec<ContentId>) -> Self {
         self.merge_parents = parents;
@@ -431,6 +442,7 @@ impl CommitOptsRequest {
             timestamp: self.timestamp,
             received_at: self.received_at,
             content_hash: HashAlgorithm::default(),
+            control: false,
         }
     }
 }
@@ -626,6 +638,7 @@ pub async fn build_commit(
         timestamp: opt_timestamp,
         received_at: opt_received_at,
         content_hash,
+        control,
         ..
     } = opts;
 
@@ -692,7 +705,7 @@ pub async fn build_commit(
     });
     graph_iris.sort_unstable();
     graph_iris.dedup();
-    if flakes.is_empty() && merge_parents.is_empty() && !registers_new_graph {
+    if flakes.is_empty() && merge_parents.is_empty() && !registers_new_graph && !control {
         return Err(TransactError::EmptyTransaction);
     }
 

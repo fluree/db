@@ -16,6 +16,8 @@
 //! expired value disappears when its retraction commits.
 
 mod engine;
+#[cfg(feature = "native")]
+pub mod erasure;
 pub mod journal;
 mod lineage;
 mod policy;

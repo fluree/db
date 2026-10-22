@@ -520,7 +520,11 @@ async fn build_direct_fluree(
             .clone()
             .unwrap_or_else(|| PathBuf::from(".fluree/storage"));
         let path_str = path.to_string_lossy().to_string();
-        FlureeBuilder::file(&path_str)
+        let builder = FlureeBuilder::file(&path_str);
+        match config.erasure_config() {
+            Some(erasure) => builder.with_erasure(erasure),
+            None => builder,
+        }
     };
 
     if !config.owns_storage_root() {
