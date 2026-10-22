@@ -86,7 +86,8 @@ The retention worker advances jobs in the background, one proving step at a time
   then never replayed as unindexed data, so an indexed assertion cannot lose the retraction that ended
   it. The branches checked are those that exist when it publishes, including branches made after the
   request. Creating a branch waits while a request is being accepted or published. Nothing is
-  published while the ledger is dropped, since its branches and their indexes can be restored.
+  published while the ledger is dropped, since its branches and their indexes can be restored;
+  restoring the ledger restores its requests, and pending ones resume.
 - **Overlapping requests.** A request that shares commits with an earlier one still in progress waits
   for it, and proves only what the earlier one's published erasure leaves. A request is complete once
   the published erasure of each affected commit removes every occurrence it asked for. If the earlier

@@ -1717,3 +1717,98 @@ async fn a_branch_made_after_a_removal_refuses_the_same_history() {
         .await
     ));
 }
+
+/// A dropped ledger, restored, serves its history as it did before the
+/// drop: its removal journal comes back with it, on memory and on file
+/// storage, with a restart between the drop and the restore and after it.
+#[tokio::test]
+async fn a_restored_ledger_keeps_its_removal_history() {
+    for storage in ["memory", "file", "file restarted"] {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || match storage {
+            "memory" => FlureeBuilder::memory().build_memory(),
+            _ => FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                .without_indexing()
+                .build()
+                .unwrap(),
+        };
+        let mut fluree = open();
+        let id = ledger(&fluree, "it/restore-journal").await;
+        let t1 = insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+        )
+        .await;
+        fluree
+            .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+            .await
+            .expect("remove");
+        let at_t1 = json!(format!("{id}@t:{t1}"));
+        let dropped = fluree
+            .drop_ledger("it/restore-journal", fluree_db_api::DropMode::Soft)
+            .await
+            .unwrap();
+        if storage == "file restarted" {
+            drop(fluree);
+            fluree = open();
+        }
+        fluree
+            .restore_dropped(&dropped.instance.unwrap().to_string())
+            .await
+            .unwrap();
+        assert!(
+            unavailable(read(&fluree, &id, at_t1.clone(), "ex:alice", "ex:email").await),
+            "{storage}"
+        );
+        if storage != "memory" {
+            drop(fluree);
+            let reopened = open();
+            assert!(
+                unavailable(read(&reopened, &id, at_t1, "ex:alice", "ex:email").await),
+                "{storage}, reopened"
+            );
+        }
+    }
+}
+
+/// An entry from before drops kept configs restores its ledger with the
+/// removal journal its lineage's checkpoint holds.
+#[tokio::test]
+async fn a_restore_of_an_entry_without_configs_takes_the_journal_from_the_checkpoint() {
+    use fluree_db_nameservice::DroppedLedger;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/restore-legacy").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    fluree
+        .remove_occurrences(&id, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+    let instance = fluree
+        .drop_ledger("it/restore-legacy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    let store = fluree.publisher().unwrap();
+    let held = store.get_dropped(&instance).await.unwrap().unwrap();
+    let legacy = DroppedLedger {
+        configs: None,
+        ..held.value
+    };
+    store
+        .cas_dropped(&instance, Some(held.version), Some(&legacy))
+        .await
+        .unwrap();
+
+    fluree.restore_dropped(&instance.to_string()).await.unwrap();
+    let at_t1 = json!(format!("{id}@t:{t1}"));
+    assert!(unavailable(
+        read(&fluree, &id, at_t1, "ex:alice", "ex:email").await
+    ));
+}

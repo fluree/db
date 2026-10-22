@@ -1014,17 +1014,58 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Dropped ledger not found: {instance}")))?
             .value;
-        lifecycle::restore_dropped(store, &instance)
-            .await
-            .map_err(|e| match e {
-                NameServiceError::LedgerAlreadyExists(detail) => ApiError::ledger_exists(detail),
-                NameServiceError::NotFound(_) => {
-                    ApiError::NotFound(format!("Dropped ledger not found: {instance}"))
-                }
-                e => e.into(),
-            })?;
+        let records = lifecycle::restore_dropped_with(store, &instance, |entry, records| {
+            self.prepare_restore(entry, records)
+        })
+        .await
+        .map_err(|e| match e {
+            NameServiceError::LedgerAlreadyExists(detail) => ApiError::ledger_exists(detail),
+            NameServiceError::NotFound(_) => {
+                ApiError::NotFound(format!("Dropped ledger not found: {instance}"))
+            }
+            e => e.into(),
+        })?;
+        self.resume_restored_retention(&records).await?;
         info!(ledger_name = %entry.name, %instance, "Dropped ledger restored");
         Ok(DroppedLedgerInfo::from(&entry))
+    }
+
+    /// What a restored ledger must hold before it serves beyond the configs
+    /// its drop kept: for an entry from before drops kept them, the removal
+    /// journal its lineage's checkpoint holds.
+    pub(crate) async fn prepare_restore(
+        &self,
+        entry: fluree_db_nameservice::DroppedLedger,
+        records: Vec<fluree_db_nameservice::NsRecord>,
+    ) -> std::result::Result<(), NameServiceError> {
+        if entry.configs.is_some() {
+            return Ok(());
+        }
+        for record in records.iter().filter(|r| !r.frozen) {
+            self.restore_dropped_retention(record).await.map_err(|e| {
+                NameServiceError::storage(format!(
+                    "restoring {}'s removal journal: {e}",
+                    record.ledger_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Hand the restored branches that have a retention registration back to
+    /// the retention worker: their pending work resumes.
+    pub(crate) async fn resume_restored_retention(
+        &self,
+        records: &[fluree_db_nameservice::NsRecord],
+    ) -> Result<()> {
+        let ns = self.publisher()?;
+        for record in records.iter().filter(|r| !r.frozen) {
+            let id = record.ledger_id.to_string();
+            if crate::retention::registry::read(ns, &id).await?.1.is_some() {
+                self.retention.mark_active(&id);
+            }
+        }
+        Ok(())
     }
 
     /// Delete a dropped ledger's data and forget it. Resumes a purge left

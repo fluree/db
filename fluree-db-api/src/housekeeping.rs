@@ -278,8 +278,14 @@ async fn resume_drop(fluree: &Fluree, name: &str) -> crate::Result<()> {
 }
 
 async fn resume_restore(fluree: &Fluree, instance: &InstanceId) -> crate::Result<()> {
-    match lifecycle::resume_restore(fluree.publisher()?, instance).await {
-        Ok(Some(_)) => {
+    let resumed =
+        lifecycle::resume_restore_with(fluree.publisher()?, instance, |entry, records| {
+            fluree.prepare_restore(entry, records)
+        })
+        .await;
+    match resumed {
+        Ok(Some(records)) => {
+            fluree.resume_restored_retention(&records).await?;
             info!(%instance, "resumed an interrupted restore");
             Ok(())
         }

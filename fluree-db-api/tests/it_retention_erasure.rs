@@ -925,6 +925,141 @@ fn commit_signed(bytes: &[u8]) -> bool {
     fluree_db_core::commit::codec::read_commit(bytes).is_ok_and(|c| !c.commit_signatures.is_empty())
 }
 
+/// A ledger's erasure jobs survive its drop and restore, across a restart:
+/// a published one stays published, and a pending one resumes.
+#[tokio::test]
+async fn erasures_survive_a_drop_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-restored").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:carol", "ex:email": "c@secret"}
+        ]}),
+    )
+    .await;
+    let shared = commit_at(&fluree, &id, t1).await;
+    let first = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let second = fluree
+        .erase_occurrences(&id, email("carol", "c@secret"), None)
+        .await
+        .expect("erase");
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!((report.proved, report.published), (2, 0), "{report:?}");
+
+    let dropped = fluree
+        .drop_ledger("it/erase-restored", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    drop(fluree);
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    fluree
+        .restore_dropped(&dropped.instance.unwrap().to_string())
+        .await
+        .unwrap();
+    let status = fluree.retention_status(&id).await.unwrap();
+    let jobs = status.registration.expect("registration").erasures;
+    let stage = |request: &str| jobs.iter().find(|j| j.request_id == request).unwrap().stage;
+    assert_eq!(stage(&first.request_id), ErasureStage::Published);
+    assert!(jobs
+        .iter()
+        .any(|j| j.request_id == second.request_id && j.pending()));
+
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&shared)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(!contains(&raw, "a@secret") && !contains(&raw, "c@secret"));
+}
+
+/// After a restore, the retention worker resumes the ledger's pending
+/// erasure without waiting for its periodic rescan of registrations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_resumes_a_restored_ledgers_erasure() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Arc::new(
+            FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                .with_indexer_catchup_interval(Duration::from_millis(200))
+                .with_erasure(ErasureConfig {
+                    prover: Arc::new(NativeProver::default()),
+                    verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                    retry_ms: 10,
+                })
+                .build()
+                .unwrap(),
+        )
+    };
+    let fluree = open();
+    let id = ledger(&fluree, "it/erase-worker-restored").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let asserted = commit_at(&fluree, &id, t1).await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    // Indexed through its head, so no build after the restore registers it.
+    reindex(&fluree, &id).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-worker-restored", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    drop(fluree);
+
+    // Restarted, the worker's first rescan finds no such ledger; its next
+    // is minutes away.
+    let fluree = open();
+    assert!(fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            ..Default::default()
+        })
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fluree
+        .restore_dropped(&dropped.instance.unwrap().to_string())
+        .await
+        .unwrap();
+
+    let mut stage = ErasureStage::Proving;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = fluree.retention_status(&id).await.unwrap();
+        stage = status.registration.unwrap().erasures[0].stage;
+        if stage == ErasureStage::Published {
+            break;
+        }
+    }
+    assert_eq!(stage, ErasureStage::Published);
+    let raw = store_of(&fluree, &id)
+        .await
+        .get(&asserted)
+        .await
+        .unwrap()
+        .into_vec();
+    assert!(is_replacement(&raw));
+}
+
 /// The whole workflow with the real prover and the production verifier, on a
 /// signed commit of 1,000 operations whose signature the proof verifies: run
 /// with `FLUREE_TEST_PROVER` naming a `fluree-prover` built from this tree.

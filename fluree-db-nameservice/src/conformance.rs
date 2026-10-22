@@ -135,6 +135,28 @@ impl<S: LifecycleStore> BranchRecordStore for PausedBeforeInsert<'_, S> {
     }
 }
 
+#[async_trait]
+impl<S: LifecycleStore> crate::ConfigLookup for PausedBeforeInsert<'_, S> {
+    async fn get_config(&self, ledger_id: &str) -> Result<Option<crate::ConfigValue>> {
+        self.inner.get_config(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<S: LifecycleStore> crate::ConfigPublisher for PausedBeforeInsert<'_, S> {
+    async fn push_config_fenced(
+        &self,
+        ledger_id: &str,
+        fence: Option<Fence>,
+        expected: Option<&crate::ConfigValue>,
+        new: &crate::ConfigValue,
+    ) -> Result<crate::ConfigCasResult> {
+        self.inner
+            .push_config_fenced(ledger_id, fence, expected, new)
+            .await
+    }
+}
+
 /// A create claims the name under a fresh instance root, and a second create
 /// of the name is refused.
 pub async fn create_claims_the_name<S: LifecycleStore>(store: &S) {
@@ -231,6 +253,132 @@ pub async fn restore_reinstates_under_fresh_fences<S: LifecycleStore>(store: &S)
         .await
         .unwrap()
         .is_none());
+}
+
+/// Write a config holding `marker` to `ledger_id`'s branch, with a field
+/// no reader knows.
+async fn set_config<S: LifecycleStore>(
+    store: &S,
+    ledger_id: &str,
+    marker: i64,
+) -> crate::ConfigValue {
+    let fence = store.raw_record(ledger_id).await.unwrap().unwrap().fence;
+    let mut payload = crate::ConfigPayload::new();
+    payload.extra.insert(
+        "retention".into(),
+        serde_json::json!({"journal": {"generation": marker}}),
+    );
+    payload
+        .extra
+        .insert("future".into(), serde_json::json!([marker]));
+    let config = crate::ConfigValue::new(marker, Some(payload));
+    let current = store.get_config(ledger_id).await.unwrap();
+    let pushed = store
+        .push_config_fenced(ledger_id, fence, current.as_ref(), &config)
+        .await
+        .unwrap();
+    assert!(matches!(pushed, crate::ConfigCasResult::Updated));
+    config
+}
+
+/// A soft drop keeps each branch's config, unknown fields included, and a
+/// restore reinstates it under the branch's fresh fence before the ledger
+/// is visible.
+pub async fn restore_keeps_branch_configs<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    for branch in ["dev", "bare"] {
+        lifecycle::create_branch(store, &name("mydb"), branch, "main", None)
+            .await
+            .unwrap();
+    }
+    let mut configs = std::collections::BTreeMap::new();
+    for (branch, marker) in [("main", 1), ("dev", 2)] {
+        let config = set_config(store, &format!("mydb:{branch}"), marker).await;
+        configs.insert(branch.to_string(), config);
+    }
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.entry.configs.as_ref(), Some(&configs));
+
+    let expected = &configs;
+    lifecycle::restore_dropped_with(store, &dropped.instance, |_, records| async move {
+        let binding = store.get_binding("mydb").await?.unwrap().value;
+        assert_eq!(binding.state, BindingState::Restoring);
+        for record in &records {
+            let config = store.get_config(record.ledger_id.as_ref()).await?;
+            match expected.get(&record.branch) {
+                Some(kept) => assert_eq!(config.as_ref(), Some(kept)),
+                None => assert!(config.is_none_or(|c| c.payload.is_none())),
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    for (branch, config) in &configs {
+        let restored = store.get_config(&format!("mydb:{branch}")).await.unwrap();
+        assert_eq!(restored.as_ref(), Some(config));
+    }
+}
+
+/// A restore stopped once its configs are in shows no branch, and resuming
+/// it finishes with the configs in place: no branch is ever visible without
+/// its config.
+pub async fn an_interrupted_restore_shows_no_branch_without_its_config<
+    S: LifecycleStore + crate::NameServiceLookup,
+>(
+    store: &S,
+) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let config = set_config(store, "mydb:main", 4).await;
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stopped = lifecycle::restore_dropped_with(store, &dropped.instance, |_, _| async {
+        Err(NameServiceError::storage("stopped"))
+    })
+    .await;
+    assert!(stopped.is_err());
+    assert!(store.lookup("mydb:main").await.unwrap().is_none());
+
+    lifecycle::resume_restore(store, &dropped.instance)
+        .await
+        .unwrap()
+        .expect("resumed");
+    assert!(store.lookup("mydb:main").await.unwrap().is_some());
+    let restored = store.get_config("mydb:main").await.unwrap();
+    assert_eq!(restored.as_ref(), Some(&config));
+}
+
+/// An entry from before drops captured configs restores with none: its
+/// branches come back with no config, not a refusal.
+pub async fn an_entry_without_configs_restores_with_none<S: LifecycleStore>(store: &S) {
+    lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    set_config(store, "mydb:main", 5).await;
+    let dropped = lifecycle::drop_ledger(store, &name("mydb"), false)
+        .await
+        .unwrap()
+        .unwrap();
+    let held = store.get_dropped(&dropped.instance).await.unwrap().unwrap();
+    let legacy = DroppedLedger {
+        configs: None,
+        ..held.value
+    };
+    let written = store
+        .cas_dropped(&dropped.instance, Some(held.version), Some(&legacy))
+        .await
+        .unwrap();
+    assert!(matches!(written, RegistryCas::Updated { .. }));
+
+    lifecycle::restore_dropped(store, &dropped.instance)
+        .await
+        .unwrap();
+    let restored = store.get_config("mydb:main").await.unwrap();
+    assert!(restored.is_none_or(|c| c.payload.is_none()));
 }
 
 /// Restoring into a name another ledger now holds is refused, and the dropped
@@ -1921,6 +2069,9 @@ where
     create_claims_the_name(&make().await).await;
     drop_frees_the_name(&make().await).await;
     restore_reinstates_under_fresh_fences(&make().await).await;
+    restore_keeps_branch_configs(&make().await).await;
+    an_interrupted_restore_shows_no_branch_without_its_config(&make().await).await;
+    an_entry_without_configs_restores_with_none(&make().await).await;
     restore_into_a_taken_name_is_refused(&make().await).await;
     a_restore_an_older_records_blocks_is_undone(&make().await).await;
     hard_drop_purges(&make().await).await;
@@ -1976,6 +2127,9 @@ macro_rules! lifecycle_conformance_tests {
             create_claims_the_name,
             drop_frees_the_name,
             restore_reinstates_under_fresh_fences,
+            restore_keeps_branch_configs,
+            an_interrupted_restore_shows_no_branch_without_its_config,
+            an_entry_without_configs_restores_with_none,
             restore_into_a_taken_name_is_refused,
             a_restore_an_older_records_blocks_is_undone,
             hard_drop_purges,

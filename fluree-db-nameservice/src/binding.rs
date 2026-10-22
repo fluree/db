@@ -16,7 +16,7 @@
 //! registry entry, guarded by a [`Versioned::version`] counter the backend
 //! keeps with the item.
 
-use crate::{NameServiceError, NsRecord, Result};
+use crate::{ConfigValue, NameServiceError, NsRecord, Result};
 use async_trait::async_trait;
 use fluree_db_core::{InstanceId, StorageRoot};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -268,6 +268,12 @@ pub struct DroppedLedger {
     /// marked retracted is a branch dropped before its ledger, which a
     /// restore brings back still dropped.
     pub branches: Vec<NsRecord>,
+    /// Each branch's config as it was when the ledger was dropped, by
+    /// branch; a branch with none is absent. `None` when the drop did not
+    /// capture configs (a hard drop, or an entry from before drops did): a
+    /// restore then has none to reinstate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configs: Option<std::collections::BTreeMap<String, ConfigValue>>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -282,6 +288,8 @@ struct DroppedLedgerFields {
     root: StorageRoot,
     root_branch: String,
     branches: Vec<NsRecord>,
+    #[serde(default)]
+    configs: Option<std::collections::BTreeMap<String, ConfigValue>>,
     #[serde(flatten)]
     extra: ExtraFields,
 }
@@ -297,6 +305,7 @@ impl From<DroppedLedgerFields> for DroppedLedger {
             root: f.root,
             root_branch: f.root_branch,
             branches: f.branches,
+            configs: f.configs,
         }
     }
 }
@@ -624,10 +633,41 @@ mod tests {
                 name: "mydb".into(),
                 root_branch: "main".into(),
                 branches: vec![record.clone()],
+                configs: Some(
+                    [("main".to_string(), ConfigValue::new(3, None))]
+                        .into_iter()
+                        .collect(),
+                ),
             };
             let json = serde_json::to_string(&entry).unwrap();
             assert_eq!(serde_json::from_str::<DroppedLedger>(&json).unwrap(), entry);
         }
+    }
+
+    /// An entry from before drops captured configs reads as having none
+    /// captured, not as having captured none.
+    #[test]
+    fn an_entry_without_configs_did_not_capture_them() {
+        let instance = new_instance_id();
+        let mut record = NsRecord::new("mydb:main");
+        record.fence = Some(Fence::generate());
+        let entry = DroppedLedger {
+            extra: crate::binding::ExtraFields::new(),
+            root: StorageRoot::for_instance(&LedgerName::parse("mydb").unwrap(), &instance),
+            instance,
+            state: DroppedState::Dropped,
+            dropped_at: 1,
+            name: "mydb".into(),
+            root_branch: "main".into(),
+            branches: vec![record],
+            configs: Some(Default::default()),
+        };
+        let mut json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["configs"], json!({}));
+        json.as_object_mut().unwrap().remove("configs");
+        let legacy: DroppedLedger = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.configs, None);
+        assert!(legacy.extra.is_empty());
     }
 
     #[test]
