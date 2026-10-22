@@ -7,7 +7,11 @@
 
 #![cfg(all(feature = "delta", feature = "native"))]
 
-use fluree_db_api::{ApiError, DeltaCreateConfig, Fluree, FlureeBuilder, TimeSpec};
+use fluree_db_api::{
+    ApiError, DeltaCreateConfig, Fluree, FlureeBuilder, FlureeR2rmlProvider, TimeSpec,
+};
+use fluree_db_query::error::QueryError;
+use futures::TryStreamExt;
 use serde_json::{json, Value};
 
 /// Commit times Delta Spark recorded in the `in_commit_time` fixture's log:
@@ -446,6 +450,54 @@ async fn materializing_a_delta_source_is_refused() {
         err.contains("materialization is not yet available for Delta graph sources"),
         "{err}"
     );
+}
+
+/// A Delta table is pinned and read for materialization as an Iceberg table
+/// is: its latest version is the pin, an earlier version reads as it was, and a
+/// version it never had is refused. One provider reads several versions of one
+/// table here, so no read may answer with a version an earlier call resolved.
+#[tokio::test]
+async fn a_delta_table_is_pinned_and_read_whole() {
+    let (fluree, alias) = source("delta-pinned-read").await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let table = "in_commit_time";
+
+    let latest = provider
+        .current_snapshot_id(&alias, table)
+        .await
+        .expect("latest version");
+    assert_eq!(latest, Some(2));
+
+    // (pin, rows at that version): v0 = {1}, v1 = {1, 2}, v2 = {2}.
+    for (pin, rows) in [(Some(0), 1), (Some(1), 2), (Some(2), 1), (None, 1)] {
+        let scan = provider
+            .scan_for_materialize_stream(&alias, table, &[], None, pin, None)
+            .await
+            .unwrap_or_else(|e| panic!("read at {pin:?}: {e}"));
+        assert_eq!(scan.to_snapshot_id, Some(pin.unwrap_or(2)), "pin {pin:?}");
+        assert!(!scan.incremental);
+        assert_eq!(scan.to_sequence, None);
+        let batches: Vec<_> = scan.stream.try_collect().await.expect("stream");
+        let read: usize = batches.iter().map(|b| b.num_rows).sum();
+        assert_eq!(read, rows, "rows at pin {pin:?}");
+    }
+
+    // A window start is no reason to read less: the version is read whole.
+    let scan = provider
+        .scan_for_materialize_stream(&alias, table, &[], Some(0), Some(1), Some(1))
+        .await
+        .expect("read with a window start");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream");
+    assert_eq!(batches.iter().map(|b| b.num_rows).sum::<usize>(), 2);
+
+    match provider
+        .scan_for_materialize_stream(&alias, table, &[], None, Some(9), None)
+        .await
+    {
+        Ok(_) => panic!("a version the table never had must fail, not fall forward"),
+        Err(QueryError::SnapshotNotFound { snapshot_id: 9, .. }) => {}
+        Err(other) => panic!("expected SnapshotNotFound, got: {other}"),
+    }
 }
 
 /// Registration checks each table for the columns its maps project: a column
