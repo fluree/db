@@ -118,6 +118,12 @@ What a disclosure reveals:
   `Expose`. Anyone who knows every other byte of the commit can test guesses against it, as
   under redaction.
 - **The seed must stay secret.** A leaked seed makes the leaves as guessable as unsalted ones.
+- **Keeping the seed is production work.** `host authenticate` draws a fresh seed, writes one
+  disclosure and discards the seed. A reusable proof needs the seed, or the salts, stored
+  securely for as long as disclosures are wanted.
+- **Erasure reaches the salts.** An erased operation's leaf hash can sit on paths already handed
+  out, and its salt would make it testable again. Salts stored one per slot can be deleted with
+  their operation. A seed can only be deleted whole, which ends new disclosures from that proof.
 
 A disclosure, once handed over, remains evidence after a later erasure of that operation:
 erasure cannot revoke a proof package someone already holds.
@@ -147,7 +153,7 @@ target/release/host prove medium          # writes medium.{receipt,replacement,e
 target/release/verify medium              # fresh process, no original bytes
 target/release/host prove second          # both erasures of one commit
 target/release/verify second              # the chain, back to the original CID
-target/release/host authenticate medium 1 # claim, and a disclosure of slot 1
+target/release/host authenticate medium 1 # claim, and a disclosure of slot 1 (seed not kept)
 target/release/verify disclose medium
 target/release/host execute-chain         # a chain link's cycle counts, by commit size
 target/release/host chain 4 1000          # four linked 1,000-operation commits
