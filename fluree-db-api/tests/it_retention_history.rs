@@ -1863,3 +1863,64 @@ async fn a_restored_ledger_takes_removals_made_on_another_copy_meanwhile() {
             .is_empty()
     );
 }
+
+/// A restored ledger that retracted a value itself, later than the copy
+/// that removed it did, refuses the value up to its own retraction: the
+/// entries merged from the copy end at the copy's retraction.
+#[tokio::test]
+async fn a_restored_ledger_journals_its_own_retraction_of_a_removed_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let source = ledger(&fluree, "it/restore-own-retraction").await;
+    insert(
+        &fluree,
+        &source,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&source, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/restore-own-retraction-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let t2 = insert(
+        &fluree,
+        &source,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@old"}),
+    )
+    .await;
+    fluree
+        .graph(&source)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@old"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    let instance = fluree
+        .drop_ledger("it/restore-own-retraction", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap()
+        .instance
+        .unwrap();
+    fluree
+        .remove_occurrences(&copy, select("alice", Some(json!("a@old"))))
+        .await
+        .expect("remove");
+
+    fluree.restore_dropped(instance.as_str()).await.unwrap();
+    let at_t2 = json!(format!("{source}@t:{t2}"));
+    assert!(unavailable(
+        read(&fluree, &source, at_t2, "ex:alice", "ex:email").await
+    ));
+}
