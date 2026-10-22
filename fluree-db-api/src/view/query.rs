@@ -1528,8 +1528,8 @@ impl Fluree {
     }
 
     /// Refuse a read of `db` that needs history its ledger's retention
-    /// suppressed. A read of current state costs nothing, without I/O or
-    /// waiting on the ledger; see [`Fluree::reads_current_state`].
+    /// suppressed. A read of current state costs a lookup in memory, with no
+    /// I/O or waiting on the ledger; see [`Fluree::view_freshness`].
     pub(crate) async fn refuse_suppressed_view_history(
         &self,
         db: &GraphDb,
@@ -1537,11 +1537,20 @@ impl Fluree {
         executable: &ExecutableQuery,
         history_range: Option<(i64, i64)>,
     ) -> Result<()> {
+        use crate::retention::suppression::Freshness;
         let earlier_point = history_range.is_some() || db.historical;
+        let freshness = self.view_freshness(db).await?;
         self.refuse_stale_search_sources(parsed, earlier_point)
             .await?;
-        if !earlier_point && self.reads_current_state(db).await? {
-            return Ok(());
+        if !earlier_point {
+            match freshness {
+                // Behind, with nothing suppressed.
+                Freshness::Current
+                | Freshness::Behind {
+                    journal: Some(false),
+                } => return Ok(()),
+                Freshness::Behind { .. } => {}
+            }
         }
         let reads = if executable.reasoning.modes.has_any_enabled() {
             crate::retention::suppression::Reads::Everything

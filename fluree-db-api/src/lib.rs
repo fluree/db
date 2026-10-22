@@ -2804,7 +2804,7 @@ impl FlureeBuilder {
         let ledger_manager_cell = Self::new_ledger_manager_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &ledger_manager_cell);
-        Self::finalize_with_backend(
+        let fluree = Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2819,7 +2819,10 @@ impl FlureeBuilder {
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
             self.secret_resolver,
-        )
+        );
+        // The storage root's lock keeps every other process out.
+        fluree.retention.watch.set_sole_writer();
+        fluree
     }
 
     /// Build a Fluree instance with custom storage and nameservice.
@@ -2995,7 +2998,7 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
         let index_config = self.derive_indexing();
-        Self::finalize_with_backend(
+        let fluree = Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -3010,7 +3013,10 @@ impl FlureeBuilder {
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
             self.secret_resolver,
-        )
+        );
+        // Nothing else writes this nameservice.
+        fluree.retention.watch.set_sole_writer();
+        fluree
     }
 
     /// Build an IPFS-backed Fluree instance with an in-memory nameservice.
@@ -3437,6 +3443,8 @@ impl FlureeBuilder {
         if let Some(manager) = &ledger_manager {
             spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
         }
+        let retention = Arc::<retention::RetentionRuntime>::default();
+        retention.watch.track(&event_bus);
 
         let config_content_hash = config.content_hash;
         Fluree {
@@ -3454,7 +3462,7 @@ impl FlureeBuilder {
             #[cfg(feature = "iceberg")]
             secret_resolver,
             key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
-            retention: Arc::default(),
+            retention,
             content_hash: Arc::new(content_hash::ContentHashPolicy::new(config_content_hash)),
             #[cfg(feature = "native")]
             root: RootHold::default(),

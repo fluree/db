@@ -322,6 +322,7 @@ impl Fluree {
                     scope_t,
                 })
                 .collect();
+            self.retention.watch.journal_changing(&ledger_id);
             let registration = registry::update(ns, &ledger_id, |current| {
                 let mut next = current.cloned().unwrap_or_else(|| registry::Registration {
                     active_since_t: scope_t + 1,

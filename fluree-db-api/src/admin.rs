@@ -892,6 +892,11 @@ impl crate::Fluree {
             // no drop to resume.
             return Ok(report);
         };
+        // A view of a dropped branch is refused, even on an instance that
+        // follows no event bus.
+        self.retention
+            .watch
+            .dropped(dropped.entry.branches.iter().filter_map(|r| r.fence));
         if let Some(mgr) = &self.ledger_manager {
             for id in &branch_ids {
                 mgr.disconnect(id).await;
@@ -1207,6 +1212,16 @@ impl crate::Fluree {
             ..Default::default()
         };
         let store = self.publisher()?;
+        let fence = match resume {
+            Some(fence) => Some(fence),
+            None => store.get_binding(name).await?.and_then(|b| {
+                b.value
+                    .branches
+                    .iter()
+                    .find(|l| l.branch == ledger_id.branch())
+                    .map(|l| l.fence)
+            }),
+        };
         let begun = match resume {
             Some(fence) => {
                 lifecycle::resume_drop_branch(store, name, ledger_id.branch(), fence).await
@@ -1233,6 +1248,7 @@ impl crate::Fluree {
             report.status = DropStatus::NotFound;
             return Ok(report);
         };
+        self.retention.watch.dropped(fence);
         let mut next = match begun {
             BranchDrop::Deferred { already: true } => {
                 report.status = DropStatus::AlreadyRetracted;

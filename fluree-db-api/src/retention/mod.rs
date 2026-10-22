@@ -25,6 +25,7 @@ pub mod replicas;
 mod state;
 pub(crate) mod suppression;
 pub(crate) mod validate;
+pub(crate) mod watch;
 mod worker;
 pub mod writer;
 

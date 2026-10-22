@@ -122,6 +122,9 @@ pub struct GraphDb {
     /// ([`LedgerState::instance_bits`]), which tells a ledger from one
     /// dropped before it under the same name; `0` when unknown.
     pub(crate) instance_bits: u128,
+    /// The fence of the branch record the view was loaded from: which
+    /// incarnation of the branch it reads.
+    pub(crate) fence: Option<fluree_db_nameservice::Fence>,
 
     /// Graph ID within the ledger (0 = default graph).
     ///
@@ -285,6 +288,17 @@ impl std::fmt::Debug for GraphDb {
 // Constructors
 // ============================================================================
 
+/// The fence of `state`'s branch record, when that record is the branch's
+/// own: a state built from another branch (a rebase replays onto its
+/// source's) carries the other branch's record.
+fn own_fence(state: &LedgerState) -> Option<fluree_db_nameservice::Fence> {
+    state
+        .ns_record
+        .as_ref()
+        .filter(|record| record.ledger_id.as_str() == state.ledger_id())
+        .and_then(|record| record.fence)
+}
+
 impl GraphDb {
     /// Create a base view from components.
     ///
@@ -312,6 +326,7 @@ impl GraphDb {
             t,
             ledger_id: ledger_id.into(),
             instance_bits: 0,
+            fence: None,
             graph_id: 0,
             policy: None,
             policy_enforcer: None,
@@ -360,6 +375,7 @@ impl GraphDb {
             ledger.ledger_id(),
         );
         gdb.instance_bits = ledger.instance_bits();
+        gdb.fence = own_fence(ledger);
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
         // Extract binary_store from LedgerState's TypeErasedStore
@@ -397,6 +413,7 @@ impl GraphDb {
             view.snapshot.ledger_id.as_str(),
         );
         gdb.instance_bits = view.instance_bits();
+        gdb.fence = view.fence();
         gdb.runtime_small_dicts = view.runtime_small_dicts().cloned();
         gdb.historical = true;
         gdb
@@ -494,6 +511,7 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
+        gdb.fence = own_fence(base);
         gdb.dict_novelty = Some(dict_novelty);
         gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
@@ -528,6 +546,7 @@ impl GraphDb {
             base.ledger_id(),
         );
         gdb.instance_bits = base.instance_bits();
+        gdb.fence = own_fence(base);
         gdb.runtime_small_dicts = Some(base.runtime_small_dicts.clone());
         // Carry binary store from the base ledger state
         gdb.binary_store = base

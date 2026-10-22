@@ -1030,6 +1030,8 @@ async fn a_view_held_across_a_removal_refuses_the_removed_value() {
         let view = fluree.db(&id).await.unwrap();
         let state = fluree.ledger(&id).await.unwrap();
         let held = fluree_db_api::GraphDb::from_ledger_state(&state);
+        let rows = fluree.query(&view, &email_query()).await.expect("at head");
+        assert_eq!(rows.to_jsonld(&view.snapshot).unwrap(), json!(["a@old"]));
         fluree
             .remove_occurrences(&id, select("alice", None))
             .await
@@ -1464,5 +1466,221 @@ async fn a_restore_keeps_a_value_reasserted_after_its_removal() {
             "ex:email"
         )
         .await
+    ));
+}
+
+/// A view of a ledger since purged, or replaced by another under its name,
+/// does not serve what the dropped ledger had removed: its journal went
+/// with it, so the view is refused. With and without a ledger cache, and on
+/// an instance no event bus follows.
+#[tokio::test]
+async fn a_view_of_a_purged_or_replaced_ledger_is_refused() {
+    use fluree_db_api::{ConnectionConfig, NameServiceMode};
+    let dir = tempfile::tempdir().unwrap();
+    let path = |sub: &str| dir.path().join(sub).to_string_lossy().to_string();
+    let untracked = Fluree::new(
+        ConnectionConfig::memory(),
+        fluree_db_core::MemoryStorage::new(),
+        NameServiceMode::ReadWrite(std::sync::Arc::new(
+            fluree_db_nameservice::memory::MemoryNameService::new(),
+        )),
+    );
+    for (what, fluree) in [
+        (
+            "cached",
+            FlureeBuilder::file(path("cached")).build().unwrap(),
+        ),
+        (
+            "uncached",
+            FlureeBuilder::file(path("uncached"))
+                .without_ledger_caching()
+                .build()
+                .unwrap(),
+        ),
+        ("untracked", untracked),
+    ] {
+        purged_or_replaced(&fluree, what).await;
+    }
+}
+
+async fn purged_or_replaced(fluree: &Fluree, what: &str) {
+    let name = "it/purged-view";
+    let id = ledger(fluree, name).await;
+    let t1 = insert(
+        fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    insert(
+        fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@old"}),
+    )
+    .await;
+    let head = fluree.db(&id).await.unwrap();
+    let at_t1 = fluree.db_at_t(&id, t1).await.unwrap();
+    fluree
+        .remove_occurrences(&id, select("alice", None))
+        .await
+        .expect("remove");
+    for view in [&head, &at_t1] {
+        assert!(matches!(
+            fluree.query(view, &email_query()).await,
+            Err(ApiError::HistoryUnavailable(_))
+        ));
+    }
+
+    fluree
+        .drop_ledger(name, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("purge");
+    for view in [&head, &at_t1] {
+        assert!(
+            fluree.query(view, &email_query()).await.is_err(),
+            "a view of the purged ledger was served ({what})"
+        );
+    }
+    ledger(fluree, name).await;
+    for view in [&head, &at_t1] {
+        assert!(
+            fluree.query(view, &email_query()).await.is_err(),
+            "a view of the replaced ledger was served ({what})"
+        );
+    }
+
+    // A branch dropped and created again under the same name: the same
+    // ledger, another branch.
+    insert(
+        fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    fluree
+        .create_branch(name, "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = format!("{name}:dev");
+    let on_dev = fluree.db(&dev).await.unwrap();
+    fluree
+        .remove_occurrences(&dev, select("alice", None))
+        .await
+        .expect("remove on the branch");
+    fluree.drop_branch(name, "dev").await.expect("drop branch");
+    assert!(
+        fluree.query(&on_dev, &email_query()).await.is_err(),
+        "a view of the dropped branch was served ({what})"
+    );
+    fluree
+        .create_branch(name, "dev", None, None)
+        .await
+        .expect("branch again");
+    assert!(
+        fluree.query(&on_dev, &email_query()).await.is_err(),
+        "a view of the replaced branch was served ({what})"
+    );
+}
+
+/// A drop this instance did not make is seen too: one made by another
+/// instance over the same nameservice and storage, found by the record's
+/// fence, and one announced on the event bus, as a cluster replicates it.
+#[tokio::test]
+async fn a_view_is_refused_after_a_drop_made_elsewhere() {
+    use fluree_db_api::{ConnectionConfig, NameServiceMode};
+    let storage = fluree_db_core::MemoryStorage::new();
+    let ns = std::sync::Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+    let instance = || {
+        Fluree::new(
+            ConnectionConfig::memory(),
+            storage.clone(),
+            NameServiceMode::ReadWrite(ns.clone()),
+        )
+    };
+    let (here, elsewhere) = (instance(), instance());
+    let name = "it/dropped-elsewhere";
+    let id = ledger(&here, name).await;
+    insert(
+        &here,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    // A branch dropped and created again elsewhere: the same ledger instance,
+    // another branch record.
+    here.create_branch(name, "dev", None, None)
+        .await
+        .expect("branch");
+    let dev = format!("{name}:dev");
+    let held = here.db(&dev).await.unwrap();
+    here.remove_occurrences(&dev, select("alice", None))
+        .await
+        .expect("remove");
+    elsewhere
+        .drop_branch(name, "dev")
+        .await
+        .expect("drop elsewhere");
+    elsewhere
+        .create_branch(name, "dev", None, None)
+        .await
+        .expect("branch again elsewhere");
+    assert!(
+        here.query(&held, &email_query()).await.is_err(),
+        "a view of a branch replaced elsewhere was served"
+    );
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/dropped-replicated").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let held = fluree.db(&id).await.unwrap();
+    fluree
+        .query(&held, &email_query())
+        .await
+        .expect("before the drop");
+    fluree
+        .event_bus()
+        .notify(fluree_db_nameservice::NameServiceEvent::LedgerRetracted {
+            ledger_id: fluree_db_api::LedgerId::parse(&id).unwrap(),
+            instance: None,
+        });
+    assert!(
+        fluree.query(&held, &email_query()).await.is_err(),
+        "a view of a ledger dropped on another node was served"
+    );
+}
+
+/// A view behind its ledger's head is served while the ledger suppresses
+/// nothing, and refused once a removal makes it hold a removed value.
+#[tokio::test]
+async fn a_view_behind_the_head_is_checked_again_after_a_removal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = ledger(&fluree, "it/behind-then-removed").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@old"}),
+    )
+    .await;
+    let held = fluree.db(&id).await.unwrap();
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@old"}),
+    )
+    .await;
+    let rows = fluree.query(&held, &email_query()).await.expect("behind");
+    assert_eq!(rows.to_jsonld(&held.snapshot).unwrap(), json!(["a@old"]));
+    fluree
+        .remove_occurrences(&id, select("alice", None))
+        .await
+        .expect("remove");
+    assert!(matches!(
+        fluree.query(&held, &email_query()).await,
+        Err(ApiError::HistoryUnavailable(_))
     ));
 }

@@ -34,11 +34,13 @@ Set `f:noHistory true` on a predicate's entry in the ledger's [retention default
 }
 ```
 
-The current value of `ex:count` is always served. A read that might need one of its earlier values fails with `410` and `@type` `err:db/HistoryUnavailable` instead of answering from incomplete history. Two kinds of read can need them:
+The current value of `ex:count` is always served. A read that might need one of its earlier values fails with `410` and `@type` `err:db/HistoryUnavailable` instead of answering from incomplete history. Three kinds of read can need them:
 
 - a query as of an earlier point (`ledger@t:5`, `@iso:`, `@commit:`);
 - a history range (`from` … `to`);
 - a query of a view the application opened before a later commit: once the ledger has moved past it, the view is of an earlier point.
+
+A view of a ledger that has since been dropped, or replaced by a new ledger under the same name, is refused (`404`) for every read, current or historical: its journal went with it.
 
 A historical query that never touches the predicate is still answered. The check is per query, on the predicates its patterns name. A pattern with a variable predicate, a wildcard path, a graph crawl or hydration (`select {"?s": ["*"]}`), or reasoning counts as touching every predicate. So do shortest paths, geo searches and `SERVICE`.
 

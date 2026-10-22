@@ -18,6 +18,7 @@ use fluree_db_query::ir::{Pattern, Query, Ref};
 
 use super::journal::Journal;
 use super::registry;
+use super::watch::{Check, Seen};
 use crate::{ApiError, Fluree, Result};
 
 /// What a read can touch.
@@ -197,6 +198,15 @@ enum RemovalSubject {
     Absent,
 }
 
+/// How a view stands against its ledger's head.
+pub(crate) enum Freshness {
+    /// At the head: current state.
+    Current,
+    /// Behind it. `journal` is whether the ledger's journal holds anything,
+    /// where known.
+    Behind { journal: Option<bool> },
+}
+
 /// Suppressions held between reads, by branch and journal generation.
 #[derive(Default)]
 pub(crate) struct SuppressionCache {
@@ -204,35 +214,59 @@ pub(crate) struct SuppressionCache {
 }
 
 impl Fluree {
-    /// Whether a read of `db` is of its ledger's current state: a view not
-    /// built as of an earlier point, and not overtaken since by a head this
-    /// instance knows of. Takes no ledger lock, so a query issued inside a
-    /// transaction can ask; for a cached ledger, it does no I/O either.
-    pub(crate) async fn reads_current_state(&self, db: &crate::GraphDb) -> Result<bool> {
-        if db.historical {
-            return Ok(false);
-        }
+    /// Where `db` stands against what this instance knows of its ledger.
+    /// A view of a branch since dropped, or replaced by another incarnation
+    /// under its name, is refused: what that branch suppressed is no longer
+    /// recorded anywhere. Takes no ledger lock, so a query issued inside a
+    /// transaction can ask, and reads the nameservice only for a branch this
+    /// instance has not followed yet.
+    pub(crate) async fn view_freshness(&self, db: &crate::GraphDb) -> Result<Freshness> {
         if db.graph_source_id.is_some() || db.over_graph_source {
-            return Ok(true);
+            return Ok(Freshness::Current);
         }
-        let Ok(id) = fluree_db_core::LedgerId::parse(&db.ledger_id) else {
-            return Ok(true);
+        let watch = &self.retention.watch;
+        let gone = || {
+            ApiError::NotFound(format!(
+                "{}: the ledger this view reads has been dropped",
+                db.ledger_id
+            ))
         };
-        let known = self
-            .ledger_manager
-            .as_ref()
-            .and_then(|manager| manager.known_head(&id));
-        let head = match known {
-            Some(head) => Some(head),
-            // Nothing in memory follows this ledger's head (no cache, or
-            // not cached now); the nameservice has it.
-            None => self
-                .nameservice()
-                .lookup(id.as_str())
-                .await?
-                .map(|record| record.commit_t),
+        let seen = match watch.check(&db.ledger_id, db.fence) {
+            Check::FenceDropped => return Err(gone()),
+            Check::Known(seen) => seen,
+            Check::Unknown => {
+                let Ok(id) = fluree_db_core::LedgerId::parse(&db.ledger_id) else {
+                    return Ok(Freshness::Current);
+                };
+                let token = watch.token();
+                let record = self.nameservice().lookup(id.as_str()).await?;
+                watch.learn(id.as_str(), record.as_ref(), token);
+                record.as_ref().map_or(Seen::Absent, Seen::live)
+            }
         };
-        Ok(head.is_none_or(|head| db.t >= head))
+        match seen {
+            Seen::Dropped => Err(gone()),
+            // Not a ledger here: one of another instance, or none at all.
+            Seen::Absent => Ok(Freshness::Current),
+            Seen::Live {
+                fence,
+                instance,
+                head_t,
+                journal,
+            } => {
+                let other_fence = db.fence.is_some() && fence.is_some() && db.fence != fence;
+                let other_instance =
+                    db.instance_bits != 0 && instance != 0 && instance != db.instance_bits;
+                if other_fence || other_instance {
+                    return Err(gone());
+                }
+                Ok(if db.t >= head_t {
+                    Freshness::Current
+                } else {
+                    Freshness::Behind { journal }
+                })
+            }
+        }
     }
 
     /// The branch's suppression, or `None` when its journal is empty. On a
@@ -260,8 +294,13 @@ impl Fluree {
         if confirm {
             self.confirm_journal_current(ledger_id).await?;
         }
+        let token = self.retention.watch.token();
         let (_, registration) = registry::read(ns, ledger_id).await?;
-        let Some(journal) = registration.map(|r| r.journal).filter(|j| !j.is_empty()) else {
+        let journal = registration.map(|r| r.journal).filter(|j| !j.is_empty());
+        self.retention
+            .watch
+            .learn_journal(ledger_id, journal.is_some(), token);
+        let Some(journal) = journal else {
             return Ok(None);
         };
         let cache = &self.retention.suppressions;
@@ -433,7 +472,11 @@ impl Fluree {
         };
         let head_t = match self.nameservice().lookup(ledger_id).await? {
             Some(record) => record.commit_t,
-            None => return Ok(()),
+            None => {
+                return Err(ApiError::NotFound(format!(
+                    "{ledger_id}: the ledger this read needs has been dropped"
+                )))
+            }
         };
         if read.from_t.is_none() && read.to_t >= head_t {
             return Ok(());

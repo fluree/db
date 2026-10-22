@@ -46,6 +46,8 @@ pub(crate) struct RetentionRuntime {
     pub(crate) cache: ScheduleCache,
     /// Removal journals held between reads.
     pub(crate) suppressions: super::suppression::SuppressionCache,
+    /// Each branch's instance, head and journal, as this instance knows them.
+    pub(crate) watch: Arc<super::watch::BranchWatch>,
     /// Branches whose history backfill (a rebuild) is running.
     backfills: parking_lot::Mutex<HashSet<String>>,
     /// Set on a cluster node.

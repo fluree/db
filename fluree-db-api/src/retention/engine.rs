@@ -751,6 +751,9 @@ impl Fluree {
                 problems: report.problems.clone(),
                 ..registration.clone()
             };
+            if journal_changed {
+                self.retention.watch.journal_changing(ledger_id);
+            }
             registry::update(ns, ledger_id, |current| {
                 // Another owner (or a re-activation) may have moved it on.
                 match current {

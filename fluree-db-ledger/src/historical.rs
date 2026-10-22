@@ -66,6 +66,8 @@ pub struct HistoricalLedgerView {
     /// The bits of the instance the view belongs to; see
     /// [`LedgerState::instance_bits`](crate::LedgerState::instance_bits).
     instance_bits: u128,
+    /// The fence of the branch record it was loaded from.
+    fence: Option<fluree_db_nameservice::Fence>,
 }
 
 impl HistoricalLedgerView {
@@ -198,6 +200,7 @@ impl HistoricalLedgerView {
                 .as_ref()
                 .and_then(fluree_db_core::StorageRoot::instance_bits)
                 .unwrap_or(0),
+            fence: record.fence,
         })
     }
 
@@ -419,6 +422,7 @@ impl HistoricalLedgerView {
             runtime_small_dicts,
             to_t,
             instance_bits: 0,
+            fence: None,
         }
     }
 
@@ -426,6 +430,12 @@ impl HistoricalLedgerView {
     /// at its name or a view built from components.
     pub fn instance_bits(&self) -> u128 {
         self.instance_bits
+    }
+
+    /// The fence of the branch record the view was loaded from; `None` for
+    /// a view built from components.
+    pub fn fence(&self) -> Option<fluree_db_nameservice::Fence> {
+        self.fence
     }
 
     /// Get the time bound for this view

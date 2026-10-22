@@ -35,6 +35,8 @@ pub trait ReplicaSync: Send + Sync {
 impl Fluree {
     /// Keep this node's journal reads current with the cluster's.
     pub fn set_retention_replicas(&self, sync: Arc<dyn ReplicaSync>) {
+        // Other members write the journals too.
+        self.retention.watch.clear_sole_writer();
         let _ = self.retention.replicas.set(sync);
     }
 
