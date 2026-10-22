@@ -25,10 +25,13 @@ decoder and RISC Zero's accelerated curve25519 and big-integer arithmetic.
 ## Image ids
 
 Fluree accepts proofs only from the images in `fluree-db-erasure`'s `REDACT_IMAGE_IDS`. A guest
-image id depends on the guest's code and on how it was built, so the id Fluree pins comes from
-one recorded build; a prover built differently proves under another id, and Fluree refuses its
-proofs. Any change to `fluree-db-redaction` that reaches the guest changes the id: add the new id
-to `REDACT_IMAGE_IDS`, and remove an old one only when no stored proof uses it.
+image id depends on the guest's code and on how it was built: without RISC Zero's containerized
+build, the build directory and toolchain enter the binary. So the id Fluree pins comes from one
+recorded build, and that build's binary is the one to deploy; a prover built differently proves
+under another id, and Fluree refuses its proofs. Any change to `fluree-db-redaction` that reaches
+the guest changes the id: add the new id to `REDACT_IMAGE_IDS`, and remove an old one only when no
+stored proof uses it. Moving release builds to the containerized build, so anyone can reproduce an
+id, is still to do.
 
 ## Running
 

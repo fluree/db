@@ -121,7 +121,8 @@ is outside every ledger's folder, so ledger drops and backup restores do not tou
 The prover runs at low priority (nice 10). Proving on a host that also serves transactions slows them
 down unless it is limited, so give it its own cores or its own host. See
 [`fluree-prover/README.md`](https://github.com/fluree/db/blob/main/fluree-prover/README.md) to build it.
-Fluree accepts only the guest images its build pins, so build the prover from the same release.
+Fluree accepts proofs only from the guest images its build pins, so deploy the prover binary
+recorded for the same release: a prover rebuilt elsewhere may prove under another image.
 
 ## Signatures
 
