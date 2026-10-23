@@ -33,6 +33,10 @@ pub struct GarbageReport {
     pub left: usize,
     /// Ledgers the pass ran out of time before reaching.
     pub ledgers_left: usize,
+    /// Records in the ledgers reached still within their grace period.
+    pub waiting: usize,
+    /// When the oldest record in the ledgers reached was made.
+    pub oldest_ms: Option<i64>,
     pub timings: CollectTimings,
 }
 
@@ -56,9 +60,11 @@ impl Fluree {
         self.collect_garbage_within(grace, None).await
     }
 
-    /// [`Self::collect_garbage`], claiming no more blobs once `budget` is
-    /// spent.
-    pub(crate) async fn collect_garbage_within(
+    /// [`Self::collect_garbage`], starting nothing more once `budget` is
+    /// spent: a soft limit, since a ledger's records are read and its
+    /// branches loaded whole. The next pass starts with the first ledger
+    /// this one ran out of time for.
+    pub async fn collect_garbage_within(
         &self,
         grace: Duration,
         budget: Option<Duration>,
@@ -114,12 +120,18 @@ impl Fluree {
             return Ok(false);
         }
         let pins = self.blob_pins().expect("collecting").clone();
-        let due: Vec<Recorded> = self
+        let (due, waiting): (Vec<Recorded>, Vec<Recorded>) = self
             .garbage_records(&binding.root)
             .await?
             .into_iter()
-            .filter(|r| r.record.recorded_ms <= cutoff)
-            .collect();
+            .partition(|r| r.record.recorded_ms <= cutoff);
+        report.waiting += waiting.len();
+        let oldest = due
+            .iter()
+            .chain(&waiting)
+            .map(|r| r.record.recorded_ms)
+            .min();
+        report.oldest_ms = report.oldest_ms.into_iter().chain(oldest).min();
         if due.is_empty() {
             return Ok(true);
         }

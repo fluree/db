@@ -14,19 +14,30 @@
 //! lane      <unpinned|pinned|looping> [writers] [commits] <file>
 //!                                          one idle lane in its own process,
 //!                                          latencies (µs) written to `file`
+//! fixed     [writers] [commits] [at_s]     one pass at_s into the run; the
+//!                                          commits within its window, or the
+//!                                          window GARBAGE_PERF_WINDOW=a,b ms
+//!                                          gives a run without it
+//! cadence   [writers] [rate] [minutes] [interval_s]
+//!                                          writers at rate commits/s each,
+//!                                          housekeeping's pass every
+//!                                          interval_s (default 300) with its
+//!                                          grace and budget; per pass, the
+//!                                          backlog it leaves
 //! ```
 //!
 //! Writers commit to their own ledgers with raw bodies stored, and every
 //! tenth transaction fails while staging, so garbage keeps arriving, unless
 //! `GARBAGE_PERF_NO_FAILURES` is set. `GARBAGE_PERF_NO_PASSES` keeps
-//! `scheduled`'s collector idle, for an A/B of whole runs.
+//! `scheduled`'s, `fixed`'s and `cadence`'s collector idle, for an A/B of
+//! whole runs.
 //! Durability is PageCache unless `GARBAGE_PERF_WAL` is set.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fluree_db_api::{Fluree, FlureeBuilder, GarbageReport, ReconcilePass};
+use fluree_db_api::{Fluree, FlureeBuilder, GarbageReport, HousekeepingOptions, ReconcilePass};
 use fluree_db_core::{Durability, PinWaits};
 use fluree_db_transact::TxnOpts;
 use parking_lot::Mutex;
@@ -189,6 +200,45 @@ async fn write(fluree: &Arc<Fluree>, writers: usize, commits: usize) -> Vec<(Ins
     spans
 }
 
+fn passes_off() -> bool {
+    std::env::var_os("GARBAGE_PERF_NO_PASSES").is_some()
+}
+
+/// `writers` ledgers, each written `rate` times a second for `run`; the
+/// spans of the commits that succeeded.
+async fn write_paced(fluree: &Arc<Fluree>, writers: usize, rate: f64, run: Duration) -> Vec<Span> {
+    for w in 0..writers {
+        fluree
+            .create_ledger(&format!("perf{w}"))
+            .await
+            .expect("create");
+    }
+    let end = Instant::now() + run;
+    let mut tasks = Vec::new();
+    for w in 0..writers {
+        let fluree = Arc::clone(fluree);
+        tasks.push(tokio::spawn(async move {
+            let id = format!("perf{w}:main");
+            let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / rate));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let (mut spans, mut t, mut i) = (Vec::new(), 0, 0);
+            while Instant::now() < end {
+                tick.tick().await;
+                if let Some(span) = commit(&fluree, &id, &body(w, i), expected(i), &mut t).await {
+                    spans.push(span);
+                }
+                i += 1;
+            }
+            spans
+        }));
+    }
+    let mut spans = Vec::new();
+    for task in tasks {
+        spans.extend(task.await.expect("writer"));
+    }
+    spans
+}
+
 /// One collection pass, as housekeeping runs it: collect, then reconcile
 /// every ledger, pausing after each step as long as it took.
 async fn pass(fluree: &Fluree) -> GarbageReport {
@@ -335,6 +385,121 @@ async fn scheduled(writers: usize, commits: usize, every: Duration) {
     report("all commits", latencies(&spans));
     report("commits collection overlapped", latencies(&during_c));
     report("commits reconciliation overlapped", latencies(&during_r));
+    report("commits no pass overlapped", latencies(&apart));
+}
+
+async fn fixed(writers: usize, commits: usize, at: Duration) {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = instance(&dir, true).await;
+    let start = Instant::now();
+    let collector = {
+        let fluree = Arc::clone(&fluree);
+        tokio::spawn(async move {
+            tokio::time::sleep(at).await;
+            if passes_off() {
+                return None;
+            }
+            let (collected, collection, reconciled, reconciliation) = phases(&fluree).await;
+            let files: usize = reconciled.ledgers.iter().map(|(_, r)| r.checked).sum();
+            println!(
+                "pass: collected {} deleted {} in {:.2}s; reconciled {} files in {:.2}s",
+                collected.recorded,
+                collected.deleted,
+                (collection.1 - collection.0).as_secs_f64(),
+                files,
+                (reconciliation.1 - reconciliation.0).as_secs_f64(),
+            );
+            Some((collection.0, reconciliation.1))
+        })
+    };
+    let spans = write(&fluree, writers, commits).await;
+    let window = match std::env::var("GARBAGE_PERF_WINDOW") {
+        Ok(window) => {
+            let (a, b) = window.split_once(',').expect("a,b");
+            let ms = |v: &str| start + Duration::from_millis(v.parse().expect("ms"));
+            Some((ms(a), ms(b)))
+        }
+        Err(_) => collector.await.unwrap(),
+    };
+    let Some(window) = window else {
+        report("all commits", latencies(&spans));
+        return;
+    };
+    println!(
+        "window {},{}",
+        (window.0 - start).as_millis(),
+        (window.1 - start).as_millis()
+    );
+    let within: Vec<Span> = spans
+        .iter()
+        .filter(|(a, b)| *a < window.1 && window.0 < *b)
+        .copied()
+        .collect();
+    report("commits within the window", latencies(&within));
+    report("all commits", latencies(&spans));
+}
+
+async fn cadence(writers: usize, rate: f64, minutes: u64, interval: Duration) {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = instance(&dir, true).await;
+    let options = HousekeepingOptions::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let passes: Arc<Mutex<Vec<Span>>> = Arc::default();
+    let start = Instant::now();
+    let collector = {
+        let (fluree, stop, passes) = (Arc::clone(&fluree), Arc::clone(&stop), Arc::clone(&passes));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if passes_off() {
+                    continue;
+                }
+                let began = Instant::now();
+                let collected = fluree
+                    .collect_garbage_within(options.garbage_grace, Some(options.reconcile_budget))
+                    .await
+                    .expect("collect");
+                let reconciled = fluree
+                    .reconcile_due(options.reconcile_interval, options.reconcile_budget)
+                    .await
+                    .expect("reconcile");
+                let ended = Instant::now();
+                passes.lock().push((began, ended));
+                let now = chrono::Utc::now().timestamp_millis();
+                let files: usize = reconciled.ledgers.iter().map(|(_, r)| r.checked).sum();
+                println!(
+                    "+{:>4}s pass {:>5.2}s: abandoned {} deleted {} deferred {} left {} \
+                     ledgers left {}; backlog {} (waiting {}), oldest {}s; reconciled {} \
+                     files of {} ledgers, {} due",
+                    (began - start).as_secs(),
+                    (ended - began).as_secs_f64(),
+                    collected.recorded,
+                    collected.deleted,
+                    collected.deferred,
+                    collected.left,
+                    collected.ledgers_left,
+                    collected.waiting + collected.deferred + collected.left,
+                    collected.waiting,
+                    collected.oldest_ms.map_or(0, |ms| (now - ms) / 1000),
+                    files,
+                    reconciled.ledgers.len(),
+                    reconciled.due,
+                );
+            }
+        })
+    };
+    let spans = write_paced(&fluree, writers, rate, Duration::from_secs(60 * minutes)).await;
+    stop.store(true, Ordering::Relaxed);
+    collector.abort();
+    let passes = passes.lock().clone();
+    let (during, apart): (Vec<Span>, Vec<Span>) = spans
+        .iter()
+        .partition(|(a, b)| passes.iter().any(|(s, e)| a < e && s < b));
+    report("all commits", latencies(&spans));
+    report("commits a pass overlapped", latencies(&during));
     report("commits no pass overlapped", latencies(&apart));
 }
 
@@ -541,6 +706,23 @@ async fn main() {
             let file = args.get(4).expect("output file");
             lane(name, arg(2, 8), arg(3, 300), file).await;
         }
-        _ => eprintln!("usage: garbage_perf idle|scheduled|retries|large [args]"),
+        Some("fixed") => {
+            fixed(
+                arg(1, 8),
+                arg(2, 100_000),
+                Duration::from_secs(arg(3, 30) as u64),
+            )
+            .await;
+        }
+        Some("cadence") => {
+            cadence(
+                arg(1, 8),
+                arg(2, 50) as f64,
+                arg(3, 40) as u64,
+                Duration::from_secs(arg(4, 300) as u64),
+            )
+            .await;
+        }
+        _ => eprintln!("usage: garbage_perf idle|scheduled|retries|large|fixed|cadence [args]"),
     }
 }
