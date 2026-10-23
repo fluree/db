@@ -287,7 +287,14 @@ async fn a_rebase_leaves_the_line_it_replaced_to_the_collector() {
     transact(&fluree, "garbage:main", &insert("dave"))
         .await
         .unwrap();
-    let report = fluree
+    // Through another instance over the same storage, which does not
+    // collect but records for the one that does.
+    let other = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        fluree.nameservice_mode().clone(),
+    );
+    let report = other
         .rebase_branch("garbage", "dev", ConflictStrategy::default())
         .await
         .unwrap();
@@ -401,4 +408,117 @@ async fn a_commit_a_branch_reads_from_its_parents_folder_stays() {
     collect_until(&fluree, |r| r.deleted == 2).await;
     assert!(!stored(&fluree, "garbage:main", &forked_at.receipt.commit_id).await);
     assert!(!stored(&fluree, "garbage:main", &body_id(&bob)).await);
+}
+
+/// Commit latency with writers pinning their blobs and without, and with
+/// the collector and reconciliation running throughout. Every tenth
+/// transaction fails, so garbage keeps arriving. Run with
+/// `cargo test --release -p fluree-db-api --test grp_ledger
+/// it_garbage::commit_latency -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn commit_latency_with_and_without_pins() {
+    use fluree_db_core::Durability;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    const WRITERS: usize = 8;
+    const COMMITS: usize = 200;
+    const ROUNDS: usize = 3;
+
+    async fn lane(durability: Durability, locked: bool, collecting: bool) -> Vec<Duration> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_storage_durability(durability);
+        if !locked {
+            builder = builder.without_storage_lock();
+        }
+        let fluree = Arc::new(builder.build_async().await.unwrap());
+        for w in 0..WRITERS {
+            fluree.create_ledger(&format!("perf{w}")).await.unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector = collecting.then(|| {
+            let fluree = Arc::clone(&fluree);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    fluree.collect_garbage(Duration::ZERO).await.unwrap();
+                    for w in 0..WRITERS {
+                        fluree.reconcile_garbage(&format!("perf{w}")).await.unwrap();
+                    }
+                }
+            })
+        });
+        let mut writers = Vec::new();
+        for w in 0..WRITERS {
+            let fluree = Arc::clone(&fluree);
+            writers.push(tokio::spawn(async move {
+                let id = format!("perf{w}:main");
+                let mut latencies = Vec::with_capacity(COMMITS);
+                for i in 0..COMMITS {
+                    let body = if i % 10 == 9 {
+                        json!({
+                            "@context": {"ex": "http://example.org/ns/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+                            "insert": {"@id": format!("ex:f{w}-{i}"), "ex:age": {"@value": "x", "@type": "xsd:integer"}}
+                        })
+                    } else {
+                        insert(&format!("w{w}-{i}"))
+                    };
+                    let started = Instant::now();
+                    let result = fluree
+                        .graph(&id)
+                        .transact()
+                        .txn_opts(TxnOpts::default().store_raw_txn(true))
+                        .update(&body)
+                        .commit()
+                        .await;
+                    if result.is_ok() && i >= 20 {
+                        latencies.push(started.elapsed());
+                    }
+                }
+                latencies
+            }));
+        }
+        let mut latencies = Vec::new();
+        for writer in writers {
+            latencies.extend(writer.await.unwrap());
+        }
+        stop.store(true, Ordering::Relaxed);
+        if let Some(collector) = collector {
+            collector.await.unwrap();
+        }
+        latencies
+    }
+
+    fn summary(label: &str, mut latencies: Vec<Duration>) {
+        latencies.sort();
+        let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q) as usize];
+        let mean = latencies.iter().sum::<Duration>() / latencies.len() as u32;
+        println!(
+            "{label:<32} n={:<5} mean={:>9.1?} p50={:>9.1?} p95={:>9.1?} p99={:>9.1?}",
+            latencies.len(),
+            mean,
+            at(0.50),
+            at(0.95),
+            at(0.99)
+        );
+    }
+
+    for durability in [Durability::PageCache, Durability::Wal] {
+        let lanes = [
+            ("unpinned", false, false),
+            ("pinned", true, false),
+            ("pinned, collecting", true, true),
+        ];
+        let mut results: Vec<Vec<Duration>> = vec![Vec::new(); lanes.len()];
+        for _ in 0..ROUNDS {
+            for (i, (_, locked, collecting)) in lanes.iter().enumerate() {
+                results[i].extend(lane(durability, *locked, *collecting).await);
+            }
+        }
+        for ((label, _, _), latencies) in lanes.iter().zip(results) {
+            summary(&format!("{durability:?} {label}"), latencies);
+        }
+    }
 }

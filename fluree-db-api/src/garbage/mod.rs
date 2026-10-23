@@ -139,12 +139,13 @@ impl Fluree {
             .ok_or_else(|| ApiError::internal("garbage collection needs managed storage"))
     }
 
-    /// Record `blobs` as garbage candidates, where this instance collects.
+    /// Record `blobs` as garbage candidates, where their storage is
+    /// collected: wherever writers pin, whichever instance writes.
     pub(crate) async fn record_garbage(&self, blobs: &[Blob], reason: GarbageReason) -> Result<()> {
-        if self.blob_pins().is_none() || blobs.is_empty() {
+        let storage = self.garbage_storage()?;
+        if storage.blob_pins().is_none() || blobs.is_empty() {
             return Ok(());
         }
-        let storage = self.garbage_storage()?;
         let method = storage.storage_method().to_string();
         let bytes = serde_json::to_vec(&Record {
             recorded_ms: now_ms(),
