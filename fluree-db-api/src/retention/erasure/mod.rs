@@ -27,7 +27,7 @@
 //! CIDs. Requests elsewhere are refused.
 
 pub(crate) mod index;
-mod purge;
+pub(crate) mod purge;
 mod request;
 mod worker;
 

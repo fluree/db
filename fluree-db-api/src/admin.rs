@@ -1059,6 +1059,15 @@ impl crate::Fluree {
             })
             .collect();
         let live: Vec<_> = records.iter().filter(|r| !r.frozen).cloned().collect();
+        // Branches whose indexes a purge released, rebuilt first: nothing
+        // can load them before.
+        let released = crate::retention::erasure::purge::release::released_branches(&entry);
+        for record in live.iter().filter(|r| released.contains(&r.branch)) {
+            let restored = self.restored_record(record).await.map_err(failed)?;
+            self.rebuild_released_index(&restored, &records)
+                .await
+                .map_err(failed)?;
+        }
         let Some(lineage) = self
             .restored_lineage(&live, &entry.root_branch)
             .await
@@ -1067,7 +1076,8 @@ impl crate::Fluree {
             return Ok(());
         };
         for record in &live {
-            self.restore_retention(record, None, Some(&lineage), &records)
+            let rebuilt = released.contains(&record.branch);
+            self.restore_retention(record, None, Some(&lineage), &records, rebuilt)
                 .await
                 .map_err(failed)?;
         }

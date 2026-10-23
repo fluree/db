@@ -72,6 +72,30 @@ impl Fluree {
         Ok(state)
     }
 
+    /// [`Self::load_queryable_state_with_store`] for a branch lookups do not
+    /// show yet, as one being restored: its index read through `store`.
+    pub(crate) async fn load_unlisted_state(
+        &self,
+        store: Arc<dyn ContentStore>,
+        record: NsRecord,
+    ) -> Result<LedgerState> {
+        let (mut state, root) = LedgerState::load_with_store_decoding_root(
+            store.clone(),
+            record,
+            crate::ledger_manager::decode_index_root,
+        )
+        .await?;
+        crate::ledger_manager::attach_binary_store_from(
+            store,
+            &mut state,
+            Some(Arc::clone(self.leaflet_cache())),
+            None,
+            root,
+        )
+        .await?;
+        Ok(state)
+    }
+
     /// Load a ledger by address (e.g., "mydb:main")
     ///
     /// This loads the ledger state DIRECTLY from the nameservice and storage —

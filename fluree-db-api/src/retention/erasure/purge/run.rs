@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use super::super::{ErasureJob, ErasureStage, PurgeProgress};
 use super::erase::Erased;
+use super::release::Released;
 use super::{Captured, PurgePlan};
 use crate::retention::registry;
 use crate::retention::state::{FactKey, Schedule};
@@ -33,6 +34,9 @@ pub struct PurgeReport {
     /// Holders whose indexes it rebuilt, a value living outside the leaves
     /// and the string dictionary.
     pub rebuilt: usize,
+    /// Soft-dropped ledgers whose indexes it released, to be rebuilt on
+    /// restore.
+    pub released: usize,
     /// Waiting for readers of the older indexes to finish before releasing
     /// them.
     pub waiting: bool,
@@ -77,9 +81,7 @@ impl Fluree {
             return Ok(report);
         }
         let plan = self.plan_purge(ledger).await?;
-        let blocked = if !plan.release.is_empty() {
-            Some("soft-dropped ledgers hold erased commits: restore or purge them first")
-        } else if !plan.retracted.is_empty() {
+        let blocked = if !plan.retracted.is_empty() {
             Some("dropped branches that other branches still fork from hold erased commits")
         } else if !plan.sources.is_empty() {
             Some(
@@ -99,6 +101,19 @@ impl Fluree {
         }
 
         if progress(|p| p.scanned_ms).is_none() {
+            // Soft-dropped holders' indexes, marked for a rebuild on restore.
+            if !plan.release.is_empty() {
+                match self.release_dropped(&plan.commits).await? {
+                    Released::Done { ledgers, deleted } => {
+                        report.released += ledgers;
+                        report.deleted += deleted;
+                    }
+                    Released::Changed => {
+                        report.waiting = true;
+                        return Ok(report);
+                    }
+                }
+            }
             let captured = self.capture_erased(&plan).await?;
             let rebuilt_ms = match progress(|p| p.rebuilt_ms) {
                 Some(ms) => ms,
@@ -161,6 +176,13 @@ impl Fluree {
                         .iter()
                         .chain(&scan.dictionary)
                         .collect::<BTreeSet<_>>()
+                );
+                return self.block(&jobs, report, why).await;
+            }
+            if !scan.unreleased.is_empty() {
+                let why = format!(
+                    "{} index files of soft-dropped holders were not released",
+                    scan.unreleased.len()
                 );
                 return self.block(&jobs, report, why).await;
             }

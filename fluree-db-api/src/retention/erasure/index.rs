@@ -317,6 +317,11 @@ impl ErasureIndex {
         Ok(self.storage.list_prefix(&self.address_prefix()).await?)
     }
 
+    /// Every address under `prefix`, past the substitution.
+    pub(crate) async fn list_raw(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.storage.list_prefix(prefix).await?)
+    }
+
     /// What every address of the storage starts with.
     pub(crate) fn address_prefix(&self) -> String {
         format!("fluree:{}://", self.storage.storage_method())

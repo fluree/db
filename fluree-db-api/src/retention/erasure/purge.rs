@@ -301,6 +301,7 @@ fn commit_id(commit: &str) -> Result<ContentId> {
 }
 
 mod erase;
+pub(crate) mod release;
 mod run;
 mod scan;
 #[cfg(test)]

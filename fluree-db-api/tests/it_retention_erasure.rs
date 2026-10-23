@@ -1659,19 +1659,25 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
     }
 }
 
-/// A soft-dropped copy holding an erased commit cannot have its index
-/// rebuilt while dropped: the purge stops, says why, and deletes nothing.
+/// A soft-dropped copy holding an erased commit, with a branch, both indexed
+/// over it: the purge releases the copy's indexes and dictionaries, marking
+/// its drop entry to rebuild them, and completes with no file anywhere
+/// holding the value. A restore rebuilds both branches before the copy
+/// serves, from the replacements.
 #[tokio::test]
-async fn a_purge_waits_for_a_dropped_holder() {
+async fn a_purge_releases_a_dropped_holders_index_and_a_restore_rebuilds_it() {
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let fluree = erasing(&dir, Arc::new(NativeProver::default()));
-    let id = ledger(&fluree, "it/purge-blocked").await;
+    let id = ledger(&fluree, "it/purge-dropped-origin").await;
     insert(
         &fluree,
         &id,
-        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}),
     )
     .await;
     let mut archive = Vec::new();
@@ -1679,12 +1685,26 @@ async fn a_purge_waits_for_a_dropped_holder() {
         .archive_ledger(&id, false, &mut archive)
         .await
         .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-dropped-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
     fluree
-        .restore_ledger("it/purge-blocked-copy", &mut archive.as_slice())
+        .create_branch("it/purge-dropped-copy", "dev", None, None)
         .await
         .unwrap();
-    fluree
-        .drop_ledger("it/purge-blocked-copy", fluree_db_api::DropMode::Soft)
+    let dev = "it/purge-dropped-copy:dev";
+    insert(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@id": "ex:carol", "ex:email": "c@kept"}),
+    )
+    .await;
+    reindex(&fluree, &copy).await;
+    reindex(&fluree, dev).await;
+    let dropped = fluree
+        .drop_ledger("it/purge-dropped-copy", fluree_db_api::DropMode::Soft)
         .await
         .unwrap();
     let receipt = fluree
@@ -1693,11 +1713,20 @@ async fn a_purge_waits_for_a_dropped_holder() {
         .expect("erase");
     reindex(&fluree, &id).await;
     assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
-    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert!(!files_holding(dir.path(), "a@secret").is_empty());
 
-    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
-    let why = report.blocked.expect("blocked");
-    assert!(why.contains("soft-dropped"), "{why}");
+    let mut released = 0;
+    let mut purged = 0;
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        released += report.released;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((released, purged), (1, 1));
     let job = fluree
         .retention_status(&id)
         .await
@@ -1708,14 +1737,35 @@ async fn a_purge_waits_for_a_dropped_holder() {
         .into_iter()
         .find(|j| j.request_id == receipt.request_id)
         .unwrap();
-    assert_eq!(job.stage, ErasureStage::Purging);
-    assert_eq!(job.purge.unwrap().blocked, Some(why));
-    for address in &plan.originals {
-        let path = dir
-            .path()
-            .join(address.strip_prefix("fluree:file://").unwrap());
-        assert!(path.exists(), "{address}");
+    assert_eq!(job.stage, ErasureStage::Purged, "{job:?}");
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    for ledger in [copy.as_str(), dev] {
+        let record = fluree.nameservice().lookup(ledger).await.unwrap().unwrap();
+        assert!(record.index_head_id.is_some(), "{ledger} rebuilt");
+        assert!(objects(&fluree, ledger, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        assert_eq!(
+            objects(&fluree, ledger, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
     }
+    assert_eq!(
+        objects(&fluree, dev, "ex:carol", "ex:email").await,
+        vec![json!("c@kept")]
+    );
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
 }
 
 /// An archive made before an erasure, restored after its purge, brings back

@@ -2586,6 +2586,7 @@ impl Fluree {
                 archived,
                 lineage.as_ref(),
                 std::slice::from_ref(record),
+                false,
             )
             .await?;
 

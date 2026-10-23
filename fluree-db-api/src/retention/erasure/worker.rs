@@ -690,7 +690,7 @@ impl Fluree {
             return Ok(());
         }
         let state = self
-            .load_queryable_state_with_store(store.clone(), record.clone())
+            .load_unlisted_state(store.clone(), record.clone())
             .await
             .ok();
         let config = self

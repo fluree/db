@@ -173,7 +173,8 @@ impl Fluree {
     }
 
     /// Ready a restored ledger, not yet visible, to serve, `branches` being
-    /// all of its branch records: merge its
+    /// all of its branch records and `rebuilt` saying its index was rebuilt
+    /// from the replacements already: merge its
     /// lineage's checkpoint into the archive's retention, rebuild an index
     /// that covers an erased commit, then retract every
     /// journaled occurrence it holds as current state — an archive made
@@ -187,6 +188,7 @@ impl Fluree {
         archived: Option<registry::ArchivedRetention>,
         lineage: Option<&ContentId>,
         branches: &[NsRecord],
+        rebuilt: bool,
     ) -> Result<Option<i64>> {
         let checkpoint = match lineage {
             Some(lineage) => self.journal_checkpoint(lineage).await?,
@@ -202,8 +204,10 @@ impl Fluree {
         )
         .await?;
         #[cfg(feature = "native")]
-        self.rebuild_erased_index(&self.restored_record(record).await?, branches)
-            .await?;
+        if !rebuilt {
+            self.rebuild_erased_index(&self.restored_record(record).await?, branches)
+                .await?;
+        }
         let Some(registration) = restored else {
             return Ok(None);
         };
@@ -252,7 +256,7 @@ impl Fluree {
 
     /// The record of `pending`, a ledger not yet visible, as the restore has
     /// left it: heads in place, under the storage root its claim holds.
-    async fn restored_record(&self, pending: &NsRecord) -> Result<NsRecord> {
+    pub(crate) async fn restored_record(&self, pending: &NsRecord) -> Result<NsRecord> {
         let ledger_id = pending.ledger_id.as_str();
         let stored = self
             .publisher()?
@@ -291,7 +295,7 @@ impl Fluree {
             return Ok((None, entries));
         }
         let state = self
-            .load_queryable_state_with_store(store.clone(), record.clone())
+            .load_unlisted_state(store.clone(), record.clone())
             .await?;
         let mut current: Vec<(Flake, &Removal)> = Vec::new();
         for (flake, removal) in open {
