@@ -349,3 +349,44 @@ async fn geof_distance_via_sparql() {
         "Expected ~343.5km via SPARQL, got {distance} meters"
     );
 }
+
+/// A full rebuild indexes complex geometries, as an incremental build does.
+/// It built none, so a reindex dropped the ledger's spatial index.
+#[tokio::test]
+async fn a_rebuild_keeps_the_spatial_index() {
+    use fluree_db_core::ContentStore;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    fluree.create_ledger("geo/rebuild").await.unwrap();
+    let id = "geo/rebuild:main";
+    fluree
+        .graph(id)
+        .transact()
+        .insert(&json!({
+            "@context": geo_context(),
+            "@id": "ex:park",
+            "ex:area": {"@value": "POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))", "@type": "geo:wktLiteral"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree.content_store(&record.storage_namespace());
+    let bytes = store
+        .get(record.index_head_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
+    assert!(
+        root.graph_arenas.iter().any(|g| !g.spatial.is_empty()),
+        "{:?}",
+        root.graph_arenas
+    );
+}
