@@ -452,6 +452,19 @@ impl AdminPublisher for MemoryNameService {
 
         Ok(())
     }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        let key = LedgerId::parse(ledger_id)?;
+        let mut records = self.records.write();
+        match records.get_mut(&key) {
+            Some(record) if record.frozen => {
+                record.index_head_id = None;
+                record.index_t = 0;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 #[async_trait]
@@ -645,6 +658,23 @@ impl GraphSourcePublisher for MemoryNameService {
             if record.retracted {
                 record.index_id = None;
                 record.index_t = 0;
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        let key = LedgerId::from_parts(name, branch)?;
+        if let Some(record) = self.graph_source_records.write().get_mut(&key) {
+            if index_t >= record.index_t {
+                record.index_id = Some(index_id.clone());
+                record.index_t = index_t;
             }
         }
         Ok(())
@@ -845,6 +875,11 @@ fn check_fence(
 #[cfg(test)]
 mod lifecycle_conformance {
     crate::lifecycle_conformance_tests!((super::MemoryNameService::new(), ()));
+}
+
+#[cfg(test)]
+mod single_node_conformance {
+    crate::single_node_conformance_tests!((super::MemoryNameService::new(), ()));
 }
 
 #[cfg(test)]

@@ -1797,6 +1797,83 @@ pub async fn interrupted_migration_resumes<S: crate::NameServicePublisher>(store
 /// [`lifecycle_conformance_tests!`](crate::lifecycle_conformance_tests).
 /// A retracted graph source's index head can be cleared, so one created
 /// again under its name publishes from `t` 0; a live one's is left alone.
+/// A purge clears the index head of a frozen branch once it has released
+/// that branch's index, and of no branch that is not frozen.
+pub async fn a_frozen_branchs_index_head_clears<S: crate::NameServicePublisher>(store: &S) {
+    use fluree_db_core::ContentKind::IndexRoot;
+    let main = lifecycle::create_ledger(store, &id("mydb")).await.unwrap();
+    let dev = lifecycle::create_branch(store, &name("mydb"), "dev", "main", None)
+        .await
+        .unwrap();
+    lifecycle::create_branch(store, &name("mydb"), "fx", "dev", None)
+        .await
+        .unwrap();
+    for (ledger, fence) in [("mydb:main", main.fence), ("mydb:dev", dev.fence)] {
+        store
+            .publish_index_allow_equal_fenced(ledger, fence, 3, &cid(IndexRoot, ledger))
+            .await
+            .unwrap();
+    }
+    assert!(!store.clear_frozen_index("mydb:dev").await.unwrap(), "live");
+
+    // With a child, the drop leaves the branch frozen.
+    lifecycle::begin_drop_branch(store, &name("mydb"), "dev")
+        .await
+        .unwrap();
+    assert!(store.clear_frozen_index("mydb:dev").await.unwrap());
+    let dev = store.lookup("mydb:dev").await.unwrap().expect("kept");
+    assert_eq!((dev.index_head_id, dev.index_t), (None, 0));
+    assert!(!store.clear_frozen_index("mydb:main").await.unwrap());
+    let main = store.lookup("mydb:main").await.unwrap().unwrap();
+    assert_eq!(main.index_head_id, Some(cid(IndexRoot, "mydb:main")));
+}
+
+/// A graph source's index head is replaced at the same `t` by the write that
+/// allows it, never at a lower one; the ordinary publish keeps the first.
+pub async fn a_graph_source_index_is_replaced_at_the_same_t<S: crate::NameServicePublisher>(
+    store: &S,
+) {
+    use crate::GraphSourceType;
+    use fluree_db_core::ContentKind::IndexRoot;
+    let head = || async {
+        let record = store
+            .lookup_graph_source("search:main")
+            .await
+            .unwrap()
+            .expect("graph source");
+        (record.index_id, record.index_t)
+    };
+    store
+        .publish_graph_source(
+            "search",
+            "main",
+            GraphSourceType::Bm25,
+            "{}",
+            &["docs:main".to_string()],
+        )
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &cid(IndexRoot, "a"), 5)
+        .await
+        .unwrap();
+    store
+        .publish_graph_source_index("search", "main", &cid(IndexRoot, "b"), 5)
+        .await
+        .unwrap();
+    assert_eq!(head().await, (Some(cid(IndexRoot, "a")), 5));
+    store
+        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "b"), 5)
+        .await
+        .unwrap();
+    assert_eq!(head().await, (Some(cid(IndexRoot, "b")), 5));
+    store
+        .publish_graph_source_index_allow_equal("search", "main", &cid(IndexRoot, "c"), 4)
+        .await
+        .unwrap();
+    assert_eq!(head().await, (Some(cid(IndexRoot, "b")), 5));
+}
+
 pub async fn retracted_graph_source_index_resets<S: crate::NameServicePublisher>(store: &S) {
     use crate::{GraphSourceLookup, GraphSourceType};
     use fluree_db_core::{ContentId, ContentKind};
@@ -2148,6 +2225,17 @@ where
     an_unmirrored_branch_with_children_is_kept(&make().await).await;
     a_rerun_migration_binds_late_legacy_records(&make().await).await;
     a_rerun_migration_keeps_a_stopped_branch_drop_dropped(&make().await).await;
+}
+
+/// The cases only single-node backends support: the writes a purge makes.
+#[macro_export]
+macro_rules! single_node_conformance_tests {
+    ($make:expr) => {
+        $crate::lifecycle_conformance_tests!(@cases $make;
+            a_frozen_branchs_index_head_clears,
+            a_graph_source_index_is_replaced_at_the_same_t,
+        );
+    };
 }
 
 /// Expand to one `#[tokio::test]` per conformance case, each against a fresh

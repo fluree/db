@@ -226,6 +226,11 @@ where
             });
         Ok(())
     }
+
+    /// Emits nothing: nothing loads a frozen branch.
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        self.inner.clear_frozen_index(ledger_id).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +387,26 @@ where
     /// announces it.
     async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
         self.inner.reset_graph_source_index(name, branch).await
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        self.inner
+            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t)
+            .await?;
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        self.event_bus
+            .notify(NameServiceEvent::GraphSourceIndexPublished {
+                graph_source_id,
+                index_id: index_id.clone(),
+                index_t,
+            });
+        Ok(())
     }
 }
 

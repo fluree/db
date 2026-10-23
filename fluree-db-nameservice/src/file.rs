@@ -1282,6 +1282,29 @@ impl AdminPublisher for FileNameService {
         })
         .await
     }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let address = Self::index_address(&ledger_name, &branch);
+        let outcome = self
+            .storage
+            .compare_and_swap(&address, move |bytes| {
+                let Some(data) = bytes else {
+                    return Ok(CasAction::Abort(false));
+                };
+                let mut file: NsIndexFileV2 = deserialize_json(data)?;
+                if !file.frozen {
+                    return Ok(CasAction::Abort(false));
+                }
+                file.index = IndexRef { cid: None, t: 0 };
+                Ok(CasAction::Write(serialize_json(&file)?))
+            })
+            .await?;
+        Ok(match outcome {
+            CasOutcome::Aborted(cleared) => cleared,
+            _ => true,
+        })
+    }
 }
 
 #[async_trait]
@@ -1404,6 +1427,38 @@ impl GraphSourcePublisher for FileNameService {
             fluree_db_core::StorageWrite::delete(&self.storage, &Self::index_address(name, branch))
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        let address = Self::index_address(name, branch);
+        let cid_str = index_id.to_string();
+        let id = format_ledger_id(name, branch);
+        self.storage
+            .compare_and_swap(&address, move |bytes| {
+                if let Some(data) = bytes {
+                    let existing: GraphSourceIndexFileV2WithT = deserialize_json(data)?;
+                    if index_t < existing.index_t {
+                        return Ok(CasAction::Abort(()));
+                    }
+                }
+                let file = GraphSourceIndexFileV2WithT {
+                    context: ns_context(),
+                    id: id.clone(),
+                    index: GraphSourceIndexRef {
+                        cid: cid_str.clone(),
+                    },
+                    index_t,
+                };
+                Ok(CasAction::Write(serialize_json(&file)?))
+            })
+            .await?;
         Ok(())
     }
 }
@@ -1848,6 +1903,14 @@ impl ConfigPublisher for FileNameService {
 #[cfg(test)]
 mod lifecycle_conformance {
     crate::lifecycle_conformance_tests!({
+        let dir = tempfile::tempdir().unwrap();
+        (super::FileNameService::new(dir.path()), dir)
+    });
+}
+
+#[cfg(test)]
+mod single_node_conformance {
+    crate::single_node_conformance_tests!({
         let dir = tempfile::tempdir().unwrap();
         (super::FileNameService::new(dir.path()), dir)
     });

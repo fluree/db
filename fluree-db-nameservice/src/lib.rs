@@ -779,6 +779,16 @@ pub trait AdminPublisher: Publisher {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()>;
+
+    /// Clear the index head of a frozen branch, whose index a purge has
+    /// released: nothing loads a frozen branch, and a head naming deleted
+    /// files would stop every index sweep of its ledger. `false`, changing
+    /// nothing, unless the branch is frozen. Single-node backends only.
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        Err(NameServiceError::storage(format!(
+            "clearing a frozen branch's index head is not supported here: {ledger_id}"
+        )))
+    }
 }
 
 /// Read-only graph source lookup trait.
@@ -856,6 +866,24 @@ pub trait GraphSourcePublisher: GraphSourceLookup {
     /// it indexes a ledger that replaced the dropped one's. A live source is
     /// left as it is.
     async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()>;
+
+    /// [`Self::publish_graph_source_index`], also replacing a head at the same
+    /// `t`: an index rebuilt from the same state, as a purge rebuilds one
+    /// that held erased values. Never one at a lower `t`. Single-node
+    /// backends only.
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        let _ = (index_id, index_t);
+        Err(NameServiceError::storage(format!(
+            "replacing a graph source's index at the same t is not supported here: \
+             {name}:{branch}"
+        )))
+    }
 }
 
 /// Subscription scope for filtering nameservice events.
@@ -1718,6 +1746,10 @@ where
             .publish_index_allow_equal_fenced(ledger_id, fence, index_t, index_id)
             .await
     }
+
+    async fn clear_frozen_index(&self, ledger_id: &str) -> Result<bool> {
+        (**self).clear_frozen_index(ledger_id).await
+    }
 }
 
 #[async_trait]
@@ -1775,6 +1807,18 @@ where
 
     async fn reset_graph_source_index(&self, name: &str, branch: &str) -> Result<()> {
         (**self).reset_graph_source_index(name, branch).await
+    }
+
+    async fn publish_graph_source_index_allow_equal(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        (**self)
+            .publish_graph_source_index_allow_equal(name, branch, index_id, index_t)
+            .await
     }
 }
 
