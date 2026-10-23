@@ -1577,16 +1577,22 @@ impl BinaryIndexStore {
                 Ok(FlakeValue::Ref(Sid::new(0, &bnode_iri)))
             }
             DecodeKind::IriRef => {
-                let iri = self.resolve_subject_iri(o_key).map_err(|e| {
-                    tracing::debug!(
-                        g_id,
-                        o_key,
-                        error = %e,
-                        "binary index failed to resolve IRI ref subject"
-                    );
-                    e
-                })?;
-                Ok(FlakeValue::Ref(self.encode_iri(&iri)))
+                // Decoded as a subject is: re-encoding the IRI through the
+                // namespace table would give an OVERFLOW subject the EMPTY
+                // code, a Sid no stored fact has.
+                let sid = self
+                    .resolve_subject_parts(o_key)
+                    .and_then(|(ns_code, suffix)| self.subject_sid_of_parts(ns_code, suffix))
+                    .map_err(|e| {
+                        tracing::debug!(
+                            g_id,
+                            o_key,
+                            error = %e,
+                            "binary index failed to resolve IRI ref subject"
+                        );
+                        e
+                    })?;
+                Ok(FlakeValue::Ref(sid))
             }
             DecodeKind::StringDict => {
                 let s = self.resolve_string_value(o_key as u32).map_err(|e| {
@@ -2357,15 +2363,21 @@ impl BinaryIndexStore {
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
     }
 
-    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`: what
+    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`.
+    ///
+    /// An OVERFLOW subject's parts are its `Sid`: a lookup by its IRI tries
+    /// EMPTY first, and could name another subject holding the same IRI there
+    /// (#2138) instead of the one stored here. Any other subject takes what
     /// [`Self::find_subject_sid`] gives for its IRI, else [`Self::encode_iri`].
     ///
     /// When the canonical split of the IRI is exactly the parts the subject is
     /// stored under, they are the answer: the reverse dictionary holds that
-    /// key, so the lookup `find_subject_sid` would make returns them. A
-    /// full-IRI namespace, or a split the current rules do not produce, takes
-    /// the lookup.
+    /// key, so the lookup `find_subject_sid` would make returns them. An EMPTY
+    /// subject, or a split the current rules do not produce, takes the lookup.
     pub fn subject_sid_of_parts(&self, ns_code: u16, suffix: String) -> io::Result<Sid> {
+        if ns_code == namespaces::OVERFLOW {
+            return Ok(Sid::new(ns_code, suffix));
+        }
         if namespaces::is_full_iri(ns_code) {
             return Ok(self
                 .find_subject_sid(&suffix)?
@@ -5326,11 +5338,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A subject stored under its IRI's canonical split resolves to its
-    /// stored parts without the reverse lookup; every other subject takes
-    /// it, and each resolves to what that lookup gives.
+    /// A subject stored under its IRI's canonical split, or under OVERFLOW,
+    /// resolves to its stored parts without the reverse lookup; every other
+    /// subject takes it, and each resolves to what that lookup gives.
     #[test]
-    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits() {
+    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits_and_overflow() {
         use crate::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
 
         const EX: u16 = 100;
@@ -5398,14 +5410,78 @@ pub(crate) mod tests {
                 "{suffix}"
             );
             let lookups = tree.cache_hits() - lookups;
-            if ns_code == EX {
-                assert_eq!(expected, Sid::new(EX, "alice"));
-                assert_eq!(lookups, 0, "a canonical subject needs no reverse lookup");
+            if ns_code == EX || ns_code == namespaces::OVERFLOW {
+                assert_eq!(expected, Sid::new(ns_code, suffix));
+                assert_eq!(lookups, 0, "{suffix} needs no reverse lookup");
             } else {
                 assert!(lookups > 0, "{suffix} takes the reverse lookup");
             }
         }
         let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// An OVERFLOW subject decodes to its stored `Sid`, in subject and object
+    /// position, even when another subject holds the same IRI where a lookup
+    /// by IRI finds it first: under EMPTY, as #2138 left, or under a coded
+    /// prefix. A retraction carrying the twin's `Sid` would name the twin and
+    /// leave the stored fact in place.
+    #[test]
+    fn overflow_subject_decodes_to_its_own_sid_beside_a_twin() {
+        use crate::dict::reverse_leaf::subject_reverse_key;
+
+        const IRI: &str = "http://vendors.example/v/1";
+        const VENDORS: u16 = 100;
+        const VENDORS_PREFIX: &str = "http://vendors.example/v/";
+        for (twin_ns, twin_suffix) in [(namespaces::EMPTY, IRI), (VENDORS, "1")] {
+            let cache_dir = temp_cache_dir();
+            let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+            store.set_ns_split_mode(NsSplitMode::MostGranular);
+            if twin_ns == VENDORS {
+                store.dicts.namespace_codes =
+                    Arc::new(HashMap::from([(VENDORS, VENDORS_PREFIX.to_string())]));
+                store.dicts.namespace_reverse =
+                    Arc::new(HashMap::from([(VENDORS_PREFIX.to_string(), VENDORS)]));
+            }
+            let mut reverse = Vec::new();
+            for (ns_code, suffix) in [(twin_ns, twin_suffix), (namespaces::OVERFLOW, IRI)] {
+                store.dicts.subject_forward_packs.insert(
+                    ns_code,
+                    ForwardPackReader::from_memory(vec![Arc::from(
+                        make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
+                    )])
+                    .unwrap(),
+                );
+                reverse.push(ReverseEntry {
+                    key: subject_reverse_key(ns_code, suffix.as_bytes()),
+                    id: SubjectId::new(ns_code, 1).as_u64(),
+                });
+            }
+            reverse.sort_by(|a, b| a.key.cmp(&b.key));
+            store.dicts.subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
+            let store = Arc::new(store);
+            assert_eq!(
+                store.find_subject_sid(IRI).unwrap(),
+                Some(Sid::new(twin_ns, twin_suffix)),
+                "a lookup by IRI finds the twin"
+            );
+
+            let s_id = SubjectId::new(namespaces::OVERFLOW, 1).as_u64();
+            let stored = Sid::new(namespaces::OVERFLOW, IRI);
+            let view = BinaryGraphView::new(Arc::clone(&store), 0);
+            assert_eq!(
+                view.resolve_subject_sid(s_id).unwrap(),
+                stored,
+                "twin under {twin_ns}"
+            );
+            assert_eq!(
+                store
+                    .decode_value_v3(OType::IRI_REF.as_u16(), s_id, 0, 0)
+                    .unwrap(),
+                FlakeValue::Ref(stored),
+                "twin under {twin_ns}"
+            );
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
     }
 
     #[test]
