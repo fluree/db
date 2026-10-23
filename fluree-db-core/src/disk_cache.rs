@@ -1043,6 +1043,14 @@ impl ContentStore for CachedContentStore {
         self.inner.put_with_id(id, bytes).await
     }
 
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> crate::error::Result<()> {
+        self.inner.put_minted(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<crate::storage::BlobPinner> {
+        self.inner.blob_pinner()
+    }
+
     async fn prefetch(&self, id: &ContentId) -> crate::error::Result<()> {
         let Some(path) = self.entry(id) else {
             return Ok(());

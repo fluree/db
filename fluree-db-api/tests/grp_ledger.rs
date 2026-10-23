@@ -20,6 +20,8 @@ mod it_drop_ledger;
 mod it_drop_named_graph;
 #[path = "it_dropped_ledgers.rs"]
 mod it_dropped_ledgers;
+#[path = "it_garbage.rs"]
+mod it_garbage;
 #[path = "it_graph_scoped_writes.rs"]
 mod it_graph_scoped_writes;
 #[path = "it_json_canonicalization.rs"]

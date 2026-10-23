@@ -13,7 +13,9 @@
 //! the name and deletes whatever the create wrote. A branch create that has
 //! not confirmed its listing for as long is rolled back the same way.
 //!
-//! With an interval set, it also runs the orphan sweep.
+//! With an interval set, it also runs the orphan sweep. Where the instance
+//! collects, it collects commit and transaction garbage and reconciles one
+//! ledger at a time.
 
 use crate::admin::{DropMode, DropStatus};
 use crate::Fluree;
@@ -59,6 +61,14 @@ pub struct HousekeepingOptions {
     /// long, and a branch create that has left its listing unconfirmed this
     /// long, timed by this process.
     pub abandoned_create_after: Duration,
+    /// Collect commit and transaction garbage at most this often:
+    /// [`Fluree::collect_garbage`].
+    pub garbage_interval: Duration,
+    /// How long a garbage record stands before its blob may be deleted.
+    pub garbage_grace: Duration,
+    /// Reconcile each ledger at most this often:
+    /// [`Fluree::reconcile_garbage`].
+    pub reconcile_interval: Duration,
 }
 
 impl Default for HousekeepingOptions {
@@ -66,6 +76,12 @@ impl Default for HousekeepingOptions {
         Self {
             orphan_sweep_interval: None,
             abandoned_create_after: ABANDONED_CREATE_AFTER,
+            garbage_interval: Duration::from_secs(5 * 60),
+            // The index collector's minimum age.
+            garbage_grace: Duration::from_secs(
+                60 * u64::from(fluree_db_indexer::IndexerConfig::default().gc_min_time_mins),
+            ),
+            reconcile_interval: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -85,6 +101,8 @@ struct LifecycleHousekeeping {
     options: HousekeepingOptions,
     previous: parking_lot::Mutex<Observed>,
     last_sweep: parking_lot::Mutex<Instant>,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    last_garbage: parking_lot::Mutex<Instant>,
 }
 
 #[async_trait::async_trait]
@@ -124,10 +142,36 @@ impl Housekeeping for LifecycleHousekeeping {
             Err(e) => warn!(error = %e, "lifecycle housekeeping: cannot list the nameservice"),
         }
         self.sweep_if_due(&fluree).await;
+        #[cfg(feature = "native")]
+        self.collect_if_due(&fluree).await;
     }
 }
 
 impl LifecycleHousekeeping {
+    #[cfg(feature = "native")]
+    async fn collect_if_due(&self, fluree: &Fluree) {
+        if fluree.blob_pins().is_none() {
+            return;
+        }
+        {
+            let mut last = self.last_garbage.lock();
+            if last.elapsed() < self.options.garbage_interval {
+                return;
+            }
+            *last = Instant::now();
+        }
+        match fluree.collect_garbage(self.options.garbage_grace).await {
+            Ok(report) if report == crate::garbage::GarbageReport::default() => {}
+            Ok(report) => info!(?report, "garbage collected"),
+            Err(e) => warn!(error = %e, "garbage collection failed"),
+        }
+        match fluree.reconcile_next(self.options.reconcile_interval).await {
+            Ok(Some((ledger, report))) => info!(%ledger, ?report, "garbage reconciled"),
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "garbage reconciliation failed"),
+        }
+    }
+
     async fn sweep_if_due(&self, fluree: &Fluree) {
         let Some(interval) = self.options.orphan_sweep_interval else {
             return;
@@ -368,6 +412,7 @@ impl Fluree {
             options,
             previous: parking_lot::Mutex::default(),
             last_sweep: parking_lot::Mutex::new(Instant::now()),
+            last_garbage: parking_lot::Mutex::new(Instant::now()),
         })
     }
 

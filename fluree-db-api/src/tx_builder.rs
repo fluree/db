@@ -2260,14 +2260,18 @@ impl Fluree {
         // local pending upload — both pointing to the same CID would
         // be redundant work. The result CID ends up referenced by the
         // commit record.
+        let mut txn_pin = fluree_db_core::Unpublished::new();
         let txn_id = if let Some(cid) = commit_opts.raw_txn_id.take() {
             // Drop any redundant pending upload — its blob (if it
             // landed) shares the same CID and stays content-addressed.
             commit_opts.raw_txn_upload.take();
             Some(cid)
         } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
-            let cid = pending.finish().await.map_err(ApiError::from)?;
+            let (cid, pin) = pending.finish().await.map_err(ApiError::from)?;
             tracing::debug!(ledger = %ledger.id(), raw_txn_cid = %cid, "raw txn upload finished");
+            if let Some(pin) = pin {
+                txn_pin.push(pin);
+            }
             Some(cid)
         } else {
             None
@@ -2299,6 +2303,7 @@ impl Fluree {
         )
         .await
         .map_err(ApiError::from)?;
+        staged.pins = txn_pin;
         tracing::debug!(
             ledger = %ledger.id(),
             t = staged.commit.t,

@@ -24,6 +24,7 @@ use crate::namespace::NamespaceRegistry;
 use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::Unpublished;
 use fluree_db_core::{
     ContentId, ContentKind, ContentStore, DictNovelty, Flake, HashAlgorithm, TXN_META_GRAPH_ID,
 };
@@ -105,6 +106,10 @@ pub struct StagedCommit {
     /// Tracking accounting from staging if `tracking` was set on the
     /// builder.
     pub tally: Option<fluree_db_core::TrackingTally>,
+    /// Pins on blobs this commit names that were stored ahead of it (the
+    /// raw transaction body): released once it is published, abandoned to
+    /// the collector if it never is.
+    pub pins: Unpublished,
     /// Build-time state needed by [`StagedCommit::apply`] /
     /// [`StagedCommit::finalize_state`] to construct the post-commit
     /// `LedgerState`. Private — callers shouldn't peek inside.
@@ -900,6 +905,7 @@ pub async fn build_commit(
         expected_head_ref,
         referenced_bytes: HashMap::new(),
         tally: None,
+        pins: Unpublished::new(),
         build_state: BuildState {
             base,
             new_t,
@@ -922,13 +928,11 @@ impl StagedCommit {
     /// `ApplyHead` path, rebase's batched replay publish) use
     /// [`Self::finalize_state`] instead.
     ///
-    /// On publish failure the raw-txn blob uploaded during
-    /// [`build_commit`] is deliberately left in place: it is
-    /// content-addressed and may be shared with a commit that did
-    /// publish, so deleting it here could dangle that commit's
-    /// `txn` pointer. The orphan is not reclaimed by anything today —
-    /// see the `raw_txn_upload` module docs for why no collector covers
-    /// txn blobs yet.
+    /// On publish failure the commit blob and the raw-txn blob are never
+    /// deleted here: the raw-txn blob is content-addressed and may be
+    /// shared with a commit that did publish, and an error may hide a
+    /// publish that landed. Both are abandoned to the collector, which
+    /// checks (see the `raw_txn_upload` module docs).
     ///
     /// Durability of the blob and the head ref is the content store's and
     /// nameservice's to provide: S3 acknowledges after replication, and the
@@ -957,8 +961,10 @@ impl StagedCommit {
         let StagedCommit {
             commit,
             build_state,
+            pins,
             ..
         } = self;
+        pins.published();
         let BuildState {
             base,
             new_t,
@@ -985,6 +991,7 @@ where
         expected_head_ref,
         referenced_bytes,
         tally: _,
+        pins: mut unpublished,
         build_state,
     } = staged;
     let BuildState {
@@ -1001,15 +1008,20 @@ where
 
     let phase = fluree_db_core::clock::Instant::now();
     // 8. Write referenced blobs the build phase deferred (today: none),
-    //    then write the commit blob via put_with_id (idempotent).
+    //    then write the commit blob via put_with_id (idempotent). Each is
+    //    pinned until the head names it, and abandoned to the collector
+    //    if it never does.
+    let pinner = content_store.blob_pinner();
     let write_and_publish = async {
         for (cid, bytes) in &referenced_bytes {
+            unpublished.pin(pinner.as_ref(), cid).await;
             content_store
                 .put_with_id(cid, bytes)
                 .instrument(tracing::debug_span!("commit_write_referenced_blob"))
                 .await?;
             tracing::debug!(%cid, bytes = bytes.len(), "referenced blob stored");
         }
+        unpublished.pin(pinner.as_ref(), &commit_cid).await;
         {
             let span = tracing::debug_span!("commit_write_commit_blob");
             let _g = span.enter();
@@ -1066,6 +1078,7 @@ where
     };
 
     let (blob_us, publish_us) = write_and_publish.await?;
+    unpublished.published();
     let finalize_started = fluree_db_core::clock::Instant::now();
 
     let finalized = finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base);
@@ -1276,19 +1289,24 @@ where
         }
         let expected_head_ref = current.as_ref().map(commit_head_ref);
 
+        // A transaction body stored but named by no published commit is
+        // abandoned to the collector.
+        let mut txn_pin = Unpublished::new();
         let txn_id = if let Some(pending) = opts.raw_txn_upload.take() {
-            Some(
-                pending
-                    .finish()
-                    .instrument(tracing::debug_span!("commit_write_raw_txn"))
-                    .await?,
-            )
+            let (id, pin) = pending
+                .finish()
+                .instrument(tracing::debug_span!("commit_write_raw_txn"))
+                .await?;
+            if let Some(pin) = pin {
+                txn_pin.push(pin);
+            }
+            Some(id)
         } else {
             opts.raw_txn_id.take()
         };
 
         let phase = fluree_db_core::clock::Instant::now();
-        let staged = build_commit(
+        let mut staged = build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -1297,6 +1315,7 @@ where
             opts,
         )
         .await?;
+        staged.pins = txn_pin;
         tracing::debug!(
             target: "fluree::write_path",
             ns_lookup_us,

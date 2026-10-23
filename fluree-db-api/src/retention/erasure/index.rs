@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fluree_db_core::storage::{ContentAddressedWrite, ReadHint, RemoteObject, StorageMethod};
+use fluree_db_core::storage::{
+    BlobPins, ContentAddressedWrite, ReadHint, RemoteObject, StorageMethod,
+};
 use fluree_db_core::{
     content_address, ContentBytes, ContentId, ContentKind, ContentWriteResult, EncryptionAdmin,
     RangeSource, Storage, StorageNamespace, StorageRead, StorageWrite,
@@ -488,11 +490,16 @@ impl ErasureIndex {
 pub(crate) struct ErasureStorage {
     inner: Arc<dyn Storage>,
     index: Arc<ErasureIndex>,
+    pins: Option<Arc<BlobPins>>,
 }
 
 impl ErasureStorage {
-    pub(crate) fn new(inner: Arc<dyn Storage>, index: Arc<ErasureIndex>) -> Self {
-        ErasureStorage { inner, index }
+    pub(crate) fn new(
+        inner: Arc<dyn Storage>,
+        index: Arc<ErasureIndex>,
+        pins: Option<Arc<BlobPins>>,
+    ) -> Self {
+        ErasureStorage { inner, index, pins }
     }
 
     async fn substitute(&self, address: &str) -> Option<fluree_db_core::Result<Arc<[u8]>>> {
@@ -634,6 +641,10 @@ impl StorageRead for ErasureStorage {
 
     fn query_guard(&self) -> Option<fluree_db_core::storage::residency::InFlightGuard> {
         self.inner.query_guard()
+    }
+
+    fn blob_pins(&self) -> Option<Arc<BlobPins>> {
+        self.pins.clone()
     }
 }
 

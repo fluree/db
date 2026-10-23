@@ -121,6 +121,7 @@ mod content_bytes;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
+pub mod pins;
 mod range_source;
 pub mod residency;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -134,6 +135,7 @@ pub use content_bytes::DEFAULT_MMAP_MIN_BYTES;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
+pub use pins::{Abandoned, BlobClaim, BlobPin, BlobPinner, BlobPins, Unpublished};
 pub use range_source::RangeSource;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use root_lock::{RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE};
@@ -313,6 +315,12 @@ pub trait StorageRead: Debug + Send + Sync {
     /// Begin an in-flight window on the store's residency tier. Mirror of
     /// [`ContentStore::query_guard`].
     fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
+    /// The registry protecting this storage's unpublished commit and
+    /// transaction blobs from a collector, when one collects here.
+    fn blob_pins(&self) -> Option<Arc<pins::BlobPins>> {
         None
     }
 
@@ -610,6 +618,10 @@ impl StorageRead for Arc<dyn Storage> {
     fn query_guard(&self) -> Option<residency::InFlightGuard> {
         self.as_ref().query_guard()
     }
+
+    fn blob_pins(&self) -> Option<Arc<pins::BlobPins>> {
+        self.as_ref().blob_pins()
+    }
 }
 
 #[async_trait]
@@ -700,6 +712,18 @@ pub trait ContentStore: Debug + Send + Sync {
         let id = ContentId::new_with(alg, kind, bytes);
         self.put_with_id(&id, bytes).await?;
         Ok(id)
+    }
+
+    /// [`Self::put_with_id`] for an id the caller just minted from `bytes`,
+    /// which a store may skip verifying.
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        self.put_with_id(id, bytes).await
+    }
+
+    /// Where writes to this store are pinned against a collector, when one
+    /// collects here: see [`pins`].
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        None
     }
 
     /// The object's bytes when this machine already has them, without
@@ -868,6 +892,14 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
         self.as_ref().put_with_id(id, bytes).await
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        self.as_ref().put_minted(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        self.as_ref().blob_pinner()
     }
 
     fn get_local(&self, id: &ContentId) -> Result<Option<ContentBytes>> {
@@ -1206,6 +1238,22 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
             .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
             .await?;
         Ok(())
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        let kind = id.content_kind().ok_or_else(|| {
+            crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
+        })?;
+        self.storage
+            .content_write_bytes_with_hash(kind, &self.namespace, &id.address_digest(), bytes)
+            .await?;
+        Ok(())
+    }
+
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        self.storage
+            .blob_pins()
+            .map(|pins| pins::BlobPinner::new(pins, self.namespace.clone()))
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -1756,6 +1804,14 @@ impl ContentStore for BranchedContentStore {
 
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
         self.branch_store.put_with_id(id, bytes).await
+    }
+
+    async fn put_minted(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+        self.branch_store.put_minted(id, bytes).await
+    }
+
+    fn blob_pinner(&self) -> Option<pins::BlobPinner> {
+        self.branch_store.blob_pinner()
     }
 
     /// Writes land in the branch's own store, so it is the one to keep them.

@@ -534,15 +534,15 @@ impl Committer for QueuedTransactor {
         // means the upload happens once per submission rather than
         // re-running on each worker retry.
         let raw_txn_id = if let Some(pending) = commit_opts.raw_txn_upload.take() {
-            Some(
+            let (id, _unpinned) =
                 pending
                     .finish()
                     .await
                     .map_err(|e| SubmissionError::Execution {
                         status: 500,
                         message: format!("raw_txn upload failed: {e}"),
-                    })?,
-            )
+                    })?;
+            Some(id)
         } else {
             commit_opts.raw_txn_id.take()
         };

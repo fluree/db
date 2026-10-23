@@ -69,6 +69,8 @@ pub mod export;
 pub mod export_annotations;
 pub mod export_builder;
 pub mod format;
+#[cfg(feature = "native")]
+pub mod garbage;
 pub mod graph;
 pub mod graph_commit_builder;
 pub mod graph_query_builder;
@@ -190,6 +192,8 @@ pub use format::{
     sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
     QueryOutput,
 };
+#[cfg(feature = "native")]
+pub use garbage::{GarbageReason, GarbageReport, ReconcileReport};
 pub use graph::Graph;
 pub use graph_commit_builder::{
     CommitBuilder, CommitDetail, ResolvedFlake, ResolvedTriple, ResolvedValue,
@@ -2753,7 +2757,10 @@ impl FlureeBuilder {
         // A store from before name bindings moves to the current format.
         let nameservice = FileNameService::with_storage(storage.clone());
         nameservice.migrate_blocking()?;
-        Ok(self.build_file(storage, nameservice).holding(root_lock))
+        let locked = root_lock.is_some();
+        Ok(self
+            .build_file(storage, nameservice, locked)
+            .holding(root_lock))
     }
 
     /// Build a file-backed Fluree instance, recovering the storage root's WAL
@@ -2772,7 +2779,10 @@ impl FlureeBuilder {
             Ok(nameservice)
         })
         .await?;
-        Ok(self.build_file(storage, nameservice).holding(root_lock))
+        let locked = root_lock.is_some();
+        Ok(self
+            .build_file(storage, nameservice, locked)
+            .holding(root_lock))
     }
 
     /// Run a build's startup work on its root in a task that holds
@@ -2812,20 +2822,28 @@ impl FlureeBuilder {
 
     /// Assembles a file-backed instance over `storage`, whose WAL is already
     /// recovered, and its `nameservice`, already in the current format.
+    /// `locked`: the instance holds the root's lock, so it is the only writer
+    /// and may collect commit and transaction garbage.
     #[cfg(feature = "native")]
-    fn build_file(mut self, storage: FileStorage, nameservice: FileNameService) -> Fluree {
+    fn build_file(
+        mut self,
+        storage: FileStorage,
+        nameservice: FileNameService,
+        locked: bool,
+    ) -> Fluree {
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let stored = self.encrypt_if_configured(Arc::new(storage));
-        let (stored, erasure) = self.erasure_storage(stored);
+        let pins = locked.then(|| Arc::new(fluree_db_core::BlobPins::new()));
+        let (stored, erasure) = self.erasure_storage(stored, pins.clone());
         let backend = StorageBackend::Managed(stored);
         let index_config = self.derive_indexing();
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let ledger_manager_cell = Self::new_ledger_manager_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &ledger_manager_cell);
-        let fluree = Self::finalize_with_backend(
+        let mut fluree = Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2844,6 +2862,7 @@ impl FlureeBuilder {
         // The storage root's lock keeps every other process out.
         fluree.retention.watch.set_sole_writer();
         let _ = fluree.retention.erasure.set(erasure);
+        fluree.root.pins = pins;
         fluree
     }
 
@@ -2854,6 +2873,7 @@ impl FlureeBuilder {
     fn erasure_storage(
         &mut self,
         stored: Arc<dyn Storage>,
+        pins: Option<Arc<fluree_db_core::BlobPins>>,
     ) -> (Arc<dyn Storage>, Arc<retention::erasure::ErasureRuntime>) {
         let config = self.erasure.take();
         let verifier = config
@@ -2866,6 +2886,7 @@ impl FlureeBuilder {
         let storage: Arc<dyn Storage> = Arc::new(retention::erasure::index::ErasureStorage::new(
             stored,
             index.clone(),
+            pins,
         ));
         (
             storage,
@@ -3684,7 +3705,10 @@ impl FlureeBuilder {
             let storage = self
                 .wrap_address_identifiers(base_storage, &self.config)
                 .await?;
-            let (storage, erasure) = self.erasure_storage(storage);
+            let pins = root_lock
+                .is_some()
+                .then(|| Arc::new(fluree_db_core::BlobPins::new()));
+            let (storage, erasure) = self.erasure_storage(storage, pins.clone());
             let backend = StorageBackend::Managed(storage);
             let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
@@ -3705,7 +3729,7 @@ impl FlureeBuilder {
                     )
                 }
             };
-            let fluree = Self::finalize_with_backend(
+            let mut fluree = Self::finalize_with_backend(
                 self.ledger_cache_config,
                 self.config,
                 RuntimeParts {
@@ -3722,6 +3746,7 @@ impl FlureeBuilder {
                 self.secret_resolver,
             );
             let _ = fluree.retention.erasure.set(erasure);
+            fluree.root.pins = pins;
             Ok(fluree.holding(root_lock))
         }
     }
@@ -3898,6 +3923,9 @@ struct RootHold {
     /// Set for an instance [`SharedFluree`] handles own. Its lifecycle is
     /// theirs, so [`Fluree::disconnect`] leaves it alone.
     owned_by_shared_handles: bool,
+    /// Pins on the commit and transaction blobs writers have not yet
+    /// published. Only an instance holding the lock collects garbage.
+    pins: Option<Arc<fluree_db_core::BlobPins>>,
 }
 
 impl Fluree {
