@@ -54,7 +54,7 @@ use serde_json::{json, Map, Value as JsonValue};
 use fluree_db_iceberg::io::ColumnBatch;
 use fluree_db_iceberg::DeleteConvention;
 use fluree_db_query::r2rml::R2rmlProvider;
-use fluree_db_r2rml::mapping::TriplesMap;
+use fluree_db_r2rml::mapping::{ObjectMap, TermType, TriplesMap};
 use fluree_db_r2rml::materialize::{
     batch_has_column, column_is_orderable, column_sort_key, column_string, emit_row_terms,
     expand_template_from_batch, materialize_graph_from_batch, materialize_subject_from_batch,
@@ -67,7 +67,9 @@ use std::sync::Arc;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 
 use crate::error::TargetTally;
-use crate::graph_source::r2rml::{MaterializeScan, CHANGE_TYPE_COLUMN, COMMIT_VERSION_COLUMN};
+use crate::graph_source::r2rml::{
+    MaterializeOptions, MaterializeScan, CHANGE_TYPE_COLUMN, COMMIT_VERSION_COLUMN,
+};
 use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
 // `StreamExt::next` — the scan is consumed as a stream so the whole table is never
@@ -239,12 +241,9 @@ pub trait MaterializeSource: Send + Sync {
     /// The compiled R2RML mapping for `graph_source_id`.
     async fn compiled_mapping(&self, graph_source_id: &str) -> Result<Arc<CompiledR2rmlMapping>>;
 
-    /// Materialization options: `(delete convention, order_by column)`. Either one being
-    /// present switches the pass from additive merge to latest-by-key.
-    async fn materialize_options(
-        &self,
-        graph_source_id: &str,
-    ) -> Result<(Option<DeleteConvention>, Option<String>)>;
+    /// Materialization options: a delete convention or an `order_by` column switches
+    /// the pass from additive merge to latest-by-key.
+    async fn materialize_options(&self, graph_source_id: &str) -> Result<MaterializeOptions>;
 
     /// One window of rows for `table_name`, starting after `from_snapshot_id`, as a
     /// stream — the whole table is never resident.
@@ -265,10 +264,7 @@ impl MaterializeSource for FlureeR2rmlProvider<'_> {
         Ok(R2rmlProvider::compiled_mapping(self, graph_source_id, None).await?)
     }
 
-    async fn materialize_options(
-        &self,
-        graph_source_id: &str,
-    ) -> Result<(Option<DeleteConvention>, Option<String>)> {
+    async fn materialize_options(&self, graph_source_id: &str) -> Result<MaterializeOptions> {
         Ok(FlureeR2rmlProvider::materialize_options(self, graph_source_id).await?)
     }
 
@@ -379,12 +375,29 @@ impl Fluree {
                 "Graph source '{source_graph_source_id}' has no R2RML triples maps"
             )));
         }
-        let (delete_convention, order_by) =
-            provider.materialize_options(source_graph_source_id).await?;
+        let MaterializeOptions {
+            delete: delete_convention,
+            order_by,
+            change_feed,
+        } = provider.materialize_options(source_graph_source_id).await?;
         // Latest-by-key (whole-subject replace + tombstone deletes) is enabled by
         // configuring a delete convention and/or an ordering column. With neither,
         // the pass is the legacy additive merge (a subject may span multiple rows).
         let latest_by_key = delete_convention.is_some() || order_by.is_some();
+        // An additive pass over a change feed deletes the triples a row held by
+        // value, and a blank node has none to give: its label names a fresh node
+        // in each transaction, so the delete is refused and every later pass with
+        // it. Refused before the first load, not at the first delete.
+        if change_feed && !latest_by_key {
+            if let Some(tm) = blank_node_objects(&mapping) {
+                return Err(ApiError::Config(format!(
+                    "triples map '{tm}' maps objects to blank nodes, which additive \
+                     materialization cannot retract when the change feed deletes or updates \
+                     their row. Map them to IRIs, or configure delete/order_by: \
+                     latest-by-key replaces a subject whole"
+                )));
+            }
+        }
 
         // 2. Group triples maps by their logical table (deterministic order), then
         //    read each table ONCE against its OWN per-(source,table) watermark and
@@ -1581,13 +1594,14 @@ fn extract_first_i64(v: &JsonValue) -> Option<i64> {
 /// Where a change feed row sits in the feed: the version that made it, and
 /// whether it asserts the row's values (`insert`, `update_postimage`) or
 /// retracts them (`delete`, `update_preimage`).
+///
+/// An update's before-image retracts what the row held where it held it. So
+/// an update that moves a row to another subject, graph or target ledger
+/// removes the old copy; one that does not is outranked by its after-image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowChange {
     version: i64,
     asserts: bool,
-    /// An update's before-image. Latest-by-key takes the after-image beside it
-    /// as the row and skips this one; additive mode retracts what it held.
-    preimage: bool,
 }
 
 impl RowChange {
@@ -1597,21 +1611,16 @@ impl RowChange {
             .ok_or_else(|| {
                 ApiError::Internal(format!("change feed row without a {COMMIT_VERSION_COLUMN}"))
             })?;
-        let (asserts, preimage) = match column_string(batch, CHANGE_TYPE_COLUMN, row).as_deref() {
-            Some("insert" | "update_postimage") => (true, false),
-            Some("delete") => (false, false),
-            Some("update_preimage") => (false, true),
+        let asserts = match column_string(batch, CHANGE_TYPE_COLUMN, row).as_deref() {
+            Some("insert" | "update_postimage") => true,
+            Some("delete" | "update_preimage") => false,
             other => {
                 return Err(ApiError::Internal(format!(
                     "change feed row with {CHANGE_TYPE_COLUMN} {other:?}"
                 )))
             }
         };
-        Ok(Self {
-            version,
-            asserts,
-            preimage,
-        })
+        Ok(Self { version, asserts })
     }
 
     /// Its order among changes: a later version wins, and within one version
@@ -2835,15 +2844,28 @@ fn build_live_node(
     Ok(collector.node)
 }
 
-/// Expand one source row through a triples map into the accumulator. The subject
-/// IRI is built by the exact `term.rs` materializer (so live and tombstone rows
-/// for the same key produce the same IRI).
-///
-/// When `latest_by_key` (a `delete` convention and/or `order_by` is configured),
-/// the row is classified live vs tombstone, ranked by `order_by`, and recorded
-/// as a whole-row REPLACE — the latest row per key wins. Otherwise (legacy
-/// additive mode) the live row's triples are MERGED into the subject's node, so
-/// a subject spanning multiple rows accumulates their values.
+/// The first triples map, by IRI, with an object map that yields blank nodes:
+/// `rr:termType rr:BlankNode`, or a reference to a map whose subjects are.
+fn blank_node_objects(mapping: &CompiledR2rmlMapping) -> Option<&str> {
+    let yields_blank_nodes = |object_map: &ObjectMap| match object_map {
+        ObjectMap::RefObjectMap(reference) => mapping
+            .triples_maps
+            .get(&reference.parent_triples_map)
+            .is_some_and(|parent| parent.subject_map.term_type == TermType::BlankNode),
+        other => other.term_type() == TermType::BlankNode,
+    };
+    mapping
+        .triples_maps
+        .values()
+        .filter(|tm| {
+            tm.predicate_object_maps
+                .iter()
+                .any(|pom| yields_blank_nodes(&pom.object_map))
+        })
+        .map(|tm| tm.iri.as_str())
+        .min()
+}
+
 /// Resolve a materialization row's TARGET ledger id. A `target` with no `{...}`
 /// placeholder is used verbatim (a plain single-target job routes every row to
 /// the same ledger). A templated target is expanded against the row's columns
@@ -2857,6 +2879,16 @@ fn resolve_target_ledger(target: &str, batch: &ColumnBatch, row: usize) -> Optio
     expand_template_from_batch(target, batch, row).ok()
 }
 
+/// Expand one source row through a triples map into the accumulator. The subject
+/// IRI is built by the exact `term.rs` materializer (so live and tombstone rows
+/// for the same key produce the same IRI).
+///
+/// When `latest_by_key` (a `delete` convention and/or `order_by` is configured),
+/// the row is classified live vs tombstone, ranked by `order_by`, and recorded
+/// as a whole-row REPLACE — the latest row per key wins. Otherwise (additive
+/// mode) the live row's triples are MERGED into the subject's node, so a
+/// subject spanning multiple rows accumulates their values; a change feed row
+/// instead asserts or retracts its triples one by one.
 #[allow(clippy::too_many_arguments)]
 fn materialize_row_into(
     ctx: &TmEmitContext<'_>,
@@ -2871,11 +2903,6 @@ fn materialize_row_into(
     stats: &mut MaterializeStats,
     accum: &mut MaterializeAccum,
 ) -> Result<()> {
-    // Latest-by-key replaces a key's row with the latest image of it, and an
-    // update's after-image is that image.
-    if latest_by_key && change.is_some_and(|c| c.preimage) {
-        return Ok(());
-    }
     let tm = ctx.tm();
     let subject_term = materialize_subject_from_batch(&tm.subject_map, batch, row)
         .map_err(|e| ApiError::Internal(format!("R2RML subject materialization failed: {e}")))?;
@@ -2902,7 +2929,7 @@ fn materialize_row_into(
         match change {
             // A change row asserts or retracts exactly the triples it maps to.
             Some(change) => {
-                accum.record_change(target_ledger, graph_iri, subject_iri, change, node)
+                accum.record_change(target_ledger, graph_iri, subject_iri, change, node);
             }
             // Legacy additive: merge this live row into the (target, graph, subject) node.
             None => accum.merge_live(target_ledger, graph_iri, subject_iri, node),
@@ -4155,11 +4182,12 @@ mod engine_tests {
         async fn compiled_mapping(&self, _gs: &str) -> Result<Arc<CompiledR2rmlMapping>> {
             Ok(self.mapping.clone())
         }
-        async fn materialize_options(
-            &self,
-            _gs: &str,
-        ) -> Result<(Option<DeleteConvention>, Option<String>)> {
-            Ok((self.delete.clone(), self.order_by.clone()))
+        async fn materialize_options(&self, _gs: &str) -> Result<MaterializeOptions> {
+            Ok(MaterializeOptions {
+                delete: self.delete.clone(),
+                order_by: self.order_by.clone(),
+                change_feed: self.change_feed,
+            })
         }
         async fn scan_window(
             &self,
@@ -4878,11 +4906,59 @@ mod engine_tests {
         assert_eq!(people, ["1", "2"]);
     }
 
+    /// An additive pass over a change feed deletes a row's triples by value,
+    /// and the delete parser refuses a blank node label, which names a fresh
+    /// node. So a mapping with blank node objects is refused before anything
+    /// loads, where it would otherwise fail at its first delete and every pass
+    /// after. Latest-by-key retracts a subject by pattern and takes it.
+    #[tokio::test]
+    async fn an_additive_change_feed_refuses_blank_node_objects_before_loading() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let (gs, target) = ("people:main", "people_native:main");
+        let tm = TriplesMap::new("http://tm/people", "people")
+            .with_subject_template("http://ex/person/{id}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/child"),
+                object_map: ObjectMap::Template {
+                    template: "_:child_{id}".to_string(),
+                    columns: vec!["id".to_string()],
+                    term_type: TermType::BlankNode,
+                    datatype: None,
+                    language: None,
+                },
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let rows = || vec![change_batch(&[("1", "a", "insert", 1, 0)])];
+
+        let additive = FakeSource::new(mapping.clone(), rows()).change_feed();
+        let err = fluree
+            .materialize_from_source(&additive, gs, target, false, None, None)
+            .await
+            .expect_err("blank node objects cannot be retracted by value");
+        assert!(
+            matches!(&err, ApiError::Config(m) if m.contains("'http://tm/people'") && m.contains("blank nodes")),
+            "{err}"
+        );
+        assert_eq!(additive.scans(), 0, "refused before reading a row");
+
+        let latest = FakeSource {
+            order_by: Some("seq".to_string()),
+            ..FakeSource::new(mapping, rows())
+        }
+        .change_feed();
+        let result = fluree
+            .materialize_from_source(&latest, gs, target, false, None, None)
+            .await
+            .expect("latest-by-key retracts by pattern");
+        assert_eq!(result.subjects_upserted, 1);
+    }
+
     /// Latest-by-key over a change feed takes each key's latest change in
     /// commit order, whatever order the rows arrive in. Within one version an
     /// assertion wins over a retraction (a rewritten file deletes and inserts
-    /// the same key), an update's before-image is not the row, and the
-    /// configured `order_by` still orders rows of one version.
+    /// the same key), an update's before-image retracts the key it held (so
+    /// an update that changes the key moves the subject), and the configured
+    /// `order_by` still orders rows of one version.
     #[tokio::test]
     async fn a_latest_by_key_change_feed_follows_commit_order() {
         let fluree = FlureeBuilder::memory().build_memory();
@@ -4896,6 +4972,7 @@ mod engine_tests {
                     ("2", "b", "insert", 1, 0),
                     ("3", "c", "insert", 1, 0),
                     ("4", "d", "insert", 1, 0),
+                    ("5", "e", "insert", 1, 0),
                 ])],
             )
         }
@@ -4919,6 +4996,8 @@ mod engine_tests {
                     ("3", "c", "update_preimage", 11, 0),
                     ("4", "d-late", "insert", 12, 2),
                     ("4", "d-early", "insert", 12, 1),
+                    ("6", "e", "update_postimage", 12, 0),
+                    ("5", "e", "update_preimage", 12, 0),
                 ])],
             )
         }
@@ -4928,13 +5007,16 @@ mod engine_tests {
             .await
             .expect("change pass");
         assert_eq!(
-            result.subjects_retracted, 1,
-            "only id 1's latest change is a delete"
+            result.subjects_retracted, 2,
+            "id 1's latest change is a delete, and id 5's an update away from it"
         );
 
         let (names, people) = people_in(&fluree, target).await;
-        assert_eq!(names, pairs(&[("2", "b2"), ("3", "c2"), ("4", "d-late")]));
-        assert_eq!(people, ["2", "3", "4"]);
+        assert_eq!(
+            names,
+            pairs(&[("2", "b2"), ("3", "c2"), ("4", "d-late"), ("6", "e")])
+        );
+        assert_eq!(people, ["2", "3", "4", "6"]);
     }
 
     /// A change feed the row budget cut short ends its window where it

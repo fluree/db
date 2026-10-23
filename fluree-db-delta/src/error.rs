@@ -133,6 +133,16 @@ pub(crate) fn change_feed_refusal(error: &delta_kernel::Error) -> Option<String>
     }
 }
 
+/// The version a change feed failure names: where the feed is off.
+pub(crate) fn feed_off_at(error: &delta_kernel::Error) -> Option<u64> {
+    use delta_kernel::Error as K;
+    match error {
+        K::Backtraced { source, .. } => feed_off_at(source),
+        K::ChangeDataFeedUnsupported(version) => Some(*version),
+        _ => None,
+    }
+}
+
 /// [`change_feed_refusal`] for a failure to open a range. Kernel reports a log
 /// that no longer reaches the range's start as a plain message, so, as for
 /// [`DeltaError::is_unreachable_version`], every failure that is not an access

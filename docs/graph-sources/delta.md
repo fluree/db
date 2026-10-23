@@ -462,11 +462,16 @@ retract theirs. How a key's changes combine depends on the source's options:
   deleted row's triples are removed, and a row inserted and deleted between
   two passes never lands. A triple the deleted row shares with another row or
   source, such as a common class, is removed too: a statement does not record
-  which rows asserted it.
+  which rows asserted it. A mapping with blank-node objects is refused in this
+  mode before anything loads: a delete names the triples it removes, and a
+  blank node's label names a new node in every transaction. Map them to IRIs,
+  or use latest-by-key.
 - **Latest-by-key** (`delete_column` and `delete_values`, or `order_by`, set on
   [`/delta/map`](../api/endpoints.md#post-api_base_urldeltamap)): a key's
-  latest change replaces its subject whole, and a delete removes it. Changes
-  are ordered by version; `order_by` orders a key's rows within one version.
+  latest change replaces its subject whole. A delete removes the subject, and
+  so does an update that moves its row to another subject, graph or target
+  ledger. Changes are ordered by version; `order_by` orders a key's rows
+  within one version.
 
 A pass applies at most `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` changed rows (by
 default derived from the novelty ceiling; see
@@ -478,7 +483,10 @@ When the change feed cannot serve a window, the pass reads the latest version
 whole instead and logs why at `warn`: the feed was off for part of the window,
 the schema changed inside it, or log retention has removed its start. A whole
 read upserts what the table holds but cannot see what it no longer holds, so
-rows deleted inside that window stay in the target.
+rows deleted inside that window stay in the target. Most such windows are
+caught before any rows are read. A version inside one that fails only when it
+is read, such as one whose change file has been removed, fails that pass; the
+server remembers it until restart, and the next pass reads the table whole.
 
 From Rust, `FlureeR2rmlProvider::current_snapshot_id` returns a table's latest
 version, and `scan_for_materialize_stream` reads the changes after a version,

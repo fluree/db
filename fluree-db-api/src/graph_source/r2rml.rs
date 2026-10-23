@@ -361,6 +361,19 @@ fn int_pushdown_literal(
     }
 }
 
+/// How a graph source's rows are materialized. A delete convention or an
+/// ordering column makes a pass latest-by-key; neither, additive.
+#[derive(Debug, Default)]
+pub struct MaterializeOptions {
+    /// The rows that delete their subject.
+    pub delete: Option<DeleteConvention>,
+    /// The column that orders the rows of one key.
+    pub order_by: Option<String>,
+    /// Incremental passes read the source's change feed, in which a deleted
+    /// or updated row retracts what it held.
+    pub change_feed: bool,
+}
+
 /// One materialize scan: what to read, how it was chosen, and how stale the window is.
 ///
 /// A struct rather than a tuple because `window_age_ms` is easy to drop silently
@@ -1865,14 +1878,12 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((metadata.current_snapshot().map(|s| s.snapshot_id), columns))
     }
 
-    /// The source graph source's materialization options from the persisted
-    /// `IcebergGsConfig`: the optional tombstone/delete convention and the
-    /// optional latest-by-key ordering column. Both `None` means additive,
-    /// scan-order materialization (legacy behavior).
+    /// The source graph source's materialization options from its persisted
+    /// config (`IcebergGsConfig` or `DeltaGsConfig`).
     pub async fn materialize_options(
         &self,
         graph_source_id: &str,
-    ) -> QueryResult<(Option<DeleteConvention>, Option<String>)> {
+    ) -> QueryResult<MaterializeOptions> {
         let record = self
             .fluree
             .nameservice()
@@ -1892,7 +1903,11 @@ impl<'a> FlureeR2rmlProvider<'a> {
                         "Failed to parse Delta graph source config for '{graph_source_id}': {e}"
                     ))
                 })?;
-            return Ok((config.delete, config.order_by));
+            return Ok(MaterializeOptions {
+                delete: config.delete,
+                order_by: config.order_by,
+                change_feed: true,
+            });
         }
         require_iceberg_backed(&record, graph_source_id)?;
         let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
@@ -1900,7 +1915,11 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
             ))
         })?;
-        Ok((config.delete, config.order_by))
+        Ok(MaterializeOptions {
+            delete: config.delete,
+            order_by: config.order_by,
+            change_feed: false,
+        })
     }
 
     /// Scan only the data files ADDED in the snapshot window

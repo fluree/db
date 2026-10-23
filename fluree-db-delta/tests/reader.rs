@@ -1502,3 +1502,67 @@ async fn a_range_the_feed_does_not_cover_is_refused() {
         ])
     );
 }
+
+/// Kernel opens a range after checking its two ends, so a version inside it
+/// fails only once rows are flowing. Here the change file of the MERGE at
+/// version 4 is gone.
+#[tokio::test]
+async fn a_failure_inside_a_range_is_remembered_beyond_the_table_handle() {
+    allow_roots();
+    let staged = tempfile::tempdir().unwrap();
+    let dir = staged.path().join("change_feed");
+    copy_dir_all(&fixtures().join("change_feed"), &dir);
+    std::fs::remove_file(
+        dir.join("_change_data/cdc-00000-32085b26-4a53-4fb5-a220-e4c7c65ba3ce.c000.snappy.parquet"),
+    )
+    .unwrap();
+    // A new handle for every read, as when the cached one has expired.
+    let open = |selector| {
+        let table = DeltaTable::open(
+            "change_feed",
+            dir.to_str().unwrap(),
+            &DeltaIoConfig::default(),
+        )
+        .expect("open table");
+        async move { table.snapshot(selector).await.unwrap() }
+    };
+
+    let feed = open(VersionSelector::Latest)
+        .await
+        .changes_since(0, &[], None)
+        .await
+        .expect("both ends of the range are readable");
+    let read: Vec<_> = feed.stream.collect().await;
+    let (failure, rows) = read.split_last().expect("the stream ends in an error");
+    assert!(
+        matches!(
+            failure,
+            Err(DeltaError::ChangeFeedUnavailable { after: 0, .. })
+        ),
+        "expected ChangeFeedUnavailable, got {:?}",
+        failure.as_ref().map(|b| b.num_rows)
+    );
+    assert!(!rows.is_empty() && rows.iter().all(Result::is_ok));
+
+    match open(VersionSelector::Latest)
+        .await
+        .changes_since(0, &[], None)
+        .await
+    {
+        Err(DeltaError::ChangeFeedUnavailable { after: 0, .. }) => {}
+        Err(other) => panic!("expected ChangeFeedUnavailable, got {other}"),
+        Ok(_) => panic!("a range covering the failure must be refused before any rows are read"),
+    }
+
+    // A range that ends before the failure is still read.
+    let (rows, _) = changes(&open(VersionSelector::Version(3)).await, 0, None).await;
+    assert_eq!(
+        by_version(rows),
+        by_version(
+            changes_after_0()
+                .into_iter()
+                .filter(|row| matches!(row[4], Cell::Int(version) if version <= 3))
+                .collect()
+        )
+    );
+}
