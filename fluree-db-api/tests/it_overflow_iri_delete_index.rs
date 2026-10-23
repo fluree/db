@@ -17,10 +17,12 @@ const PAGE: &str = "http://example.org/page";
 const PRICE: &str = "http://example.org/price";
 const COUNTRY: &str = "http://example.org/country";
 const V: &str = "http://vendors.example/v/1";
+const V2: &str = "http://vendors.example/v/2";
 const O1: &str = "http://offers.example/o/1";
 const O2: &str = "http://offers.example/o/2";
 const O3: &str = "http://offers.example/o/3";
 const O4: &str = "http://offers.example/o/4";
+const O5: &str = "http://offers.example/o/5";
 
 async fn rows(fluree: &Fluree, ledger: &LedgerState, q: &str) -> usize {
     support::query_sparql(fluree, ledger, q)
@@ -54,7 +56,8 @@ async fn sparql_update(fluree: &Fluree, ledger: LedgerState, body: &str) -> Ledg
 /// Each offer names the vendor and its own page, both overflow IRIs. O1 goes
 /// by `DELETE WHERE`, whose objects come from the WHERE solutions; O2 by
 /// `DELETE DATA`, whose objects come from the request; O3 by a JSON-LD
-/// where/delete. O4 stays.
+/// where/delete. O4 stays. O5's vendor is replaced by an upsert, which
+/// retracts the current value it reads.
 #[tokio::test]
 async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -71,7 +74,7 @@ async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
         .map(|i| json!({"@id": format!("http://ns{i}.example/s"), LABEL: "filler"}))
         .collect();
     graph.push(json!({"@id": V, LABEL: "vendor one", COUNTRY: {"@id": "http://example.org/US"}}));
-    for o in [O1, O2, O3, O4] {
+    for o in [O1, O2, O3, O4, O5] {
         graph.push(json!({"@id": o, VENDOR: {"@id": V}, PAGE: {"@id": format!("{o}/")}, PRICE: 1}));
     }
     fluree
@@ -98,11 +101,16 @@ async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
         .await
         .expect("JSON-LD delete")
         .ledger;
+    let ledger = fluree
+        .upsert(ledger, &json!({"@id": O5, VENDOR: {"@id": V2}}))
+        .await
+        .expect("upsert")
+        .ledger;
 
     // Pending: reads that bind no overflow IRI. Binding one is #1842.
     let joins = [
-        (format!("SELECT ?s WHERE {{ ?s <{VENDOR}> ?v }}"), 1),
-        (format!("SELECT ?s WHERE {{ ?s <{PAGE}> ?pg }}"), 1),
+        (format!("SELECT ?s WHERE {{ ?s <{VENDOR}> ?v }}"), 2),
+        (format!("SELECT ?s WHERE {{ ?s <{PAGE}> ?pg }}"), 2),
         (
             format!("SELECT ?s ?l WHERE {{ ?s <{VENDOR}> ?v . ?v <{LABEL}> ?l }}"),
             1,
@@ -122,6 +130,8 @@ async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
         checks.push((format!("SELECT ?p ?o WHERE {{ <{o}> ?p ?o }}"), 0));
     }
     checks.push((format!("SELECT ?s WHERE {{ ?s <{VENDOR}> <{V}> }}"), 1));
+    checks.push((format!("SELECT ?s WHERE {{ ?s <{VENDOR}> <{V2}> }}"), 1));
+    checks.push((format!("SELECT ?v WHERE {{ <{O5}> <{VENDOR}> ?v }}"), 1));
     checks.push((format!("SELECT ?p ?x WHERE {{ <{V}> ?p ?x }}"), 2));
     support::build_incrementally_and_publish_index(&fluree, id).await;
     let incremental = fluree.ledger(id).await.expect("reload");
