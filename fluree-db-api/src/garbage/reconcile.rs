@@ -19,10 +19,12 @@ use crate::{Fluree, Result};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileReport {
-    /// Commit and transaction files listed.
+    /// Commit and transaction files checked.
     pub listed: usize,
     /// Of those, recorded as garbage.
     pub recorded: usize,
+    /// Every file is checked.
+    pub complete: bool,
 }
 
 /// A ledger's last completed reconciliation, beside its records.
@@ -33,13 +35,49 @@ struct Reconciled {
     completed_ms: i64,
 }
 
+/// A reconciliation in progress: when it started, and the last file it
+/// checked.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Reconciling {
+    started_ms: i64,
+    after: String,
+}
+
 const RECONCILED: &str = "reconciled.json";
+const RECONCILING: &str = "reconciling.json";
+
+/// Files one reconciliation step checks at most.
+const STEP: usize = 50_000;
 
 impl Fluree {
     /// Record the commit and transaction files in ledger `name`'s branch
     /// folders that no branch references. `None` when the ledger is not
     /// settled, or this instance does not collect.
     pub async fn reconcile_garbage(&self, name: &str) -> Result<Option<ReconcileReport>> {
+        let mut total = ReconcileReport::default();
+        loop {
+            let Some(step) = self.reconcile_step(name, STEP, None).await? else {
+                return Ok(None);
+            };
+            total.listed += step.listed;
+            total.recorded += step.recorded;
+            if step.complete {
+                total.complete = true;
+                return Ok(Some(total));
+            }
+        }
+    }
+
+    /// Check up to `budget` more of ledger `name`'s commit and transaction
+    /// files, resuming the reconciliation in progress unless it started
+    /// before `not_before`.
+    pub(super) async fn reconcile_step(
+        &self,
+        name: &str,
+        budget: usize,
+        not_before: Option<i64>,
+    ) -> Result<Option<ReconcileReport>> {
         if self.blob_pins().is_none() {
             return Ok(None);
         }
@@ -47,20 +85,27 @@ impl Fluree {
             return Ok(None);
         };
         let binding = binding.value;
-        let started_ms = now_ms();
+        let storage = self.garbage_storage()?;
+        let method = storage.storage_method().to_string();
+        let progress_address = format!("{}{RECONCILING}", dir_address(&method, &binding.root));
+        let progress = match storage.read_bytes(&progress_address).await {
+            Ok(bytes) => serde_json::from_slice::<Reconciling>(&bytes).ok(),
+            Err(fluree_db_core::Error::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        }
+        .filter(|p| not_before.is_none_or(|ms| p.started_ms >= ms));
+        let started_ms = progress.as_ref().map_or_else(now_ms, |p| p.started_ms);
         let Some(holders) = self.load_holders(name, &binding).await? else {
             return Ok(None);
         };
-        let storage = self.garbage_storage()?;
-        let method = storage.storage_method().to_string();
         let recorded: HashSet<Blob> = self
             .garbage_records(&binding.root)
             .await?
             .into_iter()
             .map(|r| r.blob)
             .collect();
-        let mut report = ReconcileReport::default();
-        let mut found = Vec::new();
+        // Every file in one order, so a step resumes after the last checked.
+        let mut files = Vec::new();
         for listing in &binding.branches {
             let namespace = StorageNamespace::new(binding.root.clone(), &listing.branch);
             for (folder, codec, suffix) in [
@@ -69,34 +114,57 @@ impl Fluree {
             ] {
                 let prefix = format!("fluree:{method}://{}/{folder}/", namespace.branch_prefix());
                 for address in storage.list_prefix(&prefix).await? {
-                    let Some(id) = address
+                    let id = address
                         .strip_prefix(&prefix)
                         .and_then(|f| f.strip_suffix(suffix))
-                        .and_then(|digest| ContentId::from_address_digest(codec, digest))
-                    else {
-                        continue;
-                    };
-                    report.listed += 1;
-                    let blob = Blob::new(namespace.clone(), id);
-                    if !recorded.contains(&blob) && !holders.references(self, &blob).await? {
-                        found.push(blob);
+                        .and_then(|digest| ContentId::from_address_digest(codec, digest));
+                    if let Some(id) = id {
+                        files.push((address, Blob::new(namespace.clone(), id)));
                     }
                 }
             }
         }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let start = progress.as_ref().map_or(0, |p| {
+            files.partition_point(|(a, _)| a.as_str() <= p.after.as_str())
+        });
+        let end = files.len().min(start + budget);
+        let mut found = Vec::new();
+        for (_, blob) in &files[start..end] {
+            if !recorded.contains(blob) && !holders.references(self, blob).await? {
+                found.push(blob.clone());
+            }
+        }
         self.record_garbage(&found, GarbageReason::Reconciled)
             .await?;
-        report.recorded = found.len();
-        let done = Reconciled {
-            started_ms,
-            completed_ms: now_ms(),
+        let report = ReconcileReport {
+            listed: end - start,
+            recorded: found.len(),
+            complete: end == files.len(),
         };
-        storage
-            .write_bytes(
-                &reconciled_address(&method, &binding.root),
-                &serde_json::to_vec(&done)?,
-            )
-            .await?;
+        if report.complete {
+            let done = Reconciled {
+                started_ms,
+                completed_ms: now_ms(),
+            };
+            storage
+                .write_bytes(
+                    &reconciled_address(&method, &binding.root),
+                    &serde_json::to_vec(&done)?,
+                )
+                .await?;
+            if progress.is_some() {
+                storage.delete(&progress_address).await?;
+            }
+        } else {
+            let progress = Reconciling {
+                started_ms,
+                after: files[end - 1].0.clone(),
+            };
+            storage
+                .write_bytes(&progress_address, &serde_json::to_vec(&progress)?)
+                .await?;
+        }
         Ok(Some(report))
     }
 
@@ -130,7 +198,7 @@ impl Fluree {
             return Ok(None);
         };
         Ok(self
-            .reconcile_garbage(&name)
+            .reconcile_step(&name, STEP, None)
             .await?
             .map(|report| (name, report)))
     }
@@ -148,23 +216,20 @@ impl Fluree {
 
     /// Collect, without a grace period, every file of ledger `name` that no
     /// branch references, as of a reconciliation started at or after
-    /// `since_ms`, running one if there is none. `false` while that cannot
-    /// be established: the ledger is unsettled, or a writer pins a file.
+    /// `since_ms`, taking a step of one if there is none. `false` while that
+    /// cannot be established: the reconciliation is not complete, the ledger
+    /// is unsettled, or a writer pins a file.
     pub(crate) async fn resolve_garbage(&self, name: &str, since_ms: i64) -> Result<bool> {
         let Some(binding) = self.publisher()?.get_binding(name).await? else {
             return Ok(false);
         };
         let root = &binding.value.root;
-        let covered = |r: &Option<Reconciled>| r.is_some_and(|r| r.started_ms >= since_ms);
-        let mut reconciled = self.reconciled(root).await?;
-        if !covered(&reconciled) {
-            if self.reconcile_garbage(name).await?.is_none() {
+        let covered = |r: Option<Reconciled>| r.is_some_and(|r| r.started_ms >= since_ms);
+        if !covered(self.reconciled(root).await?) {
+            let step = self.reconcile_step(name, STEP, Some(since_ms)).await?;
+            if !step.is_some_and(|s| s.complete) || !covered(self.reconciled(root).await?) {
                 return Ok(false);
             }
-            reconciled = self.reconciled(root).await?;
-        }
-        if !covered(&reconciled) {
-            return Ok(false);
         }
         let mut report = super::GarbageReport::default();
         self.collect_ledger(name, &binding.value, now_ms(), &mut report)

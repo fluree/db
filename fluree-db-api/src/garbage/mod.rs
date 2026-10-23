@@ -10,6 +10,8 @@
 mod check;
 mod collect;
 mod reconcile;
+#[cfg(test)]
+mod tests;
 
 pub use collect::GarbageReport;
 pub use reconcile::ReconcileReport;
