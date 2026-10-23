@@ -193,7 +193,9 @@ pub use format::{
     QueryOutput,
 };
 #[cfg(feature = "native")]
-pub use garbage::{GarbageReason, GarbageReport, ReconcilePass, ReconcileReport, ReconcileTimings};
+pub use garbage::{
+    CollectTimings, GarbageReason, GarbageReport, ReconcilePass, ReconcileReport, ReconcileTimings,
+};
 pub use graph::Graph;
 pub use graph_commit_builder::{
     CommitBuilder, CommitDetail, ResolvedFlake, ResolvedTriple, ResolvedValue,

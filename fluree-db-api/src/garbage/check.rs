@@ -334,18 +334,24 @@ impl Branch {
     async fn walk(&mut self, roots: Vec<ContentId>) -> Result<()> {
         let mut next = roots;
         while let Some(id) = next.pop() {
-            if self.commits.contains(&id) || has_commit(&self.state, &id).await? {
+            if self.commits.contains(&id) {
                 continue;
             }
-            self.commits.insert(id.clone());
-            match load_commit_envelope_by_id(self.store.as_ref(), &id).await {
-                Ok(envelope) => {
-                    self.txns.extend(envelope.txn);
-                    next.extend(envelope.parents);
-                }
+            let envelope = match load_commit_envelope_by_id(self.store.as_ref(), &id).await {
+                Ok(envelope) => Some(envelope),
                 // Nothing stored to delete, and nothing more to reach.
-                Err(fluree_db_core::Error::NotFound(_)) => {}
+                Err(fluree_db_core::Error::NotFound(_)) => None,
                 Err(e) => return Err(e.into()),
+            };
+            // A commit past the loaded state cannot be in its txn-meta.
+            let past = envelope.as_ref().is_some_and(|e| e.t > self.state.t());
+            if !past && has_commit(&self.state, &id).await? {
+                continue;
+            }
+            self.commits.insert(id);
+            if let Some(envelope) = envelope {
+                self.txns.extend(envelope.txn);
+                next.extend(envelope.parents);
             }
         }
         Ok(())

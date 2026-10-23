@@ -18,7 +18,8 @@
 //!
 //! Writers commit to their own ledgers with raw bodies stored, and every
 //! tenth transaction fails while staging, so garbage keeps arriving, unless
-//! `GARBAGE_PERF_NO_FAILURES` is set.
+//! `GARBAGE_PERF_NO_FAILURES` is set. `GARBAGE_PERF_NO_PASSES` keeps
+//! `scheduled`'s collector idle, for an A/B of whole runs.
 //! Durability is PageCache unless `GARBAGE_PERF_WAL` is set.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,6 +290,9 @@ async fn scheduled(writers: usize, commits: usize, every: Duration) {
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(every).await;
+                if std::env::var_os("GARBAGE_PERF_NO_PASSES").is_some() {
+                    continue;
+                }
                 let (collected, collection, reconciled, reconciliation) = phases(&fluree).await;
                 let files: usize = reconciled.ledgers.iter().map(|(_, r)| r.checked).sum();
                 println!(
@@ -300,6 +304,13 @@ async fn scheduled(writers: usize, commits: usize, every: Duration) {
                     reconciled.ledgers.len(),
                     (reconciliation.1 - reconciliation.0).as_secs_f64(),
                 );
+                println!("  collection {:?}", collected.timings);
+                for (ledger, report) in &reconciled.ledgers {
+                    println!(
+                        "  {ledger}: {} files in {} steps, {:?}",
+                        report.checked, report.steps, report.timings
+                    );
+                }
                 passes.lock().push((collection, reconciliation));
             }
         })
@@ -321,6 +332,7 @@ async fn scheduled(writers: usize, commits: usize, every: Duration) {
             apart.push(*span);
         }
     }
+    report("all commits", latencies(&spans));
     report("commits collection overlapped", latencies(&during_c));
     report("commits reconciliation overlapped", latencies(&during_r));
     report("commits no pass overlapped", latencies(&apart));

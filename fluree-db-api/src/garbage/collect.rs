@@ -31,6 +31,19 @@ pub struct GarbageReport {
     pub deferred: usize,
     /// Records past their grace period the pass ran out of time for.
     pub left: usize,
+    pub timings: CollectTimings,
+}
+
+/// Where a collection pass's time went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectTimings {
+    /// Loading the branches to their heads.
+    pub load: Duration,
+    /// Accounting for commits published since.
+    pub catch_up: Duration,
+    /// Checking and deleting the claimed blobs.
+    pub check: Duration,
 }
 
 impl Fluree {
@@ -95,7 +108,10 @@ impl Fluree {
             report.deferred += due.len();
             return Ok(());
         };
-        let Some(mut holders) = self.load_holders(name, binding).await? else {
+        let clock = Instant::now();
+        let holders = self.load_holders(name, binding).await?;
+        report.timings.load += clock.elapsed();
+        let Some(mut holders) = holders else {
             report.deferred += due.len();
             return Ok(());
         };
@@ -117,10 +133,14 @@ impl Fluree {
                     None => report.deferred += 1,
                 }
             }
-            if !holders.catch_up(self).await? {
+            let clock = Instant::now();
+            let caught_up = holders.catch_up(self).await?;
+            report.timings.catch_up += clock.elapsed();
+            if !caught_up {
                 report.deferred += claimed.len() + due.count();
                 return Ok(());
             }
+            let clock = Instant::now();
             for (recorded, _claim) in claimed {
                 let Some(address) = recorded.blob.address(&method) else {
                     continue;
@@ -136,6 +156,7 @@ impl Fluree {
                 }
                 storage.delete(&recorded.address).await?;
             }
+            report.timings.check += clock.elapsed();
         }
         Ok(())
     }

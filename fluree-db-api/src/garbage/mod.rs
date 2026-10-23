@@ -13,7 +13,7 @@ mod reconcile;
 #[cfg(test)]
 mod tests;
 
-pub use collect::GarbageReport;
+pub use collect::{CollectTimings, GarbageReport};
 pub use reconcile::{ReconcilePass, ReconcileReport, ReconcileTimings};
 
 use std::sync::Arc;
