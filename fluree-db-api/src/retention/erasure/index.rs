@@ -250,11 +250,35 @@ impl ErasureIndex {
         Ok(self.entries.read().contains_key(digest))
     }
 
+    /// Where an artifact is stored.
+    pub(crate) fn artifact_address(&self, kind: Artifact, hex: &str) -> String {
+        self.address(&kind.path(hex))
+    }
+
+    /// The bytes stored at `address`, past the substitution: an erased
+    /// commit's original, not its replacement. `None` when nothing is there.
+    pub(crate) async fn read_raw(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        match self.storage.read_bytes(address).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(fluree_db_core::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether anything is stored at `address`, past the substitution.
+    pub(crate) async fn exists_raw(&self, address: &str) -> Result<bool> {
+        Ok(self.storage.exists(address).await?)
+    }
+
     /// Every address under the storage, past the substitution: what the
     /// files are, not what reads of them return.
     pub(crate) async fn list_all(&self) -> Result<Vec<String>> {
-        let root = format!("fluree:{}://", self.storage.storage_method());
-        Ok(self.storage.list_prefix(&root).await?)
+        Ok(self.storage.list_prefix(&self.address_prefix()).await?)
+    }
+
+    /// What every address of the storage starts with.
+    pub(crate) fn address_prefix(&self) -> String {
+        format!("fluree:{}://", self.storage.storage_method())
     }
 
     /// Whether any commit is erased.

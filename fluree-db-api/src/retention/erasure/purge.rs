@@ -3,10 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fluree_db_core::commit::codec::read_commit_envelope;
-use fluree_db_core::{ContentId, LedgerId};
+use fluree_db_core::commit::codec::{read_commit, read_commit_envelope};
+use fluree_db_core::{ContentId, ContentKind, Flake, LedgerId};
 use serde::{Deserialize, Serialize};
 
+use super::index::{Artifact, ErasedCommit};
 use super::ErasureStage;
 use crate::retention::registry;
 use crate::{ApiError, Fluree, Result};
@@ -18,11 +19,16 @@ use crate::{ApiError, Fluree, Result};
 pub struct PurgePlan {
     /// The published requests it covers.
     pub requests: Vec<String>,
+    /// The commits they erased.
+    pub commits: Vec<String>,
     /// Every copy of an erased commit's original, in any folder.
     pub originals: Vec<String>,
     /// The transaction documents of those commits, in each folder that
     /// holds a copy of a commit naming one.
     pub transactions: Vec<String>,
+    /// Replacements a later step superseded, which still hold what it
+    /// removed: earlier steps of a chain, and steps proved on one.
+    pub superseded: Vec<String>,
     /// Branches whose indexes are rebuilt from the replacements.
     pub rebuild: Vec<String>,
     /// Branches of soft-dropped ledgers, whose index artifacts are released.
@@ -39,6 +45,7 @@ impl Fluree {
         let mut plan = PurgePlan::default();
         let mut erased = BTreeSet::new();
         let mut rebuild = BTreeSet::new();
+        let mut jobs = Vec::new();
         for record in self.nameservice().list_branches(name.name()).await? {
             if record.retracted {
                 continue;
@@ -47,6 +54,7 @@ impl Fluree {
             let Some(registration) = registry::read(ns, &branch).await?.1 else {
                 continue;
             };
+            jobs.extend(registration.erasures.iter().cloned());
             for job in registration
                 .erasures
                 .iter()
@@ -70,10 +78,36 @@ impl Fluree {
         // Each erased original's digest, with its transaction document's,
         // which the replacement keeps in its envelope.
         let mut txn_of: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut superseded = BTreeSet::new();
         for commit in &erased {
-            let cid: ContentId = commit
-                .parse()
-                .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))?;
+            let cid = commit_id(commit)?;
+            if let Some(held) = runtime.index.erased(&cid).await? {
+                let latest = held.steps.last().map(|s| s.replacement.as_str());
+                let proved = jobs
+                    .iter()
+                    .flat_map(|j| &j.commits)
+                    .filter(|t| t.commit == *commit)
+                    .filter_map(|t| t.proved.as_ref())
+                    .filter(|p| {
+                        Some(p.replacement.as_str()) != latest && p.base.as_deref() != latest
+                    })
+                    .map(|p| p.replacement.as_str());
+                let earlier = held
+                    .steps
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .map(|s| s.replacement.as_str());
+                for replacement in earlier.chain(proved) {
+                    let address = runtime.index.artifact_address(
+                        Artifact::Replacement,
+                        &commit_id(replacement)?.address_digest(),
+                    );
+                    if runtime.index.exists_raw(&address).await? {
+                        superseded.insert(address);
+                    }
+                }
+            }
             let digest = cid.address_digest();
             let Some(bytes) = runtime.index.replacement(&digest).await else {
                 continue;
@@ -110,8 +144,100 @@ impl Fluree {
         }
         plan.originals.sort();
         plan.transactions.sort();
+        plan.commits = erased.into_iter().collect();
+        plan.superseded = superseded.into_iter().collect();
         plan.rebuild = rebuild.into_iter().collect();
         plan.release = release.into_iter().collect();
         Ok(plan)
     }
+
+    /// What a purge of `ledger`'s published erasures would delete or
+    /// rebuild, and what it finds still holding an erased value that the
+    /// plan does not account for. Deletes nothing.
+    pub async fn inspect_purge(&self, ledger: &str) -> Result<PurgeInspection> {
+        let plan = self.plan_purge(ledger).await?;
+        let captured = self.capture_erased(&plan).await?;
+        let scan = self.scan_purge(&plan, &captured).await?;
+        Ok(PurgeInspection { plan, scan })
+    }
+
+    /// The facts `plan`'s erasures removed, read from the oldest bytes of
+    /// each commit still stored: an original, or a replacement a later step
+    /// superseded. They stay in memory for one pass and are never stored.
+    pub(crate) async fn capture_erased(&self, plan: &PurgePlan) -> Result<Vec<Captured>> {
+        let runtime = self.erasure_runtime()?;
+        let mut captured = Vec::new();
+        for commit in &plan.commits {
+            let cid = commit_id(commit)?;
+            let Some(held) = runtime.index.erased(&cid).await? else {
+                continue;
+            };
+            let Some(bytes) = self.oldest_bytes(plan, &cid, &held).await? else {
+                continue;
+            };
+            let decoded = read_commit(&bytes)
+                .map_err(|e| ApiError::internal(format!("stored bytes of {commit}: {e}")))?;
+            for slot in held.redacted_slots() {
+                if let Some(flake) = decoded.at_slot(slot) {
+                    captured.push(Captured {
+                        flake: flake.clone(),
+                    });
+                }
+            }
+        }
+        Ok(captured)
+    }
+
+    /// The oldest bytes of `cid` still stored: a copy of its original, or
+    /// the earliest replacement of its chain.
+    async fn oldest_bytes(
+        &self,
+        plan: &PurgePlan,
+        cid: &ContentId,
+        held: &ErasedCommit,
+    ) -> Result<Option<Vec<u8>>> {
+        let runtime = self.erasure_runtime()?;
+        let file = format!("/commit/{}.fcv2", cid.address_digest());
+        for address in plan.originals.iter().filter(|a| a.ends_with(&file)) {
+            if let Some(bytes) = runtime.index.read_raw(address).await? {
+                if ContentId::new(ContentKind::Commit, &bytes) == *cid {
+                    return Ok(Some(bytes));
+                }
+            }
+        }
+        for step in &held.steps {
+            let hex = commit_id(&step.replacement)?.address_digest();
+            let address = runtime.index.artifact_address(Artifact::Replacement, &hex);
+            if let Some(bytes) = runtime.index.read_raw(&address).await? {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
 }
+
+/// A purge's plan, and what its scan found.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeInspection {
+    pub plan: PurgePlan,
+    pub scan: PurgeScan,
+}
+
+/// An erased occurrence, read from bytes that still hold it.
+#[derive(Clone, Debug)]
+pub(crate) struct Captured {
+    pub(crate) flake: Flake,
+}
+
+fn commit_id(commit: &str) -> Result<ContentId> {
+    commit
+        .parse()
+        .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))
+}
+
+mod scan;
+#[cfg(test)]
+mod tests;
+
+pub use scan::PurgeScan;
