@@ -247,17 +247,19 @@ async fn retries(writers: usize, commits: usize) {
     // Each `when` body changes nothing until its flag is set, so its first
     // submission is abandoned and recorded; the second, the same bytes,
     // commits once the flag is set.
-    let when = |w: usize, i: usize| {
+    // A `fresh` body has the same shape, on its own flag, and is never
+    // submitted before it commits.
+    let when = |kind: &str, w: usize, i: usize| {
         json!({
             "@context": ctx(),
-            "where": {"@id": format!("ex:flag{w}-{i}"), "ex:on": true},
-            "insert": {"@id": format!("ex:r{w}-{i}"), "ex:name": format!("r{w}-{i}")}
+            "where": {"@id": format!("ex:{kind}flag{w}-{i}"), "ex:on": true},
+            "insert": {"@id": format!("ex:{kind}{w}-{i}"), "ex:name": format!("{kind}{w}-{i}")}
         })
     };
     for (w, name) in names.iter().enumerate() {
         let id = format!("{name}:main");
         for i in 0..commits {
-            commit(&fluree, &id, &when(w, i)).await;
+            commit(&fluree, &id, &when("r", w, i)).await;
         }
     }
     // Recorded, not yet due: the looping collector below takes them on
@@ -282,12 +284,16 @@ async fn retries(writers: usize, commits: usize) {
             let id = format!("perf{w}:main");
             let (mut retried, mut fresh) = (Vec::new(), Vec::new());
             for i in 0..commits {
-                let flag = json!({"@context": ctx(), "insert": {"@id": format!("ex:flag{w}-{i}"), "ex:on": true}});
-                if let Some((a, b)) = commit(&fluree, &id, &flag).await {
-                    fresh.push(b - a);
-                }
-                if let Some((a, b)) = commit(&fluree, &id, &when(w, i)).await {
+                let flags = json!({"@context": ctx(), "insert": [
+                    {"@id": format!("ex:rflag{w}-{i}"), "ex:on": true},
+                    {"@id": format!("ex:fflag{w}-{i}"), "ex:on": true}
+                ]});
+                commit(&fluree, &id, &flags).await;
+                if let Some((a, b)) = commit(&fluree, &id, &when("r", w, i)).await {
                     retried.push(b - a);
+                }
+                if let Some((a, b)) = commit(&fluree, &id, &when("f", w, i)).await {
+                    fresh.push(b - a);
                 }
             }
             (retried, fresh)
@@ -302,7 +308,7 @@ async fn retries(writers: usize, commits: usize) {
     stop.store(true, Ordering::Relaxed);
     collector.await.unwrap();
     report("body recorded as garbage, committed", retried);
-    report("fresh body, committed", fresh);
+    report("same shape, fresh body, committed", fresh);
 }
 
 async fn large(commits: usize, strays: usize) {
