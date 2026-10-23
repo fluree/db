@@ -2184,6 +2184,10 @@ impl Fluree {
         if restored.is_err() {
             self.discard_restored(&pending).await;
         }
+        #[cfg(feature = "native")]
+        if restored.is_ok() {
+            self.sweep_after_restore(new_ledger_id.name()).await;
+        }
         restored
     }
 

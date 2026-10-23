@@ -1032,6 +1032,8 @@ impl crate::Fluree {
             e => e.into(),
         })?;
         self.resume_restored_retention(&records).await?;
+        #[cfg(feature = "native")]
+        self.sweep_after_restore(&entry.name).await;
         info!(ledger_name = %entry.name, %instance, "Dropped ledger restored");
         Ok(DroppedLedgerInfo::from(&entry))
     }

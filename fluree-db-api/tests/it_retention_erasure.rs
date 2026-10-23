@@ -1563,6 +1563,10 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
     );
     let inspection = fluree.inspect_purge(&id).await.unwrap();
     assert!(inspection.scan.clean(), "{inspection:?}");
+    for ledger in [&id, &copy] {
+        let verified = fluree.verify_ledger(ledger, None).await.unwrap();
+        assert!(verified.problems.is_empty(), "{verified:?}");
+    }
 
     drop(fluree);
     let restarted = erasing(&dir, Arc::new(NativeProver::default()));
@@ -1639,4 +1643,60 @@ async fn a_purge_waits_for_a_dropped_holder() {
             .join(address.strip_prefix("fluree:file://").unwrap());
         assert!(path.exists(), "{address}");
     }
+}
+
+/// An archive made before an erasure, restored after its purge, brings back
+/// neither the transaction documents nor the index files that held the
+/// value: their writes are dropped, and the archive's index, rebuilt over,
+/// is released and swept before the copy serves.
+#[tokio::test]
+async fn an_old_archive_restored_after_a_purge_brings_nothing_back() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-old-archive").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .insert(&json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}))
+        .commit()
+        .await
+        .unwrap();
+    reindex(&fluree, &id).await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, true, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert!(files_holding(dir.path(), "a@secret").is_empty());
+
+    let copy = fluree
+        .restore_ledger("it/purge-old-archive-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    assert_eq!(
+        objects(&fluree, &copy, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
 }

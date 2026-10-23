@@ -302,6 +302,7 @@ async fn a_publication_whose_job_update_was_lost_completes() {
             ErasedCommit {
                 commit: task.commit.clone(),
                 ledger_id: task.ledger_id.clone(),
+                txn: None,
                 steps: vec![ErasureStep {
                     request_id: job.request_id.clone(),
                     slots: proved.slots.clone(),

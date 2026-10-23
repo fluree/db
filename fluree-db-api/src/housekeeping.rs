@@ -291,6 +291,10 @@ async fn resume_restore(fluree: &Fluree, instance: &InstanceId) -> crate::Result
     match resumed {
         Ok(Some(records)) => {
             fluree.resume_restored_retention(&records).await?;
+            #[cfg(feature = "native")]
+            if let Some(record) = records.first() {
+                fluree.sweep_after_restore(record.ledger_id.name()).await;
+            }
             info!(%instance, "resumed an interrupted restore");
             Ok(())
         }

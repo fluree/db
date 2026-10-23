@@ -260,7 +260,7 @@ impl Fluree {
     /// Release every index of `branch` older than its current one, with what
     /// only they reference; dictionaries its siblings still use are left to
     /// the sweep.
-    async fn collapse_index(&self, branch: &str) -> Result<()> {
+    pub(crate) async fn collapse_index(&self, branch: &str) -> Result<()> {
         let id = LedgerId::parse(branch)?;
         let Some(record) = self.nameservice().lookup(&id).await? else {
             return Ok(());

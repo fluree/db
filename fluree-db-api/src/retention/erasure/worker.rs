@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Weak;
 use std::time::Instant;
 
+use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::tracking::Tracker;
 use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, LedgerId};
 use fluree_db_erasure::{ProveRequest, ProverError};
@@ -538,8 +539,18 @@ impl Fluree {
                     let mut erased = held.unwrap_or_else(|| ErasedCommit {
                         commit: task.commit.clone(),
                         ledger_id: task.ledger_id.clone(),
+                        txn: None,
                         steps: Vec::new(),
                     });
+                    if erased.txn.is_none() {
+                        let bytes = self
+                            .commit_bytes(&task.branches[0], &commit_id(&task.commit)?)
+                            .await?;
+                        erased.txn = read_commit_envelope(&bytes)
+                            .map_err(|e| ApiError::internal(format!("{}: {e}", task.commit)))?
+                            .txn
+                            .map(|t| t.address_digest());
+                    }
                     erased.steps.push(ErasureStep {
                         request_id: job.request_id.clone(),
                         slots: proved.slots.clone(),
@@ -640,7 +651,46 @@ impl Fluree {
                 &built.root_id,
             )
             .await?;
+        // The indexes it replaces hold the erased values: released once the
+        // ledger is visible, which releasing needs (see `sweep_after_restore`).
+        runtime
+            .rebuilt_on_restore
+            .lock()
+            .insert(record.ledger_id.to_string());
         Ok(())
+    }
+
+    /// After a restore of `name`, now visible: release the indexes its
+    /// rebuilds replaced, which hold erased values, and sweep what no chain
+    /// reaches. Nothing has read them: they were never a visible head.
+    pub(crate) async fn sweep_after_restore(&self, name: &str) {
+        let Some(runtime) = self.retention.erasure.get() else {
+            return;
+        };
+        let rebuilt: Vec<String> = {
+            let mut rebuilt = runtime.rebuilt_on_restore.lock();
+            let mine: Vec<String> = rebuilt
+                .iter()
+                .filter(|b| LedgerId::parse(b).is_ok_and(|id| id.name() == name))
+                .cloned()
+                .collect();
+            for b in &mine {
+                rebuilt.remove(b);
+            }
+            mine
+        };
+        if rebuilt.is_empty() {
+            return;
+        }
+        let released = async {
+            for branch in &rebuilt {
+                self.collapse_index(branch).await?;
+            }
+            self.sweep_index_storage(name).await
+        };
+        if let Err(e) = released.await {
+            tracing::warn!(ledger = %name, error = %e, "erasure: a restored ledger's replaced indexes were not released");
+        }
     }
 
     /// The branches that may hold `job`'s commits, as they are now: its

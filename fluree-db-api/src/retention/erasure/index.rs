@@ -60,6 +60,10 @@ pub struct ErasedCommit {
     pub commit: String,
     /// The ledger id its signatures were made for.
     pub ledger_id: String,
+    /// The digest of its transaction document, which holds what its steps
+    /// removed: nothing writes that document again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn: Option<String>,
     pub steps: Vec<ErasureStep>,
 }
 
@@ -104,6 +108,8 @@ pub(crate) struct ErasureIndex {
     read: tokio::sync::Mutex<HashSet<String>>,
     /// Some commit is erased.
     any: AtomicBool,
+    /// The digests of erased commits' transaction documents.
+    txns: parking_lot::RwLock<HashSet<String>>,
     entries: parking_lot::RwLock<HashMap<String, Arc<Entry>>>,
 }
 
@@ -127,6 +133,13 @@ fn commit_digest(address: &str) -> Option<&str> {
     (!digest.is_empty() && !digest.contains('/')).then_some(digest)
 }
 
+/// The digest of the transaction document `address` names, if it names one.
+fn txn_digest(address: &str) -> Option<&str> {
+    let (_, file) = address.rsplit_once("/txn/")?;
+    let digest = file.strip_suffix(".json")?;
+    (!digest.is_empty() && !digest.contains('/')).then_some(digest)
+}
+
 /// What `incoming` makes of the erasure held for its commit: itself when
 /// it extends (or is) the first one; `None` when it changes nothing, being
 /// a prefix of the held chain or diverging from it.
@@ -139,7 +152,10 @@ fn merged(held: Option<&ErasedCommit>, incoming: ErasedCommit) -> Option<ErasedC
         tracing::warn!(commit = %incoming.commit, "divergent erasures; keeping the first");
         return None;
     }
-    (incoming.steps.len() > current.steps.len()).then_some(incoming)
+    (incoming.steps.len() > current.steps.len()).then(|| ErasedCommit {
+        txn: incoming.txn.clone().or_else(|| current.txn.clone()),
+        ..incoming
+    })
 }
 
 fn merge(held: &mut HashMap<String, ErasedCommit>, incoming: ErasedCommit) {
@@ -156,6 +172,7 @@ impl ErasureIndex {
             listed_at: parking_lot::RwLock::new(None),
             read: tokio::sync::Mutex::new(HashSet::new()),
             any: AtomicBool::new(false),
+            txns: parking_lot::RwLock::new(HashSet::new()),
             entries: parking_lot::RwLock::new(HashMap::new()),
         }
     }
@@ -225,6 +242,9 @@ impl ErasureIndex {
             };
             let key = cid.address_digest();
             if let Some(next) = merged(entries.get(&key).map(|e| &e.erased), erased) {
+                if let Some(txn) = &next.txn {
+                    self.txns.write().insert(txn.clone());
+                }
                 entries.insert(
                     key,
                     Arc::new(Entry {
@@ -242,6 +262,15 @@ impl ErasureIndex {
     fn may_be_erased(&self, digest: &str) -> bool {
         !self.fresh()
             || (self.any.load(Ordering::Acquire) && self.entries.read().contains_key(digest))
+    }
+
+    /// Whether the transaction document at `digest` is an erased commit's.
+    async fn is_erased_txn(&self, digest: &str) -> Result<bool> {
+        if self.fresh() && !self.any.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.load().await?;
+        Ok(self.txns.read().contains(digest))
     }
 
     /// Whether the commit at `digest` is erased.
@@ -477,9 +506,16 @@ impl ErasureStorage {
             .map(|r| r.map_err(|e| fluree_db_core::Error::storage(e.to_string())))
     }
 
-    /// Whether `address` is an erased commit's, whose original may not be
-    /// written back.
+    /// Whether `address` is an erased commit's, or its transaction
+    /// document's, which may not be written back.
     async fn erased_address(&self, address: &str) -> fluree_db_core::Result<bool> {
+        if let Some(digest) = txn_digest(address) {
+            return self
+                .index
+                .is_erased_txn(digest)
+                .await
+                .map_err(|e| fluree_db_core::Error::storage(e.to_string()));
+        }
         match commit_digest(address) {
             Some(digest) if self.index.may_be_erased(digest) => self
                 .index
@@ -633,7 +669,7 @@ impl ContentAddressedWrite for ErasureStorage {
         content_hash_hex: &str,
         bytes: &[u8],
     ) -> fluree_db_core::Result<ContentWriteResult> {
-        if kind == ContentKind::Commit {
+        if matches!(kind, ContentKind::Commit | ContentKind::Txn) {
             let address = content_address(
                 self.inner.storage_method(),
                 kind,
@@ -695,6 +731,7 @@ mod tests {
             commit: ContentId::new(ContentKind::Commit, format!("commit {n}").as_bytes())
                 .to_string(),
             ledger_id: "l:main".into(),
+            txn: None,
             steps: vec![step(&format!("r{n}"))],
         }
     }
@@ -720,6 +757,7 @@ mod tests {
         let erased = |steps: Vec<ErasureStep>| ErasedCommit {
             commit: "c".into(),
             ledger_id: "l:main".into(),
+            txn: None,
             steps,
         };
         let mut held = HashMap::new();
