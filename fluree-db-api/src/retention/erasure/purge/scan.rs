@@ -36,7 +36,8 @@ pub struct PurgeScan {
     /// occurrence uses.
     pub dictionary: Vec<String>,
     /// Index files and dictionaries a dropped holder still has, soft-dropped
-    /// or retracted, which the purge releases.
+    /// or retracted, and full-text or vector index files their heads no
+    /// longer use, which the purge releases.
     #[serde(default)]
     pub unreleased: Vec<String>,
     /// Captured values a surviving occurrence uses, which may stay.
@@ -224,6 +225,7 @@ impl Fluree {
             unreleased: {
                 let mut files = self.dropped_index_files(&plan.commits).await?;
                 files.extend(self.retracted_index_files(&plan.retracted).await?);
+                files.extend(self.source_leftovers(&plan.sources).await?);
                 files
             },
             in_use: in_use.len(),

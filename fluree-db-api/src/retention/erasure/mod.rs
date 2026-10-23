@@ -78,6 +78,9 @@ pub(crate) struct ErasureRuntime {
     pub(crate) admission: tokio::sync::Mutex<()>,
     /// Held by a purge pass: one at a time.
     pub(crate) purging: tokio::sync::Mutex<()>,
+    /// Held to publish a full-text index's head: a purge's rebuild, and a
+    /// sync's check that the head it built on is still the head.
+    pub(crate) source_heads: tokio::sync::Mutex<()>,
     /// Branches a restore rebuilt over an erased commit, whose replaced
     /// indexes are released once the ledger is visible.
     pub(crate) rebuilt_on_restore: parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -92,6 +95,7 @@ impl ErasureRuntime {
             purge_in_flight: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
             purging: tokio::sync::Mutex::new(()),
+            source_heads: tokio::sync::Mutex::new(()),
             rebuilt_on_restore: Default::default(),
         }
     }

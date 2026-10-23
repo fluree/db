@@ -41,6 +41,10 @@ pub struct Bm25Manifest {
     pub graph_source_id: String,
     /// Ordered list of snapshots (ascending by `index_t`).
     pub snapshots: Vec<Bm25SnapshotEntry>,
+    /// The head this manifest was read from, if it was: a publish of it
+    /// derived from that head checks the head is still the same.
+    #[serde(skip)]
+    pub loaded_from: Option<ContentId>,
 }
 
 impl Bm25Manifest {
@@ -49,6 +53,7 @@ impl Bm25Manifest {
         Self {
             graph_source_id: graph_source_id.into(),
             snapshots: Vec::new(),
+            loaded_from: None,
         }
     }
 

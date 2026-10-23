@@ -2050,13 +2050,24 @@ async fn a_purge_releases_a_retracted_holders_index() {
     .is_empty());
 }
 
-/// A purge stops for a full-text index over the ledger, which keeps its
-/// own copy.
+/// A full-text index over a holder keeps its own copy of the terms, and a
+/// sync keeps every term it ever held: the purge rebuilds it from the
+/// ledger as it is, releases its older manifests and snapshots, and
+/// completes with no file holding the erased value's term, the index still
+/// serving the rest.
 #[tokio::test]
-async fn a_purge_waits_for_a_dependent_index() {
+async fn a_purge_rebuilds_a_full_text_index_over_a_holder() {
     use std::time::Duration;
 
-    let (_dir, fluree, id) = published("it/purge-indexed").await;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-indexed").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "confidential zephyr"}),
+    )
+    .await;
     let query = json!({
         "@context": ctx(),
         "where": [{"@id": "?x", "@type": "ex:Person", "ex:email": "?email"}],
@@ -2071,14 +2082,51 @@ async fn a_purge_waits_for_a_dependent_index() {
         ))
         .await
         .unwrap();
-    publish(&fluree, &id, &[]).await;
-    let why = fluree
-        .run_purge_pass(&id, Duration::ZERO)
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:bob", "ex:email": "ordinary note"}),
+    )
+    .await;
+    fluree
+        .sync_bm25_index("it-purge-search:main")
         .await
-        .unwrap()
-        .blocked
-        .expect("blocked");
-    assert!(why.contains("full-text"), "{why}");
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "confidential zephyr"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    fluree
+        .sync_bm25_index("it-purge-search:main")
+        .await
+        .unwrap();
+    // The sync removed alice's document, and kept its terms.
+    assert!(!files_holding(&dir.path().join("graph-sources"), "zephyr").is_empty());
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1));
+    assert_eq!(
+        files_holding(dir.path(), "zephyr"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let (index, _) = fluree
+        .load_bm25_index_with_sync("it-purge-search:main", false)
+        .await
+        .unwrap();
+    assert_eq!(index.num_docs(), 1);
+    assert!(index.term_idx("note").is_some());
+    assert!(index.term_idx("zephyr").is_none());
 }
 
 /// The retention worker purges a published erasure by itself: its

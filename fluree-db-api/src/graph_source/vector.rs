@@ -418,6 +418,49 @@ impl crate::Fluree {
     /// This operation performs incremental updates when possible,
     /// falling back to full resync if needed.
     pub async fn sync_vector_index(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
+        let mut attempts = 0;
+        loop {
+            match self.sync_vector_index_once(graph_source_id).await {
+                Err(crate::ApiError::NameService(
+                    fluree_db_nameservice::NameServiceError::Conflict(_),
+                )) if attempts < 3 => attempts += 1,
+                result => return result,
+            }
+        }
+    }
+
+    /// Publish `index_id` as `graph_source_id`'s head, unless the head it
+    /// was built on, `loaded`, is no longer the head: a purge's rebuild
+    /// moved it, and publishing would bring back what that left out.
+    async fn publish_vector_head(
+        &self,
+        graph_source_id: &str,
+        (name, branch): (&str, &str),
+        loaded: Option<&ContentId>,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        let _heads = self.source_heads_lock().await;
+        if let Some(loaded) = loaded {
+            let head = self
+                .nameservice()
+                .lookup_graph_source(graph_source_id)
+                .await?
+                .and_then(|r| r.index_id);
+            if head.as_ref() != Some(loaded) {
+                return Err(fluree_db_nameservice::NameServiceError::conflict(format!(
+                    "{graph_source_id}'s index moved during the sync"
+                ))
+                .into());
+            }
+        }
+        self.publisher()?
+            .publish_graph_source_index(name, branch, index_id, index_t)
+            .await?;
+        Ok(())
+    }
+
+    async fn sync_vector_index_once(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
         use fluree_db_core::trace_first_parent_commits_by_id;
         use fluree_db_query::bm25::{CompiledPropertyDeps, PropertyDeps};
         use fluree_db_query::vector::usearch::deserialize;
@@ -562,9 +605,14 @@ impl crate::Fluree {
             let (name, branch) = split_ledger_id(graph_source_id).map_err(|e| {
                 crate::ApiError::config(format!("Invalid graph source ID '{graph_source_id}': {e}"))
             })?;
-            self.publisher()?
-                .publish_graph_source_index(&name, &branch, &new_index_id, ledger_t)
-                .await?;
+            self.publish_vector_head(
+                graph_source_id,
+                (&name, &branch),
+                Some(&index_cid),
+                &new_index_id,
+                ledger_t,
+            )
+            .await?;
             info!(
                 graph_source_id = %graph_source_id,
                 old_watermark = old_watermark,
@@ -644,9 +692,14 @@ impl crate::Fluree {
         })?;
 
         // 11. Update graph source index record (head pointer)
-        self.publisher()?
-            .publish_graph_source_index(&name, &branch, &new_index_id, ledger_t)
-            .await?;
+        self.publish_vector_head(
+            graph_source_id,
+            (&name, &branch),
+            Some(&index_cid),
+            &new_index_id,
+            ledger_t,
+        )
+        .await?;
 
         info!(
             graph_source_id = %graph_source_id,
@@ -670,6 +723,17 @@ impl crate::Fluree {
     ///
     /// Rebuilds the entire index from scratch by re-running the indexing query.
     pub async fn resync_vector_index(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
+        self.resync_vector_index_with(graph_source_id, false).await
+    }
+
+    /// [`Self::resync_vector_index`], replacing the head even at the same
+    /// `t` when `replace`, as a purge rebuilds an index that held erased
+    /// values.
+    pub(crate) async fn resync_vector_index_with(
+        &self,
+        graph_source_id: &str,
+        replace: bool,
+    ) -> Result<VectorSyncResult> {
         use fluree_db_query::vector::usearch::deserialize;
         let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
@@ -803,10 +867,23 @@ impl crate::Fluree {
             crate::ApiError::config(format!("Invalid graph source ID '{graph_source_id}': {e}"))
         })?;
 
-        // 7. Update graph source index record (head pointer)
-        self.publisher()?
-            .publish_graph_source_index(&name, &branch, &new_index_id, ledger_t)
+        // 7. Update graph source index record (head pointer): built fresh
+        // from the ledger, so a purge's rebuild replaces one at the same `t`.
+        if replace {
+            let _heads = self.source_heads_lock().await;
+            self.publisher()?
+                .publish_graph_source_index_allow_equal(&name, &branch, &new_index_id, ledger_t)
+                .await?;
+        } else {
+            self.publish_vector_head(
+                graph_source_id,
+                (&name, &branch),
+                None,
+                &new_index_id,
+                ledger_t,
+            )
             .await?;
+        }
 
         info!(
             graph_source_id = %graph_source_id,

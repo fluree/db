@@ -42,6 +42,8 @@ pub struct PurgeReport {
     /// Soft-dropped ledgers whose indexes it released, to be rebuilt on
     /// restore.
     pub released: usize,
+    /// Full-text and vector indexes over the holders it rebuilt.
+    pub sources: usize,
     /// Waiting for readers of the older indexes to finish before releasing
     /// them.
     pub waiting: bool,
@@ -86,14 +88,11 @@ impl Fluree {
             return Ok(report);
         }
         let plan = self.plan_purge(ledger).await?;
-        let blocked = if !plan.sources.is_empty() {
-            Some(
-                "full-text, vector or geospatial indexes over the ledger keep their own \
-                 copies: drop and recreate them first",
-            )
-        } else {
-            None
-        };
+        let stuck = self.unrebuildable_sources(&plan.sources).await?;
+        let blocked = (!stuck.is_empty()).then_some(
+            "full-text or vector indexes over a dropped ledger, or of a kind this build \
+             cannot rebuild, keep their own copies: drop them first",
+        );
         let blocked = blocked.or_else(|| {
             self.blob_pins().is_none().then_some(
                 "this instance does not collect garbage: it does not hold its storage's lock",
@@ -151,6 +150,7 @@ impl Fluree {
                             Erased::Nothing => {}
                         }
                     }
+                    report.sources += self.rebuild_sources(&plan.sources).await?;
                     let ms = now_ms();
                     self.update_purge(&jobs, |p| p.rebuilt_ms = Some(ms))
                         .await?;
@@ -164,6 +164,7 @@ impl Fluree {
             for branch in &plan.rebuild {
                 self.collapse_index(branch).await?;
             }
+            report.deleted += self.release_source_leftovers(&plan.sources).await?;
             let ledgers: BTreeSet<LedgerName> = plan
                 .rebuild
                 .iter()
@@ -202,7 +203,7 @@ impl Fluree {
             }
             if !scan.unreleased.is_empty() {
                 let why = format!(
-                    "{} index files of dropped holders were not released",
+                    "{} index files the purge releases are still stored",
                     scan.unreleased.len()
                 );
                 return self.block(&jobs, report, why).await;

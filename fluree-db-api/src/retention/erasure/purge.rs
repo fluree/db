@@ -309,6 +309,7 @@ mod erase;
 pub(crate) mod release;
 mod run;
 mod scan;
+mod sources;
 #[cfg(test)]
 mod tests;
 
