@@ -396,9 +396,27 @@ pub struct MaterializeScan {
     /// that carried it has been expired away — which is the state that forced the
     /// full read to begin with.
     pub to_sequence: Option<i64>,
+    /// Whether the batches are a change feed rather than table rows. Every row
+    /// then carries [`CHANGE_TYPE_COLUMN`] and [`COMMIT_VERSION_COLUMN`], and
+    /// either asserts its values or retracts them. Only a Delta source's change
+    /// data feed sets it.
+    pub change_feed: bool,
+    /// Where a change feed window cut by the per-pass row budget stopped: the
+    /// last version whose changes the stream carried. Set while the stream is
+    /// read, so it is read only after the stream ends. Once set it, not
+    /// `to_snapshot_id`, is the window's end — a version the table had, so the
+    /// watermark advances to it and the next pass reads the changes after it.
+    pub stopped_at: Option<Arc<std::sync::OnceLock<u64>>>,
     /// Column batches, streamed. See [`Self::stream`] usage notes on the method.
     pub stream: ColumnBatchStream,
 }
+
+/// The column a change feed row names its change in: `insert` and
+/// `update_postimage` assert the row, `delete` and `update_preimage` retract it.
+pub const CHANGE_TYPE_COLUMN: &str = "_change_type";
+
+/// The column a change feed row names the source version that made it in.
+pub const COMMIT_VERSION_COLUMN: &str = "_commit_version";
 
 /// Why a materialize poll reads added files only, or re-reads the whole table.
 ///
@@ -1866,6 +1884,16 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
+        #[cfg(feature = "delta")]
+        if record.source_type == GraphSourceType::Delta {
+            let config =
+                fluree_db_delta::DeltaGsConfig::from_json(&record.config).map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to parse Delta graph source config for '{graph_source_id}': {e}"
+                    ))
+                })?;
+            return Ok((config.delete, config.order_by));
+        }
         require_iceberg_backed(&record, graph_source_id)?;
         let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
@@ -1971,10 +1999,13 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// per-pass row budget: that budget paces the tracking worker's unpinned
     /// passes, and a prefix of a pin is a state the caller did not ask for.
     ///
-    /// **Delta sources** read the selected table version whole (`to` names a
-    /// version, `None` the latest), ignoring `from_snapshot_id` and
-    /// `from_sequence`: there is no incremental Delta read yet, and a full read
-    /// is correct for any window.
+    /// **Delta sources.** `to` names a table version (`None` the latest). With a
+    /// `from_snapshot_id`, the window is the table's change data feed after that
+    /// version, flagged by [`MaterializeScan::change_feed`] and cut at a commit
+    /// boundary by the row budget unless pinned. Without one, or when the feed
+    /// cannot serve the window (not enabled, schema changed, log cleaned), the
+    /// `to` version is read whole. `from_sequence` is an Iceberg cursor and is
+    /// ignored.
     ///
     /// Returns a [`MaterializeScan`]:
     /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
@@ -1982,7 +2013,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
     ///   (nothing to materialize; only possible when the caller didn't pin).
     /// - `incremental` — whether an added-files-only scan was used (vs a full
     ///   read of the live table state).
-    /// - `to_sequence` — set only when an unpinned pass was cut short.
+    /// - `to_sequence` — set only when an unpinned Iceberg pass was cut short.
+    /// - `change_feed` / `stopped_at` — a Delta change feed window, and the
+    ///   version the row budget cut it at.
     ///
     /// An incremental scan is used when `from_snapshot_id` is set **and** the
     /// window `(from, to]` is incremental-safe — only `append`/`replace`
@@ -2026,8 +2059,20 @@ impl<'a> FlureeR2rmlProvider<'a> {
     ) -> QueryResult<MaterializeScan> {
         #[cfg(feature = "delta")]
         if let Some(delta) = self.delta_source(graph_source_id).await? {
+            let budget_rows = if to_snapshot_id.is_some() {
+                0
+            } else {
+                self.pass_row_budget()
+            };
             return delta
-                .materialize_scan(self.fluree, table_name, projection, to_snapshot_id)
+                .materialize_scan(
+                    self.fluree,
+                    table_name,
+                    projection,
+                    from_snapshot_id,
+                    to_snapshot_id,
+                    budget_rows,
+                )
                 .await;
         }
         let (storage, metadata, _loc) = self
@@ -2062,6 +2107,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 incremental: false,
                 window_age_ms: None,
                 to_sequence: None,
+                change_feed: false,
+                stopped_at: None,
                 stream: empty_batch_stream(),
             });
         };
@@ -2408,6 +2455,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
             incremental,
             window_age_ms,
             to_sequence,
+            change_feed: false,
+            stopped_at: None,
             stream,
         })
     }
