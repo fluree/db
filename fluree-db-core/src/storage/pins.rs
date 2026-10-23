@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::{FutureExt, Shared};
@@ -22,6 +23,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 
 use crate::address_path::{StorageNamespace, StorageRoot};
+use crate::clock::Instant;
 use crate::ContentId;
 
 const SHARDS: usize = 64;
@@ -56,7 +58,9 @@ impl<K: Hash + Eq + Clone> Gate<K> {
         &self.shards[hash as usize % SHARDS]
     }
 
-    async fn share(&self, key: &K) {
+    /// How long it waited out an exclusive hold, if it did.
+    async fn share(&self, key: &K) -> Option<Duration> {
+        let mut waiting_since = None;
         loop {
             let exclusive = {
                 let mut shard = self.shard(key).lock();
@@ -74,9 +78,10 @@ impl<K: Hash + Eq + Clone> Gate<K> {
             };
             match exclusive {
                 Some(ended) => {
+                    waiting_since.get_or_insert_with(Instant::now);
                     let _ = ended.await;
                 }
-                None => return,
+                None => return waiting_since.map(|since| since.elapsed()),
             }
         }
     }
@@ -114,6 +119,14 @@ pub struct BlobPins {
     blobs: Gate<ContentId>,
     roots: Gate<StorageRoot>,
     abandoned: Mutex<Vec<Abandoned>>,
+    waits: Mutex<PinWaits>,
+}
+
+/// Pins that waited for a collector's claim to end, and their waits in all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinWaits {
+    pub count: u64,
+    pub total: Duration,
 }
 
 /// A blob whose writer stored it and then failed before publishing a
@@ -137,7 +150,11 @@ impl BlobPins {
 
     /// Pin `id`, stored under `namespace`, once no claim holds it.
     pub async fn pin(self: &Arc<Self>, namespace: &StorageNamespace, id: &ContentId) -> BlobPin {
-        self.blobs.share(id).await;
+        if let Some(waited) = self.blobs.share(id).await {
+            let mut waits = self.waits.lock();
+            waits.count += 1;
+            waits.total += waited;
+        }
         BlobPin {
             pins: Arc::clone(self),
             namespace: namespace.clone(),
@@ -181,6 +198,10 @@ impl BlobPins {
     /// The blobs abandoned since the last call.
     pub fn take_abandoned(&self) -> Vec<Abandoned> {
         std::mem::take(&mut *self.abandoned.lock())
+    }
+
+    pub fn waits(&self) -> PinWaits {
+        *self.waits.lock()
     }
 }
 
@@ -343,6 +364,7 @@ mod tests {
         let pins = Arc::new(BlobPins::new());
         let first = pins.pin(&namespace(), &id(b"body")).await;
         let second = pins.pin(&namespace(), &id(b"body")).await;
+        assert_eq!(pins.waits(), PinWaits::default());
         drop(first);
         assert!(pins.try_claim(&id(b"body")).is_none());
         drop(second);
@@ -366,6 +388,9 @@ mod tests {
             .expect("woken")
             .unwrap();
         assert!(pins.try_claim(&id(b"body")).is_none());
+        let waits = pins.waits();
+        assert_eq!(waits.count, 1);
+        assert!(waits.total >= Duration::from_millis(20), "{waits:?}");
         drop(pin);
         assert!(pins.try_claim(&id(b"other")).is_some());
     }

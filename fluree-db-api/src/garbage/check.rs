@@ -9,8 +9,14 @@
 //! branches were loaded. A branch reads a blob from the first folder holding
 //! it along its own and its ancestors' folders, so it references that copy
 //! only.
+//!
+//! Collection asks about one blob at a time, with point lookups. A
+//! reconciliation asks about every listed copy in a slice of the digest
+//! space at once: each branch's txn-meta is streamed once, matched by
+//! dictionary id, and which folder a branch reads is taken from the
+//! listing.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
@@ -21,8 +27,8 @@ use fluree_db_core::commit_subject::{commit_id_of_sid, commit_sid};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
     content_address, load_commit_envelope_by_id, range_with_overlay, ContentId, ContentKind,
-    ContentStore, FlakeValue, IndexType, LedgerName, RangeMatch, RangeOptions, RangeTest, Sid,
-    StorageNamespace, TXN_META_GRAPH_ID,
+    ContentStore, FlakeValue, IndexType, LedgerName, OType, RangeMatch, RangeOptions, RangeTest,
+    Sid, StorageNamespace, TXN_META_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{BindingState, NameBinding, NsRecord};
@@ -144,7 +150,57 @@ fn folders(record: &NsRecord, records: &[NsRecord]) -> Vec<StorageNamespace> {
     folders
 }
 
+/// The commit and transaction copies listed in the branches' folders, in
+/// one slice of the digest space.
+pub(crate) struct Listed {
+    pub(crate) blobs: Vec<Blob>,
+    /// The listed copies of each id, as indexes into `blobs`.
+    copies: HashMap<ContentId, Vec<usize>>,
+}
+
+impl Listed {
+    pub(crate) fn new(blobs: Vec<Blob>) -> Self {
+        let mut copies: HashMap<ContentId, Vec<usize>> = HashMap::new();
+        for (i, blob) in blobs.iter().enumerate() {
+            copies.entry(blob.id.clone()).or_default().push(i);
+        }
+        Self { blobs, copies }
+    }
+}
+
 impl Holders {
+    /// Which of `listed` a branch references: has in its history, and reads
+    /// from that copy's folder, the first of its folders the listing shows
+    /// holding it.
+    pub(crate) async fn read(&self, listed: &Listed) -> Result<Vec<bool>> {
+        let mut read = vec![false; listed.blobs.len()];
+        for branch in &self.branches {
+            let readable: Vec<ContentId> = listed
+                .copies
+                .iter()
+                .filter(|(_, copies)| {
+                    copies
+                        .iter()
+                        .any(|&i| branch.folders.contains(&listed.blobs[i].namespace))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in branch.reached(readable).await? {
+                let copies = &listed.copies[&id];
+                let first = branch.folders.iter().find_map(|folder| {
+                    copies
+                        .iter()
+                        .copied()
+                        .find(|&i| listed.blobs[i].namespace == *folder)
+                });
+                if let Some(i) = first {
+                    read[i] = true;
+                }
+            }
+        }
+        Ok(read)
+    }
+
     /// Account for commits published since the branches were loaded, from
     /// the ledger's records as they are now. `false` when it is no longer
     /// settled, or has a branch that was not loaded.
@@ -204,7 +260,7 @@ impl Holders {
 
     /// Whether a branch whose history reaches the commit's `t` has no commit
     /// record there: its txn-meta lacks records, and decides nothing.
-    async fn lacks_records(&self, fluree: &Fluree, blob: &Blob) -> Result<bool> {
+    pub(crate) async fn lacks_records(&self, fluree: &Fluree, blob: &Blob) -> Result<bool> {
         let store = fluree.backend().content_store(&blob.namespace);
         let t = match load_commit_envelope_by_id(store.as_ref(), &blob.id).await {
             Ok(envelope) => envelope.t,
@@ -239,6 +295,40 @@ impl Branch {
         Ok(false)
     }
 
+    /// Which of `ids` this branch's history holds.
+    async fn reached(&self, ids: Vec<ContentId>) -> Result<Vec<ContentId>> {
+        let (mut reached, rest): (Vec<_>, Vec<_>) = ids
+            .into_iter()
+            .partition(|id| self.commits.contains(id) || self.txns.contains(id));
+        // Above the index.
+        let txn = Sid::new(FLUREE_DB, db::TXN);
+        let mut above: HashSet<ContentId> = HashSet::new();
+        for flake in
+            self.state
+                .novelty
+                .range_flakes(TXN_META_GRAPH_ID, IndexType::Spot, None, None, true)
+        {
+            if !flake.op || flake.t > self.state.t() {
+                continue;
+            }
+            above.extend(commit_id_of_sid(&flake.s));
+            if let (true, FlakeValue::String(value)) = (flake.p == txn, &flake.o) {
+                above.extend(value.parse::<ContentId>().ok());
+            }
+        }
+        let (found, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|id| above.contains(id));
+        reached.extend(found);
+        if let (Some(index), false) = (binary_index(&self.state), rest.is_empty()) {
+            let to_t = self.state.index_t();
+            let found = tokio::task::spawn_blocking(move || indexed(&index, to_t, rest))
+                .await
+                .map_err(|e| crate::ApiError::internal(format!("txn-meta scan: {e}")))?
+                .map_err(|e| crate::ApiError::internal(format!("txn-meta scan: {e}")))?;
+            reached.extend(found);
+        }
+        Ok(reached)
+    }
+
     /// Add the commits reached from `roots` down to the first this branch's
     /// txn-meta records, and their transactions.
     async fn walk(&mut self, roots: Vec<ContentId>) -> Result<()> {
@@ -269,11 +359,7 @@ async fn merged_parents(
     store: &Arc<dyn ContentStore>,
 ) -> Result<Vec<ContentId>> {
     let mut merged = Vec::new();
-    let index = state
-        .binary_store
-        .as_ref()
-        .and_then(|s| Arc::downcast::<BinaryIndexStore>(Arc::clone(&s.0)).ok());
-    if let Some(index) = index {
+    if let Some(index) = binary_index(state) {
         merged.extend(
             indexed_merge_parents(&index, state.index_t())
                 .map_err(|e| crate::ApiError::internal(format!("txn-meta scan: {e}")))?,
@@ -292,17 +378,26 @@ async fn merged_parents(
     Ok(merged)
 }
 
-/// The parents of every commit with more than one in `index`'s txn-meta,
-/// read row by row without decoding the rest.
-fn indexed_merge_parents(
+fn binary_index(state: &LedgerState) -> Option<Arc<BinaryIndexStore>> {
+    state
+        .binary_store
+        .as_ref()
+        .and_then(|s| Arc::downcast::<BinaryIndexStore>(Arc::clone(&s.0)).ok())
+}
+
+/// Each `(s_id, o_type, o_key)` row of predicate `p` in `index`'s txn-meta
+/// as of `to_t`, in subject order, read without decoding the rest.
+fn for_each_row(
     index: &Arc<BinaryIndexStore>,
+    p: &Sid,
     to_t: i64,
-) -> std::io::Result<Vec<ContentId>> {
-    let Some(p_id) = index.sid_to_p_id(&Sid::new(FLUREE_DB, db::PREVIOUS)) else {
-        return Ok(Vec::new());
+    mut row: impl FnMut(u64, u16, u64) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let Some(p_id) = index.sid_to_p_id(p) else {
+        return Ok(());
     };
     let Some(branch) = index.branch_for_order(TXN_META_GRAPH_ID, RunSortOrder::Psot) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let bound = |s_id: u64, o_key: u64, rest: u32, o_type: u16| RunRecordV2 {
         s_id: SubjectId(s_id),
@@ -326,6 +421,19 @@ fn indexed_merge_parents(
         ColumnProjection::all(),
     );
     cursor.set_to_t(to_t);
+    while let Some(batch) = cursor.next_batch()? {
+        for i in 0..batch.row_count {
+            row(batch.s_id.get(i), batch.o_type.get(i), batch.o_key.get(i))?;
+        }
+    }
+    Ok(())
+}
+
+/// The parents of every commit with more than one in `index`'s txn-meta.
+fn indexed_merge_parents(
+    index: &Arc<BinaryIndexStore>,
+    to_t: i64,
+) -> std::io::Result<Vec<ContentId>> {
     let mut merged = Vec::new();
     let mut subject = None;
     let mut parents: Vec<u64> = Vec::new();
@@ -339,18 +447,75 @@ fn indexed_merge_parents(
         parents.clear();
         Ok(())
     };
-    while let Some(batch) = cursor.next_batch()? {
-        for i in 0..batch.row_count {
-            let s_id = batch.s_id.get(i);
+    for_each_row(
+        index,
+        &Sid::new(FLUREE_DB, db::PREVIOUS),
+        to_t,
+        |s_id, _, parent| {
             if subject != Some(s_id) {
                 flush(&mut parents)?;
                 subject = Some(s_id);
             }
-            parents.push(batch.o_key.get(i));
-        }
-    }
+            parents.push(parent);
+            Ok(())
+        },
+    )?;
     flush(&mut parents)?;
     Ok(merged)
+}
+
+/// Which of `ids` `index`'s txn-meta records as of `to_t`: commits by
+/// their `db#t`, transactions by the `db#txn` naming them. The ids are
+/// looked up in its dictionaries once, and each predicate streamed once.
+fn indexed(
+    index: &Arc<BinaryIndexStore>,
+    to_t: i64,
+    ids: Vec<ContentId>,
+) -> std::io::Result<Vec<ContentId>> {
+    let (commits, txns): (Vec<_>, Vec<_>) = ids
+        .into_iter()
+        .partition(|id| id.content_kind() == Some(ContentKind::Commit));
+    let mut reached = Vec::new();
+    let subjects: Vec<Sid> = commits.iter().map(commit_sid).collect();
+    let parts: Vec<(u16, &str)> = subjects
+        .iter()
+        .map(|s| (s.namespace_code, s.name.as_ref()))
+        .collect();
+    let mut by_subject: HashMap<u64, ContentId> = index
+        .find_subject_ids_by_parts(&parts)?
+        .into_iter()
+        .zip(commits)
+        .filter_map(|(s_id, id)| Some((s_id?, id)))
+        .collect();
+    if !by_subject.is_empty() {
+        for_each_row(index, &Sid::new(FLUREE_DB, db::T), to_t, |s_id, _, _| {
+            reached.extend(by_subject.remove(&s_id));
+            Ok(())
+        })?;
+    }
+    let names: Vec<String> = txns.iter().map(ToString::to_string).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut by_string: HashMap<u64, ContentId> = index
+        .find_string_ids(&names)?
+        .into_iter()
+        .zip(txns)
+        .filter_map(|(str_id, id)| Some((u64::from(str_id?), id)))
+        .collect();
+    if !by_string.is_empty() {
+        let string = OType::XSD_STRING.as_u16();
+        for_each_row(
+            index,
+            &Sid::new(FLUREE_DB, db::TXN),
+            to_t,
+            |_, o_type, o_key| {
+                if o_type == string {
+                    reached.extend(by_string.remove(&o_key));
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(reached)
 }
 
 fn current(state: &LedgerState) -> RangeOptions {

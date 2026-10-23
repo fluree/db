@@ -11,8 +11,9 @@ async fn file_fluree(dir: &tempfile::TempDir) -> Fluree {
         .unwrap()
 }
 
-/// A reconciliation taken in steps resumes after the last file it checked,
-/// keeping the time it started; one that must start later starts over.
+/// A reconciliation checks one slice of the digest space per step, keeping
+/// the time it started, until every file is checked once; one that must start
+/// later starts over.
 #[tokio::test]
 async fn reconciliation_resumes_where_its_last_step_stopped() {
     let dir = tempfile::tempdir().unwrap();
@@ -40,7 +41,7 @@ async fn reconciliation_resumes_where_its_last_step_stopped() {
     let mut steps = Vec::new();
     for _ in 0..10 {
         let step = fluree
-            .reconcile_step("steps", 2, None)
+            .reconcile_step("steps", 2, None, &mut None)
             .await
             .unwrap()
             .unwrap();
@@ -50,8 +51,11 @@ async fn reconciliation_resumes_where_its_last_step_stopped() {
         }
     }
     assert!(steps.last().is_some_and(|s| s.complete), "{steps:?}");
+    // Six files in slices of about two: four slices.
+    assert_eq!(steps.len(), 4, "{steps:?}");
+    assert!(steps.iter().all(|s| s.listed == 6), "{steps:?}");
     assert_eq!(
-        steps.iter().map(|s| s.listed).sum::<usize>(),
+        steps.iter().map(|s| s.checked).sum::<usize>(),
         6,
         "{steps:?}"
     );
@@ -60,23 +64,50 @@ async fn reconciliation_resumes_where_its_last_step_stopped() {
         3,
         "{steps:?}"
     );
-    assert_eq!(steps.len(), 3, "{steps:?}");
 
     // A step that may not resume progress from before `not_before` checks
     // everything again.
     let first = fluree
-        .reconcile_step("steps", 2, None)
+        .reconcile_step("steps", 2, None, &mut None)
         .await
         .unwrap()
         .unwrap();
     assert!(!first.complete);
     let restarted = fluree
-        .reconcile_step("steps", 100, Some(i64::MAX))
+        .reconcile_step("steps", 100, Some(i64::MAX), &mut None)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(restarted.listed, 6, "{restarted:?}");
+    assert_eq!(restarted.checked, 6, "{restarted:?}");
     assert!(restarted.complete);
+
+    // Steps sharing a listing list once, and again once the branches change.
+    let mut listing = None;
+    let first = fluree
+        .reconcile_step("steps", 2, None, &mut listing)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = fluree
+        .reconcile_step("steps", 2, None, &mut listing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (first.listed, second.listed),
+        (6, 0),
+        "{first:?} {second:?}"
+    );
+    fluree
+        .create_branch("steps", "dev", None, None)
+        .await
+        .unwrap();
+    let third = fluree
+        .reconcile_step("steps", 2, None, &mut listing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.listed, 6, "{third:?}");
 }
 
 /// A blob a reconciliation recorded stays unresolved while a writer pins
@@ -138,11 +169,161 @@ async fn an_unsettled_ledger_does_not_hold_up_the_others() {
         .await
         .unwrap();
 
-    let (name, report) = fluree
-        .reconcile_next(std::time::Duration::ZERO)
+    let pass = fluree
+        .reconcile_due(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        pass.ledgers
+            .iter()
+            .any(|(name, report)| name == "b-full" && report.complete),
+        "{pass:?}"
+    );
+}
+
+/// A pass out of time leaves the ledgers due, and says how long the
+/// longest-waiting has gone unreconciled.
+#[tokio::test]
+async fn a_pass_out_of_time_leaves_its_ledgers_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    for name in ["one", "two"] {
+        fluree.create_ledger(name).await.unwrap();
+        commit_raw(&fluree, &format!("{name}:main"), name).await;
+    }
+    let none = std::time::Duration::ZERO;
+    let pass = fluree.reconcile_due(none, none).await.unwrap();
+    assert!(pass.ledgers.is_empty(), "{pass:?}");
+    assert_eq!((pass.due, pass.oldest_ms), (2, None), "{pass:?}");
+
+    let before = super::now_ms();
+    fluree.reconcile_garbage("one").await.unwrap().unwrap();
+    let pass = fluree.reconcile_due(none, none).await.unwrap();
+    assert_eq!(pass.due, 2, "{pass:?}");
+    assert!(pass.oldest_ms.is_some_and(|ms| ms >= before), "{pass:?}");
+
+    let pass = fluree
+        .reconcile_due(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pass.ledgers.len(), 1, "{pass:?}");
+    assert_eq!(pass.due, 0, "{pass:?}");
+}
+
+async fn commit_raw(fluree: &Fluree, ledger_id: &str, name: &str) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .update(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "insert": {"@id": format!("ex:{name}"), "ex:name": name}
+        }))
+        .commit()
+        .await
+        .unwrap();
+}
+
+/// Over every file listed, the slice-at-a-time check a reconciliation makes
+/// agrees with the one-blob check collection makes: indexed history and
+/// novelty, a branch reading its parent's folder, the same body stored in
+/// two folders, commits a merge copied in, and strays.
+#[tokio::test]
+async fn reconciliation_and_collection_agree_on_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("agree").await.unwrap();
+    for name in ["a", "b", "c"] {
+        commit_raw(&fluree, "agree:main", name).await;
+    }
+    fluree
+        .reindex("agree:main", crate::ReindexOptions::default())
+        .await
+        .unwrap();
+    commit_raw(&fluree, "agree:main", "d").await;
+    fluree
+        .create_branch("agree", "dev", None, None)
+        .await
+        .unwrap();
+    for name in ["e", "f"] {
+        commit_raw(&fluree, "agree:dev", name).await;
+    }
+    commit_raw(&fluree, "agree:main", "g").await;
+    // Each branch reads its own copy of the same body.
+    commit_raw(&fluree, "agree:dev", "same").await;
+    commit_raw(&fluree, "agree:main", "same").await;
+    fluree
+        .merge_branch("agree", "dev", None, crate::ConflictStrategy::default())
+        .await
+        .unwrap();
+    commit_raw(&fluree, "agree:dev", "h").await;
+
+    let main = fluree.storage_namespace("agree:main").await.unwrap();
+    let dev = fluree.storage_namespace("agree:dev").await.unwrap();
+    // The body of `a`, which dev inherited, stored again in dev's folder:
+    // dev reads that copy, main its own.
+    let a_body = serde_json::to_vec(&json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "insert": {"@id": "ex:a", "ex:name": "a"}
+    }))
+    .unwrap();
+    fluree
+        .content_store(&dev)
+        .put(ContentKind::Txn, &a_body)
+        .await
+        .unwrap();
+    // The body of `h`, only dev's, stored again in main's folder: dev reads
+    // its own copy, so nothing reads that one.
+    let h_body = serde_json::to_vec(&json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "insert": {"@id": "ex:h", "ex:name": "h"}
+    }))
+    .unwrap();
+    fluree
+        .content_store(&main)
+        .put(ContentKind::Txn, &h_body)
+        .await
+        .unwrap();
+    for (namespace, stray) in [(&main, "main"), (&dev, "dev")] {
+        fluree
+            .content_store(namespace)
+            .put(
+                ContentKind::Txn,
+                format!("{{\"stray\":\"{stray}\"}}").as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let binding = fluree
+        .publisher()
+        .unwrap()
+        .get_binding("agree")
         .await
         .unwrap()
-        .expect("a ledger reconciled");
-    assert_eq!(name, "b-full");
-    assert!(report.complete);
+        .unwrap()
+        .value;
+    let holders = fluree
+        .load_holders("agree", &binding)
+        .await
+        .unwrap()
+        .expect("settled");
+    let listed = super::check::Listed::new(fluree.list_ledger(&binding).await.unwrap().slice(1, 0));
+    let read = holders.read(&listed).await.unwrap();
+    let mut unread = Vec::new();
+    for (blob, read) in listed.blobs.iter().zip(read) {
+        let referenced = holders.references(&fluree, blob).await.unwrap();
+        assert_eq!(read, referenced, "{blob:?}");
+        if !read {
+            unread.push(blob.clone());
+        }
+    }
+    assert_eq!(unread.len(), 3, "{unread:?}");
+    assert!(listed.blobs.len() > 20, "{}", listed.blobs.len());
 }

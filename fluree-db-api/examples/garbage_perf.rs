@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fluree_db_api::{Fluree, FlureeBuilder};
-use fluree_db_core::Durability;
+use fluree_db_api::{Fluree, FlureeBuilder, GarbageReport, ReconcilePass};
+use fluree_db_core::{Durability, PinWaits};
 use fluree_db_transact::TxnOpts;
 use parking_lot::Mutex;
 use serde_json::{json, Value as JsonValue};
@@ -52,8 +52,12 @@ fn ctx() -> JsonValue {
     json!({"ex": "http://example.org/ns/", "xsd": "http://www.w3.org/2001/XMLSchema#"})
 }
 
+fn fails(i: usize) -> bool {
+    i % 10 == 9 && std::env::var_os("GARBAGE_PERF_NO_FAILURES").is_none()
+}
+
 fn body(writer: usize, i: usize) -> JsonValue {
-    if i % 10 == 9 && std::env::var_os("GARBAGE_PERF_NO_FAILURES").is_none() {
+    if fails(i) {
         // Fails while staging, after its body is stored.
         json!({
             "@context": ctx(),
@@ -67,18 +71,70 @@ fn body(writer: usize, i: usize) -> JsonValue {
     }
 }
 
-/// Transact `body` on `ledger_id`; the span it took when it committed.
-async fn commit(fluree: &Fluree, ledger_id: &str, body: &JsonValue) -> Option<(Instant, Instant)> {
+/// What a transaction must do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Expect {
+    Commits,
+    /// Succeeds without a commit: its stored body is abandoned.
+    ChangesNothing,
+    Fails,
+}
+
+fn expected(i: usize) -> Expect {
+    if fails(i) {
+        Expect::Fails
+    } else {
+        Expect::Commits
+    }
+}
+
+/// Transact `body` on `ledger_id`, whose head was at `t`, and check that it
+/// did as `expect`ed; the span it took when it committed.
+async fn commit(
+    fluree: &Fluree,
+    ledger_id: &str,
+    body: &JsonValue,
+    expect: Expect,
+    t: &mut i64,
+) -> Option<(Instant, Instant)> {
     let started = Instant::now();
-    fluree
+    let result = fluree
         .graph(ledger_id)
         .transact()
         .txn_opts(TxnOpts::default().store_raw_txn(true))
         .update(body)
         .commit()
-        .await
-        .ok()
-        .map(|_| (started, Instant::now()))
+        .await;
+    let ended = Instant::now();
+    let outcome = match &result {
+        Ok(r) if r.receipt.t == *t + 1 => Expect::Commits,
+        Ok(r) if r.receipt.t == *t => Expect::ChangesNothing,
+        Ok(r) => panic!("{ledger_id}: committed t {} after {t}: {body}", r.receipt.t),
+        Err(_) => Expect::Fails,
+    };
+    assert_eq!(outcome, expect, "{ledger_id}: {:?}: {body}", result.err());
+    if outcome == Expect::Commits {
+        *t += 1;
+        return Some((started, ended));
+    }
+    None
+}
+
+/// Pins that waited for the collector, since `before`.
+fn waits_since(fluree: &Fluree, before: PinWaits) -> String {
+    let now = fluree.pin_waits().unwrap_or_default();
+    let count = now.count - before.count;
+    let total = now.total - before.total;
+    let mean = if count == 0 {
+        Duration::ZERO
+    } else {
+        total / count as u32
+    };
+    format!(
+        "pins that waited for a claim: {count}, {:.3}ms in all, {:.3}ms mean",
+        total.as_secs_f64() * 1e3,
+        mean.as_secs_f64() * 1e3
+    )
 }
 
 fn report(label: &str, mut latencies: Vec<Duration>) {
@@ -114,9 +170,9 @@ async fn write(fluree: &Arc<Fluree>, writers: usize, commits: usize) -> Vec<(Ins
         let fluree = Arc::clone(fluree);
         tasks.push(tokio::spawn(async move {
             let id = format!("perf{w}:main");
-            let mut spans = Vec::new();
+            let (mut spans, mut t) = (Vec::new(), 0);
             for i in 0..commits {
-                if let Some(span) = commit(&fluree, &id, &body(w, i)).await {
+                if let Some(span) = commit(&fluree, &id, &body(w, i), expected(i), &mut t).await {
                     if i >= 20 {
                         spans.push(span);
                     }
@@ -132,15 +188,32 @@ async fn write(fluree: &Arc<Fluree>, writers: usize, commits: usize) -> Vec<(Ins
     spans
 }
 
-/// One collection pass: collect, then reconcile each ledger in `names`.
-async fn pass(fluree: &Fluree, names: &[String]) {
-    fluree
+/// One collection pass, as housekeeping runs it: collect, then reconcile
+/// every ledger, pausing after each step as long as it took.
+async fn pass(fluree: &Fluree) -> GarbageReport {
+    phases(fluree).await.0
+}
+
+type Span = (Instant, Instant);
+
+/// [`pass`], with the span of each phase.
+async fn phases(fluree: &Fluree) -> (GarbageReport, Span, ReconcilePass, Span) {
+    let started = Instant::now();
+    let collected = fluree
         .collect_garbage(Duration::ZERO)
         .await
         .expect("collect");
-    for name in names {
-        fluree.reconcile_garbage(name).await.expect("reconcile");
-    }
+    let collection = (started, Instant::now());
+    let reconciled = fluree
+        .reconcile_due(Duration::ZERO, Duration::from_secs(3600))
+        .await
+        .expect("reconcile");
+    (
+        collected,
+        collection,
+        reconciled,
+        (collection.1, Instant::now()),
+    )
 }
 
 fn latencies(spans: &[(Instant, Instant)]) -> Vec<Duration> {
@@ -159,14 +232,13 @@ async fn idle(writers: usize, commits: usize, rounds: usize) {
             let dir = tempfile::tempdir().unwrap();
             let fluree = instance(&dir, *locked).await;
             let stop = Arc::new(AtomicBool::new(false));
-            let names: Vec<String> = (0..writers).map(|w| format!("perf{w}")).collect();
             let collector = looping.then(|| {
-                let (fluree, stop, names) = (Arc::clone(&fluree), Arc::clone(&stop), names.clone());
+                let (fluree, stop) = (Arc::clone(&fluree), Arc::clone(&stop));
                 tokio::spawn(async move {
                     // The ledgers are created by the writers.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     while !stop.load(Ordering::Relaxed) {
-                        pass(&fluree, &names).await;
+                        pass(&fluree).await;
                     }
                 })
             });
@@ -185,14 +257,13 @@ async fn idle(writers: usize, commits: usize, rounds: usize) {
 async fn lane(name: &str, writers: usize, commits: usize, file: &str) {
     let dir = tempfile::tempdir().unwrap();
     let fluree = instance(&dir, name != "unpinned").await;
-    let names: Vec<String> = (0..writers).map(|w| format!("perf{w}")).collect();
     let stop = Arc::new(AtomicBool::new(false));
     let collector = (name == "looping").then(|| {
         let (fluree, stop) = (Arc::clone(&fluree), Arc::clone(&stop));
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             while !stop.load(Ordering::Relaxed) {
-                pass(&fluree, &names).await;
+                pass(&fluree).await;
             }
         })
     });
@@ -211,17 +282,25 @@ async fn lane(name: &str, writers: usize, commits: usize, file: &str) {
 async fn scheduled(writers: usize, commits: usize, every: Duration) {
     let dir = tempfile::tempdir().unwrap();
     let fluree = instance(&dir, true).await;
-    let names: Vec<String> = (0..writers).map(|w| format!("perf{w}")).collect();
     let stop = Arc::new(AtomicBool::new(false));
-    let passes: Arc<Mutex<Vec<(Instant, Instant)>>> = Arc::default();
+    let passes: Arc<Mutex<Vec<(Span, Span)>>> = Arc::default();
     let collector = {
         let (fluree, stop, passes) = (Arc::clone(&fluree), Arc::clone(&stop), Arc::clone(&passes));
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(every).await;
-                let started = Instant::now();
-                pass(&fluree, &names).await;
-                passes.lock().push((started, Instant::now()));
+                let (collected, collection, reconciled, reconciliation) = phases(&fluree).await;
+                let files: usize = reconciled.ledgers.iter().map(|(_, r)| r.checked).sum();
+                println!(
+                    "pass: collected {} deleted {} in {:.2}s; reconciled {} files of {} ledgers in {:.2}s",
+                    collected.recorded,
+                    collected.deleted,
+                    (collection.1 - collection.0).as_secs_f64(),
+                    files,
+                    reconciled.ledgers.len(),
+                    (reconciliation.1 - reconciliation.0).as_secs_f64(),
+                );
+                passes.lock().push((collection, reconciliation));
             }
         })
     };
@@ -229,12 +308,22 @@ async fn scheduled(writers: usize, commits: usize, every: Duration) {
     stop.store(true, Ordering::Relaxed);
     collector.await.unwrap();
     let passes = passes.lock().clone();
-    let (during, apart): (Vec<_>, Vec<_>) = spans
-        .iter()
-        .partition(|(a, b)| passes.iter().any(|(s, e)| a < e && s < b));
-    report("commits a pass overlapped", latencies(&during));
+    let overlaps = |(a, b): &Span, (s, e): &Span| a < e && s < b;
+    let mut during_c = Vec::new();
+    let mut during_r = Vec::new();
+    let mut apart = Vec::new();
+    for span in &spans {
+        if passes.iter().any(|(c, _)| overlaps(span, c)) {
+            during_c.push(*span);
+        } else if passes.iter().any(|(_, r)| overlaps(span, r)) {
+            during_r.push(*span);
+        } else {
+            apart.push(*span);
+        }
+    }
+    report("commits collection overlapped", latencies(&during_c));
+    report("commits reconciliation overlapped", latencies(&during_r));
     report("commits no pass overlapped", latencies(&apart));
-    report("passes", latencies(&passes));
 }
 
 async fn retries(writers: usize, commits: usize) {
@@ -259,7 +348,14 @@ async fn retries(writers: usize, commits: usize) {
     for (w, name) in names.iter().enumerate() {
         let id = format!("{name}:main");
         for i in 0..commits {
-            commit(&fluree, &id, &when("r", w, i)).await;
+            commit(
+                &fluree,
+                &id,
+                &when("r", w, i),
+                Expect::ChangesNothing,
+                &mut 0,
+            )
+            .await;
         }
     }
     // Recorded, not yet due: the looping collector below takes them on
@@ -268,13 +364,16 @@ async fn retries(writers: usize, commits: usize) {
         .collect_garbage(Duration::from_secs(3600))
         .await
         .expect("record");
+    let before = fluree.pin_waits().unwrap_or_default();
     let stop = Arc::new(AtomicBool::new(false));
     let collector = {
-        let (fluree, stop, names) = (Arc::clone(&fluree), Arc::clone(&stop), names.clone());
+        let (fluree, stop) = (Arc::clone(&fluree), Arc::clone(&stop));
         tokio::spawn(async move {
+            let mut deleted = 0;
             while !stop.load(Ordering::Relaxed) {
-                pass(&fluree, &names).await;
+                deleted += pass(&fluree).await.deleted;
             }
+            deleted
         })
     };
     let mut tasks = Vec::new();
@@ -282,17 +381,21 @@ async fn retries(writers: usize, commits: usize) {
         let fluree = Arc::clone(&fluree);
         tasks.push(tokio::spawn(async move {
             let id = format!("perf{w}:main");
-            let (mut retried, mut fresh) = (Vec::new(), Vec::new());
+            let (mut retried, mut fresh, mut t) = (Vec::new(), Vec::new(), 0);
             for i in 0..commits {
                 let flags = json!({"@context": ctx(), "insert": [
                     {"@id": format!("ex:rflag{w}-{i}"), "ex:on": true},
                     {"@id": format!("ex:fflag{w}-{i}"), "ex:on": true}
                 ]});
-                commit(&fluree, &id, &flags).await;
-                if let Some((a, b)) = commit(&fluree, &id, &when("r", w, i)).await {
+                commit(&fluree, &id, &flags, Expect::Commits, &mut t).await;
+                if let Some((a, b)) =
+                    commit(&fluree, &id, &when("r", w, i), Expect::Commits, &mut t).await
+                {
                     retried.push(b - a);
                 }
-                if let Some((a, b)) = commit(&fluree, &id, &when("f", w, i)).await {
+                if let Some((a, b)) =
+                    commit(&fluree, &id, &when("f", w, i), Expect::Commits, &mut t).await
+                {
                     fresh.push(b - a);
                 }
             }
@@ -306,9 +409,13 @@ async fn retries(writers: usize, commits: usize) {
         fresh.extend(f);
     }
     stop.store(true, Ordering::Relaxed);
-    collector.await.unwrap();
+    let deleted = collector.await.unwrap();
     report("body recorded as garbage, committed", retried);
     report("same shape, fresh body, committed", fresh);
+    println!(
+        "collector deleted {deleted} while the writers ran; {}",
+        waits_since(&fluree, before)
+    );
 }
 
 async fn large(commits: usize, strays: usize) {
@@ -347,10 +454,11 @@ async fn large(commits: usize, strays: usize) {
     let writer = {
         let (fluree, stop) = (Arc::clone(&fluree), Arc::clone(&stop));
         tokio::spawn(async move {
-            let mut spans = Vec::new();
-            let mut i = 0;
+            let (mut spans, mut i, mut t) = (Vec::new(), 0, 0);
             while !stop.load(Ordering::Relaxed) {
-                if let Some(span) = commit(&fluree, "small:main", &body(0, i)).await {
+                if let Some(span) =
+                    commit(&fluree, "small:main", &body(0, i), expected(i), &mut t).await
+                {
                     spans.push(span);
                 }
                 i += 1;

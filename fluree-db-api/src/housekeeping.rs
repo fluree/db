@@ -14,8 +14,8 @@
 //! not confirmed its listing for as long is rolled back the same way.
 //!
 //! With an interval set, it also runs the orphan sweep. Where the instance
-//! collects, it collects commit and transaction garbage and reconciles one
-//! ledger at a time.
+//! collects, it collects commit and transaction garbage and reconciles the
+//! ledgers due, in a task of its own, within a time budget per pass.
 
 use crate::admin::{DropMode, DropStatus};
 use crate::Fluree;
@@ -69,6 +69,9 @@ pub struct HousekeepingOptions {
     /// Reconcile each ledger at most this often:
     /// [`Fluree::reconcile_garbage`].
     pub reconcile_interval: Duration,
+    /// How long one garbage pass may spend collecting, and then
+    /// reconciling, half of the latter pausing between steps.
+    pub reconcile_budget: Duration,
 }
 
 impl Default for HousekeepingOptions {
@@ -82,6 +85,7 @@ impl Default for HousekeepingOptions {
                 60 * u64::from(fluree_db_indexer::IndexerConfig::default().gc_min_time_mins),
             ),
             reconcile_interval: Duration::from_secs(24 * 60 * 60),
+            reconcile_budget: Duration::from_secs(30),
         }
     }
 }
@@ -103,6 +107,8 @@ struct LifecycleHousekeeping {
     last_sweep: parking_lot::Mutex<Instant>,
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     last_garbage: parking_lot::Mutex<Instant>,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    collecting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -149,7 +155,8 @@ impl Housekeeping for LifecycleHousekeeping {
 
 impl LifecycleHousekeeping {
     #[cfg(feature = "native")]
-    async fn collect_if_due(&self, fluree: &Fluree) {
+    async fn collect_if_due(&self, fluree: &Arc<Fluree>) {
+        use std::sync::atomic::Ordering;
         if fluree.blob_pins().is_none() {
             return;
         }
@@ -160,16 +167,29 @@ impl LifecycleHousekeeping {
             }
             *last = Instant::now();
         }
-        match fluree.collect_garbage(self.options.garbage_grace).await {
-            Ok(report) if report == crate::garbage::GarbageReport::default() => {}
-            Ok(report) => info!(?report, "garbage collected"),
-            Err(e) => warn!(error = %e, "garbage collection failed"),
+        if self
+            .collecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
-        match fluree.reconcile_next(self.options.reconcile_interval).await {
-            Ok(Some((ledger, report))) => info!(%ledger, ?report, "garbage reconciled"),
-            Ok(None) => {}
-            Err(e) => warn!(error = %e, "garbage reconciliation failed"),
-        }
+        let (fluree, options, collecting) = (
+            Arc::clone(fluree),
+            self.options.clone(),
+            Arc::clone(&self.collecting),
+        );
+        tokio::spawn(async move {
+            // Cleared even if the pass panics.
+            struct Clear(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = Clear(collecting);
+            collect_and_reconcile(&fluree, &options).await;
+        });
     }
 
     async fn sweep_if_due(&self, fluree: &Fluree) {
@@ -193,6 +213,50 @@ impl LifecycleHousekeeping {
             ),
             Err(e) => warn!(error = %e, "orphan sweep failed"),
         }
+    }
+}
+
+#[cfg(feature = "native")]
+async fn collect_and_reconcile(fluree: &Fluree, options: &HousekeepingOptions) {
+    match fluree
+        .collect_garbage_within(options.garbage_grace, Some(options.reconcile_budget))
+        .await
+    {
+        Ok(report) if report == crate::garbage::GarbageReport::default() => {}
+        Ok(report) => info!(?report, "garbage collected"),
+        Err(e) => warn!(error = %e, "garbage collection failed"),
+    }
+    let pass = match fluree
+        .reconcile_due(options.reconcile_interval, options.reconcile_budget)
+        .await
+    {
+        Ok(pass) => pass,
+        Err(e) => {
+            warn!(error = %e, "garbage reconciliation failed");
+            return;
+        }
+    };
+    for (ledger, report) in &pass.ledgers {
+        debug!(%ledger, ?report, "garbage reconciled");
+    }
+    // Throttling only defers: say when it falls behind.
+    let behind = pass.oldest_ms.map(|ms| {
+        Duration::from_millis(
+            u64::try_from(chrono::Utc::now().timestamp_millis() - ms).unwrap_or(0),
+        )
+    });
+    match behind {
+        Some(age) if age > 2 * options.reconcile_interval => warn!(
+            due = pass.due,
+            behind_secs = age.as_secs(),
+            "garbage reconciliation is behind"
+        ),
+        _ if !pass.ledgers.is_empty() => info!(
+            ledgers = pass.ledgers.len(),
+            due = pass.due,
+            "garbage reconciled"
+        ),
+        _ => {}
     }
 }
 
@@ -413,6 +477,7 @@ impl Fluree {
             previous: parking_lot::Mutex::default(),
             last_sweep: parking_lot::Mutex::new(Instant::now()),
             last_garbage: parking_lot::Mutex::new(Instant::now()),
+            collecting: Arc::default(),
         })
     }
 

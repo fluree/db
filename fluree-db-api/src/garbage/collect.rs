@@ -1,6 +1,7 @@
 //! Deleting recorded blobs that no branch references and no writer pins.
 
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use fluree_db_core::BlobClaim;
 use fluree_db_nameservice::NameBinding;
@@ -21,11 +22,15 @@ pub struct GarbageReport {
     pub recorded: usize,
     /// Blobs deleted.
     pub deleted: usize,
+    /// Of those, by ledger.
+    pub deleted_in: BTreeMap<String, usize>,
     /// Records dropped because a branch references the blob, or it is gone.
     pub resolved: usize,
     /// Records past their grace period left for a later pass: pinned, or
     /// their ledger unsettled.
     pub deferred: usize,
+    /// Records past their grace period the pass ran out of time for.
+    pub left: usize,
 }
 
 impl Fluree {
@@ -33,6 +38,17 @@ impl Fluree {
     /// older than `grace` that no branch references and no writer pins. Does
     /// nothing where this instance does not collect.
     pub async fn collect_garbage(&self, grace: Duration) -> Result<GarbageReport> {
+        self.collect_garbage_within(grace, None).await
+    }
+
+    /// [`Self::collect_garbage`], claiming no more blobs once `budget` is
+    /// spent.
+    pub(crate) async fn collect_garbage_within(
+        &self,
+        grace: Duration,
+        budget: Option<Duration>,
+    ) -> Result<GarbageReport> {
+        let deadline = budget.and_then(|b| Instant::now().checked_add(b));
         let Some(pins) = self.blob_pins().cloned() else {
             return Ok(GarbageReport::default());
         };
@@ -48,7 +64,7 @@ impl Fluree {
         let cutoff = now_ms() - i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
         for (name, binding) in self.publisher()?.list_bindings().await? {
             if let Err(e) = self
-                .collect_ledger(&name, &binding.value, cutoff, &mut report)
+                .collect_ledger(&name, &binding.value, cutoff, deadline, &mut report)
                 .await
             {
                 tracing::warn!(ledger = %name, error = %e, "garbage collection failed");
@@ -62,6 +78,7 @@ impl Fluree {
         name: &str,
         binding: &NameBinding,
         cutoff: i64,
+        deadline: Option<Instant>,
         report: &mut GarbageReport,
     ) -> Result<()> {
         let pins = self.blob_pins().expect("collecting").clone();
@@ -89,6 +106,10 @@ impl Fluree {
         // before the claims is caught up on.
         let mut due = due.into_iter().peekable();
         while due.peek().is_some() {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                report.left += due.count();
+                return Ok(());
+            }
             let mut claimed: Vec<(Recorded, BlobClaim)> = Vec::new();
             for recorded in due.by_ref().take(CLAIM_BATCH) {
                 match pins.try_claim(&recorded.blob.id) {
@@ -111,6 +132,7 @@ impl Fluree {
                 } else {
                     storage.delete(&address).await?;
                     report.deleted += 1;
+                    *report.deleted_in.entry(name.to_string()).or_default() += 1;
                 }
                 storage.delete(&recorded.address).await?;
             }

@@ -2630,6 +2630,19 @@ impl BinaryIndexStore {
         }
     }
 
+    /// [`Self::find_string_id`] for many values, reading each reverse-tree
+    /// leaf once.
+    pub fn find_string_ids(&self, values: &[&str]) -> io::Result<Vec<Option<u32>>> {
+        match &self.dicts.string_reverse_tree {
+            Some(tree) => Ok(tree
+                .reverse_lookup_many(values.iter().map(|v| v.as_bytes()))?
+                .into_iter()
+                .map(|opt| opt.map(|id| id as u32))
+                .collect()),
+            None => Ok(vec![None; values.len()]),
+        }
+    }
+
     /// Find all string IDs whose value starts with `prefix`.
     ///
     /// Uses a range scan on the reverse string tree over the key range

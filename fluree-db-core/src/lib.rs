@@ -214,6 +214,7 @@ pub use storage::{
     ListResult,
     MemoryContentStore,
     MemoryStorage,
+    PinWaits,
     RangeSource,
     ReadHint,
     RemoteObject,

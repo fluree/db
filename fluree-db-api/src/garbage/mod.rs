@@ -14,13 +14,13 @@ mod reconcile;
 mod tests;
 
 pub use collect::GarbageReport;
-pub use reconcile::ReconcileReport;
+pub use reconcile::{ReconcilePass, ReconcileReport, ReconcileTimings};
 
 use std::sync::Arc;
 
 use fluree_db_core::{
-    content_address, BlobPins, ContentId, ContentKind, RootHold, Storage, StorageNamespace,
-    StorageRoot, CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN,
+    content_address, BlobPins, ContentId, ContentKind, PinWaits, RootHold, Storage,
+    StorageNamespace, StorageRoot, CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +132,12 @@ impl Fluree {
     /// not collect.
     pub(crate) fn blob_pins(&self) -> Option<&Arc<BlobPins>> {
         self.root.pins.as_ref()
+    }
+
+    /// The pins that waited for a collector to finish with their blob;
+    /// `None` where this instance does not collect.
+    pub fn pin_waits(&self) -> Option<PinWaits> {
+        self.blob_pins().map(|pins| pins.waits())
     }
 
     /// Keep garbage collection out of `ledger_id`'s ledger while a transfer
