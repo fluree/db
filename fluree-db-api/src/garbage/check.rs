@@ -99,7 +99,7 @@ impl Fluree {
                 commits: HashSet::new(),
                 txns: HashSet::new(),
             };
-            let merged = merged_parents(&branch.state, &branch.store).await?;
+            let merged = merged_parents(&branch.state)?;
             branch.walk(merged).await?;
             // The commits a cached state had yet to take in.
             if loaded != head {
@@ -436,11 +436,8 @@ impl Branch {
 }
 
 /// The parents of the merges in `state`'s history: streamed from its
-/// index's txn-meta, and read from the commits above the index.
-async fn merged_parents(
-    state: &LedgerState,
-    store: &Arc<dyn ContentStore>,
-) -> Result<Vec<ContentId>> {
+/// index's txn-meta, and read from its novelty's above the index.
+fn merged_parents(state: &LedgerState) -> Result<Vec<ContentId>> {
     let mut merged = Vec::new();
     if let Some(index) = binary_index(state) {
         merged.extend(
@@ -448,15 +445,22 @@ async fn merged_parents(
                 .map_err(|e| crate::ApiError::internal(format!("txn-meta scan: {e}")))?,
         );
     }
-    let mut next = state.head_commit_id.clone();
-    while let Some(id) = next {
-        let envelope = load_commit_envelope_by_id(store.as_ref(), &id).await?;
-        if envelope.t <= state.index_t() {
-            break;
+    let previous = Sid::new(FLUREE_DB, db::PREVIOUS);
+    let mut parents: HashMap<&Sid, Vec<&Sid>> = HashMap::new();
+    for flake in state
+        .novelty
+        .range_flakes(TXN_META_GRAPH_ID, IndexType::Spot, None, None, true)
+    {
+        if let (true, true, FlakeValue::Ref(parent)) = (
+            flake.op && flake.t <= state.t(),
+            flake.p == previous,
+            &flake.o,
+        ) {
+            parents.entry(&flake.s).or_default().push(parent);
         }
-        let mut parents = envelope.parents.into_iter();
-        next = parents.next();
-        merged.extend(parents);
+    }
+    for parents in parents.into_values().filter(|p| p.len() > 1) {
+        merged.extend(parents.into_iter().filter_map(commit_id_of_sid));
     }
     Ok(merged)
 }
