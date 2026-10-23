@@ -4,7 +4,7 @@
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::{BinaryIndexStore, IndexRoot};
 use fluree_db_core::o_type::{DecodeKind, OType};
-use fluree_db_core::{ContentStore as _, Flake, LedgerSnapshot, SubjectId};
+use fluree_db_core::{ContentStore as _, Flake, FlakeValue, LedgerSnapshot, SubjectId};
 use fluree_db_indexer::{erase_index_events, ErasedEvent, IndexerConfig};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_query::binary_scan::encode_stored_object;
@@ -54,11 +54,14 @@ impl Fluree {
         };
         let mut events = Vec::new();
         for c in captured.iter().filter(|c| c.flake.t <= record.index_t) {
-            if let Some(indexed) = indexed_record(&state.snapshot, index, &c.flake)? {
-                events.push(ErasedEvent {
+            match indexed_record(&state.snapshot, index, &c.flake)? {
+                Indexed::At(indexed) => events.push(ErasedEvent {
                     record: indexed,
                     assert: c.flake.op,
-                });
+                }),
+                Indexed::Absent => {}
+                // A value in an arena has no key to find it by.
+                Indexed::Unknown => return Ok(Erased::NeedsRebuild),
             }
         }
         if events.is_empty() {
@@ -113,13 +116,21 @@ fn leafwise(root: &IndexRoot, event: &RunRecordV2) -> bool {
     }
 }
 
-/// `flake` in `index`'s ids; `None` when a term of it is not in the index,
-/// which then holds no event of it.
+/// Where `flake` is in an index.
+enum Indexed {
+    At(RunRecordV2),
+    /// A term of it is not in the index, which then holds no event of it.
+    Absent,
+    /// Its value has no key outside an arena: the index may hold it.
+    Unknown,
+}
+
+/// `flake` in `index`'s ids.
 fn indexed_record(
     snapshot: &LedgerSnapshot,
     index: &BinaryIndexStore,
     flake: &Flake,
-) -> Result<Option<RunRecordV2>> {
+) -> Result<Indexed> {
     let g_id = match &flake.g {
         None => 0,
         Some(g) => match snapshot
@@ -127,31 +138,45 @@ fn indexed_record(
             .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
         {
             Some(g_id) => g_id,
-            None => return Ok(None),
+            None => return Ok(Indexed::Absent),
         },
     };
     let Some(s_id) = index
         .find_subject_id_by_parts(flake.s.namespace_code, &flake.s.name)
         .map_err(|e| ApiError::internal(format!("subject lookup: {e}")))?
     else {
-        return Ok(None);
+        return Ok(Indexed::Absent);
     };
     let Some(p_id) = index.sid_to_p_id(&flake.p) else {
-        return Ok(None);
+        return Ok(Indexed::Absent);
     };
     let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
-    // A value the dictionaries do not hold is in no leaf.
     let Ok((o_type, o_key)) =
         encode_stored_object(&flake.o, &flake.dt, lang, index, Some((g_id, p_id)))
     else {
-        return Ok(None);
+        // A dictionary value the dictionaries do not hold is in no leaf; an
+        // arena value has no key here at all.
+        return Ok(
+            if matches!(
+                flake.o,
+                FlakeValue::Vector(_)
+                    | FlakeValue::BigInt(_)
+                    | FlakeValue::Decimal(_)
+                    | FlakeValue::GeoPoint(_)
+                    | FlakeValue::TripleTerm(_)
+            ) {
+                Indexed::Unknown
+            } else {
+                Indexed::Absent
+            },
+        );
     };
     let o_i = flake
         .m
         .as_ref()
         .and_then(|m| m.i)
         .map_or(u32::MAX, |i| i as u32);
-    Ok(Some(RunRecordV2::new(
+    Ok(Indexed::At(RunRecordV2::new(
         g_id,
         SubjectId(s_id),
         p_id,

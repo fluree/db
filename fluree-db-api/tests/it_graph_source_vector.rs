@@ -1161,3 +1161,123 @@ async fn vector_suspends_when_its_ledger_is_replaced() {
         .await
         .expect("it syncs from the ledger it now indexes");
 }
+
+/// A vector index over a ledger an erasure purges is rebuilt from the
+/// ledger as it is, replacing its head at the same `t`, and its earlier
+/// snapshots are released: the erased embedding is gone from it.
+#[tokio::test]
+async fn a_purge_rebuilds_a_vector_index_over_a_holder() {
+    use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+    use fluree_db_api::retention::FactSelector;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build()
+        .unwrap();
+    fluree.create_ledger("vector/purged").await.unwrap();
+    let ledger_id = "vector/purged:main";
+    let doc = |id: &str, v: [f64; 3]| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": id, "@type": "ex:Doc",
+            "ex:embedding": {"@value": v, "@type": "@vector"}
+        })
+    };
+    for (id, v) in [("ex:doc1", [1.0, 0.0, 0.0]), ("ex:doc2", [0.0, 1.0, 0.0])] {
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .insert(&doc(id, v))
+            .commit()
+            .await
+            .unwrap();
+    }
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "purged-vectors",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 2);
+
+    fluree
+        .erase_occurrences(
+            ledger_id,
+            ErasureRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/doc1".into(),
+                    predicate: "http://example.org/embedding".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        fluree.run_erasure_pass(ledger_id).await.unwrap().published,
+        1
+    );
+    fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let roots = dir.path().join("purged-vectors/main/index/roots");
+    assert!(std::fs::read_dir(&roots).unwrap().count() >= 2);
+    let head = || async {
+        let record = fluree
+            .nameservice()
+            .lookup_graph_source(&created.graph_source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        (record.index_id, record.index_t)
+    };
+    let before = head().await;
+
+    let (mut sources, mut purged) = (0, 0);
+    for _ in 0..5 {
+        let report = fluree
+            .run_purge_pass(ledger_id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        sources += report.sources;
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!((sources, purged), (1, 1));
+    assert_eq!(std::fs::read_dir(&roots).unwrap().count(), 1);
+    let after = head().await;
+    assert_eq!(after.1, before.1, "the same t");
+    assert_ne!(after.0, before.0, "a rebuilt head");
+    let index = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(index.len(), 1);
+}

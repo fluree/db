@@ -26,11 +26,8 @@ impl Fluree {
                     .is_some_and(|r| !r.retracted),
                 None => false,
             };
-            let rebuildable = match record.source_type {
-                GraphSourceType::Bm25 => true,
-                GraphSourceType::Vector => cfg!(feature = "vector"),
-                _ => false,
-            };
+            let rebuildable = record.source_type == GraphSourceType::Bm25
+                || (record.source_type == GraphSourceType::Vector && cfg!(feature = "vector"));
             if !live || !rebuildable {
                 stuck.push(id.clone());
             }
