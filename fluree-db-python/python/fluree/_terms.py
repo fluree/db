@@ -178,8 +178,9 @@ _CONVERTERS: dict[str, Callable[[str], Any]] = {
     XSD + "double": float,
     XSD + "float": float,
     XSD + "dateTime": _datetime,
-    # A date with a timezone has no lossless `datetime.date` form, so
-    # `date.fromisoformat` rejecting one sends it to the Literal fallback.
+    # The engine returns a date with no offset (it discards one at parse), so
+    # `date.fromisoformat` takes every date it returns. One with an offset
+    # would be rejected and go to the Literal fallback.
     XSD + "date": _dt.date.fromisoformat,
     XSD + "time": _time,
     RDF + "JSON": json.loads,

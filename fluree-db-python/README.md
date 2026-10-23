@@ -132,7 +132,7 @@ frozen view that every query sees identically.
   `fluree.LangString`, both `str` subclasses. A literal with no lossless
   Python type stays a `fluree.Literal`.
 - Dates and times come back as Fluree stores them
-  ([temporal values](https://fluree.github.io/db/reference/compatibility.html)):
+  ([temporal values](https://fluree.github.io/db/reference/compatibility.html#sparql-11-query)):
   an `xsd:dateTime` is a `datetime` in UTC whatever offset it was written
   with, so `isoformat()` writes `+00:00` where the data said `Z`; an
   `xsd:date` or `xsd:time` has no offset; and fractions of a second stop at
