@@ -241,4 +241,7 @@ pub struct PurgeProgress {
     /// Why the purge cannot go on, while it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// What a completed purge could not check, and what to do about it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified: Vec<String>,
 }

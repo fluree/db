@@ -19,6 +19,11 @@ use crate::retention::state::{FactKey, Schedule};
 use crate::retention::worker::now_ms;
 use crate::{ApiError, Fluree, IndexingMode, ReindexOptions, Result};
 
+/// Another process reading this storage may still hold a purged value in
+/// memory: this one cannot see into it.
+const UNVERIFIED_MEMORY: &str = "the memory of other processes that read this storage, \
+     such as query peers: restart them";
+
 /// What a purge pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,6 +243,11 @@ impl Fluree {
                 }
             }
         }
+        // What this process decoded from the released indexes. Other
+        // processes' memory is beyond it: reported as unverified.
+        self.leaflet_cache().clear();
+        crate::ontology_imports::global_schema_bundle_cache().clear();
+        crate::ontology_imports::global_schema_bundle_flakes_cache().clear();
         let ms = now_ms();
         for (branch, job) in &jobs {
             self.update_job(branch, &job.request_id, |j| {
@@ -247,6 +257,7 @@ impl Fluree {
                 p.purged_ms = Some(ms);
                 p.deleted += deleted;
                 p.blocked = None;
+                p.unverified = vec![UNVERIFIED_MEMORY.to_string()];
             })
             .await?;
         }

@@ -1624,6 +1624,11 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
         .find(|j| j.request_id == receipt.request_id)
         .unwrap();
     assert_eq!(job.stage, ErasureStage::Purged, "{job:?}");
+    let unverified = &job.purge.as_ref().unwrap().unverified;
+    assert!(
+        unverified.iter().any(|u| u.contains("other processes")),
+        "{job:?}"
+    );
     for address in plan.originals.iter().chain(&plan.transactions) {
         let path = dir
             .path()
