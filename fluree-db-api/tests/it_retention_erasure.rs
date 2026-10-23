@@ -1194,3 +1194,191 @@ async fn an_erasure_reaches_a_copy_restored_from_an_archive() {
         "{past:?}"
     );
 }
+
+/// A copy soft-dropped before an erasure and restored after it publishes
+/// had no removal, and its index was built before the erasure: the restore
+/// rebuilds that index from the commits, which read as their replacements,
+/// before the copy serves.
+#[tokio::test]
+async fn a_copy_restored_after_publication_serves_no_erased_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-drop-origin").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-dropped-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    reindex(&fluree, &copy).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-dropped-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    assert!(objects(&restarted, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}
+
+/// A copy restored from an older archive while an erasure is proved
+/// retracts the value still current in it. That retraction holds the value
+/// too: it joins the job and is erased with it.
+#[tokio::test]
+async fn a_copy_restored_while_proving_has_its_retraction_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-late-origin").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    let copy = fluree
+        .restore_ledger("it/erase-late-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let retraction = commit_at(&fluree, &copy, t1 + 1).await;
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, &copy).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+
+    let status = fluree.retention_status(&id).await.unwrap();
+    let job = status
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(job.stage, ErasureStage::Published);
+    assert!(
+        job.added.iter().any(|o| o.commit == retraction.to_string()),
+        "{job:?}"
+    );
+    let bytes = store_of(&fluree, &copy)
+        .await
+        .get(&retraction)
+        .await
+        .unwrap();
+    assert!(is_replacement(&bytes) && !contains(&bytes, "a@secret"));
+}
+
+/// A copy that retracted the value itself, then was soft-dropped before the
+/// request, holds a retraction carrying the value that nothing indexes or
+/// removes while it is dropped: the retraction joins the job, and the copy,
+/// restored, holds the value nowhere.
+#[tokio::test]
+async fn a_dropped_copys_own_retraction_is_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-own-origin").await;
+    let t1 = insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-own-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .graph(&copy)
+        .transact()
+        .update(&json!({
+            "@context": ctx(),
+            "delete": {"@id": "ex:alice", "ex:email": "a@secret"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    let retraction = commit_at(&fluree, &copy, t1 + 1).await;
+    reindex(&fluree, &copy).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-own-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    let report = fluree.run_erasure_pass(&id).await.unwrap();
+    assert_eq!(report.published, 1, "{report:?}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert!(
+        job.added.iter().any(|o| o.commit == retraction.to_string()),
+        "{job:?}"
+    );
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    let bytes = store_of(&fluree, &copy)
+        .await
+        .get(&retraction)
+        .await
+        .unwrap();
+    assert!(is_replacement(&bytes) && !contains(&bytes, "a@secret"));
+    assert!(objects(&fluree, &copy, "ex:alice", "ex:email")
+        .await
+        .is_empty());
+}

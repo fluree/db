@@ -180,6 +180,10 @@ pub struct ErasureJob {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_ms: Option<i64>,
+    /// Occurrences joined after acceptance: retractions a holder made since,
+    /// each ending the span of one of the request's occurrences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<crate::retention::removal::OccurrenceRef>,
 }
 
 impl ErasureJob {

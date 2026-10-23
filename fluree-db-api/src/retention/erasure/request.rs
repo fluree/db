@@ -3,15 +3,17 @@
 //! job that tracks it.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use fluree_db_core::{
-    ContentId, ContentStore, HashAlgorithm, LedgerId, TxnMetaEntry, TxnMetaValue,
+    BranchedContentStore, ContentId, ContentStore, HashAlgorithm, LedgerId, TxnMetaEntry,
+    TxnMetaValue,
 };
 use fluree_vocab::{db, namespaces::FLUREE_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use fluree_db_nameservice::NsRecord;
+use fluree_db_nameservice::{DroppedState, NsRecord};
 
 use super::{CommitErasure, ErasureJob, ErasureStage, SignatureMode};
 use crate::retention::registry;
@@ -200,6 +202,7 @@ impl Fluree {
             retry_at_ms: None,
             last_error: None,
             published_ms: None,
+            added: Vec::new(),
         };
         let recorded = job.clone();
         registry::update(ns, ledger_id.as_str(), |current| {
@@ -302,6 +305,67 @@ impl Fluree {
         Ok(copies)
     }
 
+    /// The branches of soft-dropped ledgers, one of whose branches holds the
+    /// original of one of `commits` in its own folder, each with its store.
+    pub(crate) async fn dropped_holders(
+        &self,
+        commits: &[&str],
+    ) -> Result<Vec<(NsRecord, Arc<dyn ContentStore>)>> {
+        let runtime = self.erasure_runtime()?;
+        let mut cids: Vec<ContentId> = commits.iter().filter_map(|c| c.parse().ok()).collect();
+        cids.sort();
+        cids.dedup();
+        let mut holders = Vec::new();
+        for entry in self.publisher()?.list_dropped().await? {
+            let entry = entry.value;
+            if matches!(entry.state, DroppedState::Purging) {
+                continue;
+            }
+            // An entry keeps its folder beside its records, not in them.
+            let branches: Vec<NsRecord> = entry
+                .branches
+                .iter()
+                .map(|r| NsRecord {
+                    storage_root: Some(entry.root.clone()),
+                    ..r.clone()
+                })
+                .collect();
+            'entry: for record in &branches {
+                for cid in &cids {
+                    if runtime
+                        .index
+                        .holds_original(&record.storage_namespace(), cid)
+                        .await?
+                    {
+                        for branch in branches.iter().filter(|r| !r.retracted) {
+                            let store: Arc<dyn ContentStore> =
+                                Arc::new(self.store_among(&branches, branch));
+                            holders.push((branch.clone(), store));
+                        }
+                        break 'entry;
+                    }
+                }
+            }
+        }
+        Ok(holders)
+    }
+
+    /// `record`'s store, with its ancestors found among `records`: the
+    /// branches of a dropped ledger, which lookups do not see.
+    fn store_among(&self, records: &[NsRecord], record: &NsRecord) -> BranchedContentStore {
+        let own = self.backend.content_store(&record.storage_namespace());
+        let parent = record
+            .source_branch
+            .as_deref()
+            .and_then(|source| records.iter().find(|r| r.branch == source));
+        match parent {
+            Some(parent) => {
+                BranchedContentStore::with_parents(own, vec![self.store_among(records, parent)])
+            }
+            None => BranchedContentStore::leaf(own),
+        }
+    }
+
     pub(crate) fn erasure_runtime(&self) -> Result<&std::sync::Arc<super::ErasureRuntime>> {
         self.retention
             .erasure
@@ -311,7 +375,7 @@ impl Fluree {
 
     /// Each affected commit, checked for what the transform supports, with
     /// the ledger id its signatures verify for.
-    async fn commits_to_erase(
+    pub(super) async fn commits_to_erase(
         &self,
         ledger_id: &LedgerId,
         found: &Found,
@@ -361,14 +425,20 @@ impl Fluree {
 
     /// A commit's bytes as stored: its original, or its replacement.
     pub(crate) async fn commit_bytes(&self, branch: &str, cid: &ContentId) -> Result<Vec<u8>> {
-        let record = self
-            .nameservice()
-            .lookup(branch)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(branch.to_string()))?;
-        let store = self
-            .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
-            .await?;
+        let store = match self.nameservice().lookup(branch).await? {
+            Some(record) => {
+                self.content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                    .await?
+            }
+            // A soft-dropped holder's branch.
+            None => self
+                .dropped_holders(&[cid.to_string().as_str()])
+                .await?
+                .into_iter()
+                .find(|(record, _)| record.ledger_id.as_str() == branch)
+                .map(|(_, store)| store)
+                .ok_or_else(|| ApiError::NotFound(branch.to_string()))?,
+        };
         Ok(store.get(cid).await?.into_vec())
     }
 
@@ -450,7 +520,7 @@ fn unsupported_commit(commit: &str, why: &str) -> ApiError {
 /// as the prover will, verifying signatures whichever mode proves them.
 /// Its error is why the commit cannot be erased.
 /// (commit, slot) -> (t, the branches holding it)
-type Found = BTreeMap<(String, u32), (i64, Vec<String>)>;
+pub(super) type Found = BTreeMap<(String, u32), (i64, Vec<String>)>;
 
 fn signing_ledger(
     bytes: &[u8],
@@ -536,6 +606,7 @@ mod tests {
             retry_at_ms: None,
             last_error: None,
             published_ms: None,
+            added: Vec::new(),
         }
     }
 

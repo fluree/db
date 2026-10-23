@@ -173,7 +173,8 @@ impl Fluree {
     }
 
     /// Ready a restored ledger, not yet visible, to serve: merge its
-    /// lineage's checkpoint into the archive's retention, then retract every
+    /// lineage's checkpoint into the archive's retention, rebuild an index
+    /// that covers an erased commit, then retract every
     /// journaled occurrence it holds as current state — an archive made
     /// before a removal holds the removed value, which history suppression
     /// does not cover — journal each retraction in its history that ends a
@@ -190,15 +191,18 @@ impl Fluree {
             None => None,
         };
         let lineage = lineage.map(ToString::to_string);
-        let Some(registration) = registry::restore(
+        let restored = registry::restore(
             self.publisher()?,
             record,
             archived,
             lineage.as_deref(),
             checkpoint,
         )
-        .await?
-        else {
+        .await?;
+        #[cfg(feature = "native")]
+        self.rebuild_erased_index(&self.restored_record(record).await?)
+            .await?;
+        let Some(registration) = restored else {
             return Ok(None);
         };
         let ns = self.publisher()?;
@@ -339,35 +343,69 @@ async fn removed_spans<'a>(
         .map(|r| ((r.commit.as_str(), r.slot), r))
         .collect();
     let from = removals.iter().map(|r| r.from_t).min().unwrap_or(0);
-    let mut cids = collect_first_parent_cids(store, head, from - 1).await?;
+    let (ends, open) = span_ends(store, head, from, &journaled).await?;
+    let ended = ends
+        .into_iter()
+        .map(|end| Removal {
+            request_id: end.by.request_id.clone(),
+            commit: end.commit.to_string(),
+            slot: end.slot,
+            predicate: end.by.predicate.clone(),
+            from_t: end.from_t,
+            until_t: Some(end.t),
+            scope_t: end.t - 1,
+        })
+        .collect();
+    Ok((ended, open))
+}
+
+/// A retraction in a history that ends the span of a named assertion.
+pub(crate) struct SpanEnd<'a, T> {
+    pub(crate) commit: ContentId,
+    pub(crate) slot: u32,
+    pub(crate) t: i64,
+    /// When the assertion was made.
+    pub(crate) from_t: i64,
+    /// What named the assertion.
+    pub(crate) by: &'a T,
+}
+
+/// Walk `head`'s history from `from_t`: the retractions not in `named` that
+/// end the span of an assertion in it, and its assertions still open at
+/// `head`.
+pub(crate) async fn span_ends<'a, T>(
+    store: &dyn ContentStore,
+    head: &ContentId,
+    from_t: i64,
+    named: &HashMap<(&str, u32), &'a T>,
+) -> Result<(Vec<SpanEnd<'a, T>>, Vec<(Flake, &'a T)>)> {
+    let mut cids = collect_first_parent_cids(store, head, from_t - 1).await?;
     cids.reverse();
-    let mut open: HashMap<FactKey, (Flake, &Removal)> = HashMap::new();
-    let mut ended = Vec::new();
+    let mut open: HashMap<FactKey, (Flake, &'a T)> = HashMap::new();
+    let mut ends = Vec::new();
     for (t, cid) in cids {
         let commit = load_commit_by_id(store, &cid).await?;
         let id = cid.to_string();
         for (slot, flake) in commit.occurrences() {
-            let removed = journaled.get(&(id.as_str(), slot));
+            let name = named.get(&(id.as_str(), slot));
             if flake.op {
-                if let Some(removal) = removed {
-                    open.insert(FactKey::of(flake), (flake.clone(), *removal));
+                if let Some(by) = name {
+                    open.insert(FactKey::of(flake), (flake.clone(), *by));
                 }
-            } else if let Some((asserted, removal)) = open.remove(&FactKey::of(flake)) {
-                if removed.is_none() {
-                    ended.push(Removal {
-                        request_id: removal.request_id.clone(),
-                        commit: id.clone(),
+            } else if let Some((asserted, by)) = open.remove(&FactKey::of(flake)) {
+                if name.is_none() {
+                    ends.push(SpanEnd {
+                        commit: cid.clone(),
                         slot,
-                        predicate: removal.predicate.clone(),
+                        t,
                         from_t: asserted.t,
-                        until_t: Some(t),
-                        scope_t: t - 1,
+                        by,
                     });
                 }
             }
         }
     }
-    Ok((ended, open.into_values().collect()))
+    Ok((ends, open.into_values().collect()))
 }
 
 /// Write `journal` as a checkpoint object under `prefix`, named by the hash

@@ -250,6 +250,12 @@ impl ErasureIndex {
         Ok(self.entries.read().contains_key(digest))
     }
 
+    /// Whether any commit is erased.
+    pub(crate) async fn any_erased(&self) -> Result<bool> {
+        self.load().await?;
+        Ok(self.any.load(Ordering::Acquire))
+    }
+
     /// Whether `namespace` holds `original`'s own file, whatever its erasure.
     pub(crate) async fn holds_original(
         &self,

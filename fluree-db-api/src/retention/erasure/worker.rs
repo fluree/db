@@ -2,19 +2,23 @@
 //! verified and stored as it lands; publishing once a job's commits are
 //! proved and indexed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Weak;
 use std::time::Instant;
 
+use fluree_db_core::tracking::Tracker;
 use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, LedgerId};
 use fluree_db_erasure::{ProveRequest, ProverError};
+use fluree_db_nameservice::NsRecord;
 use futures::FutureExt;
 
 use super::index::{Artifact, ErasedCommit, ErasureStep, REFRESH};
 use super::{CommitErasure, ErasureJob, ErasureStage, ProvedStep};
+use crate::retention::lineage::span_ends;
 use crate::retention::registry;
+use crate::retention::removal::OccurrenceRef;
 use crate::retention::worker::now_ms;
 use crate::{ApiError, Fluree, IndexingMode, Result};
 
@@ -70,6 +74,32 @@ fn need(task: &CommitErasure, held: Option<&ErasedCommit>) -> Need {
         Some(p) if p.base.as_ref() == base && p.slots == slots => Need::Publish,
         _ => Need::Prove(slots),
     }
+}
+
+/// Join `added` to `job`, to be proved before it publishes.
+fn add_commits(job: &mut ErasureJob, added: &[CommitErasure]) {
+    for new in added {
+        for slot in &new.slots {
+            job.added.push(OccurrenceRef {
+                commit: new.commit.clone(),
+                slot: *slot,
+            });
+        }
+        match job.commits.iter_mut().find(|c| c.commit == new.commit) {
+            Some(task) => {
+                task.slots.extend(&new.slots);
+                task.slots.sort_unstable();
+                task.slots.dedup();
+                for b in &new.branches {
+                    if !task.branches.contains(b) {
+                        task.branches.push(b.clone());
+                    }
+                }
+            }
+            None => job.commits.push(new.clone()),
+        }
+    }
+    job.stage = ErasureStage::Proving;
 }
 
 /// How a proving step ended.
@@ -249,6 +279,8 @@ impl Fluree {
                         report.published += 1;
                         progressed = true;
                     }
+                    // Joined by occurrences, or a step to prove again.
+                    ErasureStage::Proving => progressed = true,
                     _ => report.waiting_for_index += 1,
                 }
             }
@@ -460,11 +492,12 @@ impl Fluree {
         let runtime = self.erasure_runtime()?;
         // No branch is made between the check and the publication.
         let admission = runtime.admission.lock().await;
-        let Some(lagging) = self.lagging_branches(branch, job).await? else {
+        let Some(holders) = self.holders(branch, job).await? else {
             // Dropped: its branches, and what their indexes hold, can be
             // restored, so the gate waits until they are.
             return Ok(());
         };
+        let lagging = self.lagging_branches(&holders, job).await?;
         if !lagging.is_empty() {
             drop(admission);
             match &self.indexing_mode {
@@ -485,6 +518,13 @@ impl Fluree {
                 }
             }
             return Ok(());
+        }
+        let added = self.unclaimed_span_ends(branch, &holders, job).await?;
+        if !added.is_empty() {
+            drop(admission);
+            return self
+                .update_job(branch, &job.request_id, |j| add_commits(j, &added))
+                .await;
         }
         let mut published = Vec::with_capacity(job.commits.len());
         let mut stale = Vec::new();
@@ -547,16 +587,67 @@ impl Fluree {
         .await
     }
 
-    /// Branches, as they are now, whose history holds one of `job`'s
-    /// commits above their index, with the `t` each must index to: the
-    /// ledger's branches and its copies'. A branch made after the request
-    /// holds them too. `None` when `branch`'s ledger is dropped, which hides
-    /// its branches.
-    async fn lagging_branches(
-        &self,
-        branch: &str,
-        job: &ErasureJob,
-    ) -> Result<Option<Vec<(String, i64)>>> {
+    /// Rebuild the index of `record`, a restored branch not yet visible,
+    /// when it covers an erased commit: built before the erasure, it holds
+    /// the erased values. A rebuild reads the commits as their replacements.
+    pub(crate) async fn rebuild_erased_index(&self, record: &NsRecord) -> Result<()> {
+        let Some(runtime) = self.retention.erasure.get() else {
+            return Ok(());
+        };
+        let Some(head) = record
+            .commit_head_id
+            .as_ref()
+            .filter(|_| record.index_head_id.is_some())
+        else {
+            return Ok(());
+        };
+        if !runtime.index.any_erased().await? {
+            return Ok(());
+        }
+        let store = self
+            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
+            .await?;
+        let mut covers_erased = false;
+        for (t, cid) in collect_first_parent_cids(store.as_ref(), head, 0).await? {
+            if t <= record.index_t && runtime.index.erased(&cid).await?.is_some() {
+                covers_erased = true;
+                break;
+            }
+        }
+        if !covers_erased {
+            return Ok(());
+        }
+        let state = self
+            .load_queryable_state_with_store(store.clone(), record.clone())
+            .await
+            .ok();
+        let config = self
+            .rebuild_config(&record.ledger_id, state.as_ref(), Default::default())
+            .await?;
+        let built = fluree_db_indexer::rebuild_index_from_commits_with_tracker(
+            store,
+            Tracker::disabled(),
+            record.ledger_id.as_str(),
+            record,
+            config,
+        )
+        .await?;
+        self.publisher()?
+            .publish_index_allow_equal_fenced(
+                record.ledger_id.as_str(),
+                record.fence,
+                built.index_t,
+                &built.root_id,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The branches that may hold `job`'s commits, as they are now: its
+    /// ledger's, including any made after the request, and those of copies
+    /// holding an original. `None` when `branch`'s ledger is dropped, which
+    /// hides its branches.
+    async fn holders(&self, branch: &str, job: &ErasureJob) -> Result<Option<Vec<NsRecord>>> {
         let name = LedgerId::parse(branch)?;
         let mut records: Vec<_> = self
             .nameservice()
@@ -570,8 +661,18 @@ impl Fluree {
         }
         let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
         records.extend(self.copies_holding(&name, &commits).await?);
+        Ok(Some(records))
+    }
+
+    /// The `holders` whose history holds one of `job`'s commits above their
+    /// index, with the `t` each must index to.
+    async fn lagging_branches(
+        &self,
+        holders: &[NsRecord],
+        job: &ErasureJob,
+    ) -> Result<Vec<(String, i64)>> {
         let mut lagging = Vec::new();
-        for record in records {
+        for record in holders {
             let above: Vec<&CommitErasure> = job
                 .commits
                 .iter()
@@ -585,7 +686,7 @@ impl Fluree {
             };
             // Bounded by the branch's unindexed commits.
             let store = self
-                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                .content_store_for_record_or_id(Some(record), &record.storage_namespace())
                 .await?;
             let held: HashSet<String> = collect_first_parent_cids(store.as_ref(), head, lowest - 1)
                 .await?
@@ -601,7 +702,66 @@ impl Fluree {
                 lagging.push((record.ledger_id.to_string(), t));
             }
         }
-        Ok(Some(lagging))
+        Ok(lagging)
+    }
+
+    /// Retractions in the histories of `holders` and of dropped holders that
+    /// end the span of one of `job`'s assertions but are not in it, as
+    /// commits to erase. A copy restored from an older archive since
+    /// acceptance makes one, retracting the value still current in it; a
+    /// copy dropped before acceptance can hold its own.
+    async fn unclaimed_span_ends(
+        &self,
+        branch: &str,
+        holders: &[NsRecord],
+        job: &ErasureJob,
+    ) -> Result<Vec<CommitErasure>> {
+        let named: HashMap<(&str, u32), &CommitErasure> = job
+            .commits
+            .iter()
+            .flat_map(|task| {
+                task.slots
+                    .iter()
+                    .map(move |s| ((task.commit.as_str(), *s), task))
+            })
+            .collect();
+        let from = job.commits.iter().map(|c| c.t).min().unwrap_or(0);
+        let mut stores = Vec::with_capacity(holders.len());
+        for holder in holders {
+            let store = self
+                .content_store_for_record_or_id(Some(holder), &holder.storage_namespace())
+                .await?;
+            stores.push((holder.clone(), store));
+        }
+        // Nothing indexes a dropped holder, but its commits can hold the
+        // value too.
+        let commits: Vec<&str> = job.commits.iter().map(|c| c.commit.as_str()).collect();
+        stores.extend(self.dropped_holders(&commits).await?);
+        let mut found = super::request::Found::new();
+        for (holder, store) in &stores {
+            let Some(head) = holder.commit_head_id.as_ref() else {
+                continue;
+            };
+            let (ends, _) = span_ends(store.as_ref(), head, from, &named).await?;
+            for end in ends {
+                let entry = found
+                    .entry((end.commit.to_string(), end.slot))
+                    .or_insert((end.t, Vec::new()));
+                let id = holder.ledger_id.to_string();
+                if !entry.1.contains(&id) {
+                    entry.1.push(id);
+                }
+            }
+        }
+        if found.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates: Vec<String> = stores
+            .iter()
+            .map(|(r, _)| r.ledger_id.to_string())
+            .collect();
+        self.commits_to_erase(&LedgerId::parse(branch)?, &found, &candidates)
+            .await
     }
 
     async fn job(&self, branch: &str, request_id: &str) -> Result<ErasureJob> {

@@ -2646,6 +2646,54 @@ impl crate::Fluree {
 // =============================================================================
 
 impl crate::Fluree {
+    /// `config` for a full rebuild of `ledger_id` from its commits: with the
+    /// full-text properties its ledger config names, read from `state`, and
+    /// the history retention suppresses, which a rebuild would otherwise
+    /// bring back.
+    pub(crate) async fn rebuild_config(
+        &self,
+        ledger_id: &LedgerId,
+        state: Option<&crate::LedgerState>,
+        mut config: fluree_db_indexer::IndexerConfig,
+    ) -> Result<fluree_db_indexer::IndexerConfig> {
+        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
+        // configured plain-string values into BM25 arena building. Best-effort: if the existing
+        // index can't be loaded (e.g. first-ever reindex of a commits-only
+        // ledger) we fall back to empty — only the `@fulltext` datatype path
+        // will contribute entries, which matches pre-config behavior.
+        if let Some(state) = state {
+            // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
+            // first-ever reindex (no prior index, all config in novelty)
+            // the config query isn't filtered out by
+            // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
+            let to_t = state.t();
+            let snapshot = &state.snapshot;
+            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+            match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
+                Ok(Some(cfg)) => {
+                    config.fulltext_configured_properties =
+                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
+                }
+                Ok(None) => {
+                    // No LedgerConfig — nothing to seed.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
+                    );
+                }
+            }
+        }
+
+        // A rebuild re-derives history from the commit log: it must leave out
+        // what retention suppresses, or reindexing would bring it back.
+        config.history_suppression = self
+            .suppressed_history_for_index(ledger_id.as_str())
+            .await?;
+        Ok(config)
+    }
+
     /// Full offline reindex from commit history
     ///
     /// Rebuilds the binary index by replaying all commits. This operation:
@@ -2708,7 +2756,7 @@ impl crate::Fluree {
             .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
 
         // 3. Build binary index from commit chain
-        let mut indexer_config = opts.indexer_config.clone().unwrap_or_default();
+        let indexer_config = opts.indexer_config.clone().unwrap_or_default();
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
 
@@ -2723,41 +2771,8 @@ impl crate::Fluree {
             }
         };
 
-        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
-        // configured plain-string values into BM25 arena building. Reuses the
-        // `ledger_state` we already loaded above. Best-effort: if the existing
-        // index can't be loaded (e.g. first-ever reindex of a commits-only
-        // ledger) we fall back to empty — only the `@fulltext` datatype path
-        // will contribute entries, which matches pre-config behavior.
-        if let Some(state) = ledger_state.as_ref() {
-            // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
-            // first-ever reindex (no prior index, all config in novelty)
-            // the config query isn't filtered out by
-            // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
-            let to_t = state.t();
-            let snapshot = &state.snapshot;
-            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-            match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
-                Ok(Some(cfg)) => {
-                    indexer_config.fulltext_configured_properties =
-                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
-                }
-                Ok(None) => {
-                    // No LedgerConfig — nothing to seed.
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
-                    );
-                }
-            }
-        }
-
-        // A rebuild re-derives history from the commit log: it must leave out
-        // what retention suppresses, or reindexing would bring it back.
-        indexer_config.history_suppression = self
-            .suppressed_history_for_index(ledger_id.as_str())
+        let indexer_config = self
+            .rebuild_config(&ledger_id, ledger_state.as_ref(), indexer_config)
             .await?;
 
         // Reindex is a user-triggered API call; create a fuel-enabled,
