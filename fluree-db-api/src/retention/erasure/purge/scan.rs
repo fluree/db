@@ -1,6 +1,7 @@
-//! Where the captured facts still are in the storage a purge inspects: the
-//! folders of every holding branch, live or dropped, and the indexes of the
-//! live ones.
+//! Where the captured facts still are in what a purge inspects: the commits
+//! and TTL schedules in the folders of every holding branch, live or
+//! dropped, the indexes of the live ones, and the files nothing references
+//! that are recorded as garbage under the live ones' ledgers.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -22,9 +23,10 @@ use crate::{ApiError, Fluree, Result};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PurgeScan {
-    /// Files in a holder's folder that no holder's history reaches, holding
-    /// a captured value: commits a rebase left, transaction documents of
-    /// transactions that failed.
+    /// Files under a live holder's ledger that nothing references, recorded
+    /// as garbage by its last reconciliation or before, and not yet
+    /// collected: commits a rebase or a lost race left, transaction
+    /// documents of transactions that failed.
     pub unreferenced: Vec<String>,
     /// TTL schedules that still hold an erased fact.
     pub schedules: Vec<String>,
@@ -76,36 +78,27 @@ impl Fluree {
             .collect();
         let reachable = reachable_commits(&holders).await?;
 
-        // The files in the holders' folders, past the substitution.
+        // The holders' commits and schedules, past the substitution.
         let prefix = runtime.index.address_prefix();
-        let folders: Vec<String> = holders
-            .iter()
-            .map(|(r, _, _)| format!("{prefix}{}/", r.storage_namespace().branch_prefix()))
-            .collect();
-        let planned: HashSet<&str> = plan.transactions.iter().map(String::as_str).collect();
-        let lexical: Vec<String> = captured
-            .iter()
-            .filter_map(|c| lexical(&c.flake.o))
-            .collect();
+        let storage = self
+            .admin_storage()
+            .ok_or_else(|| ApiError::internal("a purge needs managed storage"))?;
         let mut in_use: Vec<&FlakeValue> = Vec::new();
         let mut facts_in_use: Vec<FactKey> = Vec::new();
-        let mut unreferenced = BTreeSet::new();
         let mut scheduled: Vec<(String, &Captured)> = Vec::new();
-        for address in runtime.index.list_all().await? {
-            let Some(file) = folders
-                .iter()
-                .find_map(|f| address.strip_prefix(f.as_str()))
-            else {
-                continue;
-            };
-            if let Some(digest) = file
-                .strip_prefix("commit/")
-                .and_then(|f| f.strip_suffix(".fcv2"))
-            {
-                if erased.contains(digest) {
+        for (record, _, _) in &holders {
+            let folder = format!("{prefix}{}/", record.storage_namespace().branch_prefix());
+            for address in storage.list_prefix(&format!("{folder}commit/")).await? {
+                let Some(digest) = address
+                    .strip_prefix(&format!("{folder}commit/"))
+                    .and_then(|f| f.strip_suffix(".fcv2"))
+                else {
+                    continue;
+                };
+                // What no history reaches is the garbage collector's.
+                if erased.contains(digest) || !reachable.contains(digest) {
                     continue;
                 }
-                let reached = reachable.commits.contains(digest);
                 let Some(bytes) = runtime.index.read_raw(&address).await? else {
                     continue;
                 };
@@ -115,10 +108,6 @@ impl Fluree {
                     let Some(c) = captured.iter().find(|c| c.flake.o == flake.o) else {
                         continue;
                     };
-                    if !reached {
-                        unreferenced.insert(address.clone());
-                        continue;
-                    }
                     if !in_use.contains(&&c.flake.o) {
                         in_use.push(&c.flake.o);
                     }
@@ -129,21 +118,11 @@ impl Fluree {
                         facts_in_use.push(key);
                     }
                 }
-            } else if let Some(digest) = file
-                .strip_prefix("txn/")
-                .and_then(|f| f.strip_suffix(".json"))
-            {
-                // A reachable commit's document holds what the commit does.
-                if planned.contains(address.as_str()) || reachable.transactions.contains(digest) {
+            }
+            for address in storage.list_prefix(&format!("{folder}retention/")).await? {
+                if !address.ends_with(".frs") {
                     continue;
                 }
-                let Some(bytes) = runtime.index.read_raw(&address).await? else {
-                    continue;
-                };
-                if document_holds(&bytes, &lexical) {
-                    unreferenced.insert(address.clone());
-                }
-            } else if file.starts_with("retention/") && file.ends_with(".frs") {
                 let Some(bytes) = runtime.index.read_raw(&address).await? else {
                     continue;
                 };
@@ -155,6 +134,15 @@ impl Fluree {
                     }
                 }
             }
+        }
+        let mut unreferenced = BTreeSet::new();
+        let roots: BTreeSet<_> = holders
+            .iter()
+            .filter(|(_, _, live)| *live)
+            .map(|(r, _, _)| r.storage_namespace().root().clone())
+            .collect();
+        for root in &roots {
+            unreferenced.extend(self.unresolved_garbage(root).await?);
         }
         // A schedule may hold a fact a surviving occurrence asserts again.
         let schedules: BTreeSet<String> = scheduled
@@ -233,94 +221,21 @@ impl Fluree {
     }
 }
 
-/// What the holders' histories reach.
-#[derive(Default)]
-struct Reachable {
-    /// Commit digests, through every parent of a merge.
-    commits: HashSet<String>,
-    /// The digests of the transaction documents those commits name.
-    transactions: HashSet<String>,
-}
-
+/// The digests of the commits the holders' histories reach, through every
+/// parent of a merge.
 async fn reachable_commits(
     holders: &[(NsRecord, Arc<dyn ContentStore>, bool)],
-) -> Result<Reachable> {
-    let mut reachable = Reachable::default();
+) -> Result<HashSet<String>> {
+    let mut reachable = HashSet::new();
     for (record, store, _) in holders {
         let mut next: Vec<ContentId> = record.commit_head_id.iter().cloned().collect();
         while let Some(cid) = next.pop() {
-            if !reachable.commits.insert(cid.address_digest()) {
+            if !reachable.insert(cid.address_digest()) {
                 continue;
             }
             let envelope = load_commit_envelope_by_id(store.as_ref(), &cid).await?;
-            reachable
-                .transactions
-                .extend(envelope.txn.map(|t| t.address_digest()));
             next.extend(envelope.parents);
         }
     }
     Ok(reachable)
-}
-
-/// `value` as a document writes it; `None` for a reference, which names a
-/// subject rather than holding a value.
-fn lexical(value: &FlakeValue) -> Option<String> {
-    match value {
-        FlakeValue::Ref(_) | FlakeValue::Null | FlakeValue::TripleTerm(_) => None,
-        FlakeValue::String(s) | FlakeValue::Json(s) => Some(s.clone()),
-        other => Some(other.to_string()),
-    }
-}
-
-/// Whether a stored transaction document holds one of `values`: as a JSON
-/// value, as a literal in the text of a query or RDF body, or inside a
-/// signed or base64 payload.
-fn document_holds(bytes: &[u8], values: &[String]) -> bool {
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(json) => json_holds(&json, values),
-        Err(_) => text_holds(&String::from_utf8_lossy(bytes), values),
-    }
-}
-
-fn json_holds(json: &serde_json::Value, values: &[String]) -> bool {
-    use base64::Engine as _;
-    use serde_json::Value;
-    match json {
-        Value::String(s) => {
-            values.iter().any(|v| v == s)
-                || text_holds(s, values)
-                || s.strip_prefix("base64:")
-                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-                    .is_some_and(|b| document_holds(&b, values))
-                || jws_payload(s).is_some_and(|b| document_holds(&b, values))
-        }
-        Value::Number(n) => values.iter().any(|v| {
-            *v == n.to_string() || (n.as_f64().is_some() && v.parse::<f64>().ok() == n.as_f64())
-        }),
-        Value::Bool(b) => values.iter().any(|v| *v == b.to_string()),
-        Value::Array(items) => items.iter().any(|i| json_holds(i, values)),
-        Value::Object(map) => map.values().any(|i| json_holds(i, values)),
-        Value::Null => false,
-    }
-}
-
-/// Whether `text` writes one of `values` as a quoted literal.
-fn text_holds(text: &str, values: &[String]) -> bool {
-    values
-        .iter()
-        .any(|v| text.contains(&format!("\"{v}\"")) || text.contains(&format!("'{v}'")))
-}
-
-/// The payload of a compact JWS: its middle segment, base64url.
-fn jws_payload(s: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    let mut parts = s.split('.');
-    let (Some(_), Some(payload), Some(_), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()
 }

@@ -107,7 +107,7 @@ async fn capture_reads_the_oldest_bytes_still_stored() {
 /// An index built before publication still holds the erased occurrences
 /// and their values; one rebuilt from the replacements holds neither, except
 /// a value a surviving occurrence uses. A commit file no history reaches is
-/// found by the value it holds.
+/// found once reconciliation records it.
 #[tokio::test]
 async fn a_scan_finds_what_still_holds_a_captured_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -176,6 +176,13 @@ async fn a_scan_finds_what_still_holds_a_captured_value() {
         folder(&record).join(format!("{stray}.fcv2")),
     )
     .unwrap();
+    assert!(fluree
+        .scan_purge(&plan, &captured)
+        .await
+        .unwrap()
+        .unreferenced
+        .is_empty());
+    fluree.reconcile_garbage("t/scan").await.unwrap().unwrap();
     let scan = fluree.scan_purge(&plan, &captured).await.unwrap();
     assert_eq!(scan.unreferenced.len(), 1, "{scan:?}");
     assert!(scan.unreferenced[0].contains(&stray), "{scan:?}");
@@ -227,12 +234,11 @@ async fn a_scan_follows_every_parent_of_a_merge() {
     assert_eq!(scan.in_use, 1, "{scan:?}");
 }
 
-/// A file no history reaches is found by the value it holds, in each form a
-/// transaction document takes: JSON-LD, an RDF or query body, a signed
-/// payload. A TTL schedule still holding an erased fact is found too.
+/// Transaction documents no commit names are reported once reconciliation
+/// records them, whatever they hold; a surviving commit's own document is
+/// not. A TTL schedule still holding an erased fact is found too.
 #[tokio::test]
-async fn a_scan_finds_documents_and_schedules_holding_a_captured_value() {
-    use base64::Engine as _;
+async fn a_scan_finds_recorded_garbage_and_schedules_holding_a_captured_value() {
     use sha2::{Digest, Sha256};
 
     use crate::retention::state::{Entry, FactKey, Schedule, Source};
@@ -270,40 +276,11 @@ async fn a_scan_finds_documents_and_schedules_holding_a_captured_value() {
         std::fs::write(folder.join(kind).join(format!("{hex}.{ext}")), bytes).unwrap();
         hex
     };
-    let payload = json!({"insert": {"http://example.org/email": "a@secret"}}).to_string();
-    let found = [
-        write(
-            "txn",
-            "json",
-            json!({"insert": {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}})
-                .to_string()
-                .as_bytes(),
-        ),
-        write(
-            "txn",
-            "json",
-            json!("<http://example.org/alice> <http://example.org/email> \"a@secret\" .")
-                .to_string()
-                .as_bytes(),
-        ),
-        write(
-            "txn",
-            "json",
-            json!(format!(
-                "e30.{}.c2ln",
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-            ))
-            .to_string()
-            .as_bytes(),
-        ),
-    ];
-    let other = write(
-        "txn",
-        "json",
-        json!({"insert": {"http://example.org/email": "b@other"}})
-            .to_string()
-            .as_bytes(),
-    );
+    let documents = [
+        json!({"insert": {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}}),
+        json!({"insert": {"http://example.org/email": "b@other"}}),
+    ]
+    .map(|doc| write("txn", "json", doc.to_string().as_bytes()));
     let asserted = captured.iter().find(|c| c.flake.op).unwrap();
     let mut schedule = Schedule::starting_after(0);
     schedule.insert(
@@ -319,18 +296,19 @@ async fn a_scan_finds_documents_and_schedules_holding_a_captured_value() {
     );
     let scheduled = write("retention", "frs", &schedule.encode().unwrap());
 
+    fluree
+        .reconcile_garbage("t/documents")
+        .await
+        .unwrap()
+        .unwrap();
     let scan = fluree.scan_purge(&plan, &captured).await.unwrap();
-    for hex in &found {
+    for hex in &documents {
         assert!(
             scan.unreferenced.iter().any(|a| a.contains(hex.as_str())),
             "{hex}: {scan:?}"
         );
     }
-    assert!(
-        !scan.unreferenced.iter().any(|a| a.contains(&other)),
-        "{scan:?}"
-    );
-    assert_eq!(scan.unreferenced.len(), 3, "{scan:?}");
+    assert_eq!(scan.unreferenced.len(), 2, "{scan:?}");
     assert_eq!(scan.schedules.len(), 1, "{scan:?}");
     assert!(scan.schedules[0].contains(&scheduled), "{scan:?}");
 }
@@ -420,6 +398,46 @@ async fn a_purge_rewrites_a_schedule_holding_an_erased_fact() {
     let rewritten = Schedule::decode(&store.get(&current.parse().unwrap()).await.unwrap()).unwrap();
     assert!(!rewritten.contains(&erased) && rewritten.contains(&kept));
     assert!(!store.has(&blob).await.unwrap());
+}
+
+/// A file nothing references, holding an erased value, is collected before
+/// the purge completes: the purge reconciles the ledger first.
+#[tokio::test]
+async fn a_purge_collects_an_unreferenced_file_holding_an_erased_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/stray").await.unwrap();
+    let id = "t/stray:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    // A failed transaction's body, left by a crash before it was abandoned.
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let stray = fluree
+        .content_store(&record.storage_namespace())
+        .put(
+            fluree_db_core::ContentKind::Txn,
+            json!({"insert": {"http://example.org/email": "a@secret"}})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    erase(&fluree, id, email("alice", "a@secret")).await;
+
+    let report = fluree
+        .run_purge_pass(id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert!(!fluree
+        .content_store(&record.storage_namespace())
+        .has(&stray)
+        .await
+        .unwrap());
 }
 
 /// Erasing leaf by leaf leaves an index that reads as a full rebuild from

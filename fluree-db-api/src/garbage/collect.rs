@@ -53,7 +53,7 @@ impl Fluree {
         Ok(report)
     }
 
-    async fn collect_ledger(
+    pub(super) async fn collect_ledger(
         &self,
         name: &str,
         binding: &NameBinding,

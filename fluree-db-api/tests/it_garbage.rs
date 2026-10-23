@@ -188,6 +188,17 @@ async fn commits_a_merge_copied_in_stay_after_their_branch_goes() {
     assert!(!merged.fast_forward);
     fluree.drop_branch("garbage", "dev").await.unwrap();
 
+    // The merge above the index, then within it.
+    let report = fluree
+        .reconcile_garbage("garbage")
+        .await
+        .unwrap()
+        .expect("settled");
+    assert_eq!(report.recorded, 0, "{report:?}");
+    fluree
+        .reindex("garbage:main", fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
     let report = fluree
         .reconcile_garbage("garbage")
         .await

@@ -115,7 +115,10 @@ impl Fluree {
             if !matches!(binding.value.state, BindingState::Active) {
                 continue;
             }
-            let from = self.reconciled_from(&binding.value.root).await?;
+            let from = self
+                .reconciled(&binding.value.root)
+                .await?
+                .map(|r| r.started_ms);
             if from.is_some_and(|ms| ms > due_before) {
                 continue;
             }
@@ -132,18 +135,57 @@ impl Fluree {
             .map(|report| (name, report)))
     }
 
-    /// When the last completed reconciliation of the ledger at `root`
-    /// started.
-    async fn reconciled_from(&self, root: &StorageRoot) -> Result<Option<i64>> {
+    /// The last completed reconciliation of the ledger at `root`.
+    async fn reconciled(&self, root: &StorageRoot) -> Result<Option<Reconciled>> {
         let storage = self.garbage_storage()?;
         let address = reconciled_address(storage.storage_method(), root);
         match storage.read_bytes(&address).await {
-            Ok(bytes) => Ok(serde_json::from_slice::<Reconciled>(&bytes)
-                .ok()
-                .map(|r| r.started_ms)),
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
             Err(fluree_db_core::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Collect, without a grace period, every file of ledger `name` that no
+    /// branch references, as of a reconciliation started at or after
+    /// `since_ms`, running one if there is none. `false` while that cannot
+    /// be established: the ledger is unsettled, or a writer pins a file.
+    pub(crate) async fn resolve_garbage(&self, name: &str, since_ms: i64) -> Result<bool> {
+        let Some(binding) = self.publisher()?.get_binding(name).await? else {
+            return Ok(false);
+        };
+        let root = &binding.value.root;
+        let covered = |r: &Option<Reconciled>| r.is_some_and(|r| r.started_ms >= since_ms);
+        let mut reconciled = self.reconciled(root).await?;
+        if !covered(&reconciled) {
+            if self.reconcile_garbage(name).await?.is_none() {
+                return Ok(false);
+            }
+            reconciled = self.reconciled(root).await?;
+        }
+        if !covered(&reconciled) {
+            return Ok(false);
+        }
+        let mut report = super::GarbageReport::default();
+        self.collect_ledger(name, &binding.value, now_ms(), &mut report)
+            .await?;
+        Ok(self.unresolved_garbage(root).await?.is_empty())
+    }
+
+    /// The files recorded as garbage under `root`, by the last completed
+    /// reconciliation or before it, and not yet collected.
+    pub(crate) async fn unresolved_garbage(&self, root: &StorageRoot) -> Result<Vec<String>> {
+        let Some(reconciled) = self.reconciled(root).await? else {
+            return Ok(Vec::new());
+        };
+        let method = self.garbage_storage()?.storage_method().to_string();
+        Ok(self
+            .garbage_records(root)
+            .await?
+            .into_iter()
+            .filter(|r| r.record.recorded_ms <= reconciled.completed_ms)
+            .filter_map(|r| r.blob.address(&method))
+            .collect())
     }
 }
 

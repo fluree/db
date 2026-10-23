@@ -13,11 +13,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+use fluree_db_binary_index::{
+    BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnProjection, RunSortOrder,
+};
 use fluree_db_core::commit_subject::{commit_id_of_sid, commit_sid};
+use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
-    content_address, load_commit_envelope_by_id, range_bounded_with_overlay, range_with_overlay,
-    ContentId, ContentKind, ContentStore, Flake, FlakeValue, IndexType, LedgerName, RangeMatch,
-    RangeOptions, RangeTest, Sid, StorageNamespace, TXN_META_GRAPH_ID,
+    content_address, load_commit_envelope_by_id, range_with_overlay, ContentId, ContentKind,
+    ContentStore, FlakeValue, IndexType, LedgerName, RangeMatch, RangeOptions, RangeTest, Sid,
+    StorageNamespace, TXN_META_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{BindingState, NameBinding, NsRecord};
@@ -26,9 +31,6 @@ use fluree_vocab::namespaces::FLUREE_DB;
 
 use super::Blob;
 use crate::{Fluree, Result};
-
-/// Flakes read per page of a txn-meta scan.
-const PAGE: usize = 10_000;
 
 struct Branch {
     record: NsRecord,
@@ -86,7 +88,7 @@ impl Fluree {
                 commits: HashSet::new(),
                 txns: HashSet::new(),
             };
-            let merged = merged_parents(&branch.state).await?;
+            let merged = merged_parents(&branch.state, &branch.store).await?;
             branch.walk(merged).await?;
             branches.push(branch);
         }
@@ -260,57 +262,94 @@ impl Branch {
     }
 }
 
-/// The parents of the merges in `state`'s txn-meta.
-async fn merged_parents(state: &LedgerState) -> Result<Vec<ContentId>> {
-    let previous = Sid::new(FLUREE_DB, db::PREVIOUS);
-    let end = Flake::max_for_predicate(previous.clone());
-    let cmp = IndexType::Psot.comparator();
-    let mut start = Flake::min_for_predicate(previous);
-    let mut last: Option<Flake> = None;
+/// The parents of the merges in `state`'s history: streamed from its
+/// index's txn-meta, and read from the commits above the index.
+async fn merged_parents(
+    state: &LedgerState,
+    store: &Arc<dyn ContentStore>,
+) -> Result<Vec<ContentId>> {
     let mut merged = Vec::new();
-    let mut subject: Option<Sid> = None;
-    let mut parents: Vec<ContentId> = Vec::new();
-    loop {
-        let page = range_bounded_with_overlay(
-            &state.snapshot,
-            TXN_META_GRAPH_ID,
-            state.novelty.as_ref(),
-            IndexType::Psot,
-            start,
-            end.clone(),
-            RangeOptions::default()
-                .with_to_t(state.t())
-                .with_flake_limit(PAGE),
-        )
-        .await?;
-        let full = page.len() >= PAGE;
-        for flake in &page {
-            // Pages start at the last flake read.
-            if last.as_ref().is_some_and(|l| cmp(flake, l).is_le()) {
-                continue;
-            }
-            if subject.as_ref() != Some(&flake.s) {
-                if parents.len() > 1 {
-                    merged.append(&mut parents);
-                }
-                parents.clear();
-                subject = Some(flake.s.clone());
-            }
-            if let FlakeValue::Ref(parent) = &flake.o {
-                parents.extend(commit_id_of_sid(parent));
+    let index = state
+        .binary_store
+        .as_ref()
+        .and_then(|s| Arc::downcast::<BinaryIndexStore>(Arc::clone(&s.0)).ok());
+    if let Some(index) = index {
+        merged.extend(
+            indexed_merge_parents(&index, state.index_t())
+                .map_err(|e| crate::ApiError::internal(format!("txn-meta scan: {e}")))?,
+        );
+    }
+    let mut next = state.head_commit_id.clone();
+    while let Some(id) = next {
+        let envelope = load_commit_envelope_by_id(store.as_ref(), &id).await?;
+        if envelope.t <= state.index_t() {
+            break;
+        }
+        let mut parents = envelope.parents.into_iter();
+        next = parents.next();
+        merged.extend(parents);
+    }
+    Ok(merged)
+}
+
+/// The parents of every commit with more than one in `index`'s txn-meta,
+/// read row by row without decoding the rest.
+fn indexed_merge_parents(
+    index: &Arc<BinaryIndexStore>,
+    to_t: i64,
+) -> std::io::Result<Vec<ContentId>> {
+    let Some(p_id) = index.sid_to_p_id(&Sid::new(FLUREE_DB, db::PREVIOUS)) else {
+        return Ok(Vec::new());
+    };
+    let Some(branch) = index.branch_for_order(TXN_META_GRAPH_ID, RunSortOrder::Psot) else {
+        return Ok(Vec::new());
+    };
+    let bound = |s_id: u64, o_key: u64, rest: u32, o_type: u16| RunRecordV2 {
+        s_id: SubjectId(s_id),
+        o_key,
+        p_id,
+        t: rest,
+        o_i: rest,
+        o_type,
+        g_id: TXN_META_GRAPH_ID,
+    };
+    let mut cursor = BinaryCursor::new(
+        Arc::clone(index),
+        RunSortOrder::Psot,
+        Arc::clone(branch),
+        &bound(0, 0, 0, 0),
+        &bound(u64::MAX, u64::MAX, u32::MAX, u16::MAX),
+        BinaryFilter {
+            p_id: Some(p_id),
+            ..Default::default()
+        },
+        ColumnProjection::all(),
+    );
+    cursor.set_to_t(to_t);
+    let mut merged = Vec::new();
+    let mut subject = None;
+    let mut parents: Vec<u64> = Vec::new();
+    let mut flush = |parents: &mut Vec<u64>| -> std::io::Result<()> {
+        if parents.len() > 1 {
+            for parent in parents.iter() {
+                let (ns, name) = index.resolve_subject_parts(*parent)?;
+                merged.extend(commit_id_of_sid(&Sid::new(ns, name)));
             }
         }
-        match page.last() {
-            Some(tail) if full && last.as_ref().is_none_or(|l| cmp(tail, l).is_gt()) => {
-                last = Some(tail.clone());
-                start = tail.clone();
+        parents.clear();
+        Ok(())
+    };
+    while let Some(batch) = cursor.next_batch()? {
+        for i in 0..batch.row_count {
+            let s_id = batch.s_id.get(i);
+            if subject != Some(s_id) {
+                flush(&mut parents)?;
+                subject = Some(s_id);
             }
-            _ => break,
+            parents.push(batch.o_key.get(i));
         }
     }
-    if parents.len() > 1 {
-        merged.append(&mut parents);
-    }
+    flush(&mut parents)?;
     Ok(merged)
 }
 

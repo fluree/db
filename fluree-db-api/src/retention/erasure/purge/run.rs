@@ -1,6 +1,7 @@
 //! A purge pass: rebuild the holders' indexes from the replacements,
-//! release the older ones, scan for the erased values, delete what the plan
-//! and the scan name — the originals last — and check that it is gone.
+//! release the older ones, collect the holders' ledgers' garbage, scan for
+//! the erased values, delete what the plan and the scan name — the
+//! originals last — and check that it is gone.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -88,6 +89,11 @@ impl Fluree {
         } else {
             None
         };
+        let blocked = blocked.or_else(|| {
+            self.blob_pins().is_none().then_some(
+                "this instance does not collect garbage: it does not hold its storage's lock",
+            )
+        });
         if let Some(why) = blocked {
             return self.block(&jobs, report, why.to_string()).await;
         }
@@ -139,6 +145,12 @@ impl Fluree {
                     );
                     return self.block(&jobs, report, why).await;
                 }
+                // Every file nothing references is garbage once the ledger
+                // is reconciled: collected, none can hold an erased value.
+                if !self.resolve_garbage(ledger.as_str(), rebuilt_ms).await? {
+                    report.waiting = true;
+                    return Ok(report);
+                }
             }
 
             let scan = self.scan_purge(&plan, &captured).await?;
@@ -155,12 +167,7 @@ impl Fluree {
             report.deleted += self
                 .rewrite_schedules(&plan, &scan.schedules, &captured)
                 .await?;
-            let files: Vec<&String> = plan
-                .transactions
-                .iter()
-                .chain(&plan.superseded)
-                .chain(&scan.unreferenced)
-                .collect();
+            let files: Vec<&String> = plan.transactions.iter().chain(&plan.superseded).collect();
             report.deleted += self.delete_files(&files).await?;
             let scan = self.scan_purge(&plan, &captured).await?;
             if !scan.clean() {
