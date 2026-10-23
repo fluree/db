@@ -473,7 +473,7 @@ where
             // Remap spatial entries' chunk-local subject IDs → global sid64.
             // The spatial hook accumulated entries with chunk-local s_id values;
             // spatial_chunk_ranges[ci] = (start, end) into entries for chunk ci.
-            let _spatial_entries: Vec<crate::spatial_hook::SpatialEntry> = {
+            let spatial_entries: Vec<crate::spatial_hook::SpatialEntry> = {
                 let mut all_entries = shared
                     .spatial_hook
                     .take()
@@ -1100,6 +1100,19 @@ where
                 per_graph.into_iter().collect()
             };
 
+            let spatial_by_graph: std::collections::BTreeMap<
+                fluree_db_core::GraphId,
+                Vec<fluree_db_binary_index::SpatialArenaRef>,
+            > = super::spatial::build_and_upload_spatial_indexes(
+                &spatial_entries,
+                &shared.predicates,
+                &ledger_id,
+                &content_store,
+            )
+            .await?
+            .into_iter()
+            .collect();
+
             // Datatype and language tag lists for the root. Re-snapshot
             // `language_tags` AFTER the fulltext build so any lang_id
             // allocated by the builder (notably `"en"`) is persisted.
@@ -1117,7 +1130,7 @@ where
                 tags.into_iter().map(|(_, tag)| tag).collect()
             };
 
-            // Graph arenas (numbig, vectors, fulltext) — build from uploaded_dicts CIDs.
+            // Graph arenas (numbig, vectors, spatial, fulltext).
             let graph_arenas: Vec<GraphArenaRefs> = {
                 let mut graph_ids = std::collections::BTreeSet::new();
                 for g_id_str in uploaded_dicts.numbig.keys() {
@@ -1130,7 +1143,7 @@ where
                         graph_ids.insert(g_id);
                     }
                 }
-                for g_id in fulltext_by_graph.keys() {
+                for g_id in fulltext_by_graph.keys().chain(spatial_by_graph.keys()) {
                     graph_ids.insert(*g_id);
                 }
                 graph_ids
@@ -1156,7 +1169,7 @@ where
                             g_id,
                             numbig,
                             vectors,
-                            spatial: Vec::new(),
+                            spatial: spatial_by_graph.get(&g_id).cloned().unwrap_or_default(),
                             fulltext,
                         }
                     })

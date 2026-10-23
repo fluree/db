@@ -349,3 +349,62 @@ async fn geof_distance_via_sparql() {
         "Expected ~343.5km via SPARQL, got {distance} meters"
     );
 }
+
+/// A full rebuild indexes complex geometries, as an incremental build does, and
+/// the incremental build after it adds to that index. The rebuild built none,
+/// so a reindex dropped the ledger's spatial index, and the next incremental
+/// build indexed only its own window.
+#[tokio::test]
+async fn a_rebuild_keeps_the_spatial_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    fluree.create_ledger("geo/rebuild").await.unwrap();
+    let id = "geo/rebuild:main";
+
+    insert_area(&fluree, id, "ex:park", "POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))").await;
+    fluree
+        .reindex(id, fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(spatial_geometry_counts(&fluree, id).await, vec![1]);
+
+    insert_area(&fluree, id, "ex:lake", "POLYGON((5 5, 5 6, 6 6, 6 5, 5 5))").await;
+    support::build_incrementally_and_publish_index(&fluree, id).await;
+    assert_eq!(spatial_geometry_counts(&fluree, id).await, vec![2]);
+}
+
+async fn insert_area(fluree: &fluree_db_api::Fluree, id: &str, subject: &str, wkt: &str) {
+    fluree
+        .graph(id)
+        .transact()
+        .insert(&json!({
+            "@context": geo_context(),
+            "@id": subject,
+            "ex:area": {"@value": wkt, "@type": "geo:wktLiteral"}
+        }))
+        .commit()
+        .await
+        .unwrap();
+}
+
+/// The geometry count of each spatial index in the published index root.
+async fn spatial_geometry_counts(fluree: &fluree_db_api::Fluree, id: &str) -> Vec<u64> {
+    use fluree_db_core::ContentStore;
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let store = fluree.content_store(id);
+    let bytes = store
+        .get(record.index_head_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap();
+    let mut counts = Vec::new();
+    for spatial in root.graph_arenas.iter().flat_map(|g| &g.spatial) {
+        let spatial_root: JsonValue =
+            serde_json::from_slice(&store.get(&spatial.root_cid).await.unwrap()).unwrap();
+        counts.push(spatial_root["geometry_count"].as_u64().unwrap());
+    }
+    counts
+}
