@@ -2227,6 +2227,7 @@ impl crate::Fluree {
         let mut indexer_config = opts.indexer_config.clone().unwrap_or_default();
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
+        let gc_hard_max_old_indexes = indexer_config.gc_hard_max_old_indexes;
 
         // Resolve attachment events and read fulltext config off a single
         // `LedgerState` load so the reindex doesn't pay for two snapshot
@@ -2430,6 +2431,7 @@ impl crate::Fluree {
                 let gc_config = CleanGarbageConfig {
                     max_old_indexes: Some(gc_max_old_indexes),
                     min_time_garbage_mins: Some(gc_min_time_mins),
+                    hard_max_old_indexes: gc_hard_max_old_indexes,
                     ..Default::default()
                 };
                 let pass = async {

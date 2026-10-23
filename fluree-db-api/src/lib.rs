@@ -1461,6 +1461,15 @@ fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig
         indexer_config.gc_min_time_mins = min_time.min(u32::MAX as u64) as u32;
     }
 
+    if let Some(ceiling) = config
+        .defaults
+        .as_ref()
+        .and_then(|d| d.indexing.as_ref())
+        .and_then(|i| i.gc_hard_max_old_indexes)
+    {
+        indexer_config.gc_hard_max_old_indexes = Some(ceiling.min(u32::MAX as u64) as u32);
+    }
+
     indexer_config
 }
 
@@ -2448,13 +2457,15 @@ impl FlureeBuilder {
     /// default; order relative to [`Self::with_indexing_thresholds`] does not
     /// matter, since each preserves the other's half of the config.
     ///
-    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
-    /// rate the age guard always wins and the count target bounds nothing.
-    /// `hard_max_old_indexes` is an opt-in ceiling past which the guard is
-    /// overridden. It bounds retained versions, not bytes, and overriding the
-    /// guard can release artifacts a query still reading an older version
-    /// needs; see `CleanGarbageConfig::hard_max_old_indexes` in
-    /// `fluree_db_indexer::gc` for the trade-off.
+    /// `min_time_mins` is the age guard: a superseded version is kept that long
+    /// so a query that started on it can finish. `hard_max_old_indexes` is a
+    /// ceiling (default 10) past which versions go whatever their age, and
+    /// `max_old_indexes` an optional floor (default 0) kept whatever its age.
+    /// The ceiling bounds retained versions, not bytes, and can release
+    /// artifacts a query still reading an older version needs; see
+    /// `CleanGarbageConfig::hard_max_old_indexes` in `fluree_db_indexer::gc`
+    /// for the trade-off. To remove it, set
+    /// `IndexerConfig::gc_hard_max_old_indexes` to `None`.
     pub fn with_gc_settings(
         mut self,
         max_old_indexes: Option<u32>,
@@ -5757,9 +5768,10 @@ mod tests {
             defaults.gc_min_time_mins
         );
         assert_eq!(
-            cfg3.indexer_config.gc_hard_max_old_indexes, None,
-            "the ceiling is opt-in"
+            cfg3.indexer_config.gc_hard_max_old_indexes,
+            defaults.gc_hard_max_old_indexes
         );
+        assert_eq!(defaults.gc_hard_max_old_indexes, Some(10));
         assert!(!b3.indexer_config_user_set);
     }
 
@@ -5880,6 +5892,7 @@ mod tests {
                     indexing_enabled: None,
                     track_class_stats: None,
                     gc_min_time_mins: None,
+                    gc_hard_max_old_indexes: None,
                 }),
             }),
             ..Default::default()
@@ -5888,6 +5901,45 @@ mod tests {
         let idx = derive_index_config(&config);
         assert_eq!(idx.reindex_min_bytes, 250_000);
         assert_eq!(idx.reindex_max_bytes, 2_500_000);
+    }
+
+    /// The three retention settings reach the indexer from a JSON-LD
+    /// connection config, and an absent ceiling keeps the indexer's default.
+    #[cfg(feature = "native")]
+    #[test]
+    fn connection_config_gc_retention_reaches_the_indexer() {
+        use serde_json::{json, Value as JsonValue};
+
+        let parse = |indexing: JsonValue| {
+            ConnectionConfig::from_json_ld(&json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    {"@id": "memory", "@type": "Storage"},
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "memory"},
+                        "defaults": {"indexing": indexing}
+                    }
+                ]
+            }))
+            .expect("parse")
+        };
+
+        let set = build_indexer_config(&parse(json!({
+            "maxOldIndexes": 3,
+            "gcMinTimeMins": 60,
+            "gcHardMaxOldIndexes": 40
+        })));
+        assert_eq!(set.gc_max_old_indexes, 3);
+        assert_eq!(set.gc_min_time_mins, 60);
+        assert_eq!(set.gc_hard_max_old_indexes, Some(40));
+
+        let unset = build_indexer_config(&parse(json!({"gcMinTimeMins": 60})));
+        assert_eq!(unset.gc_hard_max_old_indexes, Some(10));
     }
 
     #[test]

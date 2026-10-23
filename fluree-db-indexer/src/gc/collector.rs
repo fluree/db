@@ -344,17 +344,18 @@ pub struct GarbagePlan {
 ///
 /// # Retention Policy
 ///
-/// Both thresholds must be satisfied for GC to occur:
-/// - `max_old_indexes`: Maximum old index versions to keep (default: 5)
-///   With max_old_indexes=5, we keep current + 5 old = 6 total
-/// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 15)
+/// - `min_time_garbage_mins`: a version is kept until it has been superseded
+///   this long (default: 15)
+/// - `max_old_indexes`: a floor of old versions kept whatever their age
+///   (default: 0). With max_old_indexes=5, we keep current + 5 old = 6 total
 ///
 /// Age is determined by the garbage record's `created_at_ms` field. A record
 /// with no timestamp predates the field and is treated as past the window.
 ///
 /// An optional `hard_max_old_indexes` ceiling overrides the age check for
-/// versions past it. See [`CleanGarbageConfig::hard_max_old_indexes`] for what
-/// that costs a query still reading one of those versions.
+/// versions past it (`None` here sets none; the indexer's default is 10). See
+/// [`CleanGarbageConfig::hard_max_old_indexes`] for what that costs a query
+/// still reading one of those versions.
 ///
 /// # Roots with no garbage manifest
 ///
@@ -581,6 +582,12 @@ impl GarbagePlan {
     /// Whether the plan releases nothing.
     pub fn is_empty(&self) -> bool {
         self.planned.is_empty()
+    }
+
+    /// Whether the plan releases a version past the ceiling, inside the age
+    /// guard.
+    pub fn overrides_age_guard(&self) -> bool {
+        self.planned.iter().any(|p| p.past_ceiling)
     }
 
     /// The result of a pass that releases none of this plan.
@@ -1716,17 +1723,63 @@ mod tests {
         assert!(store.has(&cid3).await.unwrap());
     }
 
+    /// With the default settings the age guard alone decides: a slow ledger's
+    /// only old version goes once it has been superseded past the guard, and
+    /// stays while it is inside it. No count keeps it.
+    #[tokio::test]
+    async fn by_default_the_age_guard_alone_decides() {
+        for (age_mins, collected) in [(60_i64, true), (5, false)] {
+            let storage = MemoryStorage::new();
+            let seed = |what: &str| format!("default_guard_{age_mins}_{what}");
+            let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, seed("r1").as_bytes());
+            let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, seed("r2").as_bytes());
+            let (garb2, garb_addr2) =
+                cid_and_addr(ContentKind::GarbageRecord, seed("g2").as_bytes());
+            let superseded_at = current_timestamp_ms() - age_mins * 60 * 1000;
+
+            let root1 = minimal_fir6(1, None, None);
+            let root2 = minimal_fir6(
+                2,
+                Some(BinaryPrevIndexRef {
+                    t: 1,
+                    id: cid1.clone(),
+                }),
+                Some(BinaryGarbageRef { id: garb2.clone() }),
+            );
+            let garbage2 = format!(
+                r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": [], "created_at_ms": {superseded_at}}}"#
+            );
+            storage.write_bytes(&addr1, &root1).await.unwrap();
+            storage.write_bytes(&addr2, &root2).await.unwrap();
+            storage
+                .write_bytes(&garb_addr2, garbage2.as_bytes())
+                .await
+                .unwrap();
+
+            let store = test_store(&storage);
+            let result = clean_garbage(&store, &cid2, CleanGarbageConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                result.indexes_cleaned,
+                usize::from(collected),
+                "superseded {age_mins} minutes ago"
+            );
+            assert_eq!(result.retained, if collected { 1 } else { 2 });
+            assert_eq!(store.has(&cid1).await.unwrap(), !collected);
+        }
+    }
+
     /// The hard ceiling overrides the age guard.
     ///
     /// Same fixture as `test_clean_garbage_respects_time_threshold` — a garbage
     /// record only 5 minutes old against a 30-minute guard — but with the ceiling
     /// set low enough that the oldest version is past it. Without this, a ledger
-    /// publishing faster than the guard accumulates versions without bound, since
-    /// `max_old_indexes` is ANDed with the age check and so bounds nothing.
+    /// publishing faster than the guard accumulates versions without bound:
+    /// `max_old_indexes` is only a floor, and the guard holds everything above it.
     ///
-    /// Note the sibling test above pins the complement: with no ceiling set,
-    /// which is the default, this same chain is left alone, so the guard governs
-    /// everything unless an operator opts in.
+    /// Note the sibling test above pins the complement: with no ceiling set, this
+    /// same chain is left alone, so the guard governs everything.
     #[tokio::test]
     async fn test_hard_ceiling_collects_despite_recent_garbage() {
         let storage = MemoryStorage::new();
@@ -1946,18 +1999,17 @@ mod tests {
         );
     }
 
-    /// Production's regime — a live age guard and fresh garbage
-    /// records — with no ceiling set, which is the default. Every version is
-    /// inside the guard, so GC must leave all of them alone. That is the
-    /// reader-safety property the guard exists for: a query that started
-    /// against any of these versions can still read it. The default
-    /// configuration must never trade that away, so this fails if a default
-    /// ceiling is ever derived again.
+    /// Production's regime — a live age guard and fresh garbage records — with
+    /// the ceiling removed (`hard_max_old_indexes: None`; the indexer's default
+    /// is 10). Every version is inside the guard, so GC must leave all of them
+    /// alone. That is the reader-safety property the guard exists for: a query
+    /// that started against any of these versions can still read it, and
+    /// nothing but a ceiling may trade it away.
     ///
     /// Deleting GC leaves this green, deliberately: it pins the absence of an
     /// override, and GC doing nothing is exactly the required behaviour.
     #[tokio::test]
-    async fn repeated_publish_under_a_live_age_guard_retains_everything_by_default() {
+    async fn repeated_publish_under_a_live_age_guard_retains_everything_without_a_ceiling() {
         const GENERATIONS: usize = 40;
         const MAX_OLD: u32 = 2;
 
