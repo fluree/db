@@ -117,12 +117,22 @@ impl BlankNodeCounter {
         Self { next: 0 }
     }
 
+    /// The label of a template `[]`. A label can't start with `-`, so no
+    /// hand-written `_:label` collides with it (a user's `_:b0` next to a
+    /// template `[]` used to fuse into one node). Mid-label `-` is legal, so
+    /// the skolemized `fdb-…--anon{N}` serializes as written.
     fn next(&mut self) -> String {
-        // `[` is outside PN_CHARS, so no hand-written `_:label` can collide
-        // with a minted anonymous label (a user's `_:b0` next to a template
-        // `[]` used to fuse into one node — the same forgeability class as
-        // the query-side `_:[]{N}` scheme this matches).
-        let label = format!("_:[]{}", self.next);
+        format!("_:{}", self.mint("anon"))
+    }
+
+    /// The label of the reifier an annotation without `~` gets, in its own
+    /// `-ann` space so it can't meet a template `[]`.
+    fn next_annotation(&mut self) -> String {
+        self.mint("ann")
+    }
+
+    fn mint(&mut self, kind: &str) -> String {
+        let label = format!("-{kind}{}", self.next);
         self.next += 1;
         label
     }
@@ -218,23 +228,12 @@ fn resolve_reifier(
             }
             // Mint a fresh labeled blank node so it round-trips through
             // the existing template lowering exactly like a user-supplied
-            // `~ _:foo` would.
-            //
-            // **Reserved label space.** `BlankNodeCounter::next()`
-            // yields plain `_:b{N}` which can collide with
-            // user-authored `_:b0` — both would skolemize to the
-            // same SID (via `FlakeGenerator::skolemize_blank_node`
-            // keying on `(txn_id, label)`), silently fusing two
-            // distinct subjects. Prefix the synthesized label with
-            // `__fluree_ann_` so it can't conflict with any
-            // hand-written blank-node label. The prefix matches the
-            // by-selector retract's `?_fluree_del_ann_N` convention
-            // and surfaces clearly in any diagnostic output.
-            let raw = bnodes.next();
-            let stripped = raw.strip_prefix("_:").unwrap_or(&raw);
-            let reserved = format!("__fluree_ann_{stripped}");
+            // `~ _:foo` would. Its label can't be written by hand, so it
+            // never fuses with a user's blank node, which would skolemize
+            // to the same SID (`FlakeGenerator::skolemize_blank_node` keys
+            // on `(txn_id, label)`).
             Ok(SubjectTerm::BlankNode(BlankNode::labeled(
-                reserved,
+                bnodes.next_annotation(),
                 annotation.span,
             )))
         }
@@ -694,8 +693,8 @@ fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerErro
 ///   BLANK_NODE_LABEL, so anonymous names are disjoint from the labeled
 ///   arm's `_:{label}` for every possible label. (Plain `_:b{N}` collided
 ///   with a user-written `_:b0`, silently unifying two distinct
-///   existentials — the same label-space hazard the annotation expansion
-///   avoids with its `__fluree_ann_` prefix.)
+///   existentials — the same label-space hazard `BlankNodeCounter` avoids
+///   for stored nodes with its leading `-`.)
 ///
 /// Same label ⇒ same name, per SPARQL's blank-node label scoping within a
 /// request.
@@ -2374,9 +2373,9 @@ mod tests {
     #[test]
     fn test_blank_node_counter() {
         let mut counter = BlankNodeCounter::new();
-        assert_eq!(counter.next(), "_:[]0");
-        assert_eq!(counter.next(), "_:[]1");
-        assert_eq!(counter.next(), "_:[]2");
+        assert_eq!(counter.next(), "_:-anon0");
+        assert_eq!(counter.next_annotation(), "-ann1");
+        assert_eq!(counter.next(), "_:-anon2");
     }
 
     #[test]
