@@ -1470,3 +1470,173 @@ async fn a_purge_plan_lists_every_original_and_its_transaction_document() {
     assert!(plan.rebuild.contains(&id) && plan.rebuild.contains(&copy));
     assert_eq!(plan.release, vec![dropped]);
 }
+
+/// The raw files under `root` holding `needle`, wherever they are.
+fn files_holding(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut next = vec![root.to_path_buf()];
+    while let Some(dir) = next.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                next.push(path);
+            } else if contains(&std::fs::read(&path).unwrap(), needle) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A purge rebuilds every holder's index from the replacements, releases
+/// the older indexes once readers have had time, deletes every copy of the
+/// erased originals and their transaction documents, and checks they are
+/// gone: no inspected file holds the value, and the ledger reads as before.
+/// A pass that must wait for readers resumes from its rebuild.
+#[tokio::test]
+async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-run").await;
+    fluree
+        .graph(&id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .insert(&json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:alice", "ex:email": "a@secret"},
+            {"@id": "ex:bob", "ex:email": "b@kept"}
+        ]}))
+        .commit()
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-run-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    reindex(&fluree, &copy).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert!(!plan.originals.is_empty() && !plan.transactions.is_empty());
+    assert!(!files_holding(dir.path(), "a@secret").is_empty());
+
+    let report = fluree
+        .run_purge_pass(&id, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(report.waiting && report.purged == 0, "{report:?}");
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(job.stage, ErasureStage::Purged, "{job:?}");
+    for address in plan.originals.iter().chain(&plan.transactions) {
+        let path = dir
+            .path()
+            .join(address.strip_prefix("fluree:file://").unwrap());
+        assert!(!path.exists(), "{address}");
+    }
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let inspection = fluree.inspect_purge(&id).await.unwrap();
+    assert!(inspection.scan.clean(), "{inspection:?}");
+
+    drop(fluree);
+    let restarted = erasing(&dir, Arc::new(NativeProver::default()));
+    for ledger in [&id, &copy] {
+        assert_eq!(
+            objects(&restarted, ledger, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+        assert!(objects(&restarted, ledger, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+        reindex(&restarted, ledger).await;
+        assert_eq!(
+            objects(&restarted, ledger, "ex:bob", "ex:email").await,
+            vec![json!("b@kept")]
+        );
+    }
+}
+
+/// A soft-dropped copy holding an erased commit cannot have its index
+/// rebuilt while dropped: the purge stops, says why, and deletes nothing.
+#[tokio::test]
+async fn a_purge_waits_for_a_dropped_holder() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-blocked").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .restore_ledger("it/purge-blocked-copy", &mut archive.as_slice())
+        .await
+        .unwrap();
+    fluree
+        .drop_ledger("it/purge-blocked-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let plan = fluree.plan_purge(&id).await.unwrap();
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    let why = report.blocked.expect("blocked");
+    assert!(why.contains("soft-dropped"), "{why}");
+    let job = fluree
+        .retention_status(&id)
+        .await
+        .unwrap()
+        .registration
+        .expect("registration")
+        .erasures
+        .into_iter()
+        .find(|j| j.request_id == receipt.request_id)
+        .unwrap();
+    assert_eq!(job.stage, ErasureStage::Purging);
+    assert_eq!(job.purge.unwrap().blocked, Some(why));
+    for address in &plan.originals {
+        let path = dir
+            .path()
+            .join(address.strip_prefix("fluree:file://").unwrap());
+        assert!(path.exists(), "{address}");
+    }
+}

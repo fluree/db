@@ -203,6 +203,7 @@ impl Fluree {
             last_error: None,
             published_ms: None,
             added: Vec::new(),
+            purge: None,
         };
         let recorded = job.clone();
         registry::update(ns, ledger_id.as_str(), |current| {
@@ -544,10 +545,14 @@ fn signing_ledger(
 const KEEP_FINISHED: usize = 100;
 
 fn keep_recent_finished(jobs: &mut Vec<ErasureJob>) {
-    let finished = jobs.iter().filter(|j| !j.pending()).count();
-    let mut drop = finished.saturating_sub(KEEP_FINISHED);
+    let finished = |j: &ErasureJob| !j.pending() && !j.purge_pending();
+    let mut drop = jobs
+        .iter()
+        .filter(|j| finished(j))
+        .count()
+        .saturating_sub(KEEP_FINISHED);
     jobs.retain(|j| {
-        if drop > 0 && !j.pending() {
+        if drop > 0 && finished(j) {
             drop -= 1;
             false
         } else {
@@ -607,18 +612,22 @@ mod tests {
             last_error: None,
             published_ms: None,
             added: Vec::new(),
+            purge: None,
         }
     }
 
     #[test]
     fn a_registration_keeps_every_pending_job_and_the_recent_finished_ones() {
         let mut jobs: Vec<ErasureJob> = (0..KEEP_FINISHED + 10)
-            .map(|n| job(n, ErasureStage::Published))
+            .map(|n| job(n, ErasureStage::Purged))
             .collect();
         jobs.insert(3, job(9_999, ErasureStage::Proving));
+        // Published, not yet purged: still to do.
+        jobs.insert(5, job(9_998, ErasureStage::Published));
         keep_recent_finished(&mut jobs);
-        assert_eq!(jobs.len(), KEEP_FINISHED + 1);
+        assert_eq!(jobs.len(), KEEP_FINISHED + 2);
         assert!(jobs.iter().any(|j| j.request_id == "erasure-9999"));
+        assert!(jobs.iter().any(|j| j.request_id == "erasure-9998"));
         assert!(
             jobs.iter().all(|j| j.request_id != "erasure-0"),
             "oldest dropped"

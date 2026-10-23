@@ -4,11 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fluree_db_core::commit::codec::{read_commit, read_commit_envelope};
-use fluree_db_core::{ContentId, ContentKind, Flake, LedgerId};
+use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, Flake, LedgerId};
 use serde::{Deserialize, Serialize};
 
 use super::index::{Artifact, ErasedCommit};
-use super::ErasureStage;
 use crate::retention::registry;
 use crate::{ApiError, Fluree, Result};
 
@@ -33,6 +32,9 @@ pub struct PurgePlan {
     pub rebuild: Vec<String>,
     /// Branches of soft-dropped ledgers, whose index artifacts are released.
     pub release: Vec<String>,
+    /// Branches dropped while others still fork from them, which keep their
+    /// indexes, whose history holds an erased commit.
+    pub retracted: Vec<String>,
 }
 
 impl Fluree {
@@ -55,11 +57,7 @@ impl Fluree {
                 continue;
             };
             jobs.extend(registration.erasures.iter().cloned());
-            for job in registration
-                .erasures
-                .iter()
-                .filter(|j| j.stage == ErasureStage::Published)
-            {
+            for job in registration.erasures.iter().filter(|j| j.purge_pending()) {
                 plan.requests.push(job.request_id.clone());
                 erased.extend(job.commits.iter().map(|c| c.commit.clone()));
                 if let Some(holders) = self.holders(&branch, job).await? {
@@ -144,11 +142,55 @@ impl Fluree {
         }
         plan.originals.sort();
         plan.transactions.sort();
+        plan.retracted = self
+            .retracted_holders(&name, &plan.rebuild, &txn_of)
+            .await?;
         plan.commits = erased.into_iter().collect();
         plan.superseded = superseded.into_iter().collect();
         plan.rebuild = rebuild.into_iter().collect();
         plan.release = release.into_iter().collect();
         Ok(plan)
+    }
+
+    /// The retracted branches, of `name`'s ledger and of the ledgers of
+    /// `holders`, whose history holds a commit of `erased` (by digest).
+    async fn retracted_holders<T>(
+        &self,
+        name: &LedgerId,
+        holders: &[String],
+        erased: &BTreeMap<String, T>,
+    ) -> Result<Vec<String>> {
+        let mut names: BTreeSet<String> = holders
+            .iter()
+            .filter_map(|b| LedgerId::parse(b).ok())
+            .map(|id| id.name().to_string())
+            .collect();
+        names.insert(name.name().to_string());
+        let mut retracted = Vec::new();
+        for ledger in names {
+            for record in self.nameservice().list_branches(&ledger).await? {
+                let (true, Some(head)) = (record.retracted, record.commit_head_id.as_ref()) else {
+                    continue;
+                };
+                // A history that cannot be read may hold one.
+                let holds = match self
+                    .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                    .await
+                {
+                    Ok(store) => match collect_first_parent_cids(store.as_ref(), head, 0).await {
+                        Ok(cids) => cids
+                            .iter()
+                            .any(|(_, cid)| erased.contains_key(&cid.address_digest())),
+                        Err(_) => true,
+                    },
+                    Err(_) => true,
+                };
+                if holds {
+                    retracted.push(record.ledger_id.to_string());
+                }
+            }
+        }
+        Ok(retracted)
     }
 
     /// What a purge of `ledger`'s published erasures would delete or
@@ -236,8 +278,10 @@ fn commit_id(commit: &str) -> Result<ContentId> {
         .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))
 }
 
+mod run;
 mod scan;
 #[cfg(test)]
 mod tests;
 
+pub use run::PurgeReport;
 pub use scan::PurgeScan;

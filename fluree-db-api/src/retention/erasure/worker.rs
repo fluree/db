@@ -775,7 +775,7 @@ impl Fluree {
             .ok_or_else(|| ApiError::internal(format!("erasure {request_id} is gone")))
     }
 
-    async fn update_job(
+    pub(super) async fn update_job(
         &self,
         branch: &str,
         request_id: &str,

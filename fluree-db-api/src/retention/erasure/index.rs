@@ -270,6 +270,16 @@ impl ErasureIndex {
         Ok(self.storage.exists(address).await?)
     }
 
+    /// Delete what is stored at `address`, past the substitution. Whether
+    /// anything was there.
+    pub(crate) async fn delete_raw(&self, address: &str) -> Result<bool> {
+        if !self.storage.exists(address).await? {
+            return Ok(false);
+        }
+        self.storage.delete(address).await?;
+        Ok(true)
+    }
+
     /// Every address under the storage, past the substitution: what the
     /// files are, not what reads of them return.
     pub(crate) async fn list_all(&self) -> Result<Vec<String>> {

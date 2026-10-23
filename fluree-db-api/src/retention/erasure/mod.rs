@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 pub use fluree_db_erasure::{Prover, ProverConfig, SubprocessProver, Verifier};
 pub use index::{ErasedCommit, ErasureStep};
-pub use purge::{PurgeInspection, PurgePlan, PurgeScan};
+pub use purge::{PurgeInspection, PurgePlan, PurgeReport, PurgeScan};
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};
 use serde::{Deserialize, Serialize};
 pub use worker::ErasurePassReport;
@@ -74,6 +74,8 @@ pub(crate) struct ErasureRuntime {
     /// Held to accept or publish an erasure, and to create a branch: the
     /// branches an erasure reaches are the branches as they are then.
     pub(crate) admission: tokio::sync::Mutex<()>,
+    /// Held by a purge pass: one at a time.
+    pub(crate) purging: tokio::sync::Mutex<()>,
 }
 
 impl ErasureRuntime {
@@ -83,6 +85,7 @@ impl ErasureRuntime {
             config,
             in_flight: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
+            purging: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -117,6 +120,12 @@ pub enum ErasureStage {
     Indexing,
     /// The replacements stand for the originals.
     Published,
+    /// The originals, and the copies of what the request removed, are being
+    /// deleted (see the job's `purge`).
+    Purging,
+    /// No storage the purge inspected holds what the request removed, except
+    /// values a surviving occurrence still uses.
+    Purged,
     /// A commit cannot be proved (the prover refused it); nothing published.
     Failed,
 }
@@ -186,6 +195,8 @@ pub struct ErasureJob {
     /// each ending the span of one of the request's occurrences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<crate::retention::removal::OccurrenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge: Option<PurgeProgress>,
 }
 
 impl ErasureJob {
@@ -193,4 +204,34 @@ impl ErasureJob {
     pub fn pending(&self) -> bool {
         matches!(self.stage, ErasureStage::Proving | ErasureStage::Indexing)
     }
+
+    /// Published, with its storage still to be purged.
+    pub fn purge_pending(&self) -> bool {
+        matches!(self.stage, ErasureStage::Published | ErasureStage::Purging)
+    }
+}
+
+/// How far a job's purge has come. Counts only, never a value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeProgress {
+    /// When its holders' indexes were rebuilt from the replacements; their
+    /// older indexes are released once readers have had time to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_ms: Option<i64>,
+    /// When a scan found nothing unaccounted for, before the originals were
+    /// deleted: a resumed purge then only deletes them and checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purged_ms: Option<i64>,
+    /// Files deleted.
+    #[serde(default)]
+    pub deleted: usize,
+    /// Removed values a surviving occurrence still uses, which stay.
+    #[serde(default)]
+    pub in_use: usize,
+    /// Why the purge cannot go on, while it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
 }
