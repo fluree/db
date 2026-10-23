@@ -104,7 +104,7 @@ Key `IndexerConfig` fields:
 | `leaf_max_bytes` | 375,000 | Maximum bytes per leaf node (triggers split) |
 | `branch_target_children` | 100 | Target children per branch node |
 | `branch_max_children` | 200 | Maximum children per branch node |
-| `gc_max_old_indexes` | 5 | Old index versions always kept, whatever their age |
+| `gc_max_old_indexes` | 0 | Old index versions always kept, whatever their age |
 | `gc_min_time_mins` | 15 | Minutes a superseded index version is kept, so a query that started on it can finish |
 | `gc_hard_max_old_indexes` | `Some(10)` | Version ceiling past which the age guard is overridden; `None` removes it. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
 | `run_budget_bytes` | 256 MB | Memory budget for sort buffers (split across all sort orders) |

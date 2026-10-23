@@ -215,10 +215,11 @@ async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids
     }
 }
 
-/// Default snapshot retention for BM25 manifests.
-/// Uses the same default as index GC (`gc_max_old_indexes` + 1 for current).
+/// Snapshots a BM25 manifest keeps, the current one included. A count alone:
+/// unlike index GC there is no age guard, so it keeps the retention index GC
+/// had before its age guard became the default.
 fn snapshot_retention() -> usize {
-    (crate::wasm_compat::DEFAULT_MAX_OLD_INDEXES as usize) + 1
+    6
 }
 
 // =============================================================================

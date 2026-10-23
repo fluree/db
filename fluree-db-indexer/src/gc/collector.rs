@@ -344,10 +344,10 @@ pub struct GarbagePlan {
 ///
 /// # Retention Policy
 ///
-/// - `max_old_indexes`: a floor of old versions always kept (default: 5).
-///   With max_old_indexes=5, we keep current + 5 old = 6 total
-/// - `min_time_garbage_mins`: past the floor, a version is kept until it has
-///   been superseded this long (default: 15)
+/// - `min_time_garbage_mins`: a version is kept until it has been superseded
+///   this long (default: 15)
+/// - `max_old_indexes`: a floor of old versions kept whatever their age
+///   (default: 0). With max_old_indexes=5, we keep current + 5 old = 6 total
 ///
 /// Age is determined by the garbage record's `created_at_ms` field. A record
 /// with no timestamp predates the field and is treated as past the window.
@@ -1721,6 +1721,53 @@ mod tests {
         assert!(store.has(&cid1).await.unwrap());
         assert!(store.has(&cid2).await.unwrap());
         assert!(store.has(&cid3).await.unwrap());
+    }
+
+    /// With the default settings the age guard alone decides: a slow ledger's
+    /// only old version goes once it has been superseded past the guard, and
+    /// stays while it is inside it. No count keeps it.
+    #[tokio::test]
+    async fn by_default_the_age_guard_alone_decides() {
+        for (age_mins, collected) in [(60_i64, true), (5, false)] {
+            let storage = MemoryStorage::new();
+            let seed = |what: &str| format!("default_guard_{age_mins}_{what}");
+            let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, seed("r1").as_bytes());
+            let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, seed("r2").as_bytes());
+            let (garb2, garb_addr2) =
+                cid_and_addr(ContentKind::GarbageRecord, seed("g2").as_bytes());
+            let superseded_at = current_timestamp_ms() - age_mins * 60 * 1000;
+
+            let root1 = minimal_fir6(1, None, None);
+            let root2 = minimal_fir6(
+                2,
+                Some(BinaryPrevIndexRef {
+                    t: 1,
+                    id: cid1.clone(),
+                }),
+                Some(BinaryGarbageRef { id: garb2.clone() }),
+            );
+            let garbage2 = format!(
+                r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": [], "created_at_ms": {superseded_at}}}"#
+            );
+            storage.write_bytes(&addr1, &root1).await.unwrap();
+            storage.write_bytes(&addr2, &root2).await.unwrap();
+            storage
+                .write_bytes(&garb_addr2, garbage2.as_bytes())
+                .await
+                .unwrap();
+
+            let store = test_store(&storage);
+            let result = clean_garbage(&store, &cid2, CleanGarbageConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                result.indexes_cleaned,
+                usize::from(collected),
+                "superseded {age_mins} minutes ago"
+            );
+            assert_eq!(result.retained, if collected { 1 } else { 2 });
+            assert_eq!(store.has(&cid1).await.unwrap(), !collected);
+        }
     }
 
     /// The hard ceiling overrides the age guard.

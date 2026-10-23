@@ -1661,8 +1661,8 @@ Call `without_indexing()` when another process, such as a dedicated indexer, mai
 Each index build supersedes the previous version. New queries read the newest one, but a query already running keeps reading the version it started on, so the indexer keeps superseded versions for a while before it collects them:
 
 - **Age guard** (default 15 minutes): a superseded version is kept this long.
-- **Floor** (default 5): the newest this many old versions are always kept, whatever their age.
 - **Ceiling** (default 10): past this many old versions, a version is collected even inside the age guard.
+- **Floor** (default 0): optionally, the newest this many old versions are always kept, whatever their age.
 
 ```rust
 use fluree_db_api::{FlureeBuilder, IndexerConfig};

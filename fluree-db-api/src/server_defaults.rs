@@ -646,9 +646,18 @@ mod tests {
         assert!(t.contains(&format!("# log_level = \"{DEFAULT_LOG_LEVEL}\"")));
         assert!(t.contains(&format!("# enabled = {DEFAULT_INDEXING_ENABLED}")));
         assert!(t.contains("# cache_max_mb = 4096"));
-        assert!(t.contains("# gc_min_time_mins = 15 "));
-        assert!(t.contains("# gc_max_old_indexes = 5 "));
-        assert!(t.contains("# gc_hard_max_old_indexes = 10 "));
+        use crate::wasm_compat::{
+            DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
+        };
+        assert!(t.contains(&format!(
+            "# gc_min_time_mins = {DEFAULT_MIN_TIME_GARBAGE_MINS} "
+        )));
+        assert!(t.contains(&format!(
+            "# gc_max_old_indexes = {DEFAULT_MAX_OLD_INDEXES} "
+        )));
+        assert!(t.contains(&format!(
+            "# gc_hard_max_old_indexes = {DEFAULT_HARD_MAX_OLD_INDEXES} "
+        )));
     }
 
     #[test]

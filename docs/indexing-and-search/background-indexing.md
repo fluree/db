@@ -270,23 +270,23 @@ Each index build publishes a new version of the ledger's index and supersedes th
 
 #### Settings
 
-Three settings decide when a superseded version goes:
+The age guard decides when a superseded version goes, and a ceiling backs it up for ledgers that publish fast:
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | Age guard | 15 minutes | A superseded version is kept this long, so a query that started on it can finish. |
-| Floor | 5 | The newest this many old versions are always kept, whatever their age. |
 | Ceiling | 10 | Past this many old versions, a version is collected even inside the age guard. |
+| Floor | 0 | Optional. The newest this many old versions are always kept, whatever their age. |
 
 Where each one is set:
 
-| | Age guard | Floor | Ceiling |
+| | Age guard | Ceiling | Floor |
 |---|---|---|---|
-| Server flag | `--gc-min-time-mins` | `--gc-max-old-indexes` | `--gc-hard-max-old-indexes` |
-| Environment | `FLUREE_GC_MIN_TIME_MINS` | `FLUREE_GC_MAX_OLD_INDEXES` | `FLUREE_GC_HARD_MAX_OLD_INDEXES` |
-| Config file, `[server.indexing]` | `gc_min_time_mins` | `gc_max_old_indexes` | `gc_hard_max_old_indexes` |
-| [JSON-LD connection config](../reference/connection-config-jsonld.md), `defaults.indexing` | `gcMinTimeMins` | `maxOldIndexes` | `gcHardMaxOldIndexes` |
-| Rust, `IndexerConfig` | `gc_min_time_mins` | `gc_max_old_indexes` | `gc_hard_max_old_indexes` |
+| Server flag | `--gc-min-time-mins` | `--gc-hard-max-old-indexes` | `--gc-max-old-indexes` |
+| Environment | `FLUREE_GC_MIN_TIME_MINS` | `FLUREE_GC_HARD_MAX_OLD_INDEXES` | `FLUREE_GC_MAX_OLD_INDEXES` |
+| Config file, `[server.indexing]` | `gc_min_time_mins` | `gc_hard_max_old_indexes` | `gc_max_old_indexes` |
+| [JSON-LD connection config](../reference/connection-config-jsonld.md), `defaults.indexing` | `gcMinTimeMins` | `gcHardMaxOldIndexes` | `maxOldIndexes` |
+| Rust, `IndexerConfig` | `gc_min_time_mins` | `gc_hard_max_old_indexes` | `gc_max_old_indexes` |
 
 From Rust, `FlureeBuilder::with_gc_settings(floor, age_guard, ceiling)` sets them on the builder; `None` leaves a setting at its default. See [Index retention](../getting-started/rust-api.md#index-retention).
 
@@ -294,11 +294,11 @@ The process that runs the indexer collects garbage, so its settings are the ones
 
 #### How the settings combine
 
-The collector keeps the floor, then keeps each older version until it has been superseded for longer than the age guard, then collects everything past the ceiling whatever its age. A ceiling below the floor has no effect. With the defaults:
+The collector keeps each old version until it has been superseded for longer than the age guard, and collects everything past the ceiling whatever its age. A floor, if set, is kept regardless of either; a ceiling below the floor has no effect. With the defaults:
 
 | Publish rate | Old versions kept | Decided by |
 |--------------|-------------------|------------|
-| Once an hour | 5 | The floor: every old version is past the age guard. |
+| Once an hour | 1, then 0 | The age guard: the previous version is kept for 15 minutes after each publish, then collected. |
 | Every 2 minutes | 7 or 8 | The age guard: the versions superseded in the last 15 minutes. |
 | Every 10 seconds | 10 | The ceiling: the age guard alone would keep about 90. |
 
@@ -312,11 +312,11 @@ The collector runs after every index publish, and also on the worker's periodic 
 
 #### Monitoring
 
-Each pass logs what it left at `INFO`. A pass that releases something logs `Garbage collection complete`. A pass that releases nothing while versions are past the floor logs `Garbage collection released nothing`, so a ledger whose old versions are all inside the age guard still shows up. Both carry:
+Each pass logs what it left at `INFO`. A pass that releases something logs `Garbage collection complete`. A pass that releases nothing while the age guard is holding old versions logs `Garbage collection released nothing`, so the versions a ledger keeps are visible either way. Both carry:
 
 - `retained`: the versions left on the chain, the current one included.
-- `retention_target`: the floor, counting the current version (`1 + gc_max_old_indexes`).
-- `past_target`: the retained versions beyond the floor, which the age guard is holding. With the ceiling set, it stays at or below `gc_hard_max_old_indexes − gc_max_old_indexes` unless a garbage manifest could not be read.
+- `retention_target`: the floor, counting the current version (`1 + gc_max_old_indexes`, so `1` by default).
+- `past_target`: the retained versions beyond the floor, which the age guard is holding. With the default floor of 0, that is every old version kept. With the ceiling set, it stays at or below `gc_hard_max_old_indexes − gc_max_old_indexes` unless a garbage manifest could not be read.
 - `stopped_by`: present when the pass stopped before the oldest version. `age_guard` means the next version was inside `gc_min_time_mins`. `unreadable_manifest` means a garbage manifest could not be read.
 
 The completion line also carries `age_guard_overridden`: the versions collected past the ceiling while still inside the age guard. A non-zero value means the ceiling, not the age guard, is limiting retention, and a query still reading one of those versions may have lost it.
@@ -365,10 +365,10 @@ A sweep is ledger-wide rather than per-branch, because dictionary blobs are shar
 **Symptom:** the ledger's index storage (`objects/history` on disk, or its prefix in a bucket) grows much faster than its data.
 
 **Check** the garbage collection log lines (see [Monitoring](#monitoring)):
-- `past_target` near `gc_hard_max_old_indexes − gc_max_old_indexes`: the age guard is holding versions up to the ceiling, which is retention working as configured. Lower the ceiling, or the age guard, if your queries allow it (see [Sizing](#sizing)).
+- `past_target` near `gc_hard_max_old_indexes − gc_max_old_indexes` (10 by default): the age guard is holding versions up to the ceiling, which is retention working as configured. Lower the ceiling, or the age guard, if your queries allow it (see [Sizing](#sizing)).
 - `past_target` above that, with `stopped_by=unreadable_manifest`: a garbage manifest could not be read, and the collector cannot pass it. Look for storage errors on the manifest named at `DEBUG`.
 - `retained` small but storage still large: the artifacts are outside the chain the collector walks. Run a [sweep](#reclaiming-orphaned-artifacts).
-- No collector lines at all: either no version is past the floor, or this process does not run the indexer. Retention is decided where indexing runs.
+- No collector lines at all: either the ledger keeps no old versions, or this process does not run the indexer. Retention is decided where indexing runs.
 
 ### Slow Indexing
 

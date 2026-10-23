@@ -77,8 +77,8 @@ Supported:
   - `defaults.indexing.reindexMinBytes` / `reindexMaxBytes` are applied as the default `IndexConfig` for writes
   - `defaults.indexing.indexingEnabled=false` suppresses background index triggers
   - `defaults.indexing.gcMinTimeMins`: minutes a superseded index version is kept, so a query that started on it can finish (default: 15)
-  - `defaults.indexing.maxOldIndexes`: old index versions always kept, whatever their age (default: 5)
   - `defaults.indexing.gcHardMaxOldIndexes`: past this many old index versions, a version is collected even inside `gcMinTimeMins` (default: 10)
+  - `defaults.indexing.maxOldIndexes`: old index versions always kept, whatever their age (default: 0)
 
   The three retention keys apply only where this connection runs the indexer. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention) for how they combine.
 
@@ -90,7 +90,6 @@ Supported:
     "defaults": {
       "indexing": {
         "gcMinTimeMins": 30,
-        "maxOldIndexes": 5,
         "gcHardMaxOldIndexes": 40
       }
     }

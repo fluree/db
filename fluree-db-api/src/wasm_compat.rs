@@ -92,7 +92,7 @@ where
 #[cfg(target_arch = "wasm32")]
 mod stubs {
     /// Mirrors `fluree_db_indexer::gc::DEFAULT_MAX_OLD_INDEXES`.
-    pub const DEFAULT_MAX_OLD_INDEXES: u32 = 5;
+    pub const DEFAULT_MAX_OLD_INDEXES: u32 = 0;
 
     /// Mirrors `fluree_db_indexer::gc::DEFAULT_MIN_TIME_GARBAGE_MINS`.
     pub const DEFAULT_MIN_TIME_GARBAGE_MINS: u32 = 15;
@@ -201,7 +201,7 @@ mod stub_drift {
         );
         assert_eq!(
             super::DEFAULT_MAX_OLD_INDEXES,
-            5,
+            0,
             "stubs::DEFAULT_MAX_OLD_INDEXES must be updated to match"
         );
         assert_eq!(

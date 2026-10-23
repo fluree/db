@@ -173,12 +173,13 @@ pub struct IndexerConfig {
     /// Default: 200
     pub branch_max_children: usize,
 
-    /// Old index versions always retained, whatever their age: the floor.
+    /// Old index versions always retained, whatever their age: an optional
+    /// floor under the age guard.
     ///
     /// After each index refresh, the old versions past this many in the
     /// prev-index chain become eligible for GC once the age guard
     /// (`gc_min_time_mins`) has passed.
-    /// Default: 5
+    /// Default: 0, so the age guard alone decides below the ceiling.
     pub gc_max_old_indexes: u32,
 
     /// Minimum age in minutes before an index version can be garbage collected.

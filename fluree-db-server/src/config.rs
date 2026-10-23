@@ -492,7 +492,7 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
     pub reindex_max_bytes: Option<usize>,
 
-    /// Old index versions always retained, whatever their age (default 5)
+    /// Old index versions always retained, whatever their age (default 0)
     #[arg(long, env = "FLUREE_GC_MAX_OLD_INDEXES")]
     pub gc_max_old_indexes: Option<u32>,
 

@@ -94,18 +94,18 @@
 //! ## Time-Based Retention
 //!
 //! A superseded index version is kept so a query that started against it can
-//! finish; newer queries read the newest version. Three thresholds decide when
-//! it goes:
+//! finish; newer queries read the newest version. The age guard decides when it
+//! goes, and a ceiling backs it up:
 //! - `min_time_garbage_mins` (default 15): the age guard. A version is kept
 //!   until it has been superseded this long.
-//! - `max_old_indexes` (default 5): a floor. The newest this many old versions
-//!   are kept whatever their age.
-//! - `hard_max_old_indexes` (the indexer's default is 10): a ceiling. Past this
-//!   many old versions, a version goes whatever its age.
+//! - `hard_max_old_indexes` (the indexer's default is 10): the ceiling. Past
+//!   this many old versions, a version goes whatever its age.
+//! - `max_old_indexes` (default 0): an optional floor. The newest this many old
+//!   versions are kept whatever their age.
 //!
-//! Between the floor and the ceiling the age guard decides, so a ledger that
-//! publishes slowly keeps the floor and one that publishes fast keeps what fits
-//! in the guard, up to the ceiling.
+//! So a ledger keeps the versions superseded within the guard, up to the
+//! ceiling: none once it has been idle past the guard, all of them when it
+//! publishes slowly, and the ceiling when it publishes fast.
 //!
 //! Without a ceiling, retention under a sustained publish rate is "however many
 //! versions fit in the guard", which grows with publish rate and per-version
@@ -178,8 +178,9 @@ pub enum SharedBlobPolicy {
     },
 }
 
-/// Default maximum number of old indexes to retain
-pub const DEFAULT_MAX_OLD_INDEXES: u32 = 5;
+/// Default floor of old index versions kept whatever their age: none, so the
+/// age guard alone decides below the ceiling.
+pub const DEFAULT_MAX_OLD_INDEXES: u32 = 0;
 
 /// Default minimum age (in minutes) before an index can be garbage collected
 pub const DEFAULT_MIN_TIME_GARBAGE_MINS: u32 = 15;
@@ -192,9 +193,10 @@ pub const DEFAULT_HARD_MAX_OLD_INDEXES: u32 = 10;
 /// Configuration for garbage collection
 #[derive(Debug, Clone, Default)]
 pub struct CleanGarbageConfig {
-    /// Maximum number of old indexes to keep (None = default 5)
+    /// Old index versions kept whatever their age (None = default 0)
     ///
-    /// With max_old_indexes=5, we keep current + 5 old = 6 total index versions.
+    /// With max_old_indexes=5, the current version and the newest 5 old ones
+    /// are never collected.
     pub max_old_indexes: Option<u32>,
     /// Minimum age in minutes before GC (None = default 15)
     ///

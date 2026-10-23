@@ -2458,11 +2458,11 @@ impl FlureeBuilder {
     /// matter, since each preserves the other's half of the config.
     ///
     /// `min_time_mins` is the age guard: a superseded version is kept that long
-    /// so a query that started on it can finish. `max_old_indexes` is a floor
-    /// kept whatever its age, and `hard_max_old_indexes` a ceiling (default
-    /// 10) past which versions go whatever their age. The ceiling bounds
-    /// retained versions, not bytes, and can release artifacts a query still
-    /// reading an older version needs; see
+    /// so a query that started on it can finish. `hard_max_old_indexes` is a
+    /// ceiling (default 10) past which versions go whatever their age, and
+    /// `max_old_indexes` an optional floor (default 0) kept whatever its age.
+    /// The ceiling bounds retained versions, not bytes, and can release
+    /// artifacts a query still reading an older version needs; see
     /// `CleanGarbageConfig::hard_max_old_indexes` in `fluree_db_indexer::gc`
     /// for the trade-off. To remove it, set
     /// `IndexerConfig::gc_hard_max_old_indexes` to `None`.
