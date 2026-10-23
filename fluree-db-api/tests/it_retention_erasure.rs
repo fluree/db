@@ -1768,6 +1768,79 @@ async fn a_purge_releases_a_dropped_holders_index_and_a_restore_rebuilds_it() {
     );
 }
 
+/// Under the write-ahead log, no file under the storage holds the erased
+/// value once a purge completes, the log's segments included.
+#[tokio::test]
+async fn a_purge_under_the_write_ahead_log_leaves_no_file_holding_the_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_storage_durability(fluree_db_core::Durability::Wal)
+        .with_erasure(ErasureConfig {
+            prover: Arc::new(NativeProver::default()),
+            verifier: Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build()
+        .unwrap();
+    let id = ledger(&fluree, "it/purge-wal").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
+/// Another process's write-ahead log under the storage may hold the erased
+/// bytes, beyond this process's checkpoint, and an open after it stops
+/// replays it: the purge stops and says why.
+#[tokio::test]
+async fn a_purge_waits_for_another_processs_write_ahead_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-foreign-log").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let owner = dir.path().join(".fluree-wal/owners/another-node");
+    std::fs::create_dir_all(&owner).unwrap();
+    std::fs::write(owner.join("00000000000000000001.wal"), b"").unwrap();
+
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    let why = report.blocked.expect("blocked");
+    assert!(why.contains("write-ahead log"), "{why}");
+    assert_eq!(report.purged, 0);
+}
+
 /// An archive made before an erasure, restored after its purge, brings back
 /// neither the transaction documents nor the index files that held the
 /// value: their writes are dropped, and the archive's index, rebuilt over,

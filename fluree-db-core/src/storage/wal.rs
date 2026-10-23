@@ -624,6 +624,43 @@ pub(super) fn checkpoint_root(base: &Path) -> io::Result<bool> {
     Ok(any)
 }
 
+/// How many segment files the logs of owners other than this process keep
+/// under `base`: what a write there holds, no checkpoint here retires, and
+/// an open of the root after their owner dies replays.
+pub(super) fn foreign_segments(base: &Path) -> io::Result<usize> {
+    let base = match std::fs::canonicalize(base) {
+        Ok(base) => base,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let owners = base.join(WAL_DIR).join(OWNERS_DIR);
+    let entries = match std::fs::read_dir(&owners) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut segments = 0;
+    for entry in entries {
+        let dir = entry?.path();
+        let ours = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&dir)
+            .and_then(Weak::upgrade)
+            .is_some();
+        if ours || !dir.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(&dir)? {
+            let path = file?.path();
+            if path.extension().is_some_and(|e| e == SEGMENT_EXT) {
+                segments += 1;
+            }
+        }
+    }
+    Ok(segments)
+}
+
 /// Replay the logs of owners that are no longer running, if this root has
 /// owned logs at all. A dead node's acknowledged payloads may exist only in
 /// its log; any node opening the root, or missing a file, can apply them.

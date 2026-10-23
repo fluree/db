@@ -96,6 +96,13 @@ impl Fluree {
                 "this instance does not collect garbage: it does not hold its storage's lock",
             )
         });
+        let blocked = match blocked {
+            Some(why) => Some(why),
+            None => (self.foreign_wal_segments().await? > 0).then_some(
+                "another process's write-ahead log under this storage may hold erased bytes, \
+                 and an open after it stops would replay them",
+            ),
+        };
         if let Some(why) = blocked {
             return self.block(&jobs, report, why.to_string()).await;
         }
@@ -223,6 +230,7 @@ impl Fluree {
                 )));
             }
         }
+        self.make_deletes_durable(&plan).await?;
         if let Some(manager) = &self.ledger_manager {
             for branch in &plan.rebuild {
                 if let Ok(id) = LedgerId::parse(branch) {
@@ -390,6 +398,42 @@ impl Fluree {
             }
         }
         Ok(deleted)
+    }
+
+    /// Make the purge's deletes survive a crash: retire the write-ahead log,
+    /// which would otherwise replay the writes they undid and still holds
+    /// their bytes, then flush the directories they were in.
+    async fn make_deletes_durable(&self, plan: &PurgePlan) -> Result<()> {
+        let Some(root) = self.config.index_storage.path.clone() else {
+            return Ok(());
+        };
+        let prefix = self.erasure_runtime()?.index.address_prefix();
+        let keys: Vec<String> = plan
+            .originals
+            .iter()
+            .chain(&plan.transactions)
+            .chain(&plan.superseded)
+            .filter_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            fluree_db_core::FileStorage::checkpoint_wal(root.as_ref())?;
+            fluree_db_core::FileStorage::sync_parent_dirs(root.as_ref(), &keys)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("purge flush: {e}")))??;
+        Ok(())
+    }
+
+    /// Segments other processes' write-ahead logs keep under this storage.
+    async fn foreign_wal_segments(&self) -> Result<usize> {
+        let Some(root) = self.config.index_storage.path.clone() else {
+            return Ok(0);
+        };
+        Ok(tokio::task::spawn_blocking(move || {
+            fluree_db_core::FileStorage::foreign_wal_segments(root.as_ref())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("write-ahead log check: {e}")))??)
     }
 
     /// Release every index of `branch` older than its current one, with what

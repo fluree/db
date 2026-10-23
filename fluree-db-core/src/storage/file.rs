@@ -1125,6 +1125,51 @@ impl FileStorage {
         wal::checkpoint_root(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
     }
 
+    /// How many segment files other processes' logs keep under `root`. Their
+    /// writes are beyond this process's checkpoint, and the next open after
+    /// their owner dies replays them.
+    pub fn foreign_wal_segments(root: impl AsRef<Path>) -> Result<usize> {
+        wal::foreign_segments(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
+    }
+
+    /// Flush the directories under `root` that held the files at `keys`, so
+    /// their unlinks survive power loss: without the WAL, an unlink is
+    /// durable only once its directory is. Returns how many it flushed.
+    pub fn sync_parent_dirs(root: impl AsRef<Path>, keys: &[String]) -> Result<usize> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for key in keys {
+            if let Some(dir) = wal::key_path(root.as_ref(), key)
+                .as_deref()
+                .and_then(Path::parent)
+            {
+                dirs.insert(dir.to_path_buf());
+            }
+        }
+        let mut flushed = 0;
+        for dir in dirs {
+            #[cfg(not(unix))]
+            let _ = dir;
+            #[cfg(unix)]
+            match std::fs::File::open(&dir) {
+                Ok(handle) => {
+                    handle.sync_all().map_err(|e| {
+                        crate::error::Error::io(format!("flush {}: {e}", dir.display()))
+                    })?;
+                    flushed += 1;
+                }
+                // Gone with its last file: its parent records that.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(crate::error::Error::io(format!(
+                        "open {}: {e}",
+                        dir.display()
+                    )))
+                }
+            }
+        }
+        Ok(flushed)
+    }
+
     /// Abandon the WAL without flushing, as a crash would, so a test can
     /// reopen the root and exercise replay within one process.
     #[doc(hidden)]
