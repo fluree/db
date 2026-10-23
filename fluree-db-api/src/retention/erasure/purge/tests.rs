@@ -421,3 +421,122 @@ async fn a_purge_rewrites_a_schedule_holding_an_erased_fact() {
     assert!(!rewritten.contains(&erased) && rewritten.contains(&kept));
     assert!(!store.has(&blob).await.unwrap());
 }
+
+/// Erasing leaf by leaf leaves an index that reads as a full rebuild from
+/// the replacements does: every subject the same as of every `t`, for a
+/// value in a dictionary and a value embedded in the key alike.
+#[tokio::test]
+async fn erasing_leaf_by_leaf_reads_as_a_rebuild() {
+    use fluree_db_core::{range, IndexType, RangeMatch, RangeOptions, RangeTest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/leafwise").await.unwrap();
+    let id = "t/leafwise:main";
+    let ex = |s: &str| format!("http://example.org/{s}");
+    insert(
+        &fluree,
+        id,
+        json!({"@graph": [
+            {"@id": ex("alice"), ex("email"): "a@secret", ex("nick"): "ally", ex("age"): 41},
+            {"@id": ex("bob"), ex("email"): "b@kept", ex("age"): 30}
+        ]}),
+    )
+    .await;
+    insert(
+        &fluree,
+        id,
+        json!({"@graph": [
+            {"@id": ex("carol"), ex("name"): "Carol", ex("score"): 3.5},
+            // The same string, kept: its dictionary entry stays.
+            {"@id": ex("dave"), ex("email"): "a@secret"}
+        ]}),
+    )
+    .await;
+    fluree
+        .graph(id)
+        .transact()
+        .update(&json!({
+            "delete": {"@id": ex("bob"), ex("age"): 30},
+            "insert": {"@id": ex("bob"), ex("age"): 31}
+        }))
+        .commit()
+        .await
+        .unwrap();
+    let request = ErasureRequest {
+        matching: vec![
+            FactSelector {
+                subject: ex("alice"),
+                predicate: ex("email"),
+                graph: None,
+                object: None,
+            },
+            FactSelector {
+                subject: ex("alice"),
+                predicate: ex("age"),
+                graph: None,
+                object: None,
+            },
+            // A string nothing else uses: its dictionary entry goes.
+            FactSelector {
+                subject: ex("alice"),
+                predicate: ex("nick"),
+                graph: None,
+                object: None,
+            },
+        ],
+        ..Default::default()
+    };
+    erase(&fluree, id, request).await;
+    let plan = fluree.plan_purge(id).await.unwrap();
+    let captured = fluree.capture_erased(&plan).await.unwrap();
+    assert!(captured.len() >= 4, "{captured:?}");
+
+    let reads = |fluree: &Fluree| {
+        let fluree = fluree.clone();
+        async move {
+            let state = fluree.ledger(id).await.unwrap();
+            let mut out = Vec::new();
+            for t in 1..=state.t() {
+                for s in ["alice", "bob", "carol", "dave"] {
+                    let sid = state.snapshot.encode_iri(&ex(s)).unwrap();
+                    let mut flakes: Vec<String> = range(
+                        &state.snapshot,
+                        0,
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject(sid),
+                        RangeOptions {
+                            to_t: Some(t),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| format!("{} {} {:?} {}", f.s, f.p, f.o, f.op))
+                    .collect();
+                    flakes.sort();
+                    out.push((t, s, flakes));
+                }
+            }
+            out
+        }
+    };
+
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    assert_eq!(
+        fluree.erase_from_index(&record, &captured).await.unwrap(),
+        super::erase::Erased::Leafwise
+    );
+    let scan = fluree.scan_purge(&plan, &captured).await.unwrap();
+    assert!(
+        scan.indexed.is_empty() && scan.dictionary.is_empty(),
+        "{scan:?}"
+    );
+    let leafwise = reads(&fluree).await;
+
+    fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+    let rebuilt = reads(&fluree).await;
+    assert_eq!(leafwise, rebuilt);
+}

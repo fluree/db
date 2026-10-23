@@ -1544,6 +1544,8 @@ async fn a_purge_deletes_every_copy_and_leaves_reads_as_they_were() {
         .await
         .unwrap();
     assert!(report.waiting && report.purged == 0, "{report:?}");
+    // The ledger and its copy, rewritten leaf by leaf.
+    assert_eq!((report.leafwise, report.rebuilt), (2, 0), "{report:?}");
     let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
     assert_eq!(report.purged, 1, "{report:?}");
 
@@ -1858,4 +1860,55 @@ async fn the_worker_purges_a_published_erasure() {
         files_holding(dir.path(), "a@secret"),
         Vec::<std::path::PathBuf>::new()
     );
+}
+
+/// A value stored outside the leaves and the string dictionary, here an
+/// integer too large for 64 bits in the big-number arena, cannot be erased
+/// leaf by leaf: that holder's index is rebuilt from the replacements, and
+/// the purge completes as before.
+#[tokio::test]
+async fn a_value_outside_the_leaves_is_purged_by_a_rebuild() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-big").await;
+    let big = "123456789012345678901234567890";
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:balance": {
+            "@value": big,
+            "@type": "http://www.w3.org/2001/XMLSchema#integer"
+        }}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(
+            &id,
+            ErasureRequest {
+                matching: vec![FactSelector {
+                    subject: "http://example.org/alice".into(),
+                    predicate: "http://example.org/balance".into(),
+                    graph: None,
+                    object: None,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        (report.purged, report.leafwise, report.rebuilt),
+        (1, 0, 1),
+        "{report:?}"
+    );
+    assert!(objects(&fluree, &id, "ex:alice", "ex:balance")
+        .await
+        .is_empty());
 }

@@ -10,6 +10,7 @@ use fluree_db_indexer::{plan_garbage, release_garbage_plan, siblings_of, CleanGa
 use serde::Serialize;
 
 use super::super::{ErasureJob, ErasureStage, PurgeProgress};
+use super::erase::Erased;
 use super::{Captured, PurgePlan};
 use crate::retention::registry;
 use crate::retention::state::{FactKey, Schedule};
@@ -26,6 +27,11 @@ pub struct PurgeReport {
     pub purged: usize,
     /// Files it deleted.
     pub deleted: usize,
+    /// Holders whose indexes it rewrote leaf by leaf.
+    pub leafwise: usize,
+    /// Holders whose indexes it rebuilt, a value living outside the leaves
+    /// and the string dictionary.
+    pub rebuilt: usize,
     /// Waiting for readers of the older indexes to finish before releasing
     /// them.
     pub waiting: bool,
@@ -34,9 +40,11 @@ pub struct PurgeReport {
 }
 
 impl Fluree {
-    /// Purge `ledger`'s published erasures. Rebuilds every holding branch's
-    /// index from the replacements, releases the older indexes once
-    /// `release_after` has passed since the rebuild, scans for the erased
+    /// Purge `ledger`'s published erasures. Rewrites every holding branch's
+    /// index without the erased events, leaf by leaf (rebuilding it from the
+    /// replacements where a value lives outside the leaves and the string
+    /// dictionary), releases the older indexes once `release_after` has
+    /// passed since, scans for the erased
     /// values, deletes what the plan and the scan name with the originals
     /// last, and checks that they are gone. A pass interrupted anywhere
     /// resumes from where it stopped.
@@ -90,7 +98,17 @@ impl Fluree {
                 Some(ms) => ms,
                 None => {
                     for branch in &plan.rebuild {
-                        self.reindex(branch, ReindexOptions::default()).await?;
+                        let Some(record) = self.nameservice().lookup(branch).await? else {
+                            continue;
+                        };
+                        match self.erase_from_index(&record, &captured).await? {
+                            Erased::Leafwise => report.leafwise += 1,
+                            Erased::NeedsRebuild => {
+                                self.reindex(branch, ReindexOptions::default()).await?;
+                                report.rebuilt += 1;
+                            }
+                            Erased::Nothing => {}
+                        }
                     }
                     let ms = now_ms();
                     self.update_purge(&jobs, |p| p.rebuilt_ms = Some(ms))

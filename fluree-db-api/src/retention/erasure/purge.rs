@@ -300,6 +300,7 @@ fn commit_id(commit: &str) -> Result<ContentId> {
         .map_err(|_| ApiError::internal(format!("not a commit id: {commit}")))
 }
 
+mod erase;
 mod run;
 mod scan;
 #[cfg(test)]
