@@ -226,3 +226,111 @@ async fn a_scan_follows_every_parent_of_a_merge() {
     assert!(scan.clean(), "{scan:?}");
     assert_eq!(scan.in_use, 1, "{scan:?}");
 }
+
+/// A file no history reaches is found by the value it holds, in each form a
+/// transaction document takes: JSON-LD, an RDF or query body, a signed
+/// payload. A TTL schedule still holding an erased fact is found too.
+#[tokio::test]
+async fn a_scan_finds_documents_and_schedules_holding_a_captured_value() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    use crate::retention::state::{Entry, FactKey, Schedule, Source};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/documents").await.unwrap();
+    let id = "t/documents:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}),
+    )
+    .await;
+    // A surviving use of the value, whose own document holds it.
+    fluree
+        .graph(id)
+        .transact()
+        .txn_opts(fluree_db_transact::TxnOpts::default().store_raw_txn(true))
+        .insert(&json!({"@id": "http://example.org/dave", "http://example.org/email": "a@secret"}))
+        .commit()
+        .await
+        .unwrap();
+    erase(&fluree, id, email("alice", "a@secret")).await;
+    fluree.reindex(id, ReindexOptions::default()).await.unwrap();
+    let plan = fluree.plan_purge(id).await.unwrap();
+    let captured = fluree.capture_erased(&plan).await.unwrap();
+    assert!(fluree.scan_purge(&plan, &captured).await.unwrap().clean());
+
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let folder = dir.path().join(record.storage_namespace().branch_prefix());
+    let write = |kind: &str, ext: &str, bytes: &[u8]| {
+        let hex = hex::encode(Sha256::digest(bytes));
+        std::fs::create_dir_all(folder.join(kind)).unwrap();
+        std::fs::write(folder.join(kind).join(format!("{hex}.{ext}")), bytes).unwrap();
+        hex
+    };
+    let payload = json!({"insert": {"http://example.org/email": "a@secret"}}).to_string();
+    let found = [
+        write(
+            "txn",
+            "json",
+            json!({"insert": {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"}})
+                .to_string()
+                .as_bytes(),
+        ),
+        write(
+            "txn",
+            "json",
+            json!("<http://example.org/alice> <http://example.org/email> \"a@secret\" .")
+                .to_string()
+                .as_bytes(),
+        ),
+        write(
+            "txn",
+            "json",
+            json!(format!(
+                "e30.{}.c2ln",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+            ))
+            .to_string()
+            .as_bytes(),
+        ),
+    ];
+    let other = write(
+        "txn",
+        "json",
+        json!({"insert": {"http://example.org/email": "b@other"}})
+            .to_string()
+            .as_bytes(),
+    );
+    let asserted = captured.iter().find(|c| c.flake.op).unwrap();
+    let mut schedule = Schedule::starting_after(0);
+    schedule.insert(
+        FactKey::of(&asserted.flake),
+        Entry {
+            due_ms: 0,
+            occurrence_t: asserted.flake.t,
+            occurrence_slot: 0,
+            source: Source::Property,
+            generation_t: asserted.flake.t,
+            reifier: None,
+        },
+    );
+    let scheduled = write("retention", "frs", &schedule.encode().unwrap());
+
+    let scan = fluree.scan_purge(&plan, &captured).await.unwrap();
+    for hex in &found {
+        assert!(
+            scan.unreferenced.iter().any(|a| a.contains(hex.as_str())),
+            "{hex}: {scan:?}"
+        );
+    }
+    assert!(
+        !scan.unreferenced.iter().any(|a| a.contains(&other)),
+        "{scan:?}"
+    );
+    assert_eq!(scan.unreferenced.len(), 3, "{scan:?}");
+    assert_eq!(scan.schedules.len(), 1, "{scan:?}");
+    assert!(scan.schedules[0].contains(&scheduled), "{scan:?}");
+}
