@@ -2021,10 +2021,11 @@ async fn a_purge_waits_for_a_retracted_holder_and_for_a_dependent_index() {
         "where": [{"@id": "?x", "@type": "ex:Person", "ex:email": "?email"}],
         "select": {"?x": ["@id", "ex:email"]}
     });
+    // Named by the ledger alone, as a creator may: its main branch.
     fluree
         .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
             "it-purge-search",
-            &id,
+            "it/purge-indexed",
             query,
         ))
         .await

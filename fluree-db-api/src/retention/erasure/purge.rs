@@ -165,7 +165,11 @@ impl Fluree {
                         g.source_type,
                         GraphSourceType::Bm25 | GraphSourceType::Vector | GraphSourceType::Geo
                     )
-                    && g.dependencies.iter().any(|d| holders.contains(d))
+                    // As the creator named it: a ledger alone is its main
+                    // branch.
+                    && g.dependencies.iter().any(|d| {
+                        LedgerId::parse(d).is_ok_and(|id| holders.contains(&id.to_string()))
+                    })
             })
             .map(|g| g.graph_source_id.to_string())
             .collect();
