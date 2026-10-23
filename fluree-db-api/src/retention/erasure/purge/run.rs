@@ -59,6 +59,11 @@ impl Fluree {
             Some("soft-dropped ledgers hold erased commits: restore or purge them first")
         } else if !plan.retracted.is_empty() {
             Some("dropped branches that other branches still fork from hold erased commits")
+        } else if !plan.sources.is_empty() {
+            Some(
+                "full-text, vector or geospatial indexes over the ledger keep their own \
+                 copies: drop and recreate them first",
+            )
         } else {
             None
         };

@@ -1700,3 +1700,102 @@ async fn an_old_archive_restored_after_a_purge_brings_nothing_back() {
         vec![json!("b@kept")]
     );
 }
+
+/// A purge stops for what it cannot yet rebuild: a branch of a copy that
+/// was dropped while another still forks from it, keeping its index, and a
+/// full-text index over the ledger, which keeps its own copy.
+#[tokio::test]
+async fn a_purge_waits_for_a_retracted_holder_and_for_a_dependent_index() {
+    use std::time::Duration;
+
+    async fn published(name: &str) -> (tempfile::TempDir, Fluree, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+        let id = ledger(&fluree, name).await;
+        insert(
+            &fluree,
+            &id,
+            json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "a@secret"}),
+        )
+        .await;
+        (dir, fluree, id)
+    }
+    async fn publish(fluree: &Fluree, id: &str, holders: &[&str]) {
+        fluree
+            .erase_occurrences(id, email("alice", "a@secret"), None)
+            .await
+            .expect("erase");
+        for holder in std::iter::once(&id).chain(holders) {
+            reindex(fluree, holder).await;
+        }
+        assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+    }
+
+    let (_dir, fluree, id) = published("it/purge-retracted").await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    fluree
+        .restore_ledger("it/purge-retracted-copy", &mut archive.as_slice())
+        .await
+        .unwrap();
+    fluree
+        .create_branch("it/purge-retracted-copy", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("it/purge-retracted-copy", "dev2", Some("dev"), None)
+        .await
+        .unwrap();
+    let dropped = fluree
+        .drop_branch("it/purge-retracted-copy", "dev")
+        .await
+        .unwrap();
+    assert!(dropped.deferred, "{dropped:?}");
+    publish(
+        &fluree,
+        &id,
+        &[
+            "it/purge-retracted-copy:main",
+            "it/purge-retracted-copy:dev2",
+        ],
+    )
+    .await;
+    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert_eq!(
+        plan.retracted,
+        vec!["it/purge-retracted-copy:dev".to_string()]
+    );
+    let why = fluree
+        .run_purge_pass(&id, Duration::ZERO)
+        .await
+        .unwrap()
+        .blocked
+        .expect("blocked");
+    assert!(why.contains("dropped branches"), "{why}");
+
+    let (_dir, fluree, id) = published("it/purge-indexed").await;
+    let query = json!({
+        "@context": ctx(),
+        "where": [{"@id": "?x", "@type": "ex:Person", "ex:email": "?email"}],
+        "select": {"?x": ["@id", "ex:email"]}
+    });
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "it-purge-search",
+            &id,
+            query,
+        ))
+        .await
+        .unwrap();
+    publish(&fluree, &id, &[]).await;
+    let why = fluree
+        .run_purge_pass(&id, Duration::ZERO)
+        .await
+        .unwrap()
+        .blocked
+        .expect("blocked");
+    assert!(why.contains("full-text"), "{why}");
+}

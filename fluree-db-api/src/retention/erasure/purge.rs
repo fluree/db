@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fluree_db_core::commit::codec::{read_commit, read_commit_envelope};
 use fluree_db_core::{collect_first_parent_cids, ContentId, ContentKind, Flake, LedgerId};
+use fluree_db_nameservice::GraphSourceType;
 use serde::{Deserialize, Serialize};
 
 use super::index::{Artifact, ErasedCommit};
@@ -35,6 +36,9 @@ pub struct PurgePlan {
     /// Branches dropped while others still fork from them, which keep their
     /// indexes, whose history holds an erased commit.
     pub retracted: Vec<String>,
+    /// Full-text, vector and geospatial indexes over a holder, which keep
+    /// their own copies of what they index.
+    pub sources: Vec<String>,
 }
 
 impl Fluree {
@@ -142,13 +146,29 @@ impl Fluree {
         }
         plan.originals.sort();
         plan.transactions.sort();
-        plan.retracted = self
-            .retracted_holders(&name, &plan.rebuild, &txn_of)
-            .await?;
         plan.commits = erased.into_iter().collect();
         plan.superseded = superseded.into_iter().collect();
         plan.rebuild = rebuild.into_iter().collect();
         plan.release = release.into_iter().collect();
+        plan.retracted = self
+            .retracted_holders(&name, &plan.rebuild, &txn_of)
+            .await?;
+        let holders: BTreeSet<&String> = plan.rebuild.iter().chain(&plan.release).collect();
+        plan.sources = self
+            .nameservice()
+            .all_graph_source_records()
+            .await?
+            .into_iter()
+            .filter(|g| {
+                !g.retracted
+                    && matches!(
+                        g.source_type,
+                        GraphSourceType::Bm25 | GraphSourceType::Vector | GraphSourceType::Geo
+                    )
+                    && g.dependencies.iter().any(|d| holders.contains(d))
+            })
+            .map(|g| g.graph_source_id.to_string())
+            .collect();
         Ok(plan)
     }
 
@@ -167,27 +187,29 @@ impl Fluree {
             .collect();
         names.insert(name.name().to_string());
         let mut retracted = Vec::new();
-        for ledger in names {
-            for record in self.nameservice().list_branches(&ledger).await? {
-                let (true, Some(head)) = (record.retracted, record.commit_head_id.as_ref()) else {
-                    continue;
-                };
-                // A history that cannot be read may hold one.
-                let holds = match self
-                    .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
-                    .await
-                {
-                    Ok(store) => match collect_first_parent_cids(store.as_ref(), head, 0).await {
-                        Ok(cids) => cids
-                            .iter()
-                            .any(|(_, cid)| erased.contains_key(&cid.address_digest())),
-                        Err(_) => true,
-                    },
+        // Listings of a ledger's branches leave its retracted ones out.
+        for record in self.nameservice().all_records().await? {
+            let (true, Some(head)) = (record.retracted, record.commit_head_id.as_ref()) else {
+                continue;
+            };
+            if !names.contains(record.ledger_id.name()) {
+                continue;
+            }
+            // A history that cannot be read may hold one.
+            let holds = match self
+                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                .await
+            {
+                Ok(store) => match collect_first_parent_cids(store.as_ref(), head, 0).await {
+                    Ok(cids) => cids
+                        .iter()
+                        .any(|(_, cid)| erased.contains_key(&cid.address_digest())),
                     Err(_) => true,
-                };
-                if holds {
-                    retracted.push(record.ledger_id.to_string());
-                }
+                },
+                Err(_) => true,
+            };
+            if holds {
+                retracted.push(record.ledger_id.to_string());
             }
         }
         Ok(retracted)
