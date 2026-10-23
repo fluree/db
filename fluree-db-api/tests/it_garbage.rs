@@ -2,10 +2,12 @@
 //! checked against every branch, and deleted; what any branch references
 //! stays.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use fluree_db_api::{
     CommitOpts, ConflictStrategy, Fluree, FlureeBuilder, GarbageReport, IndexConfig,
+    NameServiceMode,
 };
 use fluree_db_core::{ContentId, ContentKind, ContentStore as _};
 use fluree_db_transact::{ir::TxnType, TxnOpts};
@@ -197,4 +199,195 @@ async fn commits_a_merge_copied_in_stay_after_their_branch_goes() {
     }
     let verified = fluree.verify_ledger("garbage:main", None).await.unwrap();
     assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+}
+
+/// The commit files in `ledger_id`'s own folder.
+async fn commit_files(fluree: &Fluree, ledger_id: &str) -> Vec<String> {
+    let namespace = fluree.storage_namespace(ledger_id).await.unwrap();
+    let storage = fluree.admin_storage().unwrap();
+    let mut files = storage
+        .list_prefix(&format!(
+            "fluree:{}://{}/commit/",
+            storage.storage_method(),
+            namespace.branch_prefix()
+        ))
+        .await
+        .unwrap();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn commits_that_lost_their_publish_race_are_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact(&fluree, "garbage:main", &insert("alice"))
+        .await
+        .unwrap();
+    let before = commit_files(&fluree, "garbage:main").await;
+    // Another writer over the same storage, whose every publish loses.
+    let racing = Arc::new(crate::race_nameservice::PausingNameService::new(
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+    ));
+    racing.lose_commit_races();
+    let losing = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        NameServiceMode::ReadWrite(racing),
+    );
+    let handle = losing.ledger_cached("garbage:main").await.unwrap();
+    losing
+        .stage(&handle)
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:bob",
+            "ex:name": "bob"
+        }))
+        .execute()
+        .await
+        .expect_err("every publish loses");
+    assert!(commit_files(&fluree, "garbage:main").await.len() > before.len());
+
+    collect_until(&fluree, |r| r.deleted > 0).await;
+    assert_eq!(commit_files(&fluree, "garbage:main").await, before);
+    let verified = fluree.verify_ledger("garbage:main", None).await.unwrap();
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+}
+
+#[tokio::test]
+async fn a_rebase_leaves_the_line_it_replaced_to_the_collector() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact(&fluree, "garbage:main", &insert("alice"))
+        .await
+        .unwrap();
+    fluree
+        .create_branch("garbage", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = [insert("bob"), insert("carol")];
+    let mut replaced = Vec::new();
+    for body in &dev {
+        let result = transact(&fluree, "garbage:dev", body).await.unwrap();
+        replaced.push(result.receipt.commit_id);
+    }
+    transact(&fluree, "garbage:main", &insert("dave"))
+        .await
+        .unwrap();
+    let report = fluree
+        .rebase_branch("garbage", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 2);
+
+    // The replaced commits and their transactions; the replays carry none.
+    collect_until(&fluree, |r| r.deleted == 4).await;
+    for id in &replaced {
+        assert!(!stored(&fluree, "garbage:dev", id).await);
+    }
+    for body in &dev {
+        assert!(!stored(&fluree, "garbage:dev", &body_id(body)).await);
+    }
+    for ledger in ["garbage:dev", "garbage:main"] {
+        let verified = fluree.verify_ledger(ledger, None).await.unwrap();
+        assert!(
+            verified.problems.is_empty(),
+            "{ledger}: {:?}",
+            verified.problems
+        );
+    }
+}
+
+#[tokio::test]
+async fn what_a_merge_copied_before_losing_its_race_is_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact(&fluree, "garbage:main", &insert("alice"))
+        .await
+        .unwrap();
+    fluree
+        .create_branch("garbage", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = [insert("bob"), insert("carol")];
+    for body in &dev {
+        transact(&fluree, "garbage:dev", body).await.unwrap();
+    }
+    transact(&fluree, "garbage:main", &insert("dave"))
+        .await
+        .unwrap();
+    let before = commit_files(&fluree, "garbage:main").await;
+    let racing = Arc::new(crate::race_nameservice::PausingNameService::new(
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+    ));
+    racing.lose_commit_races();
+    let losing = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        NameServiceMode::ReadWrite(racing),
+    );
+    losing
+        .merge_branch("garbage", "dev", None, ConflictStrategy::default())
+        .await
+        .expect_err("the merge's publish loses");
+    assert!(commit_files(&fluree, "garbage:main").await.len() > before.len());
+
+    collect_until(&fluree, |r| r.deleted >= 5).await;
+    assert_eq!(commit_files(&fluree, "garbage:main").await, before);
+    let namespace = fluree.storage_namespace("garbage:main").await.unwrap();
+    for body in &dev {
+        // Copied in, and gone again; dev keeps its own.
+        assert!(!fluree
+            .content_store(&namespace)
+            .has(&body_id(body))
+            .await
+            .unwrap());
+        assert!(stored(&fluree, "garbage:dev", &body_id(body)).await);
+    }
+}
+
+#[tokio::test]
+async fn a_commit_a_branch_reads_from_its_parents_folder_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact(&fluree, "garbage:main", &insert("alice"))
+        .await
+        .unwrap();
+    let before = fluree
+        .nameservice()
+        .lookup("garbage:main")
+        .await
+        .unwrap()
+        .unwrap();
+    let bob = insert("bob");
+    let forked_at = transact(&fluree, "garbage:main", &bob).await.unwrap();
+    fluree
+        .create_branch("garbage", "dev", None, None)
+        .await
+        .unwrap();
+    // Main forgets its last commit; dev still reads it from main's folder.
+    fluree
+        .branch_admin()
+        .unwrap()
+        .reset_head_fenced(
+            "garbage:main",
+            before.fence,
+            fluree_db_nameservice::NsRecordSnapshot::from_record(&before),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree.reconcile_garbage("garbage").await.unwrap().unwrap();
+    assert_eq!(report.recorded, 0, "{report:?}");
+
+    fluree.drop_branch("garbage", "dev").await.unwrap();
+    let report = fluree.reconcile_garbage("garbage").await.unwrap().unwrap();
+    assert_eq!(report.recorded, 2, "{report:?}");
+    collect_until(&fluree, |r| r.deleted == 2).await;
+    assert!(!stored(&fluree, "garbage:main", &forked_at.receipt.commit_id).await);
+    assert!(!stored(&fluree, "garbage:main", &body_id(&bob)).await);
 }

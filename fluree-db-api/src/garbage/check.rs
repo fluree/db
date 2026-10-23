@@ -1,20 +1,23 @@
-//! Whether any branch of a ledger references a commit or transaction blob.
+//! Whether any branch of a ledger references a commit or transaction blob in
+//! a given folder.
 //!
 //! A branch's state to its head (index plus novelty) holds a txn-meta record
 //! of every commit in its history: the commit's subject, its parents, its
 //! transaction. Commits a merge copied in from another branch appear there
 //! only as a merge's parent, so they and their transactions are found by
 //! walking their envelopes from there, as are commits published after the
-//! branches were loaded.
+//! branches were loaded. A branch reads a blob from the first folder holding
+//! it along its own and its ancestors' folders, so it references that copy
+//! only.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use fluree_db_core::commit_subject::{commit_id_of_sid, commit_sid};
 use fluree_db_core::{
-    load_commit_envelope_by_id, range_bounded_with_overlay, range_with_overlay, ContentId,
-    ContentKind, ContentStore, Flake, FlakeValue, IndexType, LedgerName, RangeMatch, RangeOptions,
-    RangeTest, Sid, TXN_META_GRAPH_ID,
+    content_address, load_commit_envelope_by_id, range_bounded_with_overlay, range_with_overlay,
+    ContentId, ContentKind, ContentStore, Flake, FlakeValue, IndexType, LedgerName, RangeMatch,
+    RangeOptions, RangeTest, Sid, StorageNamespace, TXN_META_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{BindingState, NameBinding, NsRecord};
@@ -31,17 +34,19 @@ struct Branch {
     record: NsRecord,
     state: LedgerState,
     store: Arc<dyn ContentStore>,
+    /// The folders it reads, its own first.
+    folders: Vec<StorageNamespace>,
+    /// Commits in its history its txn-meta lacks: copied in by a merge, or
+    /// published since it was loaded.
+    commits: HashSet<ContentId>,
+    /// The transactions those commits name.
+    txns: HashSet<ContentId>,
 }
 
 /// The branches of one ledger, loaded to decide what they reference.
 pub(crate) struct Holders {
     name: String,
     branches: Vec<Branch>,
-    /// Commits reached outside every branch's txn-meta: copied in by a
-    /// merge, or published since the branches were loaded.
-    commits: HashSet<ContentId>,
-    /// The transactions those commits name.
-    txns: HashSet<ContentId>,
 }
 
 impl Fluree {
@@ -56,15 +61,10 @@ impl Fluree {
         let Some(records) = self.settled_records(name, binding).await? else {
             return Ok(None);
         };
-        let mut holders = Holders {
-            name: name.to_string(),
-            branches: Vec::new(),
-            commits: HashSet::new(),
-            txns: HashSet::new(),
-        };
-        for record in records {
+        let mut branches = Vec::new();
+        for record in &records {
             let store = self
-                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                .content_store_for_record_or_id(Some(record), &record.storage_namespace())
                 .await?;
             let state = self
                 .load_queryable_state_with_store(store.clone(), record.clone())
@@ -78,18 +78,22 @@ impl Fluree {
                 tracing::warn!(ledger = %record.ledger_id, "txn-meta lacks the head commit; garbage left alone");
                 return Ok(None);
             }
-            holders.branches.push(Branch {
-                record,
+            let mut branch = Branch {
+                folders: folders(record, &records),
+                record: record.clone(),
                 state,
                 store,
-            });
+                commits: HashSet::new(),
+                txns: HashSet::new(),
+            };
+            let merged = merged_parents(&branch.state).await?;
+            branch.walk(merged).await?;
+            branches.push(branch);
         }
-        for i in 0..holders.branches.len() {
-            let merged = merged_parents(&holders.branches[i].state).await?;
-            let store = holders.branches[i].store.clone();
-            holders.walk(&store, merged).await?;
-        }
-        Ok(Some(holders))
+        Ok(Some(Holders {
+            name: name.to_string(),
+            branches,
+        }))
     }
 
     /// The records of `binding`'s branches, when it is settled.
@@ -124,10 +128,24 @@ impl Fluree {
     }
 }
 
+/// The folders `record`'s branch reads, its own first, then its ancestors'.
+fn folders(record: &NsRecord, records: &[NsRecord]) -> Vec<StorageNamespace> {
+    let mut folders = vec![record.storage_namespace()];
+    let mut source = record.source_branch.as_deref();
+    while let Some(parent) = source.and_then(|s| records.iter().find(|r| r.branch == s)) {
+        if folders.contains(&parent.storage_namespace()) {
+            break;
+        }
+        folders.push(parent.storage_namespace());
+        source = parent.source_branch.as_deref();
+    }
+    folders
+}
+
 impl Holders {
     /// Account for commits published since the branches were loaded, from
     /// the ledger's records as they are now. `false` when it is no longer
-    /// settled.
+    /// settled, or has a branch that was not loaded.
     pub(crate) async fn catch_up(&mut self, fluree: &Fluree) -> Result<bool> {
         let Some(binding) = fluree.publisher()?.get_binding(&self.name).await? else {
             return Ok(false);
@@ -136,79 +154,99 @@ impl Holders {
             return Ok(false);
         };
         for record in records {
-            let loaded = self.branches.iter().any(|b| {
-                b.record.branch == record.branch && b.record.commit_head_id == record.commit_head_id
-            });
-            if loaded {
-                continue;
+            let Some(branch) = self
+                .branches
+                .iter_mut()
+                .find(|b| b.record.branch == record.branch)
+            else {
+                return Ok(false);
+            };
+            if branch.record.commit_head_id != record.commit_head_id {
+                branch.store = fluree
+                    .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
+                    .await?;
+                branch
+                    .walk(record.commit_head_id.into_iter().collect())
+                    .await?;
             }
-            let store = fluree
-                .content_store_for_record_or_id(Some(&record), &record.storage_namespace())
-                .await?;
-            self.walk(&store, record.commit_head_id.into_iter().collect())
-                .await?;
         }
         Ok(true)
     }
 
-    /// Whether a branch references `blob`.
+    /// Whether a branch references `blob`: has it in its history, and reads
+    /// it from `blob`'s folder.
     pub(crate) async fn references(&self, fluree: &Fluree, blob: &Blob) -> Result<bool> {
-        match blob.id.content_kind() {
-            Some(ContentKind::Commit) => {
-                if self.commits.contains(&blob.id) || self.known(&blob.id).await? {
-                    return Ok(true);
-                }
-                // A branch whose history reaches the commit's t without a
-                // commit record there lacks records, and decides nothing.
-                let store = fluree.backend().content_store(&blob.namespace);
-                let t = match load_commit_envelope_by_id(store.as_ref(), &blob.id).await {
-                    Ok(envelope) => envelope.t,
-                    Err(fluree_db_core::Error::NotFound(_)) => return Ok(false),
-                    Err(e) => return Err(e.into()),
-                };
-                for branch in self.branches.iter().filter(|b| b.state.t() >= t) {
-                    if !committed_at(&branch.state, t).await? {
-                        tracing::warn!(ledger = %branch.record.ledger_id, t, "txn-meta lacks a commit; garbage left alone");
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
+        let kind = blob.id.content_kind();
+        for branch in &self.branches {
+            if !branch.folders.contains(&blob.namespace) {
+                continue;
             }
-            Some(ContentKind::Txn) => {
-                if self.txns.contains(&blob.id) {
-                    return Ok(true);
+            let reached = match kind {
+                Some(ContentKind::Commit) => {
+                    branch.commits.contains(&blob.id) || has_commit(&branch.state, &blob.id).await?
                 }
-                for branch in &self.branches {
-                    if names_txn(&branch.state, &blob.id).await? {
-                        return Ok(true);
-                    }
+                Some(ContentKind::Txn) => {
+                    branch.txns.contains(&blob.id) || names_txn(&branch.state, &blob.id).await?
                 }
-                Ok(false)
+                _ => return Ok(true),
+            };
+            if reached && branch.reads_from(fluree, blob).await? {
+                return Ok(true);
             }
-            _ => Ok(true),
         }
+        if kind == Some(ContentKind::Commit) {
+            return self.lacks_records(fluree, blob).await;
+        }
+        Ok(false)
     }
 
-    /// Whether a branch's txn-meta records commit `id`.
-    async fn known(&self, id: &ContentId) -> Result<bool> {
-        for branch in &self.branches {
-            if has_commit(&branch.state, id).await? {
+    /// Whether a branch whose history reaches the commit's `t` has no commit
+    /// record there: its txn-meta lacks records, and decides nothing.
+    async fn lacks_records(&self, fluree: &Fluree, blob: &Blob) -> Result<bool> {
+        let store = fluree.backend().content_store(&blob.namespace);
+        let t = match load_commit_envelope_by_id(store.as_ref(), &blob.id).await {
+            Ok(envelope) => envelope.t,
+            Err(fluree_db_core::Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        for branch in self.branches.iter().filter(|b| b.state.t() >= t) {
+            if !committed_at(&branch.state, t).await? {
+                tracing::warn!(ledger = %branch.record.ledger_id, t, "txn-meta lacks a commit; garbage left alone");
                 return Ok(true);
             }
         }
         Ok(false)
     }
+}
 
-    /// Add the commits reached from `roots`, read from `store`, down to the
-    /// first a branch's txn-meta records, and their transactions.
-    async fn walk(&mut self, store: &Arc<dyn ContentStore>, roots: Vec<ContentId>) -> Result<()> {
+impl Branch {
+    /// Whether the first of this branch's folders holding `blob`'s id is
+    /// `blob`'s.
+    async fn reads_from(&self, fluree: &Fluree, blob: &Blob) -> Result<bool> {
+        let storage = fluree.garbage_storage()?;
+        let method = storage.storage_method();
+        let Some(kind) = blob.id.content_kind() else {
+            return Ok(true);
+        };
+        for folder in &self.folders {
+            let address = content_address(method, kind, folder, &blob.id.address_digest());
+            if storage.exists(&address).await? {
+                return Ok(folder == &blob.namespace);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Add the commits reached from `roots` down to the first this branch's
+    /// txn-meta records, and their transactions.
+    async fn walk(&mut self, roots: Vec<ContentId>) -> Result<()> {
         let mut next = roots;
         while let Some(id) = next.pop() {
-            if self.commits.contains(&id) || self.known(&id).await? {
+            if self.commits.contains(&id) || has_commit(&self.state, &id).await? {
                 continue;
             }
             self.commits.insert(id.clone());
-            match load_commit_envelope_by_id(store.as_ref(), &id).await {
+            match load_commit_envelope_by_id(self.store.as_ref(), &id).await {
                 Ok(envelope) => {
                     self.txns.extend(envelope.txn);
                     next.extend(envelope.parents);

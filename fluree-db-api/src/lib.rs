@@ -4149,6 +4149,17 @@ impl Fluree {
         self.backend.content_store(namespace)
     }
 
+    /// Where blobs written under `namespace` are pinned against the garbage
+    /// collector: by the storage, so every instance writing to it pins.
+    pub(crate) fn blob_pinner(
+        &self,
+        namespace: &StorageNamespace,
+    ) -> Option<fluree_db_core::BlobPinner> {
+        self.admin_storage()?
+            .blob_pins()
+            .map(|pins| fluree_db_core::BlobPinner::new(pins, namespace.clone()))
+    }
+
     /// Where `ledger_id`'s artifacts live, from its nameservice record.
     pub async fn storage_namespace(&self, ledger_id: &str) -> Result<StorageNamespace> {
         Ok(self

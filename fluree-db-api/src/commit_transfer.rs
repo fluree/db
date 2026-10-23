@@ -27,6 +27,7 @@ use base64::Engine as _;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
 use fluree_db_core::Storage;
+use fluree_db_core::{BlobPinner, Unpublished};
 use fluree_db_core::{ContentAddressedWrite, ContentKind, Flake, GraphId, Sid, TXN_META_GRAPH_ID};
 use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
@@ -280,6 +281,8 @@ pub struct StagedPush {
     /// Indexing-needed hint carried through to the receipt and the
     /// background indexer trigger.
     pub indexing_status: IndexingStatus,
+    /// Pins on the blobs written, released once the head names them.
+    pub pins: Unpublished,
 }
 
 /// Push precomputed commits to a ledger (transaction server mode).
@@ -619,8 +622,10 @@ impl Fluree {
         }
 
         // 5) Write required blobs and commit bytes to storage. Content
-        //    addressing makes these writes idempotent; orphan blobs on
-        //    a later apply failure are GC fodder.
+        //    addressing makes these writes idempotent; each stays pinned
+        //    until the head names it, and is abandoned to the garbage
+        //    collector if it never does.
+        let mut pins = Unpublished::new();
         let storage = self
             .backend()
             .admin_storage_cloned()
@@ -631,6 +636,7 @@ impl Fluree {
             &request.blobs,
             &decoded,
             &merged,
+            &mut pins,
         )
         .await
         .map_err(PushError::into_api_error)?;
@@ -638,14 +644,23 @@ impl Fluree {
         // Merged-in commits are written first. They are the parents, and a
         // failure part way through then leaves no stored commit whose parent
         // is absent.
-        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
-            .await
-            .map_err(PushError::into_api_error)?;
+        write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &merged,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
-        let stored_commits =
-            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
-                .await
-                .map_err(PushError::into_api_error)?;
+        let stored_commits = write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &decoded,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_head_id = final_head.commit_id.clone();
@@ -684,6 +699,7 @@ impl Fluree {
             write_guard: guard,
             final_state: new_state,
             indexing_status,
+            pins,
         })
     }
 
@@ -706,6 +722,7 @@ impl Fluree {
             mut write_guard,
             final_state,
             indexing_status,
+            pins,
         } = staged;
 
         let new_ref = RefValue {
@@ -724,7 +741,7 @@ impl Fluree {
             )
             .await?
         {
-            CasResult::Updated => {}
+            CasResult::Updated => pins.published(),
             CasResult::Conflict { actual } => {
                 return Err(ApiError::http(
                     409,
@@ -1349,11 +1366,15 @@ async fn write_required_blobs<S>(
     provided: &HashMap<String, Base64Bytes>,
     decoded: &[PushCommitDecoded],
     merged: &[PushCommitDecoded],
+    pins: &mut Unpublished,
 ) -> std::result::Result<(), PushError>
 where
     S: Storage + Send + Sync,
 {
     let required = required_txn_cids(decoded, merged);
+    let pinner = storage
+        .blob_pins()
+        .map(|p| BlobPinner::new(p, namespace.clone()));
 
     for addr in &required {
         let txn_id: ContentId = addr
@@ -1382,6 +1403,7 @@ where
         // Write using the CID digest to ensure deterministic placement.
         // (digest hex matches the legacy CAS hash during the transition period)
         let expected_hash = txn_id.address_digest();
+        pins.pin(pinner.as_ref(), &txn_id).await;
         let _res = storage
             .content_write_bytes_with_hash(ContentKind::Txn, namespace, &expected_hash, &bytes)
             .await
@@ -1395,9 +1417,16 @@ async fn write_commit_blobs<S: Storage + ContentAddressedWrite + Clone + Send + 
     storage: &S,
     namespace: &StorageNamespace,
     decoded: &[PushCommitDecoded],
+    pins: &mut Unpublished,
 ) -> std::result::Result<Vec<StoredCommit>, PushError> {
+    let pinner = storage
+        .blob_pins()
+        .map(|p| BlobPinner::new(p, namespace.clone()));
     let mut stored = Vec::with_capacity(decoded.len());
     for (idx, c) in decoded.iter().enumerate() {
+        if let Some(id) = ContentId::from_address_digest(CODEC_FLUREE_COMMIT, &c.digest_hex) {
+            pins.pin(pinner.as_ref(), &id).await;
+        }
         let res = storage
             .content_write_bytes_with_hash(ContentKind::Commit, namespace, &c.digest_hex, &c.bytes)
             .await
@@ -2641,6 +2670,7 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         // 6) Write blobs + commit bytes to local CAS.
+        let mut pins = Unpublished::new();
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
             ApiError::config("push_commits_strict requires a managed storage backend")
         })?;
@@ -2650,19 +2680,29 @@ impl Fluree {
             &request.blobs,
             &decoded,
             &merged,
+            &mut pins,
         )
         .await
         .map_err(PushError::into_api_error)?;
 
         // Parents before children, as in `prepare_push`.
-        write_commit_blobs(&storage, &base_state.storage_namespace(), &merged)
-            .await
-            .map_err(PushError::into_api_error)?;
+        write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &merged,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
-        let stored_commits =
-            write_commit_blobs(&storage, &base_state.storage_namespace(), &decoded)
-                .await
-                .map_err(PushError::into_api_error)?;
+        let stored_commits = write_commit_blobs(
+            &storage,
+            &base_state.storage_namespace(),
+            &decoded,
+            &mut pins,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
         let new_ref = RefValue {
@@ -2682,7 +2722,7 @@ impl Fluree {
             )
             .await?
         {
-            CasResult::Updated => {}
+            CasResult::Updated => pins.published(),
             CasResult::Conflict { actual } => {
                 return Err(ApiError::http(
                     409,

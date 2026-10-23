@@ -468,7 +468,12 @@ impl Fluree {
         }
 
         let content_store = self.content_store(&head.storage_namespace());
+        // Pinned until the head names them; abandoned to the garbage
+        // collector if it never does.
+        let pinner = content_store.blob_pinner();
+        let mut pins = fluree_db_core::Unpublished::new();
         for pending in &txn.pending {
+            pins.pin(pinner.as_ref(), &pending.commit_id).await;
             content_store
                 .put_with_id(&pending.commit_id, &pending.bytes)
                 .await
@@ -494,7 +499,7 @@ impl Fluree {
             .await
             .map_err(|e| ApiError::internal(format!("transaction head publish failed: {e}")))?;
         match cas {
-            CasResult::Updated => {}
+            CasResult::Updated => pins.published(),
             CasResult::Conflict { actual } => {
                 // The lock serializes in-process writers, so a CAS conflict
                 // means an external writer advanced the durable head.

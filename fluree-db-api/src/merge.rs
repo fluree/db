@@ -11,7 +11,7 @@ use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, BranchDiff};
-use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
+use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore, Unpublished};
 use fluree_db_core::{LedgerId, StorageNamespace};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
@@ -98,6 +98,9 @@ pub struct StagedMerge {
     /// post-apply index copy. Carried through so the apply path can
     /// address content-store namespaces without a re-lookup.
     pub source_ledger_id: LedgerId,
+    /// Pins on the commits and transactions copied into the target,
+    /// released once its head names them.
+    pub pins: Unpublished,
 }
 
 /// Summary report of a completed merge operation.
@@ -394,6 +397,7 @@ impl crate::Fluree {
             commit,
             source_index_for_publish,
             source_ledger_id,
+            pins,
             ..
         } = staged;
 
@@ -483,6 +487,7 @@ impl crate::Fluree {
                 (new_head_t, new_head_id)
             }
         };
+        pins.published();
 
         // Best-effort: copy source's index artifacts into the target
         // namespace. Errors here only warn — the target can rebuild from
@@ -574,8 +579,9 @@ impl crate::Fluree {
                 .map(|(_, cid)| cid)
                 .collect(),
         };
+        let mut pins = Unpublished::new();
         let commits_copied = self
-            .copy_commits(source_store, &to_copy, &target_namespace)
+            .copy_commits(source_store, &to_copy, &target_namespace, &mut pins)
             .await?;
         Ok(StagedMerge {
             target: resolved_target.to_string(),
@@ -596,6 +602,7 @@ impl crate::Fluree {
             new_head_id: source_head_id,
             commit: None,
             source_index_for_publish: None,
+            pins,
         })
     }
 
@@ -700,8 +707,14 @@ impl crate::Fluree {
         // Copy source commit chain to target namespace so the target is
         // self-contained for DAG walking. This must happen before the merge
         // commit is published.
+        let mut pins = Unpublished::new();
         let commits_copied = self
-            .copy_commits(source_store, &diff.source_only, &target_namespace)
+            .copy_commits(
+                source_store,
+                &diff.source_only,
+                &target_namespace,
+                &mut pins,
+            )
             .await?;
 
         // With the lock held the staged base is authoritative — derive
@@ -763,6 +776,7 @@ impl crate::Fluree {
                 staged: staged_commit,
             }),
             source_index_for_publish,
+            pins,
         })
     }
 
@@ -792,10 +806,12 @@ impl crate::Fluree {
         source_store: &impl ContentStore,
         cids: &[ContentId],
         target: &StorageNamespace,
+        pins: &mut Unpublished,
     ) -> Result<usize> {
         let storage = self
             .admin_storage()
             .ok_or_else(|| ApiError::internal("merge requires managed storage backend"))?;
+        let pinner = self.blob_pinner(target);
 
         let mut copied = 0;
 
@@ -810,6 +826,7 @@ impl crate::Fluree {
             })?;
 
             // Write commit blob to target namespace.
+            pins.pin(pinner.as_ref(), cid).await;
             storage
                 .content_write_bytes_with_hash(
                     ContentKind::Commit,
@@ -837,6 +854,7 @@ impl crate::Fluree {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                pins.pin(pinner.as_ref(), txn_cid).await;
                 storage
                     .content_write_bytes_with_hash(
                         ContentKind::Txn,

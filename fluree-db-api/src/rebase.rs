@@ -208,6 +208,9 @@ pub struct StagedRebase {
     /// content-addressed objects but aren't on the active head
     /// chain until that single advance commits.
     pub pending_replays: Vec<PendingReplay>,
+    /// The branch's commits the replays replace, unreferenced once the
+    /// advance commits.
+    pub superseded: Vec<ContentId>,
 }
 
 /// Built-but-unwritten replay commit. Carried inside
@@ -416,6 +419,7 @@ impl crate::Fluree {
                 write_guard,
                 final_state,
                 pending_replays: Vec::new(),
+                superseded: Vec::new(),
             });
         }
 
@@ -586,7 +590,46 @@ impl crate::Fluree {
             write_guard,
             final_state: current_state,
             pending_replays,
+            superseded: diff.source.commits.clone(),
         })
+    }
+
+    /// Pin the planned replays and the line they replace, with its
+    /// transactions, and record them as garbage. The pins hold until the
+    /// rebase ends, so no collection pass decides on them meanwhile.
+    async fn record_rebase(
+        &self,
+        namespace: &StorageNamespace,
+        replays: &[PendingReplay],
+        superseded: &[ContentId],
+    ) -> Result<Vec<fluree_db_core::BlobPin>> {
+        let Some(pinner) = self.blob_pinner(namespace) else {
+            return Ok(Vec::new());
+        };
+        let store = self.content_store(namespace);
+        let mut ids: Vec<ContentId> = replays.iter().map(|r| r.commit_id.clone()).collect();
+        for id in superseded {
+            ids.push(id.clone());
+            match fluree_db_core::load_commit_envelope_by_id(store.as_ref(), id).await {
+                Ok(envelope) => ids.extend(envelope.txn),
+                Err(fluree_db_core::Error::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut pins = Vec::with_capacity(ids.len());
+        for id in &ids {
+            pins.push(pinner.pin(id).await);
+        }
+        #[cfg(feature = "native")]
+        {
+            let blobs: Vec<crate::garbage::Blob> = ids
+                .into_iter()
+                .map(|id| crate::garbage::Blob::new(namespace.clone(), id))
+                .collect();
+            self.record_garbage(&blobs, crate::garbage::GarbageReason::Rebase)
+                .await?;
+        }
+        Ok(pins)
     }
 
     /// Apply a [`StagedRebase`] through the local commit pipeline:
@@ -596,8 +639,10 @@ impl crate::Fluree {
     /// against concurrent transactions via the held write guard.
     ///
     /// All-or-nothing: if the blob write or publish fails, nothing
-    /// is on the active head chain. Orphan blobs in the content
-    /// store are GC fodder later.
+    /// is on the active head chain. Before writing, the replays and
+    /// the line they replace (with its transactions) are pinned and
+    /// recorded as garbage: the collector deletes whichever side the
+    /// branch no longer references once the pins go.
     async fn apply_rebase(&self, staged: StagedRebase) -> Result<RebaseReport> {
         let StagedRebase {
             branch: _,
@@ -621,9 +666,13 @@ impl crate::Fluree {
             write_guard,
             final_state,
             pending_replays,
+            superseded,
         } = staged;
 
         if let Some(ref last_head_id) = new_head_id {
+            let _pins = self
+                .record_rebase(&branch_namespace, &pending_replays, &superseded)
+                .await?;
             if !pending_replays.is_empty() {
                 let content_store = self.content_store(&branch_namespace);
                 for blob in &pending_replays {
