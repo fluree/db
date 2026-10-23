@@ -1462,10 +1462,8 @@ async fn sync_local(
         // Empty-payload gate: an explicitly empty payload clears the graph.
         // Enforced here (not only in `sync_named_graph`) because the
         // consensus submission below calls the builder directly.
-        let explicitly_empty = body_json
-            .get("@graph")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty);
+        let explicitly_empty =
+            fluree_db_api::GraphPayload::JsonLd(&body_json).is_explicitly_empty_jsonld();
         if explicitly_empty && !query_params.allow_empty {
             set_span_error_code(&span, "error:BadRequest");
             return Err(ServerError::bad_request(
