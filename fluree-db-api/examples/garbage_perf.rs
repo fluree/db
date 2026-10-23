@@ -11,10 +11,14 @@
 //!                                          works through many candidates
 //! large     [commits] [strays]             reconcile a ledger of `commits`
 //!                                          commits while another commits
+//! lane      <unpinned|pinned|looping> [writers] [commits] <file>
+//!                                          one idle lane in its own process,
+//!                                          latencies (µs) written to `file`
 //! ```
 //!
 //! Writers commit to their own ledgers with raw bodies stored, and every
-//! tenth transaction fails while staging, so garbage keeps arriving.
+//! tenth transaction fails while staging, so garbage keeps arriving, unless
+//! `GARBAGE_PERF_NO_FAILURES` is set.
 //! Durability is PageCache unless `GARBAGE_PERF_WAL` is set.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +53,7 @@ fn ctx() -> JsonValue {
 }
 
 fn body(writer: usize, i: usize) -> JsonValue {
-    if i % 10 == 9 {
+    if i % 10 == 9 && std::env::var_os("GARBAGE_PERF_NO_FAILURES").is_none() {
         // Fails while staging, after its body is stored.
         json!({
             "@context": ctx(),
@@ -176,6 +180,32 @@ async fn idle(writers: usize, commits: usize, rounds: usize) {
     for ((label, _, _), latencies) in lanes.iter().zip(results) {
         report(label, latencies);
     }
+}
+
+async fn lane(name: &str, writers: usize, commits: usize, file: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = instance(&dir, name != "unpinned").await;
+    let names: Vec<String> = (0..writers).map(|w| format!("perf{w}")).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let collector = (name == "looping").then(|| {
+        let (fluree, stop) = (Arc::clone(&fluree), Arc::clone(&stop));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            while !stop.load(Ordering::Relaxed) {
+                pass(&fluree, &names).await;
+            }
+        })
+    });
+    let spans = write(&fluree, writers, commits).await;
+    stop.store(true, Ordering::Relaxed);
+    if let Some(collector) = collector {
+        collector.await.unwrap();
+    }
+    let lines: Vec<String> = latencies(&spans)
+        .iter()
+        .map(|d| d.as_micros().to_string())
+        .collect();
+    std::fs::write(file, lines.join("\n")).unwrap();
 }
 
 async fn scheduled(writers: usize, commits: usize, every: Duration) {
@@ -380,6 +410,11 @@ async fn main() {
         }
         Some("retries") => retries(arg(1, 8), arg(2, 200)).await,
         Some("large") => large(arg(1, 100_000), arg(2, 1000)).await,
+        Some("lane") => {
+            let name = args.get(1).expect("lane name");
+            let file = args.get(4).expect("output file");
+            lane(name, arg(2, 8), arg(3, 300), file).await;
+        }
         _ => eprintln!("usage: garbage_perf idle|scheduled|retries|large [args]"),
     }
 }
