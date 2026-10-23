@@ -511,18 +511,9 @@ impl GraphSink for GraphCollectorSink {
             }
             None => {
                 // Anonymous blank node (`[ … ]`, collection spine nodes,
-                // reifiers) — unique counter-based label. The leading '-'
-                // keeps the minted namespace disjoint from every
-                // user-written label: Turtle's BLANK_NODE_LABEL must start
-                // with PN_CHARS_U | [0-9], so `_:-b1` can never lex, while
-                // '-' stays legal medially so the label still serializes.
-                //
-                // Without it a document's own `_:b1` and the first mint are
-                // the same `BlankId` and their nodes silently MERGE. Matches
-                // `FlakeSink`/`ImportSink`, which carry the same fix for the
-                // same reason.
+                // reifiers): a counter-based reserved label.
                 self.blank_counter += 1;
-                let label = format!("-b{}", self.blank_counter);
+                let label = crate::syntax::reserved_blank_label("b", self.blank_counter);
                 self.add_term(Term::blank(label))
             }
         }

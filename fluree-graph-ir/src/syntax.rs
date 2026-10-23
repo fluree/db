@@ -262,6 +262,15 @@ pub fn is_blank_node_label(label: &str) -> bool {
     )
 }
 
+/// The label (without `_:`) of an anonymous node a parser or sink mints:
+/// `-{kind}{n}`. A `BLANK_NODE_LABEL` can't start with `-`, so no label a
+/// user writes is one and a minted node never merges with a written one.
+/// `-` is legal mid-label, so a stored id holding it (`fdb-{scope}-{label}`)
+/// is a `BLANK_NODE_LABEL` and serializes as written.
+pub fn reserved_blank_label(kind: &str, n: impl std::fmt::Display) -> String {
+    format!("-{kind}{n}")
+}
+
 /// Whether `tag` is a language tag proper: `[a-zA-Z]+ ('-' [a-zA-Z0-9]+)*`,
 /// the first subtag letters only and no subtag empty.
 pub fn is_lang_tag_body(tag: &str) -> bool {
@@ -413,6 +422,20 @@ mod tests {
         }
         for bad in ["", "-a", ".a", "a.", "a/b", "a:b"] {
             assert!(!is_blank_node_label(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_reserved_label_cannot_be_written_but_serializes_in_a_stored_id() {
+        for label in [
+            reserved_blank_label("b", 1),
+            reserved_blank_label("b", "0-7"),
+            reserved_blank_label("bnpl", 0),
+            reserved_blank_label("anon", 12),
+        ] {
+            assert!(!is_blank_node_label(&label), "{label} can be written");
+            let stored = format!("fdb-01h-0-{label}");
+            assert!(is_blank_node_label(&stored), "{stored} does not serialize");
         }
     }
 
