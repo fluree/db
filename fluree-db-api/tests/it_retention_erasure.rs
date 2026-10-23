@@ -1382,3 +1382,91 @@ async fn a_dropped_copys_own_retraction_is_erased() {
         .await
         .is_empty());
 }
+
+/// A purge plan inventories, before anything is deleted, every copy of an
+/// erased commit's original — the ledger's, a copy's, a dropped copy's —
+/// and the transaction documents those copies name. Another ledger's
+/// identical transaction document is not in it.
+#[tokio::test]
+async fn a_purge_plan_lists_every_original_and_its_transaction_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let stored = fluree_db_transact::TxnOpts::default().store_raw_txn(true);
+    let doc = json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"});
+    let id = ledger(&fluree, "it/purge-origin").await;
+    let t1 = fluree
+        .graph(&id)
+        .transact()
+        .txn_opts(stored.clone())
+        .insert(&doc)
+        .commit()
+        .await
+        .unwrap()
+        .receipt
+        .t;
+    let asserted = commit_at(&fluree, &id, t1).await;
+    let unrelated = ledger(&fluree, "it/purge-unrelated").await;
+    fluree
+        .graph(&unrelated)
+        .transact()
+        .txn_opts(stored)
+        .insert(&doc)
+        .commit()
+        .await
+        .unwrap();
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/purge-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    let dropped = fluree
+        .restore_ledger("it/purge-dropped", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .drop_ledger("it/purge-dropped", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+
+    let receipt = fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    assert!(fluree.plan_purge(&id).await.unwrap().requests.is_empty());
+    reindex(&fluree, &id).await;
+    reindex(&fluree, &copy).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    let plan = fluree.plan_purge(&id).await.unwrap();
+    assert_eq!(plan.requests, vec![receipt.request_id.clone()]);
+    let digest = asserted.address_digest();
+    let originals: Vec<&String> = plan
+        .originals
+        .iter()
+        .filter(|a| a.ends_with(&format!("/commit/{digest}.fcv2")))
+        .collect();
+    assert_eq!(originals.len(), 3, "{plan:?}");
+    for ledger in ["it/purge-origin/", "it/purge-copy/", "it/purge-dropped/"] {
+        assert!(originals.iter().any(|a| a.contains(ledger)), "{plan:?}");
+        assert!(
+            plan.transactions.iter().any(|a| a.contains(ledger)),
+            "{plan:?}"
+        );
+    }
+    assert!(
+        !plan
+            .originals
+            .iter()
+            .chain(&plan.transactions)
+            .any(|a| a.contains("it/purge-unrelated")),
+        "{plan:?}"
+    );
+    assert!(plan.rebuild.contains(&id) && plan.rebuild.contains(&copy));
+    assert_eq!(plan.release, vec![dropped]);
+}

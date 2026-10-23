@@ -27,6 +27,7 @@
 //! CIDs. Requests elsewhere are refused.
 
 pub(crate) mod index;
+mod purge;
 mod request;
 mod worker;
 
@@ -35,6 +36,7 @@ use std::sync::Arc;
 
 pub use fluree_db_erasure::{Prover, ProverConfig, SubprocessProver, Verifier};
 pub use index::{ErasedCommit, ErasureStep};
+pub use purge::PurgePlan;
 pub use request::{BranchRemoval, ErasureReceipt, ErasureRequest};
 use serde::{Deserialize, Serialize};
 pub use worker::ErasurePassReport;

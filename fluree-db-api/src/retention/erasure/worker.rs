@@ -647,7 +647,11 @@ impl Fluree {
     /// ledger's, including any made after the request, and those of copies
     /// holding an original. `None` when `branch`'s ledger is dropped, which
     /// hides its branches.
-    async fn holders(&self, branch: &str, job: &ErasureJob) -> Result<Option<Vec<NsRecord>>> {
+    pub(super) async fn holders(
+        &self,
+        branch: &str,
+        job: &ErasureJob,
+    ) -> Result<Option<Vec<NsRecord>>> {
         let name = LedgerId::parse(branch)?;
         let mut records: Vec<_> = self
             .nameservice()

@@ -250,6 +250,13 @@ impl ErasureIndex {
         Ok(self.entries.read().contains_key(digest))
     }
 
+    /// Every address under the storage, past the substitution: what the
+    /// files are, not what reads of them return.
+    pub(crate) async fn list_all(&self) -> Result<Vec<String>> {
+        let root = format!("fluree:{}://", self.storage.storage_method());
+        Ok(self.storage.list_prefix(&root).await?)
+    }
+
     /// Whether any commit is erased.
     pub(crate) async fn any_erased(&self) -> Result<bool> {
         self.load().await?;
@@ -285,7 +292,7 @@ impl ErasureIndex {
     /// `None` when it is not erased. Its proofs verify once per process; a
     /// proof or replacement that does not verify is an error, never the
     /// original.
-    async fn replacement(&self, digest: &str) -> Option<Result<Arc<[u8]>>> {
+    pub(crate) async fn replacement(&self, digest: &str) -> Option<Result<Arc<[u8]>>> {
         if let Err(e) = self.load().await {
             return Some(Err(e));
         }
