@@ -1940,37 +1940,39 @@ async fn an_old_archive_restored_after_a_purge_brings_nothing_back() {
     );
 }
 
-/// A purge stops for what it cannot yet rebuild: a branch of a copy that
-/// was dropped while another still forks from it, keeping its index, and a
-/// full-text index over the ledger, which keeps its own copy.
+async fn published(name: &str) -> (tempfile::TempDir, Fluree, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, name).await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    (dir, fluree, id)
+}
+
+async fn publish(fluree: &Fluree, id: &str, holders: &[&str]) {
+    fluree
+        .erase_occurrences(id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    for holder in std::iter::once(&id).chain(holders) {
+        reindex(fluree, holder).await;
+    }
+    assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
+}
+
+/// A branch of a copy dropped while another still forks from it keeps its
+/// index, frozen: the purge clears its index head, the sweep releases the
+/// index, and the purge completes with no file holding the value, the child
+/// reading as before.
 #[tokio::test]
-async fn a_purge_waits_for_a_retracted_holder_and_for_a_dependent_index() {
+async fn a_purge_releases_a_retracted_holders_index() {
     use std::time::Duration;
 
-    async fn published(name: &str) -> (tempfile::TempDir, Fluree, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let fluree = erasing(&dir, Arc::new(NativeProver::default()));
-        let id = ledger(&fluree, name).await;
-        insert(
-            &fluree,
-            &id,
-            json!({"@context": ctx(), "@type": "ex:Person", "@id": "ex:alice", "ex:email": "a@secret"}),
-        )
-        .await;
-        (dir, fluree, id)
-    }
-    async fn publish(fluree: &Fluree, id: &str, holders: &[&str]) {
-        fluree
-            .erase_occurrences(id, email("alice", "a@secret"), None)
-            .await
-            .expect("erase");
-        for holder in std::iter::once(&id).chain(holders) {
-            reindex(fluree, holder).await;
-        }
-        assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
-    }
-
-    let (_dir, fluree, id) = published("it/purge-retracted").await;
+    let (dir, fluree, id) = published("it/purge-retracted").await;
     let mut archive = Vec::new();
     fluree
         .archive_ledger(&id, false, &mut archive)
@@ -1980,10 +1982,19 @@ async fn a_purge_waits_for_a_retracted_holder_and_for_a_dependent_index() {
         .restore_ledger("it/purge-retracted-copy", &mut archive.as_slice())
         .await
         .unwrap();
+    // Indexed, so the branch made from it starts with a copy of the index.
+    reindex(&fluree, "it/purge-retracted-copy:main").await;
     fluree
         .create_branch("it/purge-retracted-copy", "dev", None, None)
         .await
         .unwrap();
+    let dev = fluree
+        .nameservice()
+        .lookup("it/purge-retracted-copy:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(dev.index_head_id.is_some());
     fluree
         .create_branch("it/purge-retracted-copy", "dev2", Some("dev"), None)
         .await
@@ -2007,13 +2018,43 @@ async fn a_purge_waits_for_a_retracted_holder_and_for_a_dependent_index() {
         plan.retracted,
         vec!["it/purge-retracted-copy:dev".to_string()]
     );
-    let why = fluree
-        .run_purge_pass(&id, Duration::ZERO)
+
+    let mut purged = 0;
+    for _ in 0..5 {
+        let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+        assert!(report.blocked.is_none(), "{report:?}");
+        purged += report.purged;
+        if purged > 0 {
+            break;
+        }
+    }
+    assert_eq!(purged, 1);
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    let dev = fluree
+        .nameservice()
+        .lookup("it/purge-retracted-copy:dev")
         .await
         .unwrap()
-        .blocked
-        .expect("blocked");
-    assert!(why.contains("dropped branches"), "{why}");
+        .expect("kept for its child");
+    assert!(dev.index_head_id.is_none());
+    assert!(objects(
+        &fluree,
+        "it/purge-retracted-copy:dev2",
+        "ex:alice",
+        "ex:email"
+    )
+    .await
+    .is_empty());
+}
+
+/// A purge stops for a full-text index over the ledger, which keeps its
+/// own copy.
+#[tokio::test]
+async fn a_purge_waits_for_a_dependent_index() {
+    use std::time::Duration;
 
     let (_dir, fluree, id) = published("it/purge-indexed").await;
     let query = json!({

@@ -116,6 +116,33 @@ impl Fluree {
         Ok(Released::Done { ledgers, deleted })
     }
 
+    /// Whether retracted `branch` still has an index head: one a sweep keeps.
+    pub(super) async fn frozen_index_head(&self, branch: &str) -> Result<bool> {
+        Ok(self
+            .nameservice()
+            .lookup(branch)
+            .await?
+            .is_some_and(|r| r.index_head_id.is_some()))
+    }
+
+    /// The index files still stored for retracted `branches`, which the
+    /// sweep releases once their heads are cleared.
+    pub(super) async fn retracted_index_files(&self, branches: &[String]) -> Result<Vec<String>> {
+        let runtime = self.erasure_runtime()?;
+        let storage = runtime.index.address_prefix();
+        let mut files = Vec::new();
+        for branch in branches {
+            if let Some(record) = self.nameservice().lookup(branch).await? {
+                let prefix = format!(
+                    "{storage}{}/index/",
+                    record.storage_namespace().branch_prefix()
+                );
+                files.extend(runtime.index.list_raw(&prefix).await?);
+            }
+        }
+        Ok(files)
+    }
+
     /// The index files and dictionaries still stored for the soft-dropped
     /// ledgers holding the original of a commit of `commits`.
     pub(super) async fn dropped_index_files(&self, commits: &[String]) -> Result<Vec<String>> {

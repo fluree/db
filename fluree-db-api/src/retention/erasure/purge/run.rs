@@ -86,9 +86,7 @@ impl Fluree {
             return Ok(report);
         }
         let plan = self.plan_purge(ledger).await?;
-        let blocked = if !plan.retracted.is_empty() {
-            Some("dropped branches that other branches still fork from hold erased commits")
-        } else if !plan.sources.is_empty() {
+        let blocked = if !plan.sources.is_empty() {
             Some(
                 "full-text, vector or geospatial indexes over the ledger keep their own \
                  copies: drop and recreate them first",
@@ -126,6 +124,16 @@ impl Fluree {
                     }
                 }
             }
+            // Retracted holders' index heads, so the sweep releases their
+            // indexes: nothing loads a frozen branch.
+            for branch in &plan.retracted {
+                if self.publisher()?.clear_frozen_index(branch).await? {
+                    report.released += 1;
+                } else if self.frozen_index_head(branch).await? {
+                    let why = format!("{branch} is dropped but not yet frozen");
+                    return self.block(&jobs, report, why).await;
+                }
+            }
             let captured = self.capture_erased(&plan).await?;
             let rebuilt_ms = match progress(|p| p.rebuilt_ms) {
                 Some(ms) => ms,
@@ -159,6 +167,7 @@ impl Fluree {
             let ledgers: BTreeSet<LedgerName> = plan
                 .rebuild
                 .iter()
+                .chain(&plan.retracted)
                 .filter_map(|b| LedgerId::parse(b).ok())
                 .map(|id| id.ledger_name())
                 .collect();
@@ -193,7 +202,7 @@ impl Fluree {
             }
             if !scan.unreleased.is_empty() {
                 let why = format!(
-                    "{} index files of soft-dropped holders were not released",
+                    "{} index files of dropped holders were not released",
                     scan.unreleased.len()
                 );
                 return self.block(&jobs, report, why).await;

@@ -33,8 +33,9 @@ pub struct PurgePlan {
     pub rebuild: Vec<String>,
     /// Branches of soft-dropped ledgers, whose index artifacts are released.
     pub release: Vec<String>,
-    /// Branches dropped while others still fork from them, which keep their
-    /// indexes, whose history holds an erased commit.
+    /// Branches dropped while others still fork from them, frozen, whose
+    /// history holds an erased commit: their index heads are cleared and
+    /// their indexes released.
     pub retracted: Vec<String>,
     /// Full-text, vector and geospatial indexes over a holder, which keep
     /// their own copies of what they index.
