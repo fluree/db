@@ -54,7 +54,7 @@ async fn staging_data_invalid_transactions() {
     );
 }
 
-/// An insert or upsert of a document with no nodes is refused as having
+/// An insert or upsert of a document that names no node is refused as having
 /// nothing to add, not as an object with only `@id`, which it doesn't have.
 #[tokio::test]
 async fn an_empty_insert_or_upsert_has_nothing_to_add() {
@@ -63,6 +63,9 @@ async fn an_empty_insert_or_upsert_has_nothing_to_add() {
         json!([]),
         json!({"@graph": []}),
         json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": []}),
+        json!([{}]),
+        json!({"@graph": [{}]}),
+        json!({"@context": {"ex": "http://example.org/ns/"}}),
     ];
     for (i, doc) in empty_documents.iter().enumerate() {
         for upsert in [false, true] {
@@ -86,14 +89,62 @@ async fn an_empty_insert_or_upsert_has_nothing_to_add() {
         }
     }
 
-    let ledger = fluree.create_ledger("tx/only-id:main").await.unwrap();
-    let only_id = json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:alice"});
-    let err = fluree
-        .insert(ledger, &only_id)
+    let only_id_documents = [
+        json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:alice"}),
+        json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [{"@id": "ex:alice"}]}),
+    ];
+    for (i, doc) in only_id_documents.iter().enumerate() {
+        let ledger = fluree
+            .create_ledger(&format!("tx/only-id-{i}:main"))
+            .await
+            .unwrap();
+        let err = fluree
+            .insert(ledger, doc)
+            .await
+            .expect_err("an object with only @id is refused")
+            .to_string();
+        assert!(err.contains("only @id"), "{doc}: {err}");
+    }
+}
+
+/// In an update, `"insert": []` adds nothing and the rest of the update
+/// applies, as `"delete": []` already did.
+#[tokio::test]
+async fn an_update_with_an_empty_insert_applies_its_delete() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let ledger = fluree.create_ledger("tx/empty-insert:main").await.unwrap();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:alice", "ex:name": "Alice"}),
+        )
         .await
-        .expect_err("an object with only @id is refused")
-        .to_string();
-    assert!(err.contains("only @id"), "{err}");
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "where": {"@id": "ex:alice", "ex:name": "?n"},
+                "delete": {"@id": "ex:alice", "ex:name": "?n"},
+                "insert": []
+            }),
+        )
+        .await
+        .expect("an empty insert is a no-op")
+        .ledger;
+    let rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"@context": ctx, "select": "?n", "where": {"@id": "ex:alice", "ex:name": "?n"}}),
+    )
+    .await
+    .unwrap()
+    .to_jsonld(&ledger.snapshot)
+    .unwrap();
+    assert_eq!(rows, json!([]));
 }
 
 #[tokio::test]

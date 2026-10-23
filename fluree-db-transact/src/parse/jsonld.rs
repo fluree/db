@@ -376,6 +376,16 @@ fn strict_compact_iri(opts: &TxnOpts, json: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether an expanded document names a node with `@id`. When it yields no
+/// triples, such a node has only its `@id`.
+fn names_a_node(expanded: &Value) -> bool {
+    match expanded {
+        Value::Array(items) => items.iter().any(names_a_node),
+        Value::Object(obj) => obj.contains_key("@id") || obj.values().any(names_a_node),
+        _ => false,
+    }
+}
+
 /// Parse an insert or upsert document.
 ///
 /// Upsert parses exactly as insert; the upsert logic (query existing values,
@@ -431,7 +441,7 @@ fn parse_data(
         }
     };
     if templates.is_empty() {
-        if is_empty_document(json) {
+        if !names_a_node(&expanded) {
             return Err(TransactError::Parse(
                 "the payload has no triples; there is nothing to add".to_string(),
             ));
@@ -749,12 +759,17 @@ fn parse_update_clauses(
         );
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
-            return Err(TransactError::Parse(
-                "insert must contain at least one predicate or @type (an object with only @id is not a valid insert)"
-                    .to_string(),
-            ));
+            // As with delete: `"insert": []` is a no-op, an empty node is not.
+            if matches!(insert_val, Value::Array(arr) if arr.is_empty()) {
+                Vec::new()
+            } else {
+                return Err(TransactError::Parse(
+                    "insert must contain at least one predicate or @type".to_string(),
+                ));
+            }
+        } else {
+            templates
         }
-        templates
     } else {
         Vec::new()
     };
