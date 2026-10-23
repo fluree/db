@@ -1046,11 +1046,18 @@ async fn the_worker_resumes_a_restored_ledgers_erasure() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = fluree.retention_status(&id).await.unwrap();
         stage = status.registration.unwrap().erasures[0].stage;
-        if stage == ErasureStage::Published {
+        // The worker goes on to purge it.
+        if stage != ErasureStage::Proving && stage != ErasureStage::Indexing {
             break;
         }
     }
-    assert_eq!(stage, ErasureStage::Published);
+    assert!(
+        matches!(
+            stage,
+            ErasureStage::Published | ErasureStage::Purging | ErasureStage::Purged
+        ),
+        "{stage:?}"
+    );
     let raw = store_of(&fluree, &id)
         .await
         .get(&asserted)
@@ -1798,4 +1805,57 @@ async fn a_purge_waits_for_a_retracted_holder_and_for_a_dependent_index() {
         .blocked
         .expect("blocked");
     assert!(why.contains("full-text"), "{why}");
+}
+
+/// The retention worker purges a published erasure by itself: its
+/// originals, and every file that held the value, are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_purges_a_published_erasure() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = Arc::new(
+        FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .with_indexer_catchup_interval(Duration::from_millis(200))
+            .with_erasure(ErasureConfig {
+                prover: Arc::new(NativeProver::default()),
+                verifier: Arc::new(Verifier::accepting_dev_receipts()),
+                retry_ms: 10,
+            })
+            .build()
+            .unwrap(),
+    );
+    let id = ledger(&fluree, "it/erase-worker-purges").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    assert!(fluree.start_maintenance(
+        None,
+        Some(fluree_db_api::retention::RetentionOptions {
+            interval: Duration::from_millis(100),
+            purge_grace: Duration::ZERO,
+            ..Default::default()
+        })
+    ));
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+
+    let mut stage = ErasureStage::Proving;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = fluree.retention_status(&id).await.unwrap();
+        stage = status.registration.unwrap().erasures[0].stage;
+        if stage == ErasureStage::Purged {
+            break;
+        }
+    }
+    assert_eq!(stage, ErasureStage::Purged);
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
 }

@@ -56,6 +56,17 @@ impl Fluree {
         if jobs.is_empty() {
             return Ok(report);
         }
+        let progress = |f: fn(&PurgeProgress) -> Option<i64>| {
+            jobs.iter()
+                .map(|(_, j)| j.purge.as_ref().and_then(f))
+                .min()
+                .flatten()
+        };
+        let waiting = |rebuilt_ms: i64| now_ms() - rebuilt_ms < release_after.as_millis() as i64;
+        if progress(|p| p.scanned_ms).is_none() && progress(|p| p.rebuilt_ms).is_some_and(waiting) {
+            report.waiting = true;
+            return Ok(report);
+        }
         let plan = self.plan_purge(ledger).await?;
         let blocked = if !plan.release.is_empty() {
             Some("soft-dropped ledgers hold erased commits: restore or purge them first")
@@ -73,12 +84,6 @@ impl Fluree {
             return self.block(&jobs, report, why.to_string()).await;
         }
 
-        let progress = |f: fn(&PurgeProgress) -> Option<i64>| {
-            jobs.iter()
-                .map(|(_, j)| j.purge.as_ref().and_then(f))
-                .min()
-                .flatten()
-        };
         if progress(|p| p.scanned_ms).is_none() {
             let captured = self.capture_erased(&plan).await?;
             let rebuilt_ms = match progress(|p| p.rebuilt_ms) {
@@ -93,7 +98,7 @@ impl Fluree {
                     ms
                 }
             };
-            if now_ms() - rebuilt_ms < release_after.as_millis() as i64 {
+            if waiting(rebuilt_ms) {
                 report.waiting = true;
                 return Ok(report);
             }
@@ -182,6 +187,7 @@ impl Fluree {
         for (branch, job) in &jobs {
             self.update_job(branch, &job.request_id, |j| {
                 j.stage = ErasureStage::Purged;
+                j.retry_at_ms = None;
                 let p = j.purge.get_or_insert_with(Default::default);
                 p.purged_ms = Some(ms);
                 p.deleted += deleted;
@@ -240,8 +246,11 @@ impl Fluree {
         why: String,
     ) -> Result<PurgeReport> {
         for (branch, job) in jobs {
+            // The background worker tries again in an hour.
+            let retry_at = now_ms() + 3_600_000;
             self.update_job(branch, &job.request_id, |j| {
                 j.stage = ErasureStage::Purging;
+                j.retry_at_ms = Some(retry_at);
                 j.purge.get_or_insert_with(Default::default).blocked = Some(why.clone());
             })
             .await?;

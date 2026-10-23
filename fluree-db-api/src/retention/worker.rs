@@ -80,6 +80,9 @@ pub struct RetentionOptions {
     pub rescan_interval: Duration,
     /// Bounds on one pass.
     pub limits: RetentionLimits,
+    /// How long a purge leaves the indexes it rebuilt over before releasing
+    /// them, for readers to finish: the index collector's minimum age.
+    pub purge_grace: Duration,
 }
 
 impl Default for RetentionOptions {
@@ -88,6 +91,9 @@ impl Default for RetentionOptions {
             interval: Duration::from_secs(15),
             rescan_interval: Duration::from_secs(600),
             limits: RetentionLimits::default(),
+            purge_grace: Duration::from_secs(
+                60 * u64::from(fluree_db_indexer::IndexerConfig::default().gc_min_time_mins),
+            ),
         }
     }
 }
@@ -359,7 +365,8 @@ impl Fluree {
         #[cfg(feature = "native")]
         {
             let ledgers: Vec<String> = self.retention.active.lock().iter().cloned().collect();
-            self.erasure_sweep(&worker.fluree, &ledgers).await;
+            self.erasure_sweep(&worker.fluree, &ledgers, worker.options.purge_grace)
+                .await;
         }
         self.retention
             .last_sweep_ms

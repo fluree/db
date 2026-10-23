@@ -71,6 +71,8 @@ pub(crate) struct ErasureRuntime {
     pub(crate) config: Option<ErasureConfig>,
     /// A step is being proved.
     in_flight: AtomicBool,
+    /// A background purge pass is running.
+    purge_in_flight: AtomicBool,
     /// Held to accept or publish an erasure, and to create a branch: the
     /// branches an erasure reaches are the branches as they are then.
     pub(crate) admission: tokio::sync::Mutex<()>,
@@ -87,6 +89,7 @@ impl ErasureRuntime {
             index,
             config,
             in_flight: AtomicBool::new(false),
+            purge_in_flight: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
             purging: tokio::sync::Mutex::new(()),
             rebuilt_on_restore: Default::default(),

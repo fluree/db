@@ -380,7 +380,9 @@ async fn a_panicking_background_step_is_retried() {
     let ledgers = [id.to_string()];
     let mut proved = 0;
     for _ in 0..200 {
-        fluree.erasure_sweep(&weak, &ledgers).await;
+        fluree
+            .erasure_sweep(&weak, &ledgers, Duration::from_secs(3600))
+            .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         let job = fluree.job(id, &receipt.request_id).await.unwrap();
         proved = job.commits.iter().filter(|c| c.proved.is_some()).count();

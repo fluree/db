@@ -211,10 +211,16 @@ impl Fluree {
     /// Advance the erasure jobs of `ledgers`: publish what is proved and
     /// indexed, and start the next proving step unless one is running.
     /// Never waits for a proof.
-    pub(crate) async fn erasure_sweep(&self, fluree: &Weak<Fluree>, ledgers: &[String]) {
+    pub(crate) async fn erasure_sweep(
+        &self,
+        fluree: &Weak<Fluree>,
+        ledgers: &[String],
+        purge_grace: std::time::Duration,
+    ) {
         let Some(runtime) = self.retention.erasure.get() else {
             return;
         };
+        self.purge_sweep(fluree, ledgers, purge_grace).await;
         let Some(config) = runtime.config.as_ref() else {
             return;
         };
@@ -248,6 +254,56 @@ impl Fluree {
                 .step_and_record(&branch, &request_id, &commit, retry_ms)
                 .await;
             fluree.retention.nudge.notify_one();
+        });
+    }
+
+    /// Purge, in the background and one pass at a time, the ledgers among
+    /// `ledgers` with published erasures to purge, except those whose last
+    /// pass was blocked within the hour.
+    async fn purge_sweep(
+        &self,
+        fluree: &Weak<Fluree>,
+        ledgers: &[String],
+        grace: std::time::Duration,
+    ) {
+        let (Some(runtime), Ok(ns)) = (self.retention.erasure.get(), self.publisher()) else {
+            return;
+        };
+        let now = now_ms();
+        let mut due = std::collections::BTreeSet::new();
+        for branch in ledgers {
+            if let Ok((_, Some(registration))) = registry::read(ns, branch).await {
+                let purge = registration
+                    .erasures
+                    .iter()
+                    .any(|j| j.purge_pending() && j.retry_at_ms.is_none_or(|at| at <= now));
+                if let (true, Ok(id)) = (purge, LedgerId::parse(branch)) {
+                    due.insert(id.ledger_name().to_string());
+                }
+            }
+        }
+        if due.is_empty()
+            || runtime
+                .purge_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let fluree = fluree.clone();
+        tokio::spawn(async move {
+            let Some(fluree) = fluree.upgrade() else {
+                return;
+            };
+            let Some(runtime) = fluree.retention.erasure.get() else {
+                return;
+            };
+            let _clear = InFlight(&runtime.purge_in_flight);
+            for name in due {
+                if let Err(e) = fluree.run_purge_pass(&name, grace).await {
+                    tracing::warn!(ledger = %name, error = %e, "erasure: purge pass failed");
+                }
+            }
         });
     }
 
