@@ -499,12 +499,12 @@ Enable background indexing and configure novelty backpressure thresholds:
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
 
-Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)):
+Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)). Between the floor (`--gc-max-old-indexes`) and the ceiling (`--gc-hard-max-old-indexes`), the age guard (`--gc-min-time-mins`) decides. These settings apply only on a server that runs the indexer; a peer, or a server with indexing disabled, collects nothing:
 
 | Flag                         | Env Var                           | Default | Description                                     |
 | ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
 | `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions always kept, whatever their age |
-| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version, so keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. Decides retention between `--gc-max-old-indexes` and `--gc-hard-max-old-indexes` |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `15`    | Minutes a superseded index version is kept, so a query that started on it can finish. Keep it above your longest query: `query_timeout_ms` defaults to 15 minutes, and with it set to `0` nothing bounds a query. Decides retention between `--gc-max-old-indexes` and `--gc-hard-max-old-indexes` |
 | `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | `10`    | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so raise it above the versions published during your longest query |
 
 Config file equivalent:
@@ -1011,7 +1011,7 @@ fluree server run \
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100`                                                                   |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
 | `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions always kept, whatever their age | `5`                                                                  |
-| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `15`                              |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minutes a superseded index version is kept, so a query that started on it can finish | `15`                              |
 | `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | `10` |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |

@@ -172,7 +172,7 @@ The reindex operation:
    - **Phase F**: Uploads dictionaries and index artifacts to CAS, creates `IndexRoot` (FIR6)
 4. **Validates** that no new commits arrived during the build (conflict detection)
 5. **Publishes** the new index root via `publish_index_allow_equal`
-6. **Spawns** async garbage collection to clean up old index versions
+6. **Spawns** async garbage collection to clean up old index versions, under the same [retention settings](background-indexing.md#index-retention) as background indexing
 
 The published root links the index version it supersedes and carries a garbage manifest naming what that version replaced, so the new root participates in the GC chain like any incremental build. Roots published by Fluree **4.1.4 or earlier** did neither: they severed the chain, leaving every earlier root permanently unreachable for garbage collection. A ledger reindexed on one of those versions still holds those artifacts, and only a [storage sweep](background-indexing.md#reclaiming-orphaned-artifacts) reclaims them.
 

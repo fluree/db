@@ -440,6 +440,9 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage
 # reindex_min_bytes = {reindex_min_bytes}         # bytes of novelty before a background reindex (default ≈ every commit)
 # reindex_max_bytes = {reindex_max_bytes}      # {reindex_max_mb} MB (default: 20% of system RAM) — transactions rejected (503, retryable) until reindexed
+# gc_min_time_mins = {gc_min_time_mins}                 # minutes a superseded index version is kept for queries still reading it
+# gc_max_old_indexes = {gc_max_old_indexes}                # old index versions always kept, whatever their age
+# gc_hard_max_old_indexes = {gc_hard_max_old_indexes}          # past this many old versions, collect even inside gc_min_time_mins
 
 # [server.auth.events]
 # mode = "{auth_mode}"                      # none, optional, required
@@ -522,6 +525,9 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         reindex_min_bytes = DEFAULT_REINDEX_MIN_BYTES,
         reindex_max_bytes = default_reindex_max_bytes(),
         reindex_max_mb = default_reindex_max_bytes() / (1024 * 1024),
+        gc_min_time_mins = crate::wasm_compat::DEFAULT_MIN_TIME_GARBAGE_MINS,
+        gc_max_old_indexes = crate::wasm_compat::DEFAULT_MAX_OLD_INDEXES,
+        gc_hard_max_old_indexes = crate::wasm_compat::DEFAULT_HARD_MAX_OLD_INDEXES,
         auth_mode = DEFAULT_AUTH_MODE,
         jwks_cache_ttl = DEFAULT_JWKS_CACHE_TTL,
         mcp_enabled = DEFAULT_MCP_ENABLED,
@@ -640,6 +646,9 @@ mod tests {
         assert!(t.contains(&format!("# log_level = \"{DEFAULT_LOG_LEVEL}\"")));
         assert!(t.contains(&format!("# enabled = {DEFAULT_INDEXING_ENABLED}")));
         assert!(t.contains("# cache_max_mb = 4096"));
+        assert!(t.contains("# gc_min_time_mins = 15 "));
+        assert!(t.contains("# gc_max_old_indexes = 5 "));
+        assert!(t.contains("# gc_hard_max_old_indexes = 10 "));
     }
 
     #[test]
