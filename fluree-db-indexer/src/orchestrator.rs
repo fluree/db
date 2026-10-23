@@ -767,8 +767,9 @@ fn ledger_name_of(ledger_id: &LedgerId) -> LedgerName {
 /// the source still has that root: a version leaves a chain only once the
 /// age guard has passed, and every root left in the chain is protected
 /// (`gc::collector::retained_refs`), on this branch or a sibling's. That
-/// needs the guard to outlast the listing, so a short guard, or the version
-/// ceiling that overrides it, takes the listing fresh for every pass.
+/// needs the guard to outlast the listing, so a short guard takes the listing
+/// fresh for every pass, and so does a pass that releases a version past the
+/// ceiling, inside the guard.
 const SIBLING_LISTING_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// The nameservice's records, listed at most every
@@ -816,15 +817,18 @@ impl GcPassContext {
     /// The branches that may be siblings of `ledger_id`: the listing's, plus
     /// the ones this process has built. `None` when the listing cannot be
     /// taken, which defers every shared blob rather than guess.
+    ///
+    /// `overrides_age_guard`: the pass releases a version inside the age
+    /// guard, which the listing's age is only safe against while the guard
+    /// holds (see [`SIBLING_LISTING_MAX_AGE`]).
     async fn sibling_candidates(
         &self,
         gc: &GcGuard,
         ledger_id: &LedgerId,
+        overrides_age_guard: bool,
     ) -> Option<Vec<LedgerId>> {
         let guard_secs = u64::from(self.config.gc_min_time_mins) * 60;
-        let max_age = if self.config.gc_hard_max_old_indexes.is_some()
-            || guard_secs < 2 * SIBLING_LISTING_MAX_AGE.as_secs()
-        {
+        let max_age = if overrides_age_guard || guard_secs < 2 * SIBLING_LISTING_MAX_AGE.as_secs() {
             Duration::ZERO
         } else {
             SIBLING_LISTING_MAX_AGE
@@ -888,7 +892,9 @@ impl GcPassContext {
             );
             return Ok(plan.unreleased());
         };
-        let siblings = self.sibling_candidates(gc, ledger_id).await;
+        let siblings = self
+            .sibling_candidates(gc, ledger_id, plan.overrides_age_guard())
+            .await;
         crate::gc::release_garbage_plan(
             plan,
             &self.backend,
@@ -3871,6 +3877,131 @@ mod tests {
         assert!(
             store.has(&shared).await.unwrap(),
             "db:dev's head references the blob; it must survive main's pass"
+        );
+        let listed = ctx.directory.inner.lock().await.clone().expect("listed");
+        assert_eq!(
+            listed.1.len(),
+            1,
+            "a pass inside the age guard reads the cached listing, ceiling or not"
+        );
+    }
+
+    /// With the default settings a ledger publishing faster than the age guard
+    /// keeps ten old versions: the eleventh goes although its garbage is
+    /// fresh. A pass that collects inside the guard cannot trust a cached
+    /// listing to show every fork (see [`SIBLING_LISTING_MAX_AGE`]), so it
+    /// lists afresh and finds the one that still reads the blob.
+    #[tokio::test]
+    async fn a_pass_past_the_default_ceiling_lists_siblings_afresh() {
+        use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
+        use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
+        use fluree_db_core::{ContentStore, DictKind, StorageWrite};
+        use fluree_db_nameservice::IndexPublisher;
+
+        const MAIN: &str = "ceil:main";
+        const DEV: &str = "ceil:dev";
+        const VERSIONS: i64 = 12;
+        let dict_kind = ContentKind::DictBlob {
+            dict: DictKind::Graphs,
+        };
+        let storage = MemoryStorage::new();
+        let (shared, shared_addr) = cid_and_addr_for(MAIN, dict_kind, b"ceil leaf N");
+        let (touched, touched_addr) = cid_and_addr_for(MAIN, dict_kind, b"ceil leaf N+1");
+        storage
+            .write_bytes(&shared_addr, b"ceil leaf N")
+            .await
+            .unwrap();
+        storage
+            .write_bytes(&touched_addr, b"ceil leaf N+1")
+            .await
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut roots: Vec<ContentId> = Vec::new();
+        for t in 1..=VERSIONS {
+            let (root, root_addr) = cid_and_addr_for(
+                MAIN,
+                ContentKind::IndexRoot,
+                format!("ceil-r{t}").as_bytes(),
+            );
+            let (garbage, prev) = match roots.last() {
+                None => (None, None),
+                Some(prev) => {
+                    let (g, g_addr) = cid_and_addr_for(
+                        MAIN,
+                        ContentKind::GarbageRecord,
+                        format!("ceil-g{t}").as_bytes(),
+                    );
+                    // Version 2 replaced the blob version 1 read.
+                    let named = if t == 2 {
+                        format!(r#""{shared}""#)
+                    } else {
+                        String::new()
+                    };
+                    let body = format!(
+                        r#"{{"ledger_id": "{MAIN}", "t": {t}, "garbage": [{named}], "created_at_ms": {now_ms}}}"#
+                    );
+                    storage.write_bytes(&g_addr, body.as_bytes()).await.unwrap();
+                    (
+                        Some(BinaryGarbageRef { id: g }),
+                        Some(BinaryPrevIndexRef {
+                            t: t - 1,
+                            id: prev.clone(),
+                        }),
+                    )
+                }
+            };
+            let reads = if t == 1 { &shared } else { &touched };
+            let bytes = minimal_fir6_for(MAIN, t, prev, garbage, reads.clone());
+            storage.write_bytes(&root_addr, &bytes).await.unwrap();
+            roots.push(root);
+        }
+        let head = roots.last().unwrap().clone();
+        // A fork of version 1, made after the listing below.
+        let (dev1, dev1_addr) = cid_and_addr_for(DEV, ContentKind::IndexRoot, b"ceil-d1");
+        let dev_root = minimal_fir6_for(DEV, 1, None, None, shared.clone());
+        storage.write_bytes(&dev1_addr, &dev_root).await.unwrap();
+
+        let ns = Arc::new(MemoryNameService::new());
+        ns.create_ledger(MAIN).unwrap();
+        ns.publish_index(MAIN, VERSIONS, &head).await.unwrap();
+        ns.create_ledger(DEV).unwrap();
+        ns.publish_index(DEV, 1, &dev1).await.unwrap();
+
+        let ctx = GcPassContext {
+            backend: StorageBackend::Managed(Arc::new(storage.clone())),
+            nameservice: ns,
+            directory: Arc::default(),
+            config: IndexerConfig::default(),
+            maintenance: Arc::default(),
+            tick: watch::channel(0u64).0,
+        };
+        let mut main_record = NsRecord::new(MAIN);
+        main_record.index_head_id = Some(head.clone());
+        ctx.directory.replace(Arc::new(vec![main_record])).await;
+
+        let locks: GcLocks = Arc::default();
+        let gc = try_hold_gc(&locks, &name("ceil")).expect("free lock");
+        let result = ctx
+            .run(&id(MAIN), &head, &gc, InFlightBuild::GiveUp)
+            .await
+            .unwrap();
+
+        let store = fluree_db_core::storage::content_store_for(storage.clone(), MAIN);
+        assert_eq!(
+            (result.indexes_cleaned, result.age_guard_overridden),
+            (1, 1),
+            "the eleventh old version goes, inside the age guard"
+        );
+        assert_eq!(result.retained, 11);
+        assert!(!store.has(&roots[0]).await.unwrap());
+        assert_eq!(result.shared_deferred, 1);
+        assert!(
+            store.has(&shared).await.unwrap(),
+            "ceil:dev's head reads the blob; only a fresh listing shows it"
         );
     }
 

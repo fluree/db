@@ -2448,13 +2448,15 @@ impl FlureeBuilder {
     /// default; order relative to [`Self::with_indexing_thresholds`] does not
     /// matter, since each preserves the other's half of the config.
     ///
-    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
-    /// rate the age guard always wins and the count target bounds nothing.
-    /// `hard_max_old_indexes` is an opt-in ceiling past which the guard is
-    /// overridden. It bounds retained versions, not bytes, and overriding the
-    /// guard can release artifacts a query still reading an older version
-    /// needs; see `CleanGarbageConfig::hard_max_old_indexes` in
-    /// `fluree_db_indexer::gc` for the trade-off.
+    /// `min_time_mins` is the age guard: a superseded version is kept that long
+    /// so a query that started on it can finish. `max_old_indexes` is a floor
+    /// kept whatever its age, and `hard_max_old_indexes` a ceiling (default
+    /// 10) past which versions go whatever their age. The ceiling bounds
+    /// retained versions, not bytes, and can release artifacts a query still
+    /// reading an older version needs; see
+    /// `CleanGarbageConfig::hard_max_old_indexes` in `fluree_db_indexer::gc`
+    /// for the trade-off. To remove it, set
+    /// `IndexerConfig::gc_hard_max_old_indexes` to `None`.
     pub fn with_gc_settings(
         mut self,
         max_old_indexes: Option<u32>,
@@ -5757,9 +5759,10 @@ mod tests {
             defaults.gc_min_time_mins
         );
         assert_eq!(
-            cfg3.indexer_config.gc_hard_max_old_indexes, None,
-            "the ceiling is opt-in"
+            cfg3.indexer_config.gc_hard_max_old_indexes,
+            defaults.gc_hard_max_old_indexes
         );
+        assert_eq!(defaults.gc_hard_max_old_indexes, Some(10));
         assert!(!b3.indexer_config_user_set);
     }
 
