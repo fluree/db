@@ -31,6 +31,16 @@ pub enum DeltaError {
         version: u64,
     },
 
+    /// A version range the change data feed cannot serve: the feed was off for
+    /// part of it, the schema changed inside it, or the log no longer reaches
+    /// its start. Reading the end version whole is the way forward.
+    #[error("Delta table '{table}' has no change data feed after version {after}: {reason}")]
+    ChangeFeedUnavailable {
+        table: String,
+        after: u64,
+        reason: String,
+    },
+
     /// A column type with no `fluree-db-tabular` representation. Raised before
     /// any rows are read, so an unsupported column never reads as nulls.
     #[error("unsupported Delta column type: {0}")]
@@ -99,6 +109,39 @@ impl DeltaError {
             _ => false,
         }
     }
+}
+
+/// Why the change data feed cannot serve a range, when that is what a failure
+/// while reading it says: the feed is off at a version inside it, the schema
+/// changed, Kernel cannot read the feed of this table, or a file it needs is
+/// gone. `None` for a failure that is not about the feed (a 403, a 503).
+pub(crate) fn change_feed_refusal(error: &delta_kernel::Error) -> Option<String> {
+    use delta_kernel::Error as K;
+    match error {
+        K::Backtraced { source, .. } => change_feed_refusal(source),
+        K::ChangeDataFeedUnsupported(version) => Some(format!(
+            "the change data feed is not enabled at version {version}"
+        )),
+        K::ChangeDataFeedIncompatibleSchema(..) => {
+            Some("the schema changed inside the range".to_string())
+        }
+        K::Unsupported(message) => Some(format!("Kernel cannot read its change feed: {message}")),
+        other if kernel_is_not_found(other) => {
+            Some("a file the range needs is no longer in storage".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// [`change_feed_refusal`] for a failure to open a range. Kernel reports a log
+/// that no longer reaches the range's start as a plain message, so, as for
+/// [`DeltaError::is_unreachable_version`], every failure that is not an access
+/// or transport one is read as the feed being unavailable.
+pub(crate) fn change_range_refusal(error: &delta_kernel::Error) -> Option<String> {
+    change_feed_refusal(error).or_else(|| {
+        (!kernel_is_access_or_unsupported(error))
+            .then(|| "the log no longer reaches the start of the range".to_string())
+    })
 }
 
 fn kernel_is_access_or_unsupported(error: &delta_kernel::Error) -> bool {

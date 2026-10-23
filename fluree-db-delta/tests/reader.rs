@@ -1362,3 +1362,143 @@ async fn the_data_file_probe_reaches_a_file_the_log_alone_does_not() {
         .expect_err("no file to reach");
     assert!(err.is_missing_file(), "{err:?}");
 }
+
+const CHANGE_COLUMNS: [&str; 5] = ["id", "name", "amount", "_change_type", "_commit_version"];
+
+/// Every change after `after` through `snapshot`, as `CHANGE_COLUMNS` rows in
+/// arrival order, and where the feed stopped short.
+async fn changes(
+    snapshot: &DeltaSnapshot,
+    after: u64,
+    budget: Option<u64>,
+) -> (Vec<Vec<Cell>>, Option<u64>) {
+    let feed = snapshot
+        .changes_since(after, &[], budget)
+        .await
+        .expect("open change feed");
+    let batches: Vec<ColumnBatch> = feed.stream.map(|b| b.expect("batch")).collect().await;
+    let mut out = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows {
+            out.push(
+                CHANGE_COLUMNS
+                    .iter()
+                    .map(|c| cell(batch.column_by_name(c).expect("change column"), row))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    (out, feed.stopped_at.get().copied())
+}
+
+/// Sorted by version, then id, then change type.
+fn by_version(mut rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
+    let key = |r: &Vec<Cell>| match (&r[4], &r[0], &r[3]) {
+        (Cell::Int(v), Cell::Int(id), Cell::Str(kind)) => (*v, *id, kind.clone()),
+        other => panic!("change row {other:?}"),
+    };
+    rows.sort_by_key(key);
+    rows
+}
+
+fn change(id: i64, name: &str, amount: i64, kind: &str, version: i64) -> Vec<Cell> {
+    vec![int(id), s(name), int(amount), s(kind), int(version)]
+}
+
+/// The changes `spark_fixture.py` makes after version 0: an update, a delete,
+/// an append, a MERGE that deletes, updates and inserts in one commit, and a
+/// deleted key inserted again.
+fn changes_after_0() -> Vec<Vec<Cell>> {
+    vec![
+        change(2, "b", 200, "update_preimage", 1),
+        change(2, "b", 201, "update_postimage", 1),
+        change(3, "c", 300, "update_preimage", 1),
+        change(3, "c", 301, "update_postimage", 1),
+        change(4, "d", 400, "delete", 2),
+        change(6, "f", 600, "insert", 3),
+        change(1, "a", 100, "delete", 4),
+        change(5, "e", 500, "update_preimage", 4),
+        change(5, "e2", 501, "update_postimage", 4),
+        change(7, "g", 700, "insert", 4),
+        change(4, "d2", 401, "insert", 5),
+    ]
+}
+
+#[tokio::test]
+async fn the_change_feed_reads_every_change_after_a_version_in_commit_order() {
+    let latest = open("change_feed")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    assert_eq!(latest.version(), 5);
+    let (rows, stopped) = changes(&latest, 0, None).await;
+    assert_eq!(stopped, None, "an unbounded feed reads to the end");
+    let versions: Vec<&Cell> = rows.iter().map(|r| &r[4]).collect();
+    assert!(
+        versions.windows(2).all(|w| match (w[0], w[1]) {
+            (Cell::Int(a), Cell::Int(b)) => a <= b,
+            _ => false,
+        }),
+        "rows arrive in commit order: {versions:?}"
+    );
+    assert_eq!(by_version(rows), by_version(changes_after_0()));
+
+    // A range ending at an older version reads only up to it.
+    let v2 = open("change_feed")
+        .snapshot(VersionSelector::Version(2))
+        .await
+        .unwrap();
+    let (rows, _) = changes(&v2, 0, None).await;
+    assert_eq!(
+        by_version(rows),
+        by_version(changes_after_0()[..5].to_vec())
+    );
+}
+
+/// A budget ends the feed at the first commit boundary at or past it, and
+/// never inside a commit: version 1 holds four rows, version 2 one.
+#[tokio::test]
+async fn a_row_budget_stops_the_change_feed_at_a_commit_boundary() {
+    let latest = open("change_feed")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    let all = changes_after_0();
+    for (budget, through, rows) in [(1, 1, 4), (4, 1, 4), (5, 2, 5), (6, 3, 6)] {
+        let (read, stopped) = changes(&latest, 0, Some(budget)).await;
+        assert_eq!(stopped, Some(through), "budget {budget}");
+        assert_eq!(
+            by_version(read),
+            by_version(all[..rows].to_vec()),
+            "budget {budget}"
+        );
+    }
+    let (read, stopped) = changes(&latest, 0, Some(11)).await;
+    assert_eq!(stopped, None, "a budget the window fits does not cut it");
+    assert_eq!(read.len(), 11);
+}
+
+/// The feed of `change_feed_late` begins at version 2: a range that starts
+/// before it is refused as such, before any rows are read; one that starts
+/// at it is served.
+#[tokio::test]
+async fn a_range_the_feed_does_not_cover_is_refused() {
+    let latest = open("change_feed_late")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    assert_eq!(latest.version(), 3);
+    match latest.changes_since(0, &[], None).await {
+        Err(DeltaError::ChangeFeedUnavailable { after: 0, .. }) => {}
+        Err(other) => panic!("expected ChangeFeedUnavailable, got {other}"),
+        Ok(_) => panic!("a range starting before the feed must be refused"),
+    }
+    let (rows, _) = changes(&latest, 1, None).await;
+    assert_eq!(
+        by_version(rows),
+        by_version(vec![
+            change(2, "b", 200, "update_preimage", 3),
+            change(2, "b", 201, "update_postimage", 3),
+        ])
+    );
+}
