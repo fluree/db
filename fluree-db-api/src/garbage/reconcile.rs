@@ -78,13 +78,16 @@ impl Fluree {
         budget: usize,
         not_before: Option<i64>,
     ) -> Result<Option<ReconcileReport>> {
-        if self.blob_pins().is_none() {
+        let Some(pins) = self.blob_pins() else {
             return Ok(None);
-        }
+        };
         let Some(binding) = self.publisher()?.get_binding(name).await? else {
             return Ok(None);
         };
         let binding = binding.value;
+        let Some(_pass) = pins.try_collect_root(&binding.root) else {
+            return Ok(None);
+        };
         let storage = self.garbage_storage()?;
         let method = storage.storage_method().to_string();
         let progress_address = format!("{}{RECONCILING}", dir_address(&method, &binding.root));
@@ -168,8 +171,9 @@ impl Fluree {
         Ok(Some(report))
     }
 
-    /// Reconcile the settled ledger least recently reconciled, unless every
-    /// one was within `every`. Returns its name and report.
+    /// Take a step of reconciling the settled ledger least recently
+    /// reconciled, passing over any not settled, unless every one was
+    /// within `every`. Returns its name and report.
     pub(crate) async fn reconcile_next(
         &self,
         every: Duration,
@@ -178,7 +182,7 @@ impl Fluree {
             return Ok(None);
         }
         let due_before = now_ms() - i64::try_from(every.as_millis()).unwrap_or(i64::MAX);
-        let mut oldest: Option<(Option<i64>, String)> = None;
+        let mut due: Vec<(Option<i64>, String)> = Vec::new();
         for (name, binding) in self.publisher()?.list_bindings().await? {
             if !matches!(binding.value.state, BindingState::Active) {
                 continue;
@@ -187,20 +191,17 @@ impl Fluree {
                 .reconciled(&binding.value.root)
                 .await?
                 .map(|r| r.started_ms);
-            if from.is_some_and(|ms| ms > due_before) {
-                continue;
-            }
-            if oldest.as_ref().is_none_or(|(o, _)| from < *o) {
-                oldest = Some((from, name));
+            if from.is_none_or(|ms| ms <= due_before) {
+                due.push((from, name));
             }
         }
-        let Some((_, name)) = oldest else {
-            return Ok(None);
-        };
-        Ok(self
-            .reconcile_step(&name, STEP, None)
-            .await?
-            .map(|report| (name, report)))
+        due.sort();
+        for (_, name) in due {
+            if let Some(report) = self.reconcile_step(&name, STEP, None).await? {
+                return Ok(Some((name, report)));
+            }
+        }
+        Ok(None)
     }
 
     /// The last completed reconciliation of the ledger at `root`.

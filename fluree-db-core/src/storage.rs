@@ -135,7 +135,9 @@ pub use content_bytes::DEFAULT_MMAP_MIN_BYTES;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
-pub use pins::{Abandoned, BlobClaim, BlobPin, BlobPinner, BlobPins, Unpublished};
+pub use pins::{
+    Abandoned, BlobClaim, BlobPin, BlobPinner, BlobPins, RootCollection, RootHold, Unpublished,
+};
 pub use range_source::RangeSource;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use root_lock::{RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE};

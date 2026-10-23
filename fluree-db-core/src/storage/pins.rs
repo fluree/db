@@ -13,7 +13,7 @@
 //! writer then stores the bytes anew.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasher, BuildHasherDefault};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
 
 use futures::channel::oneshot;
@@ -21,7 +21,7 @@ use futures::future::{FutureExt, Shared};
 use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 
-use crate::address_path::StorageNamespace;
+use crate::address_path::{StorageNamespace, StorageRoot};
 use crate::ContentId;
 
 const SHARDS: usize = 64;
@@ -31,16 +31,88 @@ const SHARDS: usize = 64;
 const MAX_ABANDONED: usize = 100_000;
 
 enum Slot {
-    Pinned(usize),
-    /// Resolves when the claim ends.
-    Claimed(Shared<oneshot::Receiver<()>>),
+    Shared(usize),
+    /// Resolves when the exclusive hold ends.
+    Exclusive(Shared<oneshot::Receiver<()>>),
 }
 
-type Shard = Mutex<HashMap<ContentId, Slot>>;
+/// Shared holds that wait out an exclusive one, and exclusive holds granted
+/// only while no hold is taken, per key.
+struct Gate<K> {
+    shards: Box<[Mutex<HashMap<K, Slot>>]>,
+}
+
+impl<K: Hash + Eq + Clone> Default for Gate<K> {
+    fn default() -> Self {
+        Self {
+            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+}
+
+impl<K: Hash + Eq + Clone> Gate<K> {
+    fn shard(&self, key: &K) -> &Mutex<HashMap<K, Slot>> {
+        let hash = BuildHasherDefault::<FxHasher>::default().hash_one(key);
+        &self.shards[hash as usize % SHARDS]
+    }
+
+    async fn share(&self, key: &K) {
+        loop {
+            let exclusive = {
+                let mut shard = self.shard(key).lock();
+                match shard.get_mut(key) {
+                    Some(Slot::Shared(n)) => {
+                        *n += 1;
+                        None
+                    }
+                    Some(Slot::Exclusive(ended)) => Some(ended.clone()),
+                    None => {
+                        shard.insert(key.clone(), Slot::Shared(1));
+                        None
+                    }
+                }
+            };
+            match exclusive {
+                Some(ended) => {
+                    let _ = ended.await;
+                }
+                None => return,
+            }
+        }
+    }
+
+    fn unshare(&self, key: &K) {
+        let mut shard = self.shard(key).lock();
+        if let Some(Slot::Shared(n)) = shard.get_mut(key) {
+            *n -= 1;
+            if *n == 0 {
+                shard.remove(key);
+            }
+        }
+    }
+
+    /// The sender that ends the exclusive hold when dropped, once
+    /// [`Self::release`] has removed it.
+    fn try_exclusive(&self, key: &K) -> Option<oneshot::Sender<()>> {
+        let mut shard = self.shard(key).lock();
+        if shard.contains_key(key) {
+            return None;
+        }
+        let (done, ended) = oneshot::channel();
+        shard.insert(key.clone(), Slot::Exclusive(ended.shared()));
+        Some(done)
+    }
+
+    fn release(&self, key: &K) {
+        self.shard(key).lock().remove(key);
+    }
+}
 
 /// The pins of one storage's writers. See the module docs.
+#[derive(Default)]
 pub struct BlobPins {
-    shards: Box<[Shard]>,
+    blobs: Gate<ContentId>,
+    roots: Gate<StorageRoot>,
     abandoned: Mutex<Vec<Abandoned>>,
 }
 
@@ -50,15 +122,6 @@ pub struct BlobPins {
 pub struct Abandoned {
     pub namespace: StorageNamespace,
     pub id: ContentId,
-}
-
-impl Default for BlobPins {
-    fn default() -> Self {
-        Self {
-            shards: (0..SHARDS).map(|_| Shard::default()).collect(),
-            abandoned: Mutex::default(),
-        }
-    }
 }
 
 impl std::fmt::Debug for BlobPins {
@@ -72,52 +135,20 @@ impl BlobPins {
         Self::default()
     }
 
-    fn shard(&self, id: &ContentId) -> &Shard {
-        let hash = BuildHasherDefault::<FxHasher>::default().hash_one(id);
-        &self.shards[hash as usize % SHARDS]
-    }
-
     /// Pin `id`, stored under `namespace`, once no claim holds it.
     pub async fn pin(self: &Arc<Self>, namespace: &StorageNamespace, id: &ContentId) -> BlobPin {
-        loop {
-            let claimed = {
-                let mut shard = self.shard(id).lock();
-                match shard.get_mut(id) {
-                    Some(Slot::Pinned(n)) => {
-                        *n += 1;
-                        None
-                    }
-                    Some(Slot::Claimed(done)) => Some(done.clone()),
-                    None => {
-                        shard.insert(id.clone(), Slot::Pinned(1));
-                        None
-                    }
-                }
-            };
-            match claimed {
-                Some(done) => {
-                    let _ = done.await;
-                }
-                None => {
-                    return BlobPin {
-                        pins: Arc::clone(self),
-                        namespace: namespace.clone(),
-                        id: id.clone(),
-                    }
-                }
-            }
+        self.blobs.share(id).await;
+        BlobPin {
+            pins: Arc::clone(self),
+            namespace: namespace.clone(),
+            id: id.clone(),
         }
     }
 
     /// A claim for deleting `id`, unless a writer pins it or another claim
     /// holds it.
     pub fn try_claim(self: &Arc<Self>, id: &ContentId) -> Option<BlobClaim> {
-        let mut shard = self.shard(id).lock();
-        if shard.contains_key(id) {
-            return None;
-        }
-        let (done, ended) = oneshot::channel();
-        shard.insert(id.clone(), Slot::Claimed(ended.shared()));
+        let done = self.blobs.try_exclusive(id)?;
         Some(BlobClaim {
             pins: Arc::clone(self),
             id: id.clone(),
@@ -125,19 +156,31 @@ impl BlobPins {
         })
     }
 
+    /// Keep collection out of the ledger at `root` for a transfer that
+    /// stores blobs over several calls before publishing a head naming
+    /// them, once a collection pass there has ended.
+    pub async fn hold_root(self: &Arc<Self>, root: &StorageRoot) -> RootHold {
+        self.roots.share(root).await;
+        RootHold {
+            pins: Arc::clone(self),
+            root: root.clone(),
+        }
+    }
+
+    /// A collection pass over the ledger at `root`, unless a transfer holds
+    /// it or another pass is under way.
+    pub fn try_collect_root(self: &Arc<Self>, root: &StorageRoot) -> Option<RootCollection> {
+        let done = self.roots.try_exclusive(root)?;
+        Some(RootCollection {
+            pins: Arc::clone(self),
+            root: root.clone(),
+            _done: done,
+        })
+    }
+
     /// The blobs abandoned since the last call.
     pub fn take_abandoned(&self) -> Vec<Abandoned> {
         std::mem::take(&mut *self.abandoned.lock())
-    }
-
-    fn release(&self, id: &ContentId) {
-        let mut shard = self.shard(id).lock();
-        if let Some(Slot::Pinned(n)) = shard.get_mut(id) {
-            *n -= 1;
-            if *n == 0 {
-                shard.remove(id);
-            }
-        }
     }
 }
 
@@ -168,7 +211,7 @@ impl BlobPin {
 
 impl Drop for BlobPin {
     fn drop(&mut self) {
-        self.pins.release(&self.id);
+        self.pins.blobs.unshare(&self.id);
     }
 }
 
@@ -188,7 +231,42 @@ pub struct BlobClaim {
 
 impl Drop for BlobClaim {
     fn drop(&mut self) {
-        self.pins.shard(&self.id).lock().remove(&self.id);
+        self.pins.blobs.release(&self.id);
+    }
+}
+
+/// A transfer's hold on a ledger against collection. Dropping it lets
+/// collection back in.
+pub struct RootHold {
+    pins: Arc<BlobPins>,
+    root: StorageRoot,
+}
+
+impl Drop for RootHold {
+    fn drop(&mut self) {
+        self.pins.roots.unshare(&self.root);
+    }
+}
+
+impl std::fmt::Debug for RootHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootHold")
+            .field("root", &self.root.as_str())
+            .finish()
+    }
+}
+
+/// A collection pass's exclusive hold on a ledger. Transfers asking for a
+/// hold meanwhile wait until it is dropped.
+pub struct RootCollection {
+    pins: Arc<BlobPins>,
+    root: StorageRoot,
+    _done: oneshot::Sender<()>,
+}
+
+impl Drop for RootCollection {
+    fn drop(&mut self) {
+        self.pins.roots.release(&self.root);
     }
 }
 
@@ -290,6 +368,30 @@ mod tests {
         assert!(pins.try_claim(&id(b"body")).is_none());
         drop(pin);
         assert!(pins.try_claim(&id(b"other")).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_held_ledger_is_not_collected_and_a_hold_waits_out_a_pass() {
+        let pins = Arc::new(BlobPins::new());
+        let root = StorageRoot::parse("ledger").unwrap();
+        let hold = pins.hold_root(&root).await;
+        assert!(pins.try_collect_root(&root).is_none());
+        drop(hold);
+        let pass = pins.try_collect_root(&root).expect("unheld");
+        let waiting = tokio::spawn({
+            let pins = Arc::clone(&pins);
+            let root = root.clone();
+            async move { pins.hold_root(&root).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        drop(pass);
+        let hold = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("woken")
+            .unwrap();
+        assert!(pins.try_collect_root(&root).is_none());
+        drop(hold);
     }
 
     #[tokio::test]

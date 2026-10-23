@@ -19,8 +19,8 @@ pub use reconcile::ReconcileReport;
 use std::sync::Arc;
 
 use fluree_db_core::{
-    content_address, BlobPins, ContentId, ContentKind, Storage, StorageNamespace, StorageRoot,
-    CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN,
+    content_address, BlobPins, ContentId, ContentKind, RootHold, Storage, StorageNamespace,
+    StorageRoot, CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +134,20 @@ impl Fluree {
         self.root.pins.as_ref()
     }
 
+    /// Keep garbage collection out of `ledger_id`'s ledger while a transfer
+    /// stores commits and transactions over several calls before publishing
+    /// a head naming them, as a pull or clone does through
+    /// [`set_commit_head`](Self::set_commit_head). Waits for a collection
+    /// pass under way there to end. `None` where the storage is not
+    /// collected.
+    pub async fn hold_garbage(&self, ledger_id: &str) -> Result<Option<RootHold>> {
+        let Some(pins) = self.garbage_storage()?.blob_pins() else {
+            return Ok(None);
+        };
+        let namespace = self.storage_namespace(ledger_id).await?;
+        Ok(Some(pins.hold_root(namespace.root()).await))
+    }
+
     fn garbage_storage(&self) -> Result<&dyn Storage> {
         self.admin_storage()
             .ok_or_else(|| ApiError::internal("garbage collection needs managed storage"))
@@ -152,8 +166,12 @@ impl Fluree {
             reason,
         })?;
         for blob in blobs {
+            // A record keeps the time it was first made: a reconciliation
+            // that found the blob still answers for it.
             if let Some(address) = blob.record_address(&method) {
-                storage.write_bytes(&address, &bytes).await?;
+                if !storage.exists(&address).await? {
+                    storage.write_bytes(&address, &bytes).await?;
+                }
             }
         }
         Ok(())

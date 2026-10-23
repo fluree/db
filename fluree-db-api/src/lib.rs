@@ -2427,6 +2427,13 @@ impl FlureeBuilder {
         self
     }
 
+    /// Whether `lock` keeps every other process out of the root: not a root
+    /// opened unprotected because its filesystem cannot lock.
+    #[cfg(feature = "native")]
+    fn excludes_others(lock: &Option<Arc<fluree_db_core::RootLock>>) -> bool {
+        lock.as_ref().is_some_and(|lock| lock.is_locked())
+    }
+
     /// The root lock this build takes, before the root is swept or its WAL
     /// replayed.
     #[cfg(feature = "native")]
@@ -2757,7 +2764,7 @@ impl FlureeBuilder {
         // A store from before name bindings moves to the current format.
         let nameservice = FileNameService::with_storage(storage.clone());
         nameservice.migrate_blocking()?;
-        let locked = root_lock.is_some();
+        let locked = Self::excludes_others(&root_lock);
         Ok(self
             .build_file(storage, nameservice, locked)
             .holding(root_lock))
@@ -2779,7 +2786,7 @@ impl FlureeBuilder {
             Ok(nameservice)
         })
         .await?;
-        let locked = root_lock.is_some();
+        let locked = Self::excludes_others(&root_lock);
         Ok(self
             .build_file(storage, nameservice, locked)
             .holding(root_lock))
@@ -3705,8 +3712,7 @@ impl FlureeBuilder {
             let storage = self
                 .wrap_address_identifiers(base_storage, &self.config)
                 .await?;
-            let pins = root_lock
-                .is_some()
+            let pins = Self::excludes_others(&root_lock)
                 .then(|| Arc::new(fluree_db_core::BlobPins::new()));
             let (storage, erasure) = self.erasure_storage(storage, pins.clone());
             let backend = StorageBackend::Managed(storage);

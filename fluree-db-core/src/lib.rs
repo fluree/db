@@ -217,6 +217,8 @@ pub use storage::{
     RangeSource,
     ReadHint,
     RemoteObject,
+    RootCollection,
+    RootHold,
     Storage,
     StorageBackend,
     StorageCas,

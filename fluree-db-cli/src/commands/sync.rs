@@ -114,7 +114,6 @@ fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
     }
 }
 
-/// Build a SyncDriver with all configured remotes
 /// Where the local ledger `ledger_id` stores its artifacts.
 async fn local_namespace(
     fluree: &fluree_db_api::Fluree,
@@ -129,6 +128,19 @@ async fn local_namespace(
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))
 }
 
+/// Keep garbage collection out of `ledger_id` while a transfer stores
+/// commits and transactions before setting a head naming them.
+async fn hold_garbage(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> CliResult<Option<fluree_db_core::RootHold>> {
+    fluree
+        .hold_garbage(ledger_id)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))
+}
+
+/// Build a SyncDriver with all configured remotes
 async fn build_sync_driver(dirs: &FlureeDir) -> CliResult<(SyncDriver, Arc<TomlSyncConfigStore>)> {
     let fluree = context::build_fluree(dirs).await?;
     let config_store = Arc::new(TomlSyncConfigStore::new(dirs.config_dir().to_path_buf()));
@@ -305,6 +317,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         .map_err(|e| CliError::Config(e.to_string()))?
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
     let namespace = local_namespace(&fluree, &ledger_id).await?;
+    let _garbage_hold = hold_garbage(&fluree, &ledger_id).await?;
 
     if remote_t <= local_ref.t {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
@@ -1182,6 +1195,7 @@ pub async fn run_clone(
         .await
         .map_err(|e| CliError::Config(format!("failed to create local ledger: {e}")))?;
     let namespace = local_namespace(&fluree, &local_id).await?;
+    let _garbage_hold = hold_garbage(&fluree, &local_id).await?;
 
     // Fetch all commit objects from the remote.
     let mut head_commit_id: Option<fluree_db_core::ContentId> = None;
@@ -1501,6 +1515,7 @@ pub async fn run_clone_origin(
         .await
         .map_err(|e| CliError::Config(format!("failed to create local ledger: {e}")))?;
     let namespace = local_namespace(&fluree, &local_id).await?;
+    let _garbage_hold = hold_garbage(&fluree, &local_id).await?;
 
     // Handle empty remote ledger: local ledger created but nothing to fetch.
     let head_cid = match &ns_record.commit_head_id {
@@ -1853,6 +1868,7 @@ async fn run_pull_via_origins(
         .await?
         .ok_or_else(|| CliError::NotFound(format!("local ledger '{ledger_id}' not found")))?;
     let namespace = ns_record.storage_namespace();
+    let _garbage_hold = hold_garbage(&fluree, ledger_id).await?;
 
     let config_id = ns_record.config_id.ok_or_else(|| {
         CliError::Config(format!(

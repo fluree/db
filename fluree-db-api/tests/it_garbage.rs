@@ -522,3 +522,66 @@ async fn commit_latency_with_and_without_pins() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_transfer_holding_its_ledger_keeps_what_it_stored_until_its_head_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact(&fluree, "garbage:main", &insert("alice"))
+        .await
+        .unwrap();
+    fluree
+        .create_branch("garbage", "remote", None, None)
+        .await
+        .unwrap();
+    let body = insert("bob");
+    let remote = transact(&fluree, "garbage:remote", &body).await.unwrap();
+    let source = fluree.content_store(&fluree.storage_namespace("garbage:remote").await.unwrap());
+    let target_ns = fluree.storage_namespace("garbage:main").await.unwrap();
+    let target = fluree.content_store(&target_ns);
+    let storage = fluree.admin_storage().unwrap();
+    // As a pull stores them directly, before it sets the head.
+    let store = || async {
+        let bytes = source.get(&remote.receipt.commit_id).await.unwrap();
+        storage
+            .content_write_bytes_with_hash(
+                ContentKind::Commit,
+                &target_ns,
+                &remote.receipt.commit_id.address_digest(),
+                &bytes,
+            )
+            .await
+            .unwrap();
+        let txn = body_id(&body);
+        target
+            .put_with_id(&txn, &source.get(&txn).await.unwrap())
+            .await
+            .unwrap();
+    };
+    // An earlier attempt stopped before its head; reconciliation found it.
+    store().await;
+    let found = fluree.reconcile_garbage("garbage").await.unwrap().unwrap();
+    assert_eq!(found.recorded, 2);
+
+    let hold = fluree
+        .hold_garbage("garbage:main")
+        .await
+        .unwrap()
+        .expect("collected");
+    store().await;
+    let during = fluree.collect_garbage(Duration::ZERO).await.unwrap();
+    assert_eq!((during.deleted, during.deferred), (0, 2), "{during:?}");
+    assert!(fluree.reconcile_garbage("garbage").await.unwrap().is_none());
+    let handle = fluree.ledger_cached("garbage:main").await.unwrap();
+    fluree
+        .set_commit_head(&handle, &remote.receipt.commit_id, remote.receipt.t)
+        .await
+        .unwrap();
+    drop(hold);
+
+    let after = fluree.collect_garbage(Duration::ZERO).await.unwrap();
+    assert_eq!((after.deleted, after.resolved), (0, 2), "{after:?}");
+    let verified = fluree.verify_ledger("garbage:main", None).await.unwrap();
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+}

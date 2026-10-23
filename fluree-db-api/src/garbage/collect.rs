@@ -9,6 +9,10 @@ use serde::Serialize;
 use super::{now_ms, Blob, GarbageReason, Recorded};
 use crate::{Fluree, Result};
 
+/// Blobs claimed together, so a writer storing one again waits for no more
+/// than one batch's checks.
+const CLAIM_BATCH: usize = 32;
+
 /// What a collection pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,37 +74,46 @@ impl Fluree {
         if due.is_empty() {
             return Ok(());
         }
+        let Some(_pass) = pins.try_collect_root(&binding.root) else {
+            report.deferred += due.len();
+            return Ok(());
+        };
         let Some(mut holders) = self.load_holders(name, binding).await? else {
             report.deferred += due.len();
             return Ok(());
         };
-        // Claimed before the last check: a writer storing one of these again
-        // waits for the pass, and anything published before the claims is
-        // caught up on.
-        let mut claimed: Vec<(Recorded, BlobClaim)> = Vec::new();
-        for recorded in due {
-            match pins.try_claim(&recorded.blob.id) {
-                Some(claim) => claimed.push((recorded, claim)),
-                None => report.deferred += 1,
-            }
-        }
-        if !holders.catch_up(self).await? {
-            report.deferred += claimed.len();
-            return Ok(());
-        }
         let storage = self.garbage_storage()?;
         let method = storage.storage_method().to_string();
-        for (recorded, _claim) in claimed {
-            let Some(address) = recorded.blob.address(&method) else {
-                continue;
-            };
-            if !storage.exists(&address).await? || holders.references(self, &recorded.blob).await? {
-                report.resolved += 1;
-            } else {
-                storage.delete(&address).await?;
-                report.deleted += 1;
+        // Claimed a batch at a time, before the last check: a writer storing
+        // one of these again waits for its batch only, and anything published
+        // before the claims is caught up on.
+        let mut due = due.into_iter().peekable();
+        while due.peek().is_some() {
+            let mut claimed: Vec<(Recorded, BlobClaim)> = Vec::new();
+            for recorded in due.by_ref().take(CLAIM_BATCH) {
+                match pins.try_claim(&recorded.blob.id) {
+                    Some(claim) => claimed.push((recorded, claim)),
+                    None => report.deferred += 1,
+                }
             }
-            storage.delete(&recorded.address).await?;
+            if !holders.catch_up(self).await? {
+                report.deferred += claimed.len() + due.count();
+                return Ok(());
+            }
+            for (recorded, _claim) in claimed {
+                let Some(address) = recorded.blob.address(&method) else {
+                    continue;
+                };
+                if !storage.exists(&address).await?
+                    || holders.references(self, &recorded.blob).await?
+                {
+                    report.resolved += 1;
+                } else {
+                    storage.delete(&address).await?;
+                    report.deleted += 1;
+                }
+                storage.delete(&recorded.address).await?;
+            }
         }
         Ok(())
     }

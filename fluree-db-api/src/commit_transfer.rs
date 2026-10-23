@@ -2006,7 +2006,9 @@ impl Fluree {
     ///
     /// Writes commit and txn blobs without validation or novelty updates.
     /// Order doesn't matter — CAS writes are idempotent.
-    /// Call [`set_commit_head`] after all pages are imported.
+    /// Call [`set_commit_head`] after all pages are imported, holding
+    /// [`hold_garbage`](Self::hold_garbage) from before the first page until
+    /// then: nothing names these blobs before it.
     pub async fn import_commits_bulk(
         &self,
         handle: &LedgerHandle,
