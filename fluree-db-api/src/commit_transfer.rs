@@ -2581,7 +2581,12 @@ impl Fluree {
             .map(crate::retention::registry::ArchivedRetention::parse)
             .transpose()?;
         let retracted_t = self
-            .restore_retention(record, archived, lineage.as_ref())
+            .restore_retention(
+                record,
+                archived,
+                lineage.as_ref(),
+                std::slice::from_ref(record),
+            )
             .await?;
 
         Ok(RestoreResult {

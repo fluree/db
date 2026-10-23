@@ -654,10 +654,15 @@ impl Fluree {
         .await
     }
 
-    /// Rebuild the index of `record`, a restored branch not yet visible,
+    /// Rebuild the index of `record`, a restored branch not yet visible
+    /// among `branches`,
     /// when it covers an erased commit: built before the erasure, it holds
     /// the erased values. A rebuild reads the commits as their replacements.
-    pub(crate) async fn rebuild_erased_index(&self, record: &NsRecord) -> Result<()> {
+    pub(crate) async fn rebuild_erased_index(
+        &self,
+        record: &NsRecord,
+        branches: &[NsRecord],
+    ) -> Result<()> {
         let Some(runtime) = self.retention.erasure.get() else {
             return Ok(());
         };
@@ -671,9 +676,9 @@ impl Fluree {
         if !runtime.index.any_erased().await? {
             return Ok(());
         }
-        let store = self
-            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
-            .await?;
+        // Not visible yet, so its parents are found among `branches`.
+        let store: std::sync::Arc<dyn fluree_db_core::ContentStore> =
+            std::sync::Arc::new(self.store_among(branches, record));
         let mut covers_erased = false;
         for (t, cid) in collect_first_parent_cids(store.as_ref(), head, 0).await? {
             if t <= record.index_t && runtime.index.erased(&cid).await?.is_some() {

@@ -1051,7 +1051,14 @@ impl crate::Fluree {
         let failed = |e: ApiError| {
             NameServiceError::storage(format!("restoring {}'s removal journal: {e}", entry.name))
         };
-        let live: Vec<_> = records.into_iter().filter(|r| !r.frozen).collect();
+        let records: Vec<_> = records
+            .into_iter()
+            .map(|r| fluree_db_nameservice::NsRecord {
+                storage_root: r.storage_root.clone().or_else(|| Some(entry.root.clone())),
+                ..r
+            })
+            .collect();
+        let live: Vec<_> = records.iter().filter(|r| !r.frozen).cloned().collect();
         let Some(lineage) = self
             .restored_lineage(&live, &entry.root_branch)
             .await
@@ -1060,7 +1067,7 @@ impl crate::Fluree {
             return Ok(());
         };
         for record in &live {
-            self.restore_retention(record, None, Some(&lineage))
+            self.restore_retention(record, None, Some(&lineage), &records)
                 .await
                 .map_err(failed)?;
         }

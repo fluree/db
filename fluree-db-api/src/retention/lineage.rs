@@ -172,7 +172,8 @@ impl Fluree {
         Ok(())
     }
 
-    /// Ready a restored ledger, not yet visible, to serve: merge its
+    /// Ready a restored ledger, not yet visible, to serve, `branches` being
+    /// all of its branch records: merge its
     /// lineage's checkpoint into the archive's retention, rebuild an index
     /// that covers an erased commit, then retract every
     /// journaled occurrence it holds as current state — an archive made
@@ -185,6 +186,7 @@ impl Fluree {
         record: &NsRecord,
         archived: Option<registry::ArchivedRetention>,
         lineage: Option<&ContentId>,
+        branches: &[NsRecord],
     ) -> Result<Option<i64>> {
         let checkpoint = match lineage {
             Some(lineage) => self.journal_checkpoint(lineage).await?,
@@ -200,7 +202,7 @@ impl Fluree {
         )
         .await?;
         #[cfg(feature = "native")]
-        self.rebuild_erased_index(&self.restored_record(record).await?)
+        self.rebuild_erased_index(&self.restored_record(record).await?, branches)
             .await?;
         let Some(registration) = restored else {
             return Ok(None);
@@ -210,7 +212,7 @@ impl Fluree {
         let pending = record;
         let record = self.restored_record(pending).await?;
         let (retracted_t, removals) = self
-            .retract_removed(&record, &registration.journal.removals)
+            .retract_removed(&record, &registration.journal.removals, branches)
             .await?;
         if !removals.is_empty() {
             registry::update_fenced(ns, ledger_id, record.fence, |current| {
@@ -272,6 +274,7 @@ impl Fluree {
         &self,
         record: &NsRecord,
         removals: &[Removal],
+        branches: &[NsRecord],
     ) -> Result<(Option<i64>, Vec<Removal>)> {
         let Some(head) = record
             .commit_head_id
@@ -280,9 +283,9 @@ impl Fluree {
         else {
             return Ok((None, Vec::new()));
         };
-        let store = self
-            .content_store_for_record_or_id(Some(record), &record.storage_namespace())
-            .await?;
+        // Not visible yet, so its parents are found among its branches.
+        let store: std::sync::Arc<dyn ContentStore> =
+            std::sync::Arc::new(self.store_among(branches, record));
         let (mut entries, open) = removed_spans(store.as_ref(), head, removals).await?;
         if open.is_empty() {
             return Ok((None, entries));

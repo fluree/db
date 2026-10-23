@@ -1253,6 +1253,70 @@ async fn a_copy_restored_after_publication_serves_no_erased_value() {
         .is_empty());
 }
 
+/// A copy with a branch, both indexed over an erased commit, restored after
+/// publication: the branch's index is rebuilt too, reading the commits it
+/// shares with its parent from the parent's folder before either is
+/// visible.
+#[tokio::test]
+async fn a_restored_copys_branch_is_rebuilt_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/erase-branch-origin").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    let mut archive = Vec::new();
+    fluree
+        .archive_ledger(&id, false, &mut archive)
+        .await
+        .unwrap();
+    let copy = fluree
+        .restore_ledger("it/erase-branch-copy", &mut archive.as_slice())
+        .await
+        .unwrap()
+        .ledger_id;
+    fluree
+        .create_branch("it/erase-branch-copy", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = "it/erase-branch-copy:dev";
+    insert(
+        &fluree,
+        dev,
+        json!({"@context": ctx(), "@id": "ex:bob", "ex:email": "b@kept"}),
+    )
+    .await;
+    reindex(&fluree, &copy).await;
+    reindex(&fluree, dev).await;
+    let dropped = fluree
+        .drop_ledger("it/erase-branch-copy", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+
+    fluree
+        .restore_dropped(dropped.instance.unwrap().as_str())
+        .await
+        .unwrap();
+    for ledger in [copy.as_str(), dev] {
+        assert!(objects(&fluree, ledger, "ex:alice", "ex:email")
+            .await
+            .is_empty());
+    }
+    assert_eq!(
+        objects(&fluree, dev, "ex:bob", "ex:email").await,
+        vec![json!("b@kept")]
+    );
+}
+
 /// A copy restored from an older archive while an erasure is proved
 /// retracts the value still current in it. That retraction holds the value
 /// too: it joins the job and is erased with it.

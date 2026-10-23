@@ -353,7 +353,11 @@ impl Fluree {
 
     /// `record`'s store, with its ancestors found among `records`: the
     /// branches of a dropped ledger, which lookups do not see.
-    fn store_among(&self, records: &[NsRecord], record: &NsRecord) -> BranchedContentStore {
+    pub(crate) fn store_among(
+        &self,
+        records: &[NsRecord],
+        record: &NsRecord,
+    ) -> BranchedContentStore {
         let own = self.backend.content_store(&record.storage_namespace());
         let parent = record
             .source_branch
