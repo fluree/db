@@ -814,19 +814,6 @@ pub async fn stage_with_graph_delta(
         // set) rather than by the total WHERE cardinality.
         let mut acc = if pure_delete {
             FlakeAccumulator::pure_delete(64)
-        } else if txn.sync_graph.is_some() || txn.txn_type == TxnType::Upsert {
-            // The payload is a set: a fact it states twice must not out-vote
-            // the single retraction of the current copy that the sync or
-            // upsert wave contributes.
-            //
-            // Upsert needs this for the same reason sync does. The
-            // Turtle-to-JSON-LD adapter states an edge once per reifier
-            // attached to it, so `s p o ~ c1 {| … |} ~ c2 {| … |}` asserts the
-            // base edge twice while the upsert wave retracts the stored copy
-            // once. The surplus assertion survived, and re-upserting a payload
-            // byte-for-byte identical to what was already stored committed a
-            // delta of one flake every time.
-            FlakeAccumulator::mixed_set_assertions(64)
         } else {
             FlakeAccumulator::mixed(64)
         };
@@ -3425,14 +3412,12 @@ fn materialize_one_binding(
     let store_ref = gv.store();
     match b {
         Binding::EncodedSid { s_id, .. } => {
-            let iri = store_ref.resolve_subject_iri(*s_id).map_err(|e| {
+            // The Sid the subject is stored under: re-encoding its IRI would
+            // give an OVERFLOW subject the EMPTY code, which names no stored
+            // fact for a retraction to match.
+            let sid = gv.resolve_subject_sid(*s_id).map_err(|e| {
                 TransactError::Query(fluree_db_query::QueryError::Internal(format!(
-                    "resolve_subject_iri: {e}"
-                )))
-            })?;
-            let sid = ledger.snapshot.encode_iri(&iri).ok_or_else(|| {
-                TransactError::Query(fluree_db_query::QueryError::Internal(format!(
-                    "encode_iri returned None for subject IRI: {iri}"
+                    "resolve_subject_sid: {e}"
                 )))
             })?;
             *b = Binding::sid(sid);
