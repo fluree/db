@@ -161,6 +161,7 @@ impl Fluree {
                 report.left += due.count();
                 return Ok(false);
             }
+            let batch = Instant::now();
             let mut claimed: Vec<(Recorded, BlobClaim)> = Vec::new();
             for recorded in due.by_ref().take(CLAIM_BATCH) {
                 match pins.try_claim(&recorded.blob.id) {
@@ -192,6 +193,13 @@ impl Fluree {
                 storage.delete(&recorded.address).await?;
             }
             report.timings.check += clock.elapsed();
+            // A pass with a budget runs in the background: it pauses as long
+            // as each batch took, its claims released, so its deletes take
+            // at most half the device the commits share it with.
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(batch.elapsed().min(left)).await;
+            }
         }
         Ok(true)
     }

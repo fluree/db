@@ -251,7 +251,7 @@ type Span = (Instant, Instant);
 async fn phases(fluree: &Fluree) -> (GarbageReport, Span, ReconcilePass, Span) {
     let started = Instant::now();
     let collected = fluree
-        .collect_garbage(Duration::ZERO)
+        .collect_garbage_within(Duration::ZERO, Some(Duration::from_secs(3600)))
         .await
         .expect("collect");
     let collection = (started, Instant::now());
