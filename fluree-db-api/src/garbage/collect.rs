@@ -31,6 +31,8 @@ pub struct GarbageReport {
     pub deferred: usize,
     /// Records past their grace period the pass ran out of time for.
     pub left: usize,
+    /// Ledgers the pass ran out of time before reaching.
+    pub ledgers_left: usize,
     pub timings: CollectTimings,
 }
 
@@ -75,17 +77,29 @@ impl Fluree {
         self.record_garbage(&abandoned, GarbageReason::Abandoned)
             .await?;
         let cutoff = now_ms() - i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
-        for (name, binding) in self.publisher()?.list_bindings().await? {
-            if let Err(e) = self
+        let from = self.root.collect_from.lock().clone();
+        let mut next_from = None;
+        for (name, binding) in resume_order(self.publisher()?.list_bindings().await?, from) {
+            match self
                 .collect_ledger(&name, &binding.value, cutoff, deadline, &mut report)
                 .await
             {
-                tracing::warn!(ledger = %name, error = %e, "garbage collection failed");
+                Ok(true) => {}
+                Ok(false) => {
+                    next_from.get_or_insert(name);
+                }
+                Err(e) => {
+                    tracing::warn!(ledger = %name, error = %e, "garbage collection failed");
+                }
             }
         }
+        *self.root.collect_from.lock() = next_from;
         Ok(report)
     }
 
+    /// Collect ledger `name`'s due records, claiming none once `deadline`
+    /// passes, as checked before each costly phase. `false` when it ran out
+    /// of time.
     pub(super) async fn collect_ledger(
         &self,
         name: &str,
@@ -93,7 +107,12 @@ impl Fluree {
         cutoff: i64,
         deadline: Option<Instant>,
         report: &mut GarbageReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let out_of_time = || deadline.is_some_and(|d| Instant::now() >= d);
+        if out_of_time() {
+            report.ledgers_left += 1;
+            return Ok(false);
+        }
         let pins = self.blob_pins().expect("collecting").clone();
         let due: Vec<Recorded> = self
             .garbage_records(&binding.root)
@@ -102,18 +121,22 @@ impl Fluree {
             .filter(|r| r.record.recorded_ms <= cutoff)
             .collect();
         if due.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let Some(_pass) = pins.try_collect_root(&binding.root) else {
             report.deferred += due.len();
-            return Ok(());
+            return Ok(true);
         };
+        if out_of_time() {
+            report.left += due.len();
+            return Ok(false);
+        }
         let clock = Instant::now();
         let holders = self.load_holders(name, binding).await?;
         report.timings.load += clock.elapsed();
         let Some(mut holders) = holders else {
             report.deferred += due.len();
-            return Ok(());
+            return Ok(true);
         };
         let storage = self.garbage_storage()?;
         let method = storage.storage_method().to_string();
@@ -122,9 +145,9 @@ impl Fluree {
         // before the claims is caught up on.
         let mut due = due.into_iter().peekable();
         while due.peek().is_some() {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if out_of_time() {
                 report.left += due.count();
-                return Ok(());
+                return Ok(false);
             }
             let mut claimed: Vec<(Recorded, BlobClaim)> = Vec::new();
             for recorded in due.by_ref().take(CLAIM_BATCH) {
@@ -138,7 +161,7 @@ impl Fluree {
             report.timings.catch_up += clock.elapsed();
             if !caught_up {
                 report.deferred += claimed.len() + due.count();
-                return Ok(());
+                return Ok(true);
             }
             let clock = Instant::now();
             for (recorded, _claim) in claimed {
@@ -158,6 +181,37 @@ impl Fluree {
             }
             report.timings.check += clock.elapsed();
         }
-        Ok(())
+        Ok(true)
+    }
+}
+
+/// `ledgers` by name, from `from` on and then the rest, so a pass resumes
+/// with the ledger the last ran out of time for.
+fn resume_order<T>(mut ledgers: Vec<(String, T)>, from: Option<String>) -> Vec<(String, T)> {
+    ledgers.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(from) = from {
+        let at = ledgers.partition_point(|(name, _)| *name < from);
+        ledgers.rotate_left(at);
+    }
+    ledgers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_order;
+
+    #[test]
+    fn a_pass_resumes_with_the_ledger_the_last_did_not_reach() {
+        let names = |from: Option<&str>| -> Vec<String> {
+            let ledgers = ["c", "a", "b"].map(|n| (n.to_string(), ())).to_vec();
+            resume_order(ledgers, from.map(str::to_string))
+                .into_iter()
+                .map(|(n, ())| n)
+                .collect()
+        };
+        assert_eq!(names(None), ["a", "b", "c"]);
+        assert_eq!(names(Some("b")), ["b", "c", "a"]);
+        // One dropped since: the next after it.
+        assert_eq!(names(Some("bb")), ["c", "a", "b"]);
     }
 }

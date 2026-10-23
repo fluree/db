@@ -123,6 +123,8 @@ pub(super) struct Listing {
     /// The branches listed, with their fences: steps list again once these
     /// change.
     branches: Vec<(String, Fence)>,
+    /// When listing began.
+    taken_ms: i64,
     folders: Vec<StorageNamespace>,
     buckets: Vec<Vec<(usize, ContentId)>>,
     recorded: HashSet<Blob>,
@@ -184,7 +186,8 @@ impl Fluree {
             let total = total.get_or_insert_with(ReconcileReport::default);
             total.add(&step);
             if paced {
-                tokio::time::sleep(clock.elapsed()).await;
+                let left = budget.map_or(Duration::MAX, |b| b.saturating_sub(started.elapsed()));
+                tokio::time::sleep(clock.elapsed().min(left)).await;
             }
             if step.complete || budget.is_some_and(|b| started.elapsed() >= b) {
                 return Ok(Some(total.clone()));
@@ -226,8 +229,15 @@ impl Fluree {
             .filter(|p| not_before.is_none_or(|ms| p.started_ms >= ms));
         let mut timings = ReconcileTimings::default();
 
+        // A run covers what its listings saw, so each must be taken after the
+        // run started: a listing kept from before another run restarted this
+        // one is taken again.
+        let started_ms = progress.map_or_else(now_ms, |p| p.started_ms);
         let mut listed = 0;
-        if !listing.as_ref().is_some_and(|l| l.lists(&binding)) {
+        if !listing
+            .as_ref()
+            .is_some_and(|l| l.lists(&binding) && l.taken_ms >= started_ms)
+        {
             let clock = Instant::now();
             let mut fresh = self.list_ledger(&binding).await?;
             timings.list = clock.elapsed();
@@ -244,7 +254,7 @@ impl Fluree {
         let listing = listing.as_ref().expect("listed");
         let holders = listing.holders.as_ref().expect("loaded");
         let progress = progress.unwrap_or_else(|| Reconciling {
-            started_ms: now_ms(),
+            started_ms,
             slices: slices_for(listing.files, slice),
             next: 0,
         });
@@ -312,6 +322,7 @@ impl Fluree {
         let method = storage.storage_method();
         let mut listing = Listing {
             holders: None,
+            taken_ms: now_ms(),
             branches: binding
                 .branches
                 .iter()

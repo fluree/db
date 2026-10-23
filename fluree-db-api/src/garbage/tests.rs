@@ -328,3 +328,106 @@ async fn reconciliation_and_collection_agree_on_every_file() {
     assert_eq!(unread.len(), 3, "{unread:?}");
     assert!(listed.blobs.len() > 20, "{}", listed.blobs.len());
 }
+
+/// A run another restarted lists again before going on: an orphan that
+/// appeared after the first run's listing is recorded, and collected, before
+/// the newer run counts as complete.
+#[tokio::test]
+async fn a_run_restarted_by_another_lists_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("race").await.unwrap();
+    for name in ["a", "b", "c"] {
+        commit_raw(&fluree, "race:main", name).await;
+    }
+    // Housekeeping lists, and checks the first of four slices.
+    let mut housekeeping = None;
+    let first = fluree
+        .reconcile_step("race", 2, None, &mut housekeeping)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.complete);
+    // An orphan lands in a slice past the first.
+    let namespace = fluree.storage_namespace("race:main").await.unwrap();
+    let orphan = (0..)
+        .map(|n| format!("{{\"orphan\":{n}}}").into_bytes())
+        .find(|bytes| {
+            let id = fluree_db_core::ContentId::new(ContentKind::Txn, bytes);
+            id.as_cid().hash().digest()[0] >= 64
+        })
+        .unwrap();
+    let orphan = fluree
+        .content_store(&namespace)
+        .put(ContentKind::Txn, &orphan)
+        .await
+        .unwrap();
+    // A purge restarts the reconciliation and checks its first slice.
+    let since = super::now_ms();
+    let purge = fluree
+        .reconcile_step("race", 2, Some(since), &mut None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!purge.complete);
+    // Housekeeping goes on with the listing it holds.
+    for _ in 0..10 {
+        let step = fluree
+            .reconcile_step("race", 2, None, &mut housekeeping)
+            .await
+            .unwrap()
+            .unwrap();
+        if step.complete {
+            break;
+        }
+    }
+
+    assert!(fluree.resolve_garbage("race", since).await.unwrap());
+    assert!(!fluree.content_store(&namespace).has(&orphan).await.unwrap());
+}
+
+/// A collection with no time left loads nothing, leaves every ledger, and
+/// the next starts with the first it did not reach.
+#[tokio::test]
+async fn a_collection_out_of_time_loads_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    for name in ["a", "b", "c"] {
+        fluree.create_ledger(name).await.unwrap();
+        commit_raw(&fluree, &format!("{name}:main"), name).await;
+        let namespace = fluree
+            .storage_namespace(&format!("{name}:main"))
+            .await
+            .unwrap();
+        let stray = fluree
+            .content_store(&namespace)
+            .put(
+                ContentKind::Txn,
+                format!("{{\"stray\":\"{name}\"}}").as_bytes(),
+            )
+            .await
+            .unwrap();
+        fluree
+            .record_garbage(&[Blob::new(namespace, stray)], GarbageReason::Abandoned)
+            .await
+            .unwrap();
+    }
+    let none = std::time::Duration::ZERO;
+
+    let report = fluree
+        .collect_garbage_within(none, Some(none))
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 0, "{report:?}");
+    assert_eq!(report.ledgers_left, 3, "{report:?}");
+    assert_eq!(
+        report.timings,
+        super::CollectTimings::default(),
+        "{report:?}"
+    );
+    assert_eq!(fluree.root.collect_from.lock().as_deref(), Some("a"));
+
+    let report = fluree.collect_garbage_within(none, None).await.unwrap();
+    assert_eq!(report.deleted, 3, "{report:?}");
+    assert_eq!(*fluree.root.collect_from.lock(), None);
+}

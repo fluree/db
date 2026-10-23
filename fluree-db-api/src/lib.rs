@@ -3934,6 +3934,9 @@ struct RootHold {
     /// Pins on the commit and transaction blobs writers have not yet
     /// published. Only an instance holding the lock collects garbage.
     pins: Option<Arc<fluree_db_core::BlobPins>>,
+    /// The ledger the next garbage collection starts with: the first the
+    /// last ran out of time for.
+    collect_from: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl Fluree {
