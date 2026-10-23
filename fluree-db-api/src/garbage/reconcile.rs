@@ -113,12 +113,13 @@ fn slices_for(listed: usize, slice: usize) -> u16 {
     u16::try_from(slices.min(MAX_SLICES)).expect("at most 256")
 }
 
-/// A ledger's branches, loaded, and its branch folders and records,
-/// listed, once for the steps of a pass: each file by its folder and the
-/// first byte of its digest. Files published after the load are listed
-/// unreferenced, and a later collection finds them referenced.
+/// A ledger's branch folders and records, listed, and then its branches,
+/// loaded, once for the steps of a pass: each file by its folder and the
+/// first byte of its digest. Listing first leaves only what was being
+/// published at the load to look unreferenced; collection then finds it
+/// referenced.
 pub(super) struct Listing {
-    pub(super) holders: Holders,
+    pub(super) holders: Option<Holders>,
     /// The branches listed, with their fences: steps list again once these
     /// change.
     branches: Vec<(String, Fence)>,
@@ -228,19 +229,20 @@ impl Fluree {
         let mut listed = 0;
         if !listing.as_ref().is_some_and(|l| l.lists(&binding)) {
             let clock = Instant::now();
-            let Some(holders) = self.load_holders(name, &binding).await? else {
-                return Ok(None);
-            };
-            timings.load = clock.elapsed();
-            let clock = Instant::now();
-            let fresh = self.list_ledger(&binding, holders).await?;
+            let mut fresh = self.list_ledger(&binding).await?;
             timings.list = clock.elapsed();
+            let clock = Instant::now();
+            fresh.holders = self.load_holders(name, &binding).await?;
+            timings.load = clock.elapsed();
+            if fresh.holders.is_none() {
+                return Ok(None);
+            }
             listed = fresh.files;
             *listing = Some(fresh);
         }
         let clock = Instant::now();
         let listing = listing.as_ref().expect("listed");
-        let holders = &listing.holders;
+        let holders = listing.holders.as_ref().expect("loaded");
         let progress = progress.unwrap_or_else(|| Reconciling {
             started_ms: now_ms(),
             slices: slices_for(listing.files, slice),
@@ -305,15 +307,11 @@ impl Fluree {
 
     /// Every commit and transaction file in `binding`'s branch folders, and
     /// the records under its root.
-    pub(super) async fn list_ledger(
-        &self,
-        binding: &NameBinding,
-        holders: Holders,
-    ) -> Result<Listing> {
+    pub(super) async fn list_ledger(&self, binding: &NameBinding) -> Result<Listing> {
         let storage = self.garbage_storage()?;
         let method = storage.storage_method();
         let mut listing = Listing {
-            holders,
+            holders: None,
             branches: binding
                 .branches
                 .iter()

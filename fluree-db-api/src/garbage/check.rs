@@ -74,15 +74,20 @@ impl Fluree {
             let store = self
                 .content_store_for_record_or_id(Some(record), &record.storage_namespace())
                 .await?;
-            let state = self
-                .load_queryable_state_with_store(store.clone(), record.clone())
-                .await?;
-            let head = record
-                .commit_head_id
-                .clone()
-                .expect("settled records have heads");
+            let (state, head) = match self.cached_on_line(record, &store).await? {
+                Some(cached) => cached,
+                None => (
+                    self.load_queryable_state_with_store(store.clone(), record.clone())
+                        .await?,
+                    record
+                        .commit_head_id
+                        .clone()
+                        .expect("settled records have heads"),
+                ),
+            };
             // A history whose head has no commit record decides nothing.
-            if !has_commit(&state, &head).await? {
+            let loaded = state.head_commit_id.clone().unwrap_or_else(|| head.clone());
+            if !has_commit(&state, &loaded).await? {
                 tracing::warn!(ledger = %record.ledger_id, "txn-meta lacks the head commit; garbage left alone");
                 return Ok(None);
             }
@@ -96,12 +101,55 @@ impl Fluree {
             };
             let merged = merged_parents(&branch.state, &branch.store).await?;
             branch.walk(merged).await?;
+            // The commits a cached state had yet to take in.
+            if loaded != head {
+                branch.walk(vec![head]).await?;
+            }
             branches.push(branch);
         }
         Ok(Some(Holders {
             name: name.to_string(),
             branches,
         }))
+    }
+
+    /// The state this instance holds for `record`'s branch, and the head to
+    /// catch it up from, when the branch's head, read after the state, has
+    /// it on its first-parent line within [`MAX_GAP`] commits. A state is
+    /// cached once its commit is published, and heads only move to a higher
+    /// `t`, so the head read after it is at or past it; a history rewritten
+    /// under it, or a placeholder, gives `None`.
+    async fn cached_on_line(
+        &self,
+        record: &NsRecord,
+        store: &Arc<dyn ContentStore>,
+    ) -> Result<Option<(LedgerState, ContentId)>> {
+        let Some(manager) = &self.ledger_manager else {
+            return Ok(None);
+        };
+        let Some(handle) = manager
+            .get_loaded_handle(&fluree_db_core::LedgerId::parse(&record.ledger_id)?)
+            .await
+        else {
+            return Ok(None);
+        };
+        let state = handle.clone_state().await;
+        let Some(cached) = state.head_commit_id.clone() else {
+            return Ok(None);
+        };
+        let Some(now) = self.publisher()?.raw_record(&record.ledger_id).await? else {
+            return Ok(None);
+        };
+        let Some(head) = now.commit_head_id.clone() else {
+            return Ok(None);
+        };
+        if now.fence != record.fence
+            || state.t() > now.commit_t
+            || !on_line(store, &head, &cached, state.t()).await?
+        {
+            return Ok(None);
+        }
+        Ok(Some((state, head)))
     }
 
     /// The records of `binding`'s branches, when it is settled.
@@ -134,6 +182,35 @@ impl Fluree {
         }
         Ok(Some(records))
     }
+}
+
+/// How many commits a cached state may be behind its branch's head.
+const MAX_GAP: i64 = 10_000;
+
+/// Whether `to`, at `to_t`, is on `from`'s first-parent line within
+/// [`MAX_GAP`] commits.
+async fn on_line(
+    store: &Arc<dyn ContentStore>,
+    from: &ContentId,
+    to: &ContentId,
+    to_t: i64,
+) -> Result<bool> {
+    let mut next = Some(from.clone());
+    while let Some(id) = next {
+        if &id == to {
+            return Ok(true);
+        }
+        let envelope = match load_commit_envelope_by_id(store.as_ref(), &id).await {
+            Ok(envelope) => envelope,
+            Err(fluree_db_core::Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if envelope.t <= to_t || envelope.t - to_t > MAX_GAP {
+            return Ok(false);
+        }
+        next = envelope.parents.into_iter().next();
+    }
+    Ok(false)
 }
 
 /// The folders `record`'s branch reads, its own first, then its ancestors'.

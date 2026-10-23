@@ -593,6 +593,13 @@ impl LedgerHandle {
         Self::new(ledger_id, state, None)
     }
 
+    /// A clone of the cached state, taken under a brief read lock. Mid-commit
+    /// repairs can leave a genesis placeholder showing for a moment, so a
+    /// caller checks the head it gets.
+    pub async fn clone_state(&self) -> LedgerState {
+        self.inner.state.read().await.clone()
+    }
+
     /// Get read-only snapshot for queries (brief lock, clone, release)
     ///
     /// IMPORTANT: Queries must NOT execute while holding the internal lock.

@@ -309,14 +309,13 @@ async fn reconciliation_and_collection_agree_on_every_file() {
         .unwrap()
         .unwrap()
         .value;
+    let listing = fluree.list_ledger(&binding).await.unwrap();
     let holders = fluree
         .load_holders("agree", &binding)
         .await
         .unwrap()
         .expect("settled");
-    let listing = fluree.list_ledger(&binding, holders).await.unwrap();
     let listed = super::check::Listed::new(listing.slice(1, 0));
-    let holders = &listing.holders;
     let read = holders.read(&listed).await.unwrap();
     let mut unread = Vec::new();
     for (blob, read) in listed.blobs.iter().zip(read) {

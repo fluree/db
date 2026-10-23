@@ -307,8 +307,8 @@ async fn scheduled(writers: usize, commits: usize, every: Duration) {
                 println!("  collection {:?}", collected.timings);
                 for (ledger, report) in &reconciled.ledgers {
                     println!(
-                        "  {ledger}: {} files in {} steps, {:?}",
-                        report.checked, report.steps, report.timings
+                        "  {ledger}: {} files in {} steps, {} recorded, {:?}",
+                        report.checked, report.steps, report.recorded, report.timings
                     );
                 }
                 passes.lock().push((collection, reconciliation));

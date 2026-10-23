@@ -472,3 +472,81 @@ async fn a_transfer_holding_its_ledger_keeps_what_it_stored_until_its_head_is_se
     let verified = fluree.verify_ledger("garbage:main", None).await.unwrap();
     assert!(verified.problems.is_empty(), "{:?}", verified.problems);
 }
+
+/// Another instance over the same storage, with a nameservice of its own:
+/// what it publishes reaches no cache of the first.
+async fn unseen_writer(dir: &tempfile::TempDir) -> Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_storage_lock()
+        .build_async()
+        .await
+        .expect("build")
+}
+
+/// Transact `body` through `fluree`'s ledger cache, storing it raw.
+async fn transact_cached(fluree: &Fluree, ledger_id: &str, body: &JsonValue) {
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .txn_opts(TxnOpts::default().store_raw_txn(true))
+        .update(body)
+        .commit()
+        .await
+        .unwrap();
+}
+
+/// A collector whose cached state of a branch is behind the branch's head
+/// catches up from the head: nothing the newer commits name is recorded.
+#[tokio::test]
+async fn a_cached_branch_behind_its_head_is_caught_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact_cached(&fluree, "garbage:main", &insert("alice")).await;
+    let other = unseen_writer(&dir).await;
+    for name in ["bob", "carol"] {
+        transact(&other, "garbage:main", &insert(name))
+            .await
+            .unwrap();
+    }
+
+    let report = fluree
+        .reconcile_garbage("garbage")
+        .await
+        .unwrap()
+        .expect("settled");
+    assert_eq!(report.recorded, 0, "{report:?}");
+}
+
+/// One whose cached state of a branch is on a line since rewritten loads the
+/// branch instead: the replaced commits and their transactions are
+/// recorded.
+#[tokio::test]
+async fn a_cached_branch_whose_history_was_rewritten_is_loaded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir).await;
+    fluree.create_ledger("garbage").await.unwrap();
+    transact_cached(&fluree, "garbage:main", &insert("alice")).await;
+    fluree
+        .create_branch("garbage", "dev", None, None)
+        .await
+        .unwrap();
+    for name in ["bob", "carol"] {
+        transact_cached(&fluree, "garbage:dev", &insert(name)).await;
+    }
+    transact_cached(&fluree, "garbage:main", &insert("dave")).await;
+    // An unlocked writer records nothing: reconciliation finds the line.
+    let other = unseen_writer(&dir).await;
+    let report = other
+        .rebase_branch("garbage", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 2);
+
+    let report = fluree
+        .reconcile_garbage("garbage")
+        .await
+        .unwrap()
+        .expect("settled");
+    assert_eq!(report.recorded, 4, "{report:?}");
+}
