@@ -1813,6 +1813,44 @@ async fn a_purge_under_the_write_ahead_log_leaves_no_file_holding_the_value() {
     );
 }
 
+/// A staging file a crashed write of another process left in the ledger's
+/// folder may hold an original's bytes: the purge removes it, whatever its
+/// age.
+#[tokio::test]
+async fn a_purge_removes_staging_files_crashed_writes_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-staging").await;
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@id": "ex:alice", "ex:email": "a@secret"}),
+    )
+    .await;
+    fluree
+        .erase_occurrences(&id, email("alice", "a@secret"), None)
+        .await
+        .expect("erase");
+    reindex(&fluree, &id).await;
+    assert_eq!(fluree.run_erasure_pass(&id).await.unwrap().published, 1);
+    let folder = dir
+        .path()
+        .join(fluree.storage_namespace(&id).await.unwrap().branch_prefix());
+    let staging = folder.join("commit/0011.fcv2.4242.00000000deadbeef.1.tmp");
+    std::fs::write(&staging, b"{\"email\": \"a@secret\"}").unwrap();
+
+    let report = fluree
+        .run_purge_pass(&id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    assert!(!staging.exists());
+    assert_eq!(
+        files_holding(dir.path(), "a@secret"),
+        Vec::<std::path::PathBuf>::new()
+    );
+}
+
 /// Another process's write-ahead log under the storage may hold the erased
 /// bytes, beyond this process's checkpoint, and an open after it stops
 /// replays it: the purge stops and says why.

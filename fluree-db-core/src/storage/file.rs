@@ -799,6 +799,15 @@ impl FileStorage {
         }
     }
 
+    /// Unlink, under `dir`, every staging file another process left,
+    /// whatever its age, keeping this process's own; returns how many it
+    /// unlinked. Only for a root this process holds the lock on: no other
+    /// process writes there, so another's staging file is a crashed write's.
+    /// Blocking, and unbounded.
+    pub fn sweep_foreign_staging(dir: impl AsRef<Path>) -> usize {
+        sweep_orphaned_staging_files(dir.as_ref(), std::time::Duration::ZERO, usize::MAX).reclaimed
+    }
+
     /// The walk itself, plus what it reports.
     fn run_sweep(base_path: &Path, budget: usize) {
         let sweep = sweep_orphaned_staging_files(base_path, STALE_STAGING_AGE, budget);

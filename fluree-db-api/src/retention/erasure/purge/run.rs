@@ -235,7 +235,7 @@ impl Fluree {
                 )));
             }
         }
-        self.make_deletes_durable(&plan).await?;
+        report.deleted += self.make_deletes_durable(&plan).await?;
         if let Some(manager) = &self.ledger_manager {
             for branch in &plan.rebuild {
                 if let Ok(id) = LedgerId::parse(branch) {
@@ -413,10 +413,12 @@ impl Fluree {
 
     /// Make the purge's deletes survive a crash: retire the write-ahead log,
     /// which would otherwise replay the writes they undid and still holds
-    /// their bytes, then flush the directories they were in.
-    async fn make_deletes_durable(&self, plan: &PurgePlan) -> Result<()> {
+    /// their bytes, then flush the directories they were in. Staging files
+    /// crashed writes left in the originals' ledgers go too: one may hold an
+    /// original's bytes.
+    async fn make_deletes_durable(&self, plan: &PurgePlan) -> Result<usize> {
         let Some(root) = self.config.index_storage.path.clone() else {
-            return Ok(());
+            return Ok(0);
         };
         let prefix = self.erasure_runtime()?.index.address_prefix();
         let keys: Vec<String> = plan
@@ -426,13 +428,27 @@ impl Fluree {
             .chain(&plan.superseded)
             .filter_map(|a| a.strip_prefix(&prefix).map(str::to_string))
             .collect();
-        tokio::task::spawn_blocking(move || {
+        // Each original's ledger folder: `{name}/@{instance}/{branch}/commit/…`
+        // up to its root, or a legacy name root.
+        let ledgers: BTreeSet<String> = keys
+            .iter()
+            .filter_map(|k| k.rsplit_once("/commit/").map(|(folder, _)| folder))
+            .filter_map(|folder| folder.rsplit_once('/').map(|(root, _)| root.to_string()))
+            .collect();
+        let swept = tokio::task::spawn_blocking(move || {
+            let mut swept = 0;
+            for ledger in &ledgers {
+                swept += fluree_db_core::FileStorage::sweep_foreign_staging(
+                    std::path::Path::new(root.as_ref()).join(ledger),
+                );
+            }
             fluree_db_core::FileStorage::checkpoint_wal(root.as_ref())?;
-            fluree_db_core::FileStorage::sync_parent_dirs(root.as_ref(), &keys)
+            fluree_db_core::FileStorage::sync_parent_dirs(root.as_ref(), &keys)?;
+            Ok::<_, fluree_db_core::Error>(swept)
         })
         .await
         .map_err(|e| ApiError::internal(format!("purge flush: {e}")))??;
-        Ok(())
+        Ok(swept)
     }
 
     /// Segments other processes' write-ahead logs keep under this storage.
