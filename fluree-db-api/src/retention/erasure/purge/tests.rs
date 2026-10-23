@@ -334,3 +334,90 @@ async fn a_scan_finds_documents_and_schedules_holding_a_captured_value() {
     assert_eq!(scan.schedules.len(), 1, "{scan:?}");
     assert!(scan.schedules[0].contains(&scheduled), "{scan:?}");
 }
+
+/// A ledger's current TTL schedule holding an erased fact is rewritten
+/// without it, and the old one deleted.
+#[tokio::test]
+async fn a_purge_rewrites_a_schedule_holding_an_erased_fact() {
+    use fluree_db_core::{ContentKind, ContentStore as _};
+
+    use crate::retention::registry;
+    use crate::retention::state::{Entry, FactKey, Schedule, Source};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir);
+    fluree.create_ledger("t/scheduled").await.unwrap();
+    let id = "t/scheduled:main";
+    insert(
+        &fluree,
+        id,
+        json!({"@graph": [
+            {"@id": "http://example.org/alice", "http://example.org/email": "a@secret"},
+            {"@id": "http://example.org/bob", "http://example.org/email": "b@kept"}
+        ]}),
+    )
+    .await;
+    erase(&fluree, id, email("alice", "a@secret")).await;
+    let plan = fluree.plan_purge(id).await.unwrap();
+    let captured = fluree.capture_erased(&plan).await.unwrap();
+    let erased = FactKey::of(&captured.iter().find(|c| c.flake.op).unwrap().flake);
+
+    // A schedule naming the erased fact and a surviving one.
+    let record = fluree.nameservice().lookup(id).await.unwrap().unwrap();
+    let state = fluree.ledger(id).await.unwrap();
+    let bob = fluree_db_core::range(
+        &state.snapshot,
+        0,
+        fluree_db_core::IndexType::Spot,
+        fluree_db_core::RangeTest::Eq,
+        fluree_db_core::RangeMatch::subject(
+            state.snapshot.encode_iri("http://example.org/bob").unwrap(),
+        ),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let kept = FactKey::of(&bob[0]);
+    let entry = |t| Entry {
+        due_ms: i64::MAX,
+        occurrence_t: t,
+        occurrence_slot: 0,
+        source: Source::Property,
+        generation_t: t,
+        reifier: None,
+    };
+    let mut schedule = Schedule::starting_after(0);
+    schedule.insert(erased.clone(), entry(1));
+    schedule.insert(kept.clone(), entry(1));
+    let store = fluree.content_store(&record.storage_namespace());
+    let blob = store
+        .put(ContentKind::RetentionState, &schedule.encode().unwrap())
+        .await
+        .unwrap();
+    let ns = fluree.publisher().unwrap();
+    registry::update(ns, id, |r| {
+        Some(registry::Registration {
+            schedule: Some(blob.to_string()),
+            ..r?.clone()
+        })
+    })
+    .await
+    .unwrap();
+
+    let report = fluree
+        .run_purge_pass(id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.purged, 1, "{report:?}");
+    let current = registry::read(ns, id)
+        .await
+        .unwrap()
+        .1
+        .unwrap()
+        .schedule
+        .unwrap();
+    assert_ne!(current, blob.to_string());
+    let rewritten = Schedule::decode(&store.get(&current.parse().unwrap()).await.unwrap()).unwrap();
+    assert!(!rewritten.contains(&erased) && rewritten.contains(&kept));
+    assert!(!store.has(&blob).await.unwrap());
+}

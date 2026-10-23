@@ -5,12 +5,14 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_core::{content_path, ContentId, ContentKind, ContentStore, LedgerId, LedgerName};
 use fluree_db_indexer::{plan_garbage, release_garbage_plan, siblings_of, CleanGarbageConfig};
 use serde::Serialize;
 
 use super::super::{ErasureJob, ErasureStage, PurgeProgress};
+use super::{Captured, PurgePlan};
 use crate::retention::registry;
+use crate::retention::state::{FactKey, Schedule};
 use crate::retention::worker::now_ms;
 use crate::{ApiError, Fluree, IndexingMode, ReindexOptions, Result};
 
@@ -127,10 +129,9 @@ impl Fluree {
                 );
                 return self.block(&jobs, report, why).await;
             }
-            if !scan.schedules.is_empty() {
-                let why = "TTL schedules still hold erased facts".to_string();
-                return self.block(&jobs, report, why).await;
-            }
+            report.deleted += self
+                .rewrite_schedules(&plan, &scan.schedules, &captured)
+                .await?;
             let files: Vec<&String> = plan
                 .transactions
                 .iter()
@@ -247,6 +248,79 @@ impl Fluree {
         }
         report.blocked = Some(why);
         Ok(report)
+    }
+
+    /// Remove `captured`'s facts from the TTL schedules at `addresses`: a
+    /// holder's current schedule is rewritten without them, and any other is
+    /// deleted, as stale. Returns how many files it deleted.
+    async fn rewrite_schedules(
+        &self,
+        plan: &PurgePlan,
+        addresses: &[String],
+        captured: &[Captured],
+    ) -> Result<usize> {
+        let runtime = self.erasure_runtime()?;
+        let ns = self.publisher()?;
+        let prefix = runtime.index.address_prefix();
+        let erased: Vec<FactKey> = captured.iter().map(|c| FactKey::of(&c.flake)).collect();
+        let mut deleted = 0;
+        for address in addresses {
+            let mut current = None;
+            for branch in &plan.rebuild {
+                let Some(record) = self.nameservice().lookup(branch).await? else {
+                    continue;
+                };
+                let Some(blob) = registry::read(ns, branch).await?.1.and_then(|r| r.schedule)
+                else {
+                    continue;
+                };
+                let Ok(cid) = blob.parse::<ContentId>() else {
+                    continue;
+                };
+                let held = format!(
+                    "{prefix}{}",
+                    content_path(
+                        ContentKind::RetentionState,
+                        &record.storage_namespace(),
+                        &cid.address_digest()
+                    )
+                );
+                if held == *address {
+                    current = Some((branch, record, blob));
+                    break;
+                }
+            }
+            if let Some((branch, record, blob)) = current {
+                let Some(bytes) = runtime.index.read_raw(address).await? else {
+                    continue;
+                };
+                let mut schedule = Schedule::decode(&bytes).map_err(ApiError::internal)?;
+                for key in &erased {
+                    schedule.remove(key);
+                }
+                let encoded = schedule.encode().map_err(ApiError::internal)?;
+                let store = self.content_store(&record.storage_namespace());
+                let rewritten = store
+                    .put(ContentKind::RetentionState, &encoded)
+                    .await?
+                    .to_string();
+                let (pending, next_due_ms) = (schedule.len() as u64, schedule.next_due_ms());
+                registry::update(ns, branch, |r| {
+                    let r = r?;
+                    (r.schedule.as_deref() == Some(blob.as_str())).then(|| registry::Registration {
+                        schedule: Some(rewritten.clone()),
+                        pending,
+                        next_due_ms,
+                        ..r.clone()
+                    })
+                })
+                .await?;
+            }
+            if runtime.index.delete_raw(address).await? {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Delete `files` past the substitution; one already gone counts as
