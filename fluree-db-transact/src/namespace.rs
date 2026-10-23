@@ -526,6 +526,11 @@ impl WorkerCache {
         Sid::new(BLANK_NODE, local)
     }
 
+    /// The prefix a namespace code stands for.
+    pub fn prefix_for_code(&self, code: u16) -> Option<String> {
+        self.alloc.get_prefix(code)
+    }
+
     /// Consume the cache and return the set of codes first observed after
     /// the snapshot. The serial finalizer uses these for commit-order publication.
     pub fn into_new_codes(self) -> FxHashSet<u16> {
@@ -579,6 +584,18 @@ impl NsAllocator<'_> {
             NsAllocator::Exclusive(reg) => reg.blank_node_sid(unique_id),
             NsAllocator::Cached(cache) => cache.blank_node_sid(unique_id),
         }
+    }
+
+    /// The IRI a SID from [`Self::sid_for_iri`] stands for.
+    pub fn iri_for_sid(&self, sid: &Sid) -> Option<String> {
+        if sid.namespace_code == OVERFLOW {
+            return Some(sid.name.to_string());
+        }
+        let prefix = match self {
+            NsAllocator::Exclusive(reg) => reg.get_prefix(sid.namespace_code).map(str::to_string),
+            NsAllocator::Cached(cache) => cache.prefix_for_code(sid.namespace_code),
+        }?;
+        Some(format!("{prefix}{}", sid.name))
     }
 }
 

@@ -230,6 +230,31 @@ pub trait GraphSink {
         ))
     }
 
+    /// Emit a list item in the named graph `graph`: [`Self::emit_list_item`]
+    /// for a quad.
+    ///
+    /// Only called when [`Self::supports_quads`] returns `true`. The default
+    /// body errors, as [`Self::emit_quad`]'s does: a quad sink that does not
+    /// override it refuses list items in a named graph rather than drop the
+    /// graph name or the index.
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        graph: TermId,
+        index: i32,
+    ) -> SinkResult {
+        let _ = (subject, predicate, object, graph, index);
+        debug_assert!(
+            self.supports_quads(),
+            "emit_quad_list_item called on a sink that does not support quads"
+        );
+        Err(SinkError::rejected(
+            "this sink cannot represent list items in named graphs",
+        ))
+    }
+
     /// Called by the producer at each statement terminator, after the
     /// statement has parsed and emitted successfully.
     ///
@@ -933,6 +958,12 @@ mod tests {
         let err = sink
             .emit_quad(s, p, o, g)
             .expect_err("the default quad body must refuse, never silently fall back");
+        assert!(matches!(err, SinkError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("named graphs"), "{err}");
+
+        let err = sink
+            .emit_quad_list_item(s, p, o, g, 0)
+            .expect_err("the default quad list-item body must refuse too");
         assert!(matches!(err, SinkError::Rejected(_)), "{err:?}");
         assert!(err.to_string().contains("named graphs"), "{err}");
     }

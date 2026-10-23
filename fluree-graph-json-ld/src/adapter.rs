@@ -11,20 +11,29 @@
 //! - Handles language-tagged strings and typed literals
 //! - Handles `@json` typed values with canonical normalization
 //!
-//! # Limitations
+//! # Graph scoping
 //!
-//! - **`@graph`** on a node (a graph selector, or a JSON-LD named graph's
-//!   content) is refused with [`AdapterError::Unsupported`]. Emitting it
-//!   correctly needs the quad protocol
-//!   ([`fluree_graph_ir::GraphSink::supports_quads`] /
-//!   [`fluree_graph_ir::GraphSink::emit_quad`]); until this adapter uses it,
-//!   graph-scoped statements are refused rather than folded into the
-//!   default graph. (A top-level envelope is unwrapped by expansion and never
-//!   reaches the adapter.)
-//! - **`@reverse`** and **`@included`** are read as the transaction parser
-//!   reads them: a reverse property's values are the subjects of statements
-//!   pointing at the node, and included nodes are described alongside it with
-//!   no linking statement.
+//! A node's statements, and those of every node nested in it, are written to
+//! the node's graph: its own graph selector (`"@graph": "<graph>"`, Fluree's
+//! extension) if it has one, else the enclosing node's. A JSON-LD named graph
+//! (`{"@id": G, "@graph": [nodes]}`) keeps its own properties in the
+//! enclosing graph and writes its content nodes to `G`. Embedded nodes, list
+//! members, `@included` nodes and `@reverse` statements share their node's
+//! graph. This is how the transaction parser reads a document.
+//!
+//! [`to_graph_events_scoped`] writes the statements of a named graph as quads
+//! ([`fluree_graph_ir::GraphSink::emit_quad`]) and asks the caller to resolve
+//! each graph name. [`to_graph_events`] has no resolver and refuses graph
+//! scoping with [`AdapterError::Unsupported`], as does a sink without quad
+//! support: folding the statements into the default graph would lose data.
+//! (A top-level envelope is unwrapped by expansion and never reaches the
+//! adapter.)
+//!
+//! `@reverse` and `@included` are read as the transaction parser reads them:
+//! a reverse property's values are the subjects of statements pointing at the
+//! node, and included nodes are described alongside it with no linking
+//! statement. Any other keyword on a node object is refused, as the
+//! transaction parser refuses it.
 //!
 //! # Example
 //!
@@ -47,9 +56,12 @@
 //! assert_eq!(graph.len(), 1);
 //! ```
 
+use crate::graph_shape::{node_graph, NodeGraph};
+use crate::is_keyword_form;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
-use fluree_vocab::rdf;
+use fluree_vocab::{rdf, reifies_iris};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Strip `_:` prefix from blank node label if present
@@ -79,6 +91,17 @@ pub enum AdapterError {
 /// Result type for adapter operations
 pub type Result<T> = std::result::Result<T, AdapterError>;
 
+/// A graph name a document writes, as [`to_graph_events_scoped`] meets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphNameRef<'a> {
+    /// A node's graph selector (`"@graph": "ex:g"`), as written: compact,
+    /// relative or absolute, or a keyword such as `default`.
+    Selector(&'a str),
+    /// The (expanded) `@id` of a JSON-LD named graph, already checked by
+    /// [`node_graph`]: not a blank node and not a variable.
+    NamedGraph(&'a str),
+}
+
 /// Represents the result of processing a JSON-LD value
 ///
 /// Used to distinguish between single values, lists, and absent values.
@@ -91,10 +114,19 @@ enum ProcessedValue {
     None,
 }
 
+/// The graph a node's statements are written to.
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    Default,
+    /// A named graph, by its IRI term.
+    Named(TermId),
+}
+
 /// Convert expanded JSON-LD to GraphSink events
 ///
 /// The input must be expanded JSON-LD (output of `expand()`). This function
-/// walks the expanded structure and emits triple events to the sink.
+/// walks the expanded structure and emits triple events to the sink. Graph
+/// scoping is refused; [`to_graph_events_scoped`] writes it.
 ///
 /// # Arguments
 ///
@@ -121,14 +153,38 @@ enum ProcessedValue {
 /// assert_eq!(graph.len(), 1);
 /// ```
 pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<()> {
+    to_graph_events_scoped(expanded, sink, |_| {
+        Err(AdapterError::Unsupported(
+            "JSON-LD `@graph` graph scoping is not supported here".to_string(),
+        ))
+    })
+}
+
+/// Convert expanded JSON-LD to GraphSink events, writing each statement to
+/// its graph (see the [module docs](self)).
+///
+/// `resolve` names each graph the document writes: `Ok(None)` is the default
+/// graph, `Ok(Some(iri))` the named graph `iri` (absolute), and an error
+/// refuses the document. A named graph needs a sink that supports quads.
+pub fn to_graph_events_scoped<S, F>(expanded: &Value, sink: &mut S, resolve: F) -> Result<()>
+where
+    S: GraphSink,
+    F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
+{
+    let mut walk = Walk {
+        sink,
+        resolve,
+        selectors: HashMap::new(),
+        named_graphs: HashMap::new(),
+    };
     match expanded {
         Value::Array(arr) => {
             for item in arr {
-                process_node(item, sink, None)?;
+                walk.node(item, Scope::Default, None)?;
             }
         }
         Value::Object(_) => {
-            process_node(expanded, sink, None)?;
+            walk.node(expanded, Scope::Default, None)?;
         }
         _ => {
             return Err(AdapterError::InvalidStructure(
@@ -139,122 +195,404 @@ pub fn to_graph_events<S: GraphSink>(expanded: &Value, sink: &mut S) -> Result<(
     Ok(())
 }
 
-/// Process a single node in the expanded JSON-LD
-///
-/// If `forced_subject` is provided, it will be used as the subject instead of
-/// deriving one from `@id`. This is used for embedded nodes without `@id` to
-/// ensure the object edge and the embedded node's triples use the same blank node.
-fn process_node<S: GraphSink>(
-    node: &Value,
-    sink: &mut S,
-    forced_subject: Option<TermId>,
-) -> Result<TermId> {
-    let obj = node.as_object().ok_or_else(|| {
-        AdapterError::InvalidStructure("Expected node to be an object".to_string())
-    })?;
+/// One walk over an expanded document: the sink, and the caller's graph-name
+/// resolver.
+struct Walk<'s, S, F> {
+    sink: &'s mut S,
+    resolve: F,
+    /// The scope each graph name opened, by name as written: a document
+    /// names few graphs, often on every node. A term stays valid for the
+    /// whole walk (producers may keep IRI terms across statements, and the
+    /// walk ends none).
+    selectors: HashMap<String, Scope>,
+    named_graphs: HashMap<String, Scope>,
+}
 
-    // Get subject from forced_subject, @id, or generate blank node
-    let subject_id = if let Some(id) = forced_subject {
-        id
-    } else if let Some(id_val) = obj.get("@id") {
-        let id_str = id_val
-            .as_str()
-            .ok_or_else(|| AdapterError::InvalidStructure("@id must be a string".to_string()))?;
-        if id_str.starts_with("_:") {
-            sink.term_blank(Some(strip_blank_prefix(id_str)))
-        } else {
-            sink.term_iri(id_str)
+impl<S, F> Walk<'_, S, F>
+where
+    S: GraphSink,
+    F: FnMut(GraphNameRef<'_>) -> Result<Option<String>>,
+{
+    /// The scope a graph name opens.
+    fn open(&mut self, name: GraphNameRef<'_>) -> Result<Scope> {
+        let (opened, raw) = match name {
+            GraphNameRef::Selector(raw) => (&self.selectors, raw),
+            GraphNameRef::NamedGraph(raw) => (&self.named_graphs, raw),
+        };
+        if let Some(&scope) = opened.get(raw) {
+            return Ok(scope);
         }
-    } else {
-        // Anonymous blank node
-        sink.term_blank(None)
-    };
-
-    // Process each predicate-object pair
-    for (key, value) in obj {
-        match key.as_str() {
-            // Nodes described alongside this one, with no linking statement.
-            "@included" => {
-                for node in node_items(value, "@included")? {
-                    process_node(node, sink, None)?;
+        let scope = match (self.resolve)(name)? {
+            None => Scope::Default,
+            Some(iri) => {
+                if !self.sink.supports_quads() {
+                    return Err(AdapterError::Unsupported(format!(
+                        "graph <{iri}>: this sink cannot write named graphs"
+                    )));
                 }
-                continue;
+                Scope::Named(self.sink.term_iri(&iri))
             }
-            // Statements whose object is this node.
-            "@reverse" => {
-                let Value::Object(properties) = value else {
-                    return Err(AdapterError::InvalidStructure(
-                        "@reverse must be a map of properties".to_string(),
-                    ));
-                };
-                for (property, values) in properties {
-                    let predicate_id = sink.term_iri(property);
-                    for node in node_items(values, "a reverse property's value")? {
-                        if let ProcessedValue::Single(node_id) = process_value(node, sink)? {
-                            sink.emit_triple(node_id, predicate_id, subject_id)?;
+        };
+        match name {
+            GraphNameRef::Selector(_) => self.selectors.insert(raw.to_string(), scope),
+            GraphNameRef::NamedGraph(_) => self.named_graphs.insert(raw.to_string(), scope),
+        };
+        Ok(scope)
+    }
+
+    /// Emit one statement in `scope`.
+    fn emit(
+        &mut self,
+        scope: Scope,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: Option<i32>,
+    ) -> Result<()> {
+        let emitted = match (scope, index) {
+            (Scope::Default, None) => self.sink.emit_triple(subject, predicate, object),
+            (Scope::Default, Some(index)) => {
+                self.sink.emit_list_item(subject, predicate, object, index)
+            }
+            (Scope::Named(graph), None) => self.sink.emit_quad(subject, predicate, object, graph),
+            (Scope::Named(graph), Some(index)) => self
+                .sink
+                .emit_quad_list_item(subject, predicate, object, graph, index),
+        };
+        Ok(emitted?)
+    }
+
+    /// Process a single node in the expanded JSON-LD, in `scope` unless it
+    /// opens its own.
+    ///
+    /// If `forced_subject` is provided, it will be used as the subject instead of
+    /// deriving one from `@id`. This is used for embedded nodes without `@id` to
+    /// ensure the object edge and the embedded node's triples use the same blank node.
+    fn node(
+        &mut self,
+        node: &Value,
+        scope: Scope,
+        forced_subject: Option<TermId>,
+    ) -> Result<TermId> {
+        let obj = node.as_object().ok_or_else(|| {
+            AdapterError::InvalidStructure("Expected node to be an object".to_string())
+        })?;
+
+        // A node's own graph selector opens its scope. A JSON-LD named
+        // graph's own properties stay in the enclosing scope, and its
+        // content nodes are written to the graph its `@id` names (after the
+        // properties, below).
+        let mut named_graph_content: Option<(&str, &[Value])> = None;
+        let scope = match node_graph(obj).map_err(AdapterError::InvalidStructure)? {
+            NodeGraph::Enclosing => scope,
+            NodeGraph::Selector(raw) => self.open(GraphNameRef::Selector(raw))?,
+            NodeGraph::NamedGraph { name, content } => {
+                named_graph_content = Some((name, content));
+                scope
+            }
+        };
+
+        // Get subject from forced_subject, @id, or generate blank node
+        let subject_id = if let Some(id) = forced_subject {
+            id
+        } else if let Some(id_val) = obj.get("@id") {
+            let id_str = id_val.as_str().ok_or_else(|| {
+                AdapterError::InvalidStructure("@id must be a string".to_string())
+            })?;
+            if id_str.starts_with("_:") {
+                self.sink.term_blank(Some(strip_blank_prefix(id_str)))
+            } else {
+                self.sink.term_iri(id_str)
+            }
+        } else {
+            // Anonymous blank node
+            self.sink.term_blank(None)
+        };
+
+        // Process each predicate-object pair
+        for (key, value) in obj {
+            match key.as_str() {
+                // Handled above, or (`@index`) carries no statement.
+                "@id" | "@graph" | "@index" => continue,
+                // Nodes described alongside this one, with no linking statement.
+                "@included" => {
+                    for node in node_items(value, "@included")? {
+                        self.node(node, scope, None)?;
+                    }
+                    continue;
+                }
+                // Statements whose object is this node.
+                "@reverse" => {
+                    let Value::Object(properties) = value else {
+                        return Err(AdapterError::InvalidStructure(
+                            "@reverse must be a map of properties".to_string(),
+                        ));
+                    };
+                    for (property, values) in properties {
+                        let predicate_id = self.sink.term_iri(property);
+                        for node in node_items(values, "a reverse property's value")? {
+                            if let ProcessedValue::Single(node_id) = self.value(node, scope)? {
+                                self.emit(scope, node_id, predicate_id, subject_id, None)?;
+                            }
                         }
+                    }
+                    continue;
+                }
+                "@type" => {}
+                // Skipping a keyword would drop what it says.
+                k if is_keyword_form(k) => {
+                    return Err(AdapterError::Unsupported(format!(
+                        "JSON-LD keyword {k:?} is not supported on a node object"
+                    )));
+                }
+                // A key that merely starts with `@` (`@odata.etag`) expands to
+                // no IRI, so JSON-LD expansion drops it.
+                k if k.starts_with('@') => continue,
+                _ => {}
+            }
+
+            // Handle @type specially (maps to rdf:type)
+            if key == "@type" {
+                let rdf_type_id = self.sink.term_iri(rdf::TYPE);
+
+                let types = match value {
+                    Value::Array(arr) => arr.iter().collect::<Vec<_>>(),
+                    _ => vec![value],
+                };
+
+                for type_val in types {
+                    if let Some(type_iri) = type_val.as_str() {
+                        let object_id = self.sink.term_iri(type_iri);
+                        self.emit(scope, subject_id, rdf_type_id, object_id, None)?;
                     }
                 }
                 continue;
             }
-            // Graph scoping (a node's graph selector, or a named graph's
-            // content) needs quads, which this adapter does not emit yet.
-            // Folding the statements into the default graph would lose data.
-            "@graph" => {
-                return Err(AdapterError::Unsupported(
-                    "JSON-LD `@graph` graph scoping is not supported by bulk import; \
-                     use `fluree insert`, or import the data as TriG or N-Quads"
-                        .to_string(),
-                ));
-            }
-            // Skip other JSON-LD keywords except @type
-            k if k.starts_with('@') && k != "@type" => continue,
-            _ => {}
-        }
 
-        // Handle @type specially (maps to rdf:type)
-        if key == "@type" {
-            let rdf_type_id = sink.term_iri(rdf::TYPE);
+            // Regular predicate (expanded IRI)
+            let predicate_id = self.sink.term_iri(key);
 
-            let types = match value {
+            // A reifier bundle in a named graph names that graph, which is
+            // the graph of the edge it reifies: `f:reifiesGraph` beside its
+            // `f:reifiesSubject`, as the transaction parser writes it.
+            let anchor = match scope {
+                Scope::Named(graph) if key == reifies_iris::SUBJECT => Some(graph),
+                _ => None,
+            };
+
+            // Process values (always an array in expanded form)
+            let values = match value {
                 Value::Array(arr) => arr.iter().collect::<Vec<_>>(),
                 _ => vec![value],
             };
 
-            for type_val in types {
-                if let Some(type_iri) = type_val.as_str() {
-                    let object_id = sink.term_iri(type_iri);
-                    sink.emit_triple(subject_id, rdf_type_id, object_id)?;
+            for val in values {
+                match self.value(val, scope)? {
+                    ProcessedValue::Single(object_id) => {
+                        self.emit(scope, subject_id, predicate_id, object_id, None)?;
+                        if let Some(graph) = anchor {
+                            let reifies_graph = self.sink.term_iri(reifies_iris::GRAPH);
+                            self.sink
+                                .emit_quad(subject_id, reifies_graph, graph, graph)?;
+                        }
+                    }
+                    ProcessedValue::List(items) => {
+                        for (index, object_id) in items {
+                            self.emit(scope, subject_id, predicate_id, object_id, Some(index))?;
+                        }
+                    }
+                    ProcessedValue::None => {}
                 }
             }
-            continue;
         }
 
-        // Regular predicate (expanded IRI)
-        let predicate_id = sink.term_iri(key);
-
-        // Process values (always an array in expanded form)
-        let values = match value {
-            Value::Array(arr) => arr.iter().collect::<Vec<_>>(),
-            _ => vec![value],
-        };
-
-        for val in values {
-            match process_value(val, sink)? {
-                ProcessedValue::Single(object_id) => {
-                    sink.emit_triple(subject_id, predicate_id, object_id)?;
-                }
-                ProcessedValue::List(items) => {
-                    for (index, object_id) in items {
-                        sink.emit_list_item(subject_id, predicate_id, object_id, index)?;
-                    }
-                }
-                ProcessedValue::None => {}
+        if let Some((name, nodes)) = named_graph_content {
+            let graph = self.open(GraphNameRef::NamedGraph(name))?;
+            for node in nodes {
+                self.node(node, graph, None)?;
             }
+        }
+
+        Ok(subject_id)
+    }
+
+    /// Process a value, in `scope`, and return the processed result
+    fn value(&mut self, value: &Value, scope: Scope) -> Result<ProcessedValue> {
+        match value {
+            Value::Object(obj) => {
+                // Check for @id (reference to another node)
+                if let Some(id_val) = obj.get("@id") {
+                    // An embedded node object carrying more than a bare `@id`
+                    // asserts its own triples (JSON-LD embedded-node semantics);
+                    // recurse so they aren't silently dropped. A `{"@id": ...}`
+                    // singleton is a pure reference.
+                    if obj.len() > 1 {
+                        let subject_id = self.node(value, scope, None)?;
+                        return Ok(ProcessedValue::Single(subject_id));
+                    }
+                    let id_str = id_val.as_str().ok_or_else(|| {
+                        AdapterError::InvalidStructure("@id must be a string".to_string())
+                    })?;
+                    let term_id = if id_str.starts_with("_:") {
+                        self.sink.term_blank(Some(strip_blank_prefix(id_str)))
+                    } else {
+                        self.sink.term_iri(id_str)
+                    };
+                    return Ok(ProcessedValue::Single(term_id));
+                }
+
+                // Check for @value (literal)
+                if let Some(val) = obj.get("@value") {
+                    return process_literal(val, obj, self.sink);
+                }
+
+                // Check for @list
+                if let Some(list_val) = obj.get("@list") {
+                    return self.list(list_val, scope);
+                }
+
+                // Nested/embedded node without @id - allocate blank node first,
+                // then process the node using that same blank node as subject.
+                // This ensures the object edge and embedded node triples share identity.
+                let subject_id = self.sink.term_blank(None);
+                self.node(value, scope, Some(subject_id))?;
+                Ok(ProcessedValue::Single(subject_id))
+            }
+            // Direct scalar values (shouldn't happen in properly expanded JSON-LD)
+            Value::String(s) => Ok(ProcessedValue::Single(self.sink.term_literal(
+                s,
+                Datatype::xsd_string(),
+                None,
+            ))),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Ok(ProcessedValue::Single(self.sink.term_literal_value(
+                        LiteralValue::Integer(i),
+                        Datatype::xsd_integer(),
+                    )))
+                } else if let Some(f) = n.as_f64() {
+                    Ok(ProcessedValue::Single(self.sink.term_literal_value(
+                        LiteralValue::Double(f),
+                        Datatype::xsd_double(),
+                    )))
+                } else {
+                    Ok(ProcessedValue::None)
+                }
+            }
+            Value::Bool(b) => Ok(ProcessedValue::Single(
+                self.sink
+                    .term_literal_value(LiteralValue::Boolean(*b), Datatype::xsd_boolean()),
+            )),
+            _ => Ok(ProcessedValue::None),
         }
     }
 
-    Ok(subject_id)
+    /// Process a @list value, in `scope`, and return the list items with indices
+    fn list(&mut self, list_val: &Value, scope: Scope) -> Result<ProcessedValue> {
+        let items = match list_val {
+            Value::Array(arr) => arr,
+            _ => {
+                return Err(AdapterError::InvalidStructure(
+                    "@list value must be an array".to_string(),
+                ))
+            }
+        };
+
+        // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+        // Conversion): the statement stores as one ordinary triple, the twin of
+        // Turtle's `()` fix (issue #1694). It used to produce zero events,
+        // silently losing the statement.
+        if items.is_empty() {
+            return Ok(ProcessedValue::Single(self.sink.term_iri(rdf::NIL)));
+        }
+
+        let mut indexed_items = Vec::with_capacity(items.len());
+
+        for (index, item) in items.iter().enumerate() {
+            // Process each list item as a single value (lists cannot be nested directly)
+            match self.list_item(item, scope)? {
+                Some(term_id) => {
+                    indexed_items.push((index as i32, term_id));
+                }
+                None => {
+                    // Skip null/unsupported items in list
+                }
+            }
+        }
+
+        Ok(ProcessedValue::List(indexed_items))
+    }
+
+    /// Process a single list item, in `scope` (cannot return a list, only
+    /// single values)
+    fn list_item(&mut self, value: &Value, scope: Scope) -> Result<Option<TermId>> {
+        match value {
+            Value::Object(obj) => {
+                // Check for @id (reference to another node)
+                if let Some(id_val) = obj.get("@id") {
+                    // A member carrying more than a bare `@id` asserts its own
+                    // triples, as an embedded node does outside a list.
+                    if obj.len() > 1 {
+                        return Ok(Some(self.node(value, scope, None)?));
+                    }
+                    let id_str = id_val.as_str().ok_or_else(|| {
+                        AdapterError::InvalidStructure("@id must be a string".to_string())
+                    })?;
+                    return Ok(Some(if id_str.starts_with("_:") {
+                        self.sink.term_blank(Some(strip_blank_prefix(id_str)))
+                    } else {
+                        self.sink.term_iri(id_str)
+                    }));
+                }
+
+                // Check for @value (literal)
+                if let Some(val) = obj.get("@value") {
+                    return match process_literal(val, obj, self.sink)? {
+                        ProcessedValue::Single(id) => Ok(Some(id)),
+                        _ => Ok(None),
+                    };
+                }
+
+                // Nested @list inside @list is an error in JSON-LD
+                if obj.contains_key("@list") {
+                    return Err(AdapterError::InvalidStructure(
+                        "Nested @list is not allowed".to_string(),
+                    ));
+                }
+
+                // Embedded node in list - allocate blank node and process
+                let subject_id = self.sink.term_blank(None);
+                self.node(value, scope, Some(subject_id))?;
+                Ok(Some(subject_id))
+            }
+            // Direct scalar values
+            Value::String(s) => Ok(Some(self.sink.term_literal(
+                s,
+                Datatype::xsd_string(),
+                None,
+            ))),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Ok(Some(self.sink.term_literal_value(
+                        LiteralValue::Integer(i),
+                        Datatype::xsd_integer(),
+                    )))
+                } else if let Some(f) = n.as_f64() {
+                    Ok(Some(self.sink.term_literal_value(
+                        LiteralValue::Double(f),
+                        Datatype::xsd_double(),
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            Value::Bool(b) => Ok(Some(
+                self.sink
+                    .term_literal_value(LiteralValue::Boolean(*b), Datatype::xsd_boolean()),
+            )),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// The node objects of a keyword value (one node or an array of them).
@@ -273,172 +611,6 @@ fn node_items<'v>(value: &'v Value, what: &str) -> Result<Vec<&'v Value>> {
         )));
     }
     Ok(items)
-}
-
-/// Process a value and return the processed result
-fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedValue> {
-    match value {
-        Value::Object(obj) => {
-            // Check for @id (reference to another node)
-            if let Some(id_val) = obj.get("@id") {
-                // An embedded node object carrying more than a bare `@id`
-                // asserts its own triples (JSON-LD embedded-node semantics);
-                // recurse so they aren't silently dropped. A `{"@id": ...}`
-                // singleton is a pure reference.
-                if obj.len() > 1 {
-                    let subject_id = process_node(value, sink, None)?;
-                    return Ok(ProcessedValue::Single(subject_id));
-                }
-                let id_str = id_val.as_str().ok_or_else(|| {
-                    AdapterError::InvalidStructure("@id must be a string".to_string())
-                })?;
-                let term_id = if id_str.starts_with("_:") {
-                    sink.term_blank(Some(strip_blank_prefix(id_str)))
-                } else {
-                    sink.term_iri(id_str)
-                };
-                return Ok(ProcessedValue::Single(term_id));
-            }
-
-            // Check for @value (literal)
-            if let Some(val) = obj.get("@value") {
-                return process_literal(val, obj, sink);
-            }
-
-            // Check for @list
-            if let Some(list_val) = obj.get("@list") {
-                return process_list(list_val, sink);
-            }
-
-            // Nested/embedded node without @id - allocate blank node first,
-            // then process the node using that same blank node as subject.
-            // This ensures the object edge and embedded node triples share identity.
-            let subject_id = sink.term_blank(None);
-            process_node(value, sink, Some(subject_id))?;
-            Ok(ProcessedValue::Single(subject_id))
-        }
-        // Direct scalar values (shouldn't happen in properly expanded JSON-LD)
-        Value::String(s) => Ok(ProcessedValue::Single(sink.term_literal(
-            s,
-            Datatype::xsd_string(),
-            None,
-        ))),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(ProcessedValue::Single(sink.term_literal_value(
-                    LiteralValue::Integer(i),
-                    Datatype::xsd_integer(),
-                )))
-            } else if let Some(f) = n.as_f64() {
-                Ok(ProcessedValue::Single(sink.term_literal_value(
-                    LiteralValue::Double(f),
-                    Datatype::xsd_double(),
-                )))
-            } else {
-                Ok(ProcessedValue::None)
-            }
-        }
-        Value::Bool(b) => Ok(ProcessedValue::Single(
-            sink.term_literal_value(LiteralValue::Boolean(*b), Datatype::xsd_boolean()),
-        )),
-        _ => Ok(ProcessedValue::None),
-    }
-}
-
-/// Process a @list value and return the list items with indices
-fn process_list<S: GraphSink>(list_val: &Value, sink: &mut S) -> Result<ProcessedValue> {
-    let items = match list_val {
-        Value::Array(arr) => arr,
-        _ => {
-            return Err(AdapterError::InvalidStructure(
-                "@list value must be an array".to_string(),
-            ))
-        }
-    };
-
-    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
-    // Conversion): the statement stores as one ordinary triple, the twin of
-    // Turtle's `()` fix (issue #1694). It used to produce zero events,
-    // silently losing the statement.
-    if items.is_empty() {
-        return Ok(ProcessedValue::Single(sink.term_iri(rdf::NIL)));
-    }
-
-    let mut indexed_items = Vec::with_capacity(items.len());
-
-    for (index, item) in items.iter().enumerate() {
-        // Process each list item as a single value (lists cannot be nested directly)
-        match process_list_item(item, sink)? {
-            Some(term_id) => {
-                indexed_items.push((index as i32, term_id));
-            }
-            None => {
-                // Skip null/unsupported items in list
-            }
-        }
-    }
-
-    Ok(ProcessedValue::List(indexed_items))
-}
-
-/// Process a single list item (cannot return a list, only single values)
-fn process_list_item<S: GraphSink>(value: &Value, sink: &mut S) -> Result<Option<TermId>> {
-    match value {
-        Value::Object(obj) => {
-            // Check for @id (reference to another node)
-            if let Some(id_val) = obj.get("@id") {
-                let id_str = id_val.as_str().ok_or_else(|| {
-                    AdapterError::InvalidStructure("@id must be a string".to_string())
-                })?;
-                return Ok(Some(if id_str.starts_with("_:") {
-                    sink.term_blank(Some(strip_blank_prefix(id_str)))
-                } else {
-                    sink.term_iri(id_str)
-                }));
-            }
-
-            // Check for @value (literal)
-            if let Some(val) = obj.get("@value") {
-                return match process_literal(val, obj, sink)? {
-                    ProcessedValue::Single(id) => Ok(Some(id)),
-                    _ => Ok(None),
-                };
-            }
-
-            // Nested @list inside @list is an error in JSON-LD
-            if obj.contains_key("@list") {
-                return Err(AdapterError::InvalidStructure(
-                    "Nested @list is not allowed".to_string(),
-                ));
-            }
-
-            // Embedded node in list - allocate blank node and process
-            let subject_id = sink.term_blank(None);
-            process_node(value, sink, Some(subject_id))?;
-            Ok(Some(subject_id))
-        }
-        // Direct scalar values
-        Value::String(s) => Ok(Some(sink.term_literal(s, Datatype::xsd_string(), None))),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Some(sink.term_literal_value(
-                    LiteralValue::Integer(i),
-                    Datatype::xsd_integer(),
-                )))
-            } else if let Some(f) = n.as_f64() {
-                Ok(Some(sink.term_literal_value(
-                    LiteralValue::Double(f),
-                    Datatype::xsd_double(),
-                )))
-            } else {
-                Ok(None)
-            }
-        }
-        Value::Bool(b) => Ok(Some(
-            sink.term_literal_value(LiteralValue::Boolean(*b), Datatype::xsd_boolean()),
-        )),
-        _ => Ok(None),
-    }
 }
 
 /// Process a literal value with @value, @type, @language
@@ -562,7 +734,7 @@ fn process_literal<S: GraphSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_graph_ir::{GraphCollectorSink, Term};
+    use fluree_graph_ir::{GraphCollectorSink, SinkResult, Term};
     use fluree_vocab::rdf;
     use serde_json::json;
 
@@ -1306,5 +1478,234 @@ mod tests {
         assert!(graph
             .iter()
             .any(|t| iri(&t.s) == "http://example.org/other"));
+    }
+
+    /// Records each statement as `graph s p o` (`s p o [i]` for a list
+    /// member), with `http://example.org/` written `ex:` and every blank node
+    /// `_:`.
+    #[derive(Default)]
+    struct Statements {
+        terms: Vec<String>,
+        out: Vec<String>,
+    }
+
+    impl Statements {
+        fn term(&mut self, term: String) -> TermId {
+            self.terms.push(term.replace("http://example.org/", "ex:"));
+            TermId::new(self.terms.len() as u32 - 1)
+        }
+
+        fn record(&mut self, graph: &str, s: TermId, p: TermId, o: TermId, index: Option<i32>) {
+            let [s, p, o] = [s, p, o].map(|t| self.terms[t.index() as usize].clone());
+            let index = index.map(|i| format!(" [{i}]")).unwrap_or_default();
+            self.out.push(format!("{graph} {s} {p} {o}{index}"));
+        }
+
+        fn sorted(mut self) -> Vec<String> {
+            self.out.sort();
+            self.out
+        }
+    }
+
+    impl GraphSink for Statements {
+        fn on_base(&mut self, _base_iri: &str) {}
+        fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {}
+        fn term_iri(&mut self, iri: &str) -> TermId {
+            self.term(iri.to_string())
+        }
+        fn term_blank(&mut self, _label: Option<&str>) -> TermId {
+            self.term("_:".to_string())
+        }
+        fn term_literal(&mut self, value: &str, _: Datatype, _: Option<&str>) -> TermId {
+            self.term(format!("{value:?}"))
+        }
+        fn term_literal_value(&mut self, value: LiteralValue, _: Datatype) -> TermId {
+            self.term(format!("{value:?}"))
+        }
+        fn emit_triple(&mut self, s: TermId, p: TermId, o: TermId) -> SinkResult {
+            self.record("default", s, p, o, None);
+            Ok(())
+        }
+        fn emit_list_item(&mut self, s: TermId, p: TermId, o: TermId, index: i32) -> SinkResult {
+            self.record("default", s, p, o, Some(index));
+            Ok(())
+        }
+        fn supports_quads(&self) -> bool {
+            true
+        }
+        fn emit_quad(&mut self, s: TermId, p: TermId, o: TermId, g: TermId) -> SinkResult {
+            let graph = self.terms[g.index() as usize].clone();
+            self.record(&graph, s, p, o, None);
+            Ok(())
+        }
+        fn emit_quad_list_item(
+            &mut self,
+            s: TermId,
+            p: TermId,
+            o: TermId,
+            g: TermId,
+            index: i32,
+        ) -> SinkResult {
+            let graph = self.terms[g.index() as usize].clone();
+            self.record(&graph, s, p, o, Some(index));
+            Ok(())
+        }
+    }
+
+    /// Resolves `ex:` selectors and named-graph IRIs; `default` is the
+    /// default graph.
+    fn resolve(name: GraphNameRef<'_>) -> Result<Option<String>> {
+        Ok(match name {
+            GraphNameRef::Selector("default") => None,
+            GraphNameRef::Selector(raw) => Some(raw.replace("ex:", "http://example.org/")),
+            GraphNameRef::NamedGraph(iri) => Some(iri.to_string()),
+        })
+    }
+
+    fn scoped(doc: Value) -> Result<Vec<String>> {
+        let mut sink = Statements::default();
+        to_graph_events_scoped(&crate::expand(&doc).unwrap(), &mut sink, resolve)?;
+        Ok(sink.sorted())
+    }
+
+    /// Every statement lands in its node's graph, as the transaction parser
+    /// writes it: a selector scopes its node and everything nested in it, a
+    /// named graph keeps its own properties outside and its content inside,
+    /// and a node with its own selector inside a named graph goes to its own.
+    #[test]
+    fn each_statement_is_written_to_its_nodes_graph() {
+        let doc = json!({"@context": {"ex": "http://example.org/"}, "@graph": [
+            {"@id": "ex:a", "@graph": "ex:g",
+             "ex:knows": {"@id": "ex:b", "ex:q": "w"},
+             "ex:anon": {"ex:q": "x"},
+             "ex:items": {"@list": [{"@id": "ex:c", "ex:q": "y"}]},
+             "@included": [{"@id": "ex:d", "ex:q": "z"}],
+             "@reverse": {"ex:likes": {"@id": "ex:e"}}},
+            {"@id": "ex:G", "ex:label": "G", "@graph": [
+                {"@id": "ex:f", "ex:q": "f"},
+                {"@id": "ex:i", "@graph": "ex:h", "ex:q": "i"}
+            ]},
+            {"@id": "ex:j", "@graph": "default", "ex:q": "j"}
+        ]});
+        assert_eq!(
+            scoped(doc).unwrap(),
+            [
+                "default ex:G ex:label \"G\"",
+                "default ex:j ex:q \"j\"",
+                "ex:G ex:f ex:q \"f\"",
+                "ex:g _: ex:q \"x\"",
+                "ex:g ex:a ex:anon _:",
+                "ex:g ex:a ex:items ex:c [0]",
+                "ex:g ex:a ex:knows ex:b",
+                "ex:g ex:b ex:q \"w\"",
+                "ex:g ex:c ex:q \"y\"",
+                "ex:g ex:d ex:q \"z\"",
+                "ex:g ex:e ex:likes ex:a",
+                "ex:h ex:i ex:q \"i\"",
+            ]
+        );
+    }
+
+    /// A list member that carries more than its `@id` keeps its own
+    /// statements, in the default graph as in a named one. It used to be
+    /// read as a bare reference, and its statements were dropped.
+    #[test]
+    fn a_list_member_keeps_its_own_statements() {
+        let doc = json!({"@context": {"ex": "http://example.org/"},
+            "@id": "ex:a", "ex:items": {"@list": [{"@id": "ex:b", "ex:q": "w"}, {"@id": "ex:c"}]}});
+        assert_eq!(
+            scoped(doc).unwrap(),
+            [
+                "default ex:a ex:items ex:b [0]",
+                "default ex:a ex:items ex:c [1]",
+                "default ex:b ex:q \"w\"",
+            ]
+        );
+    }
+
+    /// A reifier bundle written in a named graph names that graph
+    /// (`f:reifiesGraph`), as the transaction parser anchors it; in the
+    /// default graph it names none.
+    #[test]
+    fn a_reifier_in_a_named_graph_names_it() {
+        let doc = |graph: &str| {
+            json!({"@context": {"ex": "http://example.org/"},
+                "@id": "ex:r", "@graph": graph,
+                "https://ns.flur.ee/db#reifiesSubject": {"@id": "ex:a"}})
+        };
+        let graph = reifies_iris::GRAPH.to_string();
+        let subject = reifies_iris::SUBJECT.to_string();
+        assert_eq!(
+            scoped(doc("ex:g")).unwrap(),
+            [
+                format!("ex:g ex:r {graph} ex:g"),
+                format!("ex:g ex:r {subject} ex:a"),
+            ]
+        );
+        assert_eq!(
+            scoped(doc("default")).unwrap(),
+            [format!("default ex:r {subject} ex:a")]
+        );
+    }
+
+    /// A graph name the resolver refuses refuses the document, and so does
+    /// a named graph without an IRI name.
+    #[test]
+    fn a_graph_that_cannot_be_named_is_refused() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let mut sink = Statements::default();
+        let doc =
+            crate::expand(&json!({"@context": ctx, "@id": "ex:a", "@graph": "ex:g", "ex:q": 1}))
+                .unwrap();
+        let err = to_graph_events_scoped(&doc, &mut sink, |_| {
+            Err(AdapterError::Unsupported("no such graph".to_string()))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "no such graph");
+
+        for doc in [
+            json!({"@context": ctx, "@graph": [{"ex:q": 1, "@graph": [{"@id": "ex:a", "ex:q": 2}]}]}),
+            json!({"@context": ctx, "@id": "_:g", "@graph": [{"@id": "ex:a", "ex:q": 2}]}),
+        ] {
+            let err = scoped(doc.clone()).unwrap_err();
+            assert!(
+                matches!(err, AdapterError::InvalidStructure(_)),
+                "{doc}: {err}"
+            );
+        }
+    }
+
+    /// A sink without quads refuses a named graph; the default graph needs
+    /// none.
+    #[test]
+    fn a_named_graph_needs_a_quad_sink() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let doc = |graph: &str| {
+            crate::expand(&json!({"@context": ctx, "@id": "ex:a", "@graph": graph, "ex:q": 1}))
+                .unwrap()
+        };
+        let mut sink = GraphCollectorSink::new();
+        let err = to_graph_events_scoped(&doc("ex:g"), &mut sink, resolve).unwrap_err();
+        assert!(matches!(err, AdapterError::Unsupported(_)), "{err}");
+
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events_scoped(&doc("default"), &mut sink, resolve).unwrap();
+        assert_eq!(sink.graph().len(), 1);
+    }
+
+    /// A keyword on a node is refused, as the transaction parser refuses
+    /// it, rather than skipped with whatever it says. A key that merely
+    /// starts with `@` is no keyword and expands to no IRI.
+    #[test]
+    fn a_keyword_on_a_node_is_refused_not_skipped() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let err =
+            scoped(json!({"@context": ctx, "@id": "ex:a", "ex:q": 1, "@foo": "x"})).unwrap_err();
+        assert!(err.to_string().contains("\"@foo\""), "{err}");
+
+        assert_eq!(
+            scoped(json!({"@context": ctx, "@id": "ex:a", "ex:q": 1, "@odata.etag": "x"})).unwrap(),
+            ["default ex:a ex:q Integer(1)"]
+        );
     }
 }
