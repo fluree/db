@@ -334,8 +334,8 @@ was present.
 
 The same holds when the `WHERE` has several solutions and the templates are
 instantiated once for each: a triple that any solution inserts is kept,
-however many solutions delete it, and a commit holds only the triples whose
-stored state changes.
+however many solutions delete it, and a stored triple that solutions both
+delete and insert is not committed at all.
 
 Once a fact is indexed, a DELETE is matched against what the index stores,
 which is less than was written for an integer too large for 64 bits: the index
