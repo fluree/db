@@ -409,6 +409,72 @@ pub fn update_reverse_tree(
     })
 }
 
+/// Remove `keys` (sorted ascending) from a reverse dictionary tree. Leaves
+/// holding none of them keep their addresses; a leaf left empty is dropped.
+pub fn remove_from_reverse_tree(
+    existing_branch: &DictBranch,
+    keys: &[Vec<u8>],
+    fetch_leaf: &mut dyn FnMut(usize) -> Result<Vec<u8>, io::Error>,
+) -> io::Result<IncrementalTreeResult> {
+    if keys.is_empty() || existing_branch.leaves.is_empty() {
+        return Ok(unchanged_tree(existing_branch));
+    }
+    let probes: Vec<ReverseEntry> = keys
+        .iter()
+        .map(|key| ReverseEntry {
+            key: key.clone(),
+            id: 0,
+        })
+        .collect();
+    let slices = slice_entries_to_leaves(&probes, &existing_branch.leaves);
+
+    let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
+    let mut new_leaves: Vec<LeafArtifact> = Vec::new();
+    let mut replaced_indices: Vec<usize> = Vec::new();
+    for (i, existing_leaf) in existing_branch.leaves.iter().enumerate() {
+        let slice = slices[i];
+        if slice.is_empty() {
+            branch_entries.push(existing_leaf.clone());
+            continue;
+        }
+        let leaf_bytes = fetch_leaf(i)?;
+        let decoded = ReverseLeaf::from_bytes(&leaf_bytes)?;
+        let kept: Vec<ReverseEntry> = decoded
+            .iter()
+            .filter(|(key, _)| {
+                slice
+                    .binary_search_by(|p| p.key.as_slice().cmp(key))
+                    .is_err()
+            })
+            .map(|(key, id)| ReverseEntry {
+                key: key.to_vec(),
+                id,
+            })
+            .collect();
+        if kept.len() as u32 == existing_leaf.entry_count {
+            branch_entries.push(existing_leaf.clone());
+            continue;
+        }
+        if !kept.is_empty() {
+            branch_entries.push(encode_and_track(&kept, &mut new_leaves));
+        }
+        replaced_indices.push(i);
+    }
+
+    let branch = DictBranch {
+        leaves: branch_entries,
+    };
+    let branch_bytes = branch.encode();
+    let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
+    Ok(IncrementalTreeResult {
+        branch,
+        branch_bytes,
+        branch_hash,
+        new_leaves,
+        replaced_leaf_indices: replaced_indices,
+    })
+}
+
 // ============================================================================
 // Internal helpers
 // ============================================================================
@@ -713,6 +779,32 @@ mod tests {
         assert_eq!(new_leaf.lookup(b"alpha"), Some(1));
         assert_eq!(new_leaf.lookup(b"beta"), Some(2));
         assert_eq!(new_leaf.lookup(b"gamma"), Some(3));
+    }
+
+    #[test]
+    fn removing_from_a_reverse_tree_drops_only_those_keys() {
+        let entries = vec![
+            make_reverse_entry("alpha", 1),
+            make_reverse_entry("beta", 2),
+            make_reverse_entry("gamma", 3),
+        ];
+        let (branch, leaf_bytes) = build_test_tree(&entries);
+        let result = remove_from_reverse_tree(&branch, &[b"beta".to_vec()], &mut |idx| {
+            Ok(leaf_bytes[idx].clone())
+        })
+        .unwrap();
+        assert_eq!(result.replaced_leaf_indices, vec![0]);
+        let leaf = ReverseLeaf::from_bytes(&result.new_leaves[0].bytes).unwrap();
+        assert_eq!(leaf.lookup(b"alpha"), Some(1));
+        assert_eq!(leaf.lookup(b"beta"), None);
+        assert_eq!(leaf.lookup(b"gamma"), Some(3));
+
+        // A key the tree does not hold changes nothing.
+        let result = remove_from_reverse_tree(&branch, &[b"delta".to_vec()], &mut |idx| {
+            Ok(leaf_bytes[idx].clone())
+        })
+        .unwrap();
+        assert!(result.new_leaves.is_empty() && result.replaced_leaf_indices.is_empty());
     }
 
     #[test]

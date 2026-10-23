@@ -69,6 +69,8 @@ pub struct LeafUpdateInput<'a> {
     /// History entries retention leaves out.
     pub history_drop:
         Option<std::sync::Arc<fluree_db_binary_index::format::history_sidecar::HistoryDrop>>,
+    /// Rebuild the history even without novelty: it holds erased events.
+    pub rewrite_history: bool,
 }
 
 /// A new leaf blob produced by the update.
@@ -132,6 +134,15 @@ pub struct StreamSlices<'a> {
     pub novelty_ops: &'a [u8],
     pub superseded: &'a [RunRecordV2],
     pub superseded_ops: &'a [u8],
+    /// Keys of erased events whose history this leaf holds.
+    pub erase: &'a [RunRecordV2],
+}
+
+impl StreamSlices<'_> {
+    /// Whether the leaf these slices route to is rewritten.
+    pub fn touched(&self) -> bool {
+        !self.novelty.is_empty() || !self.erase.is_empty()
+    }
 }
 
 // ============================================================================
@@ -179,7 +190,10 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
             "a leaf without novelty cannot hold superseded events: every \
              superseded identity routes with its winner"
         );
-        return passthrough_entire_leaf(input);
+        if !input.rewrite_history {
+            return passthrough_entire_leaf(input);
+        }
+        return rewrite_leaf_history(input);
     }
 
     let header = decode_leaf_header_v3(input.leaf_bytes)?;
@@ -253,6 +267,7 @@ fn slice_streams_to_leaflets<'a>(
                 novelty_ops,
                 superseded,
                 superseded_ops,
+                erase: &[],
             }
         })
         .collect()
@@ -362,6 +377,28 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
         }],
         matched: Vec::new(),
     })
+}
+
+/// Keep every leaflet's rows as they are and rebuild the history, which
+/// [`assemble_output_leaves`] filters through the input's `history_drop`.
+fn rewrite_leaf_history(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> {
+    let header = decode_leaf_header_v3(input.leaf_bytes)?;
+    let dir = decode_leaf_dir_v3_with_base(input.leaf_bytes, &header)?;
+    let processed = dir
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            passthrough_leaflet(
+                input.leaf_bytes,
+                entry,
+                i as u32,
+                dir.payload_base,
+                input.sidecar_bytes,
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    assemble_output_leaves(processed, input)
 }
 
 /// Passthrough a single untouched leaflet.
@@ -1009,6 +1046,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1038,6 +1076,7 @@ mod tests {
             leaf_target_rows: 100,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let output = update_leaf(&input).unwrap();
 
@@ -1107,6 +1146,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let output = update_leaf(&input).unwrap();
         let origin = |leaflet_idx, copied| LeafletOrigin {
@@ -1146,6 +1186,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1177,6 +1218,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1205,6 +1247,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1242,6 +1285,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
 
         let output = update_leaf(&input).unwrap();
@@ -1288,6 +1332,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let gen1 = update_leaf(&input).unwrap();
         assert_eq!(gen1.leaves.len(), 1);
@@ -1311,6 +1356,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: empty_sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let gen2 = update_leaf(&input)
             .expect("merging novelty into an emptied-by-retract leaflet must not fail");
@@ -1400,6 +1446,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let gen1 = update_leaf(&input).unwrap();
         assert_eq!(gen1.leaves.len(), 1);
@@ -1421,6 +1468,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: gen1.leaves[0].info.sidecar_bytes.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let gen2 = update_leaf(&input)
             .expect("merging novelty into an emptied middle leaflet must not fail");
@@ -1490,6 +1538,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: leaf.sidecar_bytes.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let gen2 = update_leaf(&input)
             .expect("merging novelty into a rebuild-emitted empty partition must not fail");
@@ -1551,6 +1600,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: leaf.sidecar_bytes.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
         let gen2 = update_leaf(&input).unwrap();
         assert_eq!(gen2.leaves.len(), 1);
@@ -1603,6 +1653,7 @@ mod tests {
             leaf_target_rows: 10000,
             sidecar_bytes: sidecar.as_deref(),
             history_drop: None,
+            rewrite_history: false,
         };
 
         let output = update_leaf(&input).unwrap();

@@ -351,16 +351,34 @@ mod tests {
     }
 }
 
-/// History entries an index build leaves out, by predicate over ranges of
-/// `t`: retention that keeps no history (`f:noHistory`) for a predicate.
+/// History entries an index build leaves out: by predicate over ranges of
+/// `t`, for retention that keeps no history (`f:noHistory`) for a predicate,
+/// and as single events, for permanent erasure.
 ///
 /// A range covers whole transitions of the predicate's facts, so what is
 /// left still replays consistently from the head back to any point after the
-/// range. Reads of points inside a range are refused before they reach the
-/// index.
+/// range. An erasure removes an assertion with the retraction that ended it,
+/// a whole span of one fact, which replays consistently too. Reads of points
+/// inside a range are refused before they reach the index.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HistoryDrop {
     by_p_id: std::collections::HashMap<u32, Vec<(i64, i64)>>,
+    events: std::collections::HashSet<EventKey>,
+}
+
+/// An event's identity: `(s_id, p_id, o_type, o_key, o_i, t, op)`.
+type EventKey = (u64, u32, u16, u64, u32, u32, u8);
+
+fn event_key(entry: &HistEntryV2) -> EventKey {
+    (
+        entry.s_id.as_u64(),
+        entry.p_id,
+        entry.o_type,
+        entry.o_key,
+        entry.o_i,
+        entry.t,
+        entry.op,
+    )
 }
 
 impl HistoryDrop {
@@ -372,8 +390,13 @@ impl HistoryDrop {
             .push((from_t, until_t.unwrap_or(i64::MAX)));
     }
 
+    /// Leave out the single event `entry`.
+    pub fn insert_event(&mut self, entry: &HistEntryV2) {
+        self.events.insert(event_key(entry));
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.by_p_id.is_empty()
+        self.by_p_id.is_empty() && self.events.is_empty()
     }
 
     /// Whether `entry` is left out.
@@ -383,6 +406,6 @@ impl HistoryDrop {
             ranges
                 .iter()
                 .any(|(from, until)| *from <= i64::from(entry.t) && i64::from(entry.t) < *until)
-        })
+        }) || (!self.events.is_empty() && self.events.contains(&event_key(entry)))
     }
 }

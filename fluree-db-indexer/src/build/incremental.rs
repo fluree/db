@@ -168,6 +168,7 @@ async fn run_update_branch(
     sorted_ops: Vec<u8>,
     sorted_superseded: Vec<RunRecordV2>,
     sorted_superseded_ops: Vec<u8>,
+    sorted_erase: Vec<RunRecordV2>,
     branch_config: BranchUpdateConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
     tracker: fluree_db_core::tracking::Tracker,
@@ -185,6 +186,7 @@ async fn run_update_branch(
         &branch_bytes,
         &sorted_records,
         &sorted_ops,
+        &sorted_erase,
         branch_config.order,
     )
     .map_err(|e| IndexerError::StorageRead(format!("compute touched leaves: {e}")))?;
@@ -298,6 +300,7 @@ async fn run_update_branch(
             &sorted_ops,
             &sorted_superseded,
             &sorted_superseded_ops,
+            &sorted_erase,
             &branch_config,
             &|cid| {
                 leaf_map
@@ -376,6 +379,9 @@ struct Phase2Task {
     /// entries in the leaf merge, or in the fresh branch's writer.
     sorted_superseded: Vec<RunRecordV2>,
     sorted_superseded_ops: Vec<u8>,
+    /// Keys of erased events, sorted like `sorted_records`: the leaves
+    /// holding them are rewritten without them even with no novelty.
+    sorted_erase: Vec<RunRecordV2>,
     kind: Phase2TaskKind,
     /// History entries retention leaves out of this graph.
     history_drop:
@@ -455,6 +461,7 @@ async fn execute_phase2_task(
         sorted_ops,
         sorted_superseded,
         sorted_superseded_ops,
+        sorted_erase,
         kind,
         history_drop,
     } = task;
@@ -520,6 +527,7 @@ async fn execute_phase2_task(
                 sorted_ops,
                 sorted_superseded,
                 sorted_superseded_ops,
+                sorted_erase,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -550,6 +558,7 @@ async fn execute_phase2_task(
                 sorted_ops,
                 sorted_superseded,
                 sorted_superseded_ops,
+                sorted_erase,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -663,6 +672,187 @@ async fn execute_phase2_task(
     );
 
     Ok(output)
+}
+
+/// One erased event, in a base index's ids: an assertion or retraction whose
+/// history entry an erasure removes.
+#[derive(Clone, Copy, Debug)]
+pub struct ErasedEvent {
+    pub record: RunRecordV2,
+    /// An assertion, or else a retraction.
+    pub assert: bool,
+}
+
+/// Rewrite the index at `base_root_id` without the history of `events`. Only
+/// the leaves holding them are rewritten, in every order of their graphs, and
+/// a string only they used is emptied from the dictionaries; every other
+/// artifact is the base root's. The new root keeps the base's `index_t` and
+/// links back to it.
+pub async fn erase_index_events(
+    content_store: Arc<dyn ContentStore>,
+    ledger_id: &str,
+    base_root_id: &ContentId,
+    events: &[ErasedEvent],
+    config: &IndexerConfig,
+) -> Result<IndexResult> {
+    use fluree_db_binary_index::format::history_sidecar::{HistEntryV2, HistoryDrop};
+
+    let root_bytes = fetch_cached_index_bytes(
+        content_store.as_ref(),
+        base_root_id,
+        format!("load root {base_root_id} to erase from"),
+    )
+    .await?;
+    let base_root = fluree_db_binary_index::IndexRoot::decode(&root_bytes)
+        .map_err(|e| IndexerError::StorageRead(format!("decode root {base_root_id}: {e}")))?;
+
+    let mut by_graph: std::collections::BTreeMap<u16, Vec<&ErasedEvent>> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        by_graph.entry(event.record.g_id).or_default().push(event);
+    }
+    let mut tasks = Vec::new();
+    for (&g_id, events) in &by_graph {
+        let mut drop = HistoryDrop::default();
+        for event in events {
+            let r = &event.record;
+            drop.insert_event(&HistEntryV2 {
+                s_id: r.s_id,
+                p_id: r.p_id,
+                o_type: r.o_type,
+                o_key: r.o_key,
+                o_i: r.o_i,
+                t: r.t,
+                op: u8::from(event.assert),
+            });
+        }
+        let drop = Arc::new(drop);
+        for order in [
+            RunSortOrder::Spot,
+            RunSortOrder::Psot,
+            RunSortOrder::Post,
+            RunSortOrder::Opst,
+        ] {
+            let kind = if g_id == 0 {
+                match base_root
+                    .default_graph_orders
+                    .iter()
+                    .find(|o| o.order == order)
+                {
+                    Some(o) => Phase2TaskKind::DefaultExisting {
+                        leaves: o.leaves.clone(),
+                    },
+                    None => continue,
+                }
+            } else {
+                match base_root
+                    .named_graphs
+                    .iter()
+                    .find(|ng| ng.g_id == g_id)
+                    .and_then(|ng| ng.orders.iter().find(|(o, _)| *o == order))
+                {
+                    Some((_, branch_cid)) => Phase2TaskKind::NamedExisting {
+                        branch_cid: branch_cid.clone(),
+                    },
+                    None => continue,
+                }
+            };
+            let mut keys: Vec<RunRecordV2> = events.iter().map(|e| e.record).collect();
+            keys.sort_unstable_by(cmp_v2_for_order(order));
+            tasks.push(Phase2Task {
+                seq: tasks.len(),
+                g_id,
+                order,
+                sorted_records: Vec::new(),
+                sorted_ops: Vec::new(),
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                sorted_erase: keys,
+                kind,
+                history_drop: Some(Arc::clone(&drop)),
+            });
+        }
+    }
+
+    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
+    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
+    let tracker = fluree_db_core::tracking::Tracker::disabled();
+    let mut root_builder = IncrementalRootBuilder::from_old_root(base_root.clone(), ledger_id);
+    root_builder.set_index_t(base_root.index_t);
+    let mut rewritten = 0;
+    for task in tasks {
+        let output = execute_phase2_task(
+            task,
+            config,
+            Arc::clone(&content_store),
+            tracker.clone(),
+            Arc::clone(&upload_budget),
+            upload_buffer,
+        )
+        .await?;
+        rewritten += output.new_leaf_count;
+        match output.update {
+            Phase2TaskUpdate::Default { leaf_entries } => {
+                root_builder.set_default_graph_order(output.order, leaf_entries);
+            }
+            Phase2TaskUpdate::Named { branch_cid } => {
+                root_builder.set_named_graph_branch(output.g_id, output.order, branch_cid);
+            }
+            Phase2TaskUpdate::Unchanged => {}
+        }
+        root_builder.add_replaced_cids(output.replaced_leaf_cids);
+        root_builder.add_replaced_cids(output.replaced_sidecar_cids);
+    }
+    root_builder.set_prev_index(Some(BinaryPrevIndexRef {
+        t: base_root.index_t,
+        id: base_root_id.clone(),
+    }));
+    let (mut root, mut replaced_cids) = root_builder.build();
+    // Strings erased events used, which nothing left refers to.
+    let strings: std::collections::BTreeSet<u64> = events
+        .iter()
+        .filter(|e| super::erase_dicts::string_typed(e.record.o_type))
+        .map(|e| e.record.o_key)
+        .collect();
+    let unused =
+        super::erase_dicts::unused_strings(content_store.as_ref(), &root, &strings).await?;
+    if !unused.is_empty() {
+        replaced_cids.extend(
+            super::erase_dicts::remove_strings(
+                content_store.as_ref(),
+                &mut root.dict_refs,
+                &unused,
+            )
+            .await?,
+        );
+    }
+    super::root_assembly::attach_garbage_manifest(
+        content_store.as_ref(),
+        &mut root,
+        ledger_id,
+        &replaced_cids,
+    )
+    .await?;
+    let root_bytes = root.encode();
+    let root_id = content_store
+        .put(ContentKind::IndexRoot, &root_bytes)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    cache_artifact_bytes(&*content_store, &root_id, &root_bytes, "index_root");
+    tracing::debug!(%root_id, events = events.len(), rewritten, "erased events from the index");
+    Ok(IndexResult {
+        root_id,
+        index_t: root.index_t,
+        ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
+        stats: IndexStats {
+            flake_count: 0,
+            leaf_count: rewritten,
+            branch_count: by_graph.len(),
+            total_bytes: root_bytes.len(),
+        },
+        fuel: None,
+        fence: None,
+    })
 }
 
 /// Entry point for incremental indexing.
@@ -843,6 +1033,7 @@ pub async fn incremental_index(
                 sorted_ops,
                 sorted_superseded,
                 sorted_superseded_ops,
+                sorted_erase: Vec::new(),
                 kind,
                 history_drop: novelty
                     .shared
@@ -5435,6 +5626,7 @@ mod warm_tests {
                 sorted_ops: vec![0],
                 sorted_superseded: Vec::new(),
                 sorted_superseded_ops: Vec::new(),
+                sorted_erase: Vec::new(),
                 kind,
                 history_drop: None,
             };
@@ -5488,6 +5680,7 @@ mod warm_tests {
                 sorted_ops: vec![1],
                 sorted_superseded: Vec::new(),
                 sorted_superseded_ops: Vec::new(),
+                sorted_erase: Vec::new(),
                 kind,
                 history_drop: None,
             };
@@ -5713,6 +5906,7 @@ mod warm_tests {
             leaf_target_rows: 10_000,
             sidecar_bytes: None,
             history_drop: None,
+            rewrite_history: false,
         })
         .unwrap();
         let blob = output.leaves.into_iter().next().unwrap();
