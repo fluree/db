@@ -7336,7 +7336,7 @@ mod logging_tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_writer(std::io::sink)
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        fluree_test_support::with_scoped_default(subscriber, || {
             assert!(tracing::enabled!(tracing::Level::DEBUG));
             for character in ['±', '界', '🦀'] {
                 let start = "<http://example.org/s> <http://example.org/p> \"";

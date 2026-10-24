@@ -27,12 +27,23 @@
 //! `env!` expands at the call site, so each crate is checked against its own
 //! `Cargo.toml` and `tests/` directory.
 //!
-//! The other rules in `docs/contributing/tests.md` — that env-mutating and
-//! instrumentation-asserting tests keep their own binary — are deliberately not
-//! enforced here. Checking them means scanning Rust source for call shapes,
-//! which costs more in false positives and blind spots than review does.
+//! The rule in `docs/contributing/tests.md` that env-mutating tests keep their
+//! own binary is deliberately not enforced here. Checking it means scanning
+//! Rust source for call shapes, which costs more in false positives and blind
+//! spots than review does.
+//!
+//! The crate also holds [`scoped_default`] and [`with_scoped_default`], the
+//! only way test code should install a thread-local tracing subscriber: they
+//! make a capture see every event it should, next to any number of parallel
+//! sibling tests. [`assert_scoped_subscribers_use_the_floor`] checks that no
+//! test installs one directly; that check is a narrow scan for four exact call
+//! paths.
 
 #![forbid(unsafe_code)]
+
+mod scoped_subscriber;
+
+pub use scoped_subscriber::{scoped_default, with_scoped_default};
 
 use std::collections::HashSet;
 use std::fs;
@@ -239,6 +250,85 @@ pub fn assert_every_test_file_is_reachable(manifest_dir: &str) {
          in some other way is a false orphan; wire it in with `#[path]` \
          instead. Orphaned: {orphans:?}"
     );
+}
+
+/// Every thread-local tracing subscriber in the workspace's test code is
+/// installed through [`scoped_default`] or [`with_scoped_default`], which put
+/// the interest floor in place first (see the `scoped_subscriber` module).
+///
+/// Scans the `.rs` files under `src/` and `tests/` of each member of the
+/// workspace whose root is `workspace_root`, other than this crate and the
+/// `fluree-bench-*` crates, for `tracing::subscriber` or `tracing::dispatcher`
+/// `set_default(` / `with_default(` calls. Lines that start as comments are
+/// ignored. A call made through some other spelling, a `use` of the function
+/// say, is not caught.
+///
+/// # Panics
+///
+/// Panics listing each `file:line` that installs one directly, or if the
+/// workspace `Cargo.toml` cannot be read.
+pub fn assert_scoped_subscribers_use_the_floor(workspace_root: &str) {
+    const DIRECT: [&str; 4] = [
+        "subscriber::set_default(",
+        "subscriber::with_default(",
+        "dispatcher::set_default(",
+        "dispatcher::with_default(",
+    ];
+    let root = Path::new(workspace_root);
+    let manifest: toml::Value = fs::read_to_string(root.join("Cargo.toml"))
+        .expect("read workspace Cargo.toml")
+        .parse()
+        .expect("parse workspace Cargo.toml");
+    let members = manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+        .expect("workspace.members");
+    let mut files = Vec::new();
+    for member in members.iter().filter_map(toml::Value::as_str) {
+        if member == env!("CARGO_PKG_NAME") || member.starts_with("fluree-bench") {
+            continue;
+        }
+        for dir in ["src", "tests"] {
+            collect_rs_files(&root.join(member).join(dir), &mut files);
+        }
+    }
+    let mut direct: Vec<String> = Vec::new();
+    for file in files {
+        let Ok(src) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for (i, line) in src.lines().enumerate() {
+            let code = line.trim_start();
+            if !code.starts_with("//") && DIRECT.iter().any(|call| code.contains(call)) {
+                let rel = file.strip_prefix(root).unwrap_or(&file);
+                direct.push(format!("{}:{}", normalize(rel), i + 1));
+            }
+        }
+    }
+    direct.sort();
+    assert!(
+        direct.is_empty(),
+        "these install a thread-local tracing subscriber directly; use \
+         fluree_test_support::scoped_default or with_scoped_default, or the \
+         capture can intermittently see nothing:\n  {}",
+        direct.join("\n  ")
+    );
+}
+
+/// Every `.rs` file below `dir`, recursively.
+fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 #[cfg(test)]

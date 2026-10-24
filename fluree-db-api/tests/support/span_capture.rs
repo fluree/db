@@ -14,10 +14,13 @@
 //! assert_eq!(span.level, tracing::Level::DEBUG);
 //! ```
 //!
-//! Uses `tracing::subscriber::set_default()` (not `set_global_default`) for test
-//! isolation — each test gets its own subscriber via the returned `DefaultGuard`.
-//! Tests MUST use `#[tokio::test(flavor = "current_thread")]` so all async work
-//! runs on the thread where the subscriber is installed.
+//! Installs the subscriber as this thread's default (not the global default)
+//! for test isolation; each test gets its own via the returned `DefaultGuard`.
+//! It goes through `fluree_test_support::scoped_default`, so the capture sees
+//! every event this thread emits even with sibling tests running in the same
+//! process. Tests MUST use `#[tokio::test(flavor = "current_thread")]` so all
+//! async work runs on the thread where the subscriber is installed; events
+//! emitted on other threads (a rayon pool, say) are not captured.
 
 // Kept for: test utilities — not all methods are used in every test file.
 // Use when: writing new tracing acceptance tests in it_tracing_spans.rs.
@@ -324,7 +327,7 @@ pub fn init_test_tracing() -> (SpanStore, tracing::subscriber::DefaultGuard) {
     let store = SpanStore::new();
     let layer = SpanCaptureLayer::new(store.clone());
     let subscriber = tracing_subscriber::Registry::default().with(layer);
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = fluree_test_support::scoped_default(subscriber);
     (store, guard)
 }
 
@@ -339,6 +342,6 @@ pub fn init_info_only_tracing() -> (SpanStore, tracing::subscriber::DefaultGuard
     let layer = SpanCaptureLayer::new(store.clone());
     let filter = tracing_subscriber::filter::LevelFilter::INFO;
     let subscriber = tracing_subscriber::Registry::default().with(layer.with_filter(filter));
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = fluree_test_support::scoped_default(subscriber);
     (store, guard)
 }
