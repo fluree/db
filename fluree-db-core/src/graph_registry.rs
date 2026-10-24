@@ -597,9 +597,9 @@ mod tests {
         let txn_meta = txn_meta_graph_iri("test:a");
         let config = config_graph_iri("test:a");
         let entries = vec![
-            (1u16, txn_meta.as_str()),
-            (2u16, config.as_str()),
-            (3u16, "http://example.org/g1"),
+            (1u32, txn_meta.as_str()),
+            (2u32, config.as_str()),
+            (3u32, "http://example.org/g1"),
         ];
         let reg = GraphRegistry::seed_from_entries(&entries).unwrap();
 
@@ -620,14 +620,14 @@ mod tests {
     #[test]
     fn test_seed_from_entries_single_gid1() {
         let txn_meta = txn_meta_graph_iri("test:a");
-        let entries = vec![(1u16, txn_meta.as_str())];
+        let entries = vec![(1u32, txn_meta.as_str())];
         let reg = GraphRegistry::seed_from_entries(&entries).unwrap();
         assert_eq!(reg.next_id(), FIRST_USER_GRAPH_ID);
     }
 
     #[test]
     fn test_seed_from_entries_rejects_gid0() {
-        let entries = vec![(0u16, "bad")];
+        let entries = vec![(0u32, "bad")];
         let err = GraphRegistry::seed_from_entries(&entries).unwrap_err();
         assert!(err.to_string().contains("g_id=0"));
     }

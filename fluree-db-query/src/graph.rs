@@ -44,11 +44,12 @@
 //! 4. Executes inner patterns seeded with parent row bindings
 //! 5. Merges results with parent row (like SubqueryOperator)
 
+use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
-use crate::ir::{GraphName, Pattern};
+use crate::ir::{GraphName, Pattern, Ref, Term, TriplePattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::{
     r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml, unsupported_subscope_error,
@@ -58,7 +59,7 @@ use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::FlakeValue;
+use fluree_db_core::{FlakeValue, GraphId};
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 // Note: tracing::debug removed to fix compilation - add tracing dependency if needed
@@ -131,6 +132,16 @@ pub struct GraphOperator {
     /// time instead, preserving `?g`-not-in-scope semantics for FILTER-only /
     /// OPTIONAL / UNION references (W3C graph-variable-scope).
     seed_graph_var: bool,
+    /// Pooled graphs that can produce a solution when `?g` is unbound, from
+    /// one probe of the pooled tree per open (see `probe_pooled_graphs`).
+    /// Outer `None`: not probed yet; inner `None`: no pruning possible.
+    pooled_hits: Option<Option<rustc_hash::FxHashSet<GraphId>>>,
+    /// Graphs an unbound `?g` skips because a quad scan answered them (see
+    /// [`crate::quad_block`]).
+    skip: Option<Arc<crate::binary_scan::QuadGraphs>>,
+    /// A probe taken before `open` (see [`Self::probe_hit_count`]), which
+    /// `open` keeps rather than probing again.
+    primed_hits: Option<Option<rustc_hash::FxHashSet<GraphId>>>,
 }
 
 impl GraphOperator {
@@ -198,7 +209,121 @@ impl GraphOperator {
             row_budget: None,
             topk: None,
             seed_graph_var,
+            pooled_hits: None,
+            skip: None,
+            primed_hits: None,
         }
+    }
+
+    /// The schema of the rows feeding the block.
+    pub(crate) fn parent_schema(&self) -> &[VarId] {
+        self.child.schema()
+    }
+
+    /// Swap the operator feeding the block, returning the previous one.
+    pub(crate) fn replace_child(&mut self, child: BoxedOperator) -> BoxedOperator {
+        std::mem::replace(&mut self.child, child)
+    }
+
+    /// Leave `graphs` out of an unbound `?g`'s enumeration: another path
+    /// answered them.
+    pub(crate) fn skip_graphs(&mut self, graphs: Arc<crate::binary_scan::QuadGraphs>) {
+        self.skip = Some(graphs);
+    }
+
+    /// How many pooled graphs the block's probe leaves for an unbound `?g`,
+    /// or `None` when no probe can prune. Kept for `open`.
+    pub(crate) async fn probe_hit_count(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<usize>> {
+        let hits = self.probe_pooled_graphs(ctx).await?;
+        let count = hits.as_ref().map(rustc_hash::FxHashSet::len);
+        self.primed_hits = Some(hits);
+        Ok(count)
+    }
+
+    fn skipped(&self, ctx: &ExecutionContext<'_>, iri: &str) -> bool {
+        self.skip.as_ref().is_some_and(|skip| {
+            ctx.single_db_user_graph_id(iri)
+                .is_some_and(|g_id| skip.contains(g_id))
+        })
+    }
+
+    /// The pooled graphs worth visiting for an unbound `?g`: those whose
+    /// rows match one required triple pattern of the block. A solution in
+    /// graph `g` must match every required pattern in `g`, so a pooled graph
+    /// without such a row produces nothing and is skipped.
+    ///
+    /// The probe reads the persisted pool at the index's `t`. Unindexed
+    /// changes can add a match only in a graph they touch, so every pooled
+    /// graph the overlay changed is a candidate too.
+    ///
+    /// `None` (visit every graph) when the probe can't answer: reading below
+    /// the index's `t`, a history range, several ledgers, an overlay that
+    /// can't name the graphs it changed, or no required pattern with a bound
+    /// predicate.
+    async fn probe_pooled_graphs(
+        &self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<rustc_hash::FxHashSet<GraphId>>> {
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(None);
+        };
+        if store.pooled_graph_ids().is_empty()
+            || ctx.to_t < store.max_t()
+            || ctx.from_t.is_some()
+            || ctx.is_history_range()
+            || ctx.is_multi_ledger()
+        {
+            return Ok(None);
+        }
+        let changed = match ctx.overlay.filter(|o| !o.is_effectively_empty()) {
+            None => Vec::new(),
+            Some(overlay) => match overlay.overlay_graph_ids() {
+                Some(graphs) => graphs,
+                None => return Ok(None),
+            },
+        };
+        let Some(pattern) = probe_pattern(&self.inner_patterns) else {
+            return Ok(None);
+        };
+        let started = std::time::Instant::now();
+        let mut persisted = ctx.clone();
+        persisted.overlay = None;
+        persisted.to_t = store.max_t();
+        let mut probe =
+            BinaryScanOperator::new(pattern.clone(), None, Vec::new()).into_pool_probe();
+        probe.open(&persisted).await?;
+        let hits = probe.drain_probe_graphs();
+        probe.close();
+        let Some(mut hits) = hits? else {
+            return Ok(None);
+        };
+        let persisted_hits = hits.len();
+        hits.extend(changed.iter().copied().filter(|&g| store.is_pooled(g)));
+        tracing::debug!(
+            persisted_hits,
+            changed = changed.len(),
+            candidates = hits.len(),
+            pooled = store.pooled_graph_ids().len(),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "pool probe"
+        );
+        Ok(Some(hits))
+    }
+
+    /// Whether the probe ruled out the pooled graph named `iri`.
+    fn pooled_graph_ruled_out(&self, ctx: &ExecutionContext<'_>, iri: &str) -> bool {
+        let Some(Some(hits)) = &self.pooled_hits else {
+            return false;
+        };
+        let (Some(store), Some(g_id)) =
+            (ctx.binary_store.as_ref(), ctx.single_db_user_graph_id(iri))
+        else {
+            return false;
+        };
+        store.is_pooled(g_id) && !hits.contains(&g_id)
     }
 
     /// Extract a graph IRI from a bound `?g`. Handles the IRI-typed forms a
@@ -687,6 +812,24 @@ impl GraphOperator {
     }
 }
 
+/// The required triple pattern of a GRAPH block that best narrows a probe:
+/// a top-level triple with a bound predicate, preferring a bound subject, then
+/// a bound object. Triple-term and `rdf:reifies` patterns read their own lanes.
+fn probe_pattern(patterns: &[Pattern]) -> Option<&TriplePattern> {
+    patterns
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Triple(tp) => Some(tp),
+            _ => None,
+        })
+        .filter(|tp| match &tp.p {
+            Ref::Sid(p) => !fluree_db_core::is_rdf_reifies(p),
+            _ => false,
+        })
+        .filter(|tp| !matches!(tp.o, Term::Value(FlakeValue::TripleTerm(_))))
+        .max_by_key(|tp| u8::from(matches!(tp.s, Ref::Sid(_))) * 2 + u8::from(!tp.o.is_var()))
+}
+
 #[async_trait]
 impl Operator for GraphOperator {
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
@@ -716,6 +859,7 @@ impl Operator for GraphOperator {
         self.state = OperatorState::Open;
         self.result_buffer.clear();
         self.buffer_pos = 0;
+        self.pooled_hits = self.primed_hits.take();
         Ok(())
     }
 
@@ -891,7 +1035,15 @@ impl Operator for GraphOperator {
                                 // enumeration). It remains explicitly
                                 // addressable by the ledger's own address in
                                 // the arms above.
+                                if self.pooled_hits.is_none() {
+                                    self.pooled_hits = Some(self.probe_pooled_graphs(ctx).await?);
+                                }
                                 for iri in ctx.single_db_user_graph_iris() {
+                                    if self.pooled_graph_ruled_out(ctx, &iri)
+                                        || self.skipped(ctx, &iri)
+                                    {
+                                        continue;
+                                    }
                                     self.execute_in_graph(
                                         ctx,
                                         &parent_batch,

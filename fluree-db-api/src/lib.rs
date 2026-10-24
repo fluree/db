@@ -80,7 +80,7 @@ pub mod graphql;
 pub mod import;
 pub mod import_source;
 #[cfg(not(target_arch = "wasm32"))]
-mod indexer_fulltext_provider;
+mod indexer_config_provider;
 mod indexer_warm_cache;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
@@ -150,6 +150,8 @@ pub use admin::{
     GraphSourceDropReport,
     // Index maintenance
     IndexStatusResult,
+    MaintainIndexOptions,
+    MaintainIndexResult,
     OrphanInstance,
     OrphanSweepReport,
     ReindexOptions,
@@ -2499,7 +2501,7 @@ impl FlureeBuilder {
     /// config is discarded) and is not honored by [`build_with`],
     /// [`Fluree::from_backend`], or [`Fluree::with_indexing_mode`], which
     /// construct without an in-process worker. Provider hooks set on the
-    /// supplied config (`fulltext_config_provider`, `warm_cache_source`)
+    /// supplied config (`ledger_config_provider`, `warm_cache_source`)
     /// are replaced by
     /// the API layer's own wiring at build time.
     ///
@@ -3322,21 +3324,19 @@ impl FlureeBuilder {
     ) -> tx::IndexingMode {
         let backend = &with_artifact_cache(backend.clone(), self.ledger_cache_config.as_ref());
         if let Some(ref idx_config) = self.indexing_config {
-            // Attach an api-side full-text config provider so each index
-            // build refreshes `fulltext_configured_properties` from the
-            // live ledger. Without this, background / CLI incremental
+            // Attach an api-side ledger config provider so each index build
+            // refreshes its full-text properties and graph placement from
+            // the live ledger. Without this, background / CLI incremental
             // runs would silently drop configured plain-string values
             // committed after the connection started. 64MB cache matches
             // the default `LeafletCache` budget in `load_per_graph_arenas`.
             let ns_for_provider: Arc<dyn fluree_db_nameservice::NameServiceLookup> =
                 Arc::clone(&nameservice) as _;
-            let provider = Arc::new(
-                crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
-                    backend: backend.clone(),
-                    nameservice: ns_for_provider,
-                    leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
-                },
-            ) as Arc<dyn fluree_db_indexer::FulltextConfigProvider>;
+            let provider = Arc::new(crate::indexer_config_provider::ApiLedgerConfigProvider {
+                backend: backend.clone(),
+                nameservice: ns_for_provider,
+                leaflet_cache: Arc::new(fluree_db_binary_index::LeafletCache::with_max_mb(64)),
+            }) as Arc<dyn fluree_db_indexer::LedgerConfigProvider>;
             // Warm-on-write (co-located only): let the background build seed the
             // query server's shared read cache with the leaflets it just wrote.
             // Resolved late from the LedgerManager cell, so the worker warms the
@@ -3348,7 +3348,7 @@ impl FlureeBuilder {
             let indexer_config = idx_config
                 .indexer_config
                 .clone()
-                .with_fulltext_config_provider(provider)
+                .with_ledger_config_provider(provider)
                 .with_warm_cache_source(warm_cache_source);
             // BackgroundIndexerWorker takes an
             // `Arc<dyn IndexingNameService>` — the combined lookup
@@ -4120,7 +4120,7 @@ impl Fluree {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn build_index(&self, ledger_id: &str) -> Result<fluree_db_indexer::IndexResult> {
         let config = fluree_db_indexer::IndexerConfig::default()
-            .with_fulltext_config_provider(self.fulltext_config_provider());
+            .with_ledger_config_provider(self.ledger_config_provider());
         warn_if_staging_plaintext(&self.backend, &config);
         let content_store = self.branched_content_store(ledger_id).await?;
         Ok(fluree_db_indexer::build_index_for_ledger(
@@ -4132,12 +4132,12 @@ impl Fluree {
         .await?)
     }
 
-    /// Build a [`fluree_db_indexer::FulltextConfigProvider`] backed by this
+    /// Build a [`fluree_db_indexer::LedgerConfigProvider`] backed by this
     /// connection's storage + nameservice. Attach it to the indexer's
-    /// `IndexerConfig` (via `with_fulltext_config_provider`) so every index
-    /// build — including CLI-driven incremental runs — refreshes the
-    /// configured full-text property set from the live ledger's
-    /// `f:fullTextDefaults`.
+    /// `IndexerConfig` (via `with_ledger_config_provider`) so every index
+    /// build — including CLI-driven incremental runs — refreshes its
+    /// configured full-text properties and named-graph placement from the
+    /// live ledger's config graph.
     ///
     /// The background indexer constructed at `FlureeBuilder::build()` time
     /// already attaches one of these automatically, as does
@@ -4145,14 +4145,12 @@ impl Fluree {
     /// `fluree_db_indexer::build_index_for_ledger` directly should attach
     /// their own by calling this method.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn fulltext_config_provider(&self) -> Arc<dyn fluree_db_indexer::FulltextConfigProvider> {
-        Arc::new(
-            crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
-                backend: self.backend.clone(),
-                nameservice: self.nameservice_mode.as_arc_reader(),
-                leaflet_cache: Arc::clone(&self.leaflet_cache),
-            },
-        )
+    pub fn ledger_config_provider(&self) -> Arc<dyn fluree_db_indexer::LedgerConfigProvider> {
+        Arc::new(crate::indexer_config_provider::ApiLedgerConfigProvider {
+            backend: self.backend.clone(),
+            nameservice: self.nameservice_mode.as_arc_reader(),
+            leaflet_cache: Arc::clone(&self.leaflet_cache),
+        })
     }
 
     /// Per-instance cache for cross-ledger governance artifacts.

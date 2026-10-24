@@ -15,7 +15,9 @@ use crate::run_index::runs::streaming_reader::StreamingRunReader;
 use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
 use fluree_db_binary_index::format::leaf::{LeafInfo, LeafWriter};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
+use fluree_db_binary_index::format::run_record_v2::{
+    cmp_v2_for_order, identity_v2_for_order, RunRecordV2,
+};
 use fluree_db_core::ContentId;
 use fluree_db_core::GraphId;
 use std::io;
@@ -89,7 +91,7 @@ pub struct IndexBuildConfig {
     /// Graph ID for all records. Required because V2 run files (FRN2) do
     /// not carry g_id on the wire — the pipeline must be graph-scoped by
     /// construction (per-graph run directories + per-graph build calls).
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     /// Shared progress counter.
     pub progress: Option<Arc<AtomicU64>>,
     /// Max run files the k-way merge may hold open simultaneously. Run counts
@@ -133,6 +135,8 @@ pub struct GraphIndexResult {
     /// Per-leaf branch entries for root assembly.
     pub leaf_entries: Vec<LeafEntry>,
     pub graph_dir: PathBuf,
+    /// The pool's GSPO build only: each pooled graph's rows and history.
+    pub pool_members: Vec<fluree_db_binary_index::PoolMember>,
 }
 
 /// Result of the full V2 index build.
@@ -195,7 +199,8 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
         .collect::<io::Result<Vec<_>>>()?;
 
     let cmp = cmp_v2_for_order(config.sort_order);
-    let mut merge = KWayMerge::new(streams, cmp)?;
+    let mut merge =
+        KWayMerge::new(streams, cmp)?.with_identity(identity_v2_for_order(config.sort_order));
 
     let order = config.sort_order;
 
@@ -310,7 +315,11 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
 // Helpers
 // ============================================================================
 
-fn create_graph_dir(index_dir: &Path, g_id: u16, order_name: &str) -> io::Result<PathBuf> {
+fn create_graph_dir(
+    index_dir: &Path,
+    g_id: fluree_db_core::GraphId,
+    order_name: &str,
+) -> io::Result<PathBuf> {
     let graph_dir = index_dir.join(format!("graph_{g_id}/{order_name}"));
     std::fs::create_dir_all(&graph_dir)?;
     Ok(graph_dir)
@@ -370,6 +379,7 @@ fn build_graph_index_result(
     order: RunSortOrder,
     graph_dir: PathBuf,
     persisted_leaf_infos: Vec<PersistedLeafInfo>,
+    pool_members: Vec<fluree_db_binary_index::PoolMember>,
 ) -> io::Result<GraphIndexResult> {
     let total_rows: u64 = persisted_leaf_infos.iter().map(|l| l.total_rows).sum();
 
@@ -404,6 +414,7 @@ fn build_graph_index_result(
         leaf_infos: persisted_leaf_infos,
         leaf_entries,
         graph_dir,
+        pool_members,
     })
 }
 
@@ -481,6 +492,7 @@ impl PersistingLeafWriter {
     pub(crate) fn finish(mut self) -> io::Result<Option<GraphIndexResult>> {
         // `finish()` flushes the trailing leaf into the completed-leaves buffer;
         // persist that final batch (everything prior was drained per-push).
+        let pool_members = self.inner.take_pool_members();
         let final_batch = self.inner.finish()?;
         for info in final_batch {
             self.persisted.push(persist_leaf(&self.graph_dir, info)?);
@@ -488,7 +500,14 @@ impl PersistingLeafWriter {
         if self.persisted.is_empty() {
             return Ok(None);
         }
-        build_graph_index_result(self.g_id, self.order, self.graph_dir, self.persisted).map(Some)
+        build_graph_index_result(
+            self.g_id,
+            self.order,
+            self.graph_dir,
+            self.persisted,
+            pool_members,
+        )
+        .map(Some)
     }
 }
 
@@ -645,7 +664,7 @@ pub struct BuildAllConfig {
     pub import_unique_asserts: bool,
     pub skip_history: bool,
     /// Graph ID — builds are graph-scoped (run files don't carry g_id).
-    pub g_id: u16,
+    pub g_id: fluree_db_core::GraphId,
     pub progress: Option<Arc<AtomicU64>>,
     /// Max number of orders to build concurrently. Each order is an independent
     /// single-threaded k-way merge + leaf-encode pipeline over disjoint input
@@ -676,6 +695,7 @@ pub fn build_all_indexes(
     // Collect the orders that actually have run files to build.
     let buildable: Vec<RunSortOrder> = RunSortOrder::all_build_orders()
         .iter()
+        .chain(RunSortOrder::pool_build_orders())
         .copied()
         .filter(|order| config.base_run_dir.join(order.dir_name()).exists())
         .collect();
@@ -837,7 +857,14 @@ mod tests {
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
 
-    fn make_rec(g_id: u16, s_id: u64, p_id: u32, o_type: u16, o_key: u64, t: u32) -> RunRecordV2 {
+    fn make_rec(
+        g_id: fluree_db_core::GraphId,
+        s_id: u64,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+        t: u32,
+    ) -> RunRecordV2 {
         RunRecordV2 {
             s_id: SubjectId(s_id),
             o_key,

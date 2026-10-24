@@ -3,29 +3,35 @@
 use crate::gc::{DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS};
 use async_trait::async_trait;
 use fluree_db_binary_index::LeafletCache;
+use fluree_db_core::ledger_config::GraphPlacementIntent;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Resolves the ledger's effective configured full-text property list at
-/// index-build time.
+/// What an index build reads from the ledger's config graph.
+#[derive(Debug, Clone, Default)]
+pub struct LedgerIndexingConfig {
+    /// See [`IndexerConfig::fulltext_configured_properties`].
+    pub fulltext_properties: Vec<ConfiguredFulltextProperty>,
+    /// See [`IndexerConfig::graph_placement`].
+    pub graph_placement: GraphPlacementIntent,
+}
+
+/// Resolves the ledger's indexing config at index-build time.
 ///
 /// Background / incremental indexing runs can't see the live `LedgerConfig`
 /// through static `IndexerConfig` alone — a caller (typically the api layer)
 /// plugs in a concrete resolver via
-/// [`IndexerConfig::with_fulltext_config_provider`] so each build refreshes
-/// the set from the current ledger state.
+/// [`IndexerConfig::with_ledger_config_provider`] so each build refreshes it
+/// from the current ledger state.
 ///
 /// Implementations should be cheap on the happy path (one privileged read of
-/// the config graph) and return an empty list when the ledger has no
-/// `f:fullTextDefaults`. Failures should log + return empty rather than
-/// propagate — a bad config read shouldn't block the whole indexing run.
+/// the config graph) and return the default when the ledger has no config.
+/// Failures should log + return the default rather than propagate — a bad
+/// config read shouldn't block the whole indexing run.
 #[async_trait]
-pub trait FulltextConfigProvider: std::fmt::Debug + Send + Sync {
-    async fn fulltext_configured_properties(
-        &self,
-        ledger_id: &str,
-    ) -> Vec<ConfiguredFulltextProperty>;
+pub trait LedgerConfigProvider: std::fmt::Debug + Send + Sync {
+    async fn indexing_config(&self, ledger_id: &str) -> LedgerIndexingConfig;
 }
 
 /// Scope of a configured full-text property entry.
@@ -290,20 +296,26 @@ pub struct IndexerConfig {
     /// entries, preserving the pre-config behavior.
     ///
     /// For steady-state (background / CLI incremental) indexing, prefer
-    /// [`fulltext_config_provider`](Self::fulltext_config_provider) so each
+    /// [`ledger_config_provider`](Self::ledger_config_provider) so each
     /// run refreshes this list from the live ledger config.
     pub fulltext_configured_properties: Vec<ConfiguredFulltextProperty>,
 
-    /// Optional callback that re-resolves full-text configured properties
-    /// at the start of each index build. When present,
+    /// Placement intent for user named graphs (`f:graphPlacement`) for this
+    /// indexing run. Like `fulltext_configured_properties`, refreshed from
+    /// [`ledger_config_provider`](Self::ledger_config_provider) when one is
+    /// attached. The default places every graph automatically.
+    pub graph_placement: GraphPlacementIntent,
+
+    /// Optional callback that re-resolves the ledger's indexing config at
+    /// the start of each index build. When present,
     /// [`build_index_for_record`](crate::build_index_for_record) calls this
-    /// first and overwrites `fulltext_configured_properties` with the
-    /// result, so background/incremental runs pick up config changes that
-    /// happened after the process started.
+    /// first and overwrites `fulltext_configured_properties` and
+    /// `graph_placement` with the result, so background/incremental runs
+    /// pick up config changes that happened after the process started.
     ///
     /// `None` by default. The api layer wires its own resolver via
-    /// [`IndexerConfig::with_fulltext_config_provider`].
-    pub fulltext_config_provider: Option<Arc<dyn FulltextConfigProvider>>,
+    /// [`IndexerConfig::with_ledger_config_provider`].
+    pub ledger_config_provider: Option<Arc<dyn LedgerConfigProvider>>,
 
     /// Pre-discovered commit CIDs (`t`, cid) with `t > index_t`, sorted
     /// ascending by `t`, supplied by the nameservice's commit-CID index.
@@ -390,7 +402,8 @@ impl Default for IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
-            fulltext_config_provider: None,
+            graph_placement: GraphPlacementIntent::default(),
+            ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
@@ -427,7 +440,8 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
-            fulltext_config_provider: None,
+            graph_placement: GraphPlacementIntent::default(),
+            ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
@@ -457,7 +471,8 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
-            fulltext_config_provider: None,
+            graph_placement: GraphPlacementIntent::default(),
+            ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
@@ -487,25 +502,23 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
-            fulltext_config_provider: None,
+            graph_placement: GraphPlacementIntent::default(),
+            ledger_config_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
             warm_cache_source: None,
         }
     }
 
-    /// Attach a full-text config provider so each index build re-resolves
-    /// `fulltext_configured_properties` from the live ledger state.
+    /// Attach a ledger config provider so each index build re-resolves
+    /// `fulltext_configured_properties` and `graph_placement` from the live
+    /// ledger state.
     ///
-    /// Prefer this over [`fulltext_configured_properties`](Self::fulltext_configured_properties)
-    /// for long-lived indexer handles (background worker / CLI), which
-    /// otherwise carry a stale snapshot of the config across the whole
-    /// process lifetime.
-    pub fn with_fulltext_config_provider(
-        mut self,
-        provider: Arc<dyn FulltextConfigProvider>,
-    ) -> Self {
-        self.fulltext_config_provider = Some(provider);
+    /// Prefer this over setting those fields for long-lived indexer handles
+    /// (background worker / CLI), which otherwise carry a stale snapshot of
+    /// the config across the whole process lifetime.
+    pub fn with_ledger_config_provider(mut self, provider: Arc<dyn LedgerConfigProvider>) -> Self {
+        self.ledger_config_provider = Some(provider);
         self
     }
 

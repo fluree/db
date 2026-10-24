@@ -78,9 +78,9 @@ pub fn resolve_policy_source_g_ids(
     }
 
     let g_id = match source.graph_selector.as_deref() {
-        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-        None => Some(0u16),
+        None => Some(0),
     };
 
     match g_id {

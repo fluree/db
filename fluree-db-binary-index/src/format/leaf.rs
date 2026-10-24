@@ -41,7 +41,8 @@ use super::history_sidecar::{HistEntryV2, HistSidecarBuilder, HistorySegmentRef}
 use super::leaflet::{encode_leaflet, EncodedLeaflet};
 use super::run_record::RunSortOrder;
 use super::run_record_v2::{
-    cmp_v2_for_order, read_ordered_key_v2, write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+    cmp_v2_for_order, ordered_key_from_stored, ordered_key_len, read_ordered_key_v2,
+    write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
 };
 use super::transitions::resolve_transitions;
 
@@ -50,11 +51,30 @@ use super::transitions::resolve_transitions;
 pub const LEAF_V3_MAGIC: &[u8; 4] = b"FLI3";
 pub const LEAF_V3_VERSION: u8 = 1;
 
-/// Fixed header size: 4 (magic) + 1 (version) + 1 (order) + 2 (pad)
-///                   + 4 (leaflet_count) + 8 (total_rows)
-///                   + 26 (first_key) + 26 (last_key)
-///                   = 72 bytes.
+/// Header size of a dedicated-order leaf, 72 bytes: magic (4), version (1),
+/// order (1), pad (2), leaflet_count (4), total_rows (8), first_key (26) and
+/// last_key (26). Pooled leaves store 30-byte keys ([`leaf_header_size`]).
 pub const LEAF_V3_HEADER_SIZE: usize = 72;
+
+/// Largest header of any order.
+pub const LEAF_V3_MAX_HEADER_SIZE: usize = 20 + 2 * ORDERED_KEY_V2_SIZE;
+
+/// Header size for a leaf of `order`.
+#[inline]
+pub fn leaf_header_size(order: RunSortOrder) -> usize {
+    20 + 2 * ordered_key_len(order)
+}
+
+/// Bytes of a leaflet directory entry before its column refs: row_count,
+/// lead_group_count, first/last keys, p_const, o_type_const, flags,
+/// payload_offset, payload_len, column_count.
+#[inline]
+pub fn leaflet_dir_fixed_size(order: RunSortOrder) -> usize {
+    28 + 2 * ordered_key_len(order)
+}
+
+/// Bytes of a leaflet directory entry after its column refs (history ref).
+pub const LEAFLET_DIR_HISTORY_SIZE: usize = 20;
 
 // ── Output types ───────────────────────────────────────────────────────
 
@@ -97,16 +117,17 @@ enum SegmentKey {
 
 impl SegmentKey {
     fn of(order: RunSortOrder, p_id: u32, o_type: u16) -> Self {
-        match order {
+        match order.base() {
             RunSortOrder::Post | RunSortOrder::Psot => Self::Predicate(p_id),
             RunSortOrder::Opst => Self::OType(o_type),
-            RunSortOrder::Spot => Self::Unsegmented,
+            _ => Self::Unsegmented,
         }
     }
 }
 
-/// The routing identity of a history entry, as a record. `t` and `g_id` are
-/// carried for completeness; neither appears in an ordered routing key.
+/// The routing identity of a history entry, as a record. `t` is carried for
+/// completeness; it never appears in an ordered routing key, while `g_id` does
+/// in a pooled order's.
 fn record_from_history(entry: &HistEntryV2) -> RunRecordV2 {
     RunRecordV2 {
         s_id: entry.s_id,
@@ -115,7 +136,7 @@ fn record_from_history(entry: &HistEntryV2) -> RunRecordV2 {
         t: entry.t,
         o_i: entry.o_i,
         o_type: entry.o_type,
-        g_id: 0,
+        g_id: entry.g_id,
     }
 }
 
@@ -175,6 +196,10 @@ pub struct LeafWriter {
 
     // Completed leaves.
     completed_leaves: Vec<LeafInfo>,
+
+    /// Rows and history entries per graph, tallied for the pool's GSPO order
+    /// only (see [`Self::take_pool_members`]).
+    pool_members: Vec<crate::format::index_root::PoolMember>,
 }
 
 impl LeafWriter {
@@ -192,7 +217,7 @@ impl LeafWriter {
             zstd_level,
             skip_history: false,
             record_buf: Vec::with_capacity(leaflet_target_rows),
-            sidecar_builder: HistSidecarBuilder::new(),
+            sidecar_builder: HistSidecarBuilder::for_order(order),
             current_segment_started: false,
             pending_history: Vec::new(),
             leaflet_hist_min: None,
@@ -205,7 +230,42 @@ impl LeafWriter {
             leaf_first_record: None,
             last_record: None,
             completed_leaves: Vec::new(),
+            pool_members: Vec::new(),
         }
+    }
+
+    /// The pooled graphs this GSPO writer has written, with the rows and
+    /// history entries each holds. Empty for every other order.
+    pub fn take_pool_members(&mut self) -> Vec<crate::format::index_root::PoolMember> {
+        std::mem::take(&mut self.pool_members)
+    }
+
+    fn tally(&mut self, g_id: fluree_db_core::GraphId, rows: u32, history: u32) {
+        use crate::format::index_root::PoolMember;
+        if self.order != RunSortOrder::Gspo {
+            return;
+        }
+        // GSPO pushes arrive graph-ascending, so this is almost always the
+        // last member or a new one after it.
+        let at = match self.pool_members.last() {
+            Some(m) if m.g_id == g_id => self.pool_members.len() - 1,
+            Some(m) if m.g_id > g_id => {
+                match self.pool_members.binary_search_by_key(&g_id, |m| m.g_id) {
+                    Ok(i) => i,
+                    Err(i) => {
+                        self.pool_members.insert(i, PoolMember::new(g_id));
+                        i
+                    }
+                }
+            }
+            _ => {
+                self.pool_members.push(PoolMember::new(g_id));
+                self.pool_members.len() - 1
+            }
+        };
+        let m = &mut self.pool_members[at];
+        m.rows = m.rows.saturating_add(rows);
+        m.history = m.history.saturating_add(history);
     }
 
     /// Skip history sidecar production (import fast path).
@@ -244,14 +304,14 @@ impl LeafWriter {
         }
 
         // Update segmentation key tracking.
-        match self.order {
+        match self.order.base() {
             RunSortOrder::Post | RunSortOrder::Psot => {
                 self.current_seg_p_id = Some(record.p_id);
             }
             RunSortOrder::Opst => {
                 self.current_seg_o_type = Some(record.o_type);
             }
-            RunSortOrder::Spot => {}
+            _ => {}
         }
 
         // This record's transition entries (and those of any preceding
@@ -261,6 +321,7 @@ impl LeafWriter {
 
         self.record_buf.push(record);
         self.last_record = Some(record);
+        self.tally(record.g_id, 1, 0);
 
         // Row-count threshold.
         if self.record_buf.len() >= self.leaflet_target_rows {
@@ -292,6 +353,7 @@ impl LeafWriter {
                 o_i: rec.o_i,
                 t: rec.t,
                 op,
+                g_id: rec.g_id,
             });
         }
         match row {
@@ -313,6 +375,7 @@ impl LeafWriter {
         if self.skip_history {
             return;
         }
+        self.tally(entry.g_id, 0, 1);
         self.pending_history.push(entry);
     }
 
@@ -386,12 +449,12 @@ impl LeafWriter {
         let pending = std::mem::take(&mut self.pending_history);
         let mut retained = Vec::new();
         for entry in pending {
-            let belongs = match self.order {
+            let belongs = match self.order.base() {
                 RunSortOrder::Post | RunSortOrder::Psot => {
                     self.current_seg_p_id == Some(entry.p_id)
                 }
                 RunSortOrder::Opst => self.current_seg_o_type == Some(entry.o_type),
-                RunSortOrder::Spot => true,
+                _ => true,
             };
             if belongs {
                 self.commit_history_entry(entry);
@@ -534,12 +597,12 @@ impl LeafWriter {
             lead_group_count: 0,
             first_key,
             last_key,
-            p_const: match self.order {
+            p_const: match self.order.base() {
                 RunSortOrder::Post | RunSortOrder::Psot => Some(first.p_id),
-                RunSortOrder::Opst | RunSortOrder::Spot => None,
+                _ => None,
             },
             // OPST segments by type, so the constant is known without a scan.
-            o_type_const: match self.order {
+            o_type_const: match self.order.base() {
                 RunSortOrder::Opst => Some(first.o_type),
                 _ => entries
                     .iter()
@@ -561,12 +624,12 @@ impl LeafWriter {
     // ── Segmentation ───────────────────────────────────────────────────
 
     fn should_flush_for_segmentation(&self, next: &RunRecordV2) -> bool {
-        match self.order {
+        match self.order.base() {
             RunSortOrder::Post | RunSortOrder::Psot => {
                 self.current_seg_p_id.is_some_and(|p| p != next.p_id)
             }
             RunSortOrder::Opst => self.current_seg_o_type.is_some_and(|ot| ot != next.o_type),
-            RunSortOrder::Spot => false,
+            _ => false,
         }
     }
 
@@ -641,7 +704,10 @@ impl LeafWriter {
         let last_record = self.last_record.unwrap();
 
         // 1. Build history sidecar (must come first — CAS ordering).
-        let sidecar_builder = std::mem::take(&mut self.sidecar_builder);
+        let sidecar_builder = std::mem::replace(
+            &mut self.sidecar_builder,
+            HistSidecarBuilder::for_order(self.order),
+        );
         // The replacement builder has no current segment. This is normally
         // already false after flush_leaflet(), but keep the state coupled to
         // the builder so future flush paths cannot drop history.
@@ -747,25 +813,25 @@ pub fn build_leaf_blob_raw_keys(
 ) -> Vec<u8> {
     let leaflet_count = leaflets.len() as u32;
     let total_rows: u64 = leaflets.iter().map(|l| l.row_count as u64).sum();
-    let first_key = *first_key;
-    let last_key = *last_key;
+    let key_len = ordered_key_len(order);
 
     // Pre-compute directory size.
-    let dir_size = compute_directory_size(leaflets);
-    let payload_offset = LEAF_V3_HEADER_SIZE + dir_size;
+    let dir_size = compute_directory_size(order, leaflets);
+    let header_size = leaf_header_size(order);
+    let payload_offset = header_size + dir_size;
 
     let mut buf = Vec::new();
 
-    // ── Header (72 bytes) ──────────────────────────────────────────
+    // ── Header ─────────────────────────────────────────────────────
     buf.extend_from_slice(LEAF_V3_MAGIC);
     buf.push(LEAF_V3_VERSION);
     buf.push(order.to_wire_id());
     buf.extend_from_slice(&[0u8; 2]); // padding
     buf.extend_from_slice(&leaflet_count.to_le_bytes());
     buf.extend_from_slice(&total_rows.to_le_bytes());
-    buf.extend_from_slice(&first_key);
-    buf.extend_from_slice(&last_key);
-    debug_assert_eq!(buf.len(), LEAF_V3_HEADER_SIZE);
+    buf.extend_from_slice(&first_key[..key_len]);
+    buf.extend_from_slice(&last_key[..key_len]);
+    debug_assert_eq!(buf.len(), header_size);
 
     // ── Directory ──────────────────────────────────────────────────
     // We need to know each leaflet's payload offset relative to the
@@ -775,8 +841,8 @@ pub fn build_leaf_blob_raw_keys(
         // Leaflet dir entry format:
         // row_count: u32 (4)
         // lead_group_count: u32 (4)
-        // first_key: [u8; 26] (26)
-        // last_key: [u8; 26] (26)
+        // first_key: [u8; ordered_key_len(order)] (26 or 30)
+        // last_key: [u8; ordered_key_len(order)] (26 or 30)
         // p_const: u32 (4), uses u32::MAX for "not present"
         // o_type_const: u16 (2), uses u16::MAX for "not present"
         // flags: u32 (4)
@@ -791,8 +857,8 @@ pub fn build_leaf_blob_raw_keys(
 
         buf.extend_from_slice(&leaflet.row_count.to_le_bytes());
         buf.extend_from_slice(&leaflet.lead_group_count.to_le_bytes());
-        buf.extend_from_slice(&leaflet.first_key);
-        buf.extend_from_slice(&leaflet.last_key);
+        buf.extend_from_slice(&leaflet.first_key[..key_len]);
+        buf.extend_from_slice(&leaflet.last_key[..key_len]);
         buf.extend_from_slice(&leaflet.p_const.unwrap_or(u32::MAX).to_le_bytes());
         buf.extend_from_slice(&leaflet.o_type_const.unwrap_or(u16::MAX).to_le_bytes());
         buf.extend_from_slice(&leaflet.flags.to_le_bytes());
@@ -834,15 +900,11 @@ pub fn build_leaf_blob_raw_keys(
     buf
 }
 
-pub fn compute_directory_size(leaflets: &[EncodedLeaflet]) -> usize {
+pub fn compute_directory_size(order: RunSortOrder, leaflets: &[EncodedLeaflet]) -> usize {
+    let fixed = leaflet_dir_fixed_size(order);
     leaflets
         .iter()
-        .map(|l| {
-            // Fixed fields: 4+4+26+26+4+2+4+4+4+2 = 80 bytes
-            // Column refs: column_count * 16
-            // History: 8+4+4+4 = 20 bytes
-            80 + l.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20
-        })
+        .map(|l| fixed + l.column_refs.len() * COLUMN_BLOCK_REF_SIZE + LEAFLET_DIR_HISTORY_SIZE)
         .sum()
 }
 
@@ -887,7 +949,13 @@ impl LeafletDirEntryV3 {
     pub fn may_hold_keys(&self, order: RunSortOrder, p_id: Option<u32>, keys: &[u64]) -> bool {
         let first = read_ordered_key_v2(order, &self.first_key);
         let last = read_ordered_key_v2(order, &self.last_key);
-        let (lo, hi) = match (order, p_id) {
+        // Within one graph a GSPO leaflet orders by subject, as SPOT does.
+        let base = match order {
+            RunSortOrder::Gspo if first.g_id == last.g_id => RunSortOrder::Spot,
+            RunSortOrder::Gspo => return true,
+            o => o.base(),
+        };
+        let (lo, hi) = match (base, p_id) {
             (RunSortOrder::Spot, _) => (first.s_id.as_u64(), last.s_id.as_u64()),
             // Keys order by `(p_id, s_id)`: an end key bounds `p`'s subjects
             // only where it carries `p`.
@@ -920,7 +988,7 @@ impl LeafletDirEntryV3 {
 
 /// Decode a V3 leaf header. Validates magic bytes.
 pub fn decode_leaf_header_v3(data: &[u8]) -> io::Result<LeafHeaderV3> {
-    if data.len() < LEAF_V3_HEADER_SIZE {
+    if data.len() < 6 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "leaf too short",
@@ -935,12 +1003,17 @@ pub fn decode_leaf_header_v3(data: &[u8]) -> io::Result<LeafHeaderV3> {
     let version = data[4];
     let order = RunSortOrder::from_u8(data[5])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad order byte"))?;
+    if data.len() < leaf_header_size(order) {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "leaf too short",
+        ));
+    }
+    let k = ordered_key_len(order);
     let leaflet_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let total_rows = u64::from_le_bytes(data[12..20].try_into().unwrap());
-    let mut first_key = [0u8; ORDERED_KEY_V2_SIZE];
-    first_key.copy_from_slice(&data[20..46]);
-    let mut last_key = [0u8; ORDERED_KEY_V2_SIZE];
-    last_key.copy_from_slice(&data[46..72]);
+    let first_key = ordered_key_from_stored(order, &data[20..20 + k]);
+    let last_key = ordered_key_from_stored(order, &data[20 + k..20 + 2 * k]);
 
     Ok(LeafHeaderV3 {
         version,
@@ -996,11 +1069,14 @@ pub fn decode_leaf_dir_v3_with_base(
     data: &[u8],
     header: &LeafHeaderV3,
 ) -> io::Result<DecodedLeafDirV3> {
-    let mut pos = LEAF_V3_HEADER_SIZE;
+    let order = header.order;
+    let k = ordered_key_len(order);
+    let fixed = leaflet_dir_fixed_size(order);
+    let mut pos = leaf_header_size(order);
     let mut entries = Vec::with_capacity(header.leaflet_count as usize);
 
     for _ in 0..header.leaflet_count {
-        if pos + 80 > data.len() {
+        if pos + fixed > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "directory truncated",
@@ -1009,28 +1085,27 @@ pub fn decode_leaf_dir_v3_with_base(
 
         let row_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         let lead_group_count = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-        let mut first_key = [0u8; ORDERED_KEY_V2_SIZE];
-        first_key.copy_from_slice(&data[pos + 8..pos + 34]);
-        let mut last_key = [0u8; ORDERED_KEY_V2_SIZE];
-        last_key.copy_from_slice(&data[pos + 34..pos + 60]);
-        let p_const_raw = u32::from_le_bytes(data[pos + 60..pos + 64].try_into().unwrap());
+        let first_key = ordered_key_from_stored(order, &data[pos + 8..pos + 8 + k]);
+        let last_key = ordered_key_from_stored(order, &data[pos + 8 + k..pos + 8 + 2 * k]);
+        // Fields after the keys: `o + 60` is where they start for 26-byte keys.
+        let o = pos + 2 * k - 52;
+        let p_const_raw = u32::from_le_bytes(data[o + 60..o + 64].try_into().unwrap());
         let p_const = if p_const_raw == u32::MAX {
             None
         } else {
             Some(p_const_raw)
         };
-        let o_type_const_raw = u16::from_le_bytes(data[pos + 64..pos + 66].try_into().unwrap());
+        let o_type_const_raw = u16::from_le_bytes(data[o + 64..o + 66].try_into().unwrap());
         let o_type_const = if o_type_const_raw == u16::MAX {
             None
         } else {
             Some(o_type_const_raw)
         };
-        let flags = u32::from_le_bytes(data[pos + 66..pos + 70].try_into().unwrap());
-        let payload_offset = u32::from_le_bytes(data[pos + 70..pos + 74].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(data[pos + 74..pos + 78].try_into().unwrap());
-        let column_count =
-            u16::from_le_bytes(data[pos + 78..pos + 80].try_into().unwrap()) as usize;
-        pos += 80;
+        let flags = u32::from_le_bytes(data[o + 66..o + 70].try_into().unwrap());
+        let payload_offset = u32::from_le_bytes(data[o + 70..o + 74].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(data[o + 74..o + 78].try_into().unwrap());
+        let column_count = u16::from_le_bytes(data[o + 78..o + 80].try_into().unwrap()) as usize;
+        pos += fixed;
 
         let mut column_refs = Vec::with_capacity(column_count);
         for _ in 0..column_count {
@@ -1125,6 +1200,151 @@ mod tests {
             history_min_t: 0,
             history_max_t: 0,
         }
+    }
+
+    fn in_graph(mut rec: RunRecordV2, g_id: fluree_db_core::GraphId) -> RunRecordV2 {
+        rec.g_id = g_id;
+        rec
+    }
+
+    /// A pooled leaf stores 30-byte keys carrying the graph, a graph column per
+    /// leaflet, and decodes back to the rows it was given.
+    #[test]
+    fn pooled_leaf_round_trips_graph_keys_and_column() {
+        use crate::read::column_loader::load_leaflet_columns;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        let int = OType::XSD_INTEGER.as_u16();
+        // Graph ids that fit 16 bits get a 2-byte column; past them, 4 bytes.
+        for (order, base, width) in [
+            (RunSortOrder::PostG, 3, 2),
+            (RunSortOrder::Gspo, 3, 2),
+            (RunSortOrder::PostG, 70_000, 4),
+            (RunSortOrder::Gspo, 70_000, 4),
+        ] {
+            let mut recs: Vec<RunRecordV2> = (0..300u64)
+                .map(|i| in_graph(make_rec(i % 7, 1, int, i % 11, 1), base + (i % 5) as u32))
+                .collect();
+            recs.sort_by(cmp_v2_for_order(order));
+            recs.dedup_by(|a, b| cmp_v2_for_order(order)(a, b).is_eq());
+
+            let mut writer = LeafWriter::new(order, 64, 10_000, 1);
+            writer.set_skip_history(true);
+            for rec in &recs {
+                writer.push_record(*rec).unwrap();
+            }
+            let infos = writer.finish().unwrap();
+            assert_eq!(infos.len(), 1);
+            let bytes = &infos[0].leaf_bytes;
+
+            let header = decode_leaf_header_v3(bytes).unwrap();
+            assert_eq!(header.order, order);
+            let first = read_ordered_key_v2(order, &header.first_key);
+            assert_eq!(
+                cmp_v2_for_order(order)(&first, &recs[0]),
+                std::cmp::Ordering::Equal
+            );
+            assert_eq!(first.g_id, recs[0].g_id);
+
+            let dir = decode_leaf_dir_v3_with_base(bytes, &header).unwrap();
+            let dir_size: usize = dir
+                .entries
+                .iter()
+                .map(|e| {
+                    leaflet_dir_fixed_size(order)
+                        + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE
+                        + LEAFLET_DIR_HISTORY_SIZE
+                })
+                .sum();
+            assert_eq!(dir.payload_base, leaf_header_size(order) + dir_size);
+            assert_eq!(leaf_header_size(order), 80);
+            for entry in &dir.entries {
+                let g_ref = entry
+                    .column_refs
+                    .iter()
+                    .find(|r| r.col_id == ColumnId::GId.to_u16())
+                    .expect("pooled leaflet has a graph column");
+                assert_eq!(g_ref.elem_width, width);
+            }
+
+            let projection = ColumnProjection {
+                output: ColumnSet::ALL,
+                internal: ColumnSet::EMPTY,
+            };
+            let mut decoded = Vec::new();
+            for entry in &dir.entries {
+                let last = read_ordered_key_v2(order, &entry.last_key);
+                let batch =
+                    load_leaflet_columns(bytes, entry, dir.payload_base, &projection, order)
+                        .unwrap();
+                for i in 0..batch.row_count {
+                    decoded.push(RunRecordV2 {
+                        s_id: SubjectId(batch.s_id.get(i)),
+                        o_key: batch.o_key.get(i),
+                        p_id: batch.p_id.get(i),
+                        t: batch.t.get(i),
+                        o_i: batch.o_i.get_or(i, LIST_INDEX_NONE),
+                        o_type: batch.o_type.get(i),
+                        g_id: batch.g_id.get(i),
+                    });
+                }
+                let tail = decoded.last().unwrap();
+                assert_eq!(
+                    cmp_v2_for_order(order)(tail, &last),
+                    std::cmp::Ordering::Equal
+                );
+                assert_eq!(tail.g_id, last.g_id);
+            }
+            assert_eq!(decoded.len(), recs.len());
+            for (a, b) in decoded.iter().zip(&recs) {
+                assert_eq!(cmp_v2_for_order(order)(a, b), std::cmp::Ordering::Equal);
+                assert_eq!(a.g_id, b.g_id, "{order:?}");
+            }
+        }
+    }
+
+    /// A dedicated leaf's bytes do not change: 72-byte header, 26-byte keys.
+    #[test]
+    fn dedicated_leaf_keeps_26_byte_keys() {
+        let int = OType::XSD_INTEGER.as_u16();
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 64, 10_000, 1);
+        writer.set_skip_history(true);
+        for i in 0..10u64 {
+            writer.push_record(make_rec(i, 1, int, i, 1)).unwrap();
+        }
+        let infos = writer.finish().unwrap();
+        let bytes = &infos[0].leaf_bytes;
+        let header = decode_leaf_header_v3(bytes).unwrap();
+        assert_eq!(leaf_header_size(header.order), LEAF_V3_HEADER_SIZE);
+        let dir = decode_leaf_dir_v3_with_base(bytes, &header).unwrap();
+        let entry = &dir.entries[0];
+        assert_eq!(
+            dir.payload_base,
+            LEAF_V3_HEADER_SIZE + 80 + entry.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20
+        );
+        assert!(entry
+            .column_refs
+            .iter()
+            .all(|r| r.col_id != ColumnId::GId.to_u16()));
+    }
+
+    /// Within one graph a GSPO leaflet bounds its subjects; across graphs it
+    /// cannot.
+    #[test]
+    fn gspo_may_hold_keys_bounds_subjects_only_within_one_graph() {
+        let one = dir_entry(
+            RunSortOrder::Gspo,
+            in_graph(make_rec(100, 0, 0, 0, 0), 5),
+            in_graph(make_rec(200, 0, 0, 0, 0), 5),
+        );
+        assert!(one.may_hold_keys(RunSortOrder::Gspo, None, &[150]));
+        assert!(!one.may_hold_keys(RunSortOrder::Gspo, None, &[50, 250]));
+        let two = dir_entry(
+            RunSortOrder::Gspo,
+            in_graph(make_rec(100, 0, 0, 0, 0), 5),
+            in_graph(make_rec(20, 0, 0, 0, 0), 6),
+        );
+        assert!(two.may_hold_keys(RunSortOrder::Gspo, None, &[50]));
     }
 
     /// A PSOT leaflet is ruled out only when no probed subject of the
@@ -1380,6 +1600,7 @@ mod tests {
             o_i: LIST_INDEX_NONE,
             t,
             op,
+            g_id: 0,
         }
     }
 

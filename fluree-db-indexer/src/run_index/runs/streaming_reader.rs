@@ -4,9 +4,7 @@
 //! for use with the generic merge engine.
 
 use super::run_file::{RunFileHeader, RUN_V2_HEADER_LEN, RUN_V2_VERSION_WITH_OP};
-use fluree_db_binary_index::format::run_record_v2::{
-    RunRecordV2, RECORD_V2_WIRE_SIZE, RECORD_V2_WITH_OP_WIRE_SIZE,
-};
+use fluree_db_binary_index::format::run_record_v2::{RunRecordLayout, RunRecordV2};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
@@ -64,6 +62,7 @@ pub struct StreamingRunReader {
     is_compressed: bool,
     /// True when the run file is version 2 (31-byte records with op sideband).
     has_op: bool,
+    layout: RunRecordLayout,
 }
 
 impl StreamingRunReader {
@@ -79,6 +78,7 @@ impl StreamingRunReader {
 
         let is_compressed = (header.flags & RUN_FLAG_ZSTD_BLOCKS) != 0;
         let has_op = header.version == RUN_V2_VERSION_WITH_OP;
+        let layout = RunRecordLayout::new(header.sort_order, has_op);
         let record_count = header.record_count;
 
         let mut reader = Self {
@@ -95,6 +95,7 @@ impl StreamingRunReader {
             block_raw: Vec::new(),
             is_compressed,
             has_op,
+            layout,
         };
 
         if reader.remaining > 0 {
@@ -113,11 +114,8 @@ impl StreamingRunReader {
             return Ok(());
         }
 
-        let record_size = if self.has_op {
-            RECORD_V2_WITH_OP_WIRE_SIZE
-        } else {
-            RECORD_V2_WIRE_SIZE
-        };
+        let layout = self.layout;
+        let record_size = layout.size();
 
         if !self.is_compressed {
             let to_read = (self.remaining as usize).min(BUFFER_SIZE);
@@ -130,19 +128,10 @@ impl StreamingRunReader {
                 self.op_buffer.reserve(to_read);
             }
             for i in 0..to_read {
-                let off = i * record_size;
+                let (rec, op) = layout.read(&raw[i * record_size..(i + 1) * record_size]);
+                self.buffer.push(rec);
                 if self.has_op {
-                    let buf: &[u8; RECORD_V2_WITH_OP_WIRE_SIZE] = raw
-                        [off..off + RECORD_V2_WITH_OP_WIRE_SIZE]
-                        .try_into()
-                        .unwrap();
-                    let (rec, op) = RunRecordV2::read_run_le_with_op(buf);
-                    self.buffer.push(rec);
                     self.op_buffer.push(op);
-                } else {
-                    let buf: &[u8; RECORD_V2_WIRE_SIZE] =
-                        raw[off..off + RECORD_V2_WIRE_SIZE].try_into().unwrap();
-                    self.buffer.push(RunRecordV2::read_run_le(buf));
                 }
             }
             self.remaining -= to_read as u64;
@@ -165,21 +154,11 @@ impl StreamingRunReader {
                 self.op_buffer.reserve(n_records);
             }
             for i in 0..n_records {
-                let off = i * record_size;
+                let (rec, op) =
+                    layout.read(&self.block_raw[i * record_size..(i + 1) * record_size]);
+                self.buffer.push(rec);
                 if self.has_op {
-                    let buf: &[u8; RECORD_V2_WITH_OP_WIRE_SIZE] = self.block_raw
-                        [off..off + RECORD_V2_WITH_OP_WIRE_SIZE]
-                        .try_into()
-                        .unwrap();
-                    let (rec, op) = RunRecordV2::read_run_le_with_op(buf);
-                    self.buffer.push(rec);
                     self.op_buffer.push(op);
-                } else {
-                    let buf: &[u8; RECORD_V2_WIRE_SIZE] = self.block_raw
-                        [off..off + RECORD_V2_WIRE_SIZE]
-                        .try_into()
-                        .unwrap();
-                    self.buffer.push(RunRecordV2::read_run_le(buf));
                 }
             }
             self.remaining -= n_records as u64;
@@ -240,6 +219,7 @@ pub(crate) struct StreamingRunReaderWithOp {
     remaining: u64,
     block_raw: Vec<u8>,
     is_compressed: bool,
+    layout: RunRecordLayout,
 }
 
 impl StreamingRunReaderWithOp {
@@ -267,6 +247,7 @@ impl StreamingRunReaderWithOp {
         }
 
         let is_compressed = (header.flags & RUN_FLAG_ZSTD_BLOCKS) != 0;
+        let layout = RunRecordLayout::new(header.sort_order, true);
         let record_count = header.record_count;
 
         let mut reader = Self {
@@ -278,6 +259,7 @@ impl StreamingRunReaderWithOp {
             buf_pos: 0,
             block_raw: Vec::new(),
             is_compressed,
+            layout,
         };
 
         if reader.remaining > 0 {
@@ -297,20 +279,15 @@ impl StreamingRunReaderWithOp {
         }
 
         if !self.is_compressed {
+            let size = self.layout.size();
             let to_read = (self.remaining as usize).min(BUFFER_SIZE);
-            let byte_count = to_read * RECORD_V2_WITH_OP_WIRE_SIZE;
-            let mut raw = vec![0u8; byte_count];
+            let mut raw = vec![0u8; to_read * size];
             self.file.read_exact(&mut raw)?;
 
             self.buffer.reserve(to_read);
             self.op_buffer.reserve(to_read);
             for i in 0..to_read {
-                let off = i * RECORD_V2_WITH_OP_WIRE_SIZE;
-                let buf: &[u8; RECORD_V2_WITH_OP_WIRE_SIZE] = raw
-                    [off..off + RECORD_V2_WITH_OP_WIRE_SIZE]
-                    .try_into()
-                    .unwrap();
-                let (rec, op) = RunRecordV2::read_run_le_with_op(buf);
+                let (rec, op) = self.layout.read(&raw[i * size..(i + 1) * size]);
                 self.buffer.push(rec);
                 self.op_buffer.push(op);
             }
@@ -329,15 +306,11 @@ impl StreamingRunReaderWithOp {
             self.block_raw = zstd::bulk::decompress(&compressed, raw_len)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+            let size = self.layout.size();
             self.buffer.reserve(n_records);
             self.op_buffer.reserve(n_records);
             for i in 0..n_records {
-                let off = i * RECORD_V2_WITH_OP_WIRE_SIZE;
-                let buf: &[u8; RECORD_V2_WITH_OP_WIRE_SIZE] = self.block_raw
-                    [off..off + RECORD_V2_WITH_OP_WIRE_SIZE]
-                    .try_into()
-                    .unwrap();
-                let (rec, op) = RunRecordV2::read_run_le_with_op(buf);
+                let (rec, op) = self.layout.read(&self.block_raw[i * size..(i + 1) * size]);
                 self.buffer.push(rec);
                 self.op_buffer.push(op);
             }

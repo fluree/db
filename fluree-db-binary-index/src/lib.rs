@@ -22,7 +22,7 @@ pub use read::batched_lookup::{
 };
 pub use read::binary_cursor::BinaryCursor;
 pub use read::binary_index_store::{
-    BinaryGraphView, BinaryIndexStore, ListCensus, RemoteLeafFetch,
+    BinaryGraphView, BinaryIndexStore, GraphTree, ListCensus, RemoteLeafFetch,
 };
 pub use read::cached_units::{unit_memo_hits, UnitMemoScope};
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
@@ -41,7 +41,9 @@ pub use format::expanded_cas::{
     collect_root_cas_ids_expanded, collect_root_cas_ids_expanded_tolerant,
     legacy_annotation_arena_cids, ChainCasIds,
 };
-pub use format::index_root::{IndexRoot, LegacyAnnotationArena};
+pub use format::index_root::{
+    BranchTree, IndexRoot, LegacyAnnotationArena, PoolDeltaRun, PoolMember, PoolRouting,
+};
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};
 pub use format::wire_helpers::{
     BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, FulltextArenaRef,

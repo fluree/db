@@ -16,6 +16,7 @@ When no config graph is present (or a setting group is absent), the system defau
 | Datalog | Disabled — no rule evaluation |
 | Transact constraints | Disabled — no uniqueness enforcement |
 | Query defaults | The default graph holds only its own triples (no union default graph) |
+| Indexing defaults | Named graphs placed automatically |
 | Override control | `f:OverrideAll` — any request can override any setting |
 
 An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the ledger's configuration *or* by the request:
@@ -381,6 +382,64 @@ See [Inline fulltext search](../indexing-and-search/fulltext.md) for the
 end-user guide — when to pick this path over the `@fulltext` datatype,
 supported languages, per-graph multilingual setups, the reindex workflow,
 and how configured properties interact with `@fulltext`-datatype values.
+
+---
+
+## Indexing defaults
+
+**Group predicate**: `f:indexingDefaults`
+
+Controls how the indexer lays out named graphs. It changes storage layout and
+performance, never query results.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:graphPlacement` | IRI | `f:PlacementAuto` | `f:PlacementAuto` lets the indexer decide. `f:PlacementDedicated` gives a graph its own index trees whatever its size |
+
+Under `f:PlacementAuto`, small named graphs share one set of index trees,
+which keeps the index compact and makes queries across many graphs fast. A
+graph that grows past 4,096 live rows, or past 16,384 history entries, moves
+to trees of its own at the next index build. The `FLUREE_POOL_MAX_GRAPH_ROWS`
+and `FLUREE_POOL_MAX_GRAPH_HISTORY` environment variables change those
+bounds (see [Configuration](../operations/configuration.md)).
+
+Writes to shared graphs keep one of those trees current at every build; the
+others take the build's changes as a small delta and fold it in periodically,
+which keeps a build's writes small. A server folds an idle ledger's delta on
+its periodic indexer tick, and `POST /index` or `fluree index` does it on
+demand (see [Background Indexing](../indexing-and-search/background-indexing.md#index-maintenance-without-a-long-running-indexer)).
+
+On `f:LedgerConfig`, `f:graphPlacement` is the default for every user named
+graph; an `f:GraphConfig` override sets it for one graph. The default graph
+and the system graphs always have trees of their own, and overrides naming
+them are ignored. Override control does not apply: requests never choose the
+index layout.
+
+### When a change takes effect
+
+The next index build applies a placement change. A graph newly set to
+`f:PlacementDedicated` moves to trees of its own then, with its full history.
+A graph set back to `f:PlacementAuto` can share trees again, but moves only
+at the next full reindex. Until a build applies a change, queries read each
+graph wherever the current index holds it.
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:graphOverrides [
+      a f:GraphConfig ;
+      f:targetGraph <urn:example:catalog> ;
+      f:indexingDefaults [ f:graphPlacement f:PlacementDedicated ]
+    ] .
+}
+```
+
+Every other named graph is placed automatically; `urn:example:catalog`, a
+graph mostly queried on its own, keeps its own trees.
 
 ---
 

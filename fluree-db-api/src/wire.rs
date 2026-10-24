@@ -9,14 +9,57 @@
 //! their respective modules. Conversions from internal → wire types live
 //! here via `From` impls.
 //!
-//! Currently covers: `/reindex` and `/sweep`. Other admin endpoints
+//! Currently covers: `/index`, `/reindex` and `/sweep`. Other admin endpoints
 //! (`/create`, `/drop`, `/branch`, etc.) can be moved into this module
 //! incrementally.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::ReindexResult;
+use crate::{MaintainIndexResult, ReindexResult};
+
+/// Request body for `POST /index`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexRequest {
+    /// Ledger alias (e.g. `"mydb"` or `"mydb:main"`).
+    pub ledger: String,
+    /// Fold the pooled tree's delta runs into their bases once the index is
+    /// current. Defaults to `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<bool>,
+    /// Wait at most this long for the build.
+    #[serde(
+        default,
+        rename = "timeout-ms",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Response body for `POST /index`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexResponse {
+    pub ledger_id: String,
+    pub index_t: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
+    /// The call indexed pending commits.
+    pub built: bool,
+    /// The call folded the pooled delta into its base.
+    pub compacted: bool,
+}
+
+impl From<MaintainIndexResult> for IndexResponse {
+    fn from(r: MaintainIndexResult) -> Self {
+        Self {
+            ledger_id: r.ledger_id,
+            index_t: r.index_t,
+            root_id: r.root_id.map(|id| id.to_string()),
+            built: r.built,
+            compacted: r.compacted,
+        }
+    }
+}
 
 /// Request body for `POST /reindex`.
 ///

@@ -680,10 +680,10 @@ async fn test_sparql_update_graph_variable_rewrites_in_place() {
 
 #[tokio::test]
 async fn test_sparql_update_graph_variable_across_more_graphs_than_envelope_cap() {
-    // A commit lists only the graphs it registers. Listing every graph a
-    // `GRAPH ?g` update writes would exceed the envelope's graph-delta cap
-    // once the update spans more existing graphs than that.
-    const GRAPHS: usize = fluree_db_core::commit::codec::envelope::MAX_GRAPH_DELTA_ENTRIES + 44;
+    // A commit lists only the graphs it registers, not every graph a
+    // `GRAPH ?g` update writes; 300 is past the graph-delta cap commits once
+    // had (256).
+    const GRAPHS: usize = 300;
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-update-graph-var-wide:main";
     let mut ledger = genesis_ledger(&fluree, ledger_id).await;
@@ -711,6 +711,20 @@ async fn test_sparql_update_graph_variable_across_more_graphs_than_envelope_cap(
     try_sparql_update(&fluree, ledger, update)
         .await
         .expect("an update over more existing graphs than the cap must commit");
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .expect("ledger record");
+    let store = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let head = fluree_db_core::load_commit_by_id(&store, record.commit_head_id.as_ref().unwrap())
+        .await
+        .expect("head commit");
+    assert!(
+        head.graph_delta.is_empty(),
+        "the update registers no graph, so its commit lists none"
+    );
 
     for i in [0, GRAPHS - 1] {
         assert_eq!(

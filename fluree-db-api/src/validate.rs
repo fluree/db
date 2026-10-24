@@ -425,7 +425,7 @@ async fn validate_view_inner(
     let to_t = view.t;
 
     let data_g_id = match options.graph.as_deref() {
-        None => 0u16,
+        None => 0,
         Some(iri) => resolve_graph_iri(snapshot, iri)?,
     };
 
@@ -471,7 +471,7 @@ async fn validate_view_inner(
             ));
             shape_dbs.push(GraphDbRef::new(
                 snapshot,
-                0u16,
+                0,
                 cross_overlay.as_ref().expect("just set above"),
                 to_t,
             ));
@@ -534,7 +534,7 @@ async fn validate_view_inner(
             ));
             let bundle_db = GraphDbRef::new(
                 inline_snapshot.as_ref().expect("just set above"),
-                0u16,
+                0,
                 inline_overlay.as_ref().expect("just set above"),
                 to_t,
             );

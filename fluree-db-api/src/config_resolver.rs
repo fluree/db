@@ -25,10 +25,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use fluree_db_core::ledger_config::{
-    DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
-    OntologyImportBinding, OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults,
-    ResolvedConfig, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
-    TrustPolicy, ValidationMode,
+    DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphPlacement,
+    GraphSourceRef, IndexingDefaults, LedgerConfig, OntologyImportBinding, OverrideControl,
+    PolicyDefaults, QueryDefaults, ReasoningDefaults, ResolvedConfig, RollbackGuard,
+    ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -108,6 +108,7 @@ pub async fn resolve_ledger_config(
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let indexing = read_indexing_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
 
     Ok(Some(LedgerConfig {
@@ -120,6 +121,7 @@ pub async fn resolve_ledger_config(
         full_text,
         serving,
         query,
+        indexing,
         graph_overrides,
     }))
 }
@@ -920,6 +922,18 @@ pub fn configured_fulltext_properties_for_indexer(
     }
 
     out
+}
+
+/// The ledger config an index build reads: configured full-text properties
+/// and named-graph placement.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn indexing_config_for_indexer(
+    config: &LedgerConfig,
+) -> fluree_db_indexer::LedgerIndexingConfig {
+    fluree_db_indexer::LedgerIndexingConfig {
+        fulltext_properties: configured_fulltext_properties_for_indexer(config),
+        graph_placement: fluree_db_core::ledger_config::GraphPlacementIntent::from_config(config),
+    }
 }
 
 // ============================================================================
@@ -2363,6 +2377,48 @@ async fn read_fulltext_fields(
     })
 }
 
+/// Read indexing defaults from a parent subject (LedgerConfig or GraphConfig).
+///
+/// `f:indexingDefaults` points to a group with `f:graphPlacement`
+/// (`f:PlacementAuto` / `f:PlacementDedicated`). It carries no override
+/// control: requests never choose index layout.
+async fn read_indexing_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<IndexingDefaults>> {
+    let Some(group_sid) = read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::INDEXING_DEFAULTS,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let placement = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::GRAPH_PLACEMENT,
+    )
+    .await?;
+    let graph_placement = match placement.as_deref() {
+        None => None,
+        Some(iri) if iri == config_iris::PLACEMENT_AUTO => Some(GraphPlacement::Auto),
+        Some(iri) if iri == config_iris::PLACEMENT_DEDICATED => Some(GraphPlacement::Dedicated),
+        Some(iri) => {
+            tracing::warn!(value = iri, "unknown f:graphPlacement value — ignoring");
+            None
+        }
+    };
+    Ok(Some(IndexingDefaults { graph_placement }))
+}
+
 /// Read per-graph config overrides (`f:graphOverrides`).
 async fn read_graph_overrides(
     snapshot: &LedgerSnapshot,
@@ -2412,6 +2468,7 @@ async fn read_single_graph_config(
     let datalog = read_datalog_defaults(snapshot, overlay, to_t, gc_sid).await?;
     let transact = read_transact_defaults(snapshot, overlay, to_t, gc_sid).await?;
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let indexing = read_indexing_defaults(snapshot, overlay, to_t, gc_sid).await?;
 
     Ok(Some(GraphConfig {
         target_graph,
@@ -2421,6 +2478,7 @@ async fn read_single_graph_config(
         datalog,
         transact,
         full_text,
+        indexing,
     }))
 }
 
@@ -2803,6 +2861,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -2832,6 +2891,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -2860,6 +2920,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -2889,6 +2950,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -2919,6 +2981,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3034,6 +3097,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3071,6 +3135,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3098,6 +3163,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };
@@ -3124,6 +3190,7 @@ mod tests {
                 datalog: None,
                 transact: None,
                 full_text: None,
+                indexing: None,
             }],
             ..Default::default()
         };

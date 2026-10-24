@@ -64,6 +64,7 @@ fn apply_window(
     let branch_bytes = build_branch_bytes(RunSortOrder::Spot, 0, &entries);
 
     let config = BranchUpdateConfig {
+        pool: Default::default(),
         order: RunSortOrder::Spot,
         g_id: 0,
         zstd_level: 1,

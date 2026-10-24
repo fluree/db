@@ -312,6 +312,37 @@ impl TriggerIndexOptions {
     }
 }
 
+/// Options for [`Fluree::maintain_index`](crate::Fluree::maintain_index).
+#[derive(Debug, Clone)]
+pub struct MaintainIndexOptions {
+    /// Wait at most this long for a build the background indexer runs.
+    pub timeout_ms: Option<u64>,
+    /// Once the index is current, fold the pooled tree's delta runs into
+    /// their bases.
+    pub compact: bool,
+}
+
+impl Default for MaintainIndexOptions {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            compact: true,
+        }
+    }
+}
+
+/// Result of [`Fluree::maintain_index`](crate::Fluree::maintain_index).
+#[derive(Debug, Clone)]
+pub struct MaintainIndexResult {
+    pub ledger_id: String,
+    pub index_t: i64,
+    pub root_id: Option<fluree_db_core::ContentId>,
+    /// This call indexed pending commits.
+    pub built: bool,
+    /// This call folded the pooled tree's delta runs into their bases.
+    pub compacted: bool,
+}
+
 /// Options for reindex operation
 #[derive(Debug, Clone, Default)]
 pub struct ReindexOptions {
@@ -2571,6 +2602,138 @@ impl crate::Fluree {
     }
 }
 
+impl crate::Fluree {
+    /// Index a ledger's pending commits, then fold the pooled tree's delta
+    /// runs into their bases. For deployments with no long-running indexer
+    /// to tidy an idle ledger, such as a function run on a schedule. With
+    /// nothing to do it costs a nameservice lookup and one root read.
+    pub async fn maintain_index(
+        &self,
+        ledger_id: &str,
+        opts: MaintainIndexOptions,
+    ) -> Result<MaintainIndexResult> {
+        let id = LedgerId::parse(ledger_id)?;
+        let record = self
+            .nameservice()
+            .lookup(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {id}")))?;
+        let built = record.commit_t > record.index_t;
+        if built {
+            match &self.indexing_mode {
+                IndexingMode::Background(_) => {
+                    self.trigger_index(
+                        id.as_str(),
+                        TriggerIndexOptions {
+                            timeout_ms: opts.timeout_ms,
+                        },
+                    )
+                    .await?;
+                }
+                IndexingMode::Disabled => {
+                    let result = self.build_index(id.as_str()).await?;
+                    self.publisher()?
+                        .publish_index_allow_equal_fenced(
+                            &id,
+                            result.fence,
+                            result.index_t,
+                            &result.root_id,
+                        )
+                        .await?;
+                }
+            }
+        }
+        let compacted =
+            opts.compact && self.compact_pool_deltas(&id).await? == PoolCompaction::Compacted;
+        let record = self
+            .nameservice()
+            .lookup(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {id}")))?;
+        Ok(MaintainIndexResult {
+            ledger_id: id.to_string(),
+            index_t: record.index_t,
+            root_id: record.index_head_id,
+            built,
+            compacted,
+        })
+    }
+
+    /// Fold the pooled delta into its base at the current index `t`, with
+    /// the background indexer's builds held off. Deferred while a build is
+    /// queued or running, or another maintenance operation holds the ledger:
+    /// that build, or a later call, sees the delta.
+    pub(crate) async fn compact_pool_deltas(&self, id: &LedgerId) -> Result<PoolCompaction> {
+        let _hold = match &self.indexing_mode {
+            IndexingMode::Background(handle) => {
+                let Some(guard) = handle.acquire_maintenance(id) else {
+                    debug!(ledger_id = %id, "pool compaction deferred: ledger held for maintenance");
+                    return Ok(PoolCompaction::Deferred);
+                };
+                let busy = handle
+                    .status(id)
+                    .await
+                    .is_some_and(|s| s.phase != fluree_db_indexer::IndexPhase::Idle);
+                if busy {
+                    debug!(ledger_id = %id, "pool compaction deferred: a build is queued or running");
+                    return Ok(PoolCompaction::Deferred);
+                }
+                Some(guard)
+            }
+            IndexingMode::Disabled => None,
+        };
+        let Some(record) = self.nameservice().lookup(id).await? else {
+            return Ok(PoolCompaction::NoDelta);
+        };
+        if record.index_head_id.is_none() || record.commit_t > record.index_t {
+            return Ok(PoolCompaction::Deferred);
+        }
+        let content_store = self.branched_content_store(id.as_str()).await?;
+        let config = fluree_db_indexer::IndexerConfig::default()
+            .with_ledger_config_provider(self.ledger_config_provider());
+        let Some(result) = fluree_db_indexer::compact_pool_deltas_for_record(
+            content_store.clone(),
+            &record,
+            config,
+        )
+        .await?
+        else {
+            return Ok(PoolCompaction::NoDelta);
+        };
+        content_store
+            .sync()
+            .await
+            .map_err(|e| ApiError::internal(format!("flush index artifacts: {e}")))?;
+        self.publisher()?
+            .publish_index_allow_equal_fenced(id, record.fence, result.index_t, &result.root_id)
+            .await?;
+        // Same `t`, new root: the cached state adopts it, keeping its novelty.
+        // One left on the old root would read runs the next sweep deletes.
+        if let Some(ref lm) = self.ledger_manager {
+            let notify = crate::ledger_manager::NsNotify {
+                ledger_id: id.clone(),
+                record: None,
+            };
+            if let Err(e) = lm.notify(notify).await {
+                warn!(ledger_id = %id, error = %e, "compacted root not adopted; dropping the cached ledger");
+                lm.disconnect(id).await;
+            }
+        }
+        info!(ledger_id = %id, index_t = result.index_t, root_id = %result.root_id, "pooled delta compacted and published");
+        Ok(PoolCompaction::Compacted)
+    }
+}
+
+/// What [`Fluree::compact_pool_deltas`](crate::Fluree::compact_pool_deltas) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolCompaction {
+    Compacted,
+    /// The current index holds no delta.
+    NoDelta,
+    /// A build, or another maintenance operation, comes first.
+    Deferred,
+}
+
 // =============================================================================
 // Reindex (requires AdminPublisher for allow-equal publish)
 // =============================================================================
@@ -2669,8 +2832,12 @@ impl crate::Fluree {
             let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
             match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
                 Ok(Some(cfg)) => {
-                    indexer_config.fulltext_configured_properties =
-                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
+                    let fluree_db_indexer::LedgerIndexingConfig {
+                        fulltext_properties,
+                        graph_placement,
+                    } = crate::config_resolver::indexing_config_for_indexer(&cfg);
+                    indexer_config.fulltext_configured_properties = fulltext_properties;
+                    indexer_config.graph_placement = graph_placement;
                 }
                 Ok(None) => {
                     // No LedgerConfig — nothing to seed.
@@ -2678,7 +2845,7 @@ impl crate::Fluree {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped and graphs placed automatically"
                     );
                 }
             }

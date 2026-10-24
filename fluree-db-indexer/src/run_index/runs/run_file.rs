@@ -15,9 +15,7 @@
 //! ```
 
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{
-    RunRecordV2, RECORD_V2_WIRE_SIZE, RECORD_V2_WITH_OP_WIRE_SIZE,
-};
+use fluree_db_binary_index::format::run_record_v2::{RunRecordLayout, RunRecordV2};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -152,24 +150,23 @@ pub fn write_run_file(
     header.write_to(&mut header_buf);
     file.write_all(&header_buf)?;
 
+    let layout = RunRecordLayout::new(sort_order, false);
+    let size = layout.size();
     if !compress {
-        let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
+        let mut rec_buf = vec![0u8; size];
         for rec in records {
-            rec.write_run_le(&mut rec_buf);
+            layout.write(rec, 1, &mut rec_buf);
             file.write_all(&rec_buf)?;
         }
     } else {
         const BLOCK_RECORDS: usize = 8192;
-        let mut raw_buf: Vec<u8> = Vec::with_capacity(BLOCK_RECORDS * RECORD_V2_WIRE_SIZE);
-        let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
+        let mut raw_buf: Vec<u8> = Vec::with_capacity(BLOCK_RECORDS * size);
 
         for chunk in records.chunks(BLOCK_RECORDS) {
             raw_buf.clear();
-            raw_buf.resize(chunk.len() * RECORD_V2_WIRE_SIZE, 0u8);
+            raw_buf.resize(chunk.len() * size, 0u8);
             for (i, rec) in chunk.iter().enumerate() {
-                rec.write_run_le(&mut rec_buf);
-                let off = i * RECORD_V2_WIRE_SIZE;
-                raw_buf[off..off + RECORD_V2_WIRE_SIZE].copy_from_slice(&rec_buf);
+                layout.write(rec, 1, &mut raw_buf[i * size..(i + 1) * size]);
             }
 
             let compressed = zstd::bulk::compress(&raw_buf, zstd_level)?;
@@ -248,26 +245,25 @@ pub(crate) fn write_run_file_with_op(
     header.write_to(&mut header_buf);
     file.write_all(&header_buf)?;
 
+    let layout = RunRecordLayout::new(sort_order, true);
+    let size = layout.size();
     if !compress {
-        let mut rec_buf = [0u8; RECORD_V2_WITH_OP_WIRE_SIZE];
+        let mut rec_buf = vec![0u8; size];
         for (rec, &op) in records.iter().zip(ops.iter()) {
-            rec.write_run_le_with_op(op, &mut rec_buf);
+            layout.write(rec, op, &mut rec_buf);
             file.write_all(&rec_buf)?;
         }
     } else {
         const BLOCK_RECORDS: usize = 8192;
-        let mut raw_buf: Vec<u8> = Vec::with_capacity(BLOCK_RECORDS * RECORD_V2_WITH_OP_WIRE_SIZE);
-        let mut rec_buf = [0u8; RECORD_V2_WITH_OP_WIRE_SIZE];
+        let mut raw_buf: Vec<u8> = Vec::with_capacity(BLOCK_RECORDS * size);
 
         let record_ops: Vec<(&RunRecordV2, &u8)> = records.iter().zip(ops.iter()).collect();
 
         for chunk in record_ops.chunks(BLOCK_RECORDS) {
             raw_buf.clear();
-            raw_buf.resize(chunk.len() * RECORD_V2_WITH_OP_WIRE_SIZE, 0u8);
+            raw_buf.resize(chunk.len() * size, 0u8);
             for (i, &(rec, &op)) in chunk.iter().enumerate() {
-                rec.write_run_le_with_op(op, &mut rec_buf);
-                let off = i * RECORD_V2_WITH_OP_WIRE_SIZE;
-                raw_buf[off..off + RECORD_V2_WITH_OP_WIRE_SIZE].copy_from_slice(&rec_buf);
+                layout.write(rec, op, &mut raw_buf[i * size..(i + 1) * size]);
             }
 
             let compressed = zstd::bulk::compress(&raw_buf, zstd_level)?;
@@ -430,31 +426,16 @@ impl StreamingRunFileWriter {
         if self.block_records.is_empty() {
             return Ok(());
         }
-        let record_size = if self.with_op {
-            RECORD_V2_WITH_OP_WIRE_SIZE
-        } else {
-            RECORD_V2_WIRE_SIZE
-        };
+        let layout = RunRecordLayout::new(self.sort_order, self.with_op);
+        let record_size = layout.size();
         let mut raw_buf = vec![0u8; self.block_records.len() * record_size];
-        if self.with_op {
-            let mut rec_buf = [0u8; RECORD_V2_WITH_OP_WIRE_SIZE];
-            for (i, (rec, &op)) in self
-                .block_records
-                .iter()
-                .zip(self.block_ops.iter())
-                .enumerate()
-            {
-                rec.write_run_le_with_op(op, &mut rec_buf);
-                let off = i * record_size;
-                raw_buf[off..off + record_size].copy_from_slice(&rec_buf);
-            }
-        } else {
-            let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
-            for (i, rec) in self.block_records.iter().enumerate() {
-                rec.write_run_le(&mut rec_buf);
-                let off = i * record_size;
-                raw_buf[off..off + record_size].copy_from_slice(&rec_buf);
-            }
+        for (i, rec) in self.block_records.iter().enumerate() {
+            let op = if self.with_op { self.block_ops[i] } else { 1 };
+            layout.write(
+                rec,
+                op,
+                &mut raw_buf[i * record_size..(i + 1) * record_size],
+            );
         }
         if self.compress {
             let compressed = zstd::bulk::compress(&raw_buf, self.zstd_level)?;

@@ -421,7 +421,8 @@ impl crate::Fluree {
         // Graph routing for the staged flakes: every named graph they touch,
         // with its IRI for per-graph config resolution. The default graph
         // always gets the ledger-wide settings.
-        let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
+        let mut graph_delta: rustc_hash::FxHashMap<fluree_db_core::GraphId, String> =
+            rustc_hash::FxHashMap::default();
         for (g_id, _) in view.staged_flakes_by_graph().filter(|(g_id, _)| *g_id != 0) {
             let iri = base
                 .snapshot

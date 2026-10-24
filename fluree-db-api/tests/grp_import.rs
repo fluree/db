@@ -11,6 +11,8 @@ mod it_import_class_stats;
 mod it_import_ndjson;
 #[path = "it_import_ns_split_mode.rs"]
 mod it_import_ns_split_mode;
+#[path = "it_import_pooled_graphs.rs"]
+mod it_import_pooled_graphs;
 #[path = "it_import_remote.rs"]
 mod it_import_remote;
 #[path = "it_import_skolem.rs"]

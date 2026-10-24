@@ -383,7 +383,7 @@ pub fn leaf_entries_for_predicate(
     order: RunSortOrder,
     p_id: u32,
 ) -> &[LeafEntry] {
-    let Some(branch) = store.branch_for_order(g_id, order) else {
+    let Some(branch) = store.dedicated_branch(g_id, order) else {
         return &[];
     };
     let cmp = cmp_v2_for_order(order);
@@ -1060,7 +1060,7 @@ impl<'a> PsotSubjectSeek<'a> {
         g_id: GraphId,
         p_id: u32,
     ) -> Option<Self> {
-        store.branch_for_order(g_id, RunSortOrder::Psot)?;
+        store.dedicated_branch(g_id, RunSortOrder::Psot)?;
         Some(Self::with_projection(
             store,
             g_id,
@@ -2063,7 +2063,7 @@ pub fn build_range_cursor(
     filter: BinaryFilter,
     projection: ColumnProjection,
 ) -> Option<BinaryCursor> {
-    let branch = Arc::clone(store.branch_for_order(g_id, order)?);
+    let branch = Arc::clone(store.dedicated_branch(g_id, order)?);
     Some(BinaryCursor::new(
         Arc::clone(store),
         order,
@@ -2715,7 +2715,9 @@ pub(crate) fn probe_lane_admission(
     ctx: &ExecutionContext<'_>,
     pred_sids: &[&Sid],
 ) -> Option<ProbeLanePlan> {
-    if ctx.is_history_range() {
+    // The batched lanes read a graph's own branches; the per-row path scans
+    // a pooled graph through the pooled tree.
+    if ctx.is_history_range() || active_graph_pooled(ctx) {
         return Some(ProbeLanePlan::Decline);
     }
     // Every predicate the lane reads must clear; an empty set has nothing to
@@ -2743,12 +2745,39 @@ pub(crate) fn probe_lane_admission(
     None
 }
 
+/// The batched-lane verdict for a pooled graph. Only the subject lane can
+/// read one (through the pooled GSPO), and only from persisted rows: no
+/// overlay, at the index's `t`, one graph, and a policy that clears the
+/// predicates.
+pub(crate) fn pooled_probe_lane(ctx: &ExecutionContext<'_>, pred_sids: &[&Sid]) -> ProbeLanePlan {
+    let ok = !ctx.is_history_range()
+        && !ctx.eager_materialization
+        && matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single)
+        && ctx.overlay_free_single_graph()
+        && ctx
+            .binary_store
+            .as_ref()
+            .is_some_and(|store| ctx.to_t >= store.max_t())
+        && matches!(
+            policy_lane_for_predicates(ctx, pred_sids, POLICY_PREDICATE_PROBE_SITE),
+            PredicateFastPath::Allow
+        );
+    if ok {
+        ProbeLanePlan::Clean
+    } else {
+        ProbeLanePlan::Decline
+    }
+}
+
 /// Plan a single-predicate PSOT subject probe under the active overlay.
 pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
+    if active_graph_pooled(ctx) {
+        return Ok(pooled_probe_lane(ctx, &[pred_sid]));
+    }
     if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
         return Ok(plan);
     }
@@ -2765,7 +2794,7 @@ pub fn subject_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Psot)
         .is_none()
     {
         tracing::debug!("subject probe: PSOT branch absent with novelty present; declining");
@@ -2800,7 +2829,7 @@ pub fn object_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Opst)
         .is_none()
     {
         tracing::debug!("object probe: OPST branch absent with novelty present; declining");
@@ -2844,7 +2873,7 @@ pub fn star_probe_lane_plan(
         return Ok(ProbeLanePlan::Clean);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Spot)
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Spot)
         .is_none()
     {
         tracing::debug!("star probe: SPOT branch absent with novelty present; declining");
@@ -3815,7 +3844,20 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
 /// unfiltered).
 #[inline]
 fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
+    !ctx.is_multi_ledger()
+        && !ctx.is_history_range()
+        && !overlay_has_novelty(ctx)
+        && !active_graph_pooled(ctx)
+}
+
+/// Whether the context's active graph lives in the pooled tree. Fast paths
+/// read a graph's own branches and leaf metadata (row counts, lead groups,
+/// constant columns), which a pooled graph does not have, so they decline.
+#[inline]
+pub fn active_graph_pooled(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.binary_store
+        .as_ref()
+        .is_some_and(|store| store.is_pooled(ctx.binary_g_id))
 }
 
 /// True when the overlay can still contribute flakes.
@@ -3834,6 +3876,15 @@ pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
         Some(o) => o.epoch() != 0 && !o.is_effectively_empty(),
         None => false,
     }
+}
+
+/// [`overlay_has_novelty`] for one graph: false also when the overlay holds
+/// no rows for `g_id`, so a scan of a graph the pending writes didn't touch
+/// reads as an indexed one. An overlay that can't count one graph's rows is
+/// taken to hold some.
+#[inline]
+pub fn graph_has_novelty(ctx: &ExecutionContext<'_>, g_id: GraphId) -> bool {
+    overlay_has_novelty(ctx) && ctx.overlay().overlay_flake_count(g_id) != Some(0)
 }
 
 /// Combined fast-path eligibility: [`allow_fast_path`] + binary store present + `to_t == max_t`.
@@ -3877,7 +3928,10 @@ pub fn fast_path_store_policy_cleared<'a>(
 /// at the planner level.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered()
+    !ctx.is_multi_ledger()
+        && !ctx.is_history_range()
+        && ctx.allow_unfiltered()
+        && !active_graph_pooled(ctx)
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned
@@ -3917,7 +3971,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.is_history_range() {
+    if ctx.is_multi_ledger() || ctx.is_history_range() || active_graph_pooled(ctx) {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.

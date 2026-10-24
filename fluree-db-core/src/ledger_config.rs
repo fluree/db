@@ -43,6 +43,8 @@ pub struct LedgerConfig {
     /// Query defaults (`f:queryDefaults`). Ledger-scoped: never merged
     /// per-graph and not subject to override control.
     pub query: Option<QueryDefaults>,
+    /// Indexing defaults (`f:indexingDefaults`).
+    pub indexing: Option<IndexingDefaults>,
     /// Per-graph config overrides (`f:graphOverrides`).
     pub graph_overrides: Vec<GraphConfig>,
 }
@@ -201,6 +203,62 @@ pub struct QueryDefaults {
     /// graphs (never the reserved `#txn-meta` / `#config` graphs). `None`
     /// means off.
     pub union_default_graph: Option<bool>,
+}
+
+/// Indexing defaults from the config graph (`f:indexingDefaults`).
+///
+/// These shape the physical index, never query results, so a request cannot
+/// override them. A change takes effect at the ledger's next index build;
+/// until then readers follow the placement the current index root records.
+#[derive(Debug, Clone, Default)]
+pub struct IndexingDefaults {
+    /// `f:graphPlacement`. On `f:LedgerConfig`, the default for user named
+    /// graphs; on `f:GraphConfig`, its target graph's own placement.
+    pub graph_placement: Option<GraphPlacement>,
+}
+
+/// Where the indexer keeps a user named graph's rows (`f:graphPlacement`).
+/// The default graph and the reserved system graphs always keep their own
+/// trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphPlacement {
+    /// `f:PlacementAuto` — the indexer places the graph; a small one shares
+    /// the pooled tree with other small graphs.
+    #[default]
+    Auto,
+    /// `f:PlacementDedicated` — the graph keeps its own trees whatever its
+    /// size. A pooled graph moves out at the next index build.
+    Dedicated,
+}
+
+/// The placement an index build applies to user named graphs: the ledger
+/// default and per-graph overrides by graph IRI. Overrides naming the default
+/// graph or a system graph are dropped — those graphs always keep their own
+/// trees.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphPlacementIntent {
+    pub default: GraphPlacement,
+    pub overrides: Vec<(String, GraphPlacement)>,
+}
+
+impl GraphPlacementIntent {
+    pub fn from_config(config: &LedgerConfig) -> Self {
+        let placement =
+            |indexing: &Option<IndexingDefaults>| indexing.as_ref().and_then(|i| i.graph_placement);
+        let overrides = config
+            .graph_overrides
+            .iter()
+            .filter(|gc| {
+                gc.target_graph != fluree_vocab::config_iris::DEFAULT_GRAPH
+                    && gc.target_graph != fluree_vocab::config_iris::TXN_META_GRAPH
+            })
+            .filter_map(|gc| Some((gc.target_graph.clone(), placement(&gc.indexing)?)))
+            .collect();
+        Self {
+            default: placement(&config.indexing).unwrap_or_default(),
+            overrides,
+        }
+    }
 }
 
 /// Full-text indexing defaults from the config graph (`f:fullTextDefaults`).
@@ -369,6 +427,8 @@ pub struct GraphConfig {
     pub transact: Option<TransactDefaults>,
     /// Full-text indexing overrides for this graph.
     pub full_text: Option<FullTextDefaults>,
+    /// Indexing overrides for this graph.
+    pub indexing: Option<IndexingDefaults>,
 }
 
 // ============================================================================
@@ -721,6 +781,45 @@ mod tests {
         assert!(config.datalog.is_none());
         assert!(config.transact.is_none());
         assert!(config.graph_overrides.is_empty());
+    }
+
+    #[test]
+    fn placement_intent_keeps_user_graph_overrides() {
+        let indexing = |p| {
+            Some(IndexingDefaults {
+                graph_placement: Some(p),
+            })
+        };
+        let config = LedgerConfig {
+            indexing: indexing(GraphPlacement::Dedicated),
+            graph_overrides: vec![
+                GraphConfig {
+                    target_graph: "http://ex/g".into(),
+                    indexing: indexing(GraphPlacement::Auto),
+                    ..Default::default()
+                },
+                GraphConfig {
+                    target_graph: fluree_vocab::config_iris::DEFAULT_GRAPH.into(),
+                    indexing: indexing(GraphPlacement::Auto),
+                    ..Default::default()
+                },
+                GraphConfig {
+                    target_graph: "http://ex/no-placement".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let intent = GraphPlacementIntent::from_config(&config);
+        assert_eq!(intent.default, GraphPlacement::Dedicated);
+        assert_eq!(
+            intent.overrides,
+            vec![("http://ex/g".to_string(), GraphPlacement::Auto)]
+        );
+        assert_eq!(
+            GraphPlacementIntent::from_config(&LedgerConfig::default()).default,
+            GraphPlacement::Auto
+        );
     }
 
     #[test]

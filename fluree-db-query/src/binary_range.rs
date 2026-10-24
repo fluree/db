@@ -765,12 +765,22 @@ fn binary_range_eq_v3(
     }
 
     // Get branch manifest.
-    let branch = match store.branch_for_order(g_id, order) {
-        Some(b) => Arc::clone(b),
-        None => {
-            // No branch for this order — return overlay-only results if any.
-            return overlay_only_flakes(store, g_id, index, match_val, opts, overlay);
+    let Some(tree) = store.graph_tree(g_id, order) else {
+        // No branch for this order — return overlay-only results if any.
+        return overlay_only_flakes(store, g_id, index, match_val, opts, overlay);
+    };
+    let branch = tree.branch;
+    // A pooled graph reads the pooled tree filtered to it; its rows arrive in
+    // the pooled order's base, which is the index the overlay ops sort by.
+    let (order, index) = match tree.g_filter {
+        Some(g) => {
+            filter.g_id = Some(g);
+            (
+                tree.order,
+                crate::binary_scan::sort_order_to_index_type(tree.order),
+            )
         }
+        None => (order, index),
     };
 
     // Resolve the optional projection-predicate allow-list once.
@@ -801,7 +811,8 @@ fn binary_range_eq_v3(
         object_slice_filters(order, filter, &object_slices)
             .into_iter()
             .map(|filter| {
-                let use_range = filter.s_id.is_some()
+                let use_range = filter.g_id.is_some()
+                    || filter.s_id.is_some()
                     || filter.p_id.is_some()
                     || filter.o_type.is_some()
                     || filter.o_key.is_some();
@@ -1144,32 +1155,31 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     };
 
     // Get branch manifest.
-    let branch = match store.branch_for_order(g_id, RunSortOrder::Psot) {
-        Some(b) => Arc::clone(b),
-        None => {
-            // No PSOT branch — try overlay only.
-            return batched_refs_overlay_only(
-                store,
-                dict_novelty,
-                g_id,
-                predicate,
-                subjects,
-                opts,
-                overlay,
-            );
-        }
+    let Some(tree) = store.graph_tree(g_id, RunSortOrder::Psot) else {
+        // No PSOT branch — try overlay only.
+        return batched_refs_overlay_only(
+            store,
+            dict_novelty,
+            g_id,
+            predicate,
+            subjects,
+            opts,
+            overlay,
+        );
     };
+    let order = tree.order;
 
     let filter = BinaryFilter {
         p_id: Some(p_id),
+        g_id: tree.g_filter,
         ..Default::default()
     };
 
     let projection = ColumnProjection::all();
     let mut cursor = BinaryCursor::new(
         Arc::clone(store),
-        RunSortOrder::Psot,
-        branch,
+        order,
+        tree.branch,
         &min_key,
         &max_key,
         filter,
@@ -1199,7 +1209,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     );
 
     if !ops.is_empty() {
-        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
+        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
         cursor.set_overlay_ops(ops.into());
     }
@@ -1481,21 +1491,21 @@ fn binary_range_bounded_v3(
         );
     }
 
-    let branch = match store.branch_for_order(g_id, order) {
-        Some(b) => Arc::clone(b),
-        None => {
-            // No SPOT branch — return overlay-only results (already translated above).
-            return overlay_only_flakes_bounded(
-                store,
-                g_id,
-                index,
-                start_bound,
-                end_bound,
-                opts,
-                overlay,
-            );
-        }
+    let Some(tree) = store.graph_tree(g_id, order) else {
+        // No SPOT branch — return overlay-only results (already translated above).
+        return overlay_only_flakes_bounded(
+            store,
+            g_id,
+            index,
+            start_bound,
+            end_bound,
+            opts,
+            overlay,
+        );
     };
+    let branch = tree.branch;
+    // A pooled graph reads GSPO filtered to the graph (SPOT order within it).
+    let order = tree.order;
 
     // Compute s_id bounds for leaf selection (narrows the leaf range).
     let min_s_id = *s_id_set.iter().min().unwrap();
@@ -1520,7 +1530,10 @@ fn binary_range_bounded_v3(
         g_id,
     };
 
-    let filter = BinaryFilter::default();
+    let filter = BinaryFilter {
+        g_id: tree.g_filter,
+        ..Default::default()
+    };
     let projection = ColumnProjection::all();
     let mut cursor = BinaryCursor::new(
         Arc::clone(store),
@@ -1722,7 +1735,7 @@ fn overlay_only_flakes_bounded(
 /// exists for `(g_id, order)`.
 ///
 /// That second trigger is broader than "genesis / pre-first-index":
-/// `branch_for_order` is keyed per graph AND order, and the bulk-import path
+/// `dedicated_branch` is keyed per graph AND order, and the bulk-import path
 /// emits SPOT unconditionally while skipping PSOT/POST/OPST when the order
 /// produced no run files (`index_build.rs`'s empty-run-dir early return),
 /// so a graph with zero rows at the indexed `t` lands here for three of the

@@ -2122,6 +2122,19 @@ impl NestedLoopJoinOperator {
             Some(pred) => &[pred],
             None => &[],
         };
+        // A pooled graph has only the subject lane, read from the pooled GSPO,
+        // and only where persisted rows are the whole answer.
+        if crate::fast_path_common::active_graph_pooled(ctx) {
+            let subject_lane_only = self.batched_eligible
+                && !self.batched_object_eligible
+                && !self.batched_exists_eligible
+                && self.wildcard_direction.is_none();
+            return Ok(if subject_lane_only {
+                crate::fast_path_common::pooled_probe_lane(ctx, preds)
+            } else {
+                ProbeLanePlan::Decline
+            });
+        }
         let admitted = crate::fast_path_common::probe_lane_admission(ctx, preds);
         if self.wildcard_direction.is_some() {
             // The shared cursor reads persisted state only. Keep the first
@@ -2252,6 +2265,111 @@ impl NestedLoopJoinOperator {
         branch.find_leaves_in_range(&min_key, &max_key, cmp)
     }
 
+    /// GSPO leaves holding graph `g_id`'s rows for subjects in
+    /// `[min_s_id, max_s_id]`.
+    fn find_gspo_leaf_range(
+        branch: &fluree_db_binary_index::BranchManifest,
+        g_id: GraphId,
+        min_s_id: u64,
+        max_s_id: u64,
+    ) -> std::ops::Range<usize> {
+        use fluree_db_binary_index::format::run_record_v2::{cmp_v2_g_spot, RunRecordV2};
+        let key = |s_id: u64, low: bool| RunRecordV2 {
+            s_id: SubjectId::from_u64(s_id),
+            o_key: if low { 0 } else { u64::MAX },
+            p_id: if low { 0 } else { u32::MAX },
+            t: if low { 0 } else { u32::MAX },
+            o_i: if low { 0 } else { u32::MAX },
+            o_type: if low { 0 } else { u16::MAX },
+            g_id,
+        };
+        branch.find_leaves_in_range(&key(min_s_id, true), &key(max_s_id, false), cmp_v2_g_spot)
+    }
+
+    /// [`Self::scan_matches`] for a pooled graph: within GSPO the graph's rows
+    /// are one run ordered by subject, so each leaflet narrows to the graph by
+    /// its graph column and the predicate is checked per row. Persisted rows
+    /// only: the lane admits a pooled graph only overlay-free at the index's
+    /// `t`.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_matches_pooled(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &BinaryIndexStore,
+        branch: &fluree_db_binary_index::BranchManifest,
+        leaf_range: std::ops::Range<usize>,
+        p_id: u32,
+        g_id: GraphId,
+        unique_s_ids: &[u64],
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
+    ) -> Result<()> {
+        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        use fluree_db_binary_index::RunSortOrder;
+
+        let (Some(&s_min), Some(&s_max)) = (unique_s_ids.first(), unique_s_ids.last()) else {
+            return Ok(());
+        };
+        let proj = fluree_db_binary_index::ColumnProjection::all();
+        for leaf_idx in leaf_range {
+            ctx.check_cancelled()?;
+            let leaf = prepare_leaf_for_scan(store, &branch.leaves[leaf_idx], false)?;
+            for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
+                if entry.row_count == 0 {
+                    continue;
+                }
+                let first = read_ordered_key_v2(RunSortOrder::Gspo, &entry.first_key);
+                let last = read_ordered_key_v2(RunSortOrder::Gspo, &entry.last_key);
+                if (first.g_id, first.s_id.as_u64()) > (g_id, s_max)
+                    || (last.g_id, last.s_id.as_u64()) < (g_id, s_min)
+                {
+                    continue;
+                }
+                ctx.check_cancelled()?;
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
+                let key = |i: usize| (batch.g_id.get_or(i, 0), batch.s_id.get(i));
+                let start = partition_rows(batch.row_count, |i| key(i) < (g_id, s_min));
+                let end = partition_rows(batch.row_count, |i| key(i) <= (g_id, s_max));
+                for row in start..end {
+                    if batch.p_id.get_or(row, 0) != p_id {
+                        continue;
+                    }
+                    let Some(accum_indices) = s_id_to_accum.get(&batch.s_id.get(row)) else {
+                        continue;
+                    };
+                    let o_type_val = entry
+                        .o_type_const
+                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                    let o_key_val = batch.o_key.get(row);
+                    if !self.batched_row_matches_object_bounds(
+                        store, g_id, p_id, o_type_val, o_key_val,
+                    )? {
+                        continue;
+                    }
+                    let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
+                        || o_type_val == OType::BLANK_NODE.as_u16()
+                    {
+                        Binding::encoded_sid(o_key_val)
+                    } else {
+                        build_probe_object_binding(
+                            ctx,
+                            store,
+                            dict_overlay.as_ref(),
+                            p_id,
+                            o_type_val,
+                            o_key_val,
+                            batch.o_i.get_or(row, u32::MAX),
+                            batch.t.get_or(row, 0) as i64,
+                        )?
+                    };
+                    on_match(accum_indices, &obj_binding)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Phase 4: Scan PSOT leaves, matching accumulated subjects and invoking
     /// `on_match` per matched (left-row group, object) pair.
     ///
@@ -2268,6 +2386,7 @@ impl NestedLoopJoinOperator {
         branch: &fluree_db_binary_index::BranchManifest,
         leaf_range: std::ops::Range<usize>,
         p_id: u32,
+        pooled_graph: Option<GraphId>,
         unique_s_ids: &[u64],
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
@@ -2282,6 +2401,22 @@ impl NestedLoopJoinOperator {
         let replay_to = need_replay.then_some(ctx.to_t);
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         let proj = fluree_db_binary_index::ColumnProjection::all();
+
+        if let Some(g_id) = pooled_graph {
+            debug_assert!(probe_ops.is_none(), "pooled subject lane runs overlay-free");
+            return self.scan_matches_pooled(
+                ctx,
+                store,
+                branch,
+                leaf_range,
+                p_id,
+                g_id,
+                unique_s_ids,
+                s_id_to_accum,
+                dict_overlay,
+                on_match,
+            );
+        }
 
         for leaf_idx in leaf_range {
             ctx.check_cancelled()?;
@@ -2657,16 +2792,34 @@ impl NestedLoopJoinOperator {
             self.clear_batched_state();
             return Ok(());
         }
-        let branch = store
-            .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
-            .ok_or_else(|| QueryError::Internal("PSOT index not found for graph".into()))?;
-        let leaf_range = Self::find_psot_leaf_range(
-            branch,
-            ctx.binary_g_id,
-            p_id,
-            unique_s_ids[0],
-            *unique_s_ids.last().unwrap(),
-        );
+        let pooled_graph = store.is_pooled(ctx.binary_g_id).then_some(ctx.binary_g_id);
+        let (branch, leaf_range) = match pooled_graph {
+            Some(g_id) => {
+                let branch = store
+                    .pool_branch(RunSortOrder::Gspo)
+                    .ok_or_else(|| QueryError::Internal("pooled GSPO index not found".into()))?;
+                let range = Self::find_gspo_leaf_range(
+                    branch,
+                    g_id,
+                    unique_s_ids[0],
+                    *unique_s_ids.last().unwrap(),
+                );
+                (branch, range)
+            }
+            None => {
+                let branch = store
+                    .dedicated_branch(ctx.binary_g_id, RunSortOrder::Psot)
+                    .ok_or_else(|| QueryError::Internal("PSOT index not found for graph".into()))?;
+                let range = Self::find_psot_leaf_range(
+                    branch,
+                    ctx.binary_g_id,
+                    p_id,
+                    unique_s_ids[0],
+                    *unique_s_ids.last().unwrap(),
+                );
+                (branch, range)
+            }
+        };
 
         // One reconciler per flush: probed keys recur across flushes with new
         // left rows, so consumed-state must not outlive this flush.
@@ -2750,8 +2903,9 @@ impl NestedLoopJoinOperator {
                     ctx,
                     &store,
                     branch,
-                    leaf_range,
+                    leaf_range.clone(),
                     p_id,
+                    pooled_graph,
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
@@ -2826,8 +2980,9 @@ impl NestedLoopJoinOperator {
                     ctx,
                     &store,
                     branch,
-                    leaf_range,
+                    leaf_range.clone(),
                     p_id,
+                    pooled_graph,
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
@@ -2892,7 +3047,7 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
+        let Some(branch) = store.dedicated_branch(ctx.binary_g_id, RunSortOrder::Opst) else {
             debug_assert!(
                 !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
                 "lane plan must decline branchless graphs"
@@ -3450,6 +3605,155 @@ pub(crate) fn for_each_object_probe_match(
     Ok(())
 }
 
+/// One probed row's emitted object: `None` when the row fails the probe's
+/// object bound or bound term, `Some(None)` when it matches but the object is
+/// not emitted.
+fn subject_probe_row_object(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    params: &SubjectProbeParams<'_>,
+    p_id: u32,
+    batch: &fluree_db_binary_index::ColumnBatch,
+    row: usize,
+    o_type: u16,
+) -> Result<Option<Option<Binding>>> {
+    let o_key = batch.o_key.get(row);
+    if params.object_bounds.is_some() || params.bound_object.is_some() {
+        let decoded = store
+            .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
+            .map_err(|e| {
+                QueryError::Internal(format!(
+                    "decode_value_v3 (batched subject probe filter): {e}"
+                ))
+            })?;
+        if let Some(bounds) = params.object_bounds {
+            if !bounds.matches(&decoded) {
+                return Ok(None);
+            }
+        }
+        if let Some(term) = params.bound_object {
+            if !term_matches_probe_value(store, term, &decoded) {
+                return Ok(None);
+            }
+        }
+    }
+    if !params.emit_object {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(build_probe_object_binding(
+        ctx,
+        store,
+        params.dict_overlay,
+        p_id,
+        o_type,
+        o_key,
+        batch.o_i.get_or(row, u32::MAX),
+        batch.t.get_or(row, 0) as i64,
+    )?)))
+}
+
+/// [`batched_subject_probe_binary`] for a pooled graph: the graph's rows are
+/// one run of the pooled GSPO, ordered by subject, so each leaflet narrows to
+/// the graph and the probed subject span, and the predicate is checked per
+/// row. Matches come out ordered by subject, then object, as PSOT's do.
+/// Persisted rows only: the lane admits a pooled graph only overlay-free at
+/// the index's `t`.
+fn pooled_subject_probe(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    params: &SubjectProbeParams<'_>,
+    p_id: u32,
+) -> Result<Vec<BatchedSubjectProbeMatch>> {
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_g_spot, read_ordered_key_v2, RunRecordV2,
+    };
+    use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
+
+    let g_id = ctx.binary_g_id;
+    let Some(branch) = store.pool_branch(RunSortOrder::Gspo) else {
+        return Ok(Vec::new());
+    };
+    let mut unique_s_ids = params.subject_ids.to_vec();
+    unique_s_ids.sort_unstable();
+    unique_s_ids.dedup();
+    let (Some(&s_min), Some(&s_max)) = (unique_s_ids.first(), unique_s_ids.last()) else {
+        return Ok(Vec::new());
+    };
+    let key = |s_id: u64, low: bool| RunRecordV2 {
+        s_id: SubjectId::from_u64(s_id),
+        o_key: if low { 0 } else { u64::MAX },
+        p_id: if low { 0 } else { u32::MAX },
+        t: if low { 0 } else { u32::MAX },
+        o_i: if low { 0 } else { u32::MAX },
+        o_type: if low { 0 } else { u16::MAX },
+        g_id,
+    };
+    let leaf_range =
+        branch.find_leaves_in_range(&key(s_min, true), &key(s_max, false), cmp_v2_g_spot);
+    let proj = ColumnProjection::all();
+    let mut out = Vec::new();
+    for leaf_idx in leaf_range {
+        ctx.check_cancelled()?;
+        let leaf = prepare_leaf_for_scan(store, &branch.leaves[leaf_idx], false)?;
+        for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
+            if entry.row_count == 0 {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Gspo, &entry.first_key);
+            let last = read_ordered_key_v2(RunSortOrder::Gspo, &entry.last_key);
+            if (first.g_id, first.s_id.as_u64()) > (g_id, s_max)
+                || (last.g_id, last.s_id.as_u64()) < (g_id, s_min)
+            {
+                continue;
+            }
+            ctx.check_cancelled()?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
+            let at = |i: usize| (batch.g_id.get_or(i, 0), batch.s_id.get(i));
+            let mut row = partition_rows(batch.row_count, |i| at(i) < (g_id, s_min));
+            let end = partition_rows(batch.row_count, |i| at(i) <= (g_id, s_max));
+            let mut next_subject = 0usize;
+            while row < end {
+                let s_id = batch.s_id.get(row);
+                next_subject += unique_s_ids[next_subject..].partition_point(|&s| s < s_id);
+                if unique_s_ids.get(next_subject) != Some(&s_id) {
+                    row += 1;
+                    continue;
+                }
+                if batch.p_id.get_or(row, 0) == p_id {
+                    let o_type = entry
+                        .o_type_const
+                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                    if let Some(object) =
+                        subject_probe_row_object(ctx, store, params, p_id, &batch, row, o_type)?
+                    {
+                        out.push(BatchedSubjectProbeMatch {
+                            subject_id: s_id,
+                            object,
+                        });
+                    }
+                }
+                row += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// First row index in `0..rows` where `before` turns false (`before` must be
+/// monotone: true then false).
+fn partition_rows(rows: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0usize, rows);
+    while lo < hi {
+        let mid = lo.midpoint(hi);
+        if before(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// Bundled parameters for [`batched_subject_probe_binary`].
 pub(crate) struct SubjectProbeParams<'a> {
     pub pred_sid: &'a Sid,
@@ -3518,7 +3822,11 @@ fn batched_subject_probe_binary_uncharged(
         );
         return Ok(Vec::new());
     };
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
+    if store.is_pooled(ctx.binary_g_id) {
+        debug_assert!(probe_ops.is_none(), "pooled subject lane runs overlay-free");
+        return pooled_subject_probe(ctx, store, params, p_id);
+    }
+    let Some(branch) = store.dedicated_branch(ctx.binary_g_id, RunSortOrder::Psot) else {
         debug_assert!(
             probe_ops.is_none(),
             "lane plan must decline branchless graphs"
@@ -3622,45 +3930,14 @@ fn batched_subject_probe_binary_uncharged(
                         }
                     }
 
-                    if params.object_bounds.is_some() || params.bound_object.is_some() {
-                        let decoded = store
-                            .decode_value_v3(o_type_val, o_key_val, p_id, ctx.binary_g_id)
-                            .map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "decode_value_v3 (batched subject probe filter): {e}"
-                                ))
-                            })?;
-                        if let Some(bounds) = params.object_bounds {
-                            if !bounds.matches(&decoded) {
-                                continue;
-                            }
-                        }
-                        if let Some(term) = params.bound_object {
-                            if !term_matches_probe_value(store, term, &decoded) {
-                                continue;
-                            }
-                        }
+                    if let Some(object) =
+                        subject_probe_row_object(ctx, store, params, p_id, &batch, row, o_type_val)?
+                    {
+                        out.push(BatchedSubjectProbeMatch {
+                            subject_id: s_id,
+                            object,
+                        });
                     }
-
-                    let object = if params.emit_object {
-                        Some(build_probe_object_binding(
-                            ctx,
-                            store,
-                            params.dict_overlay,
-                            p_id,
-                            o_type_val,
-                            o_key_val,
-                            batch.o_i.get_or(row, u32::MAX),
-                            batch.t.get_or(row, 0) as i64,
-                        )?)
-                    } else {
-                        None
-                    };
-
-                    out.push(BatchedSubjectProbeMatch {
-                        subject_id: s_id,
-                        object,
-                    });
                 }
             }
         }
@@ -3771,7 +4048,7 @@ fn batched_subject_star_spot_uncharged(
         return Ok(Vec::new());
     }
 
-    let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Spot) else {
+    let Some(branch) = store.dedicated_branch(ctx.binary_g_id, RunSortOrder::Spot) else {
         debug_assert!(
             probe_ops.is_none(),
             "lane plan must decline branchless graphs"

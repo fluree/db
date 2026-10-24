@@ -372,7 +372,7 @@ pub async fn stage_with_graph_delta(
 ) -> Result<(
     StagedLedger,
     NamespaceRegistry,
-    rustc_hash::FxHashMap<u16, String>,
+    rustc_hash::FxHashMap<fluree_db_core::GraphId, String>,
 )> {
     // SPARQL graph-management verbs (CLEAR/DROP/COPY/MOVE/ADD) execute by a
     // whole-graph scan + retract/re-home at staging time rather than by the
@@ -1069,7 +1069,7 @@ fn resolve_write_graphs(
 fn ledger_graph_delta<'a>(
     ledger: &LedgerState,
     iris: impl IntoIterator<Item = &'a String>,
-) -> rustc_hash::FxHashMap<u16, String> {
+) -> rustc_hash::FxHashMap<fluree_db_core::GraphId, String> {
     let iris: Vec<String> = iris.into_iter().cloned().collect();
     let ids = ledger.snapshot.graph_registry.provisional_ids(&iris);
     iris.into_iter()
@@ -1232,7 +1232,7 @@ async fn stage_graph_mgmt(
 ) -> Result<(
     StagedLedger,
     NamespaceRegistry,
-    rustc_hash::FxHashMap<u16, String>,
+    rustc_hash::FxHashMap<fluree_db_core::GraphId, String>,
 )> {
     // A graph named through this ledger's address reads as it does in every
     // other update position (`TargetLedger::graph_management_iri`): `L#<g>`
@@ -3199,19 +3199,20 @@ async fn generate_upsert_deletions(
     // Ledger graph id per graph IRI. None in the value position means the
     // graph is not yet in the ledger registry (new graph in this txn), so
     // there cannot be existing values.
-    let ledger_g_for_txn_g: HashMap<Option<Arc<str>>, Option<u16>> = subject_groups
-        .keys()
-        .map(|(_, graph)| graph.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .map(|graph| {
-            let ledger_g = match &graph {
-                None => Some(0),
-                Some(iri) => ledger.snapshot.graph_registry.graph_id_for_iri(iri),
-            };
-            (graph, ledger_g)
-        })
-        .collect();
+    let ledger_g_for_txn_g: HashMap<Option<Arc<str>>, Option<fluree_db_core::GraphId>> =
+        subject_groups
+            .keys()
+            .map(|(_, graph)| graph.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|graph| {
+                let ledger_g = match &graph {
+                    None => Some(0),
+                    Some(iri) => ledger.snapshot.graph_registry.graph_id_for_iri(iri),
+                };
+                (graph, ledger_g)
+            })
+            .collect();
 
     // Novelty presence, resolved lazily: the per-graph set is built by a
     // filtered overlay walk only when a subject misses the base dictionary
@@ -3236,7 +3237,7 @@ async fn generate_upsert_deletions(
     let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
     let can_decide_absence = binary_store.is_some() || base_index_absent;
 
-    let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
+    let mut per_g_subjects: HashMap<fluree_db_core::GraphId, HashSet<&Sid>> = HashMap::new();
     if can_decide_absence {
         for (subject, txn_g) in subject_groups.keys() {
             if let Some(Some(ledger_g)) = ledger_g_for_txn_g.get(txn_g) {
@@ -3244,7 +3245,7 @@ async fn generate_upsert_deletions(
             }
         }
     }
-    let mut novelty_present: HashMap<u16, HashSet<Sid>> = HashMap::new();
+    let mut novelty_present: HashMap<fluree_db_core::GraphId, HashSet<Sid>> = HashMap::new();
 
     // Persisted presence: the subject reverse dictionary is authoritative
     // under canonical namespace encoding (see `fluree_db_core::ns_encoding`)
@@ -3291,7 +3292,8 @@ async fn generate_upsert_deletions(
     let mut skipped_subjects = 0usize;
 
     for ((subject, graph_id), predicates) in &subject_groups {
-        let ledger_g_id: Option<u16> = ledger_g_for_txn_g.get(graph_id).copied().flatten();
+        let ledger_g_id: Option<fluree_db_core::GraphId> =
+            ledger_g_for_txn_g.get(graph_id).copied().flatten();
 
         // Retraction flakes carry the graph Sid (flake.g). Resolved before any
         // skip so broken graph wiring still surfaces as an error.

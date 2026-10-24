@@ -170,7 +170,7 @@ pub(crate) fn parse_cypher_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
-    overlay: Option<(&dyn OverlayProvider, u16)>,
+    overlay: Option<(&dyn OverlayProvider, fluree_db_core::GraphId)>,
     policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     let ast = substituted_cypher_ast(cypher, params)?;
@@ -267,7 +267,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
     ast: &fluree_db_cypher::CypherAst,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
-    overlay: Option<(&dyn OverlayProvider, u16)>,
+    overlay: Option<(&dyn OverlayProvider, fluree_db_core::GraphId)>,
     policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
@@ -324,7 +324,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
 ///    can't supply the overlay stay conservative.
 fn reified_edges_possible(
     snapshot: &LedgerSnapshot,
-    overlay: Option<(&dyn OverlayProvider, u16)>,
+    overlay: Option<(&dyn OverlayProvider, fluree_db_core::GraphId)>,
 ) -> bool {
     let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::rdf::REIFIES) else {
         return false;
@@ -354,11 +354,11 @@ fn index_has_reified_edges(snapshot: &LedgerSnapshot, reifies_sid: &fluree_db_co
 
 fn overlay_has_reified_edges(
     overlay: &dyn OverlayProvider,
-    g_id: u16,
+    g_id: fluree_db_core::GraphId,
     reifies_sid: &fluree_db_core::Sid,
 ) -> bool {
     use std::sync::OnceLock;
-    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, u16), bool>>;
+    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, fluree_db_core::GraphId), bool>>;
     static CACHE: OnceLock<ReifiesCache> = OnceLock::new();
 
     if overlay.is_effectively_empty() {

@@ -73,6 +73,8 @@ pub struct LedgerSnapshotMetadata {
     /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
     /// canonical contract.
     pub has_list_meta: Option<bool>,
+    /// The root this index's root replaced, by its `prev_index` link.
+    pub prev_index: Option<ContentId>,
 }
 
 /// Database value at a specific point in time.
@@ -173,6 +175,8 @@ pub struct LedgerSnapshot {
     /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
     /// canonical contract.
     pub has_list_meta: Option<bool>,
+    /// The root this index's root replaced, by its `prev_index` link.
+    pub prev_index: Option<ContentId>,
 }
 
 impl Clone for LedgerSnapshot {
@@ -195,6 +199,7 @@ impl Clone for LedgerSnapshot {
             has_annotations: self.has_annotations,
             needs_link_reindex: self.needs_link_reindex,
             has_list_meta: self.has_list_meta,
+            prev_index: self.prev_index.clone(),
         }
     }
 }
@@ -253,6 +258,7 @@ impl LedgerSnapshot {
             // An empty snapshot has no indexed rows, so "no list rows" is
             // exact — everything lives in novelty, which tracks its own bit.
             has_list_meta: Some(false),
+            prev_index: None,
         }
     }
 
@@ -291,6 +297,7 @@ impl LedgerSnapshot {
             has_annotations: meta.has_annotations,
             needs_link_reindex: meta.needs_link_reindex,
             has_list_meta: meta.has_list_meta,
+            prev_index: meta.prev_index,
         })
     }
 
@@ -564,6 +571,9 @@ impl LedgerSnapshot {
 fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata> {
     use crate::stats_wire;
 
+    let inflated = crate::fir6_frame::inflate(bytes)?;
+    let bytes: &[u8] = &inflated;
+
     // Mirror `fluree-db-binary-index` wire format:
     // [magic(4)][version(1)][flags(1)][pad(2)][index_t(8)][base_t(8)] ...
     if bytes.len() < 24 {
@@ -616,6 +626,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
     const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 3;
+    const FLAG_EXT_HAS_POOL: u8 = 1 << 4;
     let flags_ext = bytes[6];
     let has_term_dict_section = flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
@@ -770,9 +781,18 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         Ok(())
     }
 
+    /// A graph id or graph count: 16-bit in `main`'s v2 roots, 32-bit in v5.
+    fn read_graph_width(bytes: &[u8], pos: &mut usize, version: u8) -> std::io::Result<u32> {
+        if version >= 3 {
+            read_u32(bytes, pos)
+        } else {
+            read_u16(bytes, pos).map(u32::from)
+        }
+    }
+
     fn skip_graph_arenas(bytes: &[u8], pos: &mut usize, version: u8) -> std::io::Result<()> {
         // Matches `write_graph_arenas_v5` in binary-index.
-        let _g_id = read_u16(bytes, pos)?;
+        let _g_id = read_graph_width(bytes, pos, version)?;
 
         // numbig
         let nb_count = read_u16(bytes, pos)? as usize;
@@ -853,7 +873,11 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     }
 
     // Small dict inlines
-    let graph_iris = read_string_array(bytes, &mut pos)?;
+    let graph_iri_count = read_graph_width(bytes, &mut pos, version)? as usize;
+    let mut graph_iris = Vec::with_capacity(graph_iri_count.min(bytes.len()));
+    for _ in 0..graph_iri_count {
+        graph_iris.push(read_string(bytes, &mut pos)?);
+    }
     let _datatype_iris = read_string_array(bytes, &mut pos)?;
     let _language_tags = read_string_array(bytes, &mut pos)?;
 
@@ -863,7 +887,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     skip_dict_tree_refs(bytes, &mut pos)?; // string reverse
 
     // Per-graph specialty arenas (skip)
-    let arena_count = read_u16(bytes, &mut pos)? as usize;
+    let arena_count = read_graph_width(bytes, &mut pos, version)? as usize;
     for _ in 0..arena_count {
         skip_graph_arenas(bytes, &mut pos, version)?;
     }
@@ -917,9 +941,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     }
 
     // Named graph routing (skip)
-    let named_count = read_u16(bytes, &mut pos)? as usize;
+    let named_count = read_graph_width(bytes, &mut pos, version)? as usize;
     for _ in 0..named_count {
-        let _g_id = read_u16(bytes, &mut pos)?;
+        let _g_id = read_graph_width(bytes, &mut pos, version)?;
         let order_count = read_u8(bytes, &mut pos)? as usize;
         for _ in 0..order_count {
             let _order_id = read_u8(bytes, &mut pos)?;
@@ -927,11 +951,36 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         }
     }
 
+    // Pool routing (skip)
+    if flags_ext & FLAG_EXT_HAS_POOL != 0 {
+        let member_count = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, member_count * 12, "pool members")?;
+        pos += member_count * 12;
+        let order_count = read_u8(bytes, &mut pos)? as usize;
+        for _ in 0..order_count {
+            let _order_id = read_u8(bytes, &mut pos)?;
+            skip_cid(bytes, &mut pos)?;
+        }
+        let delta_count = read_u8(bytes, &mut pos)? as usize;
+        for _ in 0..delta_count {
+            let _order_id = read_u8(bytes, &mut pos)?;
+            let run_count = read_u16(bytes, &mut pos)? as usize;
+            for _ in 0..run_count {
+                skip_cid(bytes, &mut pos)?;
+                ensure(bytes, pos, 4, "pool delta run")?;
+                pos += 4;
+            }
+        }
+    }
+
     // Optional sections
     let stats = if flags & FLAG_HAS_STATS != 0 {
         let stats_len = read_u32(bytes, &mut pos)? as usize;
         ensure(bytes, pos, stats_len, "stats section")?;
-        let (s, _consumed) = stats_wire::decode_stats(&bytes[pos..pos + stats_len])?;
+        let (s, _consumed) = stats_wire::decode_stats(
+            &bytes[pos..pos + stats_len],
+            stats_wire::GraphWidth::for_root_version(version),
+        )?;
         pos += stats_len;
         Some(Arc::new(s))
     } else {
@@ -948,10 +997,21 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         None
     };
 
-    if flags & FLAG_HAS_PREV_INDEX != 0 {
+    let prev_index = if flags & FLAG_HAS_PREV_INDEX != 0 {
         let _t = read_i64(bytes, &mut pos)?;
-        skip_cid(bytes, &mut pos)?;
-    }
+        let len = read_u16(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, len, "prev index cid")?;
+        let id = ContentId::from_bytes(&bytes[pos..pos + len]).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("prev index cid: {e}"),
+            )
+        })?;
+        pos += len;
+        Some(id)
+    } else {
+        None
+    };
     if flags & FLAG_HAS_GARBAGE != 0 {
         skip_cid(bytes, &mut pos)?;
     }
@@ -995,6 +1055,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         has_annotations,
         needs_link_reindex: has_annotations && !has_term_dict_section,
         has_list_meta,
+        prev_index,
     })
 }
 
@@ -1057,6 +1118,7 @@ mod tests {
             has_annotations: false,
             needs_link_reindex: false,
             has_list_meta: None,
+            prev_index: None,
         })
         .unwrap();
 

@@ -140,7 +140,7 @@ fn exact_count_by_predicate_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
 ) -> Result<Option<Vec<(u32, i64)>>> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Post) else {
+    let Some(branch) = store.dedicated_branch(g_id, RunSortOrder::Post) else {
         return Ok(None);
     };
 

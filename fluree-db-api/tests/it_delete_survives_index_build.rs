@@ -30,7 +30,7 @@ use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, LedgerState, TransactRes
 use fluree_db_binary_index::format::branch::{build_branch_bytes, read_branch_from_bytes};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::IndexRoot;
-use fluree_db_core::{ContentId, ContentKind};
+use fluree_db_core::{ContentId, ContentKind, GraphId};
 use serde_json::{json, Value as JsonValue};
 use std::path::Path;
 
@@ -506,7 +506,7 @@ async fn published_root(fluree: &Fluree, id: &str) -> (i64, IndexRoot) {
 }
 
 /// Every `(g_id, order)` in the published root whose branch has no leaves.
-async fn orders_without_leaves(fluree: &Fluree, id: &str) -> Vec<(u16, RunSortOrder)> {
+async fn orders_without_leaves(fluree: &Fluree, id: &str) -> Vec<(GraphId, RunSortOrder)> {
     let (_, root) = published_root(fluree, id).await;
     let store = fluree.content_store(
         &fluree
@@ -514,7 +514,7 @@ async fn orders_without_leaves(fluree: &Fluree, id: &str) -> Vec<(u16, RunSortOr
             .await
             .expect("storage namespace"),
     );
-    let mut empty: Vec<(u16, RunSortOrder)> = root
+    let mut empty: Vec<(GraphId, RunSortOrder)> = root
         .default_graph_orders
         .iter()
         .filter(|o| o.leaves.is_empty())
@@ -536,7 +536,7 @@ async fn orders_without_leaves(fluree: &Fluree, id: &str) -> Vec<(u16, RunSortOr
 }
 
 /// The `g_id` of `graph`, or 0 for the default graph.
-async fn graph_id(fluree: &Fluree, id: &str, graph: Option<&str>) -> u16 {
+async fn graph_id(fluree: &Fluree, id: &str, graph: Option<&str>) -> GraphId {
     match graph {
         None => 0,
         Some(iri) => fluree
@@ -551,7 +551,7 @@ async fn graph_id(fluree: &Fluree, id: &str, graph: Option<&str>) -> u16 {
 }
 
 /// Give `g_id` a SPOT branch with no leaves, as every writer writes one.
-async fn empty_spot(fluree: &Fluree, id: &str, root: &mut IndexRoot, g_id: u16) {
+async fn empty_spot(fluree: &Fluree, id: &str, root: &mut IndexRoot, g_id: GraphId) {
     use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
     let spot = RunSortOrder::Spot;
     if g_id == 0 {
@@ -575,6 +575,10 @@ async fn empty_spot(fluree: &Fluree, id: &str, root: &mut IndexRoot, g_id: u16) 
         )
         .await
         .expect("put branch");
+    // An older import pooled no graph.
+    if let Some(pool) = root.pool.as_mut() {
+        pool.members.retain(|m| m.g_id != g_id);
+    }
     match root.named_graphs.iter_mut().find(|ng| ng.g_id == g_id) {
         Some(ng) => {
             ng.orders.retain(|(order, _)| *order != spot);
@@ -602,6 +606,8 @@ async fn publish_root(fluree: &Fluree, id: &str, t: i64, root: &IndexRoot) {
     support::publish_built_index(fluree, id, t, &root_id).await;
 }
 
+/// An incremental build that keeps every named graph in trees of its own,
+/// which the caller then rewrites.
 async fn incremental_build(
     fluree: &Fluree,
     id: &str,
@@ -612,10 +618,17 @@ async fn incremental_build(
         .await
         .expect("nameservice lookup")
         .expect("ledger record");
+    let config = fluree_db_indexer::IndexerConfig {
+        graph_placement: fluree_db_core::ledger_config::GraphPlacementIntent {
+            default: fluree_db_core::ledger_config::GraphPlacement::Dedicated,
+            overrides: Vec::new(),
+        },
+        ..Default::default()
+    };
     fluree_db_indexer::build_incremental_index_for_record(
         fluree.content_store(&record.storage_namespace()),
         &record,
-        fluree_db_indexer::IndexerConfig::default(),
+        config,
     )
     .await
 }

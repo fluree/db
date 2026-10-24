@@ -2454,6 +2454,8 @@ mod tests {
             v3_uploaded: UploadedIndexes {
                 default_graph_orders: Vec::new(),
                 named_graphs: Vec::new(),
+                pool_orders: Vec::new(),
+                pool_members: Vec::new(),
             },
             graph_arenas: Vec::new(),
             datatype_iris: Vec::new(),
@@ -2467,6 +2469,7 @@ mod tests {
             sketch_ref: None,
             prev_index,
             term_dict: None,
+            pooled_graphs: Vec::new(),
         }
     }
 

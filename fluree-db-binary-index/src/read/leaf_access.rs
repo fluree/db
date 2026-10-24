@@ -24,8 +24,8 @@ use fluree_db_core::{ContentBytes, ContentId};
 use crate::format::column_block::{ColumnBlockRef, ColumnId, COLUMN_BLOCK_REF_SIZE};
 use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
 use crate::format::leaf::{
-    decode_leaf_dir_v3_with_base, decode_leaf_header_v3, DecodedLeafDirV3, LeafletDirEntryV3,
-    LEAF_V3_HEADER_SIZE,
+    decode_leaf_dir_v3_with_base, decode_leaf_header_v3, leaf_header_size, leaflet_dir_fixed_size,
+    DecodedLeafDirV3, LeafletDirEntryV3, LEAFLET_DIR_HISTORY_SIZE,
 };
 use crate::format::run_record::RunSortOrder;
 
@@ -592,6 +592,26 @@ impl LeafHandle for RangeReadLeafHandle {
             ColumnData::AbsentDefault
         };
 
+        // Pooled-tree leaflets only; dedicated trees have no graph block. Its
+        // width is the leaflet's own (2 or 4 bytes).
+        let g_ref = entry
+            .column_refs
+            .iter()
+            .find(|r| r.col_id == ColumnId::GId.to_u16())
+            .filter(|_| eff.contains(ColumnId::GId));
+        let g_id = match g_ref {
+            Some(r) if r.elem_width == 4 => {
+                ColumnData::Block(Arc::from(find_and_decode_u32(ColumnId::GId)?))
+            }
+            Some(_) => ColumnData::Block(
+                find_and_decode_u16_col(ColumnId::GId)?
+                    .into_iter()
+                    .map(u32::from)
+                    .collect(),
+            ),
+            None => ColumnData::AbsentDefault,
+        };
+
         Ok(ColumnBatch {
             row_count,
             s_id,
@@ -600,12 +620,11 @@ impl LeafHandle for RangeReadLeafHandle {
             o_type,
             o_i,
             t,
+            g_id,
         })
     }
 
     fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
-        use crate::format::history_sidecar::HIST_ENTRY_V2_SIZE;
-
         let entry = &self.dir.entries[leaflet_idx];
         if entry.history_len == 0 {
             return Ok(Vec::new());
@@ -623,23 +642,7 @@ impl LeafHandle for RangeReadLeafHandle {
         let end = offset + entry.history_len as u64;
         let bytes = self.fetcher.fetch_range(sidecar_cid, offset..end)?;
 
-        // Segment format: 4-byte entry_count (u32 LE) followed by
-        // entry_count × 31-byte HistEntryV2 records, sorted by t descending.
-        if bytes.len() < 4 {
-            return Ok(Vec::new());
-        }
-        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let mut entries = Vec::with_capacity(entry_count);
-        let mut pos = 4;
-        for _ in 0..entry_count {
-            if pos + HIST_ENTRY_V2_SIZE > bytes.len() {
-                break;
-            }
-            entries.push(HistEntryV2::read_le(&bytes[pos..])?);
-
-            pos += HIST_ENTRY_V2_SIZE;
-        }
-        Ok(entries)
+        crate::format::history_sidecar::decode_segment_bytes(&bytes)
     }
 
     fn sidecar_bytes(&self) -> Option<&[u8]> {
@@ -661,9 +664,13 @@ impl LeafHandle for RangeReadLeafHandle {
 /// over-reading a small leaf's payload costs nothing next to a second trip.
 pub(crate) const SPECULATIVE_HEADER_DIR_BYTES: u64 = 64 * 1024;
 
-/// Largest directory entry: 80 fixed + a ref per column + 20 history bytes.
-const MAX_DIR_ENTRY_BYTES: u64 =
-    80 + crate::format::column_block::ColumnId::COUNT as u64 * COLUMN_BLOCK_REF_SIZE as u64 + 20;
+/// Largest directory entry for `order`: its fixed fields, a ref per column,
+/// and the history ref.
+fn max_dir_entry_bytes(order: RunSortOrder) -> u64 {
+    (leaflet_dir_fixed_size(order)
+        + ColumnId::COUNT * COLUMN_BLOCK_REF_SIZE
+        + LEAFLET_DIR_HISTORY_SIZE) as u64
+}
 
 /// Fetch enough of a V3 leaf blob to decode the header and full directory.
 ///
@@ -685,7 +692,8 @@ pub fn fetch_header_and_directory(
         let whole = ((buf.len() as u64) < SPECULATIVE_HEADER_DIR_BYTES).then_some(buf);
         return Ok((dir, payload_base, whole));
     }
-    let upper = LEAF_V3_HEADER_SIZE as u64 + header.leaflet_count as u64 * MAX_DIR_ENTRY_BYTES;
+    let upper = leaf_header_size(header.order) as u64
+        + header.leaflet_count as u64 * max_dir_entry_bytes(header.order);
     if upper > buf.len() as u64 {
         buf = fetcher.fetch_range(leaf_cid, 0..upper)?;
     }
@@ -891,7 +899,8 @@ mod tests {
                 o_key: 100,
                 o_i: u32::MAX,
                 t: 5,
-                op: 1, // assert
+                op: 1, // assert,
+                g_id: 0,
             },
             HistEntryV2 {
                 s_id: SubjectId(1),
@@ -900,7 +909,8 @@ mod tests {
                 o_key: 50,
                 o_i: u32::MAX,
                 t: 3,
-                op: 0, // retract
+                op: 0, // retract,
+                g_id: 0,
             },
         ];
         let mut builder = HistSidecarBuilder::new();
@@ -977,7 +987,8 @@ mod tests {
             o_key: 200,
             o_i: u32::MAX,
             t: 10,
-            op: 1, // assert
+            op: 1, // assert,
+            g_id: 0,
         }];
         let mut builder = HistSidecarBuilder::new();
         builder.start_leaflet();

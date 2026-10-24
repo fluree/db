@@ -236,6 +236,7 @@ pub type TranslatedOverlayCache = Arc<
 ///
 /// When `dataset` is `None`, this is single-db mode and operators use `active_snapshot`/`overlay()`/`to_t`.
 ///
+#[derive(Clone)]
 pub struct ExecutionContext<'a> {
     /// The snapshot used for data access in the current execution scope.
     ///
@@ -1255,8 +1256,8 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// True when the active scope resolves to exactly one graph and that
-    /// graph carries no novelty overlay (never had one, or drained by an
-    /// index swap).
+    /// graph carries no novelty overlay (never had one, drained by an index
+    /// swap, or holding rows only for other graphs).
     ///
     /// The batched join/probe helpers (`flush_batched_*_binary`,
     /// `batched_subject_probe_binary`, `batched_subject_star_spot`) read base
@@ -1265,13 +1266,15 @@ impl<'a> ExecutionContext<'a> {
     /// leaflet-probe path must check this and fall back to the per-row scan
     /// (whose binary cursor merges the overlay) when it returns `false`.
     pub fn overlay_free_single_graph(&self) -> bool {
-        fn overlay_free(overlay: &dyn OverlayProvider) -> bool {
-            overlay.epoch() == 0 || overlay.is_effectively_empty()
+        fn overlay_free(overlay: &dyn OverlayProvider, g_id: GraphId) -> bool {
+            overlay.epoch() == 0
+                || overlay.is_effectively_empty()
+                || overlay.overlay_flake_count(g_id) == Some(0)
         }
         match self.active_graphs() {
-            ActiveGraphs::Single => overlay_free(self.overlay()),
+            ActiveGraphs::Single => overlay_free(self.overlay(), self.binary_g_id),
             ActiveGraphs::Many(graphs) => match graphs.as_slice() {
-                [g] => overlay_free(g.overlay),
+                [g] => overlay_free(g.overlay, g.g_id),
                 _ => false,
             },
         }

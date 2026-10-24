@@ -202,6 +202,13 @@ pub trait OverlayProvider: Send + Sync {
         None
     }
 
+    /// The graphs this overlay holds flakes for, when the implementation can
+    /// list them without walking flakes. `None` (the default) means unknown:
+    /// a caller must then assume any graph may have changed.
+    fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
+        None
+    }
+
     /// Segment metadata for `g_id`, in segment (commit) order.
     ///
     /// Enables a per-segment translation cache (only newly-appended segments
@@ -257,6 +264,10 @@ impl OverlayProvider for NoOverlay {
 
     fn is_effectively_empty(&self) -> bool {
         true
+    }
+
+    fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
+        Some(Vec::new())
     }
 
     fn list_predicates(&self) -> Option<std::sync::Arc<std::collections::HashSet<Sid>>> {

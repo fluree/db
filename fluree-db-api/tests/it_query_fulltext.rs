@@ -777,7 +777,7 @@ async fn fulltext_unconfigured_plain_string_returns_empty() {
 ///
 /// This test exercises `build_index_for_ledger` directly, which is what the
 /// CLI and background worker use, with the api-side
-/// `FulltextConfigProvider` attached.
+/// `LedgerConfigProvider` attached.
 #[tokio::test]
 async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
     use fluree_db_api::ReindexOptions;
@@ -846,7 +846,7 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
     // 3) Invoke the same indexing entry point the CLI / background worker
     //    use — `build_index_for_ledger` — with a provider-attached config.
     let idx_config = fluree_db_indexer::IndexerConfig::default()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        .with_ledger_config_provider(fluree.ledger_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
         fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
@@ -890,7 +890,7 @@ async fn fulltext_configured_property_picked_up_by_build_index_for_ledger() {
 
 /// Reproducer for the Solo bug report (2026-04-23): first-ever index build via
 /// the background / provider path must pick up `f:fullTextDefaults` from
-/// novelty. Before the fix, `ApiFulltextConfigProvider::resolve()` called
+/// novelty. Before the fix, `ApiLedgerConfigProvider::resolve()` called
 /// `resolve_ledger_config(snapshot, novelty, snapshot.t)` with
 /// `snapshot.t == 0` (genesis), which filtered out all novelty flakes and
 /// returned an empty configured-property list.
@@ -955,7 +955,7 @@ async fn fulltext_configured_property_first_build_via_provider() {
     //    the background worker on a freshly-committed ledger with no prior
     //    index. Uses `build_index_for_ledger`.
     let idx_config = fluree_db_indexer::IndexerConfig::default()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        .with_ledger_config_provider(fluree.ledger_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
         fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
@@ -1055,7 +1055,7 @@ async fn fulltext_configured_langtagged_literal_scores_via_arena() {
 
     // Build index via the provider path (same as background worker).
     let idx_config = fluree_db_indexer::IndexerConfig::default()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        .with_ledger_config_provider(fluree.ledger_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
         fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
@@ -1162,7 +1162,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
 
     // Initial full build.
     let idx_config = fluree_db_indexer::IndexerConfig::default()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        .with_ledger_config_provider(fluree.ledger_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
         fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
@@ -1207,7 +1207,7 @@ async fn fulltext_configured_incremental_adds_to_arena() {
     // Incremental build — same provider, should route the new value through
     // the fulltext hook and extend the arena.
     let idx_config = fluree_db_indexer::IndexerConfig::default()
-        .with_fulltext_config_provider(fluree.fulltext_config_provider());
+        .with_ledger_config_provider(fluree.ledger_config_provider());
     let result = fluree_db_indexer::build_index_for_ledger(
         fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
         fluree.nameservice(),
@@ -1693,7 +1693,7 @@ async fn fulltext_configured_persisted_incremental_extends_arena() {
         let _ = ledger;
 
         let idx_config = fluree_db_indexer::IndexerConfig::default()
-            .with_fulltext_config_provider(fluree.fulltext_config_provider());
+            .with_ledger_config_provider(fluree.ledger_config_provider());
         let result = fluree_db_indexer::build_index_for_ledger(
             fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap()),
             fluree.nameservice(),

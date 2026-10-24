@@ -3490,7 +3490,7 @@ pub fn build_where_operators_seeded_with_needed(
                             *planning,
                         ))
                     }
-                    _ => Box::new(crate::graph::GraphOperator::new(
+                    _ => Box::new(crate::quad_block::QuadBlockOperator::new(
                         child,
                         name.clone(),
                         inner_patterns.clone(),

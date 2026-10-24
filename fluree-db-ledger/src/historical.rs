@@ -506,6 +506,12 @@ impl OverlayProvider for HistoricalLedgerView {
             .map_or(Some(0), |n| n.overlay_flake_count(g_id))
     }
 
+    fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
+        self.overlay
+            .as_ref()
+            .map_or(Some(Vec::new()), |n| n.overlay_graph_ids())
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

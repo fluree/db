@@ -21,6 +21,10 @@
 //! entry_count: u32
 //! [HistEntryV2 × entry_count]   — sorted by t descending (newest first)
 //! ```
+//!
+//! A pooled tree's sidecar (version 2) appends each entry's graph, so its
+//! entries are [`HIST_ENTRY_V2_G_SIZE`] bytes; a segment's entry width follows
+//! from its length and count.
 
 use fluree_db_core::subject_id::SubjectId;
 
@@ -29,6 +33,9 @@ pub const SIDECAR_MAGIC: &[u8; 4] = b"FHS1";
 
 /// Sidecar format version.
 pub const SIDECAR_VERSION: u8 = 1;
+
+/// Sidecar format version whose entries carry their graph (pooled trees).
+pub const SIDECAR_VERSION_GRAPH: u8 = 2;
 
 /// Header size (magic + version + padding).
 pub const SIDECAR_HEADER_SIZE: usize = 8;
@@ -47,6 +54,10 @@ pub const SIDECAR_HEADER_SIZE: usize = 8;
 /// ```
 pub const HIST_ENTRY_V2_SIZE: usize = 31;
 
+/// Wire size of an entry that carries its graph: the 31 bytes above, then
+/// `g_id: u32 [31..35]`.
+pub const HIST_ENTRY_V2_G_SIZE: usize = 35;
+
 /// A single history entry for the V2/V3 index format.
 ///
 /// Records a past assert or retract event for time-travel replay.
@@ -62,6 +73,9 @@ pub struct HistEntryV2 {
     pub t: u32,
     /// 0 = retract, 1 = assert.
     pub op: u8,
+    /// Graph of the fact; on the wire only in a pooled tree's sidecar, 0
+    /// elsewhere.
+    pub g_id: fluree_db_core::GraphId,
 }
 
 impl HistEntryV2 {
@@ -100,8 +114,88 @@ impl HistEntryV2 {
             o_i: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
             t: u32::from_le_bytes(buf[26..30].try_into().unwrap()),
             op: buf[30],
+            g_id: 0,
         })
     }
+
+    /// Write `width` bytes: [`HIST_ENTRY_V2_G_SIZE`] appends the graph.
+    pub fn write_le_width(&self, buf: &mut [u8], width: usize) {
+        self.write_le(buf);
+        if width == HIST_ENTRY_V2_G_SIZE {
+            buf[31..35].copy_from_slice(&self.g_id.to_le_bytes());
+        }
+    }
+
+    /// Read a `width`-byte entry (see [`Self::write_le_width`]).
+    pub fn read_le_width(buf: &[u8], width: usize) -> std::io::Result<Self> {
+        let mut entry = Self::read_le(buf)?;
+        if width == HIST_ENTRY_V2_G_SIZE {
+            let g = buf.get(31..35).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "HistEntryV2 with graph requires 35 bytes",
+                )
+            })?;
+            entry.g_id = u32::from_le_bytes(g.try_into().unwrap());
+        }
+        Ok(entry)
+    }
+}
+
+/// Every entry of a whole sidecar blob, segment by segment (the segments sit
+/// back to back after the header).
+pub fn decode_sidecar_entries(bytes: &[u8]) -> std::io::Result<Vec<HistEntryV2>> {
+    if bytes.len() < SIDECAR_HEADER_SIZE || bytes[0..4] != *SIDECAR_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "history sidecar: bad header",
+        ));
+    }
+    let width = if bytes[4] == SIDECAR_VERSION_GRAPH {
+        HIST_ENTRY_V2_G_SIZE
+    } else {
+        HIST_ENTRY_V2_SIZE
+    };
+    let mut out = Vec::new();
+    let mut pos = SIDECAR_HEADER_SIZE;
+    while pos + 4 <= bytes.len() {
+        let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let end = pos + 4 + count * width;
+        if end > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "history sidecar: truncated segment",
+            ));
+        }
+        out.extend(decode_segment_bytes(&bytes[pos..end])?);
+        pos = end;
+    }
+    Ok(out)
+}
+
+/// Decode one segment's bytes (count prefix, then entries), taking the entry
+/// width from the segment's own length.
+pub fn decode_segment_bytes(bytes: &[u8]) -> std::io::Result<Vec<HistEntryV2>> {
+    let Some(count) = bytes.get(0..4) else {
+        return Ok(Vec::new());
+    };
+    let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let body = bytes.len() - 4;
+    let width = [HIST_ENTRY_V2_SIZE, HIST_ENTRY_V2_G_SIZE]
+        .into_iter()
+        .find(|w| body == count * w)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("history segment of {body} bytes does not hold {count} entries"),
+            )
+        })?;
+    (0..count)
+        .map(|i| HistEntryV2::read_le_width(&bytes[4 + i * width..], width))
+        .collect()
 }
 
 /// Per-leaflet history segment info (offset and length into the sidecar blob).
@@ -124,12 +218,23 @@ pub struct HistorySegmentRef {
 pub struct HistSidecarBuilder {
     /// One entry vec per leaflet.
     leaflet_entries: Vec<Vec<HistEntryV2>>,
+    /// Entries carry their graph (a pooled tree's sidecar).
+    with_graph: bool,
 }
 
 impl HistSidecarBuilder {
     pub fn new() -> Self {
         Self {
             leaflet_entries: Vec::new(),
+            with_graph: false,
+        }
+    }
+
+    /// A builder for a leaf of `order`: pooled orders keep each entry's graph.
+    pub fn for_order(order: crate::format::run_record::RunSortOrder) -> Self {
+        Self {
+            leaflet_entries: Vec::new(),
+            with_graph: order.is_pooled(),
         }
     }
 
@@ -162,7 +267,12 @@ impl HistSidecarBuilder {
 
         // Header.
         out.extend_from_slice(SIDECAR_MAGIC);
-        out.push(SIDECAR_VERSION);
+        let (version, width) = if self.with_graph {
+            (SIDECAR_VERSION_GRAPH, HIST_ENTRY_V2_G_SIZE)
+        } else {
+            (SIDECAR_VERSION, HIST_ENTRY_V2_SIZE)
+        };
+        out.push(version);
         out.extend_from_slice(&[0u8; 3]); // padding
 
         let mut segment_refs = Vec::with_capacity(self.leaflet_entries.len());
@@ -192,8 +302,8 @@ impl HistSidecarBuilder {
             out.extend_from_slice(&entry_count.to_le_bytes());
             for entry in entries.iter() {
                 let start = out.len();
-                out.resize(start + HIST_ENTRY_V2_SIZE, 0);
-                entry.write_le(&mut out[start..]);
+                out.resize(start + width, 0);
+                entry.write_le_width(&mut out[start..], width);
             }
 
             let len = (out.len() as u64 - offset) as u32;
@@ -237,8 +347,7 @@ pub fn decode_history_segment(
             ),
         ));
     }
-    let entry_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-    let required = offset + 4 + entry_count * HIST_ENTRY_V2_SIZE;
+    let required = offset + seg.len as usize;
     if required > data.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -249,13 +358,7 @@ pub fn decode_history_segment(
             ),
         ));
     }
-    let mut entries = Vec::with_capacity(entry_count);
-    let mut pos = offset + 4;
-    for _ in 0..entry_count {
-        entries.push(HistEntryV2::read_le(&data[pos..])?);
-        pos += HIST_ENTRY_V2_SIZE;
-    }
-    Ok(entries)
+    decode_segment_bytes(&data[offset..required])
 }
 
 #[cfg(test)]
@@ -273,6 +376,7 @@ mod tests {
             o_i: u32::MAX,
             t,
             op,
+            g_id: 0,
         }
     }
 
@@ -286,11 +390,77 @@ mod tests {
             o_i: 3,
             t: 7,
             op: 1,
+            g_id: 0,
         };
         let mut buf = [0u8; HIST_ENTRY_V2_SIZE];
         entry.write_le(&mut buf);
         let decoded = HistEntryV2::read_le(&buf).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn a_pooled_sidecar_keeps_each_entry_graph() {
+        use crate::format::run_record::RunSortOrder;
+        let entry = |g_id, t| HistEntryV2 {
+            g_id,
+            ..make_entry(1, 10, OType::XSD_INTEGER.as_u16(), 100, t, 1)
+        };
+        let mut builder = HistSidecarBuilder::for_order(RunSortOrder::Gspo);
+        builder.start_leaflet();
+        builder.push_entry(entry(7, 3));
+        builder.push_entry(entry(300, 5));
+        let (bytes, refs) = builder.build();
+        assert_eq!(bytes[4], SIDECAR_VERSION_GRAPH);
+        assert_eq!(refs[0].len as usize, 4 + 2 * HIST_ENTRY_V2_G_SIZE);
+        let decoded = decode_history_segment(&bytes, &refs[0]).unwrap();
+        assert_eq!(decoded, vec![entry(300, 5), entry(7, 3)]);
+        let at = refs[0].offset as usize;
+        assert_eq!(
+            decode_segment_bytes(&bytes[at..at + refs[0].len as usize]).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
+    fn a_whole_sidecar_decodes_segment_by_segment() {
+        use crate::format::run_record::RunSortOrder;
+        let entry = |g_id, t| HistEntryV2 {
+            g_id,
+            ..make_entry(1, 10, OType::XSD_INTEGER.as_u16(), 100, t, 1)
+        };
+        let mut builder = HistSidecarBuilder::for_order(RunSortOrder::Gspo);
+        builder.start_leaflet();
+        builder.push_entry(entry(7, 3));
+        builder.start_leaflet();
+        builder.start_leaflet();
+        builder.push_entry(entry(9, 4));
+        builder.push_entry(entry(9, 6));
+        let (bytes, _) = builder.build();
+        assert_eq!(
+            decode_sidecar_entries(&bytes).unwrap(),
+            vec![entry(7, 3), entry(9, 6), entry(9, 4)]
+        );
+    }
+
+    #[test]
+    fn a_dedicated_sidecar_is_unchanged() {
+        use crate::format::run_record::RunSortOrder;
+        let build = |mut builder: HistSidecarBuilder| {
+            builder.start_leaflet();
+            builder.push_entry(make_entry(1, 10, OType::XSD_INTEGER.as_u16(), 100, 3, 1));
+            builder.build()
+        };
+        let (bytes, refs) = build(HistSidecarBuilder::for_order(RunSortOrder::Spot));
+        assert_eq!(bytes, build(HistSidecarBuilder::new()).0);
+        assert_eq!(bytes[4], SIDECAR_VERSION);
+        assert_eq!(refs[0].len as usize, 4 + HIST_ENTRY_V2_SIZE);
+    }
+
+    #[test]
+    fn a_segment_whose_length_fits_no_entry_width_is_rejected() {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        bytes.resize(4 + 2 * HIST_ENTRY_V2_SIZE + 1, 0);
+        assert!(decode_segment_bytes(&bytes).is_err());
     }
 
     #[test]

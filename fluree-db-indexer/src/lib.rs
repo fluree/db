@@ -47,8 +47,8 @@ pub mod stats;
 
 // Re-export main types
 pub use config::{
-    ConfiguredFulltextProperty, ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig,
-    WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
+    ConfiguredFulltextProperty, ConfiguredFulltextScope, IndexerConfig, LedgerConfigProvider,
+    LedgerIndexingConfig, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
@@ -157,13 +157,17 @@ pub async fn build_index_for_record_with_tracker(
     );
     let ledger_id = record.ledger_id.as_str();
 
-    // If a config provider is attached, let it refresh the per-run
-    // `fulltext_configured_properties` from the live ledger state. This is
-    // the hook that keeps background / incremental indexing in sync with
-    // `f:fullTextDefaults` changes committed after process start.
-    if let Some(provider) = config.fulltext_config_provider.clone() {
-        config.fulltext_configured_properties =
-            provider.fulltext_configured_properties(ledger_id).await;
+    // If a config provider is attached, let it refresh the per-run indexing
+    // config from the live ledger state. This is the hook that keeps
+    // background / incremental indexing in sync with `f:fullTextDefaults` and
+    // `f:graphPlacement` changes committed after process start.
+    if let Some(provider) = config.ledger_config_provider.clone() {
+        let LedgerIndexingConfig {
+            fulltext_properties,
+            graph_placement,
+        } = provider.indexing_config(ledger_id).await;
+        config.fulltext_configured_properties = fulltext_properties;
+        config.graph_placement = graph_placement;
     }
     let correlation = crate::orchestrator::current_index_request_correlation();
     let span = tracing::debug_span!(
@@ -427,6 +431,24 @@ pub async fn build_incremental_index_for_record(
     config: IndexerConfig,
 ) -> Result<IndexResult> {
     incremental_index(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
+/// Fold a ledger's pooled delta runs into their bases at its current index
+/// `t`, with no new commits; `None` when its index holds no delta. The
+/// result publishes at an unchanged `t`, which needs an equal-`t` publish.
+pub async fn compact_pool_deltas_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<Option<IndexResult>> {
+    build::incremental::compact_pool_deltas(
         content_store,
         fluree_db_core::tracking::Tracker::disabled(),
         record.ledger_id.as_str(),

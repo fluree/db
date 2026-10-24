@@ -13,7 +13,7 @@
 
 use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{same_identity_v2, RunRecordV2};
+use fluree_db_binary_index::format::run_record_v2::{identity_v2_for_order, RunRecordV2};
 use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_binary_index::read::column_types::ColumnBatch;
 use fluree_db_core::subject_id::SubjectId;
@@ -21,6 +21,11 @@ use std::cmp::Ordering;
 
 /// Sentinel for o_i when no list index is present.
 const OI_NONE: u32 = u32::MAX;
+
+/// Novelty op marking an identity of a graph leaving the pool. It routes the
+/// merge to every leaflet holding that graph (see [`MergeInput::purge`]) and
+/// otherwise contributes nothing: no row, no history, no match.
+pub const OP_PURGE: u8 = 2;
 
 // ============================================================================
 // MergeInput / MergeOutput
@@ -48,6 +53,9 @@ pub struct MergeInput<'a> {
     pub superseded_ops: &'a [u8],
     /// Sort order (determines merge comparison).
     pub order: RunSortOrder,
+    /// Pooled tree only: graphs leaving the pool, sorted. Their rows and
+    /// history are dropped from the leaflet.
+    pub purge: &'a [fluree_db_core::GraphId],
 }
 
 /// Output of the V3 novelty merge.
@@ -71,8 +79,8 @@ pub struct MergeOutput {
 /// Extract a `RunRecordV2` from a `ColumnBatch` at the given row index.
 ///
 /// This reconstitutes a full record from the columnar representation.
-/// `g_id` is set to 0 (not relevant for incremental merge; the caller
-/// knows which graph this leaflet belongs to).
+/// `g_id` comes from the graph column, which only a pooled leaflet has; a
+/// dedicated leaflet's rows read 0 (the caller knows the graph).
 #[inline]
 fn batch_row_to_record(batch: &ColumnBatch, row: usize) -> RunRecordV2 {
     RunRecordV2 {
@@ -82,7 +90,7 @@ fn batch_row_to_record(batch: &ColumnBatch, row: usize) -> RunRecordV2 {
         t: batch.t.get_or(row, 0),
         o_i: batch.o_i.get_or(row, OI_NONE),
         o_type: batch.o_type.get(row),
-        g_id: 0,
+        g_id: batch.g_id.get_or(row, 0),
     }
 }
 
@@ -97,6 +105,7 @@ fn record_to_hist_entry(rec: &RunRecordV2, op: u8) -> HistEntryV2 {
         o_i: rec.o_i,
         t: rec.t,
         op,
+        g_id: rec.g_id,
     }
 }
 
@@ -111,6 +120,7 @@ fn batch_row_to_hist_entry(batch: &ColumnBatch, row: usize, op: u8) -> HistEntry
         o_i: batch.o_i.get_or(row, OI_NONE),
         t: batch.t.get_or(row, 0),
         op,
+        g_id: batch.g_id.get_or(row, 0),
     }
 }
 
@@ -138,7 +148,7 @@ fn cmp_batch_row_vs_record(
     let o_i = batch.o_i.get_or(row, OI_NONE);
 
     let rec_s_id = rec.s_id.as_u64();
-    match order {
+    let base = match order.base() {
         RunSortOrder::Spot => s_id
             .cmp(&rec_s_id)
             .then(p_id.cmp(&rec.p_id))
@@ -157,12 +167,18 @@ fn cmp_batch_row_vs_record(
             .then(o_key.cmp(&rec.o_key))
             .then(o_i.cmp(&rec.o_i))
             .then(s_id.cmp(&rec_s_id)),
-        RunSortOrder::Opst => o_type
+        _ => o_type
             .cmp(&rec.o_type)
             .then(o_key.cmp(&rec.o_key))
             .then(o_i.cmp(&rec.o_i))
             .then(p_id.cmp(&rec.p_id))
             .then(s_id.cmp(&rec_s_id)),
+    };
+    let g_id = batch.g_id.get_or(row, 0);
+    match order {
+        RunSortOrder::Gspo => g_id.cmp(&rec.g_id).then(base),
+        o if o.is_pooled() => base.then(g_id.cmp(&rec.g_id)),
+        _ => base,
     }
 }
 
@@ -259,10 +275,25 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     let mut si = 0usize; // superseded index
                          // Scratch: one identity's full event sequence, reused across identities.
     let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
+    let purged = |row: usize| {
+        !input.purge.is_empty()
+            && input
+                .purge
+                .binary_search(&input.batch.g_id.get_or(row, 0))
+                .is_ok()
+    };
 
     while ei < existing_len && ni < novelty_len {
+        if purged(ei) {
+            ei += 1;
+            continue;
+        }
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
+        if op == OP_PURGE {
+            ni += 1;
+            continue;
+        }
         let cmp = cmp_batch_row_vs_record(input.batch, ei, nov, input.order);
 
         match cmp {
@@ -280,6 +311,7 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
                     nov,
                     op,
                     &mut events,
+                    input.order,
                 );
                 push_transition_entries(&mut events, false, &mut new_history);
                 if op == 1 {
@@ -302,6 +334,7 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
                     nov,
                     op,
                     &mut events,
+                    input.order,
                 );
                 let changed = push_transition_entries(&mut events, true, &mut new_history);
                 if op == 1 {
@@ -328,7 +361,9 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
 
     // Drain remaining existing rows.
     while ei < existing_len {
-        out.push(batch_row_to_record(input.batch, ei));
+        if !purged(ei) {
+            out.push(batch_row_to_record(input.batch, ei));
+        }
         ei += 1;
     }
 
@@ -337,6 +372,10 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     while ni < novelty_len {
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
+        if op == OP_PURGE {
+            ni += 1;
+            continue;
+        }
         gather_identity_events(
             input.superseded,
             input.superseded_ops,
@@ -344,6 +383,7 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
             nov,
             op,
             &mut events,
+            input.order,
         );
         push_transition_entries(&mut events, false, &mut new_history);
         if op == 1 {
@@ -362,7 +402,17 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
         "every superseded event's identity must have a winner in this leaflet's novelty"
     );
 
-    let history = assemble_history(new_history, input.existing_history);
+    let history = if input.purge.is_empty() {
+        assemble_history(new_history, input.existing_history)
+    } else {
+        let kept: Vec<HistEntryV2> = input
+            .existing_history
+            .iter()
+            .filter(|h| input.purge.binary_search(&h.g_id).is_err())
+            .copied()
+            .collect();
+        assemble_history(new_history, &kept)
+    };
     MergeOutput {
         records: out,
         history,
@@ -381,9 +431,12 @@ pub(crate) fn gather_identity_events(
     nov: &RunRecordV2,
     op: u8,
     events: &mut Vec<(RunRecordV2, u8)>,
+    order: RunSortOrder,
 ) {
     events.clear();
-    while *si < superseded.len() && same_identity_v2(&superseded[*si], nov) {
+    // In the pooled tree the same triple in two graphs is two identities.
+    let same_identity = identity_v2_for_order(order);
+    while *si < superseded.len() && same_identity(&superseded[*si], nov) {
         events.push((superseded[*si], superseded_ops[*si]));
         *si += 1;
     }
@@ -473,6 +526,7 @@ mod tests {
                 ColumnData::AbsentDefault
             },
             t: ColumnData::Block(ts),
+            g_id: ColumnData::AbsentDefault,
         }
     }
 
@@ -493,6 +547,7 @@ mod tests {
             superseded: &[],
             superseded_ops: &[],
             order,
+            purge: &[],
         }
     }
 
@@ -798,7 +853,8 @@ mod tests {
             o_key: ObjKey::encode_i64(5).as_u64(),
             o_i: OI_NONE,
             t: 2,
-            op: 0, // retraction at t=2
+            op: 0, // retraction at t=2,
+            g_id: 0,
         }];
 
         let novelty = vec![rec2(2, 1, 20, 5)];
@@ -884,7 +940,8 @@ mod tests {
             o_key: ObjKey::encode_i64(10).as_u64(),
             o_i: OI_NONE,
             t: 1,
-            op: 1, // original assert at t=1
+            op: 1, // original assert at t=1,
+            g_id: 0,
         }];
 
         let novelty = vec![rec2(1, 1, 10, 5)];
@@ -1003,6 +1060,7 @@ mod tests {
             o_type: ColumnData::Const(OType::XSD_INTEGER.as_u16()),
             o_i: ColumnData::AbsentDefault,
             t: ColumnData::Block(Arc::from(vec![1u32, 1, 1])),
+            g_id: ColumnData::AbsentDefault,
         };
 
         // Insert s=4 with same p_id=42

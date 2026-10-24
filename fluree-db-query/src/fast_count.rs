@@ -1180,7 +1180,7 @@ fn count_triples_from_branch_manifest(store: &BinaryIndexStore, g_id: GraphId) -
         RunSortOrder::Opst,
     ];
     for order in order_preference {
-        if let Some(branch) = store.branch_for_order(g_id, order) {
+        if let Some(branch) = store.dedicated_branch(g_id, order) {
             return Ok(branch.leaves.iter().map(|l| l.row_count).sum());
         }
     }
@@ -1772,7 +1772,7 @@ fn count_distinct_lead_groups_inner(
     lead_len: usize,
     require_identifying_o_key: bool,
 ) -> Result<Option<LeadGroupWalk>> {
-    let Some(branch) = store.branch_for_order(g_id, order) else {
+    let Some(branch) = store.dedicated_branch(g_id, order) else {
         return Ok(Some(LeadGroupWalk {
             count: 0,
             skipped_non_identifying_rows: 0,
@@ -2033,7 +2033,7 @@ fn count_lead_groups_for_predicate(
 /// Distinct predicates uses p_const metadata rather than lead_group_count,
 /// since PSOT leaflets are predicate-homogeneous.
 fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
+    let Some(branch) = store.dedicated_branch(g_id, RunSortOrder::Psot) else {
         return Ok(0);
     };
 
@@ -2162,7 +2162,7 @@ fn is_literal_otype(ot_u16: u16) -> bool {
 }
 
 fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
+    let Some(branch) = store.dedicated_branch(g_id, RunSortOrder::Psot) else {
         return Ok(0);
     };
     let projection = projection_otype_only();
@@ -2227,7 +2227,7 @@ fn blank_subject_range() -> (u64, u64) {
 }
 
 fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
+    let Some(branch) = store.dedicated_branch(g_id, RunSortOrder::Spot) else {
         return Ok(0);
     };
     let (s_min, s_max) = blank_subject_range();
