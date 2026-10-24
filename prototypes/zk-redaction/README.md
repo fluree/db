@@ -388,9 +388,8 @@ per-operation copies, and decompressed with `ruzstd`.
 ## Gate assessment
 
 The plan's gate is a capacity assessment against recorded target commit sizes, arrival rate,
-resource budget and completion target. None of these is recorded by the product yet. So that
-the numbers can be checked against any target, these are the service times of one isolated
-16-vCPU prover like this one, proving one commit at a time, with the current build:
+resource budget and completion target. These are the service times of one isolated 16-vCPU
+prover like this one, proving one commit at a time, with the current build:
 
 | Proof | Service time | Per prover-day |
 |---|---:|---:|
@@ -412,8 +411,21 @@ signed and the proof verifies their signatures. Both figures count redaction pro
 authentication and ancestry proofs are separate and optional. How long a removal waits then depends on bursts, backlog, retries and how
 many commits each request touches, none of which this prototype models.
 
-Verdict: proving per erasure request with SHA-256, batching each commit's removals into one
-proof, is feasible as a background operation, provided proving runs apart from transactions.
-The gate is not passed. It needs recorded targets — the commit-size and signature mix, commits
-touched per request, arrival bursts, a completion percentile and a resource budget — and a
-measurement of the isolated deployment against them. PR 5 is not started.
+The targets, recorded after this report (2026-10-22):
+
+- at most 20 erasure requests a day, 95% of them complete within 7 days;
+- one isolated prover of this 16-vCPU class;
+- commits mostly up to 1,000 operations, signatures verified in the proof by default.
+
+A request touches about 2–3 commits per branch: the assertion, the retraction that ended it,
+and the removal's own retraction. That makes about 60 commit proofs a day, against one prover's
+250 (signed, verified) to 380 (unsigned): the prover is busy 16–24% of the day. A week of
+requests arriving at once, about 420 proofs, takes about 40 hours at 5.7 minutes each, inside
+the 7-day target. Through PR 5A's workflow on the same instance type, a signed 1,000-operation
+commit with its signature verified proved in 260 s (3 segments, 2.75M cycles, about 9.6 GB
+peak memory).
+
+Verdict: the gate is passed. Proving per erasure request with SHA-256, batching each commit's
+removals into one proof, meets the targets as a background operation run apart from
+transactions. PR 5 was built on that basis, as erasure through verified replacements and then
+physical purge; see [Permanent erasure](../../docs/transactions/permanent-erasure.md).
