@@ -751,8 +751,9 @@ target. The materializer enforces what it can and documents the rest:
 - **A pinned read is never cut.** Both bounds pace the tracking worker, which
   reads to the head. A read pinned to a snapshot — in Rust,
   `FlureeR2rmlProvider::scan_for_materialize_stream` with an explicit `to`, after
-  `current_snapshot_id` — returns that snapshot whole and reports the pin as its
-  `to`.
+  `current_snapshot_id` — is never cut by either bound and reports the pin as
+  its `to`: a pinned full read returns that snapshot whole, and a pinned window
+  returns the whole window.
 - **A window's working memory is budgeted, not unbounded.** The pass retains one
   node per distinct subject in the window; a window whose estimated accumulator
   exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)

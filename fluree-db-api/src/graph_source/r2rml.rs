@@ -2162,7 +2162,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             ),
         }
 
-        // A pinned read is read whole, on every path. `0` is the disabled budget:
+        // A pinned read is never cut, on every path. `0` is the disabled budget:
         // neither full-read cut below takes a prefix under it, and the
         // incremental cap is skipped for a pin outright.
         let budget_rows = if pinned { 0 } else { self.pass_row_budget() };

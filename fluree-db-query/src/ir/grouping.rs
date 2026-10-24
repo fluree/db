@@ -469,6 +469,18 @@ impl Grouping {
         None
     }
 
+    /// The grouping stage's expressions — `having` and the per-group binds —
+    /// each given to `f` to change.
+    pub fn for_each_expression_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
+        let (Self::Implicit { having, binds, .. } | Self::Explicit { having, binds, .. }) = self;
+        if let Some(having) = having {
+            f(having);
+        }
+        for (_, expr) in binds {
+            f(expr);
+        }
+    }
+
     /// Borrow the `having` filter, if any, from either variant.
     pub fn having(&self) -> Option<&Expression> {
         match self {

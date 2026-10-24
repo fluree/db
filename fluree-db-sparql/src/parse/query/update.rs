@@ -34,7 +34,7 @@ enum TransferKind {
 /// operations and MUST succeed. Collecting from those forms would wrongly
 /// reject them, so they are excluded here.
 ///
-/// Parser-synthesized labels (`#bnpl<N>` from blank-node property lists) are
+/// Parser-synthesized labels (`-bnpl<N>` from blank-node property lists) are
 /// minted from a counter that is monotonic across the whole request, so they
 /// can never collide across operations; they flow through here harmlessly.
 pub(super) fn collect_template_bnode_labels(
