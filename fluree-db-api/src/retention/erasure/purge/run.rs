@@ -445,8 +445,8 @@ impl Fluree {
             .filter_map(|k| k.rsplit_once("/commit/").map(|(folder, _)| folder))
             .filter_map(|folder| folder.rsplit_once('/').map(|(root, _)| root.to_string()))
             .collect();
-        // Scratch outside the storage: what crashed rebuilds of the holders,
-        // and crashed proving steps, left.
+        // Scratch outside the storage: what crashed imports and rebuilds of
+        // the holders, and crashed proving steps, left.
         let data_dir = match &self.indexing_mode {
             IndexingMode::Background(handle) => handle.data_dir().map(std::path::Path::to_path_buf),
             IndexingMode::Disabled => None,
@@ -466,6 +466,7 @@ impl Fluree {
             }
             let scratch = |e: std::io::Error| fluree_db_core::Error::io(format!("scratch: {e}"));
             for holder in &holders {
+                swept += crate::import::clear_import_residue(holder).map_err(scratch)?;
                 // The default spill directory, and the indexer's own.
                 swept += fluree_db_indexer::clear_rebuild_residue(None, holder).map_err(scratch)?;
                 if let Some(dir) = &data_dir {

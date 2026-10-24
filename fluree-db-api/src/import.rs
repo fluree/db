@@ -7321,6 +7321,11 @@ fn session_id() -> String {
 /// not consulted. The import removes this directory when it finishes, on
 /// success or failure, unless `cleanup_local_files` is off.
 fn derive_session_dir<S: Storage>(_storage: &S, alias_prefix: &str, sid: &str) -> PathBuf {
+    sessions_dir(alias_prefix).join(sid)
+}
+
+/// Where imports of `alias_prefix` keep their session directories.
+fn sessions_dir(alias_prefix: &str) -> PathBuf {
     // Allow overriding import scratch space for large imports.
     //
     // This is critical on macOS where `std::env::temp_dir()` often points to a
@@ -7331,7 +7336,23 @@ fn derive_session_dir<S: Storage>(_storage: &S, alias_prefix: &str, sid: &str) -
     let base = std::env::var_os("FLUREE_IMPORT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("fluree-import"));
-    base.join(alias_prefix).join("tmp_import").join(sid)
+    base.join(alias_prefix).join("tmp_import")
+}
+
+/// Remove the session directories of `ledger_id`'s imports whose process is
+/// no longer running: a crash's, or one kept by `cleanup_local_files`,
+/// holding the imported data. Returns how many it removed.
+pub(crate) fn clear_import_residue(ledger_id: &str) -> std::io::Result<usize> {
+    let alias_prefix = match fluree_db_core::LedgerId::parse(ledger_id) {
+        Ok(id) => format!("{}/{}", id.name(), id.branch()),
+        Err(_) => ledger_id.replace(':', "/"),
+    };
+    fluree_db_core::process::clear_ended(&sessions_dir(&alias_prefix), session_pid)
+}
+
+/// The process a [`session_id`] names.
+fn session_pid(sid: &str) -> Option<u32> {
+    u32::from_str_radix(sid.split('-').nth(1)?, 16).ok()
 }
 
 /// Build a JSON-LD @context from turtle prefix declarations + built-in namespaces,
@@ -7437,6 +7458,18 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod session_tests {
+    /// The process a session's directory is named for is the one that made it.
+    #[test]
+    fn a_session_names_its_process() {
+        assert_eq!(
+            super::session_pid(&super::session_id()),
+            Some(std::process::id())
+        );
+    }
 }
 
 #[cfg(test)]

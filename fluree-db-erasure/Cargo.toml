@@ -16,6 +16,8 @@ thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 libc = "0.2"
+# Scratch directories of ended processes.
+fluree-db-core = { path = "../fluree-db-core" }
 
 [features]
 # Fake receipts from a native prover, for tests of the erasure workflow

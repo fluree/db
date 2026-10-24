@@ -69,6 +69,8 @@ pub mod o_type_registry;
 pub mod overlay;
 pub mod pack;
 pub mod prefix_trie;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod process;
 pub mod query_bounds;
 pub mod range;
 pub mod range_provider;

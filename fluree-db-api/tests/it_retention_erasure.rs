@@ -1814,8 +1814,8 @@ async fn a_purge_under_the_write_ahead_log_leaves_no_file_holding_the_value() {
 }
 
 /// A staging file a crashed write of another process left in the ledger's
-/// folder may hold an original's bytes, as may a crashed rebuild's spill:
-/// the purge removes both, whatever their age.
+/// folder may hold an original's bytes, as may a crashed rebuild's or
+/// import's spill: the purge removes them, whatever their age.
 #[tokio::test]
 async fn a_purge_removes_staging_files_crashed_writes_left() {
     let dir = tempfile::tempdir().unwrap();
@@ -1851,6 +1851,12 @@ async fn a_purge_removes_staging_files_crashed_writes_left() {
         .join(format!("{ended}-crashed"));
     std::fs::create_dir_all(&session).unwrap();
     std::fs::write(session.join("run.bin"), b"a@secret").unwrap();
+    // An import's, named `{nanos}-{pid}-{seq}` in hex.
+    let import = std::env::temp_dir()
+        .join("fluree-import/it/purge-staging/main/tmp_import")
+        .join(format!("{:032x}-{ended:08x}-{:016x}", 1, 0));
+    std::fs::create_dir_all(&import).unwrap();
+    std::fs::write(import.join("spool.bin"), b"a@secret").unwrap();
 
     let report = fluree
         .run_purge_pass(&id, std::time::Duration::ZERO)
@@ -1859,6 +1865,7 @@ async fn a_purge_removes_staging_files_crashed_writes_left() {
     assert_eq!(report.purged, 1, "{report:?}");
     assert!(!staging.exists());
     assert!(!session.exists());
+    assert!(!import.exists());
     assert_eq!(
         files_holding(dir.path(), "a@secret"),
         Vec::<std::path::PathBuf>::new()
