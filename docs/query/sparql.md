@@ -1371,7 +1371,7 @@ WHERE  { ex:s ex:items ?l }
 ```
 
 - `ex:s ex:items 2` is no triple of the list: `DELETE DATA { ex:s ex:items 2 }` leaves the member, and `INSERT DATA { ex:s ex:items 2 }` adds a value beside the list.
-- Deleting a list's edge from its owner leaves its cells, as it does for any RDF list. To delete a list with its cells:
+- Deleting a list's edge from its owner leaves its cells, as it does for any RDF list, and `DELETE WHERE { ex:s ?p ?o }` deletes the edge alone. To delete a list with its cells:
 
   ```sparql
   DELETE { ex:s ex:items ?l . ?c ?p ?o }

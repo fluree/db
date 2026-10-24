@@ -437,6 +437,8 @@ A body with graph blocks is read as TriG even when sent as `text/turtle`. From t
 
 A list, a Turtle `( … )` or the same list written out as `rdf:first` / `rdf:rest` triples over the document's own blank nodes (N-Triples has no `( … )`), is stored as a JSON-LD `@list` is. A second list on one subject and property, or one whose cells carry other triples, is stored as its triples.
 
+Inserting a list that a subject and property already hold, the same members in the same order, restates it, as inserting a stored fact does. A different list is a second list on the property, beside the first. To replace a list, upsert it.
+
 ## Insert Semantics
 
 ### Additive by Default

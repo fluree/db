@@ -9,6 +9,10 @@
 //! transaction keeps — is stored as an explicit `rdf:first`/`rdf:rest` chain
 //! of fresh blank nodes. Both shapes are the same RDF; two compact lists on
 //! one property would merge into one.
+//!
+//! A list with the same members, in the same order, as the compact list its
+//! property already holds is that list: writing it again restates its
+//! members, as writing a stored fact again restates the fact.
 
 use crate::current_facts::{CurrentFacts, ListFree, Slot};
 use crate::error::Result;
@@ -219,7 +223,8 @@ pub fn chain_lists(
 
 /// The flakes that store `lists`: each compact when it is the first list on
 /// its graph, subject and predicate and the ledger holds no list members
-/// there that survive the transaction, a chain otherwise.
+/// there that survive the transaction, its compact members again when it
+/// restates the compact list there, a chain otherwise.
 ///
 /// `retracted` says whether the transaction retracts a stored fact, and must
 /// be asked before retractions cancel against assertions: an upsert that
@@ -235,14 +240,14 @@ pub async fn store_lists(
     if lists.is_empty() {
         return Ok(Vec::new());
     }
-    let held = owners_holding_lists(ledger, &lists, txn_id, retracted).await?;
-    Ok(encode(lists, &held))
+    let held = compact_lists_held(ledger, &lists, txn_id, retracted).await?;
+    Ok(encode(lists, held))
 }
 
 /// [`store_lists`] for a document no ledger holds: each list compact when it
 /// is the first on its graph, subject and predicate, a chain otherwise.
 pub fn store_new_lists(lists: Vec<PendingList>) -> Vec<Flake> {
-    encode(lists, &HashSet::new())
+    encode(lists, HashMap::new())
 }
 
 /// [`store_new_lists`] for one part of a write whose parts are stored
@@ -269,32 +274,46 @@ pub fn store_lists_claiming(lists: Vec<PendingList>, claimed: &ClaimedOwners) ->
     out
 }
 
-fn encode(lists: Vec<PendingList>, held: &HashSet<Owner>) -> Vec<Flake> {
-    let mut claimed: HashSet<Owner> = HashSet::new();
+/// Each list compact when its owner holds no compact list yet or it restates
+/// the one there, a chain otherwise. `compact` starts as the compact lists
+/// the ledger holds, by owner, and gains each stored here.
+fn encode(lists: Vec<PendingList>, mut compact: HashMap<Owner, Vec<Flake>>) -> Vec<Flake> {
     let mut out = Vec::new();
     for list in lists {
         let Some(owner) = list.owner() else {
             continue;
         };
-        if !held.contains(&owner) && claimed.insert(owner) {
-            out.extend(list.into_compact());
-        } else {
-            out.extend(list.into_chain());
+        match compact.get(&owner) {
+            Some(held) if same_members(held, &list.members) => out.extend(list.into_compact()),
+            Some(_) => out.extend(list.into_chain()),
+            None => {
+                compact.insert(owner, list.members.clone());
+                out.extend(list.into_compact());
+            }
         }
     }
     out
 }
 
-/// The owners among `lists` where the ledger holds list members that the
-/// transaction does not retract.
-async fn owners_holding_lists(
+/// Whether two compact lists hold the same members in the same order.
+fn same_members(a: &[Flake], b: &[Flake]) -> bool {
+    let lang = |f: &Flake| f.m.as_ref().and_then(|m| m.lang.clone());
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.o == y.o && x.dt == y.dt && lang(x) == lang(y))
+}
+
+/// The compact lists the ledger holds on the owners of `lists`, members the
+/// transaction retracts left out, each in position order.
+async fn compact_lists_held(
     ledger: &LedgerState,
     lists: &[PendingList],
     txn_id: &str,
     retracted: impl Fn(&Flake) -> bool,
-) -> Result<HashSet<Owner>> {
+) -> Result<HashMap<Owner, Vec<Flake>>> {
     if ListFree::check(ledger).is_some() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
     let minted = format!("{BLANK_NODE_ID_PREFIX}-{txn_id}-");
     let mut owners: Vec<Owner> = Vec::new();
@@ -310,20 +329,23 @@ async fn owners_holding_lists(
         .filter_map(|o| Slot::in_ledger(ledger, &o.0, &o.1, &o.2).map(|slot| (o, slot)))
         .collect();
     if slots.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
     let read: Vec<Slot> = slots.iter().map(|(_, slot)| slot.clone()).collect();
     let facts = CurrentFacts::new(ledger).of_slots(&read).await?;
     Ok(slots
         .into_iter()
         .zip(facts)
-        .filter(|(_, facts)| {
-            facts
+        .filter_map(|((owner, _), facts)| {
+            let mut members: Vec<Flake> = facts
                 .iter()
                 .map(crate::current_facts::StoredFact::flake)
-                .any(|f| f.m.as_ref().and_then(|m| m.i).is_some() && !retracted(f))
+                .filter(|f| f.m.as_ref().and_then(|m| m.i).is_some() && !retracted(f))
+                .cloned()
+                .collect();
+            members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
+            (!members.is_empty()).then_some((owner, members))
         })
-        .map(|((owner, _), _)| owner)
         .collect())
 }
 
@@ -345,6 +367,26 @@ mod tests {
 
     fn cell(name: &str) -> Sid {
         Sid::new(BLANK_NODE, format!("{BLANK_NODE_ID_PREFIX}-{name}"))
+    }
+
+    /// A list with the compact list's members, in its order, is that list
+    /// and restates them; one that differs, in order alone, is a chain.
+    #[test]
+    fn a_list_restating_the_compact_one_restates_its_members() {
+        let restated = store_new_lists(vec![
+            PendingList::new(vec![member(1, 0), member(2, 1)], "t--l0-".into()),
+            PendingList::new(vec![member(1, 0), member(2, 1)], "t--l1-".into()),
+        ]);
+        assert_eq!(
+            restated[2..],
+            restated[..2],
+            "the same members again, no chain"
+        );
+        let reordered = store_new_lists(vec![
+            PendingList::new(vec![member(1, 0), member(2, 1)], "t--l0-".into()),
+            PendingList::new(vec![member(2, 0), member(1, 1)], "t--l1-".into()),
+        ]);
+        assert_eq!(reordered.len(), 2 + 1 + 2 * 2, "the members, then a chain");
     }
 
     /// The first list on a property is stored compactly; a second is the

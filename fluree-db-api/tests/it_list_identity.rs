@@ -4,8 +4,10 @@
 //! subject and predicate, and a position names no list: two lists stored that
 //! way on one property merge their members into one list. Every list but one
 //! on a property is therefore stored as an explicit `rdf:first`/`rdf:rest`
-//! chain. These tests read lists back through the shared reader, which reads
-//! either shape, so they check the RDF a ledger holds, not its encoding.
+//! chain. A list with the same members, in order, as the compact list a
+//! property holds is that list, restated. These tests read lists back through
+//! the shared reader, which reads either shape, so they check the RDF a ledger
+//! holds, not its encoding.
 
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
@@ -64,20 +66,31 @@ async fn two_lists_in_one_jsonld_insert() {
     assert_eq!(lists(&ledger, "s", "p").await, [[1, 2], [3, 4]]);
 }
 
-/// Inserting a list where one is stored adds a second list, even an
-/// identical one, as inserting `[ … ]` twice adds two nodes — from novelty
-/// and from the index.
+/// Inserting a different list onto a property holding one adds a list, and
+/// inserting the same list again restates it, as inserting a stored fact
+/// does; before and over an index.
 #[tokio::test]
-async fn inserting_onto_a_stored_list_adds_a_list() {
+async fn inserting_onto_a_stored_list_adds_a_different_one() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = "it/list-identity/stored:main";
     let ledger = fluree.create_ledger(id).await.expect("create");
     let ledger = turtle(&fluree, ledger, "ex:s ex:p (1 2) .").await;
     let ledger = turtle(&fluree, ledger, "ex:s ex:p (1 2) .").await;
-    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2], [1, 2]]);
+    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2]]);
+    let ledger = turtle(&fluree, ledger, "ex:s ex:p (3 4) .").await;
+    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2], [3, 4]]);
 
     support::rebuild_and_publish_index(&fluree, id).await;
     let ledger = fluree.ledger(id).await.expect("load");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@id": "ex:s", "ex:p": {"@list": [1, 2]}}),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2], [3, 4]]);
     let ledger = fluree
         .insert(
             ledger,
@@ -88,7 +101,7 @@ async fn inserting_onto_a_stored_list_adds_a_list() {
         .ledger;
     assert_eq!(
         lists(&ledger, "s", "p").await,
-        vec![vec![1, 2], vec![1, 2], vec![5]]
+        vec![vec![1, 2], vec![3, 4], vec![5]]
     );
 }
 
@@ -132,7 +145,8 @@ async fn upsert_replaces_a_list() {
     assert_eq!(lists(&ledger, "s", "p").await, [[7], [8]]);
 }
 
-/// A list in an insert template is a new list in each WHERE solution.
+/// A list in an insert template is written in each WHERE solution: the same
+/// list on one subject is that list again, and each subject gets its own.
 #[tokio::test]
 async fn a_template_list_is_a_list_per_solution() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -153,7 +167,7 @@ async fn a_template_list_is_a_list_per_solution() {
         .await
         .expect("update")
         .ledger;
-    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2], [1, 2]]);
+    assert_eq!(lists(&ledger, "s", "p").await, [[1, 2]]);
     assert_eq!(lists(&ledger, "a", "p").await, [[3]]);
     assert_eq!(lists(&ledger, "b", "p").await, [[3]]);
 }
